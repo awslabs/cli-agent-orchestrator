@@ -909,41 +909,35 @@ class TestHandoffCreateTimeoutCoversProviderFloors:
 
 
 class TestHandoffCreateTimeoutRecovery:
-    """Review on PR #773: raising ``_HANDOFF_CREATE_TIMEOUT_S`` narrows the
-    orphaned-terminal window but cannot close it -- several providers'
-    sequential ready-timeout floors put a successful init above any single
-    fixed constant (antigravity ~370s, kimi ~300s under defaults; a profile's
-    ``provider_init_timeout`` override raises those further). The actual fix
-    is making the create call resilient to ITS OWN client-side timeout: the
-    terminal's session/window/DB row commits server-side before
-    ``provider.initialize()`` is even awaited, so a retry with the same
-    idempotency key recovers the terminal_id instead of losing it."""
+    """Review on PR #773: a fixed create timeout can never cover every
+    provider's real init time, so handoff's synchronous create retries under
+    the SAME idempotency key with the full budget each time. The server holds a
+    replay until the original provider.initialize() settles, so a recovered
+    terminal is also a ready one, and an attempt that never reached the server
+    is simply performed again with the full budget."""
 
-    def test_client_timeout_recovers_terminal_id_via_idempotent_retry(self):
-        """A real client-side ``requests.Timeout`` on the first create call
-        (server genuinely slower than the client is willing to wait) must not
-        surface as a bare failure with no terminal_id: the retry, keyed on
-        the same idempotency key generated internally for this call, must
-        hit the server's existing-terminal lookup and recover it -- proving
-        the failure mode from issue #931 / PR #773's review is closed
-        regardless of how the timeout constant is tuned."""
+    def test_timed_out_create_recovers_the_terminal_only_once_it_is_ready(self):
+        """Real HTTP round trip: the first attempt's client timeout fires while
+        the stand-in server is still "initializing"; the keyed retry must
+        return the same terminal, and only after initialization finished."""
         import http.server
         import json
         import threading
         import time
-        from urllib.parse import parse_qs, urlsplit
+        from urllib.parse import parse_qs
 
         from cli_agent_orchestrator.utils import orchestration
 
         committed = {}
+        init_done = {}
         request_count = {"n": 0}
         lock = threading.Lock()
 
-        class RecoverableSlowServerHandler(http.server.BaseHTTPRequestHandler):
+        class ReplayWaitsForInitHandler(http.server.BaseHTTPRequestHandler):
             def log_message(self, format, *args):  # noqa: A002 -- matches base signature
                 pass
 
-            def do_POST(self):
+            def do_POST(self):  # noqa: N802 -- stdlib handler naming
                 path, _, query = self.path.partition("?")
                 if path == "/sessions":
                     key = parse_qs(query).get("idempotency_key", [None])[0]
@@ -951,48 +945,44 @@ class TestHandoffCreateTimeoutRecovery:
                         request_count["n"] += 1
                         existing = committed.get(key)
                     if existing is None:
-                        # First attempt: commit the terminal (mirroring
-                        # terminal_service.create_terminal persisting the row
-                        # + idempotency mapping BEFORE awaiting
-                        # provider.initialize()), THEN sleep out the
-                        # "initialize" wait -- long enough that the client's
-                        # own timeout gives up first.
+                        # Original create: commit first (as terminal_service
+                        # does), then "initialize".
                         terminal_id = "term-recovered"
+                        event = threading.Event()
                         with lock:
                             committed[key] = terminal_id
+                            init_done[terminal_id] = event
                         time.sleep(0.6)
+                        event.set()
                     else:
-                        # Retry with the same key: the real server's
-                        # idempotency lookup returns immediately without
-                        # re-running (or re-waiting on) anything.
+                        # Replay: held until the original init settles.
                         terminal_id = existing
-                    body = json.dumps({"id": terminal_id, "provider": "antigravity_cli"}).encode()
+                        init_done[terminal_id].wait()
+                    ready = init_done[terminal_id].is_set()
+                    body = json.dumps(
+                        {"id": terminal_id, "provider": "antigravity_cli", "ready": ready}
+                    ).encode()
                     self.send_response(201)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
                     return
+                # --no-wait direct input: record whether init had finished.
+                with lock:
+                    self.server.sent_when_ready = all(e.is_set() for e in init_done.values())
                 self.send_response(200)
                 self.end_headers()
 
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RecoverableSlowServerHandler)
-        port = server.server_address[1]
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ReplayWaitsForInitHandler)
+        server.sent_when_ready = None
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
 
         old_base_url = orchestration.API_BASE_URL
         old_timeout = orchestration._HANDOFF_CREATE_TIMEOUT_S
-        old_recovery_timeout = orchestration._HANDOFF_CREATE_RECOVERY_TIMEOUT_S
-        orchestration.API_BASE_URL = f"http://127.0.0.1:{port}"
-        # The server's "initialize" sleep (0.6s) is deliberately longer than
-        # this first-attempt timeout (0.2s) -- a genuine client-side Timeout
-        # must fire -- but the recovery attempt's timeout (2.0s) is generous,
-        # since the retry never has to wait out any remaining init time.
-        orchestration._HANDOFF_CREATE_TIMEOUT_S = 0.2
-        orchestration._HANDOFF_CREATE_RECOVERY_TIMEOUT_S = 2.0
-        os.environ.pop("CAO_TERMINAL_ID", None)
-
+        orchestration.API_BASE_URL = f"http://127.0.0.1:{server.server_address[1]}"
+        orchestration._HANDOFF_CREATE_TIMEOUT_S = 0.3  # shorter than the 0.6s init
         try:
             reported = []
             result = asyncio.run(
@@ -1006,13 +996,64 @@ class TestHandoffCreateTimeoutRecovery:
         finally:
             orchestration.API_BASE_URL = old_base_url
             orchestration._HANDOFF_CREATE_TIMEOUT_S = old_timeout
-            orchestration._HANDOFF_CREATE_RECOVERY_TIMEOUT_S = old_recovery_timeout
             server.shutdown()
             thread.join(timeout=2)
 
         assert result.success is True
         assert result.terminal_id == "term-recovered"
         assert reported == ["term-recovered"]
-        # Exactly two requests hit the server: the timed-out first attempt
-        # and the recovering retry -- not a fresh (duplicate) terminal.
+        # The timed-out original plus one replay: no second worker.
         assert request_count["n"] == 2
+        # Input went in only after initialization had finished.
+        assert server.sent_when_ready is True
+
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_connect_timeout_retry_keeps_the_full_budget_and_key(
+        self, mock_create, mock_provider, _nudge
+    ):
+        """A ConnectTimeout means nothing reached the server, so the retry is a
+        fresh create. It must get the same full budget as a first attempt, not
+        a shorter recovery budget, and reuse the same idempotency key."""
+        import requests
+
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.side_effect = [
+            requests.exceptions.ConnectTimeout("connect timed out"),
+            ("dev-t1", "kiro_cli"),
+        ]
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.exceptions = requests.exceptions
+            mock_requests.post.return_value = _ok_run_step_response(terminal_id="dev-t1")
+            mock_requests.Timeout = requests.Timeout
+            result = asyncio.run(
+                _handoff_impl("developer", "Do task", on_terminal_id=lambda _t: None)
+            )
+
+        assert result.success is True
+        assert mock_create.call_count == 2
+        timeouts = [c.kwargs["create_timeout"] for c in mock_create.call_args_list]
+        keys = {c.kwargs["idempotency_key"] for c in mock_create.call_args_list}
+        assert timeouts == [_HANDOFF_CREATE_TIMEOUT_S, _HANDOFF_CREATE_TIMEOUT_S]
+        assert len(keys) == 1 and None not in keys
+
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_retries_are_bounded(self, mock_create, mock_provider, _nudge):
+        import requests
+
+        from cli_agent_orchestrator.utils.orchestration import _HANDOFF_CREATE_ATTEMPTS
+
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.side_effect = requests.exceptions.ReadTimeout("read timed out")
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.exceptions = requests.exceptions
+            mock_requests.Timeout = requests.Timeout
+            result = asyncio.run(
+                _handoff_impl("developer", "Do task", on_terminal_id=lambda _t: None)
+            )
+
+        assert result.success is False
+        assert mock_create.call_count == _HANDOFF_CREATE_ATTEMPTS

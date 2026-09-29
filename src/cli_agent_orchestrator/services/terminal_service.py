@@ -181,6 +181,35 @@ _CURRENT_COMPOSER_PROBE_MAX_CHARS = 64
 _deferred_init_tasks: set = set()
 
 
+class _SyncInitWaiter:
+    """Settles when a synchronous create's ``provider.initialize()`` finishes.
+
+    Review on PR #773: an idempotent replay used to return the moment the key's
+    terminal row existed, which a keyed synchronous create commits BEFORE it
+    awaits ``provider.initialize()``. A caller recovering from its own client
+    timeout therefore got the terminal back while the provider was still
+    starting, and then sent input into it. The original request only ever
+    returns a READY terminal, so a replay of it must not return anything
+    earlier: it waits on this until the original initialization settles.
+    """
+
+    def __init__(self) -> None:
+        self.settled = asyncio.Event()
+        self.error: Optional[BaseException] = None
+
+    def settle(self, error: Optional[BaseException] = None) -> None:
+        if not self.settled.is_set():
+            self.error = error
+            self.settled.set()
+
+
+# terminal_id -> waiter, only for keyed synchronous creates whose row is
+# committed but whose initialization has not settled yet. Entries remove
+# themselves on settle; a replay that arrives afterwards sees either a ready
+# terminal (success) or no row at all (failed create, rolled back).
+_pending_sync_inits: Dict[str, _SyncInitWaiter] = {}
+
+
 def inject_memory_context(
     first_message: str, terminal_id: str, frozen_memory: str | None = None
 ) -> str:
@@ -991,6 +1020,21 @@ async def create_terminal(
                 # A genuine retry: same key, same request. Return the terminal
                 # the first call produced without doing any real work -- the
                 # property haofeif signed off on, unchanged by the check above.
+                #
+                # If that first call is a synchronous create still inside
+                # provider.initialize(), wait for it first: the replay must
+                # give back what the original would, a READY terminal, not one
+                # whose provider is still starting (review on PR #773). A
+                # deferred-init replay returns at once, as its original did.
+                waiter = _pending_sync_inits.get(existing_terminal_id)
+                if waiter is not None and not defer_init:
+                    await waiter.settled.wait()
+                    if waiter.error is not None:
+                        raise RuntimeError(
+                            f"terminal {existing_terminal_id!r} for idempotency_key "
+                            f"{idempotency_key!r} failed to initialize: {waiter.error}"
+                        ) from waiter.error
+                    row = get_terminal(existing_terminal_id)
                 try:
                     return Terminal(**row)
                 except ValidationError as exc:
@@ -1020,6 +1064,7 @@ async def create_terminal(
             )
 
     terminal_id: Optional[str] = None
+    sync_init_waiter: Optional[_SyncInitWaiter] = None
     session_created = False  # tracks whether THIS call created the tmux session
     # harness-control#186: tracks whether THIS call created a new WINDOW in an
     # already-existing session (the `new_session=False` branch below — what
@@ -1093,6 +1138,11 @@ async def create_terminal(
 
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
+        # Registered BEFORE the row (and this key's mapping) can be committed,
+        # so there is no window in which a replay finds the row but no waiter.
+        if idempotency_key and not defer_init:
+            sync_init_waiter = _SyncInitWaiter()
+            _pending_sync_inits[terminal_id] = sync_init_waiter
 
         if not session_name:
             session_name = generate_session_name()
@@ -1478,9 +1528,13 @@ async def create_terminal(
                 svc.register_terminal(terminal_id, pane_id, is_kiro)
             except Exception as e:
                 logger.warning(f"Failed to register terminal {terminal_id} with herdr inbox: {e}")
+        if sync_init_waiter is not None:
+            sync_init_waiter.settle()
         return terminal
 
     except Exception as e:
+        if sync_init_waiter is not None:
+            sync_init_waiter.settle(e)
         # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
         try:
@@ -1566,6 +1620,12 @@ async def create_terminal(
                 worktree_service.remove_worktree, worktree_repo_root, terminal_id
             )
         raise
+    finally:
+        # Every exit, including cancellation, settles the waiter so no replay
+        # can wait forever on a create that is no longer running.
+        if sync_init_waiter is not None and terminal_id is not None:
+            sync_init_waiter.settle(RuntimeError("terminal creation did not complete"))
+            _pending_sync_inits.pop(terminal_id, None)
 
 
 def _notify_cross_node_caller(terminal_id: str, session_name: str, message: str) -> bool:
