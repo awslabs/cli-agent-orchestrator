@@ -10,6 +10,7 @@ import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.terminal import poll_until_done
 
 # Default poll timeout for sync send (seconds). Pass --timeout to override.
@@ -216,15 +217,12 @@ def set_env(session_name, pairs):
     env_vars = _parse_env_pairs(pairs)
     try:
         response = requests.post(
-            f"{API_BASE_URL}/sessions/{quote(session_name)}/env",
+            f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/env",
             json={"env_vars": env_vars},
+            timeout=get_server_settings()["mcp_request_timeout"],
         )
         response.raise_for_status()
         data = response.json()
-        click.echo(
-            f"Session '{data['session_name']}' env re-hydrated "
-            f"({len(env_vars)} set, now holding: {', '.join(data['env_keys'])})"
-        )
     except requests.HTTPError as e:
         detail = ""
         try:
@@ -232,6 +230,15 @@ def set_env(session_name, pairs):
         except Exception:
             pass
         raise click.ClickException(detail or str(e))
+    except requests.exceptions.RequestException as e:
+        # Connection refused / timeout: the likeliest failure for a command whose whole
+        # purpose is running right after a cao-server restart. Not an HTTPError subclass,
+        # so it needs its own arm to avoid escaping as a raw traceback.
+        raise click.ClickException(f"Failed to connect to cao-server: {e}")
+    click.echo(
+        f"Session '{data['session_name']}' env re-hydrated "
+        f"({len(env_vars)} set, now holding: {', '.join(data['env_keys'])})"
+    )
 
 
 @session.command()

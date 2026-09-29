@@ -711,3 +711,41 @@ class TestSetEnv:
         assert result.exit_code == 1
         assert "expects KEY=VALUE" in result.output
         mock_post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            requests.exceptions.ConnectionError("Connection refused"),
+            requests.exceptions.Timeout("read timed out"),
+        ],
+        ids=["connection-refused", "timeout"],
+    )
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    def test_transport_failure_is_a_clean_click_error(self, mock_post, failure, runner):
+        """The likeliest failure right after a restart is a server that is not back yet.
+
+        Neither ``ConnectionError`` nor ``Timeout`` is an ``HTTPError``, so catching only the
+        latter let them escape as a raw traceback."""
+        mock_post.side_effect = failure
+
+        result = runner.invoke(session, ["set-env", "cao-test", "A=b"])
+
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit), repr(result.exception)
+        assert "Failed to connect to cao-server" in result.output
+
+    @patch(
+        "cli_agent_orchestrator.cli.commands.session.get_server_settings",
+        return_value={"mcp_request_timeout": 42},
+    )
+    @patch("cli_agent_orchestrator.cli.commands.session.requests.post")
+    def test_request_carries_the_configured_timeout(self, mock_post, _settings, runner):
+        """Same bound as the launch path's env POST, so a wedged server cannot hang the CLI."""
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"session_name": "cao-test", "env_keys": ["A"]}
+        mock_post.return_value = resp
+
+        result = runner.invoke(session, ["set-env", "cao-test", "A=b"])
+
+        assert result.exit_code == 0, result.output
+        assert mock_post.call_args.kwargs["timeout"] == 42
