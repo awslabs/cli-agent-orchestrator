@@ -117,28 +117,38 @@ def _delete_unrecorded(conn: RuntimeConnection, terminal_id: str) -> None:
             conn.runtime_id,
             terminal_id,
         )
-        delay = UNRECORDED_RETRY_DELAY
-        # Until the runtime confirms, or this connection ends: no row routes a
-        # later retry, but the runtime's next hello lists the terminal again.
-        while not conn.closed:
-            try:
-                result = await conn.call(CommandType.DELETE, {}, terminal_id=terminal_id)
-                if result.get("deleted"):
-                    return
-                reason = "deferred by the runtime"
-            except RuntimeUnavailableError:
-                return  # the connection is gone
-            except RemoteRuntimeError as exc:  # no answer, or the runtime failed it
-                reason = str(exc)
-            logger.warning(
-                "unrecorded terminal %s on runtime %s not deleted yet (%s); retrying in %.0fs",
+        try:
+            delay = UNRECORDED_RETRY_DELAY
+            # Until the runtime confirms, or this connection ends: no row routes a
+            # later retry, but the runtime's next hello lists the terminal again.
+            while not conn.closed:
+                try:
+                    result = await conn.call(CommandType.DELETE, {}, terminal_id=terminal_id)
+                    if result.get("deleted"):
+                        return
+                    reason = "deferred by the runtime"
+                except RuntimeUnavailableError:
+                    return  # the connection is gone
+                except RemoteRuntimeError as exc:  # no answer, or the runtime failed it
+                    reason = str(exc)
+                logger.warning(
+                    "unrecorded terminal %s on runtime %s not deleted yet (%s); retrying in %.0fs",
+                    terminal_id,
+                    conn.runtime_id,
+                    reason,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, UNRECORDED_RETRY_MAX_DELAY)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a background task: log, never leave it unseen
+            logger.exception(
+                "cleanup of unrecorded terminal %s on runtime %s failed",
                 terminal_id,
                 conn.runtime_id,
-                reason,
-                delay,
             )
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, UNRECORDED_RETRY_MAX_DELAY)
 
     task = asyncio.create_task(run())
     _teardowns.add(task)

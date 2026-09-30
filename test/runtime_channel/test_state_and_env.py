@@ -108,6 +108,12 @@ def test_the_runtime_token_never_reaches_a_pane():
     assert env == {"OK": "y"}
 
 
+def test_nor_does_the_path_of_its_file():
+    from cli_agent_orchestrator.runtime_channel.token import TOKEN_FILE_ENV
+
+    assert TmuxClient._is_blocked_env_key(TOKEN_FILE_ENV) is True
+
+
 def test_rows_whose_pane_died_with_the_last_container_are_dropped(db, monkeypatch):
     # The runtime's state volume outlives the container; its tmux does not.
     from cli_agent_orchestrator.backends import registry as backend_registry

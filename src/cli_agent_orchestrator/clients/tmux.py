@@ -915,7 +915,7 @@ class TmuxClient:
     _BLOCKED_ENV_PREFIXES = ("CLAUDE", "CODEX_", "__MISE_")
     # Exact names never forwarded: the runtime-channel token (#745) authenticates
     # an execution runtime to cao-server and is no business of an agent pane.
-    _BLOCKED_ENV_NAMES = frozenset({"CAO_RUNTIME_TOKEN"})
+    _BLOCKED_ENV_NAMES = frozenset({"CAO_RUNTIME_TOKEN", "CAO_RUNTIME_TOKEN_FILE"})
     _BLOCKED_PREFIX_ALLOWLIST = frozenset(
         {
             "CLAUDE_CODE_USE_BEDROCK",

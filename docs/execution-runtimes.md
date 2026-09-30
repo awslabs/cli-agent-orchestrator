@@ -99,9 +99,9 @@ retried until the runtime confirms it (see [Commands](#commands)).
   protocol version is refused after the hello (close code 1002). `cao-bridge`
   exits on either rather than retrying.
 - The token is read once from `CAO_RUNTIME_TOKEN_FILE`, or from
-  `CAO_RUNTIME_TOKEN`, which is then removed from the process environment.
+  `CAO_RUNTIME_TOKEN`; both are then removed from the process environment.
   `cao-server` reads it first thing at startup, before any event plugin loads.
-  tmux never passes `CAO_RUNTIME_TOKEN` to a pane. The EKS image's entrypoint
+  tmux never passes either variable to a pane. The EKS image's entrypoint
   removes it before its setup steps (`cao init`, `cao install`, the provider
   warm-up) and passes it only to the `cao-bridge` or `cao-server` it finally
   starts.
