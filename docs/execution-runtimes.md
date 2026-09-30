@@ -22,7 +22,9 @@ start one (`POST /sessions`, `POST /sessions/{name}/terminals`,
 `POST /terminals/run-step`) return `409`.
 
 The runtime opens one WebSocket to `WS /runtime/channel`, outbound only, with
-the shared token in the `x-cao-runtime-token` header. Both sides exchange a
+the shared token in the `x-cao-runtime-token` header. Its runtime id (for
+`cao-bridge`, `CAO_BRIDGE_RUNTIME_ID`) is addressed as one URL path segment, so
+it is letters, digits, `.`, `_` and `-`; a Kubernetes pod name fits. Both sides exchange a
 hello carrying the protocol version. The runtime's hello also lists every
 terminal it runs, with its current status, so a reconnect restores status
 without replaying anything. A newer connection from the same runtime replaces

@@ -82,6 +82,15 @@ async def _validate_reused_terminal(
     metadata = await asyncio.to_thread(terminal_service.get_terminal_metadata, terminal_id)
     if metadata is None:
         raise ValueError(f"Terminal '{terminal_id}' not found")
+    if metadata.get("runtime_id") is not None:
+        from cli_agent_orchestrator.models.terminal import LocalExecutionDisabledError
+
+        # Its status and output live in an execution runtime (#745); this
+        # step's wait and extraction read them on this server.
+        raise LocalExecutionDisabledError(
+            f"terminal {terminal_id} runs in an execution runtime; run-step drives "
+            "terminals on this server only"
+        )
 
     persisted_provider = metadata.get("provider")
     if persisted_provider != requested_provider:
@@ -575,22 +584,6 @@ async def run_agent_step(
     """
     created_here = reuse_terminal_id is None
     terminal_id = reuse_terminal_id
-    if reuse_terminal_id is not None:
-        from cli_agent_orchestrator.clients.database import get_terminal_metadata
-        from cli_agent_orchestrator.models.terminal import LocalExecutionDisabledError
-
-        reused = None
-        try:
-            reused = await asyncio.to_thread(get_terminal_metadata, reuse_terminal_id)
-        except Exception:  # noqa: BLE001 - cannot tell: the reuse path fails on its own
-            logger.debug("could not look up terminal %s", reuse_terminal_id, exc_info=True)
-        if reused and reused.get("runtime_id"):
-            # Its status and output live in an execution runtime (#745); this
-            # step's wait and extraction read them on this server.
-            raise LocalExecutionDisabledError(
-                f"terminal {reuse_terminal_id} runs in an execution runtime; run-step "
-                "drives terminals on this server only"
-            )
 
     if created_here:
         # Inherit working directory from supervisor when not explicitly set.
