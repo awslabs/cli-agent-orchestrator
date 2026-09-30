@@ -64,8 +64,9 @@ class Bridge:
         self._send_lock = asyncio.Lock()
         # terminal id -> (lock, number of commands holding or awaiting it)
         self._terminal_locks: Dict[str, Tuple[asyncio.Lock, int]] = {}
-        # launch op id -> set once that launch has settled (see handle()).
-        self._launches: Dict[str, asyncio.Event] = {}
+        # launch op id -> (set once it has settled, ids of the local terminals
+        # that existed when it started: none of them can be its own).
+        self._launches: Dict[str, Tuple[asyncio.Event, Set[str]]] = {}
         # Whether the current connection completed its hello (see run()).
         self._helloed = False
         # Results that could not be sent (no channel at the time), delivered
@@ -88,6 +89,20 @@ class Bridge:
                     pass
         if isinstance(frame, Result):
             self._unsent.append(frame)
+
+    def _local_terminal_ids(self) -> Set[str]:
+        from cli_agent_orchestrator.clients.database import list_all_terminals
+
+        return {row["id"] for row in list_all_terminals()}
+
+    def _existing_terminal_ids(self) -> Set[str]:
+        """The local terminals now, or none if they cannot be read (then every
+        delete waits for the launch, which is merely slower)."""
+        try:
+            return self._local_terminal_ids()
+        except Exception:  # noqa: BLE001 - see the docstring
+            logger.debug("could not list local terminals", exc_info=True)
+            return set()
 
     def _status_of(self, terminal_id: str) -> TerminalStatus:
         from cli_agent_orchestrator.services.status_monitor import status_monitor
@@ -142,20 +157,24 @@ class Bridge:
         # launches run concurrently.
         try:
             if command.terminal_id is None:
-                launching = self._launches.setdefault(command.op_id, asyncio.Event())
+                existed = await asyncio.to_thread(self._existing_terminal_ids)
+                launching = (asyncio.Event(), existed)
+                self._launches[command.op_id] = launching
                 try:
                     payload = await self.execute(command)
                 finally:
-                    launching.set()
+                    launching[0].set()
                     self._launches.pop(command.op_id, None)
             else:
                 if command.type == CommandType.DELETE:
                     # The terminal may be one a launch still in progress is
                     # starting (its row exists before its result is sent): let
-                    # every such launch settle first, so a delete sent after a
-                    # reconnect never tears a pane down under its initialization.
-                    for settled in list(self._launches.values()):
-                        await settled.wait()
+                    # any launch that could have made it settle first, so a
+                    # delete sent after a reconnect never tears a pane down
+                    # under its initialization. Older terminals do not wait.
+                    for settled, existed in list(self._launches.values()):
+                        if command.terminal_id not in existed:
+                            await settled.wait()
                 async with self._terminal_turn(command.terminal_id):
                     payload = await self.execute(command)
             result = Result(op_id=command.op_id, ok=True, payload=payload)
