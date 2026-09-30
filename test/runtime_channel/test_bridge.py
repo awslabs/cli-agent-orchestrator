@@ -364,6 +364,32 @@ class TestOrdering:
 
 class TestConnection:
     @pytest.mark.asyncio
+    async def test_a_slow_status_read_does_not_stall_the_event_loop(self):
+        import time
+
+        bridge = _bridge()
+        bridge._ws = FakeServer()
+
+        def slow(terminal_id):
+            time.sleep(0.3)  # e.g. a capture-pane behind the status monitor
+            return TerminalStatus.IDLE
+
+        bridge._status_of = slow
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        ticking = asyncio.ensure_future(ticker())
+        await bridge._push_status("abcd1234")
+        ticking.cancel()
+        assert ticks >= 10, f"the loop ran {ticks} times in 0.3 s: the read blocked it"
+        assert bridge._ws.sent == [Status(terminal_id="abcd1234", status=TerminalStatus.IDLE)]
+
+    @pytest.mark.asyncio
     async def test_hello_reports_status_then_commands_are_answered(self, tmp_path):
         bridge = _bridge(tmp_path)
 

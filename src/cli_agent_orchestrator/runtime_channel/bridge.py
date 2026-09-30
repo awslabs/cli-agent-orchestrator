@@ -116,7 +116,10 @@ class Bridge:
         if ws is None:
             return
         async with self._send_lock:
-            frame = Status(terminal_id=terminal_id, status=self._status_of(terminal_id))
+            # Off the loop (it may capture the pane), still under the send lock
+            # so status frames cannot be reordered.
+            status = await asyncio.to_thread(self._status_of, terminal_id)
+            frame = Status(terminal_id=terminal_id, status=status)
             try:
                 await ws.send(encode(frame))
             except websockets.exceptions.ConnectionClosed:

@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from typing import Any, Awaitable, Callable, Dict, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.runtime_channel.protocol import Command, CommandType, Result, encode
@@ -270,10 +270,14 @@ class RuntimeRegistry:
 
     def list_runtimes(self) -> Dict[str, Dict[str, Any]]:
         with self._lock:
+            # One pass over the placements, not one per runtime.
+            placed: Dict[str, List[str]] = {}
+            for terminal_id, runtime_id in self._placement.items():
+                placed.setdefault(runtime_id, []).append(terminal_id)
             return {
                 runtime_id: {
                     "connected_at": conn.connected_at,
-                    "terminals": sorted(t for t, r in self._placement.items() if r == runtime_id),
+                    "terminals": sorted(placed.get(runtime_id, [])),
                 }
                 for runtime_id, conn in self._runtimes.items()
                 if conn.active
