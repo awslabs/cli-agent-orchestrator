@@ -18,6 +18,7 @@ Terminal Workflow:
 """
 
 import asyncio
+import functools
 import hashlib
 import logging
 import os
@@ -608,8 +609,21 @@ async def _await_uncancellable(fn: Callable[..., Any], /, *args: Any, **kwargs: 
     cancellations are absorbed the same way. An exception from ``fn`` is
     logged and swallowed: cleanup is best-effort and must not replace the
     error the caller is about to raise.
+
+    The thread is driven through ``loop.run_in_executor`` directly, not
+    ``asyncio.to_thread`` wrapped in a Task, on purpose. Whole-runner shutdown
+    (``asyncio.run``'s ``_cancel_all_tasks``, uvicorn's equivalent) cancels
+    every *Task* on the loop; a Task standing in for the thread would then be
+    cancelled itself, ``await shield(job)`` would raise on every iteration
+    without ever yielding, and shutdown would spin here forever after the
+    thread had long finished. An executor Future is not a Task, so shutdown
+    cancels only this awaiting coroutine, which keeps waiting for the thread
+    and then re-raises. And should the Future itself ever be cancelled or
+    finish behind our back, ``job.done()`` ends the loop instead of retrying
+    a settled awaitable.
     """
-    job = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+    loop = asyncio.get_running_loop()
+    job: "asyncio.Future[Any]" = loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
     cancelled: Optional[asyncio.CancelledError] = None
     while True:
         try:
@@ -618,7 +632,13 @@ async def _await_uncancellable(fn: Callable[..., Any], /, *args: Any, **kwargs: 
         except asyncio.CancelledError as exc:
             if cancelled is None:
                 cancelled = exc
-            # Loop: the shielded thread is still running; keep waiting for it.
+            if job.done():
+                # The job itself was cancelled or completed between iterations:
+                # nothing left to wait for. Retrying a settled awaitable would
+                # raise immediately every time and never yield to the loop.
+                break
+            # Otherwise the caller was cancelled while the thread still runs:
+            # keep waiting for it.
         except Exception:
             logger.exception("Rollback: failed-create cleanup raised")
             break

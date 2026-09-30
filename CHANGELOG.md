@@ -306,7 +306,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while the rollback waited for the lock used to unwind the handler after the
   backend kill but before the provider and row were removed, leaving a
   registered provider and a row for a terminal that no longer existed; the
-  cancellation is still raised to the caller, once the cleanup is durable (#823)
+  cancellation is still raised to the caller, once the cleanup is durable. The
+  cleanup thread is driven by an executor future rather than a task, so a
+  whole-server shutdown that lands while the rollback waits for the lock
+  cancels only the waiting request and returns once the thread finishes,
+  instead of spinning on a cancelled task and never exiting (#823)
 
 ### Changed
 

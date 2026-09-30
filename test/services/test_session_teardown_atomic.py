@@ -2177,3 +2177,78 @@ def test_failure_before_the_worker_runs_raises_the_cause_and_touches_nothing(
     assert backend.session_exists("cao-never-built") is False
     assert database.list_terminals_by_session("cao-never-built") == []
     assert session_lock._session_locks == {}
+
+
+def test_runner_shutdown_during_failed_create_rollback_terminates(real_db, runtime, monkeypatch):
+    """Whole-runner shutdown while the failure rollback waits for the lifecycle
+    lock must terminate once the cleanup thread finishes.
+
+    ``asyncio.run`` (and uvicorn) end by cancelling every Task on the loop and
+    gathering them. With the cleanup thread wrapped in a Task, that shutdown
+    cancelled the Task itself; ``await shield(job)`` then raised on every
+    iteration without yielding and ``asyncio.run`` never returned, even after
+    the thread had completed the backend and row cleanup. Construction: fail
+    provider init while a same-name holder has the lock, return from the
+    runner's main coroutine while the rollback is provably contending, release
+    the lock 150 ms later, and require ``asyncio.run`` to come back with the
+    two stores clean. Session and window arms.
+    """
+    import asyncio
+
+    for new_session in (True, False):
+        session_lock._session_locks.clear()
+        backend = FakeTmuxBackend()
+        set_backend(backend)
+        name = f"cao-shutdown-{'s' if new_session else 'w'}"
+        if not new_session:
+            _seed(backend, name, [("t-peer", "w-peer")], runtime)
+        captured: Dict[str, str] = {}
+        holder, release_lock = _fail_in_initialize_with_the_lock_taken(monkeypatch, name, captured)
+
+        async def main():
+            asyncio.create_task(
+                terminal_service.create_terminal(
+                    provider="claude_code",
+                    agent_profile="developer",
+                    session_name=name,
+                    new_session=new_session,
+                )
+            )
+            # holder (1) + the rollback thread (2): the create task is parked on
+            # the cleanup await. Returning now makes asyncio.run cancel it.
+            await asyncio.to_thread(_wait_until_lock_contended, name, 2)
+            threading.Timer(0.15, release_lock.set).start()
+
+        finished = threading.Event()
+
+        def _run():
+            try:
+                asyncio.run(main())
+            finally:
+                finished.set()
+
+        runner = threading.Thread(target=_run, daemon=True)
+        runner.start()
+        try:
+            assert finished.wait(DEADLOCK_TIMEOUT), (
+                f"asyncio.run did not return after runner shutdown ({name}): the cleanup "
+                "await is spinning on a cancelled task"
+            )
+        finally:
+            release_lock.set()
+            holder.join(timeout=DEADLOCK_TIMEOUT)
+            runner.join(timeout=DEADLOCK_TIMEOUT)
+
+        tid = captured["terminal_id"]
+        assert runtime.is_fully_gone(tid), (
+            runtime.fifo_readers,
+            runtime.status_buffers,
+            runtime.providers,
+        )
+        if new_session:
+            assert backend.session_exists(name) is False
+            assert database.list_terminals_by_session(name) == []
+        else:
+            assert backend.windows(name) == {"w-peer"}
+            assert {r["id"] for r in database.list_terminals_by_session(name)} == {"t-peer"}
+        assert session_lock._session_locks == {}
