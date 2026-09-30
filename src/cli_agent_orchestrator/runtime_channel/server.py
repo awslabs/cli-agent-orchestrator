@@ -12,6 +12,7 @@
 import asyncio
 import hmac
 import logging
+import os
 from typing import Any, Dict, List, Optional, Set
 
 from fastapi import (
@@ -75,6 +76,25 @@ UNRECORDED_RETRY_DELAY = 5.0
 UNRECORDED_RETRY_MAX_DELAY = 60.0
 # Likewise for launch settlements that outlive a cancelled request.
 _settlements: Set["asyncio.Task[Dict[str, Any]]"] = set()
+
+
+#: Seconds a launch may take, from the command to the runtime's result.
+LAUNCH_TIMEOUT_ENV = "CAO_RUNTIME_LAUNCH_TIMEOUT"
+
+
+def _launch_timeout() -> float:
+    """``CAO_RUNTIME_LAUNCH_TIMEOUT``, else ``LAUNCH_TIMEOUT`` (240 s). Set it above
+    the longest provider start-up a runtime's profiles allow."""
+    raw = os.environ.get(LAUNCH_TIMEOUT_ENV, "").strip()
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+        logger.warning("ignoring %s=%r: not a positive number of seconds", LAUNCH_TIMEOUT_ENV, raw)
+    return LAUNCH_TIMEOUT
 
 
 def _token_matches(presented: str) -> bool:
@@ -236,17 +256,26 @@ class _Launched(BaseModel):
 
 
 async def _undo_launch(runtime_id: str, terminal_id: str) -> bool:
-    """Delete a launched terminal the server will not record. True if it is gone."""
+    """Delete a launched terminal the server will not record. True if it is gone.
+
+    If the runtime defers or fails it, the delete is retried in the background
+    (see ``_delete_unrecorded``): with no central row, nothing else would.
+    """
     try:
         deleted = await runtime_registry.call(
             runtime_id, CommandType.DELETE, {}, terminal_id=terminal_id
         )
-        return bool(deleted.get("deleted"))
+        if deleted.get("deleted"):
+            return True
     except RemoteRuntimeError as exc:
         logger.warning(
             "could not delete terminal %s on runtime %s: %s", terminal_id, runtime_id, exc
         )
-        return False
+    conn = runtime_registry.connection(runtime_id)
+    if conn is not None:
+        _delete_unrecorded(conn, terminal_id)
+    # Otherwise the runtime's next hello lists the terminal, and it is deleted then.
+    return False
 
 
 def _record_launch(
@@ -383,7 +412,7 @@ async def launch_on_runtime(
     async def launch_and_settle() -> Dict[str, Any]:
         try:
             result = await conn.call(
-                CommandType.LAUNCH, body.model_dump(exclude_none=True), timeout=LAUNCH_TIMEOUT
+                CommandType.LAUNCH, body.model_dump(exclude_none=True), timeout=_launch_timeout()
             )
         except RemoteRuntimeError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc))

@@ -261,6 +261,37 @@ class TestHandle:
 
 class TestOrdering:
     @pytest.mark.asyncio
+    async def test_a_delete_of_an_older_terminal_does_not_wait_for_a_launch(self, monkeypatch):
+        import cli_agent_orchestrator.clients.database as database
+
+        bridge = _bridge()
+        bridge._ws = FakeServer()
+        bridge._local_terminal_ids = lambda: {"abcd0001"}  # existed before the launch
+        initializing = asyncio.Event()
+        events = []
+        monkeypatch.setattr(database, "get_terminal_metadata", lambda tid: {"id": tid})
+
+        async def create_terminal(**kwargs):
+            events.append("launch started")
+            await initializing.wait()
+            events.append("launch done")
+            return SimpleNamespace(id="beef0001")
+
+        monkeypatch.setattr(terminal_service, "create_terminal", create_terminal)
+        monkeypatch.setattr(terminal_service, "get_terminal", lambda tid: {"id": tid})
+        monkeypatch.setattr(
+            terminal_service, "delete_terminal", lambda tid: events.append(f"delete {tid}") or True
+        )
+        launch = asyncio.ensure_future(
+            bridge.handle(_command(CommandType.LAUNCH, None, agent_profile="developer"))
+        )
+        await asyncio.sleep(0.05)
+        await asyncio.wait_for(bridge.handle(_command(CommandType.DELETE, "abcd0001")), 2)
+        assert events == ["launch started", "delete abcd0001"], "not held up by the launch"
+        initializing.set()
+        await asyncio.wait_for(launch, 5)
+
+    @pytest.mark.asyncio
     async def test_a_delete_waits_for_a_launch_still_in_progress(self, monkeypatch):
         import cli_agent_orchestrator.clients.database as database
 

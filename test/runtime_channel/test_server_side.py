@@ -391,10 +391,14 @@ class TestRemoteTerminal:
         assert response.status_code == 500
         assert ("may still be running" in response.json()["detail"]) is (not cleaned)
         assert runtimes_of(http)["rt-1"]["terminals"] == []
-        assert [(c.type, c.terminal_id) for c in runtime.received] == [
+        received = [(c.type, c.terminal_id) for c in runtime.received]
+        assert received[:2] == [
             (CommandType.LAUNCH, None),
             (CommandType.DELETE, "beef0001"),
         ]
+        # A deferred delete is retried (TestUndoRetry); never anything else.
+        assert set(received[2:]) <= {(CommandType.DELETE, "beef0001")}
+        assert cleaned is False or len(received) == 2
         assert database.get_terminal_metadata("beef0001") is None
 
 
@@ -1343,3 +1347,48 @@ class TestRemoteApproval:
         bridge = ApprovalBridge(construct, get_provider_fn=lambda tid: "claude_code")
         await bridge._on_waiting("abcd1234")
         assert calls == ["abcd1234"], "the prompt must be read off the event loop"
+
+
+class TestUndoRetry:
+    def test_a_deferred_undo_is_retried_until_the_runtime_deletes(
+        self, http, start_runtime, monkeypatch
+    ):
+        monkeypatch.setattr(server_mod, "UNRECORDED_RETRY_DELAY", 0.01)
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(server_mod, "db_create_terminal", fail)
+        deletes = []
+
+        def script(command):
+            if command.type == CommandType.LAUNCH:
+                return {"terminal": dict(LAUNCHED)}
+            deletes.append(command.terminal_id)
+            return {"deleted": len(deletes) >= 3}  # deferred twice
+
+        start_runtime(script=script)
+        response = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
+        assert response.status_code == 500
+        assert "may still be running" in response.json()["detail"]
+        _wait_for(lambda: len(deletes) >= 3, "the undo to be retried")
+        assert deletes == ["beef0001"] * 3
+
+
+class TestLaunchTimeout:
+    def test_the_launch_deadline_is_configurable(self, http, server, monkeypatch):
+        monkeypatch.setenv("CAO_RUNTIME_LAUNCH_TIMEOUT", "0.3")
+
+        async def scenario():
+            async with _dial(server) as ws:
+                await ws.send(_hello())
+                await ws.recv()
+                started = time.monotonic()
+                response = await asyncio.to_thread(
+                    http.post, "/runtimes/rt-1/terminals", json={"agent_profile": "developer"}
+                )
+                return response, time.monotonic() - started
+
+        response, elapsed = asyncio.run(scenario())
+        assert response.status_code == 504, response.text
+        assert elapsed < 5, f"took {elapsed:.1f}s: the configured deadline was not used"

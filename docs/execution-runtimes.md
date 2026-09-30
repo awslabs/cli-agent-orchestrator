@@ -47,6 +47,10 @@ order; different terminals run concurrently.
 `GET /terminals/{id}` answers from the status the runtime last pushed. While
 the runtime is disconnected, the status is `unknown`.
 
+A launch may take up to `CAO_RUNTIME_LAUNCH_TIMEOUT` seconds (a server
+setting; 240 by default) before it is reported as `504`. Set it above the
+longest provider start-up the runtime's profiles allow.
+
 The server dispatches event plugin hooks for a remote terminal as for a local
 one: a launch, once its row is recorded, emits `post_create_terminal` and
 `post_create_session`, and a delete emits `post_kill_terminal` (and
