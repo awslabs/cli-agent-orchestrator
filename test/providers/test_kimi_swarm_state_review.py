@@ -329,6 +329,59 @@ def test_final_floor_uses_parser_lf_rows_with_unicode_separators(provider, backe
     assert provider.get_status_from_screen(screen(FINAL + FOOTER)) is TerminalStatus.COMPLETED
 
 
+def test_later_batch_revokes_monitor_ready_latch_without_a_new_dispatch(provider, backend):
+    begin(provider)
+    monitor = processing_monitor(provider, "")
+    complete = ECHO + panel("Completed.") + FINAL + FOOTER
+    backend.get_history.return_value = complete
+    monitor._process_chunk(provider.terminal_id, complete)
+    assert monitor.get_status(provider.terminal_id) is TerminalStatus.COMPLETED
+    assert not monitor._allow_processing_revert.get(provider.terminal_id, False)
+    later = TOOL + panel() + THINKING + FOOTER
+    backend.get_history.return_value = later
+    monitor._process_chunk(provider.terminal_id, later)
+    assert provider.has_pending_native_swarm
+    assert monitor.get_status(provider.terminal_id) is TerminalStatus.PROCESSING
+    assert monitor._last_status[provider.terminal_id] is TerminalStatus.PROCESSING
+    final = panel("Completed.") + FINAL + FOOTER
+    backend.get_history.return_value = final
+    monitor._process_chunk(provider.terminal_id, final)
+    assert monitor.get_status(provider.terminal_id) is TerminalStatus.COMPLETED
+
+
+def test_quoted_activity_after_ready_does_not_revoke_monitor_latch(provider, backend):
+    begin(provider)
+    monitor = processing_monitor(provider, "")
+    complete = ECHO + panel("Completed.") + FINAL + FOOTER
+    backend.get_history.return_value = complete
+    monitor._process_chunk(provider.terminal_id, complete)
+    assert monitor.get_status(provider.terminal_id) is TerminalStatus.COMPLETED
+    quote = "```text\n" + panel() + "```\n" + FOOTER
+    backend.get_history.return_value = FOOTER
+    monitor._process_chunk(provider.terminal_id, quote)
+    assert not provider.has_pending_native_swarm
+    assert monitor.get_status(provider.terminal_id) is TerminalStatus.COMPLETED
+
+
+def test_pending_swarm_cannot_revoke_terminal_error_without_new_input(provider, backend):
+    begin(provider)
+    monitor = processing_monitor(provider, "")
+    active = ECHO + panel() + FOOTER
+    backend.get_history.return_value = active
+    monitor._process_chunk(provider.terminal_id, active)
+    assert provider.has_pending_native_swarm
+    monitor._apply_detection(provider.terminal_id, TerminalStatus.ERROR)
+    assert monitor._last_status[provider.terminal_id] is TerminalStatus.ERROR
+    monitor._apply_detection(provider.terminal_id, TerminalStatus.PROCESSING)
+    assert monitor._last_status[provider.terminal_id] is TerminalStatus.ERROR
+    backend.get_history.return_value = FOOTER
+    monitor._process_chunk(provider.terminal_id, FOOTER)
+    assert monitor.get_status(provider.terminal_id) is TerminalStatus.ERROR
+    monitor.notify_input_sent(provider.terminal_id)
+    monitor._apply_detection(provider.terminal_id, TerminalStatus.PROCESSING)
+    assert monitor.get_status(provider.terminal_id) is TerminalStatus.PROCESSING
+
+
 def test_distinct_terminal_only_batch_after_main_answer_still_needs_new_main_answer(
     provider, backend
 ):

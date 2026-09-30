@@ -345,6 +345,14 @@ class StatusMonitor:
             return False
 
         armed = self._allow_processing_revert.get(terminal_id, False)
+        if (
+            last in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
+            and detected == TerminalStatus.PROCESSING
+        ):
+            # A native swarm can start another batch without a new CAO input.
+            # Only explicit current-generation provider evidence may revoke the
+            # ready latch; generic spinners/redraws retain the existing rules.
+            armed = armed or self._has_pending_native_swarm(terminal_id)
         if not armed:
             if last in _STICKY_READY_STATUSES and detected in (
                 TerminalStatus.PROCESSING,
@@ -364,6 +372,11 @@ class StatusMonitor:
             self._allow_processing_revert[terminal_id] = False
 
         return True
+
+    @staticmethod
+    def _has_pending_native_swarm(terminal_id: str) -> bool:
+        provider = provider_manager.get_provider(terminal_id)
+        return getattr(provider, "has_pending_native_swarm", False) is True
 
     # ----- pyte rendered-screen detection (edge-debounced) -------------------
 
@@ -846,8 +859,19 @@ class StatusMonitor:
                     logger.error(f"Error deriving native status for {terminal_id}: {e}")
                     return TerminalStatus.UNKNOWN
 
+        revoked_ready = False
         with self._lock:
             cached = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            if cached in (
+                TerminalStatus.IDLE,
+                TerminalStatus.COMPLETED,
+            ) and self._has_pending_native_swarm(terminal_id):
+                revoked_ready = self._apply_detection_locked(terminal_id, TerminalStatus.PROCESSING)
+                if revoked_ready:
+                    cached = TerminalStatus.PROCESSING
+                    self._processing_generation[terminal_id] = self._capture_generation.get(
+                        terminal_id, 0
+                    )
             # When cached status is PROCESSING, the debounced detection may be
             # stuck: TUI providers (kiro-cli) can send escape sequences
             # continuously after becoming idle, preventing the 200ms quiescence
@@ -858,6 +882,11 @@ class StatusMonitor:
                 buffer = self._buffers.get(terminal_id, "")
             else:
                 buffer = ""
+
+        if revoked_ready:
+            bus.publish(
+                f"terminal.{terminal_id}.status", {"status": TerminalStatus.PROCESSING.value}
+            )
 
         if cached == TerminalStatus.PROCESSING and buffer:
             fresh = self._detect_status(terminal_id, buffer)

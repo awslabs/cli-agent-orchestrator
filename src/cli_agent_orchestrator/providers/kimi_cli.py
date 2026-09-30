@@ -822,6 +822,7 @@ class KimiCliProvider(BaseProvider):
         self._turn_activity_seen = False
         self._swarm_turn_seen = False
         self._swarm_main_answer_seen = False
+        self._swarm_pending_activity = False
         self._swarm_stream_lock = threading.RLock()
         self._swarm_generation = 0
         self._swarm_revision = 0
@@ -902,6 +903,7 @@ class KimiCliProvider(BaseProvider):
             self._turn_activity_seen = False
             self._swarm_turn_seen = False
             self._swarm_main_answer_seen = False
+            self._swarm_pending_activity = False
             self.execution_evidence_ambiguous = False
             self._execution_observed = False
 
@@ -2317,6 +2319,7 @@ class KimiCliProvider(BaseProvider):
     ) -> Optional[bool]:
         if pending is not None:
             if pending:
+                self._swarm_pending_activity = True
                 # A restored provider has no dispatch timestamp, but a live
                 # native panel still prevents its ready frame from completing.
                 self._swarm_turn_seen = True
@@ -2331,10 +2334,13 @@ class KimiCliProvider(BaseProvider):
             elif self._swarm_prefix_lost:
                 if not self._swarm_main_answer_seen and (not proof_final):
                     return None
+            if not pending:
+                self._swarm_pending_activity = False
             return pending
         if not self._swarm_turn_seen:
             return False
         if self._swarm_main_answer_seen or proof_final:
+            self._swarm_pending_activity = False
             return False
         return None
 
@@ -2458,6 +2464,7 @@ class KimiCliProvider(BaseProvider):
                 return None
             if pending:
                 if self._execution_observed or not self._awaiting_turn:
+                    self._swarm_pending_activity = True
                     self._swarm_turn_seen = True
                     if (
                         kt.has_live_swarm_progress(output)
@@ -2471,7 +2478,14 @@ class KimiCliProvider(BaseProvider):
                 and proof_final
             ):
                 self._swarm_main_answer_seen = True
+                self._swarm_pending_activity = False
         return pending
+
+    @property
+    def has_pending_native_swarm(self) -> bool:
+        """Confirmed activity can revoke an earlier ready frame in this turn."""
+        with self._swarm_stream_lock:
+            return self._swarm_pending_activity
 
     def get_status(self, output: str) -> TerminalStatus:
         """Get Kimi CLI status by analyzing terminal output.
@@ -3490,6 +3504,7 @@ class KimiCliProvider(BaseProvider):
             self._turn_activity_seen = False
             self._swarm_turn_seen = False
             self._swarm_main_answer_seen = False
+            self._swarm_pending_activity = False
             self.execution_evidence_ambiguous = False
             self._status_buffer_epoch = 0
         return scratch_removed and home_removed
