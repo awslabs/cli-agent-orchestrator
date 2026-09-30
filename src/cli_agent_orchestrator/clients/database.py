@@ -2445,12 +2445,14 @@ def list_pending_deferred_init_external_owner_terminal_ids() -> List[str]:
 
 
 def count_runtime_allocated_terminals() -> int:
-    """Count terminal rows that still represent live/allocated provider runtime."""
+    """Count terminal rows that still represent live/allocated provider runtime
+    on this host. A terminal in an execution runtime (#745) uses none of it."""
 
     with SessionLocal() as db:
         return int(
             db.query(TerminalModel)
             .filter(TerminalModel.deferred_init_runtime_reclaimed.is_(False))
+            .filter(TerminalModel.runtime_id.is_(None))
             .count()
         )
 
@@ -2791,6 +2793,8 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
                 "session_incarnation_id": t.session_incarnation_id,
                 "last_active": t.last_active,
+                # Set for a terminal that runs in an execution runtime (#745).
+                "runtime_id": t.runtime_id,
             }
             for t in terminals
         ]
