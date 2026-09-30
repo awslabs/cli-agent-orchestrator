@@ -384,6 +384,35 @@ def _jsonable(terminal: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _drop_stale_rows() -> int:
+    """Forget local terminals whose tmux session is confirmed gone.
+
+    The runtime's state (its SQLite rows) can outlive the container, while its
+    tmux server does not: a row whose session is gone is a terminal lost with
+    the old container, and must not be reported as running in the hello. A
+    session that cannot be checked is kept. Returns the number of rows dropped.
+    """
+    from cli_agent_orchestrator.backends.registry import get_backend
+    from cli_agent_orchestrator.clients.database import (
+        delete_terminals_by_session,
+        list_all_terminals,
+    )
+
+    backend = get_backend()
+    dropped = 0
+    for session in sorted({row["tmux_session"] for row in list_all_terminals()}):
+        try:
+            alive = backend.session_exists_strict(session)
+        except Exception as exc:  # noqa: BLE001 - cannot tell: keep the rows
+            logger.warning("could not check tmux session %s at startup: %s", session, exc)
+            continue
+        if not alive:
+            count = delete_terminals_by_session(session)
+            logger.info("dropped %d terminal(s) of lost tmux session %s", count, session)
+            dropped += count
+    return dropped
+
+
 async def _amain() -> None:
     from cli_agent_orchestrator.clients.database import init_runtime_db
     from cli_agent_orchestrator.services.log_writer import log_writer
@@ -401,6 +430,8 @@ async def _amain() -> None:
     ready_file = Path(ready) if ready else CAO_HOME_DIR / "bridge-ready"
 
     init_runtime_db()
+    # Before the first hello, which lists every row as a running terminal.
+    await asyncio.to_thread(_drop_stale_rows)
     loop = asyncio.get_running_loop()
     bus.set_loop(loop)
     bridge = Bridge(server_url, runtime_id, token, ready_file=ready_file)
