@@ -19,8 +19,11 @@ from libtmux.window import Window
 
 from cli_agent_orchestrator.constants import (
     BRACKETED_PASTE_INCOMPATIBLE_SHELLS,
+    SESSION_PREFIX,
     TMUX_HISTORY_LINES,
 )
+from cli_agent_orchestrator.utils import fifo_writer
+from cli_agent_orchestrator.utils.forwarded_env import is_hijack_env_key
 from cli_agent_orchestrator.utils.path_validation import (
     BLOCKED_SYSTEM_DIRECTORIES,
     resolve_and_validate_path,
@@ -57,6 +60,19 @@ NO_RELAYOUT = "none"
 
 # Holds the most panes of the four, which is what a fleet needs.
 DEFAULT_PANE_LAYOUT = "tiled"
+
+# What a person reads off the window. tmux expands a user option inside a
+# format, so the border can show the mark itself -- the one label an agent
+# cannot overwrite, unlike pane_title, which a TUI rewrites on startup. Built
+# from TERMINAL_MARK_OPTION so renaming the mark cannot leave the border
+# silently reading an option nothing sets. A pane somebody split by hand has no
+# mark, and falls back to its index rather than showing an empty border.
+BORDER_STATUS_OPTION = "pane-border-status"
+BORDER_FORMAT_OPTION = "pane-border-format"
+BORDER_STATUS_TOP = "top"
+BORDER_CAPTION_FORMAT = (
+    " #{?" + TERMINAL_MARK_OPTION + ",#{" + TERMINAL_MARK_OPTION + "},#{pane_index}} "
+)
 
 
 class PaneSpawnUnavailable(RuntimeError):
@@ -385,6 +401,24 @@ def _tmux_server_liveness(socket_path: str) -> str:
     if any(candidate in command_line for command_line in command_lines for candidate in candidates):
         return _SERVER_ALIVE
     return _SERVER_UNKNOWN
+
+
+def _require_cao_session_name(session_name: str, action: str) -> None:
+    """Refuse a destructive tmux action on a session CAO did not create.
+
+    CAO shares the operator's default tmux server, so a name reaching a kill
+    here could be a personal session. Every session CAO creates starts with
+    ``SESSION_PREFIX`` (``terminal_service.create_terminal`` prepends it), so
+    the prefix is the ownership test. Raised as ``ValueError`` rather than
+    returned as ``False``: callers read False as "not confirmed gone" and go
+    on to re-check liveness, which would turn a refused kill into a confusing
+    "session still alive" failure.
+    """
+    if not session_name.startswith(SESSION_PREFIX):
+        raise ValueError(
+            f"refusing to {action} tmux session {session_name!r}: CAO only acts on "
+            f"sessions it created, and those start with {SESSION_PREFIX!r}"
+        )
 
 
 class TmuxClient:
@@ -881,7 +915,16 @@ class TmuxClient:
 
     @classmethod
     def _is_blocked_env_key(cls, key: str) -> bool:
-        """Return True if ``key`` matches a blocked prefix and isn't allowlisted."""
+        """Return True if ``key`` must not reach the pane environment.
+
+        Two classes: provider prefixes (nested-session hazard, allowlist
+        applies) and the loader/shell/interpreter startup variables from
+        ``utils.forwarded_env`` (``LD_PRELOAD``, ``BASH_ENV``, ``NODE_OPTIONS``,
+        ...), whose value would run as the operator when the pane starts.
+        The second class has no allowlist.
+        """
+        if is_hijack_env_key(key):
+            return True
         if key in cls._BLOCKED_PREFIX_ALLOWLIST:
             return False
         return any(key.startswith(p) for p in cls._BLOCKED_ENV_PREFIXES)
@@ -900,7 +943,7 @@ class TmuxClient:
             return
         for key, value in extra_env.items():
             if cls._is_blocked_env_key(key):
-                logger.warning("Dropping forwarded env var with blocked prefix: %s", key)
+                logger.warning("Dropping forwarded env var with blocked key: %s", key)
                 continue
             if len(value.encode("utf-8")) >= cls._MAX_ENV_VALUE_BYTES:
                 logger.warning(
@@ -1169,7 +1212,44 @@ class TmuxClient:
         }
         if window_shell:
             kwargs["window_shell"] = window_shell
-        return session.new_window(**kwargs).panes[0]
+        window = session.new_window(**kwargs)
+        TmuxClient._caption_panes(window, host_window_name)
+        return window.panes[0]
+
+    @staticmethod
+    def _window_sets_own_border(window: Window) -> bool:
+        """Whether this window carries a border setting of its own.
+
+        Read the way ``_pane_mark`` reads a mark: through ``show-options``
+        without ``-A``, so tmux's default does not answer for the window, and
+        without libtmux's accessor, which raises for an option the window does
+        not set.
+        """
+        prefix = f"{BORDER_STATUS_OPTION} "
+        return any(
+            line.startswith(prefix) for line in window.cmd("show-options", "-w").stdout or []
+        )
+
+    @staticmethod
+    def _caption_panes(window: Window, host_window_name: str) -> None:
+        """Caption each pane with its mark, unless the window sets its own border.
+
+        Scoped to this window, and skipped for a window that already carries a
+        border setting: that leaves one somebody arranged by hand alone, and it
+        is also why a window CAO opened before captions existed gets them on
+        the next spawn into it rather than never — the window outlives
+        cao-server.
+
+        Captions are cosmetic. A tmux that refuses the options must not cost
+        the caller its terminal.
+        """
+        try:
+            if TmuxClient._window_sets_own_border(window):
+                return
+            window.set_option(BORDER_STATUS_OPTION, BORDER_STATUS_TOP)
+            window.set_option(BORDER_FORMAT_OPTION, BORDER_CAPTION_FORMAT)
+        except Exception as e:
+            logger.warning(f"Could not caption panes in window '{host_window_name}': {e}")
 
     @staticmethod
     def _split_host_window(
@@ -1260,9 +1340,18 @@ class TmuxClient:
                     session, host_window_name, working_directory, window_shell, pane_env
                 )
             else:
-                pane = self._split_host_window(
-                    host_window, working_directory, window_shell, pane_env, pane_layout
-                )
+                try:
+                    pane = self._split_host_window(
+                        host_window, working_directory, window_shell, pane_env, pane_layout
+                    )
+                finally:
+                    # After the split is attempted, never before: a caption costs
+                    # a row per pane, and how many panes a window holds is what
+                    # decides whether this terminal fits or falls back to a window
+                    # of its own -- cosmetics must not move a terminal. After the
+                    # attempt that placement is already settled, so a full window
+                    # still gets captions for the panes it does hold.
+                    self._caption_panes(host_window, host_window_name)
             pane.set_option(TERMINAL_MARK_OPTION, terminal_name)
 
             logger.info(
@@ -1740,6 +1829,7 @@ class TmuxClient:
         through the parse-free tmux CLI instead — and then verified like any
         other, so the fallback cannot report an unconfirmed kill as success.
         """
+        _require_cao_session_name(session_name, "kill")
         try:
             session = self._find_session(session_name)
             if session is None:
@@ -1801,6 +1891,7 @@ class TmuxClient:
         Like ``kill_session``, a listing parse failure falls back to the
         parse-free tmux CLI rather than reporting "nothing to kill".
         """
+        _require_cao_session_name(session_name, "kill a window in")
         try:
             session = self._find_session(session_name)
             if not session:
@@ -2037,13 +2128,36 @@ class TmuxClient:
             logger.error(f"Failed to get pane command for {session_name}:{window_name}: {e}")
             return None
 
+    @staticmethod
+    def _pipe_pane_command(file_path: str) -> str:
+        """The ``pipe-pane -o`` command: our FIFO writer, not ``cat >> path``.
+
+        ``cat >>`` opens the path with ``O_CREAT | O_APPEND`` and follows
+        symlinks, so a symlink or regular file swapped in at the FIFO path
+        received the pane's output. ``utils/fifo_writer.py`` opens with
+        ``O_NOFOLLOW``, confirms the descriptor is a FIFO, and only then copies
+        stdin into it. It is standard-library only, run by file path, and
+        started with ``-I -S`` (isolated mode, no ``site``): nothing from the
+        environment or a user site-packages is imported. tmux runs the command
+        through ``sh -c`` on the same host as the server; measured that way the
+        writer starts in ~37 ms against ~19 ms for ``cat``, about 15-20 ms more
+        per pipe-pane attach or liveness re-arm. The interpreter running
+        cao-server is the one to name, by absolute path; PATH does not matter.
+        """
+        interpreter = sys.executable or "python3"
+        return " ".join(
+            shlex.quote(part)
+            for part in (interpreter, "-I", "-S", fifo_writer.__file__, str(file_path))
+        )
+
     def pipe_pane(self, session_name: str, window_name: str, file_path: str) -> None:
-        """Start piping pane output to file.
+        """Start piping pane output to the FIFO at ``file_path``.
 
         Args:
             session_name: Tmux session name
             window_name: Tmux window name
-            file_path: Absolute path to log file
+            file_path: Absolute path to the FIFO (must already exist as a FIFO;
+                the writer refuses anything else at that path)
 
         Raises:
             ValueError: The session or window is genuinely gone.
@@ -2058,7 +2172,7 @@ class TmuxClient:
 
             pane = self._resolve_pane(session, session_name, window_name, required=True)
             if pane:
-                pane.cmd("pipe-pane", "-o", f"cat >> {shlex.quote(str(file_path))}")
+                pane.cmd("pipe-pane", "-o", self._pipe_pane_command(file_path))
                 logger.info(f"Started pipe-pane for {session_name}:{window_name} to {file_path}")
         except Exception as e:
             logger.error(f"Failed to start pipe-pane for {session_name}:{window_name}: {e}")

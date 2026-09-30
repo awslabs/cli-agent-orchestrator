@@ -24,13 +24,15 @@ NONE = "none"
 
 PROVIDER_ENFORCEMENT: Dict[str, str] = {
     "claude_code": NATIVE,  # --disallowedTools
-    # kiro-cli is launched with --trust-all-tools on every restricted or
-    # unrestricted profile, and the ``allowedTools`` list CAO writes into the
-    # agent JSON only names tools that run WITHOUT an approval prompt (Kiro's
-    # configuration reference); availability is governed by ``tools``, which
-    # CAO writes as ["*"] unless the profile sets its own ``tools`` list. So the
-    # resolved CAO policy is not applied at all on the default path.
-    "kiro_cli": NONE,
+    # kiro-cli is launched with --trust-all-tools, which only suppresses the
+    # approval prompts; what the agent CAN use is the agent JSON's ``tools``
+    # list, and `cao install` writes the resolved CAO policy into it
+    # (``tool_mapping.kiro_agent_tools``), so a restricted role has no shell,
+    # write or network tool to call. Install-time like OpenCode: the policy is
+    # the INSTALLED agent's, and a launch override does not change it. A
+    # profile installed before this change still carries ``tools: ["*"]`` until
+    # it is reinstalled; the launch gate warns when it finds one.
+    "kiro_cli": NATIVE,
     "copilot_cli": NATIVE,  # --deny-tool
     # The permission block is written at `cao install` time from the profile's
     # allowedTools and enforced by opencode itself. The runtime policy CAO
@@ -54,7 +56,7 @@ PROVIDER_ENFORCEMENT: Dict[str, str] = {
 # role change) does not reach the provider; what runs is what `cao install`
 # wrote. The launch gate must say so instead of attaching the native promise
 # to the requested list.
-INSTALL_TIME_PROVIDERS = frozenset({"opencode_cli"})
+INSTALL_TIME_PROVIDERS = frozenset({"opencode_cli", "kiro_cli"})
 
 
 def enforcement_for(provider: str) -> str:
@@ -81,7 +83,7 @@ def describe_enforcement(provider: str, allowed_tools: Optional[Sequence[str]]) 
     level = enforcement_for(provider)
     if level == NATIVE and is_install_time(provider):
         return (
-            "native at install time (the installed agent's permission block applies; "
+            "native at install time (the installed agent's policy applies; "
             "launch overrides do not change it)"
         )
     if level == NATIVE:

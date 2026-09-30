@@ -1080,7 +1080,7 @@ def test_launch_gate_qualifies_opencode_install_time_enforcement():
     assert "Enforcement: native at install time" in result.output
     assert "launch overrides do not change it" in result.output
     assert "Blocked:  (none)" not in result.output
-    assert "set at install time from the installed agent's permissions" in result.output
+    assert "set at install time from the installed agent's policy" in result.output
     assert "WARNING: this provider does not enforce" not in result.output
 
 
@@ -1101,7 +1101,7 @@ def test_launch_gate_on_unrestricted_opencode_still_names_the_installed_policy()
         )
     assert result.exit_code == 0, result.output
     assert "Enforcement: native at install time" in result.output
-    assert "set at install time from the installed agent's permissions" in result.output
+    assert "set at install time from the installed agent's policy" in result.output
 
 
 def test_describe_enforcement_distinguishes_install_time_from_runtime_native():
@@ -1131,3 +1131,51 @@ def test_auto_approve_help_does_not_claim_enforcement():
     flat = " ".join(result.output.split())  # click re-wraps help text
     assert "restrictions still enforced" not in flat
     assert "Does not change the tool policy" in flat
+
+
+def test_launch_gate_names_kiro_install_time_enforcement():
+    """Kiro enforces the installed agent JSON's `tools`, written by `cao install`
+    from the profile; the list resolved at launch does not change it. The gate
+    says so and prints no "does not enforce" warning for a restricted profile."""
+    with patch(
+        "cli_agent_orchestrator.cli.commands.launch.kiro_install_predates_native_enforcement",
+        return_value=False,
+    ):
+        result = _restricted_launch("kiro_cli")
+    assert result.exit_code == 0
+    assert "Enforcement: native at install time" in result.output
+    assert "set at install time from the installed agent's policy" in result.output
+    assert "WARNING: this provider does not enforce" not in result.output
+    assert "WARNING: the installed Kiro agent" not in result.output
+
+
+def test_launch_gate_warns_when_the_installed_kiro_agent_predates_native_enforcement():
+    """An agent JSON with tools ["*"] was written before CAO put the policy into
+    `tools`; the restriction the gate prints is not what the agent runs with, so
+    the gate must say so and name the reinstall command."""
+    with patch(
+        "cli_agent_orchestrator.cli.commands.launch.kiro_install_predates_native_enforcement",
+        return_value=True,
+    ) as stale:
+        result = _restricted_launch("kiro_cli")
+    assert result.exit_code == 0
+    stale.assert_called_once_with("test-agent", ["fs_read"])
+    assert "WARNING: the installed Kiro agent 'test-agent' has tools" in result.output
+    assert "cao install test-agent --provider kiro_cli" in result.output
+
+
+def test_launch_yolo_on_kiro_says_it_does_not_widen_the_tool_set():
+    runner = CliRunner()
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+    ):
+        mock_post.return_value.json.return_value = {"session_name": "s", "name": "t"}
+        mock_post.return_value.raise_for_status.return_value = None
+        result = runner.invoke(
+            launch,
+            ["--agents", "a", "--provider", "kiro_cli", "--yolo", "--headless"],
+        )
+    assert result.exit_code == 0, result.output
+    assert "--yolo does not widen kiro_cli's tool set" in result.output
+    assert "re-run 'cao install'" in result.output
