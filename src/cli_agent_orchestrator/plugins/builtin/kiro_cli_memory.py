@@ -189,6 +189,10 @@ class KiroCliMemoryPlugin(CaoPlugin):
         metadata = get_terminal_metadata(event.terminal_id)
         if metadata is None:
             return None
+        if metadata.get("runtime_id"):
+            # Its pane and working directory are in an execution runtime (#745),
+            # not on this machine.
+            return None
 
         session_name = metadata.get("tmux_session") or event.session_id
         window_name = metadata.get("tmux_window")

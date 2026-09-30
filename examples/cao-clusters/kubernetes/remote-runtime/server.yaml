@@ -52,6 +52,15 @@ spec:
               value: /home/cao/.cao/state
             - name: CAO_RUNTIME_TOKEN_FILE
               value: /var/run/cao/runtime-token/token
+            # Every API call must carry this bearer token. Without it, any pod
+            # that can reach the Service gets full access, NetworkPolicy or not
+            # (not every cluster enforces it). The runtime pod, where agents run,
+            # is not given it. /health and the runtime channel need no bearer.
+            - name: CAO_AUTH_LOCAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cao-api-token
+                  key: token
             # Refuse to start agents here: local launch routes return 409 and
             # point at POST /runtimes/{runtime_id}/terminals.
             - name: CAO_LOCAL_EXECUTION

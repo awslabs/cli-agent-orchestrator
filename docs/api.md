@@ -202,10 +202,12 @@ strings. See [Control Planes](control-planes.md) for operator-facing choices.
 
 - `WS /runtime/channel` is the channel an execution runtime (`cao-bridge`)
   dials, authenticated by the shared runtime token in the
-  `x-cao-runtime-token` header. It is refused when the server has no token.
+  `x-cao-runtime-token` header, not by an API bearer. It is refused when the
+  server has no token.
 - `POST /runtimes/{runtime_id}/terminals` launches a terminal in a connected
   runtime (`agent_profile`, optional `provider` and `working_directory`) and
-  returns `201` with the terminal.
+  returns `201` with the terminal. Like `GET /runtimes`, it takes the API
+  bearer when authentication is on.
 - `GET /runtimes` lists the connected runtimes and the terminals placed on
   them.
 - With `CAO_LOCAL_EXECUTION=0`, routes that would start an agent beside the

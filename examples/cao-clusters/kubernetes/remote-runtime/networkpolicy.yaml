@@ -1,6 +1,7 @@
-# The API is unauthenticated by default, so only the runtime may reach it. Other
-# pods are refused; `kubectl port-forward`, as used in the README, still works.
-# The runtime pod serves nothing, so it accepts no ingress at all.
+# The API requires a bearer token (CAO_AUTH_LOCAL_TOKEN in server.yaml). As a
+# second fence, only the runtime may reach the server: other pods are refused;
+# `kubectl port-forward`, as used in the README, still works. The runtime pod
+# serves nothing, so it accepts no ingress at all.
 #
 # Enforced only by a CNI that implements NetworkPolicy (on EKS: the VPC CNI with
 # network policy enabled).
