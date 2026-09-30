@@ -150,6 +150,124 @@ def test_cell_redrawn_dispatch_echo_binds_only_matching_current_completion(pane_
     assert provider.probe_stale_processing_capture(completed) == expected
 
 
+@patch("cli_agent_orchestrator.backends.registry.get_backend")
+@patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+@pytest.mark.parametrize("observed_query", ["first query", "second query", "third query"])
+def test_two_captures_attribute_busy_query_to_recorded_dispatch(
+    mock_pm, mock_get_backend, observed_query
+):
+    """A delayed A frame after completed A/B must not complete dispatched C."""
+
+    backend = MagicMock()
+    backend.supports_event_inbox.return_value = False
+    backend.get_native_status.return_value = None
+    mock_get_backend.return_value = backend
+    provider = make_provider()
+    mock_pm.get_provider.return_value = provider
+    monitor = StatusMonitor()
+
+    def dispatch(query):
+        monitor.notify_input_sent("test-terminal", assume_processing=True)
+        monitor.clear_rolling_buffer("test-terminal", provider)
+        provider.mark_input_received()
+        provider.record_dispatched_message(query)
+
+    for query in ("first query", "second query"):
+        dispatch(query)
+        monitor._process_chunk(
+            "test-terminal", f"     ❯ {query}\nWaiting for response…\nEsc:cancel\n"
+        )
+        monitor._process_chunk("test-terminal", _completed_turn(query, "answer"))
+        assert monitor.get_status("test-terminal") == TerminalStatus.COMPLETED
+
+    predecessor_identity = provider._last_completion_identity
+    dispatch("third query")
+    # The new paste may have been dropped. Both A and B can repaint after the
+    # reset; being distinct from immediate predecessor B cannot attribute A.
+    monitor._process_chunk(
+        "test-terminal", f"     ❯ {observed_query}\nWaiting for response…\nEsc:cancel"
+    )
+    monitor._buffer_changed_at["test-terminal"] = -1000.0
+    backend.get_history.return_value = _completed_turn(observed_query, "answer")
+
+    assert monitor.get_status("test-terminal") == TerminalStatus.PROCESSING
+    monitor._last_stale_capture_check["test-terminal"] = None
+    expected = (
+        TerminalStatus.COMPLETED if observed_query == "third query" else TerminalStatus.PROCESSING
+    )
+    assert monitor.get_status("test-terminal") == expected
+    assert monitor._last_status["test-terminal"] == expected
+    assert backend.get_history.call_count == 2
+    if expected == TerminalStatus.PROCESSING:
+        assert provider._turn_activity_seen is False
+        assert provider._current_turn_query_identity is None
+        assert provider._last_completion_identity == predecessor_identity
+
+
+def test_old_busy_query_cannot_replace_attributed_current_dispatch():
+    provider = make_provider()
+    provider.mark_input_received()
+    assert (
+        provider.get_status(_completed_turn("second query", "answer")) == TerminalStatus.COMPLETED
+    )
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+    provider.record_dispatched_message("third query")
+    assert (
+        provider.get_status("     ❯ third   query     9:49 PM\nWaiting for response…\nEsc:cancel")
+        == TerminalStatus.PROCESSING
+    )
+    assert provider._current_turn_query_identity == "❯thirdquery"
+
+    assert (
+        provider.get_status("     ❯ first query\nWaiting for response…\nEsc:cancel")
+        == TerminalStatus.PROCESSING
+    )
+    assert provider._turn_activity_seen is True
+    assert provider._current_turn_query_identity == "❯thirdquery"
+    assert (
+        provider.probe_stale_processing_capture(_completed_turn("first query", "answer"))
+        == TerminalStatus.PROCESSING
+    )
+    assert (
+        provider.probe_stale_processing_capture(_completed_turn("third query", "answer"))
+        == TerminalStatus.COMPLETED
+    )
+
+
+@pytest.mark.parametrize(
+    ("previous_query", "dispatched_query", "observed_query"),
+    [
+        ("third query", "third query", "third query"),
+        ("third", "third query", "third query"),
+        ("third query extended", "third query", "third query"),
+        ("second query", "third query extended", "third query"),
+        ("second query", "third query", "third query extended"),
+    ],
+)
+def test_recorded_dispatch_does_not_disambiguate_repeated_or_prefix_queries(
+    previous_query, dispatched_query, observed_query
+):
+    provider = make_provider()
+    provider.mark_input_received()
+    assert (
+        provider.get_status(_completed_turn(previous_query, "answer")) == TerminalStatus.COMPLETED
+    )
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+    provider.record_dispatched_message(dispatched_query)
+    assert (
+        provider.get_status(f"     ❯ {observed_query}\nWaiting for response…\nEsc:cancel")
+        == TerminalStatus.PROCESSING
+    )
+    assert provider._turn_activity_seen is False
+    assert provider._current_turn_query_identity is None
+    assert (
+        provider.probe_stale_processing_capture(_completed_turn(observed_query, "new answer"))
+        == TerminalStatus.PROCESSING
+    )
+
+
 def test_dispatched_text_without_busy_evidence_cannot_complete_current_turn():
     provider = make_provider()
     provider.mark_input_received()

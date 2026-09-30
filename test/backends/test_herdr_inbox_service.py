@@ -1162,15 +1162,47 @@ class TestHerdrInboxServiceLifecycleEvents:
 
     @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
-    def test_retention_db_outage_still_dismantles_runtime(self, mock_meta, mock_dismantle):
-        """Unknown DB ownership retains evidence but must not leak provider/FIFO runtime."""
+    def test_retention_db_outage_preserves_runtime_for_retry(self, mock_meta, mock_dismantle):
+        """Unknown ownership cannot authorize removing a possibly live provider's home."""
 
         mock_meta.side_effect = RuntimeError("database is locked")
         mock_dismantle.return_value = True
 
-        assert _retain_deferred_failure_tombstone("tid-db-outage") is True
+        deferred = []
+        assert (
+            _retain_deferred_failure_tombstone("tid-db-outage", on_cleanup_deferred=deferred.append)
+            is True
+        )
 
-        mock_dismantle.assert_called_once_with("tid-db-outage", None, kill_window=False)
+        mock_dismantle.assert_not_called()
+        assert deferred == ["tid-db-outage"]
+
+    def test_retention_db_outage_does_not_clean_a_cached_provider(self, monkeypatch, tmp_path):
+        from cli_agent_orchestrator.clients import database
+        from cli_agent_orchestrator.services import terminal_service
+
+        sentinel = tmp_path / "live-provider-config"
+        sentinel.write_text("configuration still in use")
+        provider = MagicMock()
+        provider.cleanup.side_effect = sentinel.unlink
+        monkeypatch.setattr(
+            terminal_service.provider_manager, "_providers", {"tid-db-outage": provider}
+        )
+        monkeypatch.setattr(
+            database,
+            "get_terminal_metadata",
+            MagicMock(side_effect=RuntimeError("database is locked")),
+        )
+        deferred = []
+
+        assert _retain_deferred_failure_tombstone(
+            "tid-db-outage", on_cleanup_deferred=deferred.append
+        )
+
+        assert sentinel.read_text() == "configuration still in use"
+        provider.cleanup.assert_not_called()
+        assert terminal_service.provider_manager._providers["tid-db-outage"] is provider
+        assert deferred == ["tid-db-outage"]
 
     @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
     @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")

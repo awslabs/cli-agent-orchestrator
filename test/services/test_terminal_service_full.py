@@ -3803,6 +3803,47 @@ class TestDeferredInitFailureNotification:
         )
         repair.assert_not_called()
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("db_recovers", [True, False])
+    async def test_public_error_honors_success_sidecar_after_ownership_clear_outage(
+        self, monkeypatch, tmp_path, db_recovers
+    ):
+        from cli_agent_orchestrator.clients import database
+        from cli_agent_orchestrator.services import terminal_service
+
+        database.create_terminal(
+            "worker99", "cao-success", "w", "kimi_cli", deferred_init_external_owner=True
+        )
+        monkeypatch.setattr(terminal_service, "TERMINAL_LOG_DIR", tmp_path)
+        failed_write = MagicMock(side_effect=RuntimeError("database is locked"))
+        monkeypatch.setattr(
+            terminal_service, "update_terminal_deferred_init_external_owner", failed_write
+        )
+        await terminal_service._clear_deferred_init_external_owner("worker99")
+        complete = terminal_service._deferred_init_complete_fallback_path("worker99")
+        assert complete.is_file()
+        assert database.get_terminal_metadata("worker99")["deferred_init_external_owner"]
+
+        if db_recovers:
+            monkeypatch.setattr(
+                terminal_service,
+                "update_terminal_deferred_init_external_owner",
+                database.update_terminal_deferred_init_external_owner,
+            )
+        monkeypatch.setattr(
+            terminal_service.status_monitor, "get_status", lambda tid: TerminalStatus.ERROR
+        )
+
+        for _ in range(2):
+            terminal = terminal_service.get_terminal("worker99")
+            assert terminal["status"] == TerminalStatus.ERROR.value
+            assert terminal["deferred_init_failure"] is None
+        assert complete.exists() is not db_recovers
+        assert (
+            database.get_terminal_metadata("worker99")["deferred_init_external_owner"]
+            is not db_recovers
+        )
+
     def test_get_terminal_deferred_failure_is_durable_error_without_status_monitor(
         self, monkeypatch
     ):

@@ -906,11 +906,14 @@ class GrokCliProvider(BaseProvider):
         """Attribute a live processing marker to the in-flight turn.
 
         A processing repaint is current-turn evidence only when it can be
-        attributed. Across a dispatch reset, only a query distinct from the
-        predecessor's can attribute a spinner. Without
-        one, a query distinct from the previous turn's is enough to recover from
-        an interrupted predecessor. The pane-recovered same-query case stays
-        ambiguous here and deliberately leaves ``_turn_activity_seen`` False.
+        attributed. When the dispatched message is known, its normalized query
+        must match: an older turn can differ from the immediate predecessor
+        without belonging to this dispatch. Across a dispatch reset, only a
+        query distinct from the predecessor's can attribute a spinner. Without
+        a predecessor completion identity, a query distinct from the previous
+        turn's is enough to recover from an interrupted predecessor. The
+        pane-recovered same-query case stays ambiguous here and deliberately
+        leaves ``_turn_activity_seen`` False.
 
         This is deliberately NOT generation-level evidence: a spinner merely
         drawn in a fresh buffer generation cannot prove which turn drew it. The
@@ -919,6 +922,12 @@ class GrokCliProvider(BaseProvider):
         is not ownership. See the byte-identical cross-generation guard in
         ``_get_status_unlocked``, which fails closed on exactly that replay.
         """
+
+        if (
+            self._dispatched_query_identity is not None
+            and latest_query_identity != self._dispatched_query_identity
+        ):
+            return
 
         if self._last_completion_identity is not None:
             if self._last_completion_buffer_epoch != self._status_buffer_epoch:

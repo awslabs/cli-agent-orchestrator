@@ -3098,9 +3098,13 @@ def get_terminal(terminal_id: str) -> Dict:
             # visible. Keep the public verdict non-final until the marker (or
             # fallback sidecar) exists; the init task reads StatusMonitor
             # directly and is therefore not blocked by this API-facing gate.
+            # A success sidecar overrides a stale ownership bit after a DB
+            # outage; the retention helper honors it and repairs the bit when
+            # possible, so later ordinary provider errors remain visible.
             if (
                 metadata.get("deferred_init_external_owner")
                 and observed_status == TerminalStatus.ERROR
+                and should_retain_deferred_failure_tombstone(terminal_id, metadata)
             ):
                 status = TerminalStatus.UNKNOWN.value
             else:
@@ -3859,6 +3863,11 @@ def dismantle_terminal_runtime(
     deferral would turn a temporary process race into a permanent leak, or
     record a still-live runtime as reclaimed.
 
+    An unproven exact result also defers all remaining teardown: in particular,
+    a retained failure can be rediscovered after restart while its original
+    process still uses its worktree and private provider home. Retaining only
+    the registry row cannot undo destruction of those live resources.
+
     Ordering note: stopping the FIFO reader before killing the window is
     preferred but not load-bearing -- since issue #382 the reader loop uses a
     non-blocking fd plus a ``select`` timeout and holds its own keepalive write
@@ -3912,6 +3921,9 @@ def dismantle_terminal_runtime(
                     exact.outcome.value,
                     exact.detail,
                 )
+
+        if not runtime_complete:
+            return False
 
     # Unregister from herdr inbox service
     svc = get_herdr_inbox_service()

@@ -8,6 +8,8 @@ id (never by the reusable session/window name), and anything other than
 runtime incomplete so a later pass can retry it.
 """
 
+import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -64,7 +66,6 @@ def runtime(monkeypatch):
     monkeypatch.setattr(
         terminal_service.provider_manager, "cleanup_provider", lambda terminal_id: True
     )
-    monkeypatch.setattr(terminal_service.worktree_service, "parse_worktree_path", lambda path: None)
 
 
 def use_backend(monkeypatch, backend):
@@ -266,3 +267,80 @@ class TestRuntimeReclaimedIsGatedOnDismantle:
         assert retained is True
         assert marker_writes == ([("tid-1", True)] if expect_reclaimed else [])
         assert (deferrals == []) is expect_reclaimed
+
+
+@pytest.mark.parametrize("unproven", ["still_present", "unknown", "raises"])
+def test_rediscovery_preserves_real_worktree_until_exact_runtime_absence(
+    monkeypatch, tmp_path, isolated_memory_db, runtime, unproven
+):
+    """Restart rediscovery must not delete a live worker's uncommitted checkout."""
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services import herdr_inbox_service, worktree_service
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Fixture",
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    checkout = Path(worktree_service.create_worktree(str(repo), "tid-1"))
+    sentinel = checkout / "uncommitted.txt"
+    sentinel.write_text("The original worker still owns this work.\n")
+    database.create_terminal(
+        "tid-1",
+        "cao-x",
+        "coder-3",
+        "kimi_cli",
+        working_directory=str(checkout),
+        deferred_init_external_owner=True,
+    )
+    database.update_terminal_deferred_init_failure(
+        "tid-1", {"kind": "interrupted_init", "message": "CAO restarted during init"}
+    )
+    backend = FakeBackend(
+        outcome(
+            TerminalCleanupOutcome.STILL_PRESENT
+            if unproven == "still_present"
+            else TerminalCleanupOutcome.UNKNOWN
+        ),
+        raises=RuntimeError("backend unavailable") if unproven == "raises" else None,
+    )
+    use_backend(monkeypatch, backend)
+    cleanup_provider = MagicMock(return_value=True)
+    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", cleanup_provider)
+    monkeypatch.setattr(terminal_service, "TERMINAL_LOG_DIR", tmp_path)
+    service = herdr_inbox_service.HerdrInboxService(socket_path="/tmp/unused.sock")
+
+    # Exercise the real discovery -> retention -> snapshot -> dismantle path.
+    assert service._rediscover_deferred_failure_tombstones()
+
+    assert sentinel.read_text() == "The original worker still owns this work.\n"
+    assert checkout.is_dir()
+    cleanup_provider.assert_not_called()
+    assert database.get_terminal_metadata("tid-1")["deferred_init_runtime_reclaimed"] is False
+    assert service._pending_tombstone_runtime_cleanup == {"tid-1"}
+    assert backend.cleanup_calls == [("tid-1", "cao-x", "coder-3", False)]
+
+    # Once exact identity proof establishes absence, the same retry may reclaim
+    # resources and mark completion, while preserving the durable failure row.
+    backend._raises = None
+    backend._result = outcome(TerminalCleanupOutcome.ABSENT)
+    assert service._rediscover_deferred_failure_tombstones()
+    assert not checkout.exists()
+    cleanup_provider.assert_called_once_with("tid-1")
+    retained = database.get_terminal_metadata("tid-1")
+    assert retained["deferred_init_runtime_reclaimed"] is True
+    assert retained["deferred_init_failure"]["kind"] == "interrupted_init"

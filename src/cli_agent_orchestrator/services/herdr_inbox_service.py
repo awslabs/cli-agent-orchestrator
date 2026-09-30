@@ -76,26 +76,12 @@ def _retain_deferred_failure_tombstone(
             terminal_id,
             exc,
         )
-        # The registry row is retained because ownership is unknown, but runtime
-        # resources are independent of that durable decision. Even with the DB
-        # unavailable, dismantle can stop the FIFO/status state and clean an
-        # in-memory provider. Worktree/metadata-dependent cleanup is retried by
-        # the external owner's later explicit DELETE once the DB recovers.
-        try:
-            complete = dismantle_terminal_runtime(terminal_id, None, kill_window=False)
-            # Metadata-dependent cleanup (notably worktree removal) could not run
-            # while the DB was unavailable.  Always retry after recovery even if
-            # the metadata-independent provider/FIFO cleanup completed.
-            if on_cleanup_deferred is not None:
-                on_cleanup_deferred(terminal_id)
-        except Exception as cleanup_exc:  # noqa: BLE001 — evidence retention still wins
-            if on_cleanup_deferred is not None:
-                on_cleanup_deferred(terminal_id)
-            logger.warning(
-                "Deferred-init DB-outage runtime cleanup failed for terminal %s: %s",
-                terminal_id,
-                cleanup_exc,
-            )
+        # Unknown ownership cannot authorize resource destruction. In particular,
+        # dismantling with metadata=None bypasses exact identity proof, while a
+        # cached provider can still delete its private home without reading the
+        # DB. Preserve all resources until a retry can establish runtime absence.
+        if on_cleanup_deferred is not None:
+            on_cleanup_deferred(terminal_id)
         return True
     if not retain:
         return False
