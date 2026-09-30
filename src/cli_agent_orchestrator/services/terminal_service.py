@@ -3387,6 +3387,8 @@ def send_input(
                 # Not delivered: the terminal was not used, and no message went.
                 return False
             update_last_active(terminal_id)
+            # ``message`` is still the caller's text here (memory is injected in
+            # the runtime), which is what the local path emits as original_message.
             _emit_post_send_message(
                 registry, metadata, terminal_id, sender_id, orchestration_type, message
             )
@@ -4229,7 +4231,8 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
             # cannot restore the placement of a deleted terminal. A row that
             # could not be dropped keeps its placement: it still routes a retry.
             deleted = delete_terminal_row(terminal_id, row, registry=registry)
-            runtime_registry.forget(terminal_id)
+            if deleted or get_terminal_metadata(terminal_id) is None:
+                runtime_registry.forget(terminal_id)
             return deleted
         metadata = capture_terminal_snapshot(terminal_id)
         if not dismantle_terminal_runtime(terminal_id, metadata):
