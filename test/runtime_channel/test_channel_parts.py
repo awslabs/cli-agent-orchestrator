@@ -308,3 +308,16 @@ async def test_a_blocking_call_on_the_loop_itself_is_refused():
     _FakeRuntime(registry)
     with pytest.raises(RuntimeError):
         registry.call_blocking("rt-1", CommandType.KEY, {"key": "C-c"}, "t1")
+
+
+@pytest.mark.asyncio
+async def test_a_losing_launchs_status_cannot_touch_the_winners():
+    registry = RuntimeRegistry()
+    winner, loser = _FakeRuntime(registry, "rt-2"), _FakeRuntime(registry, "rt-1")
+    registry.place("beef0001", "rt-2")
+    assert registry.set_status("beef0001", "rt-2", TerminalStatus.IDLE, conn=winner.conn)
+    # rt-1 launched the same id; its launch is being recorded (and will lose).
+    registry.reserve("beef0001", "rt-1")
+    registry.set_status("beef0001", "rt-1", TerminalStatus.PROCESSING, conn=loser.conn)
+    registry.release("beef0001", "rt-1")
+    assert registry.get_status("beef0001", "rt-2") == TerminalStatus.IDLE

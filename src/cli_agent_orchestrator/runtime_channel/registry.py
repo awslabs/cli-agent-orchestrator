@@ -217,7 +217,9 @@ class RuntimeRegistry:
         # (terminal id, runtime id) of launches whose result has arrived and is
         # being recorded: not placed yet, but not unrecorded either.
         self._reserved: Set[Tuple[str, str]] = set()
-        self._status: Dict[str, TerminalStatus] = {}
+        # (terminal id, runtime id) -> last reported status: two runtimes that
+        # launched the same id never share (or clear) each other's entry.
+        self._status: Dict[Tuple[str, str], TerminalStatus] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     def register(
@@ -236,12 +238,8 @@ class RuntimeRegistry:
             previous = self._runtimes.get(runtime_id)
             self._runtimes[runtime_id] = conn
             self._loop = asyncio.get_running_loop()
-            for terminal_id, placed_on in self._placement.items():
-                if placed_on == runtime_id:
-                    self._status.pop(terminal_id, None)
-            for terminal_id, reserved_on in self._reserved:
-                if reserved_on == runtime_id:
-                    self._status.pop(terminal_id, None)
+            for key in [k for k in self._status if k[1] == runtime_id]:
+                del self._status[key]
         if previous is not None:
             previous.close("replaced by a new connection")
             if previous.close_socket is not None:
@@ -287,15 +285,16 @@ class RuntimeRegistry:
 
     def forget(self, terminal_id: str) -> None:
         with self._lock:
-            self._placement.pop(terminal_id, None)
-            self._status.pop(terminal_id, None)
+            runtime_id = self._placement.pop(terminal_id, None)
+            if runtime_id is not None:
+                self._status.pop((terminal_id, runtime_id), None)
 
     def unplace(self, terminal_id: str, runtime_id: str) -> None:
         """Forget a placement, but only if it is still ``runtime_id``'s."""
         with self._lock:
             if self._placement.get(terminal_id) == runtime_id:
                 del self._placement[terminal_id]
-                self._status.pop(terminal_id, None)
+                self._status.pop((terminal_id, runtime_id), None)
 
     def is_placed(self, terminal_id: str, runtime_id: str) -> bool:
         with self._lock:
@@ -312,7 +311,7 @@ class RuntimeRegistry:
                 self._reserved.discard((terminal_id, runtime_id))
                 if self._placement.get(terminal_id) != runtime_id:
                     # Undone, not recorded: a status it reported goes with it.
-                    self._status.pop(terminal_id, None)
+                    self._status.pop((terminal_id, runtime_id), None)
 
     def is_known(self, terminal_id: str, runtime_id: str) -> bool:
         """Placed on the runtime, or its launch there is still being recorded."""
@@ -349,7 +348,7 @@ class RuntimeRegistry:
                 return False
             # For a launch still being recorded, kept but not shown until the
             # terminal is placed (get_status); dropped if the launch is undone.
-            self._status[terminal_id] = status
+            self._status[(terminal_id, runtime_id)] = status
             return True
 
     def get_status(self, terminal_id: str, runtime_id: str) -> TerminalStatus:
@@ -361,7 +360,7 @@ class RuntimeRegistry:
                 return TerminalStatus.UNKNOWN
             if self._placement.get(terminal_id) != runtime_id:
                 return TerminalStatus.UNKNOWN
-            return self._status.get(terminal_id, TerminalStatus.UNKNOWN)
+            return self._status.get((terminal_id, runtime_id), TerminalStatus.UNKNOWN)
 
     async def call(
         self,
