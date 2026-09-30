@@ -104,6 +104,10 @@ class TerminalModel(Base):
     # The execution runtime this terminal runs in (#745); NULL for a terminal on
     # this host. Its own column rather than a ``metadata`` key, because an agent
     # can rewrite its metadata but must not be able to move its own placement.
+    # Local sweeps (the retention sweep in cleanup_service, the stale-row
+    # cleanup in delete_terminals_by_session) skip rows that have one: they
+    # cannot stop the agent in its runtime, and the row is the only handle on
+    # it. Such a row goes only through delete_terminal, which routes there.
     runtime_id = Column(String, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
 

@@ -4216,10 +4216,12 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                 return False
             from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
 
-            try:
-                return delete_terminal_row(terminal_id, row, registry=registry)
-            finally:
-                runtime_registry.forget(terminal_id)
+            # The row first, then the placement, so a reconnect in between
+            # cannot restore the placement of a deleted terminal. A row that
+            # could not be dropped keeps its placement: it still routes a retry.
+            deleted = delete_terminal_row(terminal_id, row, registry=registry)
+            runtime_registry.forget(terminal_id)
+            return deleted
         metadata = capture_terminal_snapshot(terminal_id)
         if not dismantle_terminal_runtime(terminal_id, metadata):
             logger.warning(
