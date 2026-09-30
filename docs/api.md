@@ -177,14 +177,14 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   counters live in the server's memory: they start at 0 for a terminal the server
   has not dispatched to, and reset when the server restarts (the CLI waiters detect
   a counter lower than the turn they wait for and fall back). Do not send to a busy
-  terminal and expect two separate answers: claude_code and kiro-cli fold input that
-  arrives mid-turn into the running turn and reply once, so `?mode=last` shows that
-  one reply. The later turn closes with it only if the terminal was seen working
-  after that input arrived; otherwise it closes at the 60s backstop, because
-  assuming it was folded in would return the wrong answer on an agent that queues
-  input instead. `cao session send` refuses to send
-  while the terminal is busy. A server that omits the fields is older than this
-  contract.
+  terminal and expect two separate answers. claude_code and kiro-cli fold input that
+  arrives mid-turn into the running turn and reply once, so both turns close on that
+  one reply and `?mode=last` shows it; if no work is drawn after the new input, the
+  later turn closes at the 60s backstop instead. An agent that QUEUES mid-turn input
+  would have its queued turn reported done with the running turn's answer: the turn
+  counter cannot tell which work frame belongs to which input. `cao session send`
+  already refuses to send while the terminal is busy. A server that omits the fields
+  is older than this contract.
 - Terminal creation accepts `use_worktree` (bool, default `false`, issue #100
   Phase 1): provisions an isolated `git worktree` on its own branch instead of
   sharing `working_directory` as given, requiring the resolved directory to be

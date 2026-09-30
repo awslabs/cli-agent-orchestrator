@@ -15,8 +15,10 @@ step:
   SLOW   once the agent has answered everything and the reads have run, every
          delivered message is closed BEFORE the backstop. Exempt: native polling (a
          turn too fast for any poll to see working is its documented cost), and input
-         sent to a busy agent that was never seen worked on after its dispatch (it
-         closes at the backstop rather than risk taking the running turn's answer).
+         sent to a busy agent whose answer landed before any work frame after its
+         dispatch was read (it closes at the backstop). The model's agent FOLDS such
+         input, as claude_code and kiro-cli do; an agent that queues it is out of
+         scope — docs/api.md says why a busy send is refused.
   STUCK  once the agent is idle and the backstop has passed, polling closes every turn.
 
 Each provider shape runs twice: with no event loop (every read inline) and with a
@@ -343,9 +345,9 @@ def _run(kind, rng, trace, loop_mode=False):
         err = early("drain")
         if err:
             return err
-        # Input sent to a busy agent is exempt: unless the monitor sees work after
-        # its dispatch, it closes at the backstop rather than risk taking the
-        # running turn's answer (an agent may queue it instead of folding it).
+        # Input sent to a busy agent is exempt: it closes when work is drawn after
+        # its dispatch (the model's agent folds it, as claude_code and kiro-cli do),
+        # and at the backstop when the answer lands before any such frame is read.
         prompt = [t for t in delivered if t not in folded]
         if kind != "native" and prompt and sm.turn_state(TID)[1] < max(prompt):
             return (
