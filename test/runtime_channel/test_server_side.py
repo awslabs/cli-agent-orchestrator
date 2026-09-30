@@ -1132,3 +1132,21 @@ class TestReplacedSocket:
                     return "got a frame"
 
         assert asyncio.run(scenario()) == "closed"
+
+
+class TestFailedRowDelete:
+    def test_a_row_that_could_not_be_dropped_keeps_its_placement(
+        self, http, start_runtime, monkeypatch
+    ):
+        _remote_row("abcd1234", "rt-1")
+        start_runtime(script=_answer, statuses={"abcd1234": TerminalStatus.IDLE})
+
+        def locked(*args, **kwargs):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(terminal_service, "delete_terminal_row", locked)
+        response = http.delete("/terminals/abcd1234")
+        assert response.status_code >= 500, response.text
+        # The row survives for a retry, and so does its routing.
+        assert database.get_terminal_metadata("abcd1234") is not None
+        assert runtimes_of(http)["rt-1"]["terminals"] == ["abcd1234"]
