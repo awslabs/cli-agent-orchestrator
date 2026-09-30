@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+from cli_agent_orchestrator.providers.kiro_cli import TUI_CREDITS_PATTERN, KiroCliProvider
 
 # Test fixtures directory
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -2101,3 +2101,64 @@ class TestKiroCli211Regressions:
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         provider.mark_input_received()
         assert provider.get_status(output) != TerminalStatus.COMPLETED
+
+
+class TestKiroCli225Tui:
+    """kiro-cli 2.25.0 frames, captured live on 2026-09-29 (fixtures
+    ``kiro_cli_tui_2_25_*``).
+
+    2.25 changed the completion marker from ``▸ Credits: 0.20 • Time: 29s`` to
+    ``▸ Credits: turn 0.20 • session 0.20 | Time: 29s``. The old pattern wanted a
+    number straight after ``Credits:``, so every finished turn fell through to
+    the separator fallback, which fails too on 2.25 because the new "Trust All
+    Tools active, confirmations are off" band sits between the last two
+    separators with a single content line. The observable result was a
+    terminal that reported PROCESSING for the whole task and then IDLE forever,
+    never COMPLETED, while the pane showed the finished response. The e2e
+    allowed-tools cases timed out on exactly that.
+    """
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_idle_after_init_is_idle(self, mock_tmux):
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        assert provider.get_status(load_fixture("kiro_cli_tui_2_25_idle_output.txt")) == (
+            TerminalStatus.IDLE
+        )
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_working_frame_is_processing(self, mock_tmux):
+        """``›  Kiro is working · 10s · Type to steer · Ctrl+S to queue`` replaces
+        the idle placeholder while a tool runs."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        assert provider.get_status(load_fixture("kiro_cli_tui_2_25_processing_output.txt")) == (
+            TerminalStatus.PROCESSING
+        )
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_finished_frame_is_completed(self, mock_tmux):
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        assert provider.get_status(load_fixture("kiro_cli_tui_2_25_completed_output.txt")) == (
+            TerminalStatus.COMPLETED
+        )
+
+    def test_finished_frame_extracts_the_response(self):
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        message = provider.extract_last_message_from_script(
+            load_fixture("kiro_cli_tui_2_25_completed_output.txt")
+        )
+        assert "SLEEP-MARK" in message or "done" in message, message
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "▸ Credits: 0.20 • Time: 29s",
+            "▸ Credits: 0.24 - Time: 3s",
+            "▸ Credits: turn 0.20 • session 0.20 | Time: 29s",
+        ],
+    )
+    def test_credits_marker_accepts_both_shapes(self, line):
+        assert re.search(TUI_CREDITS_PATTERN, line), line
+
+    def test_credits_marker_still_needs_the_arrow_and_a_number(self):
+        assert not re.search(TUI_CREDITS_PATTERN, "Credits: turn 0.20")
+        assert not re.search(TUI_CREDITS_PATTERN, "▸ Credits: turn")

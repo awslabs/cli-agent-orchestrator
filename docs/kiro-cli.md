@@ -107,6 +107,12 @@ The provider tries legacy extraction first; if no green arrows are found, it fal
 
 Kiro CLI shows `Allow this action? [y/n/t]:` prompts for sensitive operations (file edits, command execution). The provider detects these as `WAITING_USER_ANSWER` status. Unlike Claude Code, Kiro CLI does not have a trust folder dialog.
 
+### Tool Restrictions
+
+`cao install --provider kiro_cli` writes the profile's resolved `allowedTools` into the agent JSON twice: as `allowedTools` (Kiro's "run without a prompt" list) and, translated to Kiro's own tool names, as `tools`, which is what the agent can use at all. CAO launches `--trust-all-tools`, so `allowedTools` restricts nothing; `tools` does. A restricted `code_supervisor` gets `read`, `glob`, `grep`, `knowledge` and `@cao-mcp-server` and has no shell to call; `@builtin` becomes the harmless chrome (`goal`, `introspect`, `todo_list`) because in Kiro a bare `@builtin` means every built-in, shell included. `subagent` and `use_aws` follow `execute_bash`, `code` follows `fs_write`, `knowledge` follows `fs_read`. An unrestricted policy writes `tools: ["*"]`; a profile with its own `tools` list keeps it.
+
+Enforcement is install-time: changing a profile's policy takes effect at the next `cao install`, and `--allowed-tools` or a role override at launch does not change the installed agent. A profile installed before CAO wrote `tools` still carries `["*"]`; `cao launch` and the server warn when they find one, and treat that terminal as unrestricted until it is reinstalled. See [Tool Restrictions](tool-restrictions.md).
+
 ## Configuration
 
 ### Agent Profile (Required)
@@ -243,3 +249,8 @@ If you upgrade kiro-cli and handoffs stop working (worker gets killed
 prematurely, or the task sits unsent in the input box), check whether the
 paste-submit behavior or processing-indicator text changed in the new version
 and update the provider constants accordingly.
+
+### Agent-plugin MCP working directory
+
+Its MCP config format has no working-directory key (checked against the vendor's own MCP documentation, 2026-09-16), so CAO carries an agent plugin's declared `cwd` by launching the server through `/bin/sh -c 'cd -- "$1" && shift && exec "$@"'`. `exec` replaces the shell, the environment passes through, and argument boundaries survive because each argument stays a separate argv element. On a host with no `/bin/sh` such a server is skipped with `mcp.cwd_unsupported` rather than started in the wrong directory.
+See [Agent Plugins](agent-plugins.md) for the full per-provider table.

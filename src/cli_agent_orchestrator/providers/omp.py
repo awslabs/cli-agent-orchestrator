@@ -16,8 +16,10 @@ import shutil
 from pathlib import Path
 from typing import List, Optional
 
+from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR, SECURITY_PROMPT
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -128,7 +130,7 @@ class OmpProvider(BaseProvider):
         if self._agent_profile is None:
             return None
         try:
-            return load_agent_profile(self._agent_profile)
+            return _with_plugin_mcp(load_agent_profile(self._agent_profile), ProviderType.OMP.value)
         except Exception as exc:
             raise ProviderError(
                 f"Failed to load agent profile '{self._agent_profile}': {exc}"
@@ -163,10 +165,15 @@ class OmpProvider(BaseProvider):
         if profile is not None:
             context = profile.system_prompt or profile.prompt or ""
         context = self._apply_skill_prompt(context)
-        if self._allowed_tools and "*" not in self._allowed_tools:
-            tools_list = ", ".join(self._allowed_tools)
+        if self._allowed_tools is not None and "*" not in self._allowed_tools:
+            from cli_agent_orchestrator.utils.tool_mapping import (
+                tool_constraint_instruction,
+            )
+
             context = (
-                SECURITY_PROMPT + f"\nYou only have access to these tools: {tools_list}\n" + context
+                SECURITY_PROMPT
+                + f"\n{tool_constraint_instruction(self._allowed_tools)}\n"
+                + context
             )
         if context:
             context_path = self._artifact_root() / "context.md"

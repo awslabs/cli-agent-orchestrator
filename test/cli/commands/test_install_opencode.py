@@ -289,6 +289,30 @@ class TestPermissionTranslation:
         for tool in ("task", "question", "webfetch", "websearch", "codesearch"):
             assert perm[tool] == "deny", f"{tool} should always be deny"
 
+    def test_reviewer_role_installs_read_only(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        """``role: reviewer`` resolves to the shipped default, which lists ``@builtin``.
+
+        The selector must not widen the installed frontmatter: a reviewer reads
+        and lists, and nothing else, on OpenCode as on every other provider.
+        """
+        _write_profile(
+            install_workspace["local_store"] / "test-agent.md",
+            extra_frontmatter="role: reviewer\n",
+        )
+
+        runner.invoke(install, ["test-agent", "--provider", "opencode_cli"])
+
+        post = frontmatter.loads((install_workspace["agents_dir"] / "test-agent.md").read_text())
+        perm = post.metadata["permission"]
+        assert perm["read"] == "allow"
+        assert perm["glob"] == "allow"
+        assert perm["grep"] == "allow"
+        assert perm["bash"] == "deny"
+        assert perm["write"] == "deny"
+        assert perm["edit"] == "deny"
+
     def test_unpermitted_cao_tools_emit_deny(
         self, runner: CliRunner, install_workspace: Dict[str, Any]
     ):

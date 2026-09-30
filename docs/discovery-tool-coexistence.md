@@ -18,7 +18,7 @@ These are genuinely different capabilities with different risk profiles. A profi
 - `@cao-mcp-server` still controls whether the `cao-mcp-server` MCP process is wired into the provider's launch command at all (via the profile's own `mcpServers` frontmatter block). Without it, none of `cao-mcp-server`'s tools — including `list_siblings`/`update_metadata` — are reachable, same as today.
 - `discovery` is a second, independent check specifically for the two discovery tools, evaluated when they're called (see "Enforcement mechanism" below). A profile can have `@cao-mcp-server` without `discovery` (orchestration, no peer discovery — this is every existing built-in role's default) or, in principle, `discovery` without the rest of orchestration if some future profile shape wanted that.
 
-None of the built-in roles (`supervisor`, `developer`, `reviewer`) grant `discovery` by default. A profile author adds `"discovery"` to `allowedTools` explicitly:
+None of the built-in roles (`supervisor`, `developer`, `reviewer`, `workflow_scout`) grant `discovery` by default. A profile author adds `"discovery"` to `allowedTools` explicitly:
 
 ```yaml
 ---

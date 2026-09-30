@@ -18,6 +18,7 @@
 //     would send as `Last-Event-ID` — we pass it explicitly.
 
 import { useEffect, useRef } from 'react'
+import { eventStreamUrl } from '../../api'
 import type { WorkflowEvent, GapMarker } from '../../api'
 
 export interface EventFollowHandlers {
@@ -126,8 +127,7 @@ export function useEventFollow(
     const connect = async () => {
       if (closed) return
       controller = new AbortController()
-      const q = lastSeq != null ? `?after_seq=${lastSeq}` : ''
-      const url = `/workflows/runs/${encodeURIComponent(runId)}/events${q}`
+      const url = eventStreamUrl(runId, lastSeq)
       try {
         const res = await fetch(url, {
           headers: { Accept: 'text/event-stream' },

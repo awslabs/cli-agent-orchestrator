@@ -36,10 +36,10 @@ These have schema entries but only the env var is actually honored at runtime.
 | `CAO_CORS_ORIGINS` | Extend browser origins permitted by CORS | Comma-separated |
 | `CAO_WS_ALLOWED_CLIENTS` | Extend client IPs permitted to attach to PTY WebSocket | Comma-separated; security-sensitive |
 | `CAO_FORWARDED_ALLOW_IPS` | Trusted proxy IPs for X-Forwarded-For parsing | Comma-separated |
-| `CAO_AUTH_JWKS_URI` | IdP JWKS endpoint (activates auth when set) | |
-| `CAO_AUTH_AUDIENCE` | Expected token audience | |
-| `CAO_AUTH_ISSUER` | Issuer for RFC 9728 PRM endpoint | |
-| `CAO_AUTH_LOCAL_TOKEN` | Local bearer token for development/testing | |
+| `CAO_AUTH_JWKS_URI` | IdP JWKS endpoint (activates auth when set) | Bearer tokens are then RS256 JWTs verified against this JWKS |
+| `CAO_AUTH_AUDIENCE` | Expected token audience | IdP mode only |
+| `CAO_AUTH_ISSUER` | Issuer for RFC 9728 PRM endpoint | IdP mode only |
+| `CAO_AUTH_LOCAL_TOKEN` | Shared-secret bearer token. Set **alone** (no IdP) it activates auth: every scope-gated route, the PTY WebSocket handshake and the AG-UI stream must present this value as a bearer (compared after trimming surrounding whitespace; a blank value leaves auth off), and anything else is refused: HTTP 401, or close code 4401 on the WebSocket. Routes that stay open in every mode are listed under "Default posture" in the configuration guide. Set **together with** an IdP it is instead the machine JWT CAO's own clients forward on their internal calls. | Security-sensitive. Generate with `openssl rand -hex 32`. With none of the three auth variables set, the API trusts every caller that can reach its port (loopback by default, so every process and user on the host). |
 
 ## Remote Fleets (Env-Var Only)
 

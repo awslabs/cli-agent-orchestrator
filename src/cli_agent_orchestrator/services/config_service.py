@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.services.vault.config import VaultConfig
 
 logger = logging.getLogger(__name__)
 
@@ -66,11 +67,15 @@ class MemoryConfig(BaseModel):
     flush_threshold: float = 0.85
     compile_timeout_s: float = 120.0
     lint_enabled: bool = True
+    vault: VaultConfig = Field(default_factory=VaultConfig)
 
 
 class TerminalConfig(BaseModel):
     backend: str = "tmux"
     herdr_session: str = "cao"
+    spawn_mode: str = "window"
+    pane_window: str = "cao-agents"
+    pane_layout: str = "tiled"
 
 
 class AppsConfig(BaseModel):
@@ -152,6 +157,9 @@ _LEGACY_KEY_MAP: Dict[str, Tuple[str, ...]] = {
 _OWNED_DEFAULTS: Dict[str, Any] = {
     "terminal.backend": "tmux",
     "terminal.herdr_session": "cao",
+    "terminal.spawn_mode": "window",
+    "terminal.pane_window": "cao-agents",
+    "terminal.pane_layout": "tiled",
     "apps.enabled": False,
     "apps.static_dir": None,
     "auth.jwks_uri": "",
@@ -171,6 +179,9 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
 ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_TERMINAL_BACKEND": ("terminal.backend", "str", "tmux"),
     "CAO_HERDR_SESSION": ("terminal.herdr_session", "str", "cao"),
+    "CAO_TERMINAL_SPAWN_MODE": ("terminal.spawn_mode", "str", "window"),
+    "CAO_TERMINAL_PANE_WINDOW": ("terminal.pane_window", "str", "cao-agents"),
+    "CAO_TERMINAL_PANE_LAYOUT": ("terminal.pane_layout", "str", "tiled"),
     "CAO_MCP_APPS_ENABLED": ("apps.enabled", "bool", False),
     "CAO_MCP_APPS_STATIC_DIR": ("apps.static_dir", "str", None),
     "CAO_AUTH_JWKS_URI": ("auth.jwks_uri", "str", ""),
@@ -185,6 +196,7 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_MEMORY_LINT_ENABLED": ("memory.lint_enabled", "bool", True),
     "CAO_MEMORY_COMPILE_MODE": ("memory.compile_mode", "str", "llm"),
     "CAO_MEMORY_FLUSH_THRESHOLD": ("memory.flush_threshold", "float", 0.85),
+    "CAO_MEMORY_VAULT_ENABLED": ("memory.vault.enabled", "bool", False),
     "CAO_MCP_REQUEST_TIMEOUT": ("server.mcp_request_timeout", "int", 30),
     "CAO_EVENT_BUS_MAX_QUEUE_SIZE": ("server.event_bus_max_queue_size", "int", 1024),
     "CAO_PROVIDER_INIT_TIMEOUT": ("server.provider_init_timeout", "int", 60),
@@ -364,6 +376,15 @@ def _get_value(path: str, default: Any = None, override: Optional[Any] = None) -
         from cli_agent_orchestrator.services import settings_service
 
         return settings_service.is_memory_lint_enabled()
+    if path == "memory.vault" or path == "memory.vault.enabled":
+        from cli_agent_orchestrator.services import settings_service
+
+        try:
+            vault = settings_service.get_vault_config()
+        except ValueError as exc:
+            logger.warning("Invalid vault configuration disabled for config lookup: %s", exc)
+            vault = VaultConfig()
+        return vault.model_dump(mode="json") if path == "memory.vault" else vault.enabled
 
     env_name = _PATH_TO_ENV.get(path)
     if env_name is not None:
@@ -460,6 +481,7 @@ _ALL_PATHS = sorted(
         "memory.compile_mode",
         "memory.flush_threshold",
         "memory.compile_timeout_s",
+        "memory.vault",
     }
 )
 
@@ -494,7 +516,15 @@ class ConfigService:
         Reflects the same precedence ``get()`` uses (env beats file beats
         default). Intended for ``cao config list`` and debugging.
         """
-        return {p: _get_value(p) for p in _ALL_PATHS}
+        values = {
+            path: _get_value(path)
+            for path in _ALL_PATHS
+            if path not in {"memory.vault", "memory.vault.enabled"}
+        }
+        vault = _get_value("memory.vault")
+        values["memory.vault"] = vault
+        values["memory.vault.enabled"] = vault["enabled"]
+        return values
 
     @staticmethod
     def get_config() -> CAOConfig:
@@ -523,10 +553,14 @@ class ConfigService:
                 compile_mode=_get_value("memory.compile_mode", default="llm"),
                 flush_threshold=_get_value("memory.flush_threshold", default=0.85),
                 compile_timeout_s=_get_value("memory.compile_timeout_s", default=120.0),
+                vault=_get_value("memory.vault", default={}),
             ),
             terminal=TerminalConfig(
                 backend=_get_value("terminal.backend", default="tmux"),
                 herdr_session=_get_value("terminal.herdr_session", default="cao"),
+                spawn_mode=_get_value("terminal.spawn_mode", default="window"),
+                pane_window=_get_value("terminal.pane_window", default="cao-agents"),
+                pane_layout=_get_value("terminal.pane_layout", default="tiled"),
             ),
             apps=AppsConfig(
                 enabled=_get_value("apps.enabled", default=False),

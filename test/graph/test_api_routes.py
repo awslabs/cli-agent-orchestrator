@@ -352,6 +352,72 @@ def test_post_export_secret_gate_422_and_sink_not_called(client, monkeypatch):
     spy.assert_not_called()
 
 
+@pytest.mark.parametrize("hidden", ["\u200b", "\ufeff"], ids=lambda c: f"U+{ord(c):04X}")
+def test_post_export_secret_gate_sees_through_a_hidden_character(client, hidden):
+    """The gate used to scan ``json.dumps(view)``, whose default ``ensure_ascii``
+    turned a zero-width character inside the prefix into a literal ``\\u200b``
+    escape the gate could not strip, so the export went ahead. The parsed view
+    is scanned now."""
+    secret_value = f"AK{hidden}IA" + "A" * 16
+
+    @providers_base.register_provider("hidden-secret-provider")
+    class _HiddenSecretProvider(GraphProvider):
+        async def project(self, **filters: Any) -> GraphView:
+            return GraphView(
+                nodes=[Node(id="n1", kind="stub", label="N1", attrs={"token": secret_value})],
+                edges=[],
+            )
+
+    spy = MagicMock()
+
+    @sinks_base.register_sink("spy-sink-hidden")
+    class _SpySink(GraphSink):
+        def export(self, view: GraphView, dest: str, **options: Any) -> list[str]:
+            spy(dest=dest)
+            return [dest]
+
+    resp = client.post(
+        "/graph/hidden-secret-provider/export",
+        json={"sink": "spy-sink-hidden", "dest": "/tmp/x"},
+    )
+    assert resp.status_code == 422
+    assert "aws_access_key" in resp.json()["detail"]
+    assert "A" * 16 not in resp.text
+    spy.assert_not_called()
+
+
+def test_post_export_secret_gate_keeps_key_context(client):
+    """A bare 40-character secret under ``SecretAccessKey`` has no textual context once
+    serialised; the structured scan uses the key."""
+    aws_sample = "wJalrXUtn" + "FEMI/K7MD" + "ENG/bPxRf" + "iCYEXAMPL" + "EKEY"
+
+    @providers_base.register_provider("sts-provider")
+    class _StsProvider(GraphProvider):
+        async def project(self, **filters: Any) -> GraphView:
+            return GraphView(
+                nodes=[
+                    Node(id="n1", kind="stub", label="N1", attrs={"SecretAccessKey": aws_sample})
+                ],
+                edges=[],
+            )
+
+    spy = MagicMock()
+
+    @sinks_base.register_sink("spy-sink-sts")
+    class _SpySink(GraphSink):
+        def export(self, view: GraphView, dest: str, **options: Any) -> list[str]:
+            spy(dest=dest)
+            return [dest]
+
+    resp = client.post(
+        "/graph/sts-provider/export", json={"sink": "spy-sink-sts", "dest": "/tmp/x"}
+    )
+    assert resp.status_code == 422
+    assert "aws_secret_access_key" in resp.json()["detail"]
+    assert aws_sample not in resp.text
+    spy.assert_not_called()
+
+
 # ── S2: OSError from the sink is mapped to 4xx (not a bare 500) ──────────
 
 

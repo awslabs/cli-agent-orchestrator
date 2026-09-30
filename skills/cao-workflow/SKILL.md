@@ -53,7 +53,9 @@ Its public surface:
 - `emit_output(value)` — print the run-level `CAO_WORKFLOW_OUTPUT:` sentinel (the run's return).
 - `ShimError` (and `ShimIdentityError`, `ShimTransportError`, `ShimHTTPError`) — the failure
   hierarchy `step` and `run_step` raise. Failures surface **unchanged** — the shim never
-  retries.
+  retries. A structured HTTP error with a non-empty string `detail.kind` prints as
+  `run-step returned HTTP <status> (<kind>): <message>` (without the message suffix when
+  absent); an unstructured error keeps the original `run-step returned HTTP <status>` text.
 
 ## Declaring a recovery policy
 
@@ -177,10 +179,11 @@ step b) resume clean; nondeterministic ones diverge.
 #### Resolving a halt
 
 A halt reaches your script as a `ShimHTTPError` whose `.status` is `409` and whose `.body` names
-`kind: "decision_required"`, the `step_id`, and which condition halted it. A step halts when its
-outcome is genuinely unknown or unverifiable: it was dispatched and never settled and no declared
-policy permits re-execution; its stored result is unreadable; its recorded provenance cannot be
-verified under the current scheme; or its author declared `recovery="manual"` and asked to see it.
+`kind: "decision_required"`, the `step_id`, and which condition halted it; `str(exc)` now shows
+`(decision_required)` and the message too. A step halts when its outcome is genuinely unknown or
+unverifiable: it was dispatched and never settled and no declared policy permits re-execution; its
+stored result is unreadable; its recorded provenance cannot be verified under the current scheme;
+or its author declared `recovery="manual"` and asked to see it.
 
 Resolve it by naming a decision per halted step and resuming again:
 

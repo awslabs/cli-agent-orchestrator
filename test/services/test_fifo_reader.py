@@ -1,6 +1,7 @@
 """Tests for the FIFO reader manager."""
 
 import os
+import stat
 import threading
 import time
 from unittest.mock import patch
@@ -9,7 +10,7 @@ import pyte
 import pytest
 
 from cli_agent_orchestrator.services import fifo_reader as fr
-from cli_agent_orchestrator.services.fifo_reader import FifoManager
+from cli_agent_orchestrator.services.fifo_reader import FifoManager, _open_fifo
 
 pytestmark = pytest.mark.skipif(
     not hasattr(os, "mkfifo"), reason="FIFOs require a POSIX platform (os.mkfifo)"
@@ -35,7 +36,7 @@ class TestStopReader:
         assert fifo_path.exists()
 
         # No create_reader() was called, so _readers/_threads are empty.
-        manager.stop_reader("term-stale")
+        assert manager.stop_reader("term-stale") is True
 
         assert not fifo_path.exists()
 
@@ -46,7 +47,150 @@ class TestStopReader:
         manager = FifoManager()
 
         # Must not raise even though there is nothing to stop or unlink.
-        manager.stop_reader("term-missing")
+        assert manager.stop_reader("term-missing") is True
+
+    def test_unlink_failure_remains_retryable(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(fr, "FIFO_DIR", tmp_path)
+        manager = FifoManager()
+        fifo_path = tmp_path / "term-unlink-retry.fifo"
+        os.mkfifo(fifo_path)
+
+        with patch.object(type(fifo_path), "unlink", side_effect=PermissionError("busy")):
+            assert manager.stop_reader("term-unlink-retry") is False
+
+        assert fifo_path.exists()
+        assert manager.stop_reader("term-unlink-retry") is True
+        assert not fifo_path.exists()
+
+    @pytest.mark.parametrize("blocked_at", ["read", "publish"])
+    def test_retries_track_reader_until_thread_exits(self, tmp_path, monkeypatch, blocked_at):
+        """A timed-out stop must stay incomplete until the real FIFO reader exits."""
+        monkeypatch.setattr(fr, "FIFO_DIR", tmp_path)
+        manager = FifoManager()
+        monkeypatch.setattr(manager, "_ensure_watchdog", lambda: None)
+        blocked = threading.Event()
+        release = threading.Event()
+        real_read = os.read
+
+        def wait_for_release():
+            blocked.set()
+            assert release.wait(timeout=5.0)
+
+        def delayed_read(fd, size):
+            data = real_read(fd, size)
+            if blocked_at == "read":
+                wait_for_release()
+            return data
+
+        def delayed_publish(topic, payload):
+            if blocked_at == "publish":
+                wait_for_release()
+
+        monkeypatch.setattr(fr.os, "read", delayed_read)
+        monkeypatch.setattr(fr.bus, "publish", delayed_publish)
+        terminal_id = "term-stop-retry"
+        manager.create_reader(terminal_id, pane_probe=lambda: "pane", rearm=lambda: None)
+        thread = manager._threads[terminal_id]
+        stop_flag = manager._readers[terminal_id]
+        real_join = thread.join
+        # Keep the regression fast while still joining the actual live thread.
+        monkeypatch.setattr(thread, "join", lambda timeout=None: real_join(timeout=0.01))
+        fifo_path = tmp_path / f"{terminal_id}.fifo"
+        writer = os.open(fifo_path, os.O_RDWR | os.O_NONBLOCK)
+        try:
+            os.write(writer, b"last output")
+            assert blocked.wait(timeout=2.0)
+
+            assert manager.stop_reader(terminal_id) is False
+            assert manager.stop_reader(terminal_id) is False
+            assert thread.is_alive()
+            assert manager._threads[terminal_id] is thread
+            assert manager._readers[terminal_id] is stop_flag
+            assert stop_flag.is_set()
+            assert not fifo_path.exists()
+            for state in (
+                manager._pane_probe,
+                manager._rearm,
+                manager._liveness,
+                manager._last_data_at,
+                manager._registered_at,
+                manager._ever_delivered,
+                manager._cold_start_attempts,
+                manager._rearm_failures,
+                manager._probe_failures,
+            ):
+                assert terminal_id not in state
+
+            # The pending generation still owns this ID, even after unlink.
+            manager.create_reader(terminal_id)
+            assert manager._threads[terminal_id] is thread
+            assert not fifo_path.exists()
+
+            release.set()
+            real_join(timeout=2.0)
+            assert not thread.is_alive()
+            # A read that completes after stop must not revive watchdog state.
+            assert terminal_id not in manager._last_data_at
+            assert terminal_id not in manager._ever_delivered
+            assert manager.stop_reader(terminal_id) is True
+            assert terminal_id not in manager._readers
+            assert terminal_id not in manager._threads
+
+            manager.create_reader(terminal_id)
+            assert manager._threads[terminal_id] is not thread
+            assert fifo_path.exists()
+        finally:
+            release.set()
+            os.close(writer)
+            real_join(timeout=2.0)
+            manager.stop_reader(terminal_id)
+
+    def test_concurrent_stop_does_not_remove_replacement(self, tmp_path, monkeypatch):
+        """A late stop of the previous generation cannot unlink a replacement FIFO."""
+        monkeypatch.setattr(fr, "FIFO_DIR", tmp_path)
+        manager = FifoManager()
+        manager.create_reader("term-replaced")
+        old_thread = manager._threads["term-replaced"]
+        real_join = old_thread.join
+        joined = threading.Event()
+        release = threading.Event()
+        results = []
+
+        def delayed_join(timeout=None):
+            real_join(timeout=timeout)
+            if threading.current_thread() is stopper:
+                joined.set()
+                assert release.wait(timeout=5.0)
+
+        monkeypatch.setattr(old_thread, "join", delayed_join)
+        stopper = threading.Thread(
+            target=lambda: results.append(manager.stop_reader("term-replaced")), daemon=True
+        )
+        try:
+            stopper.start()
+            assert joined.wait(timeout=3.0)
+            assert not old_thread.is_alive()
+            assert manager.stop_reader("term-replaced") is True
+            manager.create_reader("term-replaced")
+            new_thread = manager._threads["term-replaced"]
+            new_stop_flag = manager._readers["term-replaced"]
+            fifo_path = tmp_path / "term-replaced.fifo"
+            inode = fifo_path.stat().st_ino
+
+            release.set()
+            stopper.join(timeout=2.0)
+
+            assert not stopper.is_alive()
+            assert results == [False]
+            assert manager._threads["term-replaced"] is new_thread
+            assert manager._readers["term-replaced"] is new_stop_flag
+            assert not new_stop_flag.is_set()
+            assert fifo_path.stat().st_ino == inode
+            assert "term-replaced" in manager._last_data_at
+        finally:
+            release.set()
+            stopper.join(timeout=3.0)
+            manager.stop_reader("term-replaced")
 
 
 class TestReaderThreadLifecycle:
@@ -287,12 +431,32 @@ class TestPipeLivenessWatchdog:
         monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
         return FifoManager()
 
-    def _enroll(self, manager, terminal_id, pane_holder, rearm_calls, last_data_at):
+    def _enroll(
+        self,
+        manager,
+        terminal_id,
+        pane_holder,
+        rearm_calls,
+        last_data_at,
+        fifo_buffer=None,
+    ):
         """Register a terminal with fake probe/rearm WITHOUT starting the reader
-        thread or the real watchdog — we call _check_pipe_liveness by hand."""
+        thread or the real watchdog — we call _check_pipe_liveness by hand.
+
+        The FIFO buffer defaults to the raw-stream shape tmux pipe-pane really
+        delivers: CRLF line ends, SGR runs and partial-redraw control
+        sequences, not the pane's rendered text.
+        """
+        if fifo_buffer is None:
+            fifo_buffer = {
+                "content": "\x1b[32m" + pane_holder["content"].replace("\n", "\r\n") + "\x1b[0m"
+            }
         manager._pane_probe[terminal_id] = lambda: pane_holder["content"]
         manager._rearm[terminal_id] = lambda: rearm_calls.append(True)
         manager._last_data_at[terminal_id] = last_data_at
+        if not hasattr(manager, "_fifo_buffer_probe"):
+            manager._fifo_buffer_probe = {}
+        manager._fifo_buffer_probe[terminal_id] = lambda: fifo_buffer["content"]
 
     def test_stall_is_detected_and_pipe_rearmed(self, tmp_path, monkeypatch):
         """Pane advanced but the FIFO delivered nothing since the last check ->
@@ -329,20 +493,36 @@ class TestPipeLivenessWatchdog:
         assert rearm_calls == [], "an idle terminal must never be re-armed"
 
     def test_healthy_pipe_is_not_rearmed(self, tmp_path, monkeypatch):
-        """Pane advancing AND the FIFO delivering bytes = a healthy pipe; no
-        re-arm even though the screen keeps changing."""
+        """Raw FIFO delivery must not cause strikes against capture-pane rows,
+        either during sustained redraws or after the terminal settles."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 2)
         manager = self._manager(tmp_path, monkeypatch)
-        pane = {"content": "line0"}
+        pane = {"content": "prompt\nline0"}
+        fifo_buffer = {"content": "prompt\r\n\x1b[32mline0\x1b[0m"}
         rearm_calls: list = []
-        self._enroll(manager, "term", pane, rearm_calls, last_data_at=time.monotonic())
+        self._enroll(
+            manager,
+            "term",
+            pane,
+            rearm_calls,
+            last_data_at=time.monotonic(),
+            fifo_buffer=fifo_buffer,
+        )
 
-        manager._check_pipe_liveness("term")  # baseline
-        for i in range(1, 4):
-            pane["content"] = f"line{i}"
-            # Simulate the reader delivering a byte right before this check.
+        manager._check_pipe_liveness("term")
+        strikes = []
+        for i in range(1, 9):
+            pane["content"] = f"prompt\nline{i}"
+            fifo_buffer["content"] += f"\r\x1b[2K\x1b[32mline{i}\x1b[0m"
             manager._last_data_at["term"] = time.monotonic()
             manager._check_pipe_liveness("term")
-        assert rearm_calls == [], "a healthy, delivering pipe must never be re-armed"
+            strikes.append(manager._liveness["term"][2])
+        for _ in range(4):
+            manager._check_pipe_liveness("term")
+            strikes.append(manager._liveness["term"][2])
+
+        assert (strikes, rearm_calls) == ([0] * 12, [])
+        assert manager._liveness["term"][0] == "prompt\nline8"
 
     def test_rearm_replays_live_pane_into_pipeline(self, tmp_path, monkeypatch):
         """After re-arm the lost bytes are gone, but the pane's CURRENT content
@@ -945,7 +1125,8 @@ class TestConcurrencyRaces:
         manager = FifoManager()
         terminal_id = "term-race"
         # Enroll by hand (no create_reader/watchdog needed for this race).
-        manager._readers[terminal_id] = threading.Event()
+        stop_flag = threading.Event()
+        manager._readers[terminal_id] = stop_flag
         manager._last_data_at[terminal_id] = 0.0
 
         entered_write_section = threading.Event()
@@ -956,8 +1137,6 @@ class TestConcurrencyRaces:
             entered_write_section.set()
             release_write_section.wait(timeout=2.0)
             return real_monotonic()
-
-        stop_flag = threading.Event()
 
         with (
             patch("cli_agent_orchestrator.services.fifo_reader.bus.publish"),
@@ -1076,3 +1255,77 @@ class TestConcurrencyRaces:
             "exactly the kind of unhandled RuntimeError that would kill it"
         )
         assert not watchdog.is_alive(), "watchdog thread must exit cleanly once stopped"
+
+
+class TestFifoPathHardening:
+    """The per-terminal FIFO path is predictable; only a real FIFO may live there."""
+
+    def _manager(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
+        return FifoManager()
+
+    def test_symlink_at_fifo_path_is_refused_and_target_untouched(self, tmp_path, monkeypatch):
+        target = tmp_path / "victim.txt"
+        target.write_text("precious")
+        (tmp_path / "term-link.fifo").symlink_to(target)
+        manager = self._manager(tmp_path, monkeypatch)
+
+        with pytest.raises(OSError, match="not a FIFO"):
+            manager.create_reader("term-link")
+
+        with manager._lock:
+            assert "term-link" not in manager._threads
+        assert target.read_text() == "precious"
+        assert (tmp_path / "term-link.fifo").is_symlink()  # refused, not replaced
+
+    def test_regular_file_at_fifo_path_is_refused(self, tmp_path, monkeypatch):
+        (tmp_path / "term-file.fifo").write_text("not a pipe")
+        manager = self._manager(tmp_path, monkeypatch)
+        with pytest.raises(OSError, match="not a FIFO"):
+            manager.create_reader("term-file")
+        with manager._lock:
+            assert "term-file" not in manager._threads
+
+    def test_existing_fifo_is_reused(self, tmp_path, monkeypatch):
+        fifo_path = tmp_path / "term-keep.fifo"
+        os.mkfifo(fifo_path)
+        before = os.lstat(fifo_path).st_ino
+        manager = self._manager(tmp_path, monkeypatch)
+        manager.create_reader("term-keep")
+        try:
+            assert os.lstat(fifo_path).st_ino == before
+        finally:
+            manager.stop_reader("term-keep")
+
+    def test_created_fifo_is_owner_only(self, tmp_path, monkeypatch):
+        manager = self._manager(tmp_path, monkeypatch)
+        manager.create_reader("term-mode")
+        try:
+            mode = os.lstat(tmp_path / "term-mode.fifo").st_mode
+            assert stat.S_ISFIFO(mode)
+            assert stat.S_IMODE(mode) & 0o077 == 0
+        finally:
+            manager.stop_reader("term-mode")
+
+    def test_open_refuses_symlink_even_to_a_real_fifo(self, tmp_path):
+        real = tmp_path / "real.fifo"
+        os.mkfifo(real)
+        link = tmp_path / "link.fifo"
+        link.symlink_to(real)
+        with pytest.raises(OSError):
+            _open_fifo(link, os.O_RDONLY | os.O_NONBLOCK)
+
+    def test_open_refuses_regular_file(self, tmp_path):
+        plain = tmp_path / "plain.fifo"
+        plain.write_text("x")
+        with pytest.raises(OSError, match="not a FIFO"):
+            _open_fifo(plain, os.O_RDONLY | os.O_NONBLOCK)
+
+    def test_open_accepts_a_fifo(self, tmp_path):
+        real = tmp_path / "ok.fifo"
+        os.mkfifo(real)
+        fd = _open_fifo(real, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            assert stat.S_ISFIFO(os.fstat(fd).st_mode)
+        finally:
+            os.close(fd)

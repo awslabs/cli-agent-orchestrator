@@ -1,0 +1,20 @@
+export KIMI_CODE_HOME=<A0DIR>/kimi-home-A
+[<USER>@<HOST> project]$ export KIMI_CODE_HOME=<A0DIR>/kimi-home-A
+[<USER>@<HOST> project]$ TERM=xterm-256color kimi
+
+   [38;5;114mMCP server "cao-mcp-server" connected · 29 tools (stdio)[39m                                                                                                                                             
+
+ [1m[38;5;222m✨ Use the CAO MCP tool `find_profiles` exactly once. Do not create, assign,[0m                                                                                                                            
+    [1;38;5;222mhand off, message, or delete anything.[22m[39m                                                                                                                                                              
+
+ [38;5;114m● [39mUsed [38;5;111m[1mfind_profiles[22m[39m[2m · MCP/cao-mcp-server[22m[2m ([22m[2mkimi[22m[2m)[22m[0m                                                                                                                                                       
+   [2m[{"name":"d6-probe","description":"Disposable.","capabilities":[],"tags":[],"role":"developer","source":"local","coverage":1,"score":1.8734}] …[22m[0m                                                      
+
+ [38;5;253m● [39mMCP-OK=1                                                                                                                                                                                             
+
+ [38;5;240m╭────────────────────────────────────────────────────────────╮[39m                                                                                                                                         
+ [38;5;240m│[39m > Use the CAO MCP tool `find_profiles` exactly once. Do not create, assign, [38;5;240m│[39m[0m                                                                                                                        
+ [38;5;240m│[39m   assign, hand off, message, or delete anything.[7m [0m [38;5;240m│[39m[0m                                                                                                                                                  
+ [38;5;240m╰────────────────────────────────────────────────────────────╯[39m                                                                                                                                         
+ [38;5;215m[1mNever Ask[22m[39m  [38;5;253mDeepSeek V4.1 Flash thinking: high[39m  [38;5;244m<A0DIR>/project-d6[39m  [38;5;244mmaster [±][39m  [38;5;242m/web: use the Web UI for a better experience[39m                                                                            
+        [38;5;253mcontext: 4% (33.7k/977k)[39m

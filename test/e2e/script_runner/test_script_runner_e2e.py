@@ -107,3 +107,25 @@ async def test_real_nonzero_exit_is_failed(tmp_path):
     row = workflow_journal.get_run("e2e-crash")
     assert row is not None
     assert row.error == "boom"
+
+
+async def test_real_shim_http_error_kind_reaches_stderr_tail(tmp_path):
+    """An uncaught kinded refusal remains distinguishable in the run record."""
+    spec = _RealSpec(
+        tmp_path,
+        source=(
+            "from cao_workflow import ShimHTTPError\n"
+            "raise ShimHTTPError("
+            '409, \'{"detail":{"kind":"diverged","message":"step changed"}}\''
+            ")\n"
+        ),
+    )
+
+    result = await run_script_workflow(spec, {}, "e2e-kinded-refusal")
+
+    assert result.state == RunState.FAILED
+    assert result.kind == "error"
+    row = workflow_journal.get_run("e2e-kinded-refusal")
+    assert row is not None
+    assert row.error is not None
+    assert "run-step returned HTTP 409 (diverged): step changed" in row.error

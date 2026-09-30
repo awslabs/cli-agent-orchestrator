@@ -9,6 +9,7 @@ from cli_agent_orchestrator.clients.database import (
     InboxModel,
     SessionLocal,
     TerminalModel,
+    delete_old_handoff_results,
 )
 from cli_agent_orchestrator.constants import (
     LOG_DIR,
@@ -33,35 +34,58 @@ def cleanup_old_data():
             f"Starting cleanup of data older than {RETENTION_DAYS} days (before {cutoff_date})"
         )
 
-        # Clean up old terminals (stop FIFO readers and clear state first)
+        # Clean up old terminals. Deferred-init external-owner/failure rows are
+        # lifecycle tombstones: age alone must never erase failure truth before
+        # the external owner acknowledges it. Ordinary stale rows keep the
+        # historical FIFO/status/Grok cleanup posture, but row deletion now
+        # flows through terminal_service.delete_terminal_row so lifecycle
+        # sidecars are removed atomically with the registry record instead of
+        # being orphaned by a bulk SQL DELETE.
         with SessionLocal() as db:
-            old_terminals = (
+            old_terminals = list(
                 db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).all()
             )
-            retained_terminal_ids: set[str] = set()
-            for terminal in old_terminals:
-                fifo_manager.stop_reader(terminal.id)
-                status_monitor.clear_terminal(terminal.id)
-                # A stale Grok terminal can still own a private GROK_HOME. An
-                # explicit deferred cleanup is its retry handle, so retention
-                # housekeeping must not bulk-delete that row underneath it.
-                if (
-                    terminal.provider == ProviderType.GROK_CLI.value
-                    and provider_manager.cleanup_provider(terminal.id) is False
-                ):
-                    retained_terminal_ids.add(terminal.id)
-                    logger.warning(
-                        "Retaining stale Grok terminal %s while cleanup is deferred", terminal.id
+
+        from cli_agent_orchestrator.services import terminal_service
+
+        deleted_terminals = 0
+        for terminal in old_terminals:
+            terminal_id = str(terminal.id)
+            try:
+                if terminal_service.should_retain_deferred_failure_tombstone(terminal_id):
+                    logger.info(
+                        "Retaining old deferred-init terminal %s until external-owner cleanup",
+                        terminal_id,
                     )
-            terminal_query = db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date)
-            if retained_terminal_ids:
-                deleted_terminals = terminal_query.filter(
-                    ~TerminalModel.id.in_(retained_terminal_ids)
-                ).delete()
-            else:
-                deleted_terminals = terminal_query.delete()
-            db.commit()
-            logger.info(f"Deleted {deleted_terminals} old terminals from database")
+                    continue
+            except Exception as exc:  # noqa: BLE001 — uncertain ownership fails closed
+                logger.warning(
+                    "Could not establish deferred-init ownership for stale terminal %s; "
+                    "retaining it: %s",
+                    terminal_id,
+                    exc,
+                )
+                continue
+
+            fifo_manager.stop_reader(terminal_id)
+            status_monitor.clear_terminal(terminal_id)
+            if (
+                terminal.provider == ProviderType.GROK_CLI.value
+                and provider_manager.cleanup_provider(terminal_id) is False
+            ):
+                logger.warning(
+                    "Retaining stale Grok terminal %s while cleanup is deferred", terminal_id
+                )
+                continue
+
+            try:
+                metadata = terminal_service.get_terminal_metadata(terminal_id)
+                if terminal_service.delete_terminal_row(terminal_id, metadata, registry=None):
+                    deleted_terminals += 1
+            except Exception as exc:  # noqa: BLE001 — retention sweep is best-effort
+                logger.warning("Failed to delete stale terminal %s: %s", terminal_id, exc)
+
+        logger.info(f"Deleted {deleted_terminals} old terminals from database")
 
         # Clean up old inbox messages
         with SessionLocal() as db:
@@ -101,6 +125,24 @@ def cleanup_old_data():
                     log_file.unlink()
                     server_logs_deleted += 1
         logger.info(f"Deleted {server_logs_deleted} old server log files")
+
+        # Clean up old handoff result records (issue #447).
+        # Same RETENTION_DAYS window as terminals/messages, but a UTC cutoff, NOT
+        # ``cutoff_date`` (PR #453 review finding 1). The three tables above default
+        # their timestamp to naive-local ``datetime.now``, so the naive-local
+        # ``cutoff_date`` matches them. ``HandoffResultModel.created_at`` defaults to
+        # ``_utcnow()`` instead, and SQLite drops the offset -- what lands in the
+        # column is UTC wall-clock. Comparing that to a local cutoff deletes rows
+        # UTC-offset hours early (east of UTC) or late (west); measured ~10-19h early
+        # under TZ=+10. This is the most sensitive swept table (it holds full worker
+        # output), so it gets the clock its WRITER uses rather than the one its
+        # neighbours use.
+        handoff_cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
+        try:
+            deleted_handoff = delete_old_handoff_results(handoff_cutoff)
+            logger.info(f"Deleted {deleted_handoff} old handoff result records")
+        except Exception as e:
+            logger.warning(f"Failed to clean up old handoff results: {e}")
 
         logger.info("Cleanup completed successfully")
 
@@ -147,8 +189,25 @@ async def cleanup_expired_memories() -> None:
 
         # Lazy-import to avoid circular imports at module level
         from cli_agent_orchestrator.services.memory_service import MemoryService
+        from cli_agent_orchestrator.services.vault.binding import (
+            ScopeBinding,
+            VaultBinding,
+            VaultConfigUnavailableError,
+            _load_vault_config,
+            resolve,
+        )
 
         memory_service = MemoryService(base_dir=MEMORY_BASE_DIR)
+        try:
+            vault_config = _load_vault_config()
+        except VaultConfigUnavailableError as exc:
+            logger.warning(
+                "vault configuration unavailable; expiring native copies only: %s",
+                exc,
+            )
+            vault_config = None
+        resolved_bindings: dict[tuple[str, str | None], ScopeBinding] = {}
+        refused_bindings: set[tuple[str, str | None]] = set()
 
         # Walk project dirs: {MEMORY_BASE_DIR}/{project_dir}/wiki/index.md
         # Glob and parse are sync I/O; offload to a thread so the event
@@ -172,6 +231,29 @@ async def cleanup_expired_memories() -> None:
                     # files resolve correctly. Fall back to the
                     # container's scope_id otherwise.
                     effective_scope_id = entry.get("scope_id") or scope_id
+                    binding_key = (entry["scope"], effective_scope_id)
+                    target = "native"
+                    if vault_config is not None:
+                        resolved_binding = resolved_bindings.get(binding_key)
+                        if resolved_binding is None:
+                            resolved_binding = resolve(
+                                entry["scope"],
+                                effective_scope_id,
+                                vault_config=vault_config,
+                            )
+                            resolved_bindings[binding_key] = resolved_binding
+
+                        if isinstance(resolved_binding, VaultBinding):
+                            if binding_key not in refused_bindings:
+                                logger.warning(
+                                    "vault-bound memory retention preserves vault note "
+                                    "scope=%s scope_id=%s",
+                                    entry["scope"],
+                                    effective_scope_id,
+                                )
+                                refused_bindings.add(binding_key)
+                        else:
+                            target = "binding"
                     # ``forget()`` is declared async but its body is
                     # sync FS work (unlink + flock + index rewrite).
                     # Offload to a thread so the event loop stays
@@ -182,6 +264,7 @@ async def cleanup_expired_memories() -> None:
                         entry["key"],
                         entry["scope"],
                         effective_scope_id,
+                        target,
                     )
                     expired_count += 1
                     logger.info(
@@ -200,7 +283,9 @@ async def cleanup_expired_memories() -> None:
         logger.error(f"Error during memory cleanup: {e}")
 
 
-def _forget_sync(memory_service, key: str, scope: str, scope_id: str | None) -> None:
+def _forget_sync(
+    memory_service, key: str, scope: str, scope_id: str | None, target: str = "binding"
+) -> None:
     """Run MemoryService.forget() synchronously in a worker thread.
 
     forget() is declared async but its body is sync; we invoke it
@@ -209,7 +294,7 @@ def _forget_sync(memory_service, key: str, scope: str, scope_id: str | None) -> 
     """
     import asyncio as _asyncio
 
-    _asyncio.run(memory_service.forget(key=key, scope=scope, scope_id=scope_id))
+    _asyncio.run(memory_service.forget(key=key, scope=scope, scope_id=scope_id, target=target))
 
 
 def _find_expired_entries(index_path: Path, now: datetime) -> list[dict]:
