@@ -210,6 +210,13 @@ class RuntimeRegistry:
             self._placement.pop(terminal_id, None)
             self._status.pop(terminal_id, None)
 
+    def unplace(self, terminal_id: str, runtime_id: str) -> None:
+        """Forget a placement, but only if it is still ``runtime_id``'s."""
+        with self._lock:
+            if self._placement.get(terminal_id) == runtime_id:
+                del self._placement[terminal_id]
+                self._status.pop(terminal_id, None)
+
     def is_placed(self, terminal_id: str, runtime_id: str) -> bool:
         with self._lock:
             return self._placement.get(terminal_id) == runtime_id
