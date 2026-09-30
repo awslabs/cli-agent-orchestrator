@@ -1876,7 +1876,10 @@ class TmuxClient:
         session's value never answers for it.
         """
         prefix = f"{TERMINAL_ID_OPTION} "
-        for line in target.cmd("show-options", scope).stdout or []:
+        result = target.cmd("show-options", scope)
+        if result.returncode != 0 or result.stderr:
+            raise TmuxLookupError("Could not read exact terminal identity from tmux options")
+        for line in result.stdout or []:
             if line.startswith(prefix):
                 return str(line[len(prefix) :])
         return None

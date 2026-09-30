@@ -33,6 +33,20 @@ logger = logging.getLogger(__name__)
 Base: Any = declarative_base()
 
 
+class SessionIncarnationModel(Base):
+    """Current logical lifetime of a reusable session name.
+
+    Keep the pointer after teardown so retries cannot claim historical terminal
+    rows. A successful new-session creation replaces it in the same transaction
+    as its initial terminal; individual terminal deletion never removes it.
+    """
+
+    __tablename__ = "session_incarnations"
+
+    session_name = Column(String, primary_key=True)
+    incarnation_id = Column(String, nullable=False)
+
+
 class TerminalModel(Base):
     """SQLAlchemy model for terminal metadata only."""
 
@@ -1856,6 +1870,7 @@ def create_terminal(
     session_incarnation_id: Optional[str] = None,
     idempotency_key: Optional[str] = None,
     request_fingerprint: Optional[str] = None,
+    new_session_incarnation: bool = False,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
 
@@ -1879,6 +1894,18 @@ def create_terminal(
     import json as _json
 
     with SessionLocal() as db:
+        if new_session_incarnation:
+            if not session_incarnation_id:
+                raise ValueError("A new session incarnation requires an incarnation id")
+            incarnation = db.get(SessionIncarnationModel, tmux_session)
+            if incarnation is None:
+                db.add(
+                    SessionIncarnationModel(
+                        session_name=tmux_session, incarnation_id=session_incarnation_id
+                    )
+                )
+            else:
+                incarnation.incarnation_id = session_incarnation_id
         terminal = TerminalModel(
             id=terminal_id,
             tmux_session=tmux_session,
@@ -2119,23 +2146,65 @@ def update_terminal_deferred_init_runtime_reclaimed(terminal_id: str, reclaimed:
         return True
 
 
-def update_terminals_session_incarnation(terminal_ids: List[str], incarnation_id: str) -> bool:
+def get_session_incarnation(session_name: str) -> Optional[str]:
+    """Read the durable current pointer, including for an already-deleted session."""
+
+    if not session_name:
+        return None
+    with SessionLocal() as db:
+        incarnation = db.get(SessionIncarnationModel, session_name)
+        return str(incarnation.incarnation_id) if incarnation is not None else None
+
+
+def get_session_incarnations(session_names: List[str]) -> Dict[str, str]:
+    """Read current pointers in one query for a fleet listing."""
+
+    names = [name for name in session_names if name]
+    if not names:
+        return {}
+    with SessionLocal() as db:
+        return {
+            str(row.session_name): str(row.incarnation_id)
+            for row in db.query(SessionIncarnationModel)
+            .filter(SessionIncarnationModel.session_name.in_(names))
+            .all()
+        }
+
+
+def update_terminals_session_incarnation(
+    terminal_ids: List[str], incarnation_id: str, *, session_name: Optional[str] = None
+) -> bool:
     """Atomically assign one session incarnation to the specified terminal rows.
 
-    Used only while the per-session lifecycle lock is held.  All requested rows
-    must still exist; otherwise no assignment is committed.  This prevents a
-    legacy-session backfill from leaving a half-tagged live incarnation after a
-    concurrent/stale-row anomaly.
+    Used while the per-session lifecycle lock is held. All requested rows must
+    exist and have no conflicting identity. When session_name is supplied, its
+    durable pointer is committed atomically with the backfill. A conflicting
+    pointer or a row belonging to another session rejects the whole assignment.
     """
 
     unique_ids = list(dict.fromkeys(str(terminal_id) for terminal_id in terminal_ids))
-    if not unique_ids:
+    if not unique_ids and session_name is None:
         return True
     with SessionLocal() as db:
         terminals = db.query(TerminalModel).filter(TerminalModel.id.in_(unique_ids)).all()
-        if len(terminals) != len(unique_ids):
+        if len(terminals) != len(unique_ids) or any(
+            (terminal.session_incarnation_id not in (None, incarnation_id))
+            or (session_name is not None and terminal.tmux_session != session_name)
+            for terminal in terminals
+        ):
             db.rollback()
             return False
+        if session_name is not None:
+            current = db.get(SessionIncarnationModel, session_name)
+            if current is not None and current.incarnation_id != incarnation_id:
+                db.rollback()
+                return False
+            if current is None:
+                db.add(
+                    SessionIncarnationModel(
+                        session_name=session_name, incarnation_id=incarnation_id
+                    )
+                )
         for terminal in terminals:
             terminal.session_incarnation_id = str(incarnation_id)
         db.commit()

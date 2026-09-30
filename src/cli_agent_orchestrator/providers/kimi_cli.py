@@ -1319,11 +1319,25 @@ class KimiCliProvider(BaseProvider):
             system_prompt = profile.system_prompt
         system_prompt = self._apply_skill_prompt(system_prompt)
 
-        # Prepend security constraints for soft enforcement. Kimi Code's
-        # `tools`/`disallowedTools` frontmatter could enforce this natively, but
-        # CAO keeps the prompt-level guarantee for this change: kimi_cli is
-        # registered as a soft-enforcement provider and silently upgrading an
-        # advisory restriction to a hard one is a separate decision.
+        # Kimi Code's Markdown agent format declares a native ``tools``
+        # allowlist. Keep emitting it for forward compatibility and prompt/tool
+        # shaping, but do NOT rely on it as the security boundary: Kimi Code
+        # 2.1.1 interactive main-agent launches still expose write/exec tools
+        # under ``--auto`` despite this frontmatter. The matching profile list
+        # is therefore also enforced in the private runtime home's
+        # ``[tools].enabled`` by KimiCodeRuntimeHomeBuilder below.
+        # AgentProfile validates this field as ``list[str] | None``. Some
+        # provider tests and third-party seams use lightweight mocks whose
+        # undeclared ``.tools`` attribute is itself a MagicMock; treating that
+        # as an explicit empty policy would unexpectedly fail closed. Only a
+        # concrete list is an intentional native Kimi tool declaration.
+        profile_tools = profile.tools if profile is not None else None
+        native_tools = profile_tools if isinstance(profile_tools, list) else None
+
+        # Preserve the existing CAO-vocabulary prompt restriction as
+        # defense-in-depth.  ``native_tools`` is provider vocabulary while
+        # ``allowedTools`` is CAO vocabulary; profiles that do not opt into a
+        # native list retain today's soft-enforcement behavior unchanged.
         if self._allowed_tools is not None and "*" not in self._allowed_tools:
             from cli_agent_orchestrator.constants import SECURITY_PROMPT
             from cli_agent_orchestrator.utils.tool_mapping import (
@@ -1333,15 +1347,19 @@ class KimiCliProvider(BaseProvider):
             tool_constraint = f"\n{tool_constraint_instruction(self._allowed_tools)}\n"
             system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
 
-        if not system_prompt.strip():
+        if not system_prompt.strip() and native_tools is None:
             return None
 
         name = kimi_agent_name(self.terminal_id)
         description = json.dumps(f"CAO launch-scoped agent for terminal {self.terminal_id}"[:200])
+        tools_frontmatter = ""
+        if native_tools is not None:
+            tools_frontmatter = f"tools: {json.dumps(native_tools, ensure_ascii=False)}\n"
         return (
             "---\n"
             f"name: {name}\n"
             f"description: {description}\n"
+            f"{tools_frontmatter}"
             "---\n"
             "\n"
             "${base_prompt}\n"
@@ -1430,7 +1448,11 @@ class KimiCliProvider(BaseProvider):
         mcp_servers = profile.mcpServers if profile is not None else None
         builder = KimiCodeRuntimeHomeBuilder(source_home, terminal_dir)
         try:
-            runtime = builder.build(mcp_servers)
+            profile_tools = profile.tools if profile is not None else None
+            runtime = builder.build(
+                mcp_servers,
+                tool_allowlist=profile_tools if isinstance(profile_tools, list) else None,
+            )
         except RuntimeHomeError as exc:
             raise ProviderError(f"Failed to build Kimi Code runtime home: {exc}") from exc
         self._runtime_home_builder = builder

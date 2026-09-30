@@ -34,6 +34,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import requests
 from pydantic import ValidationError
 
+from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam: creation no longer bulk-deletes with this helper,; but older integrations/tests patch the imported symbol while exercising; create_terminal. Keep the name exported from this module until that seam; can be retired separately.
     count_runtime_allocated_terminals,
@@ -47,6 +48,7 @@ from cli_agent_orchestrator.clients.database import delete_terminal as db_delete
 from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam: creation no longer bulk-deletes with this helper,; but older integrations/tests patch the imported symbol while exercising; create_terminal. Keep the name exported from this module until that seam; can be retired separately.
     delete_terminals_by_session,
     get_idempotency_record,
+    get_session_incarnation,
     get_terminal_metadata,
     list_all_terminals,
     list_pending_deferred_init_external_owner_terminal_ids,
@@ -1404,6 +1406,7 @@ async def create_terminal(
                         session_incarnation_id=session_incarnation_id,
                         idempotency_key=idempotency_key,
                         request_fingerprint=request_fingerprint,
+                        new_session_incarnation=created_session,
                     )
                 except BaseException:
                     _clear_deferred_init_external_owner_active(terminal_id)
@@ -1848,24 +1851,40 @@ def _fsync_parent_directory(path: Path) -> None:
         os.close(fd)
 
 
-def _write_deferred_failure_fallback(terminal_id: str, failure: dict[str, Any]) -> bool:
-    """Atomically persist deferred failure outside SQLite as a last-resort tombstone."""
+def _write_deferred_sidecar(target: Path, payload: bytes) -> None:
+    """Publish a complete, fsynced sidecar; keep prior truth on a failed write."""
 
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
     try:
-        TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
-        target = _deferred_failure_fallback_path(terminal_id)
-        tmp = target.with_name(target.name + ".tmp")
-        payload = json.dumps(failure, ensure_ascii=False, sort_keys=True).encode("utf-8")
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            os.write(fd, payload)
+            written = 0
+            while written < len(payload):
+                count = os.write(fd, payload[written:])
+                if count <= 0:
+                    raise OSError("short write while persisting deferred-init sidecar")
+                written += count
             os.fsync(fd)
         finally:
             os.close(fd)
         os.chmod(tmp, 0o600)
+        if tmp.read_bytes() != payload:
+            raise OSError("deferred-init sidecar bytes do not match the complete payload")
         os.replace(tmp, target)
         os.chmod(target, 0o600)
         _fsync_parent_directory(target)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _write_deferred_failure_fallback(terminal_id: str, failure: dict[str, Any]) -> bool:
+    """Atomically persist deferred failure outside SQLite as a last-resort tombstone."""
+
+    try:
+        target = _deferred_failure_fallback_path(terminal_id)
+        payload = json.dumps(failure, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        _write_deferred_sidecar(target, payload)
         return True
     except Exception as exc:  # noqa: BLE001 — fallback is best-effort but explicit
         logger.error("Could not persist deferred-init fallback for %s: %s", terminal_id, exc)
@@ -1923,19 +1942,8 @@ def _write_deferred_init_complete_fallback(terminal_id: str) -> bool:
     """Durably record successful deferred init when the DB ownership clear is unavailable."""
 
     try:
-        TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
         target = _deferred_init_complete_fallback_path(terminal_id)
-        tmp = target.with_name(target.name + ".tmp")
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            os.write(fd, b"complete\n")
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, target)
-        os.chmod(target, 0o600)
-        _fsync_parent_directory(target)
+        _write_deferred_sidecar(target, b"complete\n")
         return True
     except Exception as exc:  # noqa: BLE001 — fail-closed retention is safer than deletion
         logger.error(
@@ -2027,10 +2035,10 @@ def _purge_stale_session_rows_for_recreate(session_name: str) -> None:
 def _resolve_existing_session_incarnation_locked(session_name: str) -> str:
     """Resolve/backfill the durable incarnation of an already-live session.
 
-    Caller must hold the per-session lifecycle lock. Retained deferred-init
-    failures can share the reusable session label with a later replacement, so
-    only rows that still represent live/pending runtime are allowed to define
-    the CURRENT incarnation.
+    Caller must hold the per-session lifecycle lock. The durable pointer takes
+    precedence over terminal state, including when every current row failed.
+    For older sessions without a pointer, active rows or exact backend identity
+    proof establish membership before an atomic pointer/backfill commit.
 
     Legacy active rows with no incarnation are backfilled atomically. If one
     active row already carries an incarnation, all legacy active siblings are
@@ -2039,12 +2047,58 @@ def _resolve_existing_session_incarnation_locked(session_name: str) -> str:
     created.
     """
 
+    current = get_session_incarnation(session_name)
+    if current is not None:
+        return current
+
     rows = list_terminals_by_session(session_name)
     active_rows: list[dict[str, Any]] = []
+    legacy_failed_rows: list[dict[str, Any]] = []
     for row in rows:
         failure = get_deferred_init_failure(str(row["id"]), row.get("deferred_init_failure"))
         if failure is None and not row.get("deferred_init_runtime_reclaimed"):
             active_rows.append(row)
+        elif (
+            failure is not None
+            and not row.get("deferred_init_runtime_reclaimed")
+            and not row.get("session_incarnation_id")
+        ):
+            legacy_failed_rows.append(row)
+
+    # A legacy failed sibling can still be present beside a healthy conductor.
+    # Backfill it only after proving exact membership, never by its session label.
+    if active_rows:
+        for row in legacy_failed_rows:
+            exact = get_backend().cleanup_terminal_exact(
+                str(row["id"]), session_name, row.get("tmux_window"), close=False
+            )
+            if exact.outcome == TerminalCleanupOutcome.UNKNOWN:
+                raise TerminalRecordCorruptError(
+                    f"Could not verify legacy failed sibling in {session_name!r}"
+                )
+            if exact.outcome == TerminalCleanupOutcome.STILL_PRESENT:
+                active_rows.append(row)
+
+    # Sessions predating the durable pointer may have only failed terminals.
+    # Failure is not evidence that their backend session was replaced. Use the
+    # exact terminal identity to prove membership without closing any window.
+    if not active_rows and rows:
+        for row in rows:
+            if row.get("deferred_init_runtime_reclaimed"):
+                continue
+            exact = get_backend().cleanup_terminal_exact(
+                str(row["id"]), session_name, row.get("tmux_window"), close=False
+            )
+            if exact.outcome == TerminalCleanupOutcome.UNKNOWN:
+                raise TerminalRecordCorruptError(
+                    f"Could not verify session incarnation for {session_name!r}"
+                )
+            if exact.outcome == TerminalCleanupOutcome.STILL_PRESENT:
+                active_rows.append(row)
+        if not active_rows:
+            raise TerminalRecordCorruptError(
+                f"No terminal proves the current incarnation of session {session_name!r}"
+            )
 
     incarnation_ids = {
         str(row["session_incarnation_id"])
@@ -2059,7 +2113,9 @@ def _resolve_existing_session_incarnation_locked(session_name: str) -> str:
 
     incarnation_id = next(iter(incarnation_ids)) if incarnation_ids else uuid.uuid4().hex
     legacy_ids = [str(row["id"]) for row in active_rows if not row.get("session_incarnation_id")]
-    if legacy_ids and not update_terminals_session_incarnation(legacy_ids, incarnation_id):
+    if not update_terminals_session_incarnation(
+        legacy_ids, incarnation_id, session_name=session_name
+    ):
         raise TerminalRecordCorruptError(
             f"Could not atomically backfill session incarnation for "
             f"{session_name!r}: {legacy_ids!r}"
@@ -2501,6 +2557,11 @@ def redeliver_dropped_message(
     ``wait_until_status`` for the PROCESSING edge before ever reaching here,
     and that pre-existing behavior is unchanged by this helper's extraction.
 
+    The full re-send is forwarded to ``send_input`` as ``redelivery=True``: it
+    repeats the dispatch CAO is already waiting on, so the provider must treat
+    it as another delivery attempt of the same logical turn rather than as a
+    newly dispatched turn.
+
     Returns True when the worker was found already started and nothing was
     sent; False when a redelivery was attempted (or deliberately skipped).
     """
@@ -2553,6 +2614,7 @@ def redeliver_dropped_message(
         registry=registry,
         sender_id=sender_id,
         orchestration_type=orchestration_type,
+        redelivery=True,
     )
     return False
 
@@ -2997,6 +3059,7 @@ def send_input(
     registry: PluginRegistry | None = None,
     sender_id: str | None = None,
     orchestration_type: OrchestrationType | None = None,
+    redelivery: bool = False,
     frozen_memory: str | None = None,
 ) -> bool:
     """Send input to terminal via tmux paste buffer.
@@ -3005,6 +3068,14 @@ def send_input(
     of Enter keys sent after pasting is determined by the provider's
     ``paste_enter_count`` property (e.g., some TUIs need 2 Enters because
     bracketed paste triggers multi-line mode).
+
+    ``redelivery`` is set only by :func:`redeliver_dropped_message`'s full
+    re-send: the very same logical dispatch is being delivered a second time
+    because the first attempt never reached the agent, not a new turn. It is
+    forwarded as ``mark_redelivery_received()`` so a provider can refresh its
+    per-delivery-attempt state without advancing its logical turn count. It is
+    declared ahead of ``frozen_memory`` so the memory block stays the final
+    parameter.
 
     ``frozen_memory`` is forwarded UNCHANGED to :func:`inject_memory_context` and
     is otherwise none of this function's business — not inspected, not validated,
@@ -3101,8 +3172,15 @@ def send_input(
         # frames must be parsed as belonging to this turn, not as a stale
         # post-clear redraw.  StatusMonitor has already armed and cleared the
         # same dispatch boundary above.
+        #
+        # A redelivery re-sends the dispatch CAO is still waiting on, so it gets
+        # the same boundary but must not be counted as a new logical turn.
         if provider:
-            provider.mark_input_received()
+            if redelivery:
+                provider.mark_redelivery_received()
+            else:
+                provider.mark_input_received()
+            provider.record_dispatched_message(message)
 
         get_backend().send_keys(
             metadata["tmux_session"],

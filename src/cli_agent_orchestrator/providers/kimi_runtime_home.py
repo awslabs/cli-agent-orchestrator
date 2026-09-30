@@ -58,8 +58,16 @@ import re
 import shutil
 import stat
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+import tomlkit
+
+try:  # Python 3.11+
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 — tomli is a declared dependency there
+    import tomli as tomllib  # type: ignore[no-redef]
 
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 
@@ -444,7 +452,11 @@ class KimiCodeRuntimeHomeBuilder:
 
     # -- build ------------------------------------------------------------
 
-    def build(self, profile_mcp_servers: Optional[Mapping[str, Any]] = None) -> RuntimeHomeResult:
+    def build(
+        self,
+        profile_mcp_servers: Optional[Mapping[str, Any]] = None,
+        tool_allowlist: Optional[Sequence[str]] = None,
+    ) -> RuntimeHomeResult:
         """Materialise the runtime home. Idempotent for a given builder."""
 
         if self._result is not None:
@@ -485,6 +497,9 @@ class KimiCodeRuntimeHomeBuilder:
         trust_records, trust_skipped, trust_state, trust_truncated = (
             self._snapshot_workspace_trust()
         )
+
+        if tool_allowlist is not None:
+            self._apply_tool_allowlist(self._home / "config.toml", tool_allowlist)
 
         for name in LINK_DIRS:
             src = self._source / name
@@ -528,6 +543,179 @@ class KimiCodeRuntimeHomeBuilder:
             trust_truncated,
         )
         return result
+
+    @staticmethod
+    def _tool_pattern_intersection(left: str, right: str) -> Optional[str]:
+        """Return a conservative pattern representing ``left ∩ right``.
+
+        Kimi's built-ins are exact names. MCP entries are fnmatch-style globs;
+        the overwhelmingly common shape is a trailing ``*`` for one server.
+        Keep only intersections we can prove without broadening either side.
+        """
+
+        if left == "*":
+            return right
+        if right == "*":
+            return left
+        if left == right:
+            return left
+
+        left_mcp = left.startswith("mcp__")
+        right_mcp = right.startswith("mcp__")
+        if not left_mcp or not right_mcp:
+            return None
+
+        left_glob = any(ch in left for ch in "*?[")
+        right_glob = any(ch in right for ch in "*?[")
+        if not left_glob and fnmatchcase(left, right):
+            return left
+        if not right_glob and fnmatchcase(right, left):
+            return right
+
+        # For the supported server-glob shape, the longer *literal* prefix
+        # is the strict subset when one prefix contains the other. A prefix
+        # containing any other glob metacharacter (for example [ab] or ?) is
+        # not ordered by string-prefix containment, so fail closed instead of
+        # returning a pattern that can broaden either input policy.
+        if left.endswith("*") and right.endswith("*"):
+            left_prefix = left[:-1]
+            right_prefix = right[:-1]
+            if any(ch in left_prefix for ch in "*?[") or any(ch in right_prefix for ch in "*?["):
+                return None
+            if left_prefix.startswith(right_prefix):
+                return left
+            if right_prefix.startswith(left_prefix):
+                return right
+        return None
+
+    @classmethod
+    def _intersect_tool_allowlists(
+        cls, existing: Sequence[str], requested: Sequence[str]
+    ) -> List[str]:
+        result: List[str] = []
+        for left in existing:
+            for right in requested:
+                overlap = cls._tool_pattern_intersection(str(left), str(right))
+                if overlap is not None and overlap not in result:
+                    result.append(overlap)
+        return result
+
+    @classmethod
+    def _apply_tool_allowlist(cls, path: Path, requested: Sequence[str]) -> None:
+        """Enforce a profile tool allowlist in the per-worker Kimi config.
+
+        Kimi Code 2.1.1 does not reliably enforce main-agent ``tools``
+        frontmatter under ``--auto``. Its runtime-global ``[tools].enabled``
+        policy is enforced, so security-sensitive profiles mirror their native
+        tool list into the worker's private ``KIMI_CODE_HOME/config.toml``.
+
+        ``tomlkit`` performs the round-trip edit. The resulting document is
+        parsed again with ``tomllib``/``tomli`` and compared to the original
+        semantic tree plus exactly one intended change. This keeps comments and
+        formatting where possible while refusing any rewrite that changes
+        unrelated configuration.
+        """
+
+        requested_list = [str(item) for item in requested]
+        if requested_list == ["*"]:
+            return
+        if not requested_list:
+            raise RuntimeHomeError(
+                "Kimi Code runtime hard tool policy cannot represent an empty allowlist"
+            )
+
+        try:
+            text = path.read_text(encoding="utf-8") if path.is_file() else ""
+            parsed = tomllib.loads(text) if text.strip() else {}
+            document = tomlkit.parse(text) if text.strip() else tomlkit.document()
+        except (OSError, tomllib.TOMLDecodeError, tomlkit.exceptions.ParseError) as exc:
+            raise RuntimeHomeError(f"Could not read runtime Kimi config {path}: {exc}") from exc
+
+        tools = parsed.get("tools", {})
+        if tools is None:
+            tools = {}
+        if not isinstance(tools, dict):
+            raise RuntimeHomeError("Kimi Code [tools] config must be a table")
+        existing = tools.get("enabled")
+        if existing is not None and (
+            not isinstance(existing, list) or not all(isinstance(item, str) for item in existing)
+        ):
+            raise RuntimeHomeError("Kimi Code tools.enabled must be an array of strings")
+
+        if existing:
+            effective = cls._intersect_tool_allowlists(existing, requested_list)
+            if not effective:
+                raise RuntimeHomeError(
+                    "Kimi Code profile tool allowlist has no overlap with existing tools.enabled"
+                )
+        else:
+            effective = requested_list
+
+        document_tools = document.get("tools")
+        if document_tools is None:
+            document_tools = tomlkit.table()
+            document["tools"] = document_tools
+        if not hasattr(document_tools, "__setitem__"):
+            raise RuntimeHomeError("Kimi Code [tools] config must be a table")
+        document_tools["enabled"] = list(effective)
+        new_text = tomlkit.dumps(document)
+
+        expected = dict(parsed)
+        expected["tools"] = {**tools, "enabled": list(effective)}
+        try:
+            reparsed = tomllib.loads(new_text)
+        except tomllib.TOMLDecodeError as exc:
+            raise RuntimeHomeError(f"Refusing to write runtime Kimi config {path}: {exc}") from exc
+        if reparsed != expected:
+            raise RuntimeHomeError(
+                f"Refusing to write runtime Kimi config {path}: the tool-policy "
+                "rewrite would change unrelated configuration"
+            )
+
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = path.with_name(path.name + ".tools.tmp")
+        try:
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                payload = new_text.encode("utf-8")
+                written = 0
+                while written < len(payload):
+                    count = os.write(fd, payload[written:])
+                    if count <= 0:
+                        raise OSError("short write while persisting Kimi tool policy")
+                    written += count
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.chmod(tmp, 0o600)
+
+            # Verify the bytes that will actually be published, not merely the
+            # in-memory document. A short/partial filesystem write must never
+            # turn a requested hard policy into an unrestricted but still-valid
+            # TOML prefix.
+            try:
+                persisted = tomllib.loads(tmp.read_text(encoding="utf-8"))
+            except (OSError, tomllib.TOMLDecodeError) as exc:
+                raise RuntimeHomeError(
+                    f"Refusing to publish runtime Kimi config {path}: {exc}"
+                ) from exc
+            if persisted != expected:
+                raise RuntimeHomeError(
+                    f"Refusing to publish runtime Kimi config {path}: persisted "
+                    "tool policy does not match the verified document"
+                )
+            os.replace(tmp, path)
+            os.chmod(path, 0o600)
+        except RuntimeHomeError:
+            raise
+        except OSError as exc:
+            raise RuntimeHomeError(f"Could not write runtime Kimi config {path}: {exc}") from exc
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:  # pragma: no cover
+                    pass
 
     # -- cleanup ----------------------------------------------------------
 

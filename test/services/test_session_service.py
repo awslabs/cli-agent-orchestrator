@@ -15,6 +15,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.backends import registry as backend_registry
+from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome, TerminalCleanupResult
 from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
 from cli_agent_orchestrator.clients import database as db_mod
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
@@ -927,6 +928,9 @@ class TestGetSession:
             }
         ]
         mock_failure.return_value = mock_list_terminals.return_value[0]["deferred_init_failure"]
+        mock_get_backend.return_value.cleanup_terminal_exact.return_value = TerminalCleanupResult(
+            TerminalCleanupOutcome.STILL_PRESENT
+        )
 
         result = get_session("cao-test")
 
@@ -1173,6 +1177,17 @@ class TestDeleteSession:
     BY ID to the incarnation it started tearing down. Faithful-fake, real-DB
     reconciliation and concurrency tests live in test_session_teardown_atomic.py.
     """
+
+    @pytest.fixture(autouse=True)
+    def mock_incarnation_backfill(self, monkeypatch):
+        # This class supplies synthetic registry rows through mocks. Real
+        # persistence/backfill and retry behavior are tested with SQLite in
+        # test_session_incarnation.py.
+        monkeypatch.setattr(
+            session_service_mod,
+            "update_terminals_session_incarnation",
+            MagicMock(return_value=True),
+        )
 
     @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")

@@ -64,6 +64,7 @@ dependencies = [
     "requests>=2.32.0",
     "rank-bm25>=0.2.2",
     "pyte>=0.8.2",
+    "wcwidth>=0.2.13",
     # JWT/JWKS verification for the default-off OAuth 2.1 auth layer (RS256 via
     # JWKS). The [crypto] extra pulls in `cryptography` for RSA signature
     # verification and provides `jwt.PyJWKClient`. See spec task 9.1 research note.
@@ -105,6 +106,7 @@ dependencies = [
     # not just a dev dependency — or every `cao` command would fail to import.
     "tomli>=2.0.0; python_version < '3.11'",
     "psutil>=7.0.0",
+    "tomlkit>=0.13.3,<1.0.0",
 ]
 
 [project.optional-dependencies]

@@ -31,6 +31,13 @@ import shutil
 import socket
 import stat
 import subprocess
+import sys
+import textwrap
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 from pathlib import Path
 from typing import Any, Dict
 from unittest.mock import MagicMock
@@ -39,6 +46,7 @@ import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers import kimi_cli as kimi_cli_module
+from cli_agent_orchestrator.providers import kimi_runtime_home as kimi_runtime_home_module
 from cli_agent_orchestrator.providers import kimi_transcript as kt
 from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kimi_cli import (
@@ -65,6 +73,7 @@ from cli_agent_orchestrator.providers.kimi_runtime_home import (
     PRESERVE_FILES,
     TRUST_DIR_NAME,
     KimiCodeRuntimeHomeBuilder,
+    RuntimeHomeError,
     iter_forbidden_runtime_state,
     kimi_agent_name,
     merge_mcp_servers,
@@ -988,6 +997,7 @@ class TestKimiCodeMarkdownAgent:
         profile.system_prompt = prompt
         profile.model = None
         profile.mcpServers = None
+        profile.tools = None
         return provider, profile
 
     def test_base_prompt_interpolated_before_cao_text(self):
@@ -1017,10 +1027,351 @@ class TestKimiCodeMarkdownAgent:
         rendered = provider._render_markdown_agent(profile)
         assert "SKILL BLOCK" in rendered
 
+    def test_native_tools_are_emitted_in_agent_frontmatter(self):
+        provider, profile = self._provider_with_prompt("review only")
+        profile.tools = [
+            "Read",
+            "Grep",
+            "Glob",
+            "mcp__cao-bridge-worker-mcp__complete_turn",
+        ]
+
+        rendered = provider._render_markdown_agent(profile)
+
+        assert (
+            'tools: ["Read", "Grep", "Glob", ' '"mcp__cao-bridge-worker-mcp__complete_turn"]'
+        ) in rendered
+        assert rendered.index("tools:") < rendered.index("---\n\n${base_prompt}")
+
+    def test_empty_native_tools_still_create_deny_all_agent_file(self):
+        provider, profile = self._provider_with_prompt("   ")
+        profile.tools = []
+
+        rendered = provider._render_markdown_agent(profile)
+
+        assert "tools: []" in rendered
+        assert "${base_prompt}" in rendered
+
     def test_agent_name_slugifies_and_defaults(self):
         assert kimi_agent_name("Term 1/Abc") == "cao-kimi-term-1-abc"
         assert kimi_agent_name("") == "cao-kimi-terminal"
         assert len(kimi_agent_name("x" * 200)) <= len("cao-kimi-") + 48
+
+
+class TestKimiCodeRuntimeToolPolicy:
+    def test_profile_tools_are_written_to_runtime_global_allowlist(self, tmp_path):
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "config.toml").write_text('[providers.demo]\ntype = "openai"\n')
+
+        result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build(
+            tool_allowlist=["Read", "Grep", "mcp__bridge__complete_turn"]
+        )
+        parsed = tomllib.loads((result.home / "config.toml").read_text())
+
+        assert parsed["tools"]["enabled"] == [
+            "Read",
+            "Grep",
+            "mcp__bridge__complete_turn",
+        ]
+
+    def test_profile_tools_intersect_existing_runtime_allowlist(self, tmp_path):
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "config.toml").write_text(
+            '[tools]\nenabled = ["Read", "Bash", "mcp__bridge__*"]\n'
+            'disabled = ["mcp__bridge__dangerous"]\n'
+        )
+
+        result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build(
+            tool_allowlist=["Read", "Glob", "mcp__bridge__complete_turn"]
+        )
+        parsed = tomllib.loads((result.home / "config.toml").read_text())
+
+        assert parsed["tools"]["enabled"] == ["Read", "mcp__bridge__complete_turn"]
+        assert parsed["tools"]["disabled"] == ["mcp__bridge__dangerous"]
+
+    def test_disjoint_existing_and_profile_tools_fail_closed(self, tmp_path):
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "config.toml").write_text('[tools]\nenabled = ["Bash"]\n')
+
+        with pytest.raises(RuntimeHomeError, match="no overlap"):
+            KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build(tool_allowlist=["Read"])
+
+    def test_no_profile_tools_leave_runtime_config_unchanged(self, tmp_path):
+        source = tmp_path / "source"
+        source.mkdir()
+        original = '[tools]\nenabled = ["Bash"]\n'
+        (source / "config.toml").write_text(original)
+
+        result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build()
+
+        assert (result.home / "config.toml").read_text() == original
+
+    def test_no_profile_tools_keep_multiline_string_byte_for_byte(self, tmp_path):
+        """The no-tools path never rewrites, so even a ``[tools]``-looking
+        string body is carried across untouched."""
+
+        source = tmp_path / "source"
+        source.mkdir()
+        original = 'prompt = """\n[tools]\nenabled = ["Bash"]\n"""\n'
+        (source / "config.toml").write_text(original)
+
+        result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build()
+
+        assert (result.home / "config.toml").read_text() == original
+
+    def test_tools_header_inside_multiline_string_is_not_a_table(self, tmp_path):
+        """P1: a ``[tools]`` line inside a string is data, not a policy.
+
+        A text-matching rewrite injected ``enabled`` into the literal string
+        body, leaving the worker with no real global policy while the file still
+        looked written. The structural locator must ignore the string and
+        create a real table outside it.
+        """
+
+        source = tmp_path / "source"
+        source.mkdir()
+        string_value = 'prompt = """\n[tools]\nenabled = ["Bash"]\n"""\n'
+        (source / "config.toml").write_text(string_value + 'model = "x"\n')
+
+        result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build(
+            tool_allowlist=["Read", "Grep"]
+        )
+        rewritten = (result.home / "config.toml").read_text()
+        parsed = tomllib.loads(rewritten)
+
+        assert parsed["tools"]["enabled"] == ["Read", "Grep"]
+        assert parsed["prompt"] == '[tools]\nenabled = ["Bash"]\n'
+        assert parsed["model"] == "x"
+        assert rewritten.startswith(string_value)
+
+    def test_multiline_enabled_array_is_replaced_wholly(self, tmp_path):
+        """P2: replacing only the opening line corrupted a multi-line array."""
+
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "config.toml").write_text(
+            "[tools]\n"
+            "enabled = [\n"
+            '    "Read",\n'
+            '    "Bash",\n'
+            "]\n"
+            'disabled = ["mcp__bridge__dangerous"]\n'
+        )
+
+        result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build(
+            tool_allowlist=["Read", "Glob"]
+        )
+        rewritten = (result.home / "config.toml").read_text()
+        parsed = tomllib.loads(rewritten)
+
+        assert parsed["tools"]["enabled"] == ["Read"]
+        assert parsed["tools"]["disabled"] == ["mcp__bridge__dangerous"]
+        # The whole array span was replaced: no leftover element, no half-array.
+        assert '"Bash"' not in rewritten
+        assert "enabled = [\n" not in rewritten
+
+    def test_comment_mentioning_tools_is_not_a_table(self, tmp_path):
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "config.toml").write_text('# [tools]\n# enabled = ["Bash"]\nmodel = "x"\n')
+
+        result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build(
+            tool_allowlist=["Read"]
+        )
+        parsed = tomllib.loads((result.home / "config.toml").read_text())
+
+        assert parsed["tools"]["enabled"] == ["Read"]
+        assert parsed["model"] == "x"
+
+    def test_dotted_tools_table_is_extended_not_duplicated(self, tmp_path):
+        """A ``tools`` table declared through dotted keys gets the new key."""
+
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "config.toml").write_text(
+            'tools.disabled = ["mcp__bridge__dangerous"]\nmodel = "x"\n'
+        )
+
+        result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build(
+            tool_allowlist=["Read"]
+        )
+        parsed = tomllib.loads((result.home / "config.toml").read_text())
+
+        assert parsed["tools"]["enabled"] == ["Read"]
+        assert parsed["tools"]["disabled"] == ["mcp__bridge__dangerous"]
+        assert parsed["model"] == "x"
+
+    def test_nested_tools_table_is_not_the_top_level_table(self, tmp_path):
+        """``[tools.sub]`` must not be treated as ``[tools]``."""
+
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "config.toml").write_text("[tools.sub]\nx = 1\n")
+
+        result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build(
+            tool_allowlist=["Read"]
+        )
+        parsed = tomllib.loads((result.home / "config.toml").read_text())
+
+        assert parsed["tools"]["enabled"] == ["Read"]
+        assert parsed["tools"]["sub"] == {"x": 1}
+
+    def test_inline_tools_table_is_updated_structurally(self, tmp_path):
+        """Round-trip editing handles a valid inline tools table safely."""
+
+        source = tmp_path / "source"
+        source.mkdir()
+        original = 'tools = { disabled = ["Bash"] }\n'
+        (source / "config.toml").write_text(original)
+
+        result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build(
+            tool_allowlist=["Read"]
+        )
+        parsed = tomllib.loads((result.home / "config.toml").read_text())
+        assert parsed["tools"]["enabled"] == ["Read"]
+        assert parsed["tools"]["disabled"] == ["Bash"]
+
+    def test_glob_prefix_intersection_never_broadens_character_class(self):
+        """String-prefix ordering is invalid when either prefix is itself a glob."""
+
+        assert (
+            KimiCodeRuntimeHomeBuilder._tool_pattern_intersection(
+                "mcp__srv__[a*", "mcp__srv__[ab]*"
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        "original,expected_prompt",
+        [
+            ('prompt = """ends with quote""""\n', 'ends with quote"'),
+            ("prompt = '''ends with quote''''\n", "ends with quote'"),
+        ],
+    )
+    def test_multiline_string_quote_edges_remain_valid(self, tmp_path, original, expected_prompt):
+        """A valid quote adjacent to a multiline closing delimiter is preserved."""
+
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "config.toml").write_text(original + '[tools]\nenabled = ["Read", "Bash"]\n')
+
+        result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build(
+            tool_allowlist=["Read"]
+        )
+        parsed = tomllib.loads((result.home / "config.toml").read_text())
+        assert parsed["prompt"] == expected_prompt
+        assert parsed["tools"]["enabled"] == ["Read"]
+
+    def test_runtime_policy_writer_handles_short_writes(self, tmp_path, monkeypatch):
+        """Publishing loops until all policy bytes reach the temporary file."""
+
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "config.toml").write_text('model = "example"\n')
+
+        real_write = os.write
+
+        def short_write(fd, data):
+            return real_write(fd, data[: max(1, min(7, len(data)))])
+
+        monkeypatch.setattr(kimi_runtime_home_module.os, "write", short_write)
+        result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build(
+            tool_allowlist=["Read"]
+        )
+
+        parsed = tomllib.loads((result.home / "config.toml").read_text())
+        assert parsed["model"] == "example"
+        assert parsed["tools"]["enabled"] == ["Read"]
+
+    def test_runtime_policy_writer_fails_closed_on_zero_write(self, tmp_path, monkeypatch):
+        source = tmp_path / "source"
+        source.mkdir()
+        original = 'model = "example"\n'
+        (source / "config.toml").write_text(original)
+
+        calls = 0
+        real_write = os.write
+
+        def zero_after_prefix(fd, data):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return real_write(fd, data[: min(8, len(data))])
+            return 0
+
+        monkeypatch.setattr(kimi_runtime_home_module.os, "write", zero_after_prefix)
+        with pytest.raises(RuntimeHomeError, match="short write"):
+            KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build(tool_allowlist=["Read"])
+
+        # The copied runtime config is never atomically replaced with the
+        # truncated temporary policy document.
+        assert (tmp_path / "temp" / "kimi-home" / "config.toml").read_text() == original
+
+    def test_unrepresentable_empty_allowlist_fails_closed(self, tmp_path):
+        """An empty ``enabled`` means *unrestricted* in Kimi config, so a
+        deny-all profile list cannot be expressed and must not launch."""
+
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "config.toml").write_text('model = "x"\n')
+
+        with pytest.raises(RuntimeHomeError, match="empty allowlist"):
+            KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build(tool_allowlist=[])
+
+    def test_wildcard_allowlist_leaves_runtime_config_unchanged(self, tmp_path):
+        source = tmp_path / "source"
+        source.mkdir()
+        original = 'model = "x"\n'
+        (source / "config.toml").write_text(original)
+
+        result = KimiCodeRuntimeHomeBuilder(source, tmp_path / "temp").build(tool_allowlist=["*"])
+
+        assert (result.home / "config.toml").read_text() == original
+
+    def test_tomllib_fallback_binds_tomli_on_python_310(self):
+        """Python 3.10 has no ``tomllib``; the module must import ``tomli``.
+
+        The fallback is proven in a subprocess by hiding ``tomllib`` behind a
+        finder that raises and standing the real parser in for ``tomli``, so the
+        ``except ModuleNotFoundError`` branch actually executes.
+        """
+
+        script = textwrap.dedent("""
+            import sys
+            try:
+                import tomllib as real
+            except ModuleNotFoundError:
+                import tomli as real
+
+            sys.modules["tomli"] = real
+
+            class _NoTomllib:
+                def find_spec(self, name, path=None, target=None):
+                    if name == "tomllib":
+                        raise ModuleNotFoundError("No module named 'tomllib'")
+                    return None
+
+            sys.meta_path.insert(0, _NoTomllib())
+            for name in list(sys.modules):
+                if name == "tomllib" or name.startswith("tomllib."):
+                    del sys.modules[name]
+
+            import cli_agent_orchestrator.providers.kimi_runtime_home as krh
+
+            assert krh.tomllib is real, "fallback did not bind tomli"
+            print("fallback-ok")
+            """)
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "fallback-ok" in result.stdout
 
 
 # =============================================================================
@@ -2657,6 +3008,40 @@ class TestKimiLegacyUnchanged:
         command = provider._build_kimi_command()
         assert "--mcp-config" in command
         assert "CAO_TERMINAL_ID" in command
+
+    def test_legacy_mock_profile_tools_seam_stays_soft(self, tmp_path, monkeypatch):
+        """A pre-``tools`` mock profile must not become a hard tool policy.
+
+        Older seams build a ``MagicMock`` profile and never assign ``.tools``,
+        so the attribute is itself a ``MagicMock`` rather than a declared list.
+        Reading it as a policy would either fail closed or inject a bogus
+        ``tools`` table; only a concrete ``list`` may activate the native path.
+        """
+
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "config.toml").write_text('model = "x"\n')
+        provider = _code_provider("term-mock-tools")
+        provider._kimi_source_home = source
+        provider._agent_profile = "developer"
+        profile = MagicMock()
+        profile.system_prompt = "hello"
+        profile.model = None
+        profile.mcpServers = None
+        # Deliberately not assigning ``profile.tools``: the legacy mock shape.
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.kimi_cli.load_agent_profile",
+            lambda _name: profile,
+        )
+
+        command = provider._build_kimi_code_command()
+
+        assert "--agent-file" in command
+        runtime_config = (provider._managed_runtime_home() / "config.toml").read_text()
+        assert runtime_config == 'model = "x"\n'
+        rendered = provider._render_markdown_agent(profile)
+        assert rendered is not None
+        assert "tools:" not in rendered
 
     def test_legacy_uses_temp_cwd_not_real_cwd(self):
         provider = KimiCliProvider("term-legacy5", "s", "w")

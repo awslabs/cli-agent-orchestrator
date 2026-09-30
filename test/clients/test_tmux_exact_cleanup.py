@@ -36,6 +36,8 @@ def _show_options(*lines):
 
     def cmd(*args):
         result = MagicMock()
+        result.returncode = 0
+        result.stderr = []
         result.stdout = list(lines)
         return result
 
@@ -97,6 +99,27 @@ class SwitchableSession:
 
 
 class TestReplacementIsNeverTouched:
+    @pytest.mark.parametrize("scope", ["window", "pane"])
+    def test_unreadable_scoped_identity_is_unknown_even_after_rename(self, tmux, scope):
+        renamed = window(name="renamed-live-window")
+        target = renamed
+        if scope == "pane":
+            target = pane()
+            renamed.panes = [target]
+        failure = MagicMock()
+        failure.returncode = 1
+        failure.stderr = ["server temporarily unavailable"]
+        failure.stdout = []
+        target.cmd.side_effect = None
+        target.cmd.return_value = failure
+        use(tmux, session(windows=[renamed]))
+
+        result = tmux.cleanup_terminal_exact("existing-terminal", SESSION, WINDOW, close=False)
+
+        assert result.outcome is TerminalCleanupOutcome.UNKNOWN
+        renamed.kill.assert_not_called()
+        target.kill.assert_not_called()
+
     def test_a_replacement_reusing_the_window_name_is_not_closed(self, tmux):
         replacement = window(name=WINDOW, terminal_id="tid-new", panes=[pane("%9")])
         use(tmux, session(windows=[replacement]))

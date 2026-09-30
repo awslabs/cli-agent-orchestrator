@@ -283,6 +283,7 @@ class TestCreateTerminal:
             working_directory=os.path.realpath(os.getcwd()),
             deferred_init_external_owner=False,
             session_incarnation_id=result.session_incarnation_id,
+            new_session_incarnation=True,
             idempotency_key=None,
             # No key supplied, so no fingerprint is computed (review on PR #634).
             request_fingerprint=None,
@@ -523,7 +524,7 @@ class TestCreateTerminal:
         incarnation = terminal_service._resolve_existing_session_incarnation_locked("cao-reused")
 
         assert incarnation == "inc-current"
-        update.assert_not_called()
+        update.assert_called_once_with([], incarnation, session_name="cao-reused")
 
     def test_existing_session_incarnation_backfills_legacy_live_rows(self, monkeypatch):
         from cli_agent_orchestrator.services import terminal_service
@@ -557,7 +558,9 @@ class TestCreateTerminal:
         incarnation = terminal_service._resolve_existing_session_incarnation_locked("cao-legacy")
 
         assert incarnation
-        update.assert_called_once_with(["legacy-live-a", "legacy-live-b"], incarnation)
+        update.assert_called_once_with(
+            ["legacy-live-a", "legacy-live-b"], incarnation, session_name="cao-legacy"
+        )
 
     def test_existing_session_incarnation_conflict_fails_closed(self, monkeypatch):
         from cli_agent_orchestrator.services import terminal_service
@@ -2354,6 +2357,7 @@ class TestSendInput:
         send_input("test1234", "hello worker")
 
         mock_provider.mark_input_received.assert_called_once()
+        mock_provider.record_dispatched_message.assert_called_once_with("hello worker")
         mock_status_monitor.notify_input_sent.assert_called_once_with("test1234")
         # The active provider receives the same explicit buffer-generation
         # boundary, so stateful detectors never compare post-dispatch output
@@ -2370,6 +2374,7 @@ class TestSendInput:
         manager = MagicMock()
         manager.attach_mock(mock_status_monitor.clear_rolling_buffer, "clear")
         manager.attach_mock(mock_provider.mark_input_received, "mark_input")
+        manager.attach_mock(mock_provider.record_dispatched_message, "record_message")
         manager.attach_mock(mock_tmux.send_keys, "send_keys")
         # Re-run with the manager wired in to capture ordered calls.
         mock_status_monitor.reset_mock()
@@ -2378,11 +2383,15 @@ class TestSendInput:
         manager.reset_mock()
         manager.attach_mock(mock_status_monitor.clear_rolling_buffer, "clear")
         manager.attach_mock(mock_provider.mark_input_received, "mark_input")
+        manager.attach_mock(mock_provider.record_dispatched_message, "record_message")
         manager.attach_mock(mock_tmux.send_keys, "send_keys")
         send_input("test1234", "hello again")
         ordered = [c[0] for c in manager.mock_calls]
         assert (
-            ordered.index("clear") < ordered.index("mark_input") < ordered.index("send_keys")
+            ordered.index("clear")
+            < ordered.index("mark_input")
+            < ordered.index("record_message")
+            < ordered.index("send_keys")
         ), f"clear and mark_input must precede send_keys; got order {ordered}"
 
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")

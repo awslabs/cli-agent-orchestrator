@@ -33,7 +33,11 @@ from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.session_service import list_current_session_terminals
 from cli_agent_orchestrator.services.status_monitor import status_monitor
-from cli_agent_orchestrator.services.terminal_service import create_terminal, send_input
+from cli_agent_orchestrator.services.terminal_service import (
+    create_terminal,
+    send_input,
+    should_retain_deferred_failure_tombstone,
+)
 from cli_agent_orchestrator.utils.template import render_template
 
 logger = logging.getLogger(__name__)
@@ -334,14 +338,23 @@ async def execute_flow(name: str) -> bool:
             # still in use.  Do not create a same-named flow session until those
             # rows have been retried: doing so would abandon their only cleanup
             # handle and could collide with the deterministic GROK_HOME path.
+            # The absent-backend view is raw history, including tombstones
+            # whose external owners have not acknowledged their failures.
+            cleanup_rows = [
+                terminal_metadata
+                for terminal_metadata in terminals
+                if not should_retain_deferred_failure_tombstone(
+                    str(terminal_metadata["id"]), terminal_metadata
+                )
+            ]
             cleanup_complete = True
-            for terminal_metadata in terminals:
+            for terminal_metadata in cleanup_rows:
                 if provider_manager.cleanup_provider(terminal_metadata["id"]) is False:
                     cleanup_complete = False
             if not cleanup_complete:
                 logger.warning("Flow %s has retained terminal cleanup; deferring next run", name)
                 return False
-            delete_terminals_by_ids([str(t["id"]) for t in terminals])
+            delete_terminals_by_ids([str(t["id"]) for t in cleanup_rows])
         terminal = await create_terminal(
             session_name=session_name,
             provider=flow.provider,

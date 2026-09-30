@@ -126,6 +126,47 @@ env GROK_SUBAGENTS=0 GROK_WORKFLOWS=0 GROK_GOAL=0 \
   picker to be the newest thing on screen: status is read from an append-only
   raw buffer, so a picker a later frame erased or a transcript that quotes one
   loses to the newer processing frame and the turn keeps running.
+- A stale raw-FIFO `Waiting for response…` marker can outlive the turn it came
+  from (#813). For a quiet terminal stuck on PROCESSING, CAO re-checks the
+  rendered pane and honors a ready verdict only after two matching reads, and
+  only when PROCESSING was re-established from provider evidence after the last
+  dispatch. A full re-delivery of a dropped paste is another delivery attempt
+  of the same logical turn rather than a new turn, so a genuinely successful
+  resend can still complete even though it is the second paste CAO sent.
+  Grok Build 1.0.41 can paint a right-edge scrollbar beside the completion
+  marker and across blank rows. Rendered recovery removes that scrollbar and
+  its cell padding only when the composer width and repeated blank rows agree;
+  response extraction uses display-cell widths to preserve Unicode text.
+  When a per-cell redraw omits the query marker, an exact echo of the dispatched
+  text followed by busy chrome can establish the current query. The completed
+  pane must still show that same distinct query; clock suffixes do not establish
+  a new query or turn.
+- Completion attribution requires an independently attributable current-turn
+  signal; a busy frame is not one. A completion is attributed to the current
+  turn after a dispatch reset only when its query differs from the predecessor's
+  query and matches attributable current processing evidence. Within the SAME
+  buffer generation, an advanced stream position can establish a later
+  completion. Grok can emit the busy frame
+  and the finished frame in one FIFO burst, so a busy frame cannot be required
+  either — but neither can it stand in for ownership. A dropped paste whose old
+  busy frame and old finished frame are replayed after the dispatch boundary
+  produces exactly the bytes of a genuine byte-identical repeat, and the rolling
+  stream coordinate space restarts at that reset, so neither the generation
+  change nor the spinner proves which turn drew them.
+- Completion fingerprints ignore whitespace so raw cursor-positioned output and
+  rendered panes, including indentation and wrapping changes, identify the same
+  completion. Whitespace alone cannot prove that another turn ran.
+- The safety trade-off for that rule is explicit: a repeated query separated by
+  a dispatch-boundary reset stays PROCESSING even if the answer or duration
+  changes. Raw streams retain transient busy chrome that rendered panes erase,
+  so a changed fingerprint cannot prove a new turn. Prefix-related query
+  fragments are also ambiguous: a shorter visible line may be a soft-wrapped
+  predecessor query. Such queries, and unmatched queries without attributable
+  processing evidence, stay PROCESSING. CAO prefers to fail closed
+  here and let its dropped-paste re-delivery and timeout paths decide, rather
+  than ever report a turn that may never have run. The first turn is exempt (it
+  has no predecessor) and is the #813 recovery case itself; a replay that brings
+  only the old screen back with no fresh generation still reads PROCESSING.
 
 ### Native workflow opt-in
 
