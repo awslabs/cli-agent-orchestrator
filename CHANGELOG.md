@@ -47,6 +47,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Workflow script run-step refusals now retain their typed reason in run
+  records.** When a structured HTTP error includes a string `detail.kind`,
+  `ShimHTTPError` includes that kind and its optional message in the exception
+  text, so replay divergence, decision-required halts, worker errors, and
+  timeouts remain distinguishable after an uncaught exception reaches the
+  script's stderr tail. Unstructured responses keep the previous message.
+  (#830)
+
 - **OpenCode agents whose display name contains spaces never reported COMPLETED.**
   The completion marker read the agent name as one `\S+` token, so a marker such
   as `▣  Sisyphus - Ultraworker · Big Pickle · 3.1s` never matched and every
