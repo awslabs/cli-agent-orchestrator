@@ -387,7 +387,29 @@ async def _finish_launch(
             session_id=launched.session_name, session_name=launched.session_name
         ),
     )
-    return await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
+    try:
+        return await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
+    except Exception:  # noqa: BLE001 - the launch is recorded: never report it failed
+        # Committed and running: a failed read-back must not turn it into an
+        # error the caller might retry (a second agent). Answer from the record.
+        logger.warning("could not read back launched terminal %s", terminal_id, exc_info=True)
+        return Terminal(
+            id=terminal_id,
+            name=launched.name,
+            provider=launched.provider,
+            session_name=launched.session_name,
+            agent_profile=launched.agent_profile,
+            caller_id=None,
+            allowed_tools=launched.allowed_tools,
+            engine=launched.engine,
+            shell_command=None,
+            group=None,
+            metadata=None,
+            status=runtime_registry.get_status(terminal_id, runtime_id),
+            last_active=None,
+            deferred_init_failure=None,
+            session_incarnation_id=None,
+        ).model_dump(mode="json")
 
 
 @router.post(

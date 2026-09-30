@@ -1392,3 +1392,24 @@ class TestLaunchTimeout:
         response, elapsed = asyncio.run(scenario())
         assert response.status_code == 504, response.text
         assert elapsed < 5, f"took {elapsed:.1f}s: the configured deadline was not used"
+
+
+class TestLaunchReadBack:
+    def test_a_recorded_launch_is_reported_even_if_reading_it_back_fails(
+        self, http, start_runtime, monkeypatch
+    ):
+        start_runtime(script=_answer)
+
+        def flaky(terminal_id):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(terminal_service, "get_terminal", flaky)
+        response = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
+        assert response.status_code == 201, response.text
+        body = response.json()
+        assert (body["id"], body["session_name"], body["provider"]) == (
+            "beef0001",
+            "cao-beef",
+            "mock_cli",
+        )
+        assert database.get_terminal_metadata("beef0001") is not None
