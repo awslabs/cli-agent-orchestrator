@@ -2681,10 +2681,18 @@ def delete_terminal(terminal_id: str) -> bool:
 
 
 def delete_terminals_by_session(tmux_session: str) -> int:
-    """Delete all terminals in a session."""
+    """Delete all local terminals in a session.
+
+    Its callers sweep rows a dead local tmux session left behind. A row whose
+    terminal runs in an execution runtime (#745) is never such a row, so it is
+    kept even when the names match.
+    """
     with SessionLocal() as db:
         deleted = (
-            db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).delete()
+            db.query(TerminalModel)
+            .filter(TerminalModel.tmux_session == tmux_session)
+            .filter(TerminalModel.runtime_id.is_(None))
+            .delete()
         )
         db.commit()
         return deleted

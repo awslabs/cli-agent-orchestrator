@@ -87,6 +87,7 @@ The server never resends a command by itself.
   exits on either rather than retrying.
 - The token is read once from `CAO_RUNTIME_TOKEN_FILE`, or from
   `CAO_RUNTIME_TOKEN`, which is then removed from the process environment.
+  `cao-server` reads it first thing at startup, before any event plugin loads.
   tmux never passes `CAO_RUNTIME_TOKEN` to a pane. The EKS image's entrypoint
   removes it before its setup steps (`cao init`, `cao install`, the provider
   warm-up) and passes it only to the `cao-bridge` or `cao-server` it finally
