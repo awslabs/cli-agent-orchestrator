@@ -66,6 +66,8 @@ class Bridge:
         self._terminal_locks: Dict[str, Tuple[asyncio.Lock, int]] = {}
         # launch op id -> set once that launch has settled (see handle()).
         self._launches: Dict[str, asyncio.Event] = {}
+        # Whether the current connection completed its hello (see run()).
+        self._helloed = False
         # Results that could not be sent (no channel at the time), delivered
         # after the next hello: the server acts on results it no longer awaits.
         self._unsent: List[Result] = []
@@ -263,6 +265,7 @@ class Bridge:
                 f"this runtime {PROTOCOL_VERSION}"
             )
         self._ws = ws
+        self._helloed = True
         self._mark_ready(True)
         logger.info("runtime %s connected to %s", self.runtime_id, self.server_url)
         # Everything from here on runs inside the guard: however the connected
@@ -292,14 +295,13 @@ class Bridge:
         backoff = BACKOFF_INITIAL
         self._mark_ready(False)
         while not self._stop.is_set():
-            established = False
+            self._helloed = False
             try:
                 async with connect(
                     self.server_url,
                     additional_headers={TOKEN_HEADER: self._token},
                     max_size=16 * 1024 * 1024,
                 ) as ws:
-                    established = True
                     await self.serve(ws)
             except ChannelRefused:
                 raise
@@ -313,7 +315,9 @@ class Bridge:
                 raise
             except Exception as exc:  # noqa: BLE001 - network errors are retried
                 logger.warning("runtime channel lost: %s", exc)
-            if established:
+            if self._helloed:
+                # Only a completed hello: a server that accepts the upgrade and
+                # then drops the channel still backs off exponentially.
                 backoff = BACKOFF_INITIAL
             if self._stop.is_set():
                 break

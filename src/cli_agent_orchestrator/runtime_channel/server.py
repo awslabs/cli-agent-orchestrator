@@ -67,6 +67,11 @@ router = APIRouter()
 
 # Strong references to teardown tasks: the event loop keeps only weak ones.
 _teardowns: Set["asyncio.Task[None]"] = set()
+# A runtime may defer deleting a terminal (its cleanup is not done yet). For one
+# the server never recorded, no row would route a later retry, so the delete
+# is retried here: up to this many attempts, doubling the delay from this.
+UNRECORDED_RETRIES = 6
+UNRECORDED_RETRY_DELAY = 5.0
 # Likewise for launch settlements that outlive a cancelled request.
 _settlements: Set["asyncio.Task[Dict[str, Any]]"] = set()
 
@@ -91,10 +96,27 @@ def _delete_unrecorded(conn: RuntimeConnection, terminal_id: str) -> None:
             conn.runtime_id,
             terminal_id,
         )
-        try:
-            await conn.call(CommandType.DELETE, {}, terminal_id=terminal_id)
-        except RemoteRuntimeError as exc:
-            logger.warning("could not delete unrecorded terminal %s: %s", terminal_id, exc)
+        delay = UNRECORDED_RETRY_DELAY
+        for attempt in range(1, UNRECORDED_RETRIES + 1):
+            try:
+                result = await conn.call(CommandType.DELETE, {}, terminal_id=terminal_id)
+            except RemoteRuntimeError as exc:
+                # Gone with its connection; the next hello lists it again.
+                logger.warning("could not delete unrecorded terminal %s: %s", terminal_id, exc)
+                return
+            if result.get("deleted"):
+                return
+            # Deferred by the runtime. No row routes a later retry, so retry here.
+            if attempt < UNRECORDED_RETRIES:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60.0)
+        logger.warning(
+            "runtime %s deferred deleting unrecorded terminal %s %d times; it is deleted "
+            "once the runtime next reconnects",
+            conn.runtime_id,
+            terminal_id,
+            UNRECORDED_RETRIES,
+        )
 
     task = asyncio.create_task(run())
     _teardowns.add(task)
