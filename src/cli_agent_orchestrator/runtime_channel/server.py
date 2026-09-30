@@ -374,19 +374,21 @@ async def launch_on_runtime(
 ) -> Dict[str, Any]:
     """Launch a terminal in a connected execution runtime."""
     conn = runtime_registry.connection(runtime_id)
-    try:
-        if conn is None:
-            raise RuntimeUnavailableError(f"runtime {runtime_id} is not connected")
-        result = await conn.call(
-            CommandType.LAUNCH, body.model_dump(exclude_none=True), timeout=LAUNCH_TIMEOUT
+    if conn is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"runtime {runtime_id} is not connected",
         )
-    except RemoteRuntimeError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc))
 
-    raw = result.get("terminal")
-    reserved = raw.get("id") if isinstance(raw, dict) else None
-
-    async def settle() -> Dict[str, Any]:
+    async def launch_and_settle() -> Dict[str, Any]:
+        try:
+            result = await conn.call(
+                CommandType.LAUNCH, body.model_dump(exclude_none=True), timeout=LAUNCH_TIMEOUT
+            )
+        except RemoteRuntimeError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc))
+        raw = result.get("terminal")
+        reserved = raw.get("id") if isinstance(raw, dict) else None
         try:
             return await _finish_launch(request, runtime_id, body, conn, raw)
         finally:
@@ -394,13 +396,15 @@ async def launch_on_runtime(
             if isinstance(reserved, str):
                 runtime_registry.release(reserved, runtime_id)
 
-    # The agent runs from here on, so recording it (or undoing it) must finish
-    # even if this request is cancelled: shielded, in its own task.
-    settlement = asyncio.ensure_future(settle())
-    _settlements.add(settlement)
-    settlement.add_done_callback(_settlements.discard)
-    settlement.add_done_callback(lambda done: done.cancelled() or done.exception())
-    return await asyncio.shield(settlement)
+    # From the moment the command is sent, the runtime may start an agent: the
+    # launch and its settlement (record it, or undo it) are one task, shielded
+    # from this request's cancellation, so a client that goes away can never
+    # leave an agent running unrecorded, or a reservation behind.
+    operation = asyncio.ensure_future(launch_and_settle())
+    _settlements.add(operation)
+    operation.add_done_callback(_settlements.discard)
+    operation.add_done_callback(lambda done: done.cancelled() or done.exception())
+    return await asyncio.shield(operation)
 
 
 @router.get("/runtimes")
