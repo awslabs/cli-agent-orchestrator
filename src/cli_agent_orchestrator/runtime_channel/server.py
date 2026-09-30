@@ -158,7 +158,9 @@ def _delete_unrecorded(conn: RuntimeConnection, terminal_id: str) -> None:
 @router.websocket("/runtime/channel")
 async def runtime_channel(ws: WebSocket) -> None:
     if not _token_matches(ws.headers.get(TOKEN_HEADER, "")):
-        # Closing before accept fails the handshake (HTTP 403).
+        # Closing before accept() rejects the handshake itself: the ASGI server
+        # answers the upgrade request with HTTP 403 (no WebSocket, so the close
+        # code is never sent). The tests and `cao-bridge` rely on that 403.
         await ws.close(code=status.WS_1008_POLICY_VIOLATION)
         return
     await ws.accept()
