@@ -86,7 +86,9 @@ and the server's stale-row and retention sweeps leave remote rows alone.
 | `504` | Sent, but no result arrived (timeout or disconnect). The outcome is unknown. | only if repeating the operation is harmless |
 | `502` | The runtime ran the command and reported a failure; the detail carries its reason. | depends on the reason |
 
-The server never resends a command by itself.
+The server never resends a caller's command by itself. Its own compensating
+`delete` of a terminal it has no record of is the exception: that one is
+retried until the runtime confirms it (see [Commands](#commands)).
 
 ## Security
 
