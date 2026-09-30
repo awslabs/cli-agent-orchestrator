@@ -596,3 +596,45 @@ def test_every_reconnect_closes_its_own_stream(runner):
     # BOTH the dropped stream and the reconnected one were closed.
     dropped.close.assert_called()
     final.close.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# A missing credential is fatal, not a reconnect (review of #838).
+# ---------------------------------------------------------------------------
+def test_missing_credential_during_follow_exits_1_with_the_message(runner):
+    """``api_http`` raises AuthNotConfiguredError for a local 401 with no bearer.
+    It is a RequestException, so the reconnect handler used to retry it and the
+    final status read then swallowed it into ``stream ended`` with exit 0. It
+    must fail loudly and once."""
+    from cli_agent_orchestrator.utils import api_http
+
+    with (
+        patch(
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
+            side_effect=api_http.AuthNotConfiguredError(api_http.NO_TOKEN_MESSAGE),
+        ) as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
+    ):
+        result = runner.invoke(workflow, ["events", "run1"])
+    assert result.exit_code == 1
+    assert "CAO_AUTH_LOCAL_TOKEN" in result.output
+    assert mock_get.call_count == 1, "the auth failure must not be retried"
+
+
+def test_missing_credential_on_the_final_status_read_exits_1(runner):
+    """The stream ends without a terminal frame and the final status read is the
+    call that meets the 401: still exit 1, not ``stream ended``."""
+    from cli_agent_orchestrator.utils import api_http
+
+    stream = _stream_resp(_event_frame(1, "step.completed", "s1", "completed"))
+    with (
+        patch(
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
+            side_effect=[stream, api_http.AuthNotConfiguredError(api_http.NO_TOKEN_MESSAGE)],
+        ),
+        _HUMAN,
+    ):
+        result = runner.invoke(workflow, ["events", "run1"])
+    assert result.exit_code == 1
+    assert "CAO_AUTH_LOCAL_TOKEN" in result.output
+    assert "stream ended" not in result.output

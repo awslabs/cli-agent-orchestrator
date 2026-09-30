@@ -42,19 +42,34 @@ export function SettingsPanel() {
   const [tokenInput, setTokenInput] = useState('')
   const [hasToken, setHasToken] = useState(() => getToken() !== null)
 
+  const { showSnackbar } = useStore()
+
+  // The token card is rendered whether or not the protected settings loaded:
+  // on an auth-enabled server the very first thing a user needs is a place to
+  // enter the token, and that is exactly when `getAgentDirs()` answers 401.
+  // After the token changes, the protected loads are retried.
   const saveToken = () => {
     if (!tokenInput.trim()) return
-    setToken(tokenInput)
+    if (!setToken(tokenInput)) {
+      showSnackbar({ type: 'error', message: 'Could not store the access token in this tab (storage unavailable)' })
+      return
+    }
     setTokenInput('')
     setHasToken(true)
     showSnackbar({ type: 'success', message: 'Access token set for this tab' })
+    load()
+    refreshProfiles()
   }
   const clearToken = () => {
-    setToken(null)
+    if (!setToken(null)) {
+      showSnackbar({ type: 'error', message: 'Could not clear the access token (storage unavailable)' })
+      return
+    }
     setHasToken(false)
     showSnackbar({ type: 'info', message: 'Access token cleared' })
+    load()
+    refreshProfiles()
   }
-  const { showSnackbar } = useStore()
 
   const load = async () => {
     try {
@@ -97,8 +112,63 @@ export function SettingsPanel() {
     }
   }
 
+  const tokenCard = (
+    <div className="bg-gray-800/60 border border-gray-700/50 rounded-xl p-5" data-testid="access-token-card">
+      <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide mb-4">
+        Server Access Token
+      </h3>
+      <p className="text-xs text-gray-500 mb-4">
+        Only needed when the cao-server runs with authentication. The token is sent as{' '}
+        <code className="text-gray-400">Authorization: Bearer</code> on every request and on the
+        terminal WebSocket handshake. It is kept for this browser tab only (sessionStorage) and
+        discarded when the tab closes. You can also open the UI as{' '}
+        <code className="text-gray-400">/#token=…</code> to set it.
+      </p>
+      <div className="flex gap-2">
+        <input
+          type="password"
+          value={tokenInput}
+          onChange={e => setTokenInput(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && saveToken()}
+          placeholder={hasToken ? 'Token set for this tab' : 'Paste the server token'}
+          autoComplete="off"
+          data-testid="access-token-input"
+          className="flex-1 bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 font-mono focus:border-emerald-500 focus:outline-none"
+        />
+        <button
+          onClick={saveToken}
+          disabled={!tokenInput.trim()}
+          data-testid="access-token-save"
+          className="flex items-center gap-1.5 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-white text-sm px-4 py-2.5 rounded-lg transition-colors"
+        >
+          Save
+        </button>
+        <button
+          onClick={clearToken}
+          disabled={!hasToken}
+          data-testid="access-token-clear"
+          className="flex items-center gap-1.5 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-white text-sm px-4 py-2.5 rounded-lg transition-colors"
+        >
+          Clear
+        </button>
+      </div>
+      <p className="text-xs text-gray-500 mt-3" data-testid="access-token-state">
+        {hasToken ? 'A token is set for this tab.' : 'No token set; requests are sent without a bearer.'}
+      </p>
+    </div>
+  )
+
   if (!settings) {
-    return <div className="text-gray-500 text-sm py-8 text-center">Loading settings...</div>
+    return (
+      <div className="space-y-6">
+        {tokenCard}
+        <div className="text-gray-500 text-sm py-8 text-center" data-testid="settings-loading">
+          {hasToken
+            ? 'Loading settings...'
+            : 'Loading settings... If this server requires authentication, set the access token above.'}
+        </div>
+      </div>
+    )
   }
 
   const disabled = new Set(settings.disabled_dirs ?? [])
@@ -230,49 +300,7 @@ export function SettingsPanel() {
         )}
       </div>
 
-      <div className="bg-gray-800/60 border border-gray-700/50 rounded-xl p-5" data-testid="access-token-card">
-        <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide mb-4">
-          Server Access Token
-        </h3>
-        <p className="text-xs text-gray-500 mb-4">
-          Only needed when the cao-server runs with authentication. The token is sent as{' '}
-          <code className="text-gray-400">Authorization: Bearer</code> on every request and on the
-          terminal WebSocket handshake. It is kept for this browser tab only (sessionStorage) and
-          discarded when the tab closes. You can also open the UI as{' '}
-          <code className="text-gray-400">/#token=…</code> to set it.
-        </p>
-        <div className="flex gap-2">
-          <input
-            type="password"
-            value={tokenInput}
-            onChange={e => setTokenInput(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && saveToken()}
-            placeholder={hasToken ? 'Token set for this tab' : 'Paste the server token'}
-            autoComplete="off"
-            data-testid="access-token-input"
-            className="flex-1 bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 font-mono focus:border-emerald-500 focus:outline-none"
-          />
-          <button
-            onClick={saveToken}
-            disabled={!tokenInput.trim()}
-            data-testid="access-token-save"
-            className="flex items-center gap-1.5 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-white text-sm px-4 py-2.5 rounded-lg transition-colors"
-          >
-            Save
-          </button>
-          <button
-            onClick={clearToken}
-            disabled={!hasToken}
-            data-testid="access-token-clear"
-            className="flex items-center gap-1.5 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-white text-sm px-4 py-2.5 rounded-lg transition-colors"
-          >
-            Clear
-          </button>
-        </div>
-        <p className="text-xs text-gray-500 mt-3" data-testid="access-token-state">
-          {hasToken ? 'A token is set for this tab.' : 'No token set; requests are sent without a bearer.'}
-        </p>
-      </div>
+      {tokenCard}
 
       <div className="flex items-center gap-3">
         <button

@@ -85,3 +85,56 @@ describe('auth token for an auth-enabled server (#807)', () => {
     expect(eventStreamUrl('r1', 5)).toBe('/workflows/runs/r1/events?after_seq=5&access_token=t1')
   })
 })
+
+/** jsdom's sessionStorage is a proxy, so spies on Storage.prototype do not
+ * intercept it; stand in a Map-backed fake whose write paths can be made to
+ * throw or to no-op. */
+function fakeStorage(opts: { setThrows?: boolean; setNoop?: boolean; removeThrows?: boolean } = {}) {
+  const map = new Map<string, string>()
+  return {
+    getItem: (k: string) => (map.has(k) ? map.get(k)! : null),
+    setItem: (k: string, v: string) => {
+      if (opts.setThrows) throw new DOMException('denied', 'SecurityError')
+      if (opts.setNoop) return
+      map.set(k, v)
+    },
+    removeItem: (k: string) => {
+      if (opts.removeThrows) throw new DOMException('denied', 'SecurityError')
+      map.delete(k)
+    },
+    clear: () => map.clear(),
+    key: (i: number) => Array.from(map.keys())[i] ?? null,
+    get length() {
+      return map.size
+    },
+  }
+}
+
+describe('token storage failures are reported, not hidden (#838 review)', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('setToken returns false when storage throws and leaves no token', () => {
+    vi.stubGlobal('sessionStorage', fakeStorage({ setThrows: true }))
+    expect(setToken('t1')).toBe(false)
+    expect(getToken()).toBeNull()
+  })
+
+  it('setToken returns false when the write silently did not stick', () => {
+    vi.stubGlobal('sessionStorage', fakeStorage({ setNoop: true }))
+    expect(setToken('t1')).toBe(false)
+  })
+
+  it('clearing returns false when removal throws', () => {
+    vi.stubGlobal('sessionStorage', fakeStorage({ removeThrows: true }))
+    expect(setToken('t1')).toBe(true)
+    expect(setToken(null)).toBe(false)
+    expect(getToken()).toBe('t1')
+  })
+
+  it('a fragment token that cannot be stored is left in the URL', () => {
+    vi.stubGlobal('sessionStorage', fakeStorage({ setThrows: true }))
+    history.replaceState(null, '', '/#token=abc')
+    expect(captureTokenFromFragment()).toBe(false)
+    expect(location.hash).toBe('#token=abc')
+  })
+})

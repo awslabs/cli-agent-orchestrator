@@ -145,3 +145,26 @@ class TestSurface:
         assert api_http.exceptions is requests.exceptions
         assert api_http.Response is requests.Response
         assert issubclass(api_http.AuthNotConfiguredError, requests.exceptions.RequestException)
+
+
+class TestCallerHeaderCaseInsensitivity:
+    """HTTP header names are case-insensitive and Requests folds them. A caller's
+    ``authorization`` in ANY spelling must win over the node credential, and must
+    count as "a bearer was sent" for the 401 rule."""
+
+    @pytest.mark.parametrize("spelling", ["Authorization", "authorization", "AUTHORIZATION"])
+    def test_caller_credential_wins_in_every_spelling(self, auth_on, spelling):
+        with patch.object(requests, "get") as real:
+            real.return_value = MagicMock(status_code=200)
+            api_http.get(LOCAL, headers={spelling: "Bearer mine"})
+        sent = real.call_args.kwargs["headers"]
+        assert list(sent.keys()) == [spelling]
+        assert sent[spelling] == "Bearer mine"
+
+    @pytest.mark.parametrize("spelling", ["authorization", "AUTHORIZATION"])
+    def test_a_caller_bearer_in_any_spelling_suppresses_the_401_message(
+        self, auth_on_no_token, spelling
+    ):
+        with patch.object(requests, "get") as real:
+            real.return_value = MagicMock(status_code=401)
+            assert api_http.get(LOCAL, headers={spelling: "Bearer mine"}).status_code == 401

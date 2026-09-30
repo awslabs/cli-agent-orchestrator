@@ -35,6 +35,7 @@ from typing import Any, Dict, Optional
 
 import requests
 from requests import Response, exceptions  # noqa: F401  (re-exported for the commands)
+from requests.structures import CaseInsensitiveDict
 
 from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.security.auth import get_local_bearer
@@ -98,14 +99,19 @@ NO_TOKEN_MESSAGE = (
 
 
 def _send(method: str, url: str, **kwargs: Any) -> Response:
-    headers: Dict[str, str] = dict(kwargs.pop("headers", None) or {})
+    # Case-insensitive on purpose: HTTP header names are, and Requests folds
+    # them when it prepares the request. A caller's ``authorization`` (any
+    # spelling) must win over the node credential; a plain dict would add a
+    # second key and let Requests' normalisation pick the wrong one.
+    headers: CaseInsensitiveDict = CaseInsensitiveDict(kwargs.pop("headers", None) or {})
     for key, value in auth_headers_for(url).items():
-        headers.setdefault(key, value)
+        if key not in headers:
+            headers[key] = value
     # ``requests.<verb>`` rather than ``requests.request`` so a test that patches
     # ``requests.get`` globally still intercepts the call.
     verb = getattr(requests, method.lower())
-    response = verb(url, headers=headers or None, **kwargs)
-    sent_bearer = any(k.lower() == "authorization" for k in headers)
+    response = verb(url, headers=dict(headers) or None, **kwargs)
+    sent_bearer = "authorization" in headers
     if response.status_code == 401 and is_local_api(url) and not sent_bearer:
         raise AuthNotConfiguredError(NO_TOKEN_MESSAGE, response=response)
     return response

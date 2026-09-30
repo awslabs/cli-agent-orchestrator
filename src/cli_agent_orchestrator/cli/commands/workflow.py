@@ -1110,6 +1110,10 @@ def _final_events_status(run_id: str):
         response = api_http.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=MCP_REQUEST_TIMEOUT
         )
+    except api_http.AuthNotConfiguredError as exc:
+        # A missing credential is not a lost socket: surface it (exit 1) rather
+        # than answering "not terminal" and letting the follow end with exit 0.
+        raise click.ClickException(str(exc)) from exc
     except api_http.exceptions.RequestException:
         return None
     if response.status_code != 200:
@@ -1217,6 +1221,12 @@ def events_cmd(run_id, follow, after_seq, as_json):
                         terminal_state = frame.terminal_state
                         saw_terminal = True
                         break
+            except api_http.AuthNotConfiguredError as exc:
+                # Not a dropped connection: the server wants a bearer and this
+                # shell has none to send. Retrying cannot change that, and the
+                # final status read would swallow it into ``stream_ended`` with
+                # exit 0. Fail loudly with the actionable message instead.
+                raise click.ClickException(str(exc)) from exc
             except api_http.exceptions.RequestException:
                 # A dropped connection is not run death — reconnect from the last
                 # seen seq (exact resume), bounded so a flapping stream cannot spin

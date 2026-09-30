@@ -1167,7 +1167,7 @@ def test_launch_gate_warns_when_the_installed_kiro_agent_predates_native_enforce
 def test_launch_yolo_on_kiro_says_it_does_not_widen_the_tool_set():
     runner = CliRunner()
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
     ):
         mock_post.return_value.json.return_value = {"session_name": "s", "name": "t"}

@@ -32,21 +32,32 @@ export function getToken(): string | null {
   }
 }
 
-/** Store (or, with null / empty, clear) the token for this tab. */
-export function setToken(token: string | null): void {
+/**
+ * Store (or, with null / empty, clear) the token for this tab.
+ *
+ * Returns true only when storage actually holds the requested state afterwards.
+ * `sessionStorage` can throw (`SecurityError` in a locked-down context,
+ * `QuotaExceededError`) or silently no-op; a caller that reported success on a
+ * failed write would leave requests anonymous while telling the user a token
+ * is set, so the result is read back and compared.
+ */
+export function setToken(token: string | null): boolean {
+  const wanted = token && token.trim() ? token.trim() : null
   try {
-    if (token && token.trim()) sessionStorage.setItem(STORAGE_KEY, token.trim())
+    if (wanted) sessionStorage.setItem(STORAGE_KEY, wanted)
     else sessionStorage.removeItem(STORAGE_KEY)
   } catch {
-    /* storage unavailable: nothing to do */
+    return false
   }
+  return getToken() === wanted
 }
 
 /**
  * Move a `#token=...` fragment into sessionStorage and strip it from the URL.
  *
  * Call once, before the app renders. Other fragment parameters are kept.
- * Returns true when a token was captured.
+ * Returns true when a token was captured AND stored; if storage refused it the
+ * fragment is left in place so the failure is visible rather than silent.
  */
 export function captureTokenFromFragment(): boolean {
   const hash = location.hash
@@ -54,7 +65,7 @@ export function captureTokenFromFragment(): boolean {
   const params = new URLSearchParams(hash.slice(1))
   const token = params.get('token')
   if (!token || !token.trim()) return false
-  setToken(token)
+  if (!setToken(token)) return false
   params.delete('token')
   const rest = params.toString()
   history.replaceState(null, '', `${location.pathname}${location.search}${rest ? `#${rest}` : ''}`)
