@@ -65,7 +65,8 @@ class TestCleanupOldData:
             inbox_query,
             idempotency_query,
         ]
-        old_terminal_query.filter.return_value.all.return_value = [old_terminal]
+        # The selection filters by age, then to local rows only (#745).
+        old_terminal_query.filter.return_value.filter.return_value.all.return_value = [old_terminal]
         inbox_query.filter.return_value.delete.return_value = 0
         idempotency_query.filter.return_value.delete.return_value = 0
         mock_provider_manager.cleanup_provider.return_value = False
@@ -134,7 +135,8 @@ class TestCleanupOldData:
         inbox_query = MagicMock()
         idempotency_query = MagicMock()
         mock_db.query.side_effect = [terminal_query, inbox_query, idempotency_query]
-        terminal_query.filter.return_value.all.return_value = [old_terminal]
+        # Old rows, then local ones only (#745).
+        terminal_query.filter.return_value.filter.return_value.all.return_value = [old_terminal]
         inbox_query.filter.return_value.delete.return_value = 0
         idempotency_query.filter.return_value.delete.return_value = 0
         mock_log_dir.exists.return_value = False
@@ -173,7 +175,8 @@ class TestCleanupOldData:
         inbox_query = MagicMock()
         idempotency_query = MagicMock()
         mock_db.query.side_effect = [terminal_query, inbox_query, idempotency_query]
-        terminal_query.filter.return_value.all.return_value = [old_terminal]
+        # Old rows, then local ones only (#745).
+        terminal_query.filter.return_value.filter.return_value.all.return_value = [old_terminal]
         inbox_query.filter.return_value.delete.return_value = 0
         idempotency_query.filter.return_value.delete.return_value = 0
         mock_get_meta.return_value = {"id": "old-normal", "tmux_session": "cao-old"}

@@ -132,7 +132,7 @@ async def runtime_channel(ws: WebSocket) -> None:
         runtime_registry.activate(conn)
         # The hello lists every terminal the runtime runs.
         for terminal_id in hello.statuses:
-            if not runtime_registry.is_placed(terminal_id, runtime_id):
+            if not runtime_registry.is_known(terminal_id, runtime_id):
                 _delete_unrecorded(conn, terminal_id)
 
         while True:
@@ -143,14 +143,20 @@ async def runtime_channel(ws: WebSocket) -> None:
                 break
             if isinstance(frame, Result):
                 launched = frame.payload.get("terminal") if frame.ok else None
+                launched_id = launched.get("id") if isinstance(launched, dict) else None
+                if not isinstance(launched_id, str):
+                    launched_id = None
+                if launched_id and conn.awaits(frame.op_id):
+                    # Reserved before its caller resumes, so a reconnect's hello
+                    # in the meantime does not take it for an unrecorded one.
+                    runtime_registry.reserve(launched_id, runtime_id)
                 if (
                     not conn.resolve(frame)
-                    and isinstance(launched, dict)
-                    and isinstance(launched.get("id"), str)
-                    and not runtime_registry.is_placed(launched["id"], runtime_id)
+                    and launched_id
+                    and not runtime_registry.is_known(launched_id, runtime_id)
                 ):
                     # A launch that finished after the server gave up on it.
-                    _delete_unrecorded(conn, launched["id"])
+                    _delete_unrecorded(conn, launched_id)
             elif isinstance(frame, Status):
                 if runtime_registry.set_status(
                     frame.terminal_id, runtime_id, frame.status, conn=conn
@@ -236,31 +242,16 @@ def _record_launch(
     return None
 
 
-@router.post(
-    "/runtimes/{runtime_id}/terminals",
-    response_model=Terminal,
-    status_code=status.HTTP_201_CREATED,
-)
-async def launch_on_runtime(
+async def _finish_launch(
+    request: Request,
     runtime_id: str,
     body: LaunchRequest,
-    request: Request,
-    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+    conn: Optional[RuntimeConnection],
+    raw: Any,
 ) -> Dict[str, Any]:
-    """Launch a terminal in a connected execution runtime."""
+    """Validate and record a launch result; undo the launch if it cannot be recorded."""
     from cli_agent_orchestrator.services import terminal_service
 
-    conn = runtime_registry.connection(runtime_id)
-    try:
-        if conn is None:
-            raise RuntimeUnavailableError(f"runtime {runtime_id} is not connected")
-        result = await conn.call(
-            CommandType.LAUNCH, body.model_dump(exclude_none=True), timeout=LAUNCH_TIMEOUT
-        )
-    except RemoteRuntimeError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc))
-
-    raw = result.get("terminal")
     try:
         launched = _Launched.model_validate(raw)
     except ValidationError as exc:
@@ -325,6 +316,38 @@ async def launch_on_runtime(
         ),
     )
     return await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
+
+
+@router.post(
+    "/runtimes/{runtime_id}/terminals",
+    response_model=Terminal,
+    status_code=status.HTTP_201_CREATED,
+)
+async def launch_on_runtime(
+    runtime_id: str,
+    body: LaunchRequest,
+    request: Request,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Launch a terminal in a connected execution runtime."""
+    conn = runtime_registry.connection(runtime_id)
+    try:
+        if conn is None:
+            raise RuntimeUnavailableError(f"runtime {runtime_id} is not connected")
+        result = await conn.call(
+            CommandType.LAUNCH, body.model_dump(exclude_none=True), timeout=LAUNCH_TIMEOUT
+        )
+    except RemoteRuntimeError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+
+    raw = result.get("terminal")
+    reserved = raw.get("id") if isinstance(raw, dict) else None
+    try:
+        return await _finish_launch(request, runtime_id, body, conn, raw)
+    finally:
+        # Recorded (and so placed) or undone: either way no longer in flight.
+        if isinstance(reserved, str):
+            runtime_registry.release(reserved, runtime_id)
 
 
 @router.get("/runtimes")

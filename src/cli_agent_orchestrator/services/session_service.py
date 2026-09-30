@@ -523,6 +523,10 @@ def get_session(session_name: str) -> Dict:
         raise
 
 
+class _RoutedToRuntime(Exception):
+    """Raised inside a local teardown that finds the session's terminals in a runtime."""
+
+
 def _delete_remote_session(session_name: str, registry: PluginRegistry | None) -> Optional[Dict]:
     """Tear down a session whose terminals run in an execution runtime (#745).
 
@@ -698,6 +702,10 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
         # self-deadlock path. Guaranteed released on every exit, exceptions
         # included (context manager).
         with session_lifecycle_lock(session_name):
+            if session_is_remote(session_name):
+                # A runtime recorded this session after it was routed here as
+                # local (#745): its terminals are not this tmux's to tear down.
+                raise _RoutedToRuntime()
             terminals = list_terminals_by_session(session_name)
             # A session NAME is only a reusable backend label.  Retained
             # deferred-init failures from an older incarnation can legitimately
@@ -931,6 +939,11 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
         )
         return result
 
+    except _RoutedToRuntime:
+        # Nothing was touched: the check ran first under the lock. Tear the
+        # session down in its runtime; no rows left means another delete did.
+        remote = _delete_remote_session(session_name, registry)
+        return remote if remote is not None else {"deleted": [session_name], "errors": []}
     except Exception as e:
         logger.error(f"Failed to delete session {session_name}: {e}")
         raise
