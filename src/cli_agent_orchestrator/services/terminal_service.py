@@ -1351,11 +1351,6 @@ async def _create_terminal_unguarded(
     ephemeral_state: _EphemeralLaunchState,
 ) -> Terminal:
     """Create body; the caller compensates an unbound claim or a cancelled bind."""
-    if not local_execution_enabled():
-        raise LocalExecutionDisabledError(
-            f"this cao-server runs no agents ({LOCAL_EXECUTION_ENV}=0); launch in an "
-            "execution runtime with POST /runtimes/{runtime_id}/terminals"
-        )
     # Idempotency resolution runs BEFORE the terminal cap check below, and the
     # order is deliberate: a key HIT returns an already-existing terminal and
     # allocates nothing, so charging it against the cap would 429 a legitimate
@@ -1463,6 +1458,13 @@ async def _create_terminal_unguarded(
     # cleanly with nothing to roll back. Best-effort under concurrency: two
     # simultaneous creates can both pass the check (no cross-request lock),
     # which is acceptable for the cap's placement-guard purpose.
+    # After the idempotency HIT above (a retry recovers a terminal made before
+    # local execution was switched off), before anything is allocated.
+    if not local_execution_enabled():
+        raise LocalExecutionDisabledError(
+            f"this cao-server runs no agents ({LOCAL_EXECUTION_ENV}=0); launch in an "
+            "execution runtime with POST /runtimes/{runtime_id}/terminals"
+        )
     max_terminals = get_max_terminals()
     if max_terminals is not None:
         # Terminals on this host only: one running in an execution runtime
@@ -3982,11 +3984,14 @@ def dispatch_input(
                     "frozen_memory": frozen_memory,
                 },
             )
+            if not result.get("success"):
+                # Not delivered: the terminal was not used, and no message went.
+                return False
             update_last_active(terminal_id)
             _emit_post_send_message(
                 registry, metadata, terminal_id, sender_id, orchestration_type, message
             )
-            return bool(result.get("success"))
+            return True
 
         provider = provider_manager.get_provider(terminal_id)
 
@@ -4176,8 +4181,10 @@ def send_special_key(terminal_id: str, key: str) -> bool:
 
         if metadata.get("runtime_id"):
             result = _call_runtime(metadata, "key", {"key": key})
+            if not result.get("success"):
+                return False
             update_last_active(terminal_id)
-            return bool(result.get("success"))
+            return True
 
         # Arm StatusMonitor stickiness: special keys (Enter on a permission
         # prompt, C-c interrupting work, C-d sending EOF) all initiate a new

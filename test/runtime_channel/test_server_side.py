@@ -757,7 +757,9 @@ class TestRemoteSessionTeardown:
         )
         result = session_service.delete_session("cao-swap1")
         assert deleted == [], "the replacement local terminal is not this delete's"
-        assert result["deleted"] == ["cao-swap1"]
+        # The name is taken again, so it is not reported as freed.
+        assert result["deleted"] == []
+        assert "another session" in result["errors"][0]["error"]
         assert database.get_terminal_metadata("beef0002") is not None
 
     def test_a_session_recorded_remotely_mid_delete_is_torn_down_in_its_runtime(self, monkeypatch):
@@ -1475,3 +1477,36 @@ class TestLaunchStatusOrder:
         response, status_now = asyncio.run(scenario())
         assert response.status_code == 201, response.text
         assert status_now == "processing", "the older status in the result must not win"
+
+
+class TestUnsuccessfulSends:
+    def _last_active(self, terminal_id):
+        with database.SessionLocal() as db:
+            return db.get(database.TerminalModel, terminal_id).last_active
+
+    def test_an_input_the_runtime_did_not_deliver_changes_nothing(
+        self, http, start_runtime, monkeypatch
+    ):
+        _remote_row("abcd1234", "rt-1")
+        plugins = _RecordingPlugins()
+        monkeypatch.setattr(app.state, "plugin_registry", plugins)
+        before = self._last_active("abcd1234")
+        start_runtime(script=lambda command: {"success": False})
+        response = http.post(
+            "/terminals/abcd1234/input",
+            params={"message": "hi", "sender_id": "abcd9999", "orchestration_type": "send_message"},
+        )
+        assert response.status_code == 200 and response.json()["success"] is False
+        time.sleep(0.2)
+        assert self._last_active("abcd1234") == before
+        assert [t for t, _ in plugins.events] == []
+
+    def test_a_key_the_runtime_did_not_send_does_not_mark_the_terminal_active(
+        self, http, start_runtime
+    ):
+        _remote_row("abcd1234", "rt-1")
+        before = self._last_active("abcd1234")
+        start_runtime(script=lambda command: {"success": False})
+        response = http.post("/terminals/abcd1234/key", params={"key": "Enter"})
+        assert response.status_code == 200 and response.json()["success"] is False
+        assert self._last_active("abcd1234") == before

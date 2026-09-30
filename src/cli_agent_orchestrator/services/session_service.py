@@ -548,8 +548,18 @@ def _delete_remote_session(session_name: str, registry: PluginRegistry | None) -
         with session_lifecycle_lock(session_name):
             if not session_is_remote(session_name):
                 # The remote incarnation went while this call waited for the
-                # lock (another delete), and the name may now be a new local
-                # session's: that one is not this call's to tear down.
+                # lock (another delete). If the name is taken again (a new local
+                # session), that one is not this call's, and the name is not free.
+                if list_terminals_by_session(session_name):
+                    return {
+                        "deleted": [],
+                        "errors": [
+                            {
+                                "session": session_name,
+                                "error": "already deleted; the name now belongs to another session",
+                            }
+                        ],
+                    }
                 return {"deleted": [session_name], "errors": []}
             for terminal in list_terminals_by_session(session_name):
                 if terminal_service.delete_terminal(terminal["id"]):
