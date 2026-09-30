@@ -1059,6 +1059,41 @@ class TestSiblings:
 
 class TestLaunchCancellation:
     @pytest.mark.asyncio
+    async def test_a_cancel_landing_with_the_launch_result_still_settles_it(self):
+        from types import SimpleNamespace
+
+        registry = server_mod.runtime_registry
+        sent = []
+
+        async def send_text(text):
+            sent.append(decode(text))
+
+        conn = registry.register("rt-1", send_text)
+        registry.activate(conn)
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(plugin_registry=None)))
+        body = server_mod.LaunchRequest(agent_profile="developer")
+        task = asyncio.ensure_future(server_mod.launch_on_runtime("rt-1", body, request))
+        for _ in range(100):
+            if sent:
+                break
+            await asyncio.sleep(0.01)
+        # The client goes away while the runtime is still starting the agent.
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # Then the result arrives, as the receive loop delivers it.
+        (launch,) = sent
+        if conn.awaits(launch.op_id):
+            registry.reserve("beef0001", "rt-1")
+        conn.resolve(Result(op_id=launch.op_id, ok=True, payload={"terminal": dict(LAUNCHED)}))
+        for _ in range(200):
+            if database.get_terminal_metadata("beef0001") and not server_mod._settlements:
+                break
+            await asyncio.sleep(0.01)
+        assert database.get_terminal_metadata("beef0001") is not None, "recorded anyway"
+        assert ("beef0001", "rt-1") not in registry._reserved, "the reservation was released"
+
+    @pytest.mark.asyncio
     async def test_a_launch_whose_caller_went_away_is_still_settled(self, monkeypatch):
         from types import SimpleNamespace
 
