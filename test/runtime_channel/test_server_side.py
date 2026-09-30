@@ -1170,3 +1170,28 @@ class TestLaunchIdRace:
         registry.release("beef0001", "rt-2")
         assert registry.is_known("beef0001", "rt-1")
         assert not registry.is_known("beef0001", "rt-2")
+
+
+class TestUnrecordedCleanupRetry:
+    @pytest.mark.asyncio
+    async def test_a_deferred_delete_of_an_unrecorded_terminal_is_retried(self, monkeypatch):
+        registry = RuntimeRegistry()
+        deletes = []
+
+        async def send_text(text):
+            command = decode(text)
+            deletes.append(command)
+            done = len(deletes) >= 3  # the runtime defers twice, then succeeds
+            reply = Result(op_id=command.op_id, ok=True, payload={"deleted": done})
+            asyncio.get_running_loop().call_soon(conn.resolve, reply)
+
+        conn = registry.register("rt-1", send_text)
+        registry.activate(conn)
+        monkeypatch.setattr(server_mod, "UNRECORDED_RETRY_DELAY", 0.01)
+        server_mod._delete_unrecorded(conn, "beef0009")
+        for _ in range(200):
+            if len(deletes) >= 3 and not server_mod._teardowns:
+                break
+            await asyncio.sleep(0.01)
+        assert [(c.type, c.terminal_id) for c in deletes] == [(CommandType.DELETE, "beef0009")] * 3
+        assert not server_mod._teardowns, "the retries stop once it is deleted"

@@ -427,6 +427,35 @@ class TestConnection:
         assert not (tmp_path / "ready").exists(), "Ready must not outlive the connection"
 
     @pytest.mark.asyncio
+    async def test_a_server_that_drops_every_hello_gets_growing_backoff(self, monkeypatch):
+        attempts = []
+
+        class DropsBeforeHello:
+            async def __aenter__(self):
+                attempts.append(asyncio.get_running_loop().time())
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def send(self, text):
+                pass
+
+            async def recv(self):
+                raise websockets.exceptions.ConnectionClosedError(None, None)
+
+        monkeypatch.setattr(bridge_mod, "connect", lambda *args, **kwargs: DropsBeforeHello())
+        monkeypatch.setattr(bridge_mod, "BACKOFF_INITIAL", 0.05)
+        bridge = _bridge()
+        running = asyncio.ensure_future(bridge.run())
+        await asyncio.sleep(0.7)
+        bridge.stop()
+        await asyncio.wait_for(running, 5)
+        # Doubling from 0.05 s allows ~4 attempts in 0.7 s; a reset after every
+        # accepted upgrade would retry every 0.05 s (~14 attempts).
+        assert len(attempts) <= 5, f"{len(attempts)} attempts: the backoff never grew"
+
+    @pytest.mark.asyncio
     async def test_a_server_speaking_another_version_is_fatal(self, tmp_path):
         with pytest.raises(ChannelRefused):
             await _bridge(tmp_path).serve(FakeServer(version=PROTOCOL_VERSION + 1))
