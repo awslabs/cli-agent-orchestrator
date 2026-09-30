@@ -168,3 +168,48 @@ class TestPluginRegistryLifespan:
 
                 assert isinstance(registry, PluginRegistry)
                 assert len(registry._plugins) == 1
+
+
+class TestRuntimeTokenBeforePlugins:
+    """#745: plugin setup may start child processes; none may inherit the token."""
+
+    @pytest.mark.asyncio
+    async def test_the_runtime_token_is_gone_before_plugins_load(self, monkeypatch) -> None:
+        import os
+
+        from cli_agent_orchestrator.runtime_channel import token as token_mod
+
+        monkeypatch.setenv(token_mod.TOKEN_ENV, "s3cret")
+        monkeypatch.delenv(token_mod.TOKEN_FILE_ENV, raising=False)
+        token_mod._reset_for_tests()
+        seen: list = []
+        mock_load = AsyncMock(side_effect=lambda: seen.append(os.environ.get(token_mod.TOKEN_ENV)))
+        status_run, log_run, inbox_run, opencode_daemon = _consumer_patches()
+        try:
+            with (
+                patch("cli_agent_orchestrator.api.main.setup_logging"),
+                patch("cli_agent_orchestrator.api.main.init_db"),
+                patch(
+                    "cli_agent_orchestrator.services.memory_reconciliation.reconcile_memory_startup",
+                    return_value=None,
+                ),
+                patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
+                patch(
+                    "cli_agent_orchestrator.api.main.cleanup_expired_memories",
+                    new_callable=AsyncMock,
+                ),
+                patch("cli_agent_orchestrator.api.main.flow_daemon", fake_flow_daemon),
+                patch("cli_agent_orchestrator.api.main.bus.set_loop"),
+                status_run,
+                log_run,
+                inbox_run,
+                opencode_daemon,
+                patch.object(PluginRegistry, "load", mock_load),
+                patch.object(PluginRegistry, "teardown", AsyncMock()),
+            ):
+                async with lifespan(app):
+                    # Still the server's, to check the runtimes that dial in.
+                    assert token_mod.runtime_token() == "s3cret"
+        finally:
+            token_mod._reset_for_tests()
+        assert seen == [None], "a plugin's setup ran with CAO_RUNTIME_TOKEN in its environment"

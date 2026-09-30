@@ -251,14 +251,16 @@ class Bridge:
         self._ws = ws
         self._mark_ready(True)
         logger.info("runtime %s connected to %s", self.runtime_id, self.server_url)
-        # Changes during the hello exchange were not forwarded (nothing was
-        # connected yet), so send each terminal's status as it is now.
-        for terminal_id in statuses:
-            await self._push_status(terminal_id)
-        unsent, self._unsent = self._unsent, []
-        for result in unsent:
-            await self._send(result)
+        # Everything from here on runs inside the guard: however the connected
+        # state ends, the runtime stops reporting Ready.
         try:
+            # Changes during the hello exchange were not forwarded (nothing was
+            # connected yet), so send each terminal's status as it is now.
+            for terminal_id in statuses:
+                await self._push_status(terminal_id)
+            unsent, self._unsent = self._unsent, []
+            for result in unsent:
+                await self._send(result)
             async for raw in ws:
                 frame = decode(raw)
                 if isinstance(frame, Command):

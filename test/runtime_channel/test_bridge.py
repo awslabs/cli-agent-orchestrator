@@ -377,6 +377,21 @@ class TestConnection:
         assert late in server.sent
 
     @pytest.mark.asyncio
+    async def test_a_failure_right_after_the_hello_leaves_the_runtime_not_ready(self, tmp_path):
+        bridge = _bridge(tmp_path)
+
+        def broken(terminal_id):
+            raise RuntimeError("status monitor unavailable")
+
+        # The status replay after the hello fails with something other than a
+        # closed connection.
+        bridge._status_of = broken
+        with pytest.raises(RuntimeError):
+            await bridge.serve(FakeServer())
+        assert bridge._ws is None
+        assert not (tmp_path / "ready").exists(), "Ready must not outlive the connection"
+
+    @pytest.mark.asyncio
     async def test_a_server_speaking_another_version_is_fatal(self, tmp_path):
         with pytest.raises(ChannelRefused):
             await _bridge(tmp_path).serve(FakeServer(version=PROTOCOL_VERSION + 1))

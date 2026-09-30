@@ -357,7 +357,8 @@ class TestTerminalOperations:
         mock_session.__exit__ = MagicMock(return_value=False)
 
         mock_query = MagicMock()
-        mock_query.filter.return_value.delete.return_value = 2
+        # Session name, then local rows only: a remote row is never swept (#745).
+        mock_query.filter.return_value.filter.return_value.delete.return_value = 2
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 

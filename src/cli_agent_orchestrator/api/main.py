@@ -1303,6 +1303,10 @@ def _sweep_workflow_runs_at_startup() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
+    # Read the runtime-channel token (#745) first, so it leaves this process's
+    # environment before anything below can start a child process: plugin
+    # setup, a tmux server, and so any agent pane.
+    runtime_token()
     logger.info("Starting CLI Agent Orchestrator server...")
     setup_logging()
     # Scrub credential query params (``?access_token=`` / ``?ticket=``) from
@@ -1361,10 +1365,6 @@ async def lifespan(app: FastAPI):
 
     # Start flow daemon as background task
     daemon_task = asyncio.create_task(flow_daemon())
-
-    # Read the runtime-channel token now, so it leaves this process's
-    # environment before any tmux server (and so any agent pane) starts.
-    runtime_token()
 
     # Register event loop with event bus for thread-safe publishing
     loop = asyncio.get_running_loop()

@@ -56,6 +56,20 @@ def test_an_existing_database_gains_the_column_once(db):
         assert conn.execute("SELECT runtime_id FROM terminals").fetchall() == [(None,)]
 
 
+def test_a_stale_row_sweep_never_takes_a_remote_row(db):
+    # The sweep drops rows a dead LOCAL tmux session left behind (local create,
+    # flow recycling). A row whose terminal runs in a runtime is not one of them.
+    _, engine = db
+    database.Base.metadata.create_all(engine)
+    database.create_terminal("aaaa0001", "cao-x", "dev-a", "mock_cli", "developer")
+    database.create_terminal(
+        "aaaa0002", "cao-x", "dev-b", "mock_cli", "developer", runtime_id="rt-1"
+    )
+
+    assert database.delete_terminals_by_session("cao-x") == 1
+    assert [t["id"] for t in database.list_terminals_by_session("cao-x")] == ["aaaa0002"]
+
+
 def test_a_runtime_creates_only_the_pane_tables(db):
     _, engine = db
     database.init_runtime_db()
