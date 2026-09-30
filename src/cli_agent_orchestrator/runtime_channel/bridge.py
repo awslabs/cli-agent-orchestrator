@@ -194,6 +194,11 @@ class Bridge:
             logger.warning("command %s (%s) failed: %s", command.op_id, command.type.value, exc)
             result = Result(op_id=command.op_id, ok=False, error=str(exc) or type(exc).__name__)
         await self._send(result)
+        launched = result.payload.get("terminal") if result.ok else None
+        if command.type == CommandType.LAUNCH and isinstance(launched, dict):
+            # A status change sent before this result was refused (the server
+            # did not know the terminal yet): follow it with the current one.
+            await self._push_status(launched["id"])
 
     async def execute(self, command: Command) -> Dict[str, Any]:
         # Imported here: the provider stack is only needed once work arrives.

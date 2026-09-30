@@ -261,6 +261,32 @@ class TestHandle:
 
 class TestOrdering:
     @pytest.mark.asyncio
+    async def test_a_launch_result_is_followed_by_the_terminals_current_status(self, monkeypatch):
+        bridge = _bridge()
+        server = FakeServer()
+        bridge._ws = server
+
+        async def create_terminal(**kwargs):
+            return SimpleNamespace(id="beef0001")
+
+        launched = {
+            "id": "beef0001",
+            "name": "developer-beef",
+            "provider": "mock_cli",
+            "session_name": "cao-beef",
+            "agent_profile": "developer",
+            "allowed_tools": None,
+            "status": TerminalStatus.PROCESSING,  # when the result was built
+        }
+        monkeypatch.setattr(terminal_service, "create_terminal", create_terminal)
+        monkeypatch.setattr(terminal_service, "get_terminal", lambda tid: dict(launched))
+        # It finished meanwhile; a status sent before the result was refused.
+        bridge._status_of = lambda tid: TerminalStatus.COMPLETED
+        await bridge.handle(_command(CommandType.LAUNCH, None, agent_profile="developer"))
+        assert isinstance(server.sent[0], Result) and server.sent[0].ok
+        assert server.sent[1:] == [Status(terminal_id="beef0001", status=TerminalStatus.COMPLETED)]
+
+    @pytest.mark.asyncio
     async def test_a_delete_of_an_older_terminal_does_not_wait_for_a_launch(self, monkeypatch):
         import cli_agent_orchestrator.clients.database as database
 
