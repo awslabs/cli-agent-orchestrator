@@ -239,6 +239,9 @@ class RuntimeRegistry:
             for terminal_id, placed_on in self._placement.items():
                 if placed_on == runtime_id:
                     self._status.pop(terminal_id, None)
+            for terminal_id, reserved_on in self._reserved.items():
+                if reserved_on == runtime_id:
+                    self._status.pop(terminal_id, None)
         if previous is not None:
             previous.close("replaced by a new connection")
             if previous.close_socket is not None:
@@ -298,11 +301,6 @@ class RuntimeRegistry:
         with self._lock:
             return self._placement.get(terminal_id) == runtime_id
 
-    def placed_on(self, terminal_id: str) -> Optional[str]:
-        """The runtime a terminal is placed on, if any."""
-        with self._lock:
-            return self._placement.get(terminal_id)
-
     def reserve(self, terminal_id: str, runtime_id: str) -> None:
         """Mark a launch whose result arrived as being recorded (see ``is_known``)."""
         with self._lock:
@@ -312,6 +310,9 @@ class RuntimeRegistry:
         with self._lock:
             if self._reserved.get(terminal_id) == runtime_id:
                 del self._reserved[terminal_id]
+                if self._placement.get(terminal_id) != runtime_id:
+                    # Undone, not recorded: a status it reported goes with it.
+                    self._status.pop(terminal_id, None)
 
     def is_known(self, terminal_id: str, runtime_id: str) -> bool:
         """Placed on the runtime, or its launch there is still being recorded."""
@@ -330,8 +331,13 @@ class RuntimeRegistry:
         with self._lock:
             if conn is not None and self._runtimes.get(runtime_id) is not conn:
                 return False
-            if self._placement.get(terminal_id) != runtime_id:
+            if runtime_id not in (
+                self._placement.get(terminal_id),
+                self._reserved.get(terminal_id),
+            ):
                 return False
+            # For a launch still being recorded, kept but not shown until the
+            # terminal is placed (get_status); dropped if the launch is undone.
             self._status[terminal_id] = status
             return True
 

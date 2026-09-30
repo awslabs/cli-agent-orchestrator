@@ -3132,13 +3132,13 @@ def _call_runtime(metadata: Dict, command_type: str, payload: Dict, timeout: flo
     )
 
 
-def _current_status(terminal_id: str, runtime_id: Optional[str] = None) -> TerminalStatus:
-    """A terminal's status: the one its runtime pushed, if it runs in one (#745),
-    else the local status monitor's. ``runtime_id`` defaults to its placement."""
-    from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
-
-    runtime_id = runtime_id or runtime_registry.placed_on(terminal_id)
+def _current_status(terminal_id: str, runtime_id: Optional[str]) -> TerminalStatus:
+    """A terminal's status, given its row's ``runtime_id``: the one its runtime
+    pushed if it runs in one (#745; unknown while that runtime is away), else
+    the local status monitor's."""
     if runtime_id:
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
         return runtime_registry.get_status(terminal_id, runtime_id)
     return status_monitor.get_status(terminal_id)
 
@@ -3281,7 +3281,10 @@ def list_siblings(
         caller_id, prefix, caller_session=caller_session, cross_session=cross_session
     )
     for sibling in siblings:
-        sibling["status"] = _current_status(sibling["id"]).value
+        # The row's runtime (#745) decides where the status comes from; it is
+        # not part of the sibling's reported shape.
+        runtime_id = sibling.pop("runtime_id", None)
+        sibling["status"] = _current_status(sibling["id"], runtime_id).value
     return siblings
 
 
