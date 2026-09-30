@@ -114,9 +114,26 @@ plugin is not loadable.
 
 ### Accepted git source spellings
 
-A git source is cloned with the transport you name, so it must be one git
-speaks: `https://`, `ssh://`, `git://`, `file://`, or an `scp`-style
-`git@host:owner/repo.git`.
+A git source is cloned only over **`https://` or `ssh://`** (URL or `scp`-style
+`git@host:owner/repo.git`) and only from an **allowed host**: `github.com` by
+default. Set `CAO_PLUGIN_ALLOWED_HOSTS` to a comma-separated list of hostnames
+to allow others (an internal GitLab or CodeCommit mirror, for example); the
+list replaces the default, so include `github.com` if you still want it.
+Entries are bare hostnames, matched case-insensitively: no scheme, port or
+path (an entry like `host:8443` matches nothing). A source may name any port
+on an allowed host. The same shape as `CAO_PROFILE_ALLOWED_HOSTS` for
+profile downloads.
+
+`file://`, `git://`, `http://` and remote-helper spellings such as `ext::` are
+refused before any `git` process starts, as are URLs carrying a query string,
+fragment or embedded credential, and locations that are not git URLs at all
+(a local path reaching the git branch through the API, for instance). For a
+repository on this machine, pass its directory as a plain path source instead.
+Independently of that check, every `git` CAO runs is pinned to
+`GIT_ALLOW_PROTOCOL=https:ssh` and `http.followRedirects=false`, so the
+transport rule holds inside git too and an allowed host cannot redirect the
+clone somewhere the allowlist never saw (a renamed repository therefore fails
+with git's own message; retype the new location).
 
 The `pip`/`uv` requirement spelling is accepted for the two forms that map
 cleanly onto a transport, and rewritten before the clone:
@@ -129,10 +146,7 @@ cleanly onto a transport, and rewritten before the clone:
 Every other `git+` form — `git+file://`, `git+git://`, `git+http://`, or a bare
 `git+something` — is **refused** with a message naming the two supported forms.
 Git would otherwise read `git+file` as the name of a remote helper and fail with
-`fatal: remote helper 'git+file' aborted session`. The prefix is not stripped
-across the board on purpose: doing so would silently turn `git+file://` into an
-accepted read of a local filesystem path. Use a plain path or a `file://` URL
-for a local repository.
+`fatal: remote helper 'git+file' aborted session`.
 
 The same operations are available over the HTTP API — `GET/POST /plugins`,
 `POST /plugins/validate`, `DELETE /plugins/{name}` — and in the web UI's

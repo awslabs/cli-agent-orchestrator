@@ -230,7 +230,7 @@ When using CLI Agent Orchestrator:
 
 2. **Secure API Access**: The CAO server runs on localhost by default. If exposing externally, use proper authentication and TLS.
 
-3. **Agent Profiles**: Review agent profiles before installation, especially those from external sources. Remote profile downloads (`cao install https://...`) are restricted by an allowlist — the default trusts `github.com` and `raw.githubusercontent.com` only. Extend via `CAO_PROFILE_ALLOWED_HOSTS=host1,host2` on the `cao-server` environment when using self-hosted profile mirrors. The HTTP install endpoint additionally refuses local `.md` file paths; only the CLI can install from disk.
+3. **Agent Profiles**: Review agent profiles before installation, especially those from external sources. Remote profile downloads (`cao install https://...`) are restricted by an allowlist — the default trusts `github.com` and `raw.githubusercontent.com` only. Extend via `CAO_PROFILE_ALLOWED_HOSTS=host1,host2` on the `cao-server` environment when using self-hosted profile mirrors. The HTTP install endpoint additionally refuses local `.md` file paths; only the CLI can install from disk. Agent plugin git sources are held to the same rule: only `https://` or `ssh://` to an allowed host (`github.com` by default; `CAO_PLUGIN_ALLOWED_HOSTS` replaces the list), no `file://`, `git://` or remote-helper transports, and every `git` CAO runs is pinned with `GIT_ALLOW_PROTOCOL=https:ssh`.
 
 4. **Environment Variables**: Never commit sensitive environment variables. Use `.env` files (excluded from git) or secure secret management.
 

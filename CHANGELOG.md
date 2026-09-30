@@ -380,6 +380,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unrestricted. The Kiro e2e restricted case asserts bash is refused again
   (#836, follow-up to #824)
 
+- **Agent plugin git sources are allowlisted by scheme and host.** The plugin
+  resolver handed the source string to `git clone` unchanged, and for git the
+  text before `://` is a transport: `file://` read any repository the server
+  user could, `git://` opened a TCP connection from the server to any host and
+  port it could reach, and the `ext::` helper runs a command wherever git's
+  protocol policy allows it; `--` on the argv guards against option injection
+  only. The surface is default-off (`CAO_AGENT_PLUGINS_ENABLED`) and, with auth
+  on, needs `cao:write`, but with auth off any local caller of `POST /plugins`
+  could reach it, and `"kind": "git"` skipped the CLI's shape check. A plugin is
+  now cloned only over `https://` or `ssh://` (URL or scp-style) from an allowed
+  host (`github.com` by default; `CAO_PLUGIN_ALLOWED_HOSTS` replaces the list),
+  with no query, fragment or embedded credential, the clone target is rebuilt
+  from the validated parts, and every `git` CAO runs is pinned with
+  `GIT_ALLOW_PROTOCOL=https:ssh` and `http.followRedirects=false` so the rule
+  holds inside git as well. Same posture as the profile downloader's
+  `CAO_PROFILE_ALLOWED_HOSTS` guard. Reported through the AWS Vulnerability
+  Reporting Program (#847)
+
 - **an unknown `role` no longer falls open to unrestricted `["*"]`.** Omitting
   `role` still uses developer defaults. A typo or a role that is not defined
   now raises `ValueError` on install, launch, and delegation, so providers no
