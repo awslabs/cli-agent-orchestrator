@@ -4,7 +4,6 @@ import os
 import time
 
 import click
-import requests
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import (
@@ -16,6 +15,7 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.settings_service import get_server_settings
+from cli_agent_orchestrator.utils import api_http
 from cli_agent_orchestrator.utils.enforcement import (
     NATIVE,
     describe_enforcement,
@@ -337,7 +337,7 @@ def launch(
         if forwarded_env:
             post_kwargs["json"] = {"env_vars": forwarded_env}
 
-        response = requests.post(url, **post_kwargs)
+        response = api_http.post(url, **post_kwargs)
         response.raise_for_status()
 
         terminal = response.json()
@@ -381,7 +381,7 @@ def launch(
                     f"Conductor {terminal['id']} did not become ready within 120s"
                 )
             request_timeout = get_server_settings()["mcp_request_timeout"]
-            response = requests.post(
+            response = api_http.post(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/input",
                 params={"message": message},
                 timeout=request_timeout,
@@ -393,7 +393,7 @@ def launch(
                 return
             poll_until_done(terminal["id"], timeout=300)
             request_timeout = get_server_settings()["mcp_request_timeout"]
-            output_resp = requests.get(
+            output_resp = api_http.get(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/output",
                 params={"mode": "last"},
                 timeout=request_timeout,
@@ -403,7 +403,7 @@ def launch(
             if output:
                 click.echo(output)
 
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {str(e)}")
     except click.ClickException:
         raise

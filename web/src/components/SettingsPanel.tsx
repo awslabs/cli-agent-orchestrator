@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { getToken, setToken } from '../auth'
 import { api, AgentDirsSettings } from '../api'
 import { useStore } from '../store'
 import { FolderOpen, Plus, X, RefreshCw } from 'lucide-react'
@@ -38,6 +39,21 @@ export function SettingsPanel() {
   const [busy, setBusy] = useState(false)
   const [profileCount, setProfileCount] = useState<number | null>(null)
   const [dupCount, setDupCount] = useState(0)
+  const [tokenInput, setTokenInput] = useState('')
+  const [hasToken, setHasToken] = useState(() => getToken() !== null)
+
+  const saveToken = () => {
+    if (!tokenInput.trim()) return
+    setToken(tokenInput)
+    setTokenInput('')
+    setHasToken(true)
+    showSnackbar({ type: 'success', message: 'Access token set for this tab' })
+  }
+  const clearToken = () => {
+    setToken(null)
+    setHasToken(false)
+    showSnackbar({ type: 'info', message: 'Access token cleared' })
+  }
   const { showSnackbar } = useStore()
 
   const load = async () => {
@@ -212,6 +228,50 @@ export function SettingsPanel() {
             directory — the first-scanned one wins. Disable a directory to change which is active.
           </p>
         )}
+      </div>
+
+      <div className="bg-gray-800/60 border border-gray-700/50 rounded-xl p-5" data-testid="access-token-card">
+        <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide mb-4">
+          Server Access Token
+        </h3>
+        <p className="text-xs text-gray-500 mb-4">
+          Only needed when the cao-server runs with authentication. The token is sent as{' '}
+          <code className="text-gray-400">Authorization: Bearer</code> on every request and on the
+          terminal WebSocket handshake. It is kept for this browser tab only (sessionStorage) and
+          discarded when the tab closes. You can also open the UI as{' '}
+          <code className="text-gray-400">/#token=…</code> to set it.
+        </p>
+        <div className="flex gap-2">
+          <input
+            type="password"
+            value={tokenInput}
+            onChange={e => setTokenInput(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && saveToken()}
+            placeholder={hasToken ? 'Token set for this tab' : 'Paste the server token'}
+            autoComplete="off"
+            data-testid="access-token-input"
+            className="flex-1 bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 font-mono focus:border-emerald-500 focus:outline-none"
+          />
+          <button
+            onClick={saveToken}
+            disabled={!tokenInput.trim()}
+            data-testid="access-token-save"
+            className="flex items-center gap-1.5 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-white text-sm px-4 py-2.5 rounded-lg transition-colors"
+          >
+            Save
+          </button>
+          <button
+            onClick={clearToken}
+            disabled={!hasToken}
+            data-testid="access-token-clear"
+            className="flex items-center gap-1.5 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-white text-sm px-4 py-2.5 rounded-lg transition-colors"
+          >
+            Clear
+          </button>
+        </div>
+        <p className="text-xs text-gray-500 mt-3" data-testid="access-token-state">
+          {hasToken ? 'A token is set for this tab.' : 'No token set; requests are sent without a bearer.'}
+        </p>
       </div>
 
       <div className="flex items-center gap-3">

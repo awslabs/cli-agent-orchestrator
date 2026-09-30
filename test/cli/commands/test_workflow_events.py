@@ -112,7 +112,7 @@ def test_renders_normal_frames_in_seq_order(runner):
     )
     with (
         patch(
-            "cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream
         ) as get,
         _HUMAN,
     ):
@@ -135,7 +135,7 @@ def test_terminal_failed_frame_exits_1(runner):
         _event_frame(1, "step.attempt.failed", "s1", "failed"),
         _event_frame(2, "run.failed", None, "failed"),
     )
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream):
         result = runner.invoke(workflow, ["events", "run1"])
     assert result.exit_code == 1
 
@@ -148,7 +148,7 @@ def test_step_completed_state_does_not_close_follow_early(runner):
         _event_frame(2, "run.failed", None, "failed"),
     )
     with (
-        patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream),
+        patch("cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream),
         _HUMAN,
     ):
         result = runner.invoke(workflow, ["events", "run1"])
@@ -170,7 +170,7 @@ def test_gap_rendered_as_declared(runner):
         _event_frame(23, "run.completed", None, "completed"),
     )
     with (
-        patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream),
+        patch("cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream),
         _HUMAN,
     ):
         result = runner.invoke(workflow, ["events", "run1"])
@@ -192,7 +192,7 @@ def test_no_gap_frame_no_synthesized_gap(runner):
         # seq jumps to 23 with NO gap frame between them.
         _event_frame(23, "run.completed", None, "completed"),
     )
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream):
         result = runner.invoke(workflow, ["events", "run1"])
     assert result.exit_code == 0
     # The follower renders what the server DECLARES; a bare seq jump is not a gap.
@@ -208,7 +208,7 @@ def test_gap_frame_does_not_advance_cursor_or_close(runner):
         _gap_frame(after_seq=10, before_seq=12, missing_count=1),
         _event_frame(12, "run.cancelled", None, "cancelled"),
     )
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream):
         result = runner.invoke(workflow, ["events", "run1"])
     # Cancelled is terminal-non-completed -> exit 1; the gap did not end the follow.
     assert result.exit_code == 1
@@ -238,7 +238,7 @@ def test_reconnect_uses_last_id_as_after_seq(runner):
 
     with (
         patch(
-            "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
             side_effect=[first, second],
         ) as get,
         patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
@@ -256,7 +256,7 @@ def test_after_seq_flag_sets_initial_cursor(runner):
     """--after-seq seeds the initial resume cursor on the very first open."""
     stream = _stream_resp(_event_frame(6, "run.completed", None, "completed"))
     with patch(
-        "cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream
     ) as get:
         result = runner.invoke(workflow, ["events", "run1", "--after-seq", "5"])
     assert result.exit_code == 0
@@ -272,7 +272,7 @@ def test_stream_ends_without_terminal_does_final_status_check(runner):
     state read there (here: completed -> exit 0)."""
     stream = _stream_resp(_event_frame(1, "step.completed", "s1", "completed"))
     with patch(
-        "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
         side_effect=[stream, _snap_resp("completed")],
     ) as get:
         result = runner.invoke(workflow, ["events", "run1"])
@@ -288,7 +288,7 @@ def test_stream_ends_non_terminal_reports_stream_ended_exit_0(runner):
     stream = _stream_resp(_event_frame(1, "step.completed", "s1", "completed"))
     with (
         patch(
-            "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
             side_effect=[stream, _snap_resp("running")],
         ),
         _HUMAN,
@@ -307,7 +307,7 @@ def test_reconnect_budget_exhausted_falls_back_to_status(runner):
     drops = [dropping] * (WORKFLOW_EVENTS_MAX_RECONNECTS + 1)
     with (
         patch(
-            "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
             side_effect=drops + [_snap_resp("completed")],
         ),
         patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
@@ -325,10 +325,10 @@ def test_ctrl_c_detaches_without_cancel(runner):
     hint, and NO cancel POST is issued."""
     with (
         patch(
-            "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
             side_effect=KeyboardInterrupt,
         ),
-        patch("cli_agent_orchestrator.cli.commands.workflow.requests.post") as post,
+        patch("cli_agent_orchestrator.cli.commands.workflow.api_http.post") as post,
     ):
         result = runner.invoke(workflow, ["events", "run1"])
     assert result.exit_code == 0
@@ -349,7 +349,7 @@ def test_json_emits_stable_lines_including_gap(runner):
         _gap_frame(after_seq=19, before_seq=21, missing_count=1),
         _event_frame(21, "run.completed", None, "completed"),
     )
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream):
         result = runner.invoke(workflow, ["events", "run1", "--json"])
     assert result.exit_code == 0
     lines = [json.loads(ln) for ln in result.stdout.splitlines() if ln.strip()]
@@ -374,7 +374,7 @@ def test_non_tty_json_no_gap_frame_still_no_synthesized_gap(runner):
         _event_frame(19, "step.completed", "s1", "completed"),
         _event_frame(23, "run.completed", None, "completed"),
     )
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream):
         result = runner.invoke(workflow, ["events", "run1", "--json"])
     assert result.exit_code == 0
     lines = [json.loads(ln) for ln in result.stdout.splitlines() if ln.strip()]
@@ -389,7 +389,7 @@ def test_unknown_run_404(runner):
     genuinely unknown — the message must stay run-scoped."""
     stream = _stream_resp(status_code=404)
     stream.json.return_value = {"detail": "unknown run 'ghost'"}
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream):
         result = runner.invoke(workflow, ["events", "ghost"])
     assert result.exit_code != 0
     assert "unknown run" in result.output
@@ -414,7 +414,7 @@ def test_absent_events_route_reported_as_capability_not_unknown_run(runner):
     snapshot_200.json.return_value = {"run_id": "live-1", "state": "running", "steps": []}
 
     with patch(
-        "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
         side_effect=[events_404, snapshot_200],
     ):
         result = runner.invoke(workflow, ["events", "live-1"])
@@ -436,7 +436,7 @@ def test_absent_events_route_on_batch_read_also_degrades(runner):
     snapshot_200.json.return_value = {"run_id": "live-2", "state": "running", "steps": []}
 
     with patch(
-        "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
         side_effect=[batch_404, snapshot_200],
     ):
         result = runner.invoke(workflow, ["events", "live-2", "--no-follow"])
@@ -453,7 +453,7 @@ def test_probe_transport_failure_falls_back_to_run_scoped_message(runner):
     events_404.json.return_value = {"detail": "unknown run 'maybe'"}
 
     with patch(
-        "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
         side_effect=[events_404, requests.ConnectionError("probe down")],
     ):
         result = runner.invoke(workflow, ["events", "maybe"])
@@ -486,7 +486,7 @@ def test_no_follow_batch_read(runner):
     resp.status_code = 200
     resp.json.return_value = rows
     with patch(
-        "cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=resp
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=resp
     ) as get:
         result = runner.invoke(workflow, ["events", "run1", "--no-follow"])
     assert result.exit_code == 0
@@ -555,7 +555,7 @@ def test_stream_closed_after_terminal_frame_break(runner):
         _event_frame(3, "step.completed", "s3", "completed"),
         _event_frame(4, "step.completed", "s4", "completed"),
     )
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream):
         result = runner.invoke(workflow, ["events", "run1"])
     assert result.exit_code == 0
     stream.close.assert_called()
@@ -564,7 +564,7 @@ def test_stream_closed_after_terminal_frame_break(runner):
 def test_stream_closed_on_non_200_error_arm(runner):
     """The non-200 arm closes too — an early ``raise`` must not leak the socket."""
     stream = _stream_resp(status_code=500)
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream):
         result = runner.invoke(workflow, ["events", "run1"])
     assert result.exit_code != 0
     stream.close.assert_called()
@@ -586,7 +586,7 @@ def test_every_reconnect_closes_its_own_stream(runner):
 
     with (
         patch(
-            "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
             side_effect=[dropped, final],
         ),
         patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep", lambda *_: None),
