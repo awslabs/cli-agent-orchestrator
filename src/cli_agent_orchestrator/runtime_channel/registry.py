@@ -224,9 +224,11 @@ class RuntimeRegistry:
             return True
 
     def get_status(self, terminal_id: str, runtime_id: str) -> TerminalStatus:
-        """The runtime's last report, or UNKNOWN while the runtime is not connected."""
+        """The runtime's last report, or UNKNOWN while the runtime is not connected
+        (or its hello exchange is not over: commands are still refused then)."""
         with self._lock:
-            if runtime_id not in self._runtimes:
+            conn = self._runtimes.get(runtime_id)
+            if conn is None or not conn.active:
                 return TerminalStatus.UNKNOWN
             if self._placement.get(terminal_id) != runtime_id:
                 return TerminalStatus.UNKNOWN

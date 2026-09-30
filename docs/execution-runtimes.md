@@ -62,6 +62,13 @@ starts an agent but cannot report it stops it, and the launch fails with `502`
 naming the terminal. So a lost launch result cannot leave an agent running
 unseen.
 
+The server checks a launch result before recording it. An invalid one fails
+the launch with `502`, after deleting the terminal it names, if any. A session
+name or terminal id already in use, on another runtime or on the server
+itself, fails it with `409`, after deleting the new terminal; runtimes pick
+session names independently, so a retry gets a fresh one. For the same
+reason, a local session cannot be created under the name of a remote one.
+
 ## Failure outcomes
 
 | Status | Meaning | Safe to retry |

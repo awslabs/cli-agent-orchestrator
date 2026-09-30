@@ -23,11 +23,16 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
-from cli_agent_orchestrator.clients.database import list_terminal_ids_on_runtime
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
+from cli_agent_orchestrator.clients.database import (
+    get_terminal_metadata,
+    list_terminal_ids_on_runtime,
+    list_terminals_by_session,
+)
+from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.models.terminal import Terminal, TerminalId, TerminalStatus
 from cli_agent_orchestrator.plugins import PostCreateSessionEvent, PostCreateTerminalEvent
 from cli_agent_orchestrator.runtime_channel.protocol import (
     PROTOCOL_VERSION,
@@ -54,6 +59,7 @@ from cli_agent_orchestrator.security.auth import (
 )
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
+from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +178,64 @@ class LaunchRequest(BaseModel):
     working_directory: Optional[str] = None
 
 
+class _Launched(BaseModel):
+    """The terminal a runtime reports it launched: checked before it is recorded."""
+
+    id: TerminalId
+    name: str = Field(min_length=1)
+    provider: ProviderType
+    session_name: str = Field(min_length=1)
+    agent_profile: Optional[str] = None
+    allowed_tools: Optional[List[str]] = None
+    status: Optional[TerminalStatus] = None
+
+
+async def _undo_launch(runtime_id: str, terminal_id: str) -> bool:
+    """Delete a launched terminal the server will not record. True if it is gone."""
+    try:
+        deleted = await runtime_registry.call(
+            runtime_id, CommandType.DELETE, {}, terminal_id=terminal_id
+        )
+        return bool(deleted.get("deleted"))
+    except RemoteRuntimeError as exc:
+        logger.warning(
+            "could not delete terminal %s on runtime %s: %s", terminal_id, runtime_id, exc
+        )
+        return False
+
+
+def _record_launch(
+    runtime_id: str, launched: _Launched, working_directory: Optional[str]
+) -> Optional[str]:
+    """Write the central row for a launch. Returns the conflict instead, if its id or
+    its session name is already in use: on another runtime, or on this server."""
+    # The lock local creation and teardown take for a session name, so the
+    # check and the row write are one step for every creator of that name.
+    with session_lifecycle_lock(launched.session_name):
+        if get_terminal_metadata(launched.id) is not None:
+            return f"terminal id {launched.id} is already in use"
+        if list_terminals_by_session(launched.session_name):
+            return f"session {launched.session_name} already exists"
+        # Placed before the row is written, so a reconnect in between does not
+        # take the terminal for an unrecorded one.
+        runtime_registry.place(launched.id, runtime_id)
+        try:
+            db_create_terminal(
+                launched.id,
+                launched.session_name,
+                launched.name,
+                launched.provider.value,
+                agent_profile=launched.agent_profile,
+                allowed_tools=launched.allowed_tools,
+                working_directory=working_directory,
+                runtime_id=runtime_id,
+            )
+        except Exception:
+            runtime_registry.forget(launched.id)
+            raise
+    return None
+
+
 @router.post(
     "/runtimes/{runtime_id}/terminals",
     response_model=Terminal,
@@ -196,47 +260,50 @@ async def launch_on_runtime(
     except RemoteRuntimeError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc))
 
-    info = result["terminal"]
-    terminal_id = info["id"]
-    # Placed before the row is written, so a reconnect in between does not
-    # take the terminal for an unrecorded one.
-    runtime_registry.place(terminal_id, runtime_id)
+    raw = result.get("terminal")
     try:
-        await asyncio.to_thread(
-            db_create_terminal,
-            terminal_id,
-            info["session_name"],
-            info["name"],
-            info["provider"],
-            agent_profile=info.get("agent_profile"),
-            allowed_tools=info.get("allowed_tools"),
-            working_directory=body.working_directory,
-            runtime_id=runtime_id,
+        launched = _Launched.model_validate(raw)
+    except ValidationError as exc:
+        # Nothing here may be trusted except, perhaps, the id: use it to stop
+        # the agent the runtime may have started, and record nothing.
+        named = raw.get("id") if isinstance(raw, dict) else None
+        detail = f"runtime {runtime_id} returned an invalid launch result"
+        if isinstance(named, str) and named:
+            cleaned = await _undo_launch(runtime_id, named)
+            detail += f" for terminal {named}; " + (
+                "it was deleted" if cleaned else "it may still be running there"
+            )
+        else:
+            detail += "; an agent may still be running there"
+        logger.warning("%s: %s", detail, exc)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
+
+    terminal_id = launched.id
+    try:
+        conflict = await asyncio.to_thread(
+            _record_launch, runtime_id, launched, body.working_directory
         )
     except Exception as exc:  # noqa: BLE001
         # The agent is running with no central row: tear it down so nothing is
         # left running that the server cannot see.
         logger.exception("could not record terminal %s from runtime %s", terminal_id, runtime_id)
-        runtime_registry.forget(terminal_id)
-        cleaned = False
-        try:
-            deleted = await runtime_registry.call(
-                runtime_id, CommandType.DELETE, {}, terminal_id=terminal_id
-            )
-            cleaned = bool(deleted.get("deleted"))
-        except RemoteRuntimeError:
-            pass
+        cleaned = await _undo_launch(runtime_id, terminal_id)
         detail = f"launched terminal {terminal_id} on runtime {runtime_id} but could not record it"
         if not cleaned:
             detail += "; it may still be running there"
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=detail
         ) from exc
+    if conflict:
+        cleaned = await _undo_launch(runtime_id, terminal_id)
+        detail = f"runtime {runtime_id} launched terminal {terminal_id}, but {conflict}; " + (
+            "it was deleted" if cleaned else "it may still be running there"
+        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
 
-    reported = info.get("status")
-    if reported:
+    if launched.status:
         # Ignored if the runtime reconnected meanwhile: its new hello is newer.
-        runtime_registry.set_status(terminal_id, runtime_id, TerminalStatus(reported), conn=conn)
+        runtime_registry.set_status(terminal_id, runtime_id, launched.status, conn=conn)
     # The central lifecycle events, as a local launch in a new session emits
     # them: the runtime starts its agent with no plugin registry of its own.
     plugins = getattr(request.app.state, "plugin_registry", None)
@@ -244,16 +311,18 @@ async def launch_on_runtime(
         plugins,
         "post_create_terminal",
         PostCreateTerminalEvent(
-            session_id=info["session_name"],
+            session_id=launched.session_name,
             terminal_id=terminal_id,
-            agent_name=info.get("agent_profile"),
-            provider=info["provider"],
+            agent_name=launched.agent_profile,
+            provider=launched.provider.value,
         ),
     )
     dispatch_plugin_event(
         plugins,
         "post_create_session",
-        PostCreateSessionEvent(session_id=info["session_name"], session_name=info["session_name"]),
+        PostCreateSessionEvent(
+            session_id=launched.session_name, session_name=launched.session_name
+        ),
     )
     return await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
 
