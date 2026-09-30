@@ -124,8 +124,15 @@ async def runtime_channel(ws: WebSocket) -> None:
     try:
         # Terminals whose central row names this runtime are its to report on;
         # a status for any other terminal is ignored.
-        for terminal_id in await asyncio.to_thread(list_terminal_ids_on_runtime, runtime_id):
+        recorded = await asyncio.to_thread(list_terminal_ids_on_runtime, runtime_id)
+        for terminal_id in recorded:
             runtime_registry.place(terminal_id, runtime_id)
+        # A delete may have dropped a row after that read and before its
+        # placement: undo the placement of any row that is gone now.
+        still_recorded = set(await asyncio.to_thread(list_terminal_ids_on_runtime, runtime_id))
+        for terminal_id in recorded:
+            if terminal_id not in still_recorded:
+                runtime_registry.unplace(terminal_id, runtime_id)
         for terminal_id, reported in hello.statuses.items():
             runtime_registry.set_status(terminal_id, runtime_id, reported, conn=conn)
         await ws.send_text(server_hello)

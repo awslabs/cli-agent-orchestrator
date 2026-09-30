@@ -488,6 +488,27 @@ class TestUnrecordedTerminals:
 
 
 class TestHandshakeOrdering:
+    def test_a_terminal_deleted_during_the_hello_is_not_placed_again(
+        self, http, start_runtime, monkeypatch
+    ):
+        _remote_row("abcd1234", "rt-1")
+        real = server_mod.list_terminal_ids_on_runtime
+        calls = []
+
+        def racing(runtime_id):
+            calls.append(runtime_id)
+            ids = real(runtime_id)
+            if len(calls) == 1:
+                # A delete completes right after this snapshot: row gone, and
+                # its forget() already ran (a no-op, nothing was placed yet).
+                database.delete_terminal("abcd1234")
+                registry_mod.runtime_registry.forget("abcd1234")
+            return ids
+
+        monkeypatch.setattr(server_mod, "list_terminal_ids_on_runtime", racing)
+        start_runtime(script=_answer)
+        assert runtimes_of(http)["rt-1"]["terminals"] == [], "a ghost placement came back"
+
     def test_no_command_reaches_a_runtime_before_the_server_hello(self, http, server, monkeypatch):
         stalled, release = threading.Event(), threading.Event()
         real = server_mod.list_terminal_ids_on_runtime
