@@ -60,7 +60,8 @@ record of: one listed in the runtime's hello, or one in a launch result that
 arrives after the launch timed out or its connection dropped. A runtime that
 starts an agent but cannot report it stops it, and the launch fails with `502`
 naming the terminal. So a lost launch result cannot leave an agent running
-unseen.
+unseen. Nor can a cancelled request: once the agent runs, recording it (or
+undoing it) completes even if the caller goes away.
 
 The server checks a launch result before recording it. An invalid one fails
 the launch with `502`, after deleting the terminal it names, if any. A session
