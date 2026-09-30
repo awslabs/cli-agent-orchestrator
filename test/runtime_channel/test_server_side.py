@@ -426,7 +426,11 @@ class TestReplacedConnection:
                 async with _dial(server) as new:
                     await new.send(_hello(statuses={"abcd1234": "processing"}))
                     await new.recv()
-                    await old.send(encode(Status(terminal_id="abcd1234", status="completed")))
+                    try:
+                        # The server may already have closed the old socket.
+                        await old.send(encode(Status(terminal_id="abcd1234", status="completed")))
+                    except websockets.exceptions.ConnectionClosed:
+                        pass
                     with pytest.raises(websockets.exceptions.ConnectionClosed):
                         await asyncio.wait_for(old.recv(), 5)
                     return http.get("/terminals/abcd1234").json()["status"]
@@ -994,3 +998,80 @@ class TestSiblings:
         body = response.json()
         siblings = body["siblings"] if isinstance(body, dict) else body
         assert [(s["id"], s["status"]) for s in siblings] == [("abcd0002", "processing")]
+
+
+class TestLaunchCancellation:
+    @pytest.mark.asyncio
+    async def test_a_launch_whose_caller_went_away_is_still_settled(self, monkeypatch):
+        from types import SimpleNamespace
+
+        registry = server_mod.runtime_registry
+        sent = []
+
+        async def send_text(text):
+            command = decode(text)
+            sent.append(command)
+            payload = (
+                {"terminal": dict(LAUNCHED)}
+                if command.type == CommandType.LAUNCH
+                else {"deleted": True}
+            )
+            reply = Result(op_id=command.op_id, ok=True, payload=payload)
+            if command.type == CommandType.LAUNCH:
+                # What the channel's receive loop does for an awaited launch.
+                registry.reserve("beef0001", "rt-1")
+            asyncio.get_running_loop().call_soon(conn.resolve, reply)
+
+        conn = registry.register("rt-1", send_text)
+        registry.activate(conn)
+        entered, release = threading.Event(), threading.Event()
+
+        def failing_record(*args, **kwargs):
+            entered.set()
+            release.wait(5)
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(server_mod, "_record_launch", failing_record)
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(plugin_registry=None)))
+        body = server_mod.LaunchRequest(agent_profile="developer")
+        task = asyncio.ensure_future(server_mod.launch_on_runtime("rt-1", body, request))
+        await asyncio.to_thread(entered.wait, 5)
+        task.cancel()  # the client went away while the row was being written
+        await asyncio.sleep(0.05)
+        assert registry.is_known("beef0001", "rt-1"), "reserved until the launch settles"
+        release.set()
+        for _ in range(250):
+            if any(c.type == CommandType.DELETE for c in sent):
+                break
+            await asyncio.sleep(0.02)
+        assert [(c.type, c.terminal_id) for c in sent] == [
+            (CommandType.LAUNCH, None),
+            (CommandType.DELETE, "beef0001"),
+        ]
+        for _ in range(50):
+            if not registry.is_known("beef0001", "rt-1"):
+                break
+            await asyncio.sleep(0.02)
+        assert not registry.is_known("beef0001", "rt-1")
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+class TestReplacedSocket:
+    def test_a_replaced_connection_is_closed_even_if_it_never_speaks(self, server):
+        async def scenario():
+            async with _dial(server) as old:
+                await old.send(_hello())
+                await old.recv()
+                async with _dial(server) as new:
+                    await new.send(_hello())
+                    await new.recv()
+                    try:
+                        await asyncio.wait_for(old.recv(), 5)
+                    except websockets.exceptions.ConnectionClosed:
+                        return "closed"
+                    except asyncio.TimeoutError:
+                        return "still open"
+                    return "got a frame"
+
+        assert asyncio.run(scenario()) == "closed"

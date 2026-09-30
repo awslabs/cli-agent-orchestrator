@@ -67,6 +67,8 @@ router = APIRouter()
 
 # Strong references to teardown tasks: the event loop keeps only weak ones.
 _teardowns: Set["asyncio.Task[None]"] = set()
+# Likewise for launch settlements that outlive a cancelled request.
+_settlements: Set["asyncio.Task[Dict[str, Any]]"] = set()
 
 
 def _token_matches(presented: str) -> bool:
@@ -120,7 +122,11 @@ async def runtime_channel(ws: WebSocket) -> None:
         return
 
     runtime_id = hello.runtime_id
-    conn = runtime_registry.register(runtime_id, ws.send_text)
+
+    async def close_replaced() -> None:
+        await ws.close(code=status.WS_1000_NORMAL_CLOSURE, reason="replaced")
+
+    conn = runtime_registry.register(runtime_id, ws.send_text, close_socket=close_replaced)
     try:
         # Terminals whose central row names this runtime are its to report on;
         # a status for any other terminal is ignored.
@@ -349,12 +355,22 @@ async def launch_on_runtime(
 
     raw = result.get("terminal")
     reserved = raw.get("id") if isinstance(raw, dict) else None
-    try:
-        return await _finish_launch(request, runtime_id, body, conn, raw)
-    finally:
-        # Recorded (and so placed) or undone: either way no longer in flight.
-        if isinstance(reserved, str):
-            runtime_registry.release(reserved, runtime_id)
+
+    async def settle() -> Dict[str, Any]:
+        try:
+            return await _finish_launch(request, runtime_id, body, conn, raw)
+        finally:
+            # Recorded (and so placed) or undone: either way no longer in flight.
+            if isinstance(reserved, str):
+                runtime_registry.release(reserved, runtime_id)
+
+    # The agent runs from here on, so recording it (or undoing it) must finish
+    # even if this request is cancelled: shielded, in its own task.
+    settlement = asyncio.ensure_future(settle())
+    _settlements.add(settlement)
+    settlement.add_done_callback(_settlements.discard)
+    settlement.add_done_callback(lambda done: done.cancelled() or done.exception())
+    return await asyncio.shield(settlement)
 
 
 @router.get("/runtimes")

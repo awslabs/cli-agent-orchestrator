@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, Set
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.runtime_channel.protocol import Command, CommandType, Result, encode
@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 
 LAUNCH_TIMEOUT = 240.0
 COMMAND_TIMEOUT = 60.0
+
+# Strong references to background tasks: the event loop keeps only weak ones.
+_background: Set["asyncio.Task[None]"] = set()
 
 
 class RemoteRuntimeError(Exception):
@@ -78,10 +81,18 @@ async def _acquire_within(lock: asyncio.Lock, timeout: float) -> bool:
 class RuntimeConnection:
     """One live channel to a runtime, with op_id-correlated command calls."""
 
-    def __init__(self, runtime_id: str, send_text: Callable[[str], Awaitable[None]]):
+    def __init__(
+        self,
+        runtime_id: str,
+        send_text: Callable[[str], Awaitable[None]],
+        close_socket: Optional[Callable[[], Awaitable[None]]] = None,
+    ):
         self.runtime_id = runtime_id
         self.connected_at = time.time()
         self._send_text = send_text
+        # Closes the WebSocket itself: a replaced connection's handler may be
+        # waiting for a frame the old runtime never sends.
+        self.close_socket = close_socket
         self._send_lock = asyncio.Lock()
         self._pending: Dict[str, "asyncio.Future[Result]"] = {}
         self.closed = False
@@ -186,6 +197,15 @@ class RuntimeConnection:
         self._pending.clear()
 
 
+async def _close_quietly(conn: "RuntimeConnection") -> None:
+    """Close a replaced connection's socket; it may already be gone."""
+    try:
+        if conn.close_socket is not None:
+            await conn.close_socket()
+    except Exception:  # noqa: BLE001 - the peer may have dropped it already
+        logger.debug("closing replaced channel of runtime %s failed", conn.runtime_id)
+
+
 class RuntimeRegistry:
     """Process-wide state for connected runtimes. Thread-safe."""
 
@@ -201,14 +221,17 @@ class RuntimeRegistry:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     def register(
-        self, runtime_id: str, send_text: Callable[[str], Awaitable[None]]
+        self,
+        runtime_id: str,
+        send_text: Callable[[str], Awaitable[None]],
+        close_socket: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> RuntimeConnection:
         """Record a new channel for ``runtime_id``, replacing (and closing) any older one.
 
         Statuses reported over an earlier connection are dropped: the runtime's
         hello on this one says what it runs now (a replaced pod runs nothing).
         """
-        conn = RuntimeConnection(runtime_id, send_text)
+        conn = RuntimeConnection(runtime_id, send_text, close_socket)
         with self._lock:
             previous = self._runtimes.get(runtime_id)
             self._runtimes[runtime_id] = conn
@@ -218,6 +241,10 @@ class RuntimeRegistry:
                     self._status.pop(terminal_id, None)
         if previous is not None:
             previous.close("replaced by a new connection")
+            if previous.close_socket is not None:
+                task = asyncio.ensure_future(_close_quietly(previous))
+                _background.add(task)
+                task.add_done_callback(_background.discard)
         logger.info("runtime %s connected", runtime_id)
         return conn
 
