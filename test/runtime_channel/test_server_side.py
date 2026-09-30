@@ -562,6 +562,50 @@ class TestAttach:
 
 
 class TestLaunchAcrossAReconnect:
+    def test_a_status_reported_while_the_launch_is_recorded_is_kept(
+        self, http, server, monkeypatch
+    ):
+        recording, release = threading.Event(), threading.Event()
+        real = server_mod._record_launch
+
+        def slow_record(*args, **kwargs):
+            recording.set()
+            release.wait(5)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(server_mod, "_record_launch", slow_record)
+
+        async def scenario():
+            async with _dial(server) as old:
+                await old.send(_hello())
+                await old.recv()
+                loop = asyncio.get_running_loop()
+                request = loop.run_in_executor(
+                    None,
+                    lambda: http.post(
+                        "/runtimes/rt-1/terminals", json={"agent_profile": "developer"}
+                    ),
+                )
+                launch = await _next_command(old)
+                await old.send(
+                    encode(
+                        Result(op_id=launch.op_id, ok=True, payload={"terminal": dict(LAUNCHED)})
+                    )
+                )
+                await asyncio.to_thread(recording.wait, 5)
+                # Reconnected before the row is written; the hello carries the
+                # terminal's current status, the only report it will get.
+                async with _dial(server) as new:
+                    await new.send(_hello(statuses={"beef0001": "processing"}))
+                    await new.recv()
+                    release.set()
+                    response = await asyncio.wait_for(request, 10)
+                    return response, http.get("/terminals/beef0001").json()["status"]
+
+        response, status_now = asyncio.run(scenario())
+        assert response.status_code == 201, response.text
+        assert status_now == "processing"
+
     def test_a_reconnect_while_a_launch_is_being_recorded_keeps_its_terminal(
         self, http, server, monkeypatch
     ):
@@ -984,6 +1028,19 @@ class TestSessionNameCollisions:
 
 
 class TestSiblings:
+    def test_a_remote_siblings_status_is_unknown_before_its_runtime_reconnects(self, http):
+        # As after a server restart: remote rows, no runtime connected yet.
+        _remote_row("abcd0001", "rt-1", session="cao-grp1")
+        _remote_row("abcd0002", "rt-1", session="cao-grp1")
+        for terminal_id in ("abcd0001", "abcd0002"):
+            database.update_terminal_group(terminal_id, ["team"])
+        response = http.get("/terminals/abcd0001/siblings")
+        assert response.status_code == 200, response.text
+        body = response.json()
+        siblings = body["siblings"] if isinstance(body, dict) else body
+        assert [(s["id"], s["status"]) for s in siblings] == [("abcd0002", "unknown")]
+        assert "runtime_id" not in siblings[0], "the response shape is unchanged"
+
     def test_a_remote_siblings_status_is_the_one_its_runtime_reported(self, http, start_runtime):
         _remote_row("abcd0001", "rt-1", session="cao-grp1")
         _remote_row("abcd0002", "rt-1", session="cao-grp1")

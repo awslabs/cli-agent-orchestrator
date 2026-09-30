@@ -2567,6 +2567,9 @@ def list_siblings_by_group_prefix(
                         "id": row.id,
                         "group": sibling_group,
                         "metadata": metadata,
+                        # Where its status comes from (#745); list_siblings
+                        # drops it from the reported shape.
+                        "runtime_id": row.runtime_id,
                     }
                 )
         return siblings
