@@ -2203,7 +2203,11 @@ class TestSendInput:
         # The active provider receives the same explicit buffer-generation
         # boundary, so stateful detectors never compare post-dispatch output
         # with the discarded rolling buffer.
-        mock_status_monitor.clear_rolling_buffer.assert_called_once_with("test1234", mock_provider)
+        # It also names the turn this dispatch opened (PR #812 round 9), so an
+        # interleaved send cannot record the other dispatch's number.
+        mock_status_monitor.clear_rolling_buffer.assert_called_once_with(
+            "test1234", mock_provider, turn=mock_status_monitor.notify_input_sent.return_value
+        )
         # reset_buffer would wipe the arm — must NOT be called on send_input.
         mock_status_monitor.reset_buffer.assert_not_called()
 

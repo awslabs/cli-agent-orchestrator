@@ -2560,7 +2560,7 @@ def send_input(
         # rolling byte buffer.  Grok uses this to distinguish a new,
         # byte-identical completion from a retained completion screen.
         try:
-            status_monitor.clear_rolling_buffer(terminal_id, provider)
+            status_monitor.clear_rolling_buffer(terminal_id, provider, turn=turn)
 
             # Mark the provider before send_keys rather than after it.  send_keys
             # includes the provider-specific submit delay, during which a fast CLI

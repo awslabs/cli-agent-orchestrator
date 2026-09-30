@@ -248,12 +248,11 @@ class StatusMonitor:
         # The status a dispatch found, kept so abort_turn() can put it back when
         # the dispatch fails before any keystroke reached the agent.
         self._pre_dispatch_status: Dict[str, Optional[TerminalStatus]] = {}
-        # The most recent turn opened by a real send (its dispatch cleared the
-        # buffer), and whether that send was still unfinished when the current
-        # turn was dispatched. abort_turn() must not close a failed dispatch past
-        # an accepted message whose first work frame simply has not arrived yet.
+        # The two most recent turns opened by a real send (their dispatch cleared
+        # the buffer). abort_turn() must not close a failed dispatch past an
+        # earlier accepted message whose first work frame has not arrived yet.
         self._last_real_turn: Dict[str, int] = {}
-        self._real_send_open_at_dispatch: Dict[str, bool] = {}
+        self._prev_real_turn: Dict[str, int] = {}
 
     async def run(self) -> None:
         """Subscribe to output events and detect status changes.
@@ -1277,9 +1276,6 @@ class StatusMonitor:
         """
         with self._lock:
             self._pre_dispatch_status[terminal_id] = self._last_status.get(terminal_id)
-            self._real_send_open_at_dispatch[terminal_id] = self._turn_done.get(
-                terminal_id, 0
-            ) < self._last_real_turn.get(terminal_id, 0)
             self._allow_processing_revert[terminal_id] = True
             turn = self._turn.get(terminal_id, 0) + 1
             self._turn[terminal_id] = turn
@@ -1342,7 +1338,9 @@ class StatusMonitor:
                 return
             if self._turn_started.get(terminal_id, False):
                 return
-            if self._real_send_open_at_dispatch.get(terminal_id, False):
+            last = self._last_real_turn.get(terminal_id, 0)
+            earlier_real = self._prev_real_turn.get(terminal_id, 0) if last >= turn else last
+            if self._turn_done.get(terminal_id, 0) < earlier_real:
                 return
             self._turn_done[terminal_id] = turn
             prior = self._pre_dispatch_status.pop(terminal_id, None)
@@ -1379,7 +1377,9 @@ class StatusMonitor:
         with self._lock:
             return (self._turn.get(terminal_id, 0), self._turn_done.get(terminal_id, 0))
 
-    def clear_rolling_buffer(self, terminal_id: str, provider=None) -> None:
+    def clear_rolling_buffer(
+        self, terminal_id: str, provider=None, turn: Optional[int] = None
+    ) -> None:
         """Clear ONLY the rolling byte buffer for a terminal — preserves
         ``_last_status`` and ``_allow_processing_revert``.
 
@@ -1404,7 +1404,14 @@ class StatusMonitor:
             # turn's dispatch — the fact that lets a raw-buffer ready verdict count
             # as current-turn evidence (see _note_turn_progress_locked).
             self._turn_buffer_cleared[terminal_id] = True
-            self._last_real_turn[terminal_id] = self._turn.get(terminal_id, 0)
+            # ``turn`` is the dispatch's own number (send_input passes it). Using the
+            # live counter instead let two interleaved sends record the wrong one,
+            # and a failed send could then close the other's accepted turn.
+            real = self._turn.get(terminal_id, 0) if turn is None else turn
+            last = self._last_real_turn.get(terminal_id, 0)
+            if real > last:
+                self._prev_real_turn[terminal_id] = last
+                self._last_real_turn[terminal_id] = real
             if provider is not None:
                 provider.notify_status_buffer_reset(epoch)
 
@@ -1441,7 +1448,7 @@ class StatusMonitor:
             self._turn_buffer_cleared.pop(terminal_id, None)
             self._pre_dispatch_status.pop(terminal_id, None)
             self._last_real_turn.pop(terminal_id, None)
-            self._real_send_open_at_dispatch.pop(terminal_id, None)
+            self._prev_real_turn.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 

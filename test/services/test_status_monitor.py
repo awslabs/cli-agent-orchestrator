@@ -2640,3 +2640,60 @@ class TestRound9EveryScreenSiteIsPinned:
         sm._screen_lines = lines
         sm._midburst_processing_probe("t1", provider)
         assert sm._turn_started.get("t1") is False
+
+
+class TestRound9InterleavedSends:
+    def test_a_failed_send_does_not_close_an_interleaved_accepted_one(self):
+        """Two send_input calls interleave: A opens turn 1, B opens turn 2, A clears
+        and delivers, B clears and then fails. A's accepted turn 1 must stay open."""
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        a = sm.notify_input_sent("t1")
+        b = sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1", provider, turn=a)
+        sm.notify_input_delivered("t1")
+        sm.clear_rolling_buffer("t1", provider, turn=b)
+
+        sm.abort_turn("t1", b)
+
+        assert sm.turn_state("t1") != (2, 2)
+
+    @staticmethod
+    def _real(sm, provider):
+        turn = sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1", provider, turn=turn)
+        sm.notify_input_delivered("t1")
+        return turn
+
+    def test_several_failed_sends_behind_an_accepted_one_stay_open(self):
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        self._real(sm, provider)  # accepted, not yet seen working
+        for _ in range(2):
+            failed = sm.notify_input_sent("t1")
+            sm.clear_rolling_buffer("t1", provider, turn=failed)
+            sm.abort_turn("t1", failed)
+        assert sm.turn_state("t1") == (3, 0)
+        sm._apply_detection("t1", TerminalStatus.PROCESSING)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED)
+        assert sm.turn_state("t1") == (3, 3)
+
+    def test_a_first_ever_send_that_fails_closes(self):
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        failed = sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1", provider, turn=failed)
+        sm.abort_turn("t1", failed)
+        assert sm.turn_state("t1") == (1, 1)
+
+    def test_a_send_that_fails_before_its_clear_stays_behind_an_accepted_one(self):
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        self._real(sm, provider)
+        failed = sm.notify_input_sent("t1")  # the clear itself never ran
+        sm.abort_turn("t1", failed)
+        assert sm.turn_state("t1") == (2, 0)
