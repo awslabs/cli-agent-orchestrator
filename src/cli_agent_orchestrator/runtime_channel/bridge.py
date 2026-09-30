@@ -30,6 +30,7 @@ from cli_agent_orchestrator.constants import CAO_HOME_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.runtime_channel.protocol import (
     PROTOCOL_VERSION,
+    RUNTIME_ID_PATTERN,
     Command,
     CommandType,
     Hello,
@@ -449,6 +450,12 @@ async def _amain() -> None:
     server_url = os.environ.get("CAO_BRIDGE_SERVER_URL", "").strip()
     runtime_id = os.environ.get("CAO_BRIDGE_RUNTIME_ID", "").strip()
     token = runtime_token()
+    if runtime_id and not re.fullmatch(RUNTIME_ID_PATTERN, runtime_id):
+        raise SystemExit(
+            f"CAO_BRIDGE_RUNTIME_ID={runtime_id!r} is not a valid runtime id: it is "
+            "addressed as /runtimes/{runtime_id}, so use letters, digits, '.', '_' and "
+            "'-' (starting with a letter or digit, at most 128 characters)"
+        )
     if not server_url or not runtime_id or not token:
         raise SystemExit(
             "cao-bridge requires CAO_BRIDGE_SERVER_URL, CAO_BRIDGE_RUNTIME_ID and "

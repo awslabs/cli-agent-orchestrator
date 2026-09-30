@@ -30,6 +30,12 @@ class CommandType(str, Enum):
     DELETE = "delete"
 
 
+#: A runtime id is addressed as one URL path segment (``/runtimes/{runtime_id}/...``):
+#: letters, digits, ``.``, ``_`` and ``-``, starting with a letter or digit, at
+#: most 128 characters. A Kubernetes pod name fits.
+RUNTIME_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+
+
 class Hello(BaseModel):
     """First frame in each direction.
 
@@ -39,7 +45,7 @@ class Hello(BaseModel):
 
     kind: Literal["hello"] = "hello"
     protocol_version: int
-    runtime_id: str
+    runtime_id: str = Field(pattern=RUNTIME_ID_PATTERN)
     statuses: Dict[str, TerminalStatus] = Field(default_factory=dict)
 
 

@@ -321,3 +321,29 @@ async def test_a_losing_launchs_status_cannot_touch_the_winners():
     registry.set_status("beef0001", "rt-1", TerminalStatus.PROCESSING, conn=loser.conn)
     registry.release("beef0001", "rt-1")
     assert registry.get_status("beef0001", "rt-2") == TerminalStatus.IDLE
+
+
+@pytest.mark.parametrize("runtime_id", ["", "a/b", "rt 1", "../x", "x" * 200])
+def test_a_runtime_id_must_be_one_url_path_segment(runtime_id):
+    with pytest.raises(ValidationError):
+        Hello(protocol_version=PROTOCOL_VERSION, runtime_id=runtime_id)
+
+
+@pytest.mark.parametrize("runtime_id", ["cao-runtime-0", "rt-1", "server", "a.b_c-9"])
+def test_pod_names_are_valid_runtime_ids(runtime_id):
+    assert Hello(protocol_version=PROTOCOL_VERSION, runtime_id=runtime_id).runtime_id == runtime_id
+
+
+def test_cao_bridge_refuses_an_unaddressable_runtime_id(monkeypatch):
+    from cli_agent_orchestrator.runtime_channel import bridge as bridge_mod
+
+    monkeypatch.setenv("CAO_BRIDGE_SERVER_URL", "ws://server/runtime/channel")
+    monkeypatch.setenv("CAO_BRIDGE_RUNTIME_ID", "a/b")
+    monkeypatch.setenv(token_mod.TOKEN_ENV, "token")
+    token_mod._reset_for_tests()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            asyncio.run(bridge_mod._amain())
+        assert "CAO_BRIDGE_RUNTIME_ID" in str(exc.value)
+    finally:
+        token_mod._reset_for_tests()
