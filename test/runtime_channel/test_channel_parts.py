@@ -207,6 +207,18 @@ async def test_only_the_runtime_a_terminal_is_placed_on_may_report_its_status():
 
 
 @pytest.mark.asyncio
+async def test_status_is_unknown_until_the_hello_exchange_is_over():
+    registry = RuntimeRegistry()
+    conn = registry.register("rt-1", lambda text: asyncio.sleep(0))
+    registry.place("t1", "rt-1")
+    # The server records the runtime's hello statuses before sending its own hello.
+    assert registry.set_status("t1", "rt-1", TerminalStatus.PROCESSING, conn=conn) is True
+    assert registry.get_status("t1", "rt-1") == TerminalStatus.UNKNOWN
+    registry.activate(conn)
+    assert registry.get_status("t1", "rt-1") == TerminalStatus.PROCESSING
+
+
+@pytest.mark.asyncio
 async def test_status_is_unknown_while_the_runtime_is_disconnected():
     registry = RuntimeRegistry()
     runtime = _FakeRuntime(registry)

@@ -768,3 +768,86 @@ class TestWithApiAuthentication:
         assert response.status_code == 201, response.text
         assert http.get("/terminals/beef0001").status_code == 401
         assert http.get("/terminals/beef0001", headers=bearer).status_code == 200
+
+
+class TestInvalidLaunchResults:
+    @pytest.mark.parametrize(
+        "terminal",
+        [
+            {"id": "beef0001"},  # fields missing
+            {**LAUNCHED, "provider": "not-a-provider"},
+            {**LAUNCHED, "session_name": 7},
+        ],
+    )
+    def test_an_invalid_result_naming_a_terminal_is_undone(self, http, start_runtime, terminal):
+        def script(command):
+            if command.type == CommandType.LAUNCH:
+                return {"terminal": terminal}
+            return {"deleted": True}
+
+        runtime = start_runtime(script=script)
+        response = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
+        assert response.status_code == 502, response.text
+        assert "invalid launch result" in response.json()["detail"]
+        assert [(c.type, c.terminal_id) for c in runtime.received][1:] == [
+            (CommandType.DELETE, "beef0001")
+        ]
+        assert database.get_terminal_metadata("beef0001") is None
+        assert runtimes_of(http)["rt-1"]["terminals"] == []
+
+    @pytest.mark.parametrize("payload", [{}, {"terminal": "beef0001"}, {"terminal": {"id": 7}}])
+    def test_an_invalid_result_naming_nothing_is_a_502(self, http, start_runtime, payload):
+        runtime = start_runtime(script=lambda command: payload)
+        response = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
+        assert response.status_code == 502, response.text
+        assert "may still be running" in response.json()["detail"]
+        assert [c.type for c in runtime.received] == [CommandType.LAUNCH]
+
+
+class TestSessionNameCollisions:
+    @pytest.mark.parametrize("existing_runtime", ["rt-2", None])
+    def test_a_launch_into_a_session_name_already_in_use_is_undone(
+        self, http, start_runtime, existing_runtime
+    ):
+        # Another runtime's session, or a local one, already has this name.
+        database.create_terminal(
+            "aaaa0001", "cao-beef", "developer-aaaa", "mock_cli", "developer",
+            runtime_id=existing_runtime,
+        )  # fmt: skip
+        runtime = start_runtime(script=_answer)  # launches beef0001 in cao-beef
+        response = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
+        assert response.status_code == 409, response.text
+        assert "cao-beef" in response.json()["detail"]
+        assert [(c.type, c.terminal_id) for c in runtime.received][1:] == [
+            (CommandType.DELETE, "beef0001")
+        ]
+        assert [t["id"] for t in database.list_terminals_by_session("cao-beef")] == ["aaaa0001"]
+        assert runtimes_of(http)["rt-1"]["terminals"] == []
+
+    def test_a_launch_reusing_a_terminal_id_leaves_the_other_terminal_placed(
+        self, http, start_runtime
+    ):
+        _remote_row("beef0001", "rt-2", session="cao-other")
+        registry_mod.runtime_registry.place("beef0001", "rt-2")
+        runtime = start_runtime(script=_answer)
+        response = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
+        assert response.status_code == 409, response.text
+        assert [(c.type, c.terminal_id) for c in runtime.received][1:] == [
+            (CommandType.DELETE, "beef0001")
+        ]
+        assert database.get_terminal_metadata("beef0001")["tmux_session"] == "cao-other"
+        assert registry_mod.runtime_registry.is_placed("beef0001", "rt-2")
+
+    def test_a_local_session_cannot_take_a_remote_sessions_name(self, client):
+        _remote_row("abcd0001", "rt-1", session="cao-remote1")
+        response = client.post(
+            "/sessions",
+            params={
+                "agent_profile": "developer",
+                "provider": "mock_cli",
+                "session_name": "cao-remote1",
+            },
+        )
+        assert response.status_code == 400, response.text
+        assert "already exists" in response.json()["detail"]
+        assert [t["id"] for t in database.list_terminals_by_session("cao-remote1")] == ["abcd0001"]

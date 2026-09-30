@@ -55,6 +55,7 @@ from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam
     list_pending_deferred_init_external_owner_terminal_ids,
     list_siblings_by_group_prefix,
     list_terminals_by_session,
+    session_is_remote,
     update_last_active,
     update_terminal_deferred_init_external_owner,
     update_terminal_deferred_init_failure,
@@ -1574,6 +1575,13 @@ async def create_terminal(
             nonlocal deferred_delete_on_failure, session_incarnation_id
             assert session_name is not None  # narrowed by the caller
             with session_lifecycle_lock(session_name):
+                # A session whose terminals run in an execution runtime (#745)
+                # is not this server's to create or extend. Checked under the
+                # lock a remote launch records its session under.
+                if session_is_remote(session_name):
+                    raise ValueError(
+                        f"Session '{session_name}' already exists in an execution runtime"
+                    )
                 if new_session:
                     # Prevent duplicate sessions
                     if get_backend().session_exists(session_name):
