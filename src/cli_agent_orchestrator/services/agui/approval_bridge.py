@@ -110,7 +110,9 @@ class ApprovalBridge:
             try:
                 from cli_agent_orchestrator.services import terminal_service
 
-                raw_prompt = terminal_service.get_output(terminal_id)
+                # In a worker thread: for a terminal in an execution runtime
+                # (#745) this blocks on the channel, which runs on this loop.
+                raw_prompt = await asyncio.to_thread(terminal_service.get_output, terminal_id)
             except Exception:
                 logger.debug("Failed to get output for terminal %s", terminal_id)
 

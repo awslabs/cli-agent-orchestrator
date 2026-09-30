@@ -25,6 +25,8 @@ RECORDER = """#!/bin/sh
 printf '%s %s TOKEN=%s\\n' "$(basename "$0")" "$*" "${CAO_RUNTIME_TOKEN-<unset>}" >> "$STUB_LOG"
 if [ -n "${CAO_BRIDGE_READY_FILE:-}" ] && [ -e "$CAO_BRIDGE_READY_FILE" ]; then
   echo "$(basename "$0") $1" >> "$STUB_LOG.ready"
+elif [ -n "${CAO_WATCH_READY:-}" ] && [ -e "$CAO_WATCH_READY" ]; then
+  echo "$(basename "$0") $1" >> "$STUB_LOG.ready"
 fi
 [ "$(basename "$0")" = claude ] && echo ok
 exit 0
@@ -91,5 +93,15 @@ def test_a_readiness_file_left_by_a_restarted_container_is_cleared_first(tmp_pat
     ready.parent.mkdir()
     ready.write_text("")
     _run(tmp_path, CAO_NODE_MODE="bridge", CAO_BRIDGE_READY_FILE=str(ready))
+    seen = tmp_path / "calls.log.ready"
+    assert not seen.exists(), f"ran while the old readiness file was there: {seen.read_text()}"
+
+
+def test_the_default_readiness_file_is_cleared_too(tmp_path):
+    # Without CAO_BRIDGE_READY_FILE, cao-bridge uses $CAO_HOME_DIR/bridge-ready.
+    ready = tmp_path / "state" / "bridge-ready"
+    ready.parent.mkdir()
+    ready.write_text("")
+    _run(tmp_path, CAO_NODE_MODE="bridge", CAO_WATCH_READY=str(ready))
     seen = tmp_path / "calls.log.ready"
     assert not seen.exists(), f"ran while the old readiness file was there: {seen.read_text()}"
