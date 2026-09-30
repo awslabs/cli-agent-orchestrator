@@ -248,6 +248,10 @@ class StatusMonitor:
         # The status a dispatch found, kept so abort_turn() can put it back when
         # the dispatch fails before any keystroke reached the agent.
         self._pre_dispatch_status: Dict[str, Optional[TerminalStatus]] = {}
+        self._pre_dispatch_started: Dict[str, bool] = {}
+        # The rolling buffer a dispatch's clear discarded, so abort_turn() can put
+        # it back when the dispatch fails before anything was typed.
+        self._pre_clear_buffer: Dict[str, str] = {}
         # The two most recent turns opened by a real send (their dispatch cleared
         # the buffer). abort_turn() must not close a failed dispatch past an
         # earlier accepted message whose first work frame has not arrived yet.
@@ -260,6 +264,11 @@ class StatusMonitor:
         # loose legacy rule for uncleared turns — also reported the real send
         # finished, because turn_done is a single "highest finished" counter.
         self._turn_continuation: Dict[str, bool] = {}
+        # A real send dispatched to a busy agent: the previous turn, already seen
+        # working and unfinished at that moment. The next settled ready reading
+        # closes up to it even while the new turn itself cannot close yet, so the
+        # earlier sender is not held to the new turn's backstop (round 9 model check).
+        self._busy_carry: Dict[str, int] = {}
 
     async def run(self) -> None:
         """Subscribe to output events and detect status changes.
@@ -705,6 +714,11 @@ class StatusMonitor:
         if turn == 0 or self._turn_done.get(terminal_id, 0) >= turn:
             return
         if self._turn_unstarted_locked(terminal_id):
+            carry = self._busy_carry.pop(terminal_id, 0)
+            if carry > self._turn_done.get(terminal_id, 0):
+                # The earlier, seen-working turn finished; the busy send after it has
+                # not been seen yet and keeps waiting (see _busy_carry).
+                self._turn_done[terminal_id] = carry
             # Still inside the window where a settled RETAINED frame can only be the
             # previous turn's. Shares the predicate with the latch guard in
             # _apply_detection_locked so the two cannot disagree about when a turn
@@ -1298,6 +1312,7 @@ class StatusMonitor:
         """
         with self._lock:
             self._pre_dispatch_status[terminal_id] = self._last_status.get(terminal_id)
+            self._pre_dispatch_started[terminal_id] = self._turn_started.get(terminal_id, False)
             self._allow_processing_revert[terminal_id] = True
             turn = self._turn.get(terminal_id, 0) + 1
             self._turn[terminal_id] = turn
@@ -1309,6 +1324,14 @@ class StatusMonitor:
             continuation = not real_send and self._turn_done.get(
                 terminal_id, 0
             ) < self._last_real_turn.get(terminal_id, 0)
+            previous = turn - 1
+            if (
+                real_send
+                and previous > 0
+                and self._turn_done.get(terminal_id, 0) < previous
+                and self._turn_started.get(terminal_id, False)
+            ):
+                self._busy_carry[terminal_id] = previous
             self._turn_continuation[terminal_id] = continuation
             if not continuation:
                 self._turn_started[terminal_id] = False
@@ -1370,9 +1393,23 @@ class StatusMonitor:
                 return
             if self._turn_started.get(terminal_id, False):
                 return
+            # Nothing was typed, so undo the failed dispatch's buffer clear: the
+            # bytes it discarded (an answer the earlier send just produced, say) are
+            # still the terminal's current output. Without them nothing re-reads that
+            # answer once the agent falls silent, and its waiter sits out the
+            # backstop (round 9 model check). Anything that arrived since is kept.
+            self._buffers[terminal_id] = self._pre_clear_buffer.pop(
+                terminal_id, ""
+            ) + self._buffers.get(terminal_id, "")
             last = self._last_real_turn.get(terminal_id, 0)
             earlier_real = self._prev_real_turn.get(terminal_id, 0) if last >= turn else last
             if self._turn_done.get(terminal_id, 0) < earlier_real:
+                # Nothing was typed, so this turn simply continues the earlier send:
+                # give back what the failed dispatch took (the send's seen-working
+                # state), or that send could not close until the backstop even
+                # after its answer arrived (round 9 review).
+                self._turn_continuation[terminal_id] = True
+                self._turn_started[terminal_id] = self._pre_dispatch_started.get(terminal_id, False)
                 return
             self._turn_done[terminal_id] = turn
             prior = self._pre_dispatch_status.pop(terminal_id, None)
@@ -1429,6 +1466,7 @@ class StatusMonitor:
         chunk against state from the discarded buffer.
         """
         with self._lock:
+            self._pre_clear_buffer[terminal_id] = self._buffers.get(terminal_id, "")
             self._buffers[terminal_id] = ""
             epoch = self._buffer_epochs.get(terminal_id, 0) + 1
             self._buffer_epochs[terminal_id] = epoch
@@ -1482,9 +1520,12 @@ class StatusMonitor:
             self._turn_delivered_at.pop(terminal_id, None)
             self._turn_buffer_cleared.pop(terminal_id, None)
             self._pre_dispatch_status.pop(terminal_id, None)
+            self._pre_dispatch_started.pop(terminal_id, None)
+            self._pre_clear_buffer.pop(terminal_id, None)
             self._last_real_turn.pop(terminal_id, None)
             self._prev_real_turn.pop(terminal_id, None)
             self._turn_continuation.pop(terminal_id, None)
+            self._busy_carry.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 

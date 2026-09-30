@@ -2814,3 +2814,77 @@ class TestRound9FoundByTheModelCheck:
         finally:
             for p in patches:
                 p.stop()
+
+
+class TestRound9AbortGivesBackTheEarlierSend:
+    def test_the_earlier_send_closes_on_its_answer_not_the_backstop(self):
+        """turn 1 is seen working; two later sends fail and are left open behind it.
+        When turn 1's answer arrives, the counter must advance then, not 60s later."""
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        first = sm.notify_input_sent("t1", real_send=True)
+        sm.clear_rolling_buffer("t1", provider, turn=first)
+        sm.notify_input_delivered("t1")
+        sm._apply_detection("t1", TerminalStatus.PROCESSING, work_evidence=True)
+        for _ in range(2):
+            failed = sm.notify_input_sent("t1", real_send=True)
+            sm.clear_rolling_buffer("t1", provider, turn=failed)
+            sm.abort_turn("t1", failed)
+        assert sm.turn_state("t1") == (3, 0)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED, work_evidence=False)  # turn 1's answer
+        assert sm.turn_state("t1") == (3, 3)
+
+
+class TestRound9BusySendAndAbortBuffer:
+    """Two liveness gaps the model check's event-loop mode found (round 9)."""
+
+    @staticmethod
+    def _send(sm, provider):
+        turn = sm.notify_input_sent("t1", real_send=True)
+        sm.clear_rolling_buffer("t1", provider, turn=turn)
+        sm.notify_input_delivered("t1")
+        return turn
+
+    def test_an_earlier_turn_is_not_held_to_a_busy_sends_backstop(self):
+        """Turn 1 is seen working; turn 2 is sent while it runs. When turn 1's answer
+        settles, turn 1 closes then, although turn 2 has not been seen yet."""
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        self._send(sm, provider)
+        sm._apply_detection("t1", TerminalStatus.PROCESSING)  # turn 1 working
+        self._send(sm, provider)  # busy send
+        sm._apply_detection("t1", TerminalStatus.COMPLETED)  # turn 1's answer
+        assert sm.turn_state("t1") == (2, 1)
+        sm._apply_detection("t1", TerminalStatus.PROCESSING)  # turn 2 seen
+        sm._apply_detection("t1", TerminalStatus.COMPLETED)
+        assert sm.turn_state("t1") == (2, 2)
+
+    def test_a_busy_send_to_an_unseen_turn_does_not_carry(self):
+        """The carry needs the earlier turn to have been SEEN working: an unseen one
+        may still be showing the previous answer."""
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        self._send(sm, provider)  # turn 1, never seen working
+        self._send(sm, provider)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED)
+        assert sm.turn_state("t1") == (2, 0)
+
+    def test_an_aborted_send_gives_back_the_buffer_it_cleared(self):
+        """A failed send cleared the buffer holding the earlier send's answer; with
+        the agent then silent, only the restored bytes let the next poll read it."""
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        self._send(sm, provider)
+        with sm._lock:
+            sm._buffers["t1"] = "turn 1 answer and idle prompt"
+        failed = sm.notify_input_sent("t1", real_send=True)
+        sm.clear_rolling_buffer("t1", provider, turn=failed)
+        assert sm._buffers["t1"] == ""
+        with sm._lock:
+            sm._buffers["t1"] = "late chunk"
+        sm.abort_turn("t1", failed)
+        assert sm._buffers["t1"] == "turn 1 answer and idle promptlate chunk"

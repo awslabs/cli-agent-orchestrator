@@ -12,7 +12,16 @@ step:
          running turn (claude_code and kiro-cli really do this), so that turn's answer
          covers it. A close after TURN_START_BACKSTOP_S is the documented liveness
          valve, not an early close.
+  SLOW   once the agent has answered everything and the reads have run, every
+         delivered message is closed BEFORE the backstop. Exempt: native polling (a
+         turn too fast for any poll to see working is its documented cost), and input
+         sent to a busy agent that was never seen worked on after its dispatch (it
+         closes at the backstop rather than risk taking the running turn's answer).
   STUCK  once the agent is idle and the backstop has passed, polling closes every turn.
+
+Each provider shape runs twice: with no event loop (every read inline) and with a
+fake loop whose timers fire on demand, so the real burst/quiescence scheduling, the
+rising edge and the mid-burst probe run as they do live.
 
 Raw output is modelled as tokens ("|W3" work sign for turn 3, "|D3" its answer, "|I0"
 an idle prompt, "|P" a half-received repaint), which the fake raw detector reads the
@@ -20,6 +29,7 @@ way kiro's and grok's do. A "delayed read" runs other events inside the detector
 so a verdict is applied after the world moved on.
 """
 
+import asyncio
 import random
 import types
 from unittest.mock import patch
@@ -36,6 +46,49 @@ _RAW = {"W": S.PROCESSING, "P": S.PROCESSING, "D": S.COMPLETED, "I": S.IDLE}
 _SCREEN = {"work": S.PROCESSING, "done": S.COMPLETED, "idle": S.IDLE}
 
 
+class _Handle:
+    def __init__(self, cb, args):
+        self.cb, self.args, self.cancelled = cb, args, False
+
+    def cancel(self):
+        self.cancelled = True
+
+
+class _Task:
+    def add_done_callback(self, fn):
+        fn(self)
+
+
+class _FakeLoop:
+    """Just enough of an event loop: timers fire when the schedule says so, tasks run
+    to completion at once (on a private real loop, for asyncio.to_thread)."""
+
+    def __init__(self):
+        self.timers = []
+
+    def call_soon_threadsafe(self, fn, *args):
+        fn(*args)
+
+    def call_later(self, _delay, cb, *args):
+        handle = _Handle(cb, args)
+        self.timers.append(handle)
+        return handle
+
+    def create_task(self, coro):
+        runner = asyncio.new_event_loop()
+        try:
+            runner.run_until_complete(coro)
+        finally:
+            runner.close()
+        return _Task()
+
+    def fire(self):
+        due, self.timers = [h for h in self.timers if not h.cancelled], []
+        for handle in due:
+            handle.cb(*handle.args)
+        return bool(due)
+
+
 class _Clock:
     def __init__(self):
         self.t = 1000.0
@@ -50,6 +103,8 @@ class _Agent:
         self.pending = []  # delivered, not yet picked up
         self.answered = set()
         self.screen = ("idle", 0)
+        self.animate = False  # a working TUI redraws its spinner after new input
+        self.work_since = 0.0
 
 
 class _Provider:
@@ -90,11 +145,14 @@ class _Provider:
         return bool(lines) and lines[0] == "WORK"
 
 
-def _run(kind, rng, trace):
+def _run(kind, rng, trace, loop_mode=False):
     clock, agent = _Clock(), _Agent()
     prov = _Provider(kind, agent)
     sm = StatusMonitor()
-    delivered, delivered_at = [], {}
+    loop = _FakeLoop() if loop_mode else None
+    if loop is not None:
+        sm._loop = loop
+    delivered, delivered_at, folded = [], {}, set()
     backend = types.SimpleNamespace(supports_event_inbox=lambda: kind == "native")
 
     def token(frame):
@@ -102,10 +160,10 @@ def _run(kind, rng, trace):
 
     def draw(frame):
         agent.screen = frame
-        if kind in ("kiro", "grok"):
+        if kind in ("kiro", "grok", "claude"):
+            # claude's chunks take the real pipeline too: raw buffer + pyte feed +
+            # screen scheduling, exactly as live output does
             sm._process_chunk(TID, "|" + token(frame))
-        elif kind == "claude":
-            sm._schedule_screen_detection(TID, prov)
 
     def send(fail=False):
         turn = sm.notify_input_sent(
@@ -121,6 +179,8 @@ def _run(kind, rng, trace):
         delivered_at[turn] = clock.t
         if agent.working is not None:
             agent.working.add(turn)
+            agent.animate = True
+            folded.add(turn)
         else:
             agent.pending.append(turn)
         trace.append(f"send(turn={turn})")
@@ -131,6 +191,7 @@ def _run(kind, rng, trace):
     def pickup():
         if agent.working is None and agent.pending:
             agent.working, agent.pending = set(agent.pending), []
+            agent.work_since = clock.t
             trace.append(f"agent_picks_up({sorted(agent.working)})")
             draw(("work", max(agent.working)))
 
@@ -141,6 +202,15 @@ def _run(kind, rng, trace):
 
     def finish():
         if agent.working is not None:
+            if agent.animate:  # it keeps animating while it works on the new input
+                agent.animate = False
+                draw(("work", max(agent.working)))
+            while clock.t - agent.work_since < 1.5:
+                # A real turn keeps animating its spinner for seconds (live: at least
+                # ~2s before the answer, a frame every ~0.1s). Model frames every 0.5s
+                # rather than an answer drawn within a single frame.
+                clock.t += 0.5
+                draw(("work", max(agent.working)))
             done, agent.working = agent.working, None
             agent.answered |= done
             trace.append(f"agent_answers({sorted(done)})")
@@ -152,14 +222,14 @@ def _run(kind, rng, trace):
             sm._process_chunk(TID, "|P")  # half-received: no prompt yet, no sign
             if agent.screen[0] != "work":
                 sm._process_chunk(TID, "|" + token(agent.screen))
-        elif kind == "grok":
+        elif kind in ("grok", "claude"):
             sm._process_chunk(TID, "|" + token(agent.screen))
-        elif kind == "claude":
-            sm._schedule_screen_detection(TID, prov)
 
     def quiesce():
         trace.append("quiescence")
-        if kind in ("kiro", "grok"):
+        if loop is not None:
+            loop.fire()
+        elif kind in ("kiro", "grok"):
             sm._on_raw_quiescent(TID)
         elif kind == "claude":
             sm._on_screen_quiescent(TID, prov)
@@ -169,7 +239,10 @@ def _run(kind, rng, trace):
         sm.get_status(TID)
 
     def probe():
-        if kind == "claude":
+        # With a loop the real scheduling runs the probe; forcing _bursting here
+        # without the quiescence timer a real burst always arms would model a
+        # burst that never ends.
+        if kind == "claude" and loop is None:
             trace.append("midburst_probe")
             with sm._lock:
                 sm._bursting[TID] = True
@@ -177,6 +250,8 @@ def _run(kind, rng, trace):
 
     def tick():
         clock.t += rng.choice([0.3, 1.0, 5.0])
+        if agent.working is not None:
+            draw(("work", max(agent.working)))  # a working TUI keeps redrawing
 
     def delayed():
         inner = [
@@ -199,12 +274,19 @@ def _run(kind, rng, trace):
                 return _SCREEN[frame[0]]  # the frame this read rendered
 
             sm._detect_screen = detect
-            rng.choice([lambda: sm._on_screen_quiescent(TID, prov), lambda: sm.get_status(TID)])()
+            if loop is not None and loop.timers and rng.random() < 0.7:
+                loop.fire()
+            else:
+                rng.choice(
+                    [lambda: sm._on_screen_quiescent(TID, prov), lambda: sm.get_status(TID)]
+                )()
             sm._detect_screen = lambda _t, _q: _SCREEN[agent.screen[0]]
         else:
             prov.read_hook = hook
             if kind == "native":
                 sm.get_status(TID)
+            elif loop is not None and loop.timers and rng.random() < 0.7:
+                loop.fire()
             else:
                 rng.choice([lambda: sm._on_raw_quiescent(TID), lambda: sm.get_status(TID)])()
             prov.read_hook = None
@@ -261,6 +343,15 @@ def _run(kind, rng, trace):
         err = early("drain")
         if err:
             return err
+        # Input sent to a busy agent is exempt: unless the monitor sees work after
+        # its dispatch, it closes at the backstop rather than risk taking the
+        # running turn's answer (an agent may queue it instead of folding it).
+        prompt = [t for t in delivered if t not in folded]
+        if kind != "native" and prompt and sm.turn_state(TID)[1] < max(prompt):
+            return (
+                f"SLOW: everything answered, but turn_state={sm.turn_state(TID)} "
+                f"leaves turn {max(prompt)} for the backstop"
+            )
         clock.t += smod.TURN_START_BACKSTOP_S + 5
         for _ in range(3):
             poll()
@@ -273,13 +364,14 @@ def _run(kind, rng, trace):
         return early("final")
 
 
+@pytest.mark.parametrize("loop_mode", [False, True], ids=["inline", "loop"])
 @pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("seed", [735, 812])
-def test_turn_protocol_rules_hold_under_random_interleavings(kind, seed):
+def test_turn_protocol_rules_hold_under_random_interleavings(kind, seed, loop_mode):
     rng = random.Random(seed)
     for i in range(600):
         trace = []
-        err = _run(kind, random.Random(rng.random()), trace)
+        err = _run(kind, random.Random(rng.random()), trace, loop_mode)
         assert err is None, f"schedule {i} ({kind}, seed {seed}): {err}\n  " + "\n  ".join(
             trace[-30:]
         )

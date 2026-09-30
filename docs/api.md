@@ -178,8 +178,11 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   has not dispatched to, and reset when the server restarts (the CLI waiters detect
   a counter lower than the turn they wait for and fall back). Do not send to a busy
   terminal and expect two separate answers: claude_code and kiro-cli fold input that
-  arrives mid-turn into the running turn and reply once, so both turns finish
-  together and `?mode=last` shows that one reply. `cao session send` refuses to send
+  arrives mid-turn into the running turn and reply once, so `?mode=last` shows that
+  one reply. The later turn closes with it only if the terminal was seen working
+  after that input arrived; otherwise it closes at the 60s backstop, because
+  assuming it was folded in would return the wrong answer on an agent that queues
+  input instead. `cao session send` refuses to send
   while the terminal is busy. A server that omits the fields is older than this
   contract.
 - Terminal creation accepts `use_worktree` (bool, default `false`, issue #100
