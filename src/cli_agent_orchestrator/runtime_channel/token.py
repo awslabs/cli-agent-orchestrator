@@ -1,7 +1,7 @@
 """The shared runtime-channel token (#745).
 
 Configured as ``CAO_RUNTIME_TOKEN_FILE`` (the path of a file holding the token,
-e.g. a mounted Kubernetes Secret) or ``CAO_RUNTIME_TOKEN``. The value is removed
+e.g. a mounted Kubernetes Secret) or ``CAO_RUNTIME_TOKEN``. Both are removed
 from this process's environment once read, so tmux panes and agent processes
 started later do not inherit it. Read once per process; rotating it means a
 restart.
@@ -37,7 +37,8 @@ def runtime_token() -> Optional[str]:
 
 def _read() -> Optional[str]:
     value = os.environ.pop(TOKEN_ENV, "").strip()
-    path = os.environ.get(TOKEN_FILE_ENV, "").strip()
+    # Removed too: a later child need not learn where the token file is.
+    path = os.environ.pop(TOKEN_FILE_ENV, "").strip()
     if path:
         try:
             return Path(path).read_text(encoding="utf-8").strip() or None

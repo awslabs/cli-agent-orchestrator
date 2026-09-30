@@ -64,6 +64,8 @@ class TestToken:
         import os
 
         assert token_mod.TOKEN_ENV not in os.environ
+        # Nor does a later child learn where the token file is.
+        assert token_mod.TOKEN_FILE_ENV not in os.environ
 
     def test_the_env_value_alone_works_and_is_removed(self, monkeypatch):
         monkeypatch.setenv(token_mod.TOKEN_ENV, "from-env")

@@ -1520,3 +1520,25 @@ class TestUnsuccessfulSends:
         response = http.post("/terminals/abcd1234/key", params={"key": "Enter"})
         assert response.status_code == 200 and response.json()["success"] is False
         assert self._last_active("abcd1234") == before
+
+
+class TestUnrecordedCleanupErrors:
+    @pytest.mark.asyncio
+    async def test_an_unexpected_error_is_logged_not_left_on_the_task(self, caplog):
+        registry = RuntimeRegistry()
+
+        async def send_text(text):
+            raise AssertionError("never reached")
+
+        conn = registry.register("rt-1", send_text)
+        registry.activate(conn)
+
+        async def broken_call(*args, **kwargs):
+            raise KeyError("unexpected")
+
+        conn.call = broken_call
+        server_mod._delete_unrecorded(conn, "beef0009")
+        (task,) = list(server_mod._teardowns)
+        await asyncio.wait_for(asyncio.shield(task), 5)
+        assert task.exception() is None, "nothing is left for 'never retrieved'"
+        assert "beef0009" in caplog.text
