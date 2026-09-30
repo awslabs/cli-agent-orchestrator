@@ -2697,3 +2697,120 @@ class TestRound9InterleavedSends:
         failed = sm.notify_input_sent("t1")  # the clear itself never ran
         sm.abort_turn("t1", failed)
         assert sm.turn_state("t1") == (2, 0)
+
+
+class TestRound9FoundByTheModelCheck:
+    """Two roots a randomized model check found (PR #812 round 9); both predate
+    round 8. Each test is the shortest failing schedule, made deterministic."""
+
+    @staticmethod
+    def _provider(sign):
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        provider.observe_execution_output = None
+        verdicts = {
+            "W": TerminalStatus.PROCESSING,
+            "P": TerminalStatus.PROCESSING,
+            "D": TerminalStatus.COMPLETED,
+            "I": TerminalStatus.IDLE,
+        }
+
+        def get_status(buffer):
+            toks = [t for t in buffer.split("|") if t]
+            return verdicts[toks[-1][0]] if toks else TerminalStatus.UNKNOWN
+
+        provider.get_status.side_effect = get_status
+        provider.shows_turn_work.side_effect = (lambda b: "|W" in b) if sign else (lambda b: None)
+        return provider
+
+    def _monitor(self, provider):
+        sm = StatusMonitor()
+        manager = patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+        manager.start().get_provider.return_value = provider
+        settings = patch(
+            "cli_agent_orchestrator.services.status_monitor.get_server_settings",
+            return_value={"state_buffer_max": 100000},
+        )
+        settings.start()
+        self.addCleanup = getattr(self, "addCleanup", None)
+        return sm, (manager, settings)
+
+    @staticmethod
+    def _send(sm, provider):
+        turn = sm.notify_input_sent("t1", real_send=True)
+        sm.clear_rolling_buffer("t1", provider, turn=turn)
+        sm.notify_input_delivered("t1")
+        return turn
+
+    def test_a_raw_read_that_began_before_the_work_does_not_close_the_turn(self):
+        """The quiescence read snapshots an idle-prompt buffer; the agent's first
+        work chunk arrives while the detector runs; the stale IDLE must not close
+        the turn that has only just started."""
+        provider = self._provider(sign=False)
+        sm, patches = self._monitor(provider)
+        try:
+            self._send(sm, provider)
+            sm._process_chunk("t1", "|I0")  # a repaint of the idle prompt
+            real = provider.get_status.side_effect
+
+            def slow(buffer):
+                provider.get_status.side_effect = real
+                sm._process_chunk("t1", "|W1")  # work lands mid-read
+                return real(buffer)
+
+            provider.get_status.side_effect = slow
+            sm._on_raw_quiescent("t1")
+            assert sm.turn_state("t1") == (1, 0)
+            sm._process_chunk("t1", "|D1")  # the real answer
+            assert sm.turn_state("t1") == (1, 1)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_a_special_key_after_an_accepted_send_does_not_finish_it(self):
+        """A real send is accepted but not yet drawn; a special key opens a turn
+        without a clear; a repaint then reads PROCESSING (no prompt yet) and IDLE.
+        Under the loose rule for uncleared turns that closed the special-key turn,
+        and turn_done is one counter, so it also reported the send finished."""
+        provider = self._provider(sign=True)
+        sm, patches = self._monitor(provider)
+        try:
+            self._send(sm, provider)
+            sm.notify_input_sent("t1")  # special key: no clear
+            sm._process_chunk("t1", "|P")
+            sm._process_chunk("t1", "|I0")
+            assert sm.turn_state("t1")[1] == 0
+            sm._process_chunk("t1", "|W1")
+            sm._process_chunk("t1", "|D1")
+            assert sm.turn_state("t1") == (2, 2)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_a_special_key_keeps_the_open_send_seen_working(self):
+        """Answering a permission prompt mid-turn must not make the turn wait for
+        fresh work: the continuation keeps the send's seen-working state."""
+        provider = self._provider(sign=True)
+        sm, patches = self._monitor(provider)
+        try:
+            self._send(sm, provider)
+            sm._process_chunk("t1", "|W1")
+            sm.notify_input_sent("t1")  # special key answers a prompt
+            sm._process_chunk("t1", "|D1")
+            assert sm.turn_state("t1") == (2, 2)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_a_real_send_to_a_busy_agent_is_not_a_continuation(self):
+        provider = self._provider(sign=True)
+        sm, patches = self._monitor(provider)
+        try:
+            self._send(sm, provider)
+            sm._process_chunk("t1", "|W1")  # turn 1 working
+            sm.notify_input_sent("t1", real_send=True)  # second real send
+            assert sm._turn_continuation.get("t1") is False
+            assert sm._turn_started.get("t1") is False
+        finally:
+            for p in patches:
+                p.stop()

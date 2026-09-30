@@ -2154,7 +2154,7 @@ class TestSendInput:
         assert send_input("test1234", "hello supervisor") == 4
 
         mock_status_monitor.notify_input_sent.assert_called_once_with(
-            "test1234", assume_processing=True
+            "test1234", assume_processing=True, real_send=True
         )
 
     @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
@@ -2199,7 +2199,7 @@ class TestSendInput:
         send_input("test1234", "hello worker")
 
         mock_provider.mark_input_received.assert_called_once()
-        mock_status_monitor.notify_input_sent.assert_called_once_with("test1234")
+        mock_status_monitor.notify_input_sent.assert_called_once_with("test1234", real_send=True)
         # The active provider receives the same explicit buffer-generation
         # boundary, so stateful detectors never compare post-dispatch output
         # with the discarded rolling buffer.

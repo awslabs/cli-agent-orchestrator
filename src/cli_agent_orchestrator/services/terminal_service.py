@@ -2540,9 +2540,11 @@ def send_input(
         # the genuine PROCESSING signal that arrives once the agent starts
         # working on the new message.
         if provider and provider.assume_processing_on_dispatch is True:
-            turn = status_monitor.notify_input_sent(terminal_id, assume_processing=True)
+            turn = status_monitor.notify_input_sent(
+                terminal_id, assume_processing=True, real_send=True
+            )
         else:
-            turn = status_monitor.notify_input_sent(terminal_id)
+            turn = status_monitor.notify_input_sent(terminal_id, real_send=True)
 
         # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
         # prompts from BEFORE the input can't trigger a false COMPLETED

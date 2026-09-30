@@ -253,6 +253,13 @@ class StatusMonitor:
         # earlier accepted message whose first work frame has not arrived yet.
         self._last_real_turn: Dict[str, int] = {}
         self._prev_real_turn: Dict[str, int] = {}
+        # True while the current turn was opened WITHOUT a clear (a special key,
+        # e.g. answering a permission prompt) while a real send was still
+        # unfinished. Such a turn continues that send: it keeps the send's
+        # seen-working state and its evidence rules. Otherwise closing it — the
+        # loose legacy rule for uncleared turns — also reported the real send
+        # finished, because turn_done is a single "highest finished" counter.
+        self._turn_continuation: Dict[str, bool] = {}
 
     async def run(self) -> None:
         """Subscribe to output events and detect status changes.
@@ -334,6 +341,10 @@ class StatusMonitor:
             # it belongs to (see _pin_cleared_turn_locked).
             cleared_turn = None if use_screen else self._pin_cleared_turn_locked(terminal_id)
             epoch = self._buffer_epochs.get(terminal_id, 0)
+            # Whether the turn had been seen working when this buffer was
+            # snapshotted: a ready verdict from an older snapshot must not close a
+            # turn whose work arrived while the detector ran (round 9).
+            started_at_read = self._turn_started.get(terminal_id, False)
             if use_screen:
                 self._feed_screen_locked(terminal_id, chunk)
 
@@ -343,7 +354,9 @@ class StatusMonitor:
             # (catches PROCESSING transition), then waits for output to settle
             # before re-detecting (catches IDLE/COMPLETED without running costly
             # regex on every single chunk during bursts).
-            self._schedule_raw_detection(terminal_id, buffer, provider, cleared_turn, epoch)
+            self._schedule_raw_detection(
+                terminal_id, buffer, provider, cleared_turn, epoch, started_at_read
+            )
             return
 
         self._schedule_screen_detection(terminal_id, provider)
@@ -670,8 +683,9 @@ class StatusMonitor:
         TURN_START_BACKSTOP_S. The backstop exists only so a broken terminal
         reports something eventually.
         """
-        provider_decides = work_evidence is not None and self._turn_buffer_cleared.get(
-            terminal_id, False
+        provider_decides = work_evidence is not None and (
+            self._turn_buffer_cleared.get(terminal_id, False)
+            or self._turn_continuation.get(terminal_id, False)
         )
         # Evidence counts only from a buffer cleared for THIS turn. A turn opened
         # without a clear (init, special keys) still holds the previous turn's
@@ -997,6 +1011,7 @@ class StatusMonitor:
         provider=None,
         cleared_buffer_turn: Optional[int] = None,
         buffer_epoch: Optional[int] = None,
+        observed_started: Optional[bool] = None,
     ) -> None:
         """Edge-debounce detection on the raw rolling buffer.
 
@@ -1032,6 +1047,7 @@ class StatusMonitor:
                 cleared_buffer_turn=cleared_turn,
                 work_evidence=self._work_evidence(provider, buffer),
                 buffer_epoch=buffer_epoch,
+                observed_started=observed_started,
             )
             return
 
@@ -1077,6 +1093,7 @@ class StatusMonitor:
                 cleared_buffer_turn=cleared_turn,
                 work_evidence=self._work_evidence(provider, buffer),
                 buffer_epoch=buffer_epoch,
+                observed_started=observed_started,
             )
 
         self._arm_quiesce_timer(loop, terminal_id, self._on_raw_quiescent)
@@ -1190,6 +1207,7 @@ class StatusMonitor:
             # _pin_cleared_turn_locked for why the pin may not be taken later.
             cleared_turn = self._pin_cleared_turn_locked(terminal_id)
             epoch = self._buffer_epochs.get(terminal_id, 0)
+            started_at_read = self._turn_started.get(terminal_id, False)
         try:
             quiesce_provider = provider_manager.get_provider(terminal_id)
         except Exception:
@@ -1203,6 +1221,7 @@ class StatusMonitor:
                 cleared_buffer_turn=cleared_turn,
                 work_evidence=self._work_evidence(quiesce_provider, buffer),
                 buffer_epoch=epoch,
+                observed_started=started_at_read,
             )
 
         loop = self._loop or self._running_loop()
@@ -1213,6 +1232,7 @@ class StatusMonitor:
                 cleared_buffer_turn=cleared_turn,
                 work_evidence=self._work_evidence(quiesce_provider, buffer),
                 buffer_epoch=epoch,
+                observed_started=started_at_read,
             )
         else:
             self._spawn_tracked(loop, _detect_and_apply())
@@ -1259,7 +1279,9 @@ class StatusMonitor:
             except RuntimeError:
                 pass  # loop already closed during shutdown — the timer is moot
 
-    def notify_input_sent(self, terminal_id: str, *, assume_processing: bool = False) -> int:
+    def notify_input_sent(
+        self, terminal_id: str, *, assume_processing: bool = False, real_send: bool = False
+    ) -> int:
         """Arm the next PROCESSING transition and open a new turn.
 
         Call before any send_keys / paste that initiates a new processing
@@ -1279,7 +1301,17 @@ class StatusMonitor:
             self._allow_processing_revert[terminal_id] = True
             turn = self._turn.get(terminal_id, 0) + 1
             self._turn[terminal_id] = turn
-            self._turn_started[terminal_id] = False
+            # A continuation keeps the open real send's seen-working state; a real
+            # send resets it again in clear_rolling_buffer (see _turn_continuation).
+            # send_input says so explicitly (real_send=True): the buffer clear that
+            # would otherwise mark it comes a moment later, and in between a real
+            # send to a busy agent must not borrow the running turn's state.
+            continuation = not real_send and self._turn_done.get(
+                terminal_id, 0
+            ) < self._last_real_turn.get(terminal_id, 0)
+            self._turn_continuation[terminal_id] = continuation
+            if not continuation:
+                self._turn_started[terminal_id] = False
             # False until clear_rolling_buffer runs for this turn (send_input calls
             # it right after this method); init/special-key turns never set it.
             self._turn_buffer_cleared[terminal_id] = False
@@ -1404,6 +1436,9 @@ class StatusMonitor:
             # turn's dispatch — the fact that lets a raw-buffer ready verdict count
             # as current-turn evidence (see _note_turn_progress_locked).
             self._turn_buffer_cleared[terminal_id] = True
+            # A real send is never a continuation, and starts unseen.
+            self._turn_continuation[terminal_id] = False
+            self._turn_started[terminal_id] = False
             # ``turn`` is the dispatch's own number (send_input passes it). Using the
             # live counter instead let two interleaved sends record the wrong one,
             # and a failed send could then close the other's accepted turn.
@@ -1449,6 +1484,7 @@ class StatusMonitor:
             self._pre_dispatch_status.pop(terminal_id, None)
             self._last_real_turn.pop(terminal_id, None)
             self._prev_real_turn.pop(terminal_id, None)
+            self._turn_continuation.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
@@ -1552,10 +1588,12 @@ class StatusMonitor:
                 bursting = self._bursting.get(terminal_id, False)
                 cleared_turn = self._pin_cleared_turn_locked(terminal_id)
                 epoch = self._buffer_epochs.get(terminal_id, 0)
+                raw_started_at_read = self._turn_started.get(terminal_id, False)
             else:
                 buffer = ""
                 bursting = False
                 epoch = None
+                raw_started_at_read = None
                 # Backstop liveness for a QUIET terminal (PR #812 review): the
                 # backstop is otherwise only evaluated when a detection verdict
                 # arrives, and a terminal whose cached status is already ready
@@ -1598,7 +1636,7 @@ class StatusMonitor:
             )
             raw_calibrated = self._is_raw_calibrated(provider)
             observed_turn: Optional[int] = None
-            observed_started: Optional[bool] = None
+            observed_started: Optional[bool] = raw_started_at_read
             if use_screen:
                 observed_turn, observed_started = self._observation_pin(terminal_id)
                 fresh = self._detect_screen(terminal_id, provider)
