@@ -91,7 +91,8 @@ def isolated(monkeypatch, tmp_path):
     monkeypatch.setenv(token_mod.TOKEN_ENV, TOKEN)
     monkeypatch.delenv(token_mod.TOKEN_FILE_ENV, raising=False)
     token_mod._reset_for_tests()
-    backend_registry.set_backend(_NoLocalTmux())
+    # Through monkeypatch, so later test modules get their backend back.
+    monkeypatch.setattr(backend_registry, "_backend", _NoLocalTmux())
     yield registry
     token_mod._reset_for_tests()
 
