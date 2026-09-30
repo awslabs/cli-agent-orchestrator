@@ -355,6 +355,30 @@ class RuntimeRegistry:
             self._status[(terminal_id, runtime_id)] = status
             return True
 
+    def seed_status(
+        self,
+        terminal_id: str,
+        runtime_id: str,
+        status: TerminalStatus,
+        conn: Optional[RuntimeConnection] = None,
+    ) -> bool:
+        """Like ``set_status``, but only while no status is known for the terminal
+        on that runtime (``unknown`` says nothing): a launch result's status is
+        older than any real status frame the runtime sent after it."""
+        with self._lock:
+            known = self._status.get((terminal_id, runtime_id), TerminalStatus.UNKNOWN)
+            if known != TerminalStatus.UNKNOWN:
+                return False
+            if conn is not None and self._runtimes.get(runtime_id) is not conn:
+                return False
+            if (
+                self._placement.get(terminal_id) != runtime_id
+                and (terminal_id, runtime_id) not in self._reserved
+            ):
+                return False
+            self._status[(terminal_id, runtime_id)] = status
+            return True
+
     def get_status(self, terminal_id: str, runtime_id: str) -> TerminalStatus:
         """The runtime's last report, or UNKNOWN while the runtime is not connected
         (or its hello exchange is not over: commands are still refused then)."""

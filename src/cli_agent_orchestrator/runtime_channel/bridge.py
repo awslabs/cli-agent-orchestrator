@@ -45,6 +45,8 @@ logger = logging.getLogger(__name__)
 
 BACKOFF_INITIAL = 1.0
 BACKOFF_MAX = 30.0
+# A connection that stays up this long after its hello resets the backoff.
+STABLE_CONNECTION = 10.0
 _STATUS_TOPIC = re.compile(r"^terminal\.([^.]+)\.status$")
 
 
@@ -67,8 +69,8 @@ class Bridge:
         # launch op id -> (set once it has settled, ids of the local terminals
         # that existed when it started: none of them can be its own).
         self._launches: Dict[str, Tuple[asyncio.Event, Set[str]]] = {}
-        # Whether the current connection completed its hello (see run()).
-        self._helloed = False
+        # Loop time the current connection completed its hello (see run()).
+        self._helloed_at: Optional[float] = None
         # Results that could not be sent (no channel at the time), delivered
         # after the next hello: the server acts on results it no longer awaits.
         self._unsent: List[Result] = []
@@ -109,9 +111,10 @@ class Bridge:
 
         return status_monitor.get_status(terminal_id)
 
-    async def _push_status(self, terminal_id: str) -> None:
+    async def _push_status(self, terminal_id: str, skip_unknown: bool = False) -> None:
         """Send the terminal's current status. It is read under the send lock, so
-        the last frame the server gets for a terminal carries its newest status."""
+        the last frame the server gets for a terminal carries its newest status.
+        With ``skip_unknown``, nothing is sent while the status is not known."""
         ws = self._ws
         if ws is None:
             return
@@ -119,6 +122,8 @@ class Bridge:
             # Off the loop (it may capture the pane), still under the send lock
             # so status frames cannot be reordered.
             status = await asyncio.to_thread(self._status_of, terminal_id)
+            if skip_unknown and status == TerminalStatus.UNKNOWN:
+                return
             frame = Status(terminal_id=terminal_id, status=status)
             try:
                 await ws.send(encode(frame))
@@ -197,8 +202,9 @@ class Bridge:
         launched = result.payload.get("terminal") if result.ok else None
         if command.type == CommandType.LAUNCH and isinstance(launched, dict):
             # A status change sent before this result was refused (the server
-            # did not know the terminal yet): follow it with the current one.
-            await self._push_status(launched["id"])
+            # did not know the terminal yet): follow it with the current one,
+            # unless that is still unknown (then the result's status stands).
+            await self._push_status(launched["id"], skip_unknown=True)
 
     async def execute(self, command: Command) -> Dict[str, Any]:
         # Imported here: the provider stack is only needed once work arrives.
@@ -301,7 +307,7 @@ class Bridge:
                 f"this runtime {PROTOCOL_VERSION}"
             )
         self._ws = ws
-        self._helloed = True
+        self._helloed_at = asyncio.get_running_loop().time()
         self._mark_ready(True)
         logger.info("runtime %s connected to %s", self.runtime_id, self.server_url)
         # Everything from here on runs inside the guard: however the connected
@@ -331,7 +337,7 @@ class Bridge:
         backoff = BACKOFF_INITIAL
         self._mark_ready(False)
         while not self._stop.is_set():
-            self._helloed = False
+            self._helloed_at = None
             try:
                 async with connect(
                     self.server_url,
@@ -351,9 +357,14 @@ class Bridge:
                 raise
             except Exception as exc:  # noqa: BLE001 - network errors are retried
                 logger.warning("runtime channel lost: %s", exc)
-            if self._helloed:
-                # Only a completed hello: a server that accepts the upgrade and
-                # then drops the channel still backs off exponentially.
+            helloed_at = self._helloed_at
+            if (
+                helloed_at is not None
+                and asyncio.get_running_loop().time() - helloed_at >= STABLE_CONNECTION
+            ):
+                # Only a connection that held: a server that accepts the upgrade
+                # (or even completes the hello) and then drops the channel still
+                # gets exponential backoff.
                 backoff = BACKOFF_INITIAL
             if self._stop.is_set():
                 break
