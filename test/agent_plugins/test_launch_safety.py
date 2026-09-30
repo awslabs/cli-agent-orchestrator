@@ -28,6 +28,7 @@ from cli_agent_orchestrator.agent_plugins.projection import (
     rebuild_projection,
     sweep_dangling_projections,
 )
+from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
 from .conftest import build_plugin
@@ -76,20 +77,20 @@ class TestDeliveryPathsToleratesBrokenLinks:
         assert build_skill_catalog() == ""  # no skills, no exception
 
 
+@pytest.mark.usefixtures("isolated_memory_db")
 class TestCreateTerminalUnderConcurrentSweep:
-    """The real launch path, with a sweep racing it."""
+    """The real launch and persistence path, with a sweep racing it.
+
+    Creation now reads stale rows before persisting a new session incarnation.
+    Use a per-test database for both operations, independent of the developer's
+    initialized CAO home, rather than mocking only the old bulk-delete boundary.
+    """
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    # Upstream's terminal-durability work made `create_terminal` drop stale rows
-    # for a reused session name. Unmocked, that hits a real DB: green wherever a
-    # developer has an initialised CAO database and red on a clean CI runner with
-    # "no such table: terminals".
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
@@ -102,8 +103,6 @@ class TestCreateTerminalUnderConcurrentSweep:
         mock_gen_session,
         mock_gen_window,
         mock_backend,
-        mock_db_create,
-        mock_delete_by_session,
         mock_provider_manager,
         mock_fifo_dir,
         mock_fifo_manager,
@@ -144,18 +143,17 @@ class TestCreateTerminalUnderConcurrentSweep:
 
         sweeper.join(timeout=10)
         assert terminal.id == "test1234"
+        assert terminal.session_incarnation_id
+        assert database.get_terminal_metadata(terminal.id)["session_incarnation_id"] == (
+            terminal.session_incarnation_id
+        )
+        assert database.get_session_incarnation("cao-session") == terminal.session_incarnation_id
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    # Upstream's terminal-durability work made `create_terminal` drop stale rows
-    # for a reused session name. Unmocked, that hits a real DB: green wherever a
-    # developer has an initialised CAO database and red on a clean CI runner with
-    # "no such table: terminals".
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
@@ -168,8 +166,6 @@ class TestCreateTerminalUnderConcurrentSweep:
         mock_gen_session,
         mock_gen_window,
         mock_backend,
-        mock_db_create,
-        mock_delete_by_session,
         mock_provider_manager,
         mock_fifo_dir,
         mock_fifo_manager,
@@ -197,6 +193,11 @@ class TestCreateTerminalUnderConcurrentSweep:
             provider="claude_code", agent_profile="developer", new_session=True
         )
         assert terminal.id == "test5678"
+        assert terminal.session_incarnation_id
+        assert database.get_terminal_metadata(terminal.id)["session_incarnation_id"] == (
+            terminal.session_incarnation_id
+        )
+        assert database.get_session_incarnation("cao-session") == terminal.session_incarnation_id
 
 
 class TestSweepNeverRaises:
