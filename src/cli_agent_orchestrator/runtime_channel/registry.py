@@ -47,6 +47,34 @@ class RemoteCommandError(RemoteRuntimeError):
     status_code = 502
 
 
+def _give_up_lock(attempt: "asyncio.Future[Any]", lock: asyncio.Lock) -> None:
+    """Stop waiting for ``lock``; release it if the attempt won it meanwhile."""
+    if attempt.done():
+        if not attempt.cancelled():
+            lock.release()
+        return
+    attempt.cancel()
+    attempt.add_done_callback(lambda done: None if done.cancelled() else lock.release())
+
+
+async def _acquire_within(lock: asyncio.Lock, timeout: float) -> bool:
+    """Acquire ``lock`` within ``timeout`` seconds; False if it was not had in time.
+
+    Never leaves the lock held by an abandoned attempt: not on timeout, and not
+    when the caller itself is cancelled while waiting.
+    """
+    attempt = asyncio.ensure_future(lock.acquire())
+    try:
+        done, _ = await asyncio.wait({attempt}, timeout=timeout)
+    except asyncio.CancelledError:
+        _give_up_lock(attempt, lock)
+        raise
+    if attempt in done:
+        return True
+    _give_up_lock(attempt, lock)
+    return False
+
+
 class RuntimeConnection:
     """One live channel to a runtime, with op_id-correlated command calls."""
 
@@ -69,14 +97,27 @@ class RuntimeConnection:
     ) -> Dict[str, Any]:
         """Send one command and return its result payload.
 
-        A command whose result does not arrive is reported as unknown, never
-        retried here: it may already have run in the runtime.
+        ``timeout`` bounds the whole call: waiting for the channel, the send and
+        the result. Not yet written when it runs out: 503, safe to retry.
+        Written, but no result: 504, never retried here, since the command may
+        already have run in the runtime.
         """
         op_id = uuid.uuid4().hex
         frame = Command(op_id=op_id, type=command_type, terminal_id=terminal_id, payload=payload)
-        future: "asyncio.Future[Result]" = asyncio.get_running_loop().create_future()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+
+        def left() -> float:
+            return max(deadline - loop.time(), 0.0)
+
+        future: "asyncio.Future[Result]" = loop.create_future()
         try:
-            async with self._send_lock:
+            if not await _acquire_within(self._send_lock, left()):
+                raise RuntimeUnavailableError(
+                    f"runtime {self.runtime_id} did not take {command_type.value} within "
+                    f"{timeout:g}s; it was not sent"
+                )
+            try:
                 # Checked under the lock: a call still queued behind another send
                 # when this connection was replaced or dropped is never written.
                 if self.closed:
@@ -87,7 +128,7 @@ class RuntimeConnection:
                 try:
                     # Bounded too: a runtime that stops reading stalls the send
                     # under backpressure, and the lock with it.
-                    await asyncio.wait_for(self._send_text(encode(frame)), timeout)
+                    await asyncio.wait_for(self._send_text(encode(frame)), left())
                 except asyncio.TimeoutError as exc:
                     raise RemoteOutcomeUnknownError(
                         f"sending {command_type.value} to runtime {self.runtime_id} timed out; "
@@ -97,8 +138,10 @@ class RuntimeConnection:
                     raise RemoteOutcomeUnknownError(
                         f"sending {command_type.value} to runtime {self.runtime_id} failed: {exc}"
                     ) from exc
+            finally:
+                self._send_lock.release()
             try:
-                result = await asyncio.wait_for(future, timeout=timeout)
+                result = await asyncio.wait_for(future, timeout=left())
             except asyncio.TimeoutError as exc:
                 raise RemoteOutcomeUnknownError(
                     f"{command_type.value} on runtime {self.runtime_id} timed out; outcome unknown"
@@ -227,6 +270,11 @@ class RuntimeRegistry:
     def is_placed(self, terminal_id: str, runtime_id: str) -> bool:
         with self._lock:
             return self._placement.get(terminal_id) == runtime_id
+
+    def placed_on(self, terminal_id: str) -> Optional[str]:
+        """The runtime a terminal is placed on, if any."""
+        with self._lock:
+            return self._placement.get(terminal_id)
 
     def reserve(self, terminal_id: str, runtime_id: str) -> None:
         """Mark a launch whose result arrived as being recorded (see ``is_known``)."""

@@ -3132,6 +3132,17 @@ def _call_runtime(metadata: Dict, command_type: str, payload: Dict, timeout: flo
     )
 
 
+def _current_status(terminal_id: str, runtime_id: Optional[str] = None) -> TerminalStatus:
+    """A terminal's status: the one its runtime pushed, if it runs in one (#745),
+    else the local status monitor's. ``runtime_id`` defaults to its placement."""
+    from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+    runtime_id = runtime_id or runtime_registry.placed_on(terminal_id)
+    if runtime_id:
+        return runtime_registry.get_status(terminal_id, runtime_id)
+    return status_monitor.get_status(terminal_id)
+
+
 def get_terminal(terminal_id: str) -> Dict:
     """Get terminal data."""
     try:
@@ -3148,10 +3159,8 @@ def get_terminal(terminal_id: str) -> Dict:
         # DB-backed failure marker is authoritative and survives server restart,
         # unlike StatusMonitor's in-memory latch.
         if metadata.get("runtime_id"):
-            # Derived beside the pane by the runtime and pushed over the channel.
-            from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
-
-            status = runtime_registry.get_status(terminal_id, metadata["runtime_id"]).value
+            # Derived beside the pane by its runtime, and pushed over the channel.
+            status = _current_status(terminal_id, metadata["runtime_id"]).value
         elif deferred_failure is not None:
             status = TerminalStatus.ERROR.value
         else:
@@ -3272,7 +3281,7 @@ def list_siblings(
         caller_id, prefix, caller_session=caller_session, cross_session=cross_session
     )
     for sibling in siblings:
-        sibling["status"] = status_monitor.get_status(sibling["id"]).value
+        sibling["status"] = _current_status(sibling["id"]).value
     return siblings
 
 

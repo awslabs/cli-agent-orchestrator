@@ -75,7 +75,7 @@ and the server's stale-row and retention sweeps leave remote rows alone.
 
 | Status | Meaning | Safe to retry |
 |---|---|---|
-| `503` | The runtime is not connected. Nothing was sent. | yes |
+| `503` | The runtime is not connected, or did not take the command within its timeout. Nothing was sent. | yes |
 | `504` | Sent, but no result arrived (timeout or disconnect). The outcome is unknown. | only if repeating the operation is harmless |
 | `502` | The runtime ran the command and reported a failure; the detail carries its reason. | depends on the reason |
 

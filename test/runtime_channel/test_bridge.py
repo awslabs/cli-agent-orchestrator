@@ -260,6 +260,41 @@ class TestHandle:
 
 class TestOrdering:
     @pytest.mark.asyncio
+    async def test_a_delete_waits_for_a_launch_still_in_progress(self, monkeypatch):
+        import cli_agent_orchestrator.clients.database as database
+
+        bridge = _bridge()
+        bridge._ws = FakeServer()
+        initializing = asyncio.Event()
+        events = []
+        monkeypatch.setattr(database, "get_terminal_metadata", lambda tid: {"id": tid})
+
+        async def create_terminal(**kwargs):
+            events.append("launch started")
+            await initializing.wait()  # the provider is still starting
+            events.append("launch done")
+            return SimpleNamespace(id="beef0001")
+
+        def delete_terminal(terminal_id):
+            events.append(f"delete {terminal_id}")
+            return True
+
+        monkeypatch.setattr(terminal_service, "create_terminal", create_terminal)
+        monkeypatch.setattr(terminal_service, "get_terminal", lambda tid: {"id": tid})
+        monkeypatch.setattr(terminal_service, "delete_terminal", delete_terminal)
+        launch = asyncio.ensure_future(
+            bridge.handle(_command(CommandType.LAUNCH, None, agent_profile="developer"))
+        )
+        await asyncio.sleep(0.05)
+        # After a reconnect the server deletes the terminal it has no record of.
+        delete = asyncio.ensure_future(bridge.handle(_command(CommandType.DELETE, "beef0001")))
+        await asyncio.sleep(0.1)
+        assert events == ["launch started"], "the delete must not run under the launch"
+        initializing.set()
+        await asyncio.wait_for(asyncio.gather(launch, delete), 5)
+        assert events == ["launch started", "launch done", "delete beef0001"]
+
+    @pytest.mark.asyncio
     async def test_a_command_after_a_deferred_delete_still_waits_its_turn(self, monkeypatch):
         import threading
 

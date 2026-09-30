@@ -679,6 +679,35 @@ class TestServerThatRunsNoAgents:
 
 
 class TestRemoteSessionTeardown:
+    def test_a_remote_session_replaced_while_waiting_for_the_lock_is_left_alone(self, monkeypatch):
+        from cli_agent_orchestrator.services import session_service
+
+        _remote_row("abcd0001", "rt-1", session="cao-swap1")
+        real = session_service.session_is_remote
+        calls = []
+
+        def racing(name):
+            calls.append(name)
+            answer = real(name)
+            if len(calls) == 1:
+                # Before this delete gets the lock, another delete removes the
+                # last remote row and a local session takes the name.
+                database.delete_terminal("abcd0001")
+                database.create_terminal("beef0002", "cao-swap1", "dev-b", "mock_cli", "developer")
+            return answer
+
+        monkeypatch.setattr(session_service, "session_is_remote", racing)
+        deleted = []
+        monkeypatch.setattr(
+            terminal_service,
+            "delete_terminal",
+            lambda terminal_id, registry=None: deleted.append(terminal_id) or True,
+        )
+        result = session_service.delete_session("cao-swap1")
+        assert deleted == [], "the replacement local terminal is not this delete's"
+        assert result["deleted"] == ["cao-swap1"]
+        assert database.get_terminal_metadata("beef0002") is not None
+
     def test_a_session_recorded_remotely_mid_delete_is_torn_down_in_its_runtime(self, monkeypatch):
         from cli_agent_orchestrator.services import session_service
 
@@ -948,3 +977,20 @@ class TestSessionNameCollisions:
         assert response.status_code == 400, response.text
         assert "already exists" in response.json()["detail"]
         assert [t["id"] for t in database.list_terminals_by_session("cao-remote1")] == ["abcd0001"]
+
+
+class TestSiblings:
+    def test_a_remote_siblings_status_is_the_one_its_runtime_reported(self, http, start_runtime):
+        _remote_row("abcd0001", "rt-1", session="cao-grp1")
+        _remote_row("abcd0002", "rt-1", session="cao-grp1")
+        for terminal_id in ("abcd0001", "abcd0002"):
+            database.update_terminal_group(terminal_id, ["team"])
+        start_runtime(
+            script=_answer,
+            statuses={"abcd0001": TerminalStatus.IDLE, "abcd0002": TerminalStatus.PROCESSING},
+        )
+        response = http.get("/terminals/abcd0001/siblings")
+        assert response.status_code == 200, response.text
+        body = response.json()
+        siblings = body["siblings"] if isinstance(body, dict) else body
+        assert [(s["id"], s["status"]) for s in siblings] == [("abcd0002", "processing")]
