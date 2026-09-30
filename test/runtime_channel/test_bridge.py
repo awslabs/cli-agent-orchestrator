@@ -364,6 +364,37 @@ class TestOrdering:
 
 class TestConnection:
     @pytest.mark.asyncio
+    async def test_one_failed_status_push_does_not_stop_the_forwarder(self):
+        bridge = _bridge()
+        server = FakeServer()
+        bridge._ws = server
+        calls = []
+
+        def status_of(terminal_id):
+            calls.append(terminal_id)
+            if len(calls) == 1:
+                raise RuntimeError("status monitor hiccup")
+            return TerminalStatus.COMPLETED
+
+        bridge._status_of = status_of
+        previous = bus._loop
+        bus.set_loop(asyncio.get_running_loop())
+        forwarding = asyncio.ensure_future(bridge.forward_status())
+        try:
+            await asyncio.sleep(0)
+            bus.publish("terminal.abcd1234.status", {"status": "processing"})
+            bus.publish("terminal.abcd1234.status", {"status": "completed"})
+            for _ in range(100):
+                if server.sent:
+                    break
+                await asyncio.sleep(0.01)
+            assert not forwarding.done(), "the forwarder died on one bad status"
+            assert server.sent == [Status(terminal_id="abcd1234", status=TerminalStatus.COMPLETED)]
+        finally:
+            forwarding.cancel()
+            bus.set_loop(previous)
+
+    @pytest.mark.asyncio
     async def test_a_slow_status_read_does_not_stall_the_event_loop(self):
         import time
 

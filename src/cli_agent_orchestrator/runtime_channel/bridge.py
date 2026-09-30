@@ -133,7 +133,16 @@ class Bridge:
                 event = await queue.get()
                 match = _STATUS_TOPIC.match(event["topic"])
                 if match:
-                    await self._push_status(match.group(1))
+                    try:
+                        await self._push_status(match.group(1))
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001 - one bad status must not end forwarding
+                        logger.warning(
+                            "could not push the status of terminal %s",
+                            match.group(1),
+                            exc_info=True,
+                        )
         finally:
             bus.unsubscribe("terminal.*.status", queue)
 
