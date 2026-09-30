@@ -360,6 +360,7 @@ class StatusMonitor:
         work_evidence: Optional[bool] = None,
         buffer_epoch: Optional[int] = None,
         observed_turn: Optional[int] = None,
+        observed_started: Optional[bool] = None,
     ) -> None:
         """Apply the sticky-latch rules to a freshly detected status and publish
         on change. Shared by the raw and pyte detection paths.
@@ -409,6 +410,12 @@ class StatusMonitor:
         no buffer pin, since they are never post-dispatch evidence, but a verdict
         they produce still belongs to the turn it was read in: if a dispatch
         opened a newer turn meanwhile, the verdict is dropped (round 9).
+        ``observed_started`` is whether that turn had already been seen working
+        when the read began. A ready verdict from a read that began before the
+        work was seen may show the PREVIOUS turn's retained frame — claude's 2s
+        submit delay routinely lets a read land on it after the dispatch — so if
+        the turn became started while the read was out, the verdict is dropped;
+        the next read closes the turn.
         """
         with self._lock:
             changed = self._apply_detection_locked(
@@ -420,6 +427,7 @@ class StatusMonitor:
                 work_evidence=work_evidence,
                 buffer_epoch=buffer_epoch,
                 observed_turn=observed_turn,
+                observed_started=observed_started,
             )
         if changed:
             # Publish outside the lock — subscribers must never be able to
@@ -438,6 +446,7 @@ class StatusMonitor:
         work_evidence: Optional[bool] = None,
         buffer_epoch: Optional[int] = None,
         observed_turn: Optional[int] = None,
+        observed_started: Optional[bool] = None,
     ) -> bool:
         """Sticky-latch core of _apply_detection. Caller MUST hold self._lock.
 
@@ -472,6 +481,17 @@ class StatusMonitor:
                 f"_apply_detection [{terminal_id}]: discarding {detected.value} — read "
                 f"during turn {observed_turn}, terminal is on turn "
                 f"{self._turn.get(terminal_id, 0)}"
+            )
+            return False
+        if (
+            observed_started is False
+            and detected in _TURN_END_STATUSES
+            and self._turn_started.get(terminal_id, False)
+        ):
+            logger.debug(
+                f"_apply_detection [{terminal_id}]: discarding {detected.value} — the "
+                "read began before this turn was seen working, so it may show the "
+                "previous turn's frame"
             )
             return False
         if buffer_epoch is not None and buffer_epoch != self._buffer_epochs.get(terminal_id, 0):
@@ -787,9 +807,12 @@ class StatusMonitor:
         if loop is None:
             # No event loop (unit tests / offline replay): detect immediately
             # on the current screen — deterministic, no timing.
-            pin = self._current_turn(terminal_id)
+            turn, started = self._observation_pin(terminal_id)
             self._apply_detection(
-                terminal_id, self._detect_screen(terminal_id, provider), observed_turn=pin
+                terminal_id,
+                self._detect_screen(terminal_id, provider),
+                observed_turn=turn,
+                observed_started=started,
             )
             return
 
@@ -804,12 +827,13 @@ class StatusMonitor:
             # definition. It is the right moment to notice work starting and the
             # wrong one to conclude work finished — settled=False. The quiescence
             # timer armed below re-reads the same screen once it stops changing.
-            pin = self._current_turn(terminal_id)
+            turn, started = self._observation_pin(terminal_id)
             self._apply_detection(
                 terminal_id,
                 self._detect_screen(terminal_id, provider),
                 settled=False,
-                observed_turn=pin,
+                observed_turn=turn,
+                observed_started=started,
             )
         else:
             self._midburst_processing_probe(terminal_id, provider)
@@ -859,7 +883,7 @@ class StatusMonitor:
                 return
             self._midburst_probe_at[terminal_id] = now
 
-        pin = self._current_turn(terminal_id)
+        turn, _ = self._observation_pin(terminal_id)
         lines, _ = self._screen_lines(terminal_id)
         if not lines:
             # Render failed or the screen is empty: no evidence, no verdict. The
@@ -876,7 +900,7 @@ class StatusMonitor:
             # only ever applies PROCESSING, which the settled guard does not gate —
             # but stated explicitly so the flag stays honest about the frame.
             self._apply_detection(
-                terminal_id, TerminalStatus.PROCESSING, settled=False, observed_turn=pin
+                terminal_id, TerminalStatus.PROCESSING, settled=False, observed_turn=turn
             )
 
     def _on_screen_quiescent(self, terminal_id: str, provider) -> None:
@@ -890,15 +914,20 @@ class StatusMonitor:
             self._quiesce_handle.pop(terminal_id, None)
 
         async def _detect_and_apply() -> None:
-            pin = self._current_turn(terminal_id)
+            turn, started = self._observation_pin(terminal_id)
             detected = await asyncio.to_thread(self._detect_screen, terminal_id, provider)
-            self._apply_detection(terminal_id, detected, observed_turn=pin)
+            self._apply_detection(
+                terminal_id, detected, observed_turn=turn, observed_started=started
+            )
 
         loop = self._loop or self._running_loop()
         if loop is None:
-            pin = self._current_turn(terminal_id)
+            turn, started = self._observation_pin(terminal_id)
             self._apply_detection(
-                terminal_id, self._detect_screen(terminal_id, provider), observed_turn=pin
+                terminal_id,
+                self._detect_screen(terminal_id, provider),
+                observed_turn=turn,
+                observed_started=started,
             )
         else:
             self._spawn_tracked(loop, _detect_and_apply())
@@ -936,10 +965,11 @@ class StatusMonitor:
             return False
         return answer if isinstance(answer, bool) else None
 
-    def _current_turn(self, terminal_id: str) -> int:
-        """The turn a retained or native read belongs to — take it BEFORE the read."""
+    def _observation_pin(self, terminal_id: str) -> Tuple[int, bool]:
+        """(turn, seen working yet) for a retained or native read — take it BEFORE
+        the read, and pass both to _apply_detection."""
         with self._lock:
-            return self._turn.get(terminal_id, 0)
+            return self._turn.get(terminal_id, 0), self._turn_started.get(terminal_id, False)
 
     def _pin_cleared_turn_locked(self, terminal_id: str) -> Optional[int]:
         """Pin the turn whose dispatch cleared the rolling buffer. Caller MUST
@@ -1465,8 +1495,10 @@ class StatusMonitor:
             if provider is not None:
                 with self._lock:
                     buffer = self._buffers.get(terminal_id, "")
-                    # The turn this native read belongs to, taken before the read.
+                    # The turn this native read belongs to, and whether it had been
+                    # seen working yet — both taken before the read.
                     native_turn = self._turn.get(terminal_id, 0)
+                    native_started = self._turn_started.get(terminal_id, False)
                 try:
                     # The native (herdr) path ignores the buffer arg; pass the
                     # rolling buffer (empty for herdr) so the rare
@@ -1484,8 +1516,16 @@ class StatusMonitor:
                 # Only if no dispatch opened a newer turn during the read (the native
                 # query shells out, so it can straddle one): a delayed verdict for
                 # the previous turn must not close the new one (round 9).
+                # Likewise, a ready answer from a query sent before the turn was seen
+                # working must not close it once it has been (the same rule as
+                # _apply_detection's observed_started).
                 with self._lock:
-                    if self._turn.get(terminal_id, 0) == native_turn:
+                    stale = self._turn.get(terminal_id, 0) != native_turn or (
+                        native_status in _TURN_END_STATUSES
+                        and not native_started
+                        and self._turn_started.get(terminal_id, False)
+                    )
+                    if not stale:
                         self._note_turn_progress_locked(terminal_id, native_status, True)
                 return native_status
 
@@ -1551,8 +1591,9 @@ class StatusMonitor:
             )
             raw_calibrated = self._is_raw_calibrated(provider)
             observed_turn: Optional[int] = None
+            observed_started: Optional[bool] = None
             if use_screen:
-                observed_turn = self._current_turn(terminal_id)
+                observed_turn, observed_started = self._observation_pin(terminal_id)
                 fresh = self._detect_screen(terminal_id, provider)
                 # A pyte screen read mid-burst is a half-drawn frame; a retained
                 # screen is never post-dispatch evidence, so it carries no buffer
@@ -1598,6 +1639,7 @@ class StatusMonitor:
                     work_evidence=work_evidence,
                     buffer_epoch=epoch,
                     observed_turn=observed_turn,
+                    observed_started=observed_started,
                 )
                 # Report what the latch ACCEPTED, not what this read proposed. A
                 # verdict refused as unsettled must not be handed to the caller

@@ -2513,3 +2513,130 @@ class TestRound9AbortKeepsEarlierInput:
 
         assert sm.turn_state("t1") == (4, 4)
         assert sm._last_status["t1"] == TerminalStatus.IDLE
+
+
+class TestRound9ReadBeganBeforeWork:
+    """The more common order (round 9 re-review): dispatch first, then a read that
+    renders the retained turn-1 frame, and turn 2's first work lands before that
+    read's verdict is applied. The turn pin alone cannot see this."""
+
+    @staticmethod
+    def _send(sm, provider):
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1", provider)
+        sm.notify_input_delivered("t1")
+
+    def _turn_two_sent(self, provider):
+        sm = StatusMonitor()
+        self._send(sm, provider)
+        sm._apply_detection("t1", TerminalStatus.PROCESSING)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED)
+        self._send(sm, provider)  # turn 2 dispatched, not yet seen working
+        return sm
+
+    def _work_lands_during_read(self, sm, verdict):
+        def read(*_args):
+            sm._apply_detection("t1", TerminalStatus.PROCESSING)  # turn 2's first work
+            return verdict  # ...but this read rendered the retained turn-1 frame
+
+        return read
+
+    def test_screen_quiescence(self):
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        sm = self._turn_two_sent(provider)
+        sm._detect_screen = self._work_lands_during_read(sm, TerminalStatus.COMPLETED)
+        sm._on_screen_quiescent("t1", provider)
+        assert sm.turn_state("t1") == (2, 1)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        # The next read, begun after the work was seen, closes the turn.
+        sm._detect_screen = lambda *_: TerminalStatus.COMPLETED
+        sm._on_screen_quiescent("t1", provider)
+        assert sm.turn_state("t1") == (2, 2)
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_native_poll(self, mock_get_backend, mock_pm):
+        mock_get_backend.return_value = _backend(event_inbox=True)
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        mock_pm.get_provider.return_value = provider
+        sm = self._turn_two_sent(provider)
+        provider.get_status.side_effect = self._work_lands_during_read(sm, TerminalStatus.COMPLETED)
+        sm.get_status("t1")
+        assert sm.turn_state("t1") == (2, 1)
+        provider.get_status.side_effect = None
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        sm.get_status("t1")
+        assert sm.turn_state("t1") == (2, 2)
+
+
+class TestRound9EveryScreenSiteIsPinned:
+    """Each screen read site drops a verdict that straddles a dispatch (round 9)."""
+
+    @staticmethod
+    def _send(sm, provider):
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1", provider)
+        sm.notify_input_delivered("t1")
+
+    def _setup(self):
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.supports_midburst_processing_probe = True
+        sm = StatusMonitor()
+        self._send(sm, provider)
+        sm._apply_detection("t1", TerminalStatus.PROCESSING)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED)
+        assert sm.turn_state("t1") == (1, 1)
+        return sm, provider
+
+    def _straddle(self, sm, provider, verdict):
+        def read(*_args):
+            self._send(sm, provider)
+            sm._apply_detection("t1", TerminalStatus.PROCESSING)
+            return verdict
+
+        return read
+
+    def test_the_no_loop_schedule_path(self):
+        sm, provider = self._setup()
+        sm._detect_screen = self._straddle(sm, provider, TerminalStatus.COMPLETED)
+        sm._schedule_screen_detection("t1", provider)
+        assert sm.turn_state("t1") == (2, 1)
+
+    def test_the_rising_edge(self):
+        sm, provider = self._setup()
+        sm._loop = MagicMock()
+        sm._arm_quiesce_timer = lambda *a, **k: None
+        with sm._lock:
+            sm._bursting["t1"] = False
+        # A stale "working" verdict from turn 1's frame, applied after turn 2 was
+        # dispatched, must not mark turn 2 as working.
+        seen = {}
+
+        def read(*_args):
+            sm.notify_input_sent("t1")
+            sm.clear_rolling_buffer("t1", provider)
+            sm.notify_input_delivered("t1")
+            return TerminalStatus.PROCESSING
+
+        sm._detect_screen = read
+        sm._schedule_screen_detection("t1", provider)
+        seen["started"] = sm._turn_started.get("t1")
+        assert seen["started"] is False
+
+    def test_the_midburst_probe(self):
+        sm, provider = self._setup()
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        provider.probe_processing_from_screen.return_value = True
+
+        def lines(*_args):
+            sm.notify_input_sent("t1")
+            sm.clear_rolling_buffer("t1", provider)
+            sm.notify_input_delivered("t1")
+            return (["✻ Cultivating… (3s)"], None)  # turn 1's spinner frame
+
+        sm._screen_lines = lines
+        sm._midburst_processing_probe("t1", provider)
+        assert sm._turn_started.get("t1") is False
