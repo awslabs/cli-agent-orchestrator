@@ -1,6 +1,7 @@
 """Service helpers for installing agent profiles."""
 
 import errno
+import json
 import logging
 import os
 import re
@@ -62,7 +63,11 @@ from cli_agent_orchestrator.utils.path_validation import (
     validate_path_component,
 )
 from cli_agent_orchestrator.utils.skill_injection import compose_agent_prompt
-from cli_agent_orchestrator.utils.tool_mapping import granted_mcp_servers, resolve_allowed_tools
+from cli_agent_orchestrator.utils.tool_mapping import (
+    granted_mcp_servers,
+    kiro_agent_tools,
+    resolve_allowed_tools,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -446,6 +451,40 @@ def _materialize_opencode_mcp(
         log_delivery_findings(McpDeliveryResult(findings=tuple(collisions)), agent_name=agent_name)
 
 
+def installed_kiro_tools(profile_name: str) -> Optional[List[str]]:
+    """The ``tools`` list in the Kiro agent JSON ``cao install`` wrote for ``profile_name``.
+
+    ``None`` when no agent file exists or it cannot be read as JSON with a
+    list-valued ``tools``. The launch gate and the server use this to notice a
+    profile installed before CAO wrote the policy into ``tools`` (it carries
+    ``["*"]``) and say so, since on Kiro the installed file is the policy.
+    """
+    agent_file = KIRO_AGENTS_DIR / f"{flatten_path_separators(profile_name)}.json"
+    try:
+        data = json.loads(agent_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    tools = data.get("tools") if isinstance(data, dict) else None
+    if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
+        return None
+    return tools
+
+
+def kiro_install_predates_native_enforcement(
+    profile_name: str, allowed_tools: Optional[List[str]]
+) -> bool:
+    """True when a restricted policy is requested but the installed Kiro agent has ``tools: ["*"]``.
+
+    That file was written before CAO put the policy into ``tools`` (or by
+    hand), so the restriction the launch prints is not what the agent runs
+    with. A missing or unreadable agent file is not reported here: launch
+    fails on that on its own.
+    """
+    if allowed_tools is None or "*" in allowed_tools:
+        return False
+    return installed_kiro_tools(profile_name) == ["*"]
+
+
 def install_agent(
     source: str,
     provider: Optional[str] = None,
@@ -673,7 +712,14 @@ def install_agent(
             kiro_agent_config = KiroAgentConfig(
                 name=profile.name,
                 description=profile.description,
-                tools=profile.tools if profile.tools is not None else ["*"],
+                # ``tools`` is what Kiro lets the agent HAVE; ``allowedTools``
+                # only names what runs without a prompt (and CAO launches
+                # --trust-all-tools). An explicit profile ``tools`` list wins;
+                # otherwise the resolved CAO policy is the availability list,
+                # so a restricted role is restricted on Kiro too, natively.
+                tools=(
+                    profile.tools if profile.tools is not None else kiro_agent_tools(allowed_tools)
+                ),
                 allowedTools=allowed_tools,
                 resources=kiro_resources,
                 prompt=raw_prompt,

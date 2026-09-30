@@ -47,6 +47,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Workflow script run-step refusals now retain their typed reason in run
+  records.** When a structured HTTP error includes a string `detail.kind`,
+  `ShimHTTPError` includes that kind and its optional message in the exception
+  text, so replay divergence, decision-required halts, worker errors, and
+  timeouts remain distinguishable after an uncaught exception reaches the
+  script's stderr tail. Unstructured responses keep the previous message.
+  (#830)
+- **Kiro CLI 2.25.0 turns never reached COMPLETED.** 2.25 prints the
+  completion marker as `▸ Credits: turn 0.20 • session 0.20 | Time: 29s`; the
+  detector wanted a number straight after `Credits:`, so every finished turn
+  fell through to the separator fallback, which the new "Trust All Tools
+  active" band defeats as well. A terminal reported PROCESSING for the whole
+  task and then IDLE forever while the pane showed the finished response, so a
+  supervisor never saw its worker complete and the Kiro e2e cases timed out.
+  The marker now accepts a word between `Credits:` and the number; fixtures cut
+  from live 2.25.0 frames pin idle, working and finished (#837)
+
 - **OpenCode agents whose display name contains spaces never reported COMPLETED.**
   The completion marker read the agent name as one `\S+` token, so a marker such
   as `▣  Sisyphus - Ultraworker · Big Pickle · 3.1s` never matched and every
@@ -245,12 +262,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a test asserts every `uses:` is a full SHA and every uv workflow carries the
   lock policy. `cargo-deny.yml`'s actions were already pinned (#820)
 
+- **Forwarded session environment accepted loader, shell and interpreter
+  startup variables.** `--env`, the ops-MCP `launch_session` tool and
+  `POST /sessions` now refuse `LD_*`, `DYLD_*`, `GCONV_PATH`, `PATH`, `HOME`,
+  `SHELL`, `BASH_ENV`, `ENV`, `ZDOTDIR`, `PROMPT_COMMAND`, `PS0`, `PS1`, `PS2`,
+  `PS4`, `PYTHONSTARTUP`, `PYTHONPATH`, `PYTHONHOME`, `PERL5OPT`, `PERL5LIB`,
+  `NODE_OPTIONS`, `RUBYOPT` and `RUBYLIB`, whose value decides what runs as the
+  operator the moment the pane starts, plus their siblings `PYTHONUSERBASE`,
+  `PERLLIB` and `NODE_PATH`, and `AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE`,
+  which the AWS SDK reads when the provider CLI authenticates at startup and
+  whose `credential_process` runs the command the file names. `POST /sessions` also applies the existing forwarded-env rules at
+  the HTTP boundary (422 naming the key) instead of dropping violating keys
+  server-side with only a log warning (#823)
+
+- **The per-terminal output FIFO accepted whatever sat at its path.** The
+  reader checked `exists()` then called `mkfifo`, and opened the path following
+  symlinks, so a same-user process that planted a symlink or regular file at
+  the predictable `<CAO_HOME_DIR>/fifos/<terminal>.fifo` (by default under
+  `~/.aws/cli-agent-orchestrator`) could redirect the output stream. The FIFO is now created exclusively with mode 0600, an existing
+  non-FIFO at the path fails terminal creation instead of being used, and both
+  opens use `O_NOFOLLOW` and verify the descriptor is a FIFO. The write end
+  had the same gap from the other side: `pipe-pane -o "cat >> <path>"` follows
+  a symlink and appends to a regular file, so a swapped path received the
+  pane's output while the hardened reader stayed on the old pipe. tmux now
+  runs `utils/fifo_writer.py` (standard library only, started by file path with `-I -S`)
+  instead of `cat`, which opens with `O_NOFOLLOW`, checks the descriptor is a
+  FIFO, and only then copies the pane's output into it (#823)
+
+- **Session teardown could reach tmux sessions CAO did not create.** CAO
+  shares the operator's default tmux server and names every session it creates
+  `cao-<name>`, but `DELETE /sessions/{name}` (and so `cao shutdown --session`
+  and the ops `shutdown_session` tool) passed any valid name straight to the
+  kill, so a request for `dev` destroyed a personal session called `dev`. A
+  bare name is now canonicalised to `cao-<name>` on the route, the same rule
+  `POST /sessions` applies, and `session_service.delete_session`,
+  `TmuxClient.kill_session` and `TmuxClient.kill_window` refuse any name
+  without the prefix. Behaviour change: a shutdown request for an unprefixed
+  name now targets the CAO session of that name and can no longer remove a
+  personal one. A dedicated tmux socket is tracked separately (#823)
+
+- **A failed herdr command put its raw stderr into the error returned to API
+  clients.** herdr's stderr can name local paths, socket locations and flags.
+  The exception now carries the redacted command and exit status only; stderr
+  goes to the cao-server log (#823)
+
+- **A failed terminal create could kill a newer session of the same name.**
+  When provider initialisation failed after the session and its registry row
+  were committed, the rollback killed the tmux session by name without the
+  lifecycle lock, so a teardown and recreate of that name landing in between
+  lost the new session. The rollback now reacquires the lock and proceeds only
+  if this create's own registry row still names the session; otherwise the
+  name belongs to someone else and the backend session is left alone. The
+  same check now guards the compensator for a create whose caller was
+  cancelled after the row committed, which killed by name too. Both rollbacks
+  run off the event loop: they block on the lifecycle lock, and a same-name
+  teardown holding it would otherwise have stalled every API request until it
+  finished. The failure handler's whole cleanup (reader, status buffer, backend
+  session or window, provider, registry row, worktree) is now one operation
+  that a cancellation of the create request cannot interrupt: a cancel landing
+  while the rollback waited for the lock used to unwind the handler after the
+  backend kill but before the provider and row were removed, leaving a
+  registered provider and a row for a terminal that no longer existed; the
+  cancellation is still raised to the caller, once the cleanup is durable. The
+  cleanup thread is driven by an executor future rather than a task, so a
+  whole-server shutdown that lands while the rollback waits for the lock
+  cancels only the waiting request and returns once the thread finishes,
+  instead of spinning on a cancelled task and never exiting (#823)
+
 ### Changed
 
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped
   silently, so `limit=500` keeps working rather than becoming a 422.
 
 ### Security
+
+- **Kiro CLI, the default provider, now applies the CAO tool policy.** `cao
+  install --provider kiro_cli` writes the resolved `allowedTools` into the agent
+  JSON's `tools` field, which is what Kiro lets the agent *have* (`allowedTools`
+  only names what runs without a prompt, and CAO launches `--trust-all-tools`),
+  so a restricted role has no shell, write or network tool to call: on kiro-cli
+  2.25.0 a `code_supervisor` gets `read`/`glob`/`grep`/`knowledge` plus
+  `@cao-mcp-server`, and `@builtin` becomes the harmless chrome
+  (`goal`/`introspect`/`todo_list`) rather than every built-in, shell included,
+  which is what a bare `@builtin` means in Kiro. `subagent` and `use_aws` gate
+  with `execute_bash`, `code` (it can rewrite files) with `fs_write`,
+  `knowledge` with `fs_read`. Both the current names and the older
+  `fs_read`/`fs_write`/`execute_bash` aliases are written so 2.22 and 2.25
+  read the same grant; an unrestricted policy still writes `["*"]` and an
+  explicit profile `tools` list still wins. Kiro moves from **None** to
+  **Hard (install time)** in SECURITY.md and docs/tool-restrictions.md, next to
+  OpenCode: the policy is the installed agent's, and `--allowed-tools` or a
+  role override at launch does not change it. **Reinstall your Kiro profiles**:
+  one installed before this change still carries `tools: ["*"]`; `cao launch`
+  and the server warn when they find one and keep treating that terminal as
+  unrestricted. The Kiro e2e restricted case asserts bash is refused again
+  (#836, follow-up to #824)
 
 - **an unknown `role` no longer falls open to unrestricted `["*"]`.** Omitting
   `role` still uses developer defaults. A typo or a role that is not defined

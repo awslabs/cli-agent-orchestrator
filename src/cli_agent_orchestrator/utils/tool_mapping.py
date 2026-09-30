@@ -71,6 +71,28 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
         ],
         "web_fetch": ["WebFetch", "WebSearch"],
     },
+    # Kiro CLI. The agent JSON's ``tools`` field is AVAILABILITY (a tool not
+    # listed does not exist for the agent); ``allowedTools`` only names tools
+    # that run without an approval prompt. CAO writes the resolved policy into
+    # ``tools`` at install time (``kiro_agent_tools``). Both spellings of each
+    # built-in are listed: kiro-cli 2.25 names them read/write/shell/glob/grep
+    # and still accepts the older fs_read/fs_write/execute_bash as aliases;
+    # 2.22 documented the older names. A name a version does not know is
+    # silently ignored, so listing both keeps the grant identical on either.
+    # Privilege-equivalence, as for Claude Code above: ``subagent`` spawns an
+    # agent with its own tool set and ``use_aws`` runs AWS CLI calls, so both
+    # gate with execute_bash; ``code`` can write files (pattern_rewrite), so it
+    # gates with fs_write; ``knowledge`` reads and indexes files, so fs_read.
+    # goal/introspect/todo_list are the harmless chrome ``@builtin`` grants
+    # (KIRO_BUILTIN_CHROME). Measured on kiro-cli 2.25.0, 2026-09-29.
+    "kiro_cli": {
+        "execute_bash": ["execute_bash", "shell", "subagent", "use_aws"],
+        "fs_read": ["fs_read", "read", "knowledge"],
+        "fs_write": ["fs_write", "write", "code"],
+        "fs_list": ["glob", "grep"],
+        "fs_*": ["fs_read", "read", "knowledge", "fs_write", "write", "code", "glob", "grep"],
+        "web_fetch": ["web_fetch", "web_search"],
+    },
     # Antigravity CLI (agy) shares Google's gemini-style tool vocabulary
     # (write_file/read_file/run_shell_command/...). Restrictions are enforced
     # softly via the injected security prompt (see SOFT_ENFORCEMENT_PROVIDERS).
@@ -265,6 +287,38 @@ def granted_mcp_servers(
             name for name in names if name == pattern or fnmatch.fnmatchcase(name, pattern)
         )
     return sorted(granted)
+
+
+#: Kiro built-ins that ``@builtin`` grants on the ``tools`` axis: the ones that
+#: can neither run commands, write files nor reach the network. On Kiro a bare
+#: ``@builtin`` in ``tools`` means EVERY built-in, shell included, so it must
+#: not pass through as written (the reviewer default would gain a shell).
+KIRO_BUILTIN_CHROME: List[str] = ["goal", "introspect", "todo_list"]
+
+
+def kiro_agent_tools(allowed: List[str]) -> List[str]:
+    """Translate a resolved CAO allowlist into Kiro's ``tools`` availability list.
+
+    ``["*"]`` stays ``["*"]``. Otherwise each CAO capability becomes the Kiro
+    built-ins it maps to (both spellings, see ``TOOL_MAPPING["kiro_cli"]``),
+    ``@builtin`` becomes the harmless chrome only, and any other ``@`` entry
+    (``@server`` or ``@server/tool``) passes through: Kiro reads those forms
+    itself. An empty allowlist yields an empty ``tools`` list, which in Kiro
+    is an agent with no tools -- the deny-everything a profile asked for.
+    Sorted, so two installs of the same profile write the same bytes.
+    """
+    if "*" in allowed:
+        return ["*"]
+    mapping = TOOL_MAPPING["kiro_cli"]
+    tools: Set[str] = set()
+    for cao_tool in allowed:
+        if cao_tool == "@builtin":
+            tools.update(KIRO_BUILTIN_CHROME)
+        elif cao_tool.startswith("@"):
+            tools.add(cao_tool)
+        else:
+            tools.update(mapping.get(cao_tool, ()))
+    return sorted(tools)
 
 
 def get_disallowed_tools(provider: str, allowed: List[str]) -> List[str]:

@@ -732,11 +732,11 @@ class TestKillSession:
     def test_kill_session_success(self, tmux):
         mock_session = MagicMock()
         tmux.server.sessions.get.return_value = mock_session
-        # The strict verify runs list-sessions: exit 0 with "ses" absent from the
+        # The strict verify runs list-sessions: exit 0 with "cao-ses" absent from the
         # name list is an authoritative "gone" (#498).
         tmux.server.cmd.return_value = _cmd_result(0, stdout=["other"])
 
-        result = tmux.kill_session("ses")
+        result = tmux.kill_session("cao-ses")
 
         assert result is True
         mock_session.kill.assert_called_once()
@@ -755,7 +755,7 @@ class TestKillSession:
         tmux.server.sessions.get.return_value = mock_session
         # 1st verify: still listed -> must sleep and retry. 2nd: gone -> True.
         tmux.server.cmd.side_effect = [
-            _cmd_result(0, stdout=["ses"]),
+            _cmd_result(0, stdout=["cao-ses"]),
             _cmd_result(0, stdout=[]),
         ]
         sleeps: list[float] = []
@@ -763,7 +763,7 @@ class TestKillSession:
             "cli_agent_orchestrator.clients.tmux.time.sleep", lambda s: sleeps.append(s)
         )
 
-        result = tmux.kill_session("ses")
+        result = tmux.kill_session("cao-ses")
 
         assert result is True
         mock_session.kill.assert_called_once()
@@ -786,7 +786,7 @@ class TestKillSession:
         )
         monkeypatch.setattr(tmux, "_KILL_SESSION_VERIFY_TIMEOUT_SECONDS", 0)
 
-        result = tmux.kill_session("ses")
+        result = tmux.kill_session("cao-ses")
 
         assert result is False
         mock_session.kill.assert_called_once()
@@ -794,14 +794,14 @@ class TestKillSession:
     def test_kill_session_not_found(self, tmux):
         tmux.server.sessions.get.return_value = None
 
-        result = tmux.kill_session("nonexistent")
+        result = tmux.kill_session("cao-nonexistent")
 
         assert result is False
 
     def test_kill_session_error(self, tmux):
         tmux.server.sessions.get.side_effect = Exception("tmux error")
 
-        result = tmux.kill_session("ses")
+        result = tmux.kill_session("cao-ses")
 
         assert result is False
 
@@ -810,10 +810,10 @@ class TestKillSession:
         tmux.server.sessions.get.return_value = mock_session
         # Every verify authoritatively still lists the session, so the bounded
         # poll expires without confirmation.
-        tmux.server.cmd.return_value = _cmd_result(0, stdout=["ses"])
+        tmux.server.cmd.return_value = _cmd_result(0, stdout=["cao-ses"])
         monkeypatch.setattr(tmux, "_KILL_SESSION_VERIFY_TIMEOUT_SECONDS", 0)
 
-        result = tmux.kill_session("ses")
+        result = tmux.kill_session("cao-ses")
 
         assert result is False
         mock_session.kill.assert_called_once()
@@ -829,7 +829,7 @@ class TestKillWindow:
         mock_session.windows.get.return_value = mock_window
         tmux.server.sessions.get.return_value = mock_session
 
-        result = tmux.kill_window("ses", "win")
+        result = tmux.kill_window("cao-ses", "win")
 
         assert result is True
         mock_window.kill.assert_called_once()
@@ -837,7 +837,7 @@ class TestKillWindow:
     def test_kill_window_session_not_found(self, tmux):
         tmux.server.sessions.get.return_value = None
 
-        result = tmux.kill_window("ses", "win")
+        result = tmux.kill_window("cao-ses", "win")
 
         assert result is False
 
@@ -846,14 +846,14 @@ class TestKillWindow:
         mock_session.windows.get.return_value = None
         tmux.server.sessions.get.return_value = mock_session
 
-        result = tmux.kill_window("ses", "nonexistent")
+        result = tmux.kill_window("cao-ses", "cao-nonexistent")
 
         assert result is False
 
     def test_kill_window_error(self, tmux):
         tmux.server.sessions.get.side_effect = Exception("tmux error")
 
-        result = tmux.kill_window("ses", "win")
+        result = tmux.kill_window("cao-ses", "win")
 
         assert result is False
 
@@ -935,7 +935,26 @@ class TestPipePane:
 
         tmux.pipe_pane("ses", "win", "/tmp/log.txt")
 
-        mock_pane.cmd.assert_called_once_with("pipe-pane", "-o", "cat >> /tmp/log.txt")
+        # Our FIFO writer, not `cat >> path`: cat follows a symlink and appends
+        # to a regular file swapped in at the FIFO path; the writer refuses both.
+        import shlex
+        import sys
+
+        from cli_agent_orchestrator.utils import fifo_writer
+
+        mock_pane.cmd.assert_called_once_with(
+            "pipe-pane",
+            "-o",
+            f"{shlex.quote(sys.executable)} -I -S {shlex.quote(fifo_writer.__file__)} /tmp/log.txt",
+        )
+
+    def test_pipe_pane_command_quotes_the_fifo_path(self, tmux):
+        """The path rides through `sh -c`; a space or quote in it must not split the command."""
+        import shlex
+
+        command = tmux._pipe_pane_command("/tmp/odd dir/it's.fifo")
+        assert command.endswith(" " + shlex.quote("/tmp/odd dir/it's.fifo"))
+        assert shlex.split(command)[-1] == "/tmp/odd dir/it's.fifo"
 
     def test_pipe_pane_session_not_found(self, tmux):
         tmux.server.sessions.get.return_value = None
@@ -1215,3 +1234,29 @@ class TestRealTmuxExitEmpty:
         finally:
             subprocess.run(["tmux", "-S", socket_path, "kill-server"], capture_output=True)
             shutil.rmtree(socket_dir, ignore_errors=True)
+
+
+class TestKillRefusesForeignSessions:
+    """CAO shares the operator's tmux server; kills stay inside the cao- namespace."""
+
+    def test_kill_session_refuses_unprefixed_name_before_any_lookup(self, tmux):
+        with pytest.raises(ValueError, match="only acts on sessions it created"):
+            tmux.kill_session("dev")
+        tmux.server.sessions.get.assert_not_called()
+        tmux.server.cmd.assert_not_called()
+
+    def test_kill_session_cli_fallback_is_never_reached_for_a_foreign_name(self, tmux):
+        with patch("cli_agent_orchestrator.clients.tmux.subprocess") as mock_subprocess:
+            with pytest.raises(ValueError):
+                tmux.kill_session("dev")
+        mock_subprocess.run.assert_not_called()
+
+    def test_kill_window_refuses_unprefixed_session(self, tmux):
+        with pytest.raises(ValueError, match="only acts on sessions it created"):
+            tmux.kill_window("dev", "editor")
+        tmux.server.sessions.get.assert_not_called()
+
+    def test_prefixed_name_proceeds_to_the_normal_path(self, tmux):
+        tmux.server.sessions.get.return_value = None
+        assert tmux.kill_session("cao-dev") is False  # absent, not refused
+        tmux.server.sessions.get.assert_called_once()

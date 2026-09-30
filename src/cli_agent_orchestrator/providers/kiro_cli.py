@@ -88,8 +88,17 @@ TUI_SEPARATOR_PATTERN = r"^[─]{20,}$"
 # regex can anchor on the raw ─── characters.
 _NON_SGR_CSI = re.compile(r"\x1b\[[0-9;?]*[^m]")
 
-# TUI Credits line: "▸ Credits: N.NN • Time: Ns" marks response completion
-TUI_CREDITS_PATTERN = r"▸\s*Credits:\s*[\d.]+"
+# TUI Credits line marks response completion. Two shapes so far:
+#   up to 2.2x:  "▸ Credits: 0.20 • Time: 29s"
+#   2.25.0:      "▸ Credits: turn 0.20 • session 0.20 | Time: 29s"
+# The 2.25 form put the word "turn" between "Credits:" and the number, which
+# the old pattern did not accept: every turn on 2.25 then fell through to the
+# separator fallback, and that fails too because the new "Trust All Tools
+# active" band sits between the last two separators with a single line of
+# content. Result was IDLE forever after a finished task (never COMPLETED),
+# reproduced against a live 2.25.0 pane on 2026-09-29. Accept an optional
+# "turn" (and any other single word) before the first number.
+TUI_CREDITS_PATTERN = r"▸\s*Credits:\s*(?:[A-Za-z]+\s+)?[\d.]+"
 
 # TUI processing indicator: ghost text shown while agent is working.
 # kiro-cli 2.11+ replaced "Kiro is working" with "Thinking..." (with an

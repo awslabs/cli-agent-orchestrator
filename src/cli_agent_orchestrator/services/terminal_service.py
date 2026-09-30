@@ -18,6 +18,7 @@ Terminal Workflow:
 """
 
 import asyncio
+import functools
 import hashlib
 import json
 import logging
@@ -106,6 +107,9 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
 )
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
+from cli_agent_orchestrator.services.install_service import (
+    kiro_install_predates_native_enforcement,
+)
 from cli_agent_orchestrator.services.memory_gateway import (
     memory_context_for_terminal,
     remote_memory_url,
@@ -426,6 +430,37 @@ def _roll_back_backend_create_locked(
             logger.exception(f"Rollback: failed to kill window {session_name}:{window_name}")
 
 
+def _still_owns_incarnation(session_name: str, terminal_id: Optional[str]) -> bool:
+    """Under the lifecycle lock: does this row still own the current incarnation?
+
+    Failed-init tombstones and deferred provider-cleanup rows can outlive the
+    session they belong to. A surviving row and matching reusable name alone
+    therefore do not prove ownership: its durable incarnation must still match
+    the current pointer. Both are published atomically by the create transaction.
+    Only legacy rows with no incarnation and no current pointer use the older
+    row-existence witness. Callers must hold the lifecycle lock through rollback.
+    """
+    row = get_terminal_metadata(terminal_id) if terminal_id else None
+    if row is None or row.get("tmux_session") != session_name:
+        logger.warning(
+            f"Rollback: terminal {terminal_id} is no longer registered under "
+            f"{session_name}; another lifecycle operation owns that name now, so "
+            f"the backend session is left alone"
+        )
+        return False
+    row_incarnation = row.get("session_incarnation_id")
+    current_incarnation = get_session_incarnation(session_name)
+    if row_incarnation != current_incarnation:
+        logger.warning(
+            "Rollback: terminal %s no longer owns the current incarnation of %s; "
+            "leaving the backend session and forwarded env alone",
+            terminal_id,
+            session_name,
+        )
+        return False
+    return True
+
+
 def _roll_back_cancelled_create(
     session_name: str,
     terminal_id: str,
@@ -439,22 +474,67 @@ def _roll_back_cancelled_create(
     REACQUIRE the lifecycle lock: the worker released it when it returned, and
     an unlocked late kill could destroy a NEW incarnation of the name that
     another caller legitimately built in between — the same
-    never-observable-half-built argument the closure's docstring makes. Under
-    the lock, kill the session/window THIS call created, then drop the
-    committed row, so the cancelled create leaves both stores exactly as it
-    found them.
+    never-observable-half-built argument the closure's docstring makes. The
+    lock serializes lifecycle operations; it does not say whose incarnation is
+    under the name once acquired, so the row is checked as well: a
+    ``delete_session`` plus a fresh create of the same name can both complete
+    between the worker's commit and this compensation, and killing by name
+    then would destroy the replacement and clear its forwarded env. Under the
+    lock, kill the session/window only if this call's row still belongs to the
+    current incarnation. Always drop this terminal's own row: no provider or
+    deferred-init task has been started yet, so retaining the pending row would
+    leave an UNKNOWN terminal that nobody can finish initializing.
 
     Best-effort like its sibling: the cancellation is already propagating and
     is what the caller must see.
     """
     with session_lifecycle_lock(session_name):
-        _roll_back_backend_create_locked(session_name, window_name, created_session=created_session)
+        if _still_owns_incarnation(session_name, terminal_id):
+            _roll_back_backend_create_locked(
+                session_name, window_name, created_session=created_session
+            )
         try:
             db_delete_terminal(terminal_id)
         except Exception:
             logger.exception(
                 f"Rollback: failed to delete registry row {terminal_id} " "after a cancelled create"
             )
+
+
+def _roll_back_backend_create_if_still_ours(
+    session_name: str,
+    window_name: Optional[str],
+    terminal_id: Optional[str],
+    *,
+    created_session: bool,
+) -> None:
+    """Undo a create that failed AFTER the locked transaction committed.
+
+    Provider initialisation, FIFO setup and the rest of ``create_terminal`` run
+    after the lifecycle lock was released, so by the time their failure reaches
+    the outer handler another caller may have torn the name down and rebuilt it
+    (``delete_session`` then a fresh ``new_session=True`` create, or the reverse
+    order of the same pair). An unlocked ``kill_session(session_name)`` there
+    destroyed that newer incarnation and left its registry row pointing at
+    nothing.
+
+    Reacquire the lock, then use this call's own registry row as the ownership
+    witness (``_still_owns_incarnation``). If the row is gone or belongs to an
+    older incarnation, the backend session and forwarded env are left alone.
+    Otherwise the existing locked rollback runs exactly as before. The caller
+    separately releases this terminal's provider and row, retaining its retry
+    handle if provider cleanup is deferred.
+
+    Synchronous, and it blocks on a ``threading.Lock``: the async caller runs it
+    through ``asyncio.to_thread`` so a same-name teardown holding the lock
+    parks this thread, not the API event loop.
+    """
+    with session_lifecycle_lock(session_name):
+        if not _still_owns_incarnation(session_name, terminal_id):
+            return
+        _roll_back_backend_create_locked(
+            session_name, window_name or "", created_session=created_session
+        )
 
 
 async def _finish_and_roll_back_cancelled_create(
@@ -480,6 +560,152 @@ async def _finish_and_roll_back_cancelled_create(
         window_name,
         created_session=session_created,
     )
+
+
+def _roll_back_failed_create(
+    terminal_id: Optional[str],
+    session_name: Optional[str],
+    window_name: Optional[str],
+    *,
+    session_created: bool,
+    window_created: bool,
+    worktree_repo_root: Optional[str],
+) -> None:
+    """Undo everything a failed ``create_terminal`` built, in dependency order.
+
+    One synchronous, best-effort function: every step is guarded so a failure
+    in one never skips the ones after it, and the caller runs the whole thing
+    on a single worker thread through ``_await_uncancellable``, so neither the
+    lifecycle lock (a ``threading.Lock`` a same-name teardown may be holding)
+    nor a cancellation of the create request can leave it half done. The order
+    is the one the steps depend on:
+
+    1. FIFO reader and status monitor -- stop consuming the pane's output.
+    2. Backend session or window -- locked and ownership-checked
+       (``_roll_back_backend_create_if_still_ours``); the helper also drops the
+       forwarded env for a session it kills. The window arm exists for
+       harness-control#186: a window added to an ALREADY-EXISTING session
+       (``new_session=False``, every MCP spawn/assign-into-existing-session
+       call) has no session-level teardown to fall back on, and without it a
+       provider init timeout rolled back the row and stopped the reader but
+       left the pane running, invisible to list/tree, forever.
+    3. Provider -- AFTER the process-owning session/window is stopped, because
+       a provider releasing private on-disk state must not race a process
+       still writing it (Grok's updater can still be writing ``$GROK_HOME``
+       while its initialization fails; its cleanup verifies no such process
+       remains).
+    4. Registry row -- unless the provider deferred its cleanup (an explicit
+       ``False`` from ``cleanup_provider``), in which case the row is the only
+       retry handle and is retained so the failed terminal stays discoverable
+       and its deletion retryable rather than leaking credentials/config.
+       Idempotent (``DELETE ... WHERE id = ?``), a no-op when the failure
+       happened before the row was written.
+    5. Worktree -- a worktree created before a later step failed would
+       otherwise survive as an orphan worktree + branch with no CAO-side
+       record pointing at it.
+    """
+    if terminal_id is not None:
+        _clear_deferred_init_external_owner_active(terminal_id)
+        try:
+            fifo_manager.stop_reader(terminal_id)
+        except Exception:
+            pass  # Ignore cleanup errors
+        try:
+            status_monitor.clear_terminal(terminal_id)
+        except Exception:
+            pass  # Ignore cleanup errors
+    if session_created and session_name:
+        try:
+            _roll_back_backend_create_if_still_ours(
+                session_name, window_name, terminal_id, created_session=True
+            )
+        except Exception:
+            logger.exception(f"Rollback: locked session rollback failed for {session_name}")
+    elif window_created and session_name and window_name:
+        try:
+            _roll_back_backend_create_if_still_ours(
+                session_name, window_name, terminal_id, created_session=False
+            )
+        except Exception:
+            logger.exception(
+                f"Rollback: locked window rollback failed for {session_name}:{window_name}"
+            )
+    cleanup_complete = True
+    try:
+        if terminal_id is not None:
+            cleanup_complete = provider_manager.cleanup_provider(terminal_id) is not False
+    except Exception:
+        # Preserve the existing rollback contract for an unexpected
+        # provider-manager failure. Only an explicit False is a Grok
+        # cleanup deferral with enough information to retry safely.
+        cleanup_complete = True
+    if cleanup_complete:
+        try:
+            if terminal_id is not None:
+                db_delete_terminal(terminal_id)
+        except Exception:
+            pass  # Ignore cleanup errors
+    elif terminal_id is not None:
+        logger.warning(
+            "Create rollback deferred Grok cleanup for %s; retaining terminal metadata for retry",
+            terminal_id,
+        )
+    if worktree_repo_root is not None and terminal_id is not None:
+        try:
+            worktree_service.remove_worktree(worktree_repo_root, terminal_id)
+        except Exception:
+            # Best-effort like every step above; the create's own error is
+            # what the caller must see, not a failed worktree removal.
+            logger.exception(
+                f"Rollback: worktree removal failed for {terminal_id} under {worktree_repo_root}"
+            )
+
+
+async def _await_uncancellable(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> None:
+    """Run blocking cleanup ``fn`` on a worker thread and see it through to the end.
+
+    A cancellation of the awaiting task while ``fn`` runs (or waits on a lock)
+    does not interrupt it: the thread is shielded, the wait resumes, and the
+    cancellation is re-raised only once ``fn`` has returned, so the caller
+    still observes it but never before the cleanup is durable. Repeat
+    cancellations are absorbed the same way. An exception from ``fn`` is
+    logged and swallowed: cleanup is best-effort and must not replace the
+    error the caller is about to raise.
+
+    The thread is driven through ``loop.run_in_executor`` directly, not
+    ``asyncio.to_thread`` wrapped in a Task, on purpose. Whole-runner shutdown
+    (``asyncio.run``'s ``_cancel_all_tasks``, uvicorn's equivalent) cancels
+    every *Task* on the loop; a Task standing in for the thread would then be
+    cancelled itself, ``await shield(job)`` would raise on every iteration
+    without ever yielding, and shutdown would spin here forever after the
+    thread had long finished. An executor Future is not a Task, so shutdown
+    cancels only this awaiting coroutine, which keeps waiting for the thread
+    and then re-raises. And should the Future itself ever be cancelled or
+    finish behind our back, ``job.done()`` ends the loop instead of retrying
+    a settled awaitable.
+    """
+    loop = asyncio.get_running_loop()
+    job: "asyncio.Future[Any]" = loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
+    cancelled: Optional[asyncio.CancelledError] = None
+    while True:
+        try:
+            await asyncio.shield(job)
+            break
+        except asyncio.CancelledError as exc:
+            if cancelled is None:
+                cancelled = exc
+            if job.done():
+                # The job itself was cancelled or completed between iterations:
+                # nothing left to wait for. Retrying a settled awaitable would
+                # raise immediately every time and never yield to the loop.
+                break
+            # Otherwise the caller was cancelled while the thread still runs:
+            # keep waiting for it.
+        except Exception:
+            logger.exception("Rollback: failed-create cleanup raised")
+            break
+    if cancelled is not None:
+        raise cancelled
 
 
 # ``allowed_tools=None`` and ``allowed_tools=[]`` are DIFFERENT requests --
@@ -1076,6 +1302,12 @@ async def create_terminal(
             )
 
     terminal_id: Optional[str] = None
+    # The window name the failure handler rolls back. ``window_name`` itself is
+    # first bound inside the try, so a failure before that point (capability
+    # probe, worktree) would leave it unassigned; this mirror is set from the
+    # create worker's result, the only point after which there is a window to
+    # roll back, and is None before it.
+    rollback_window_name: Optional[str] = None
     session_created = False  # tracks whether THIS call created the tmux session
     # harness-control#186: tracks whether THIS call created a new WINDOW in an
     # already-existing session (the `new_session=False` branch below — what
@@ -1218,6 +1450,20 @@ async def create_terminal(
                 f"'{agent_profile}' requests {allowed_tools}. Treat this worker as "
                 f"unrestricted; for enforced restrictions use one of: "
                 f"{', '.join(native_providers())}."
+            )
+        elif (
+            provider == ProviderType.KIRO_CLI.value
+            and agent_profile
+            and kiro_install_predates_native_enforcement(agent_profile, allowed_tools)
+        ):
+            # Kiro enforces the installed agent JSON's `tools`. A file written
+            # before CAO put the policy there still says ["*"], so the
+            # restriction this request carries is not what the agent runs with.
+            logger.warning(
+                f"Terminal {terminal_id}: the installed Kiro agent '{agent_profile}' has "
+                f'tools ["*"]; it predates native enforcement, so the requested '
+                f"restriction {allowed_tools} is NOT applied. Treat this worker as "
+                f"unrestricted until `cao install {agent_profile} --provider kiro_cli` is re-run."
             )
 
         # Step 3c: Create the tmux session/window and its registry row as ONE
@@ -1432,6 +1678,7 @@ async def create_terminal(
         create_worker = asyncio.ensure_future(asyncio.to_thread(_create_session_or_window_locked))
         try:
             window_name, session_created, window_created = await asyncio.shield(create_worker)
+            rollback_window_name = window_name
         except asyncio.CancelledError:
             if not create_worker.cancelled():
                 compensator = asyncio.ensure_future(
@@ -1596,92 +1843,24 @@ async def create_terminal(
         return terminal
 
     except Exception as e:
-        # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
-        if terminal_id is not None:
-            _clear_deferred_init_external_owner_active(terminal_id)
-        try:
-            if terminal_id is not None:
-                fifo_manager.stop_reader(terminal_id)
-        except Exception:
-            pass  # Ignore cleanup errors
-        try:
-            if terminal_id is not None:
-                status_monitor.clear_terminal(terminal_id)
-        except Exception:
-            pass  # Ignore cleanup errors
-        # Roll back the DB terminal row so a failed create does not leave an
-        # orphan record: the stale row would still be listed for the session
-        # and report UNKNOWN status even though nothing is running. Idempotent
-        # (DELETE ... WHERE id = ?), so it is a no-op when the failure happened
-        # before the row was written. Runs regardless of session_created so a
-        if session_created and session_name:
-            try:
-                get_backend().kill_session(session_name)
-            except:
-                pass  # Ignore cleanup errors
-            # Session is gone, drop any forwarded env we stashed for it so
-            # secrets don't linger in memory or bleed into a future reuse
-            # of the same name.
-            clear_session_env(session_name)
-        elif window_created and session_name and window_name:
-            # harness-control#186: a window added to an ALREADY-EXISTING session
-            # (new_session=False -- every MCP spawn/assign-into-existing-session
-            # call) has no session-level teardown to fall back on above, since
-            # `session_created` is False and the pre-existing session must stay
-            # up. Live-reproduced without this: a provider init timeout here
-            # (e.g. "Claude Code initialization timed out after 60s") rolls back
-            # the DB row and stops the FIFO/provider/status-monitor above, but
-            # the tmux WINDOW itself — the actual pane, still running whatever
-            # shell/process the provider left behind — was never torn down.
-            # Result: the caller (the spawning agent's MCP tool call) gets a
-            # hard error back, AND a permanently orphaned window is left behind:
-            # invisible to this terminal's own list/tree (the DB row is gone),
-            # never cleaned up, sitting there indefinitely.
-            try:
-                get_backend().kill_window(session_name, window_name)
-            except Exception:
-                pass  # Ignore cleanup errors
-        # The process-owning tmux session/window must be stopped before a
-        # provider releases private on-disk state.  In particular Grok can
-        # have an updater still writing $GROK_HOME while its initialization
-        # fails; its cleanup verifies that no such process remains.
-        cleanup_complete = True
-        try:
-            if terminal_id is not None:
-                cleanup_complete = provider_manager.cleanup_provider(terminal_id) is not False
-        except Exception:
-            # Preserve the existing rollback contract for an unexpected
-            # provider-manager failure. Only an explicit False is a Grok
-            # cleanup deferral with enough information to retry safely.
-            cleanup_complete = True
-        # Do not erase the only retry handle before Grok has safely released
-        # its private home.  The original create error is still raised below;
-        # retaining this row makes the failed terminal discoverable and its
-        # deletion retryable rather than leaking credentials/config forever.
-        if cleanup_complete:
-            try:
-                if terminal_id is not None:
-                    db_delete_terminal(terminal_id)
-            except Exception:
-                pass  # Ignore cleanup errors
-        elif terminal_id is not None:
-            logger.warning(
-                "Create rollback deferred Grok cleanup for %s; retaining terminal metadata for retry",
-                terminal_id,
-            )
-        if worktree_repo_root is not None and terminal_id is not None:
-            # A worktree WAS created (Step 1b succeeded) before some later step
-            # failed -- roll it back too, same best-effort posture as everything
-            # else in this block. Without this, a provider-init timeout (or any
-            # later failure) on a worktree-backed terminal would leave an orphan
-            # worktree + branch behind with no CAO-side record pointing at it.
-            # Offloaded to a thread for the same reason Step 1b's create is:
-            # `git worktree remove` is a blocking subprocess call and this
-            # `except` block still runs on the shared event loop.
-            await asyncio.to_thread(
-                worktree_service.remove_worktree, worktree_repo_root, terminal_id
-            )
+        # Everything this call built is torn down by ONE owned operation
+        # (``_roll_back_failed_create``) on ONE worker thread, and the await
+        # is not cancellable: if the create request is cancelled while the
+        # rollback waits on the lifecycle lock, the cleanup still runs to the
+        # end and the cancellation is re-raised afterwards. Before this the
+        # backend rollback was its own ``await`` inside this handler, so a
+        # cancellation landing there unwound the handler with the row,
+        # provider registration and worktree still in place.
+        await _await_uncancellable(
+            _roll_back_failed_create,
+            terminal_id,
+            session_name,
+            rollback_window_name,
+            session_created=session_created,
+            window_created=window_created,
+            worktree_repo_root=worktree_repo_root,
+        )
         raise
 
 

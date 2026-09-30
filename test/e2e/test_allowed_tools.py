@@ -13,11 +13,12 @@ Test strategy:
 6. Verify the agent CAN execute bash — output should contain the command result
 
 Provider coverage:
-- Kiro CLI: NO enforcement. CAO launches kiro-cli --trust-all-tools and writes
-  tools: ["*"], so the allowedTools in the agent JSON only suppresses approval
-  prompts (utils/enforcement.py classifies kiro_cli as ``none``). The restricted
-  case below therefore asserts that bash RUNS; if Kiro ever blocks it, that
-  test fails and the classification must be revisited.
+- Kiro CLI: Hard enforcement at install time. ``cao install`` writes the
+  resolved policy into the agent JSON's ``tools`` (availability); CAO still
+  launches --trust-all-tools, which only suppresses prompts for the tools that
+  remain (utils/enforcement.py classifies kiro_cli ``native``). The profiles
+  are installed into the managed server's HOME by a fixture, since that is the
+  HOME the server's kiro-cli reads.
 - Claude Code: Hard enforcement via --disallowedTools flags.
   Tests pass allowed_tools=@cao-mcp-server to trigger Bash blocking.
 - Codex: Soft enforcement via security system prompt.
@@ -573,27 +574,31 @@ def _run_reviewer_write_test(provider: str):
 class TestKiroCliAllowedTools:
     """E2E allowedTools tests for the Kiro CLI provider.
 
-    ``cao install`` writes the profile's allowedTools into the agent JSON, but
-    Kiro's ``allowedTools`` names the tools that run WITHOUT an approval prompt,
-    not the tools that exist; availability is ``tools``, which CAO writes as
-    ``["*"]``, and CAO launches ``--trust-all-tools`` on every profile. So the
-    CAO policy is not applied at runtime and ``utils/enforcement.py`` classifies
-    kiro_cli as ``none`` (#824). Runtime allowed_tools API params are stored in
-    the DB for auditing/inheritance and do not affect Kiro's behavior either.
+    ``cao install`` writes the profile's resolved ``allowedTools`` into the agent
+    JSON as ``allowedTools`` (Kiro's run-without-a-prompt list; CAO launches
+    ``--trust-all-tools`` so it restricts nothing) AND, translated to Kiro's
+    tool names, as ``tools``, which is what the agent can use at all. That is
+    where the CAO policy is enforced, natively and at install time, so
+    utils/enforcement.py classifies kiro_cli ``native`` alongside OpenCode.
+    Runtime allowed_tools API params are stored in the DB for auditing and
+    inheritance and do not change the installed agent.
 
-    To test Kiro's actual tool blocking, first run:
-        cao install src/cli_agent_orchestrator/agent_store/code_supervisor.md --provider kiro_cli
-    This writes allowedTools: ["@cao-mcp-server"] into the agent JSON.
+    The managed server runs with ``$HOME`` redirected, and the kiro-cli it
+    spawns reads its agents from THAT HOME, so every case here takes
+    ``kiro_profiles_in_server_home``: it runs the real installer into the
+    server's HOME and hands back the agent JSON, and the restricted case
+    asserts the installed ``tools`` list before launching anything.
+    ``require_kiro`` also skips when kiro-cli is installed but logged out.
     """
 
-    def test_unrestricted_developer_can_bash(self, require_kiro):
+    def test_unrestricted_developer_can_bash(self, kiro_profiles_in_server_home):
         """Developer with wildcard allowedTools can execute bash."""
         _run_unrestricted_tool_test(
             provider="kiro_cli",
             agent_profile="developer",
         )
 
-    def test_allowed_tools_stored_in_metadata(self, require_kiro):
+    def test_allowed_tools_stored_in_metadata(self, kiro_profiles_in_server_home):
         """allowed_tools is persisted and returned by GET /terminals."""
         _run_allowed_tools_stored_test(
             provider="kiro_cli",
@@ -601,32 +606,35 @@ class TestKiroCliAllowedTools:
             allowed_tools="@builtin,fs_read,@cao-mcp-server",
         )
 
-    def test_restricted_supervisor_can_still_bash(self, require_kiro):
-        """A restricted Kiro supervisor CAN run bash: the CAO policy is not applied.
+    def test_restricted_supervisor_cannot_bash(self, kiro_profiles_in_server_home):
+        """A restricted Kiro supervisor cannot run bash: ``tools`` has no shell in it.
 
-        kiro_cli is launched --trust-all-tools with tools: ["*"], and the
-        allowedTools written to the agent JSON only suppresses approval
-        prompts, so utils/enforcement.py classifies it ``none``. This test is
-        the executable statement of that claim (#824): it asserts the marker
-        file IS created. If Kiro starts enforcing, this fails with a message
-        saying the classification must be revisited. It is a direct assertion
-        rather than an xfail so that an environmental failure (session create,
-        readiness, completion timeout) fails visibly instead of being counted
-        as the expected outcome.
-
-        NOTE: the installed profile matters for what this case means. The
-        shipped code_supervisor installs allowedTools
-        ["@cao-mcp-server", "fs_read", "fs_list"] (no execute_bash) via
-            cao install code_supervisor --provider kiro_cli
-        A profile installed before the allowedTools feature carries no
-        restriction at all, so bash runs for a different reason and this test
-        says nothing about Kiro's enforcement; reinstall the profile first.
+        The installed ``code_supervisor`` JSON is the precondition, asserted not
+        assumed: its ``tools`` list must carry no shell-class tool (``shell``,
+        ``execute_bash``, ``subagent``, ``use_aws``) and must still grant
+        ``@cao-mcp-server`` and a read tool, so the agent is a working supervisor
+        that simply has nothing to run a command with. Ground truth is the marker
+        file on disk: with no shell tool it cannot appear, whatever the agent
+        says. If it does appear, Kiro is not honouring ``tools`` and the
+        classification in utils/enforcement.py must be revisited.
         """
+        installed = kiro_profiles_in_server_home["code_supervisor"]
+        tools = installed.get("tools")
+        assert isinstance(tools, list) and tools, installed
+        assert tools != [
+            "*"
+        ], "installed code_supervisor is unrestricted; reinstall wrote no policy"
+        shell_class = {"shell", "execute_bash", "subagent", "use_aws"}
+        assert not (
+            set(tools) & shell_class
+        ), f"the installed code_supervisor still has a shell-class tool: {tools}"
+        assert "@cao-mcp-server" in tools, tools
+        assert {"read", "fs_read"} & set(tools), tools
         _run_restricted_tool_test(
             provider="kiro_cli",
             agent_profile="code_supervisor",
             allowed_tools="@cao-mcp-server",
-            expect_blocked=False,
+            expect_blocked=True,
         )
 
 

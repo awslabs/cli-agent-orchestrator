@@ -40,6 +40,73 @@ FORWARDED_ENV_PREFIX_ALLOWLIST = frozenset(
     }
 )
 
+# Variables that decide what the spawned pane runs BEFORE the provider CLI's
+# first tool call: the dynamic loader's hooks, which program and rc file the
+# shell starts with, the shell's own prompt hooks, the interpreters' startup
+# imports, and the files the AWS SDK reads to authenticate the provider itself.
+# A forwarded value here executes attacker code as the operator before the
+# agent has done anything, regardless of provider or role, so they are refused
+# outright. Exact names for the shell/interpreter hooks; prefixes for the
+# loaders, whose whole ``LD_*`` / ``DYLD_*`` families are control knobs.
+# Variables that only act when the agent itself runs a program
+# (``GIT_SSH_COMMAND``, ``EDITOR``, ``PAGER``, ...) are not listed: whether
+# the agent may run programs at all is the tool policy's decision, and a value
+# in those cannot run before it. This is a denylist and will trail new
+# providers and new startup hooks; an allowlist of known-safe forwarded names
+# is the shape that would not. Mirrored server-side in
+# ``TmuxClient._is_blocked_env_key``.
+FORWARDED_ENV_HIJACK_KEYS = frozenset(
+    {
+        # the pane's shell resolves the typed launch command through PATH,
+        # sources its rc files from HOME, and programs consult SHELL
+        "PATH",
+        "HOME",
+        "SHELL",
+        # sh/bash/zsh read these on startup and source the file they name
+        "BASH_ENV",
+        "ENV",
+        "ZDOTDIR",
+        # bash runs PROMPT_COMMAND and expands command substitutions in the
+        # prompt strings at the first prompt, before anything is typed
+        "PROMPT_COMMAND",
+        "PS0",
+        "PS1",
+        "PS2",
+        "PS4",
+        # interpreters import or execute from these before the script runs
+        "PYTHONSTARTUP",
+        "PYTHONPATH",
+        "PYTHONHOME",
+        # relocates the user site-packages, whose usercustomize.py is imported
+        # automatically at interpreter start -- same effect as PYTHONPATH
+        "PYTHONUSERBASE",
+        "PERL5OPT",
+        "PERL5LIB",
+        # PERLLIB is PERL5LIB's older alias; NODE_PATH is the fallback module
+        # search path for a program's own require() calls
+        "PERLLIB",
+        "NODE_PATH",
+        "NODE_OPTIONS",
+        "RUBYOPT",
+        "RUBYLIB",
+        # glibc loads charset-conversion modules (shared objects) from here
+        "GCONV_PATH",
+        # the AWS SDK reads these files when the provider CLI authenticates at
+        # startup (CAO first-classes Bedrock auth, and AWS_* is otherwise
+        # forwarded); a profile's credential_process runs whatever command the
+        # file names, before the provider's first tool call
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+    }
+)
+FORWARDED_ENV_HIJACK_PREFIXES = ("LD_", "DYLD_")
+
+
+def is_hijack_env_key(key: str) -> bool:
+    """True if forwarding ``key`` would let its value run code at pane start."""
+    return key in FORWARDED_ENV_HIJACK_KEYS or key.startswith(FORWARDED_ENV_HIJACK_PREFIXES)
+
+
 # Per-value byte cap. Forwarded vars ride the ``tmux new-session -e`` argv, so an
 # oversized value risks the kernel "command too long" limit (see PR #246).
 FORWARDED_ENV_MAX_VALUE_BYTES = 2048
@@ -104,6 +171,8 @@ def validate_forwarded_env(mapping: Mapping[str, str]) -> Dict[str, str]:
       * a key that is not a ``[A-Za-z_][A-Za-z0-9_]*`` ASCII identifier,
       * a key longer than ``FORWARDED_ENV_MAX_KEY_BYTES`` bytes,
       * a key using a blocked provider prefix (outside the allowlist),
+      * a key the loader, shell or an interpreter consults at startup
+        (``FORWARDED_ENV_HIJACK_KEYS`` / ``FORWARDED_ENV_HIJACK_PREFIXES``),
       * a value containing a NUL byte (breaks ``Popen`` with "embedded null
         byte" and leaks the argv into logs),
       * a value that is not encodable as UTF-8 (e.g. a lone surrogate that
@@ -129,6 +198,11 @@ def validate_forwarded_env(mapping: Mapping[str, str]) -> Dict[str, str]:
             raise ForwardedEnvError(
                 f"env key {key!r} uses a blocked prefix "
                 f"({', '.join(FORWARDED_ENV_BLOCKED_PREFIXES)}) reserved for provider env"
+            )
+        if is_hijack_env_key(key):
+            raise ForwardedEnvError(
+                f"env key {key!r} is read by the loader, shell or an interpreter "
+                "when the pane starts and cannot be forwarded"
             )
         # A NUL passes the byte-length check but makes ``Popen`` raise
         # "embedded null byte"; libtmux logs the whole argv (values included)
