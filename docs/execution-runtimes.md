@@ -67,7 +67,9 @@ the launch with `502`, after deleting the terminal it names, if any. A session
 name or terminal id already in use, on another runtime or on the server
 itself, fails it with `409`, after deleting the new terminal; runtimes pick
 session names independently, so a retry gets a fresh one. For the same
-reason, a local session cannot be created under the name of a remote one.
+reason, a local session cannot be created under the name of a remote one, a
+delete of a session a runtime recorded is always carried out in that runtime,
+and the server's stale-row and retention sweeps leave remote rows alone.
 
 ## Failure outcomes
 

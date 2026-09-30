@@ -70,6 +70,31 @@ def test_a_stale_row_sweep_never_takes_a_remote_row(db):
     assert [t["id"] for t in database.list_terminals_by_session("cao-x")] == ["aaaa0002"]
 
 
+def test_the_retention_sweep_leaves_remote_rows_alone(db, monkeypatch):
+    # An idle remote agent may be older than the retention window; its row is
+    # the only handle on it, and the sweep cannot stop it in its runtime.
+    from datetime import datetime, timedelta
+
+    import cli_agent_orchestrator.services.cleanup_service as cleanup_service
+
+    _, engine = db
+    database.Base.metadata.create_all(engine)
+    monkeypatch.setattr(cleanup_service, "SessionLocal", database.SessionLocal)
+    database.create_terminal("aaaa0001", "cao-a", "dev-a", "mock_cli", "developer")
+    database.create_terminal(
+        "aaaa0002", "cao-b", "dev-b", "mock_cli", "developer", runtime_id="rt-1"
+    )
+    long_ago = datetime.now() - timedelta(days=3650)
+    with database.SessionLocal() as s:
+        s.query(database.TerminalModel).update({"last_active": long_ago})
+        s.commit()
+
+    cleanup_service.cleanup_old_data()
+
+    assert database.get_terminal_metadata("aaaa0001") is None
+    assert database.get_terminal_metadata("aaaa0002") is not None
+
+
 def test_a_runtime_creates_only_the_pane_tables(db):
     _, engine = db
     database.init_runtime_db()

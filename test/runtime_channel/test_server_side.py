@@ -536,6 +536,54 @@ class TestAttach:
 
 
 class TestLaunchAcrossAReconnect:
+    def test_a_reconnect_while_a_launch_is_being_recorded_keeps_its_terminal(
+        self, http, server, monkeypatch
+    ):
+        recording, release = threading.Event(), threading.Event()
+        real = server_mod._record_launch
+
+        def slow_record(*args, **kwargs):
+            recording.set()
+            release.wait(5)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(server_mod, "_record_launch", slow_record)
+
+        async def scenario():
+            async with _dial(server) as old:
+                await old.send(_hello())
+                await old.recv()
+                loop = asyncio.get_running_loop()
+                request = loop.run_in_executor(
+                    None,
+                    lambda: http.post(
+                        "/runtimes/rt-1/terminals", json={"agent_profile": "developer"}
+                    ),
+                )
+                launch = await _next_command(old)
+                await old.send(
+                    encode(
+                        Result(op_id=launch.op_id, ok=True, payload={"terminal": dict(LAUNCHED)})
+                    )
+                )
+                await asyncio.to_thread(recording.wait, 5)
+                # The runtime reconnects before the server has placed the terminal;
+                # its hello lists the terminal it just started.
+                async with _dial(server) as new:
+                    await new.send(_hello(statuses={"beef0001": "idle"}))
+                    await new.recv()
+                    try:
+                        stray = decode(await asyncio.wait_for(new.recv(), 0.5))
+                    except asyncio.TimeoutError:
+                        stray = None
+                    release.set()
+                    return await asyncio.wait_for(request, 10), stray
+
+        response, stray = asyncio.run(scenario())
+        assert stray is None, f"the server sent {stray} for a launch it was still recording"
+        assert response.status_code == 201, response.text
+        assert database.get_terminal_metadata("beef0001") is not None
+
     def test_a_launch_recorded_during_a_reconnect_keeps_the_new_connections_status(
         self, http, server, monkeypatch
     ):
@@ -609,6 +657,33 @@ class TestServerThatRunsNoAgents:
 
 
 class TestRemoteSessionTeardown:
+    def test_a_session_recorded_remotely_mid_delete_is_torn_down_in_its_runtime(self, monkeypatch):
+        from cli_agent_orchestrator.services import session_service
+
+        real = session_service.session_is_remote
+        calls = []
+
+        def racing(name):
+            calls.append(name)
+            if len(calls) == 1:
+                # Routed as local; a runtime records this session right after,
+                # before the local teardown takes the session lock.
+                _remote_row("abcd0001", "rt-1", session="cao-race1")
+                return False
+            return real(name)
+
+        monkeypatch.setattr(session_service, "session_is_remote", racing)
+        deleted = []
+
+        def delete(terminal_id, registry=None):
+            deleted.append(terminal_id)
+            return database.delete_terminal(terminal_id)
+
+        monkeypatch.setattr(terminal_service, "delete_terminal", delete)
+        result = session_service.delete_session("cao-race1")
+        assert deleted == ["abcd0001"], "its terminal must be deleted in its runtime"
+        assert result["deleted"] == ["cao-race1"]
+
     def test_concurrent_deletes_of_one_remote_session_tear_it_down_once(self, monkeypatch):
         from cli_agent_orchestrator.services import session_lock, session_service
 

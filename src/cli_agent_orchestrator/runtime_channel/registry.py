@@ -104,6 +104,11 @@ class RuntimeConnection:
             raise RemoteCommandError(result.error or f"{command_type.value} failed")
         return result.payload
 
+    def awaits(self, op_id: str) -> bool:
+        """True while a call is still waiting for this op's result."""
+        future = self._pending.get(op_id)
+        return future is not None and not future.done()
+
     def resolve(self, result: Result) -> bool:
         """Deliver a result to its waiting call. False if no call is waiting for it
         any more (it timed out or was cancelled): the caller must act on it."""
@@ -139,6 +144,9 @@ class RuntimeRegistry:
         self._runtimes: Dict[str, RuntimeConnection] = {}
         # terminal id -> runtime id, for terminals whose status the runtime may report.
         self._placement: Dict[str, str] = {}
+        # terminal id -> runtime id, for launches whose result has arrived and
+        # is being recorded: not placed yet, but not unrecorded either.
+        self._reserved: Dict[str, str] = {}
         self._status: Dict[str, TerminalStatus] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -205,6 +213,21 @@ class RuntimeRegistry:
     def is_placed(self, terminal_id: str, runtime_id: str) -> bool:
         with self._lock:
             return self._placement.get(terminal_id) == runtime_id
+
+    def reserve(self, terminal_id: str, runtime_id: str) -> None:
+        """Mark a launch whose result arrived as being recorded (see ``is_known``)."""
+        with self._lock:
+            self._reserved[terminal_id] = runtime_id
+
+    def release(self, terminal_id: str, runtime_id: str) -> None:
+        with self._lock:
+            if self._reserved.get(terminal_id) == runtime_id:
+                del self._reserved[terminal_id]
+
+    def is_known(self, terminal_id: str, runtime_id: str) -> bool:
+        """Placed on the runtime, or its launch there is still being recorded."""
+        with self._lock:
+            return runtime_id in (self._placement.get(terminal_id), self._reserved.get(terminal_id))
 
     def set_status(
         self,
