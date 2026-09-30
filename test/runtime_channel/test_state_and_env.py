@@ -141,3 +141,38 @@ def test_rows_are_kept_when_tmux_cannot_be_asked(db, monkeypatch):
     monkeypatch.setattr(backend_registry, "_backend", Broken())
     assert bridge_mod._drop_stale_rows() == 0
     assert [t["id"] for t in database.list_all_terminals()] == ["aaaa0001"]
+
+
+def test_an_idempotent_retry_is_answered_even_with_local_execution_off(monkeypatch):
+    # A terminal created under a key before the server stopped running agents:
+    # retrying that create recovers it, rather than being refused.
+    import asyncio
+    from types import SimpleNamespace
+
+    from cli_agent_orchestrator.services import terminal_service as ts
+
+    fingerprint = ts._request_fingerprint(
+        "mock_cli", "developer", None, None, None, None, False, None, None, None, None, None, None
+    )
+    monkeypatch.setattr(
+        ts,
+        "get_idempotency_record",
+        lambda key: SimpleNamespace(terminal_id="aaaa0001", request_fingerprint=fingerprint),
+    )
+    monkeypatch.setattr(
+        ts,
+        "get_terminal",
+        lambda tid: {
+            "id": tid,
+            "name": "developer-aaaa",
+            "provider": "mock_cli",
+            "session_name": "cao-aaaa",
+            "agent_profile": "developer",
+            "status": "idle",
+        },
+    )
+    monkeypatch.setenv("CAO_LOCAL_EXECUTION", "0")
+    terminal = asyncio.run(
+        ts.create_terminal(provider="mock_cli", agent_profile="developer", idempotency_key="k1")
+    )
+    assert terminal.id == "aaaa0001"

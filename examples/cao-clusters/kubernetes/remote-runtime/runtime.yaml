@@ -62,7 +62,8 @@ spec:
             - name: AWS_REGION
               value: us-east-1
             # Pin every model tier, as ../eks/supervisor.yaml does: Claude Code's
-            # default model ids may not be enabled in your account.
+            # default model ids may not be enabled in your account. The Sonnet
+            # tier uses the Opus id on purpose, as there: one model to enable.
             - name: ANTHROPIC_MODEL
               value: global.anthropic.claude-opus-4-6-v1
             - name: ANTHROPIC_DEFAULT_OPUS_MODEL
