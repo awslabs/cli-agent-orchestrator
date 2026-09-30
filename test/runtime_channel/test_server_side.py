@@ -1413,3 +1413,65 @@ class TestLaunchReadBack:
             "mock_cli",
         )
         assert database.get_terminal_metadata("beef0001") is not None
+
+
+class TestRunStepOnARemoteTerminal:
+    def test_reusing_a_remote_terminal_in_run_step_is_refused(self, http, start_runtime):
+        _remote_row("abcd1234", "rt-1")
+        runtime = start_runtime(script=_answer)
+        response = http.post(
+            "/terminals/run-step",
+            json={
+                "provider": "mock_cli",
+                "agent": "developer",
+                "prompt": "hi",
+                "reuse_terminal_id": "abcd1234",
+                "timeout": 5,
+            },
+        )
+        assert response.status_code == 409, response.text
+        assert "execution runtime" in response.json()["detail"]
+        assert runtime.received == [], "nothing is sent to the runtime"
+
+
+class TestLaunchStatusOrder:
+    def test_a_status_reported_after_the_launch_result_wins(self, http, server, monkeypatch):
+        entered, release = threading.Event(), threading.Event()
+        real = server_mod._record_launch
+
+        def slow_record(*args, **kwargs):
+            entered.set()
+            release.wait(5)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(server_mod, "_record_launch", slow_record)
+
+        async def scenario():
+            async with _dial(server) as ws:
+                await ws.send(_hello())
+                await ws.recv()
+                loop = asyncio.get_running_loop()
+                request = loop.run_in_executor(
+                    None,
+                    lambda: http.post(
+                        "/runtimes/rt-1/terminals", json={"agent_profile": "developer"}
+                    ),
+                )
+                launch = await _next_command(ws)
+                # The result says idle; the terminal is processing by the time
+                # the bridge follows it with the current status.
+                await ws.send(
+                    encode(
+                        Result(op_id=launch.op_id, ok=True, payload={"terminal": dict(LAUNCHED)})
+                    )
+                )
+                await ws.send(encode(Status(terminal_id="beef0001", status="processing")))
+                await asyncio.to_thread(entered.wait, 5)
+                await asyncio.sleep(0.2)  # the status frame is handled meanwhile
+                release.set()
+                response = await asyncio.wait_for(request, 10)
+                return response, http.get("/terminals/beef0001").json()["status"]
+
+        response, status_now = asyncio.run(scenario())
+        assert response.status_code == 201, response.text
+        assert status_now == "processing", "the older status in the result must not win"

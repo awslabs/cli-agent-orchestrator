@@ -342,6 +342,10 @@ async def _finish_launch(
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
 
     terminal_id = launched.id
+    if launched.status:
+        # Only if the runtime has not already sent a newer status after its
+        # result, and not if it reconnected meanwhile (its new hello is newer).
+        runtime_registry.seed_status(terminal_id, runtime_id, launched.status, conn=conn)
     try:
         conflict = await asyncio.to_thread(
             _record_launch, runtime_id, launched, body.working_directory
@@ -364,9 +368,6 @@ async def _finish_launch(
         )
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
 
-    if launched.status:
-        # Ignored if the runtime reconnected meanwhile: its new hello is newer.
-        runtime_registry.set_status(terminal_id, runtime_id, launched.status, conn=conn)
     # The central lifecycle events, as a local launch in a new session emits
     # them: the runtime starts its agent with no plugin registry of its own.
     plugins = getattr(request.app.state, "plugin_registry", None)

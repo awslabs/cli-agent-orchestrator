@@ -542,6 +542,33 @@ class TestConnection:
         assert not (tmp_path / "ready").exists(), "Ready must not outlive the connection"
 
     @pytest.mark.asyncio
+    async def test_a_server_that_drops_right_after_the_hello_gets_growing_backoff(
+        self, monkeypatch
+    ):
+        attempts = []
+
+        class DropsAfterHello(FakeServer):
+            async def __aenter__(self):
+                attempts.append(asyncio.get_running_loop().time())
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def _iterate(self):
+                raise websockets.exceptions.ConnectionClosedError(None, None)
+                yield  # pragma: no cover - makes this an async generator
+
+        monkeypatch.setattr(bridge_mod, "connect", lambda *args, **kwargs: DropsAfterHello())
+        monkeypatch.setattr(bridge_mod, "BACKOFF_INITIAL", 0.05)
+        bridge = _bridge()
+        running = asyncio.ensure_future(bridge.run())
+        await asyncio.sleep(0.7)
+        bridge.stop()
+        await asyncio.wait_for(running, 5)
+        assert len(attempts) <= 5, f"{len(attempts)} attempts: a hello alone reset the backoff"
+
+    @pytest.mark.asyncio
     async def test_a_server_that_drops_every_hello_gets_growing_backoff(self, monkeypatch):
         attempts = []
 
