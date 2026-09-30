@@ -12,11 +12,15 @@ driven through the server's HTTP API. See
 | `StatefulSet/cao-server`, `Service/cao-server` | the API and central state, on a gp3 volume; `CAO_LOCAL_EXECUTION=0`, so it refuses to start agents itself |
 | `StatefulSet/cao-runtime` | `cao-bridge` beside tmux and the provider CLIs; runtime id is the pod name, `cao-runtime-0` |
 | `Secret/cao-runtime-token` | the shared channel token, mounted as a file into both pods (you create it) |
+| `Secret/cao-api-token` | the API bearer token, given to the server only (you create it) |
 | `NetworkPolicy/cao-server-ingress`, `NetworkPolicy/cao-runtime-ingress` | only the runtime may reach the server's API; the runtime accepts no ingress |
 
-The API has no authentication by default, so the NetworkPolicies are the
-boundary around it. They take effect only on a cluster whose CNI enforces
-NetworkPolicy (on EKS, enable network policy in the VPC CNI).
+Every API call needs the bearer token from `cao-api-token`
+(`CAO_AUTH_LOCAL_TOKEN` on the server); `/health` and the runtime channel do
+not. The runtime pod has no API token, so agents there cannot drive the API
+even though they can reach it. The NetworkPolicies are a second fence, and take
+effect only on a cluster whose CNI enforces NetworkPolicy (on EKS, enable
+network policy in the VPC CNI).
 
 ## Build
 
@@ -37,6 +41,8 @@ kustomize edit set image cao-node=<registry>/<repository>:<tag>
 kubectl apply -f namespace.yaml
 kubectl -n cao-remote create secret generic cao-runtime-token \
   --from-literal=token="$(openssl rand -hex 32)"
+kubectl -n cao-remote create secret generic cao-api-token \
+  --from-literal=token="$(openssl rand -hex 32)"
 kubectl apply -k .
 kubectl -n cao-remote rollout status statefulset/cao-server
 kubectl -n cao-remote rollout status statefulset/cao-runtime
@@ -55,21 +61,24 @@ needs no credentials.
 ```bash
 kubectl -n cao-remote port-forward svc/cao-server 9889:9889 &
 B=http://localhost:9889
+AUTH="Authorization: Bearer $(kubectl -n cao-remote get secret cao-api-token \
+  -o jsonpath='{.data.token}' | base64 -d)"
 
-curl -s $B/runtimes
-T=$(curl -s -X POST $B/runtimes/cao-runtime-0/terminals \
+curl -s -H "$AUTH" $B/runtimes
+T=$(curl -s -H "$AUTH" -X POST $B/runtimes/cao-runtime-0/terminals \
   -H 'Content-Type: application/json' \
   -d '{"agent_profile": "developer", "provider": "claude_code"}' \
   | python3 -c 'import json, sys; print(json.load(sys.stdin)["id"])')
 
-curl -s $B/terminals/$T                                    # status: idle
-curl -s -X POST "$B/terminals/$T/input?message=Reply%20with%20one%20word%3A%20ok"
-curl -s $B/terminals/$T                                    # processing, then completed
-curl -s "$B/terminals/$T/output?mode=last"
-curl -s -X DELETE $B/terminals/$T
+curl -s -H "$AUTH" $B/terminals/$T                          # status: idle
+curl -s -H "$AUTH" -X POST "$B/terminals/$T/input?message=Reply%20with%20one%20word%3A%20ok"
+curl -s -H "$AUTH" $B/terminals/$T                          # processing, then completed
+curl -s -H "$AUTH" "$B/terminals/$T/output?mode=last"
+curl -s -H "$AUTH" -X DELETE $B/terminals/$T
 ```
 
-Use `"provider": "mock_cli"` to try the path without a model.
+Use `"provider": "mock_cli"` to try the path without a model. A call without
+the token gets `401`.
 
 ## Verify
 
@@ -85,6 +94,6 @@ Use `"provider": "mock_cli"` to try the path without a model.
 kubectl delete -k .
 ```
 
-This deletes the namespace too, and with it the token Secret. The server's
+This deletes the namespace too, and with it both token Secrets. The server's
 state volume uses the `gp3` storage class; if that class retains volumes,
 delete the released PersistentVolume as well.

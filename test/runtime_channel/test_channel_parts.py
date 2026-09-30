@@ -142,6 +142,32 @@ async def test_a_disconnect_fails_waiting_calls_as_unknown():
 
 
 @pytest.mark.asyncio
+async def test_a_call_queued_behind_a_send_is_never_written_once_replaced():
+    registry = RuntimeRegistry()
+    written, release = [], asyncio.Event()
+
+    async def slow_send(text):
+        written.append(decode(text))
+        await release.wait()  # the first send holds the send lock
+
+    old = registry.register("rt-1", slow_send)
+    registry.activate(old)
+    first = asyncio.ensure_future(old.call(CommandType.INPUT, {"message": "a"}, "t1", timeout=5))
+    queued = asyncio.ensure_future(old.call(CommandType.KEY, {"key": "Enter"}, "t1", timeout=5))
+    await asyncio.sleep(0.05)
+    # A newer connection from the same runtime replaces (and closes) this one
+    # while the second call still waits for the send lock.
+    _FakeRuntime(registry)
+    release.set()
+    with pytest.raises(RemoteOutcomeUnknownError):
+        await first  # it was written, so its outcome is unknown
+    with pytest.raises(RuntimeUnavailableError) as exc:
+        await queued
+    assert exc.value.status_code == 503, "never written, so safe to retry"
+    assert [c.type for c in written] == [CommandType.INPUT]
+
+
+@pytest.mark.asyncio
 async def test_a_result_for_a_call_that_already_gave_up_is_unclaimed():
     registry = RuntimeRegistry()
     runtime = _FakeRuntime(registry, reply=None)

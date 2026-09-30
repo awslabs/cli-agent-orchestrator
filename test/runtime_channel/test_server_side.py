@@ -697,3 +697,74 @@ class TestRemoteSession:
         response = http.delete("/sessions/cao-remote1")
         assert response.status_code == 409
         assert database.get_terminal_metadata("abcd0001") is not None
+
+
+class _RecordingPlugins:
+    """Stands in for the server's plugin registry and records what it is sent."""
+
+    def __init__(self):
+        self.events = []
+
+    async def dispatch(self, event_type, event):
+        self.events.append((event_type, event))
+
+
+class TestLaunchEvents:
+    def test_a_remote_launch_emits_the_central_lifecycle_events(
+        self, http, start_runtime, monkeypatch
+    ):
+        plugins = _RecordingPlugins()
+        monkeypatch.setattr(app.state, "plugin_registry", plugins)
+        start_runtime(script=_answer)
+
+        response = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
+        assert response.status_code == 201, response.text
+        _wait_for(lambda: len(plugins.events) >= 2, "the launch's plugin events")
+        by_type = dict(plugins.events)
+        assert sorted(by_type) == ["post_create_session", "post_create_terminal"]
+        created = by_type["post_create_terminal"]
+        assert (created.terminal_id, created.provider, created.agent_name) == (
+            "beef0001",
+            "mock_cli",
+            "developer",
+        )
+        assert created.session_id == "cao-beef"
+        assert by_type["post_create_session"].session_name == "cao-beef"
+
+    def test_a_launch_the_server_could_not_record_emits_nothing(
+        self, http, start_runtime, monkeypatch
+    ):
+        plugins = _RecordingPlugins()
+        monkeypatch.setattr(app.state, "plugin_registry", plugins)
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(server_mod, "db_create_terminal", fail)
+        start_runtime(script=_answer)
+        response = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
+        assert response.status_code == 500
+        time.sleep(0.2)
+        assert plugins.events == []
+
+
+class TestWithApiAuthentication:
+    """The remote-runtime example turns on the API token; the channel keeps its own."""
+
+    API_TOKEN = "test-api-token"
+
+    def test_the_channel_works_and_the_api_requires_the_token(
+        self, http, start_runtime, monkeypatch
+    ):
+        monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", self.API_TOKEN)
+        start_runtime(script=_answer)  # dials with the runtime token only
+        bearer = {"Authorization": f"Bearer {self.API_TOKEN}"}
+
+        assert http.get("/runtimes").status_code == 401
+        launch = {"agent_profile": "developer"}
+        assert http.post("/runtimes/rt-1/terminals", json=launch).status_code == 401
+        assert http.get("/runtimes", headers=bearer).json()["runtimes"]["rt-1"]
+        response = http.post("/runtimes/rt-1/terminals", json=launch, headers=bearer)
+        assert response.status_code == 201, response.text
+        assert http.get("/terminals/beef0001").status_code == 401
+        assert http.get("/terminals/beef0001", headers=bearer).status_code == 200

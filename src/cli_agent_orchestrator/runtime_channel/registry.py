@@ -73,21 +73,23 @@ class RuntimeConnection:
         retried here: it may already have run in the runtime.
         """
         op_id = uuid.uuid4().hex
+        frame = Command(op_id=op_id, type=command_type, terminal_id=terminal_id, payload=payload)
         future: "asyncio.Future[Result]" = asyncio.get_running_loop().create_future()
-        self._pending[op_id] = future
         try:
-            if self.closed:
-                raise RuntimeUnavailableError(f"runtime {self.runtime_id} is not connected")
-            frame = Command(
-                op_id=op_id, type=command_type, terminal_id=terminal_id, payload=payload
-            )
-            try:
-                async with self._send_lock:
+            async with self._send_lock:
+                # Checked under the lock: a call still queued behind another send
+                # when this connection was replaced or dropped is never written.
+                if self.closed:
+                    raise RuntimeUnavailableError(f"runtime {self.runtime_id} is not connected")
+                # Registered before the frame is written, so its result always
+                # finds a waiter.
+                self._pending[op_id] = future
+                try:
                     await self._send_text(encode(frame))
-            except Exception as exc:  # noqa: BLE001 - the frame may have been written
-                raise RemoteOutcomeUnknownError(
-                    f"sending {command_type.value} to runtime {self.runtime_id} failed: {exc}"
-                ) from exc
+                except Exception as exc:  # noqa: BLE001 - the frame may have been written
+                    raise RemoteOutcomeUnknownError(
+                        f"sending {command_type.value} to runtime {self.runtime_id} failed: {exc}"
+                    ) from exc
             try:
                 result = await asyncio.wait_for(future, timeout=timeout)
             except asyncio.TimeoutError as exc:
@@ -96,6 +98,8 @@ class RuntimeConnection:
                 ) from exc
         finally:
             self._pending.pop(op_id, None)
+            if future.done() and not future.cancelled():
+                future.exception()  # the caller already has its outcome; mark it retrieved
         if not result.ok:
             raise RemoteCommandError(result.error or f"{command_type.value} failed")
         return result.payload

@@ -47,6 +47,22 @@ set -euo pipefail
 BIND_HOST="${CAO_BIND_HOST:-0.0.0.0}"
 PORT="${CAO_API_PORT:-9889}"
 
+# The runtime-channel token (#745) belongs only to the process this script
+# finally execs: cao-bridge, or cao-server checking the runtimes that dial it.
+# Given as CAO_RUNTIME_TOKEN, it leaves the environment here, before anything
+# below starts a subprocess (cao init, cao install, the provider warm-up), and
+# is handed back on the final exec only. CAO_RUNTIME_TOKEN_FILE, a path, needs
+# none of this.
+runtime_token="${CAO_RUNTIME_TOKEN-}"
+unset CAO_RUNTIME_TOKEN
+
+exec_with_runtime_token() {
+  if [ -n "${runtime_token}" ]; then
+    CAO_RUNTIME_TOKEN="${runtime_token}" exec "$@"
+  fi
+  exec "$@"
+}
+
 # State seed — replace `cao init` + `cao install` with a tar extract.
 #
 # In the elastic topology the state directory is a fresh emptyDir on EVERY task,
@@ -225,8 +241,8 @@ if [ "${CAO_NODE_MODE:-server}" = "bridge" ]; then
   # Execution runtime (#745): no cao-server in this pod. cao-bridge dials the
   # central server and runs agents here, beside this container's tmux.
   echo "[cao-entrypoint] starting cao-bridge as runtime ${CAO_BRIDGE_RUNTIME_ID:-?}"
-  exec cao-bridge
+  exec_with_runtime_token cao-bridge
 fi
 
 echo "[cao-entrypoint] starting cao-server on ${BIND_HOST}:${PORT}"
-exec cao-server --host "${BIND_HOST}" --port "${PORT}"
+exec_with_runtime_token cao-server --host "${BIND_HOST}" --port "${PORT}"

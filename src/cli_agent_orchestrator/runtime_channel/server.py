@@ -14,12 +14,21 @@ import hmac
 import logging
 from typing import Any, Dict, List, Optional, Set
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from pydantic import BaseModel, ValidationError
 
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import list_terminal_ids_on_runtime
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
+from cli_agent_orchestrator.plugins import PostCreateSessionEvent, PostCreateTerminalEvent
 from cli_agent_orchestrator.runtime_channel.protocol import (
     PROTOCOL_VERSION,
     CommandType,
@@ -44,6 +53,7 @@ from cli_agent_orchestrator.security.auth import (
     require_any_scope,
 )
 from cli_agent_orchestrator.services.event_bus import bus
+from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +180,7 @@ class LaunchRequest(BaseModel):
 async def launch_on_runtime(
     runtime_id: str,
     body: LaunchRequest,
+    request: Request,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict[str, Any]:
     """Launch a terminal in a connected execution runtime."""
@@ -226,6 +237,24 @@ async def launch_on_runtime(
     if reported:
         # Ignored if the runtime reconnected meanwhile: its new hello is newer.
         runtime_registry.set_status(terminal_id, runtime_id, TerminalStatus(reported), conn=conn)
+    # The central lifecycle events, as a local launch in a new session emits
+    # them: the runtime starts its agent with no plugin registry of its own.
+    plugins = getattr(request.app.state, "plugin_registry", None)
+    dispatch_plugin_event(
+        plugins,
+        "post_create_terminal",
+        PostCreateTerminalEvent(
+            session_id=info["session_name"],
+            terminal_id=terminal_id,
+            agent_name=info.get("agent_profile"),
+            provider=info["provider"],
+        ),
+    )
+    dispatch_plugin_event(
+        plugins,
+        "post_create_session",
+        PostCreateSessionEvent(session_id=info["session_name"], session_name=info["session_name"]),
+    )
     return await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
 
 

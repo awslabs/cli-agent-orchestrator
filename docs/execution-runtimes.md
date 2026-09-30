@@ -47,6 +47,12 @@ order; different terminals run concurrently.
 `GET /terminals/{id}` answers from the status the runtime last pushed. While
 the runtime is disconnected, the status is `unknown`.
 
+The server dispatches event plugin hooks for a remote terminal as for a local
+one: a launch, once its row is recorded, emits `post_create_terminal` and
+`post_create_session`, and a delete emits `post_kill_terminal` (and
+`post_kill_session` for a session). The built-in memory event plugins skip a
+remote terminal, since its working directory is in the runtime.
+
 If the server cannot record a launched terminal, it sends `delete` to the
 runtime. The `500` it then returns says whether the agent may still be
 running. The server also deletes any terminal a runtime runs that it has no
@@ -74,10 +80,20 @@ The server never resends a command by itself.
   exits on either rather than retrying.
 - The token is read once from `CAO_RUNTIME_TOKEN_FILE`, or from
   `CAO_RUNTIME_TOKEN`, which is then removed from the process environment.
-  tmux never passes `CAO_RUNTIME_TOKEN` to a pane.
+  tmux never passes `CAO_RUNTIME_TOKEN` to a pane. The EKS image's entrypoint
+  removes it before its setup steps (`cao init`, `cao install`, the provider
+  warm-up) and passes it only to the `cao-bridge` or `cao-server` it finally
+  starts.
+- A command that has not been written when its connection is replaced or
+  drops is never written; it fails with `503`.
 - The token authenticates a runtime, not an agent. Agents in a runtime run as
   the same user as `cao-bridge`, so treat everything in a runtime as trusted
   with that token.
+- The runtime token does not protect the HTTP API. Turn on API authentication
+  on the server (`CAO_AUTH_LOCAL_TOKEN`, or an IdP; see
+  [Configuration](configuration.md)), as the EKS example does, and give a
+  runtime no API credential: agents there then cannot drive the API.
+  `WS /runtime/channel` and `/health` need no bearer.
 
 ## Known limits of this slice
 

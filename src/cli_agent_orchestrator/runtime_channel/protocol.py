@@ -66,13 +66,14 @@ class Status(BaseModel):
 
 
 Frame = Annotated[Union[Hello, Command, Result, Status], Field(discriminator="kind")]
-_FRAME = TypeAdapter(Frame)
+_FRAME: "TypeAdapter[Union[Hello, Command, Result, Status]]" = TypeAdapter(Frame)
 
 
 def encode(frame: BaseModel) -> str:
     return frame.model_dump_json()
 
 
-def decode(text: str) -> Union[Hello, Command, Result, Status]:
+def decode(text: Union[str, bytes]) -> Union[Hello, Command, Result, Status]:
     """Parse one frame. Raises ``pydantic.ValidationError`` on anything else."""
-    return _FRAME.validate_json(text)
+    frame: Union[Hello, Command, Result, Status] = _FRAME.validate_json(text)
+    return frame
