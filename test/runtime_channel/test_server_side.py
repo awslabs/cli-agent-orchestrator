@@ -1195,3 +1195,37 @@ class TestUnrecordedCleanupRetry:
             await asyncio.sleep(0.01)
         assert [(c.type, c.terminal_id) for c in deletes] == [(CommandType.DELETE, "beef0009")] * 3
         assert not server_mod._teardowns, "the retries stop once it is deleted"
+
+
+class TestLaunchMetadata:
+    def test_a_remote_launch_keeps_its_kiro_engine(self, http, start_runtime):
+        kiro = {**LAUNCHED, "provider": "kiro_cli", "engine": "kas"}
+        start_runtime(script=lambda command: {"terminal": dict(kiro)})
+        response = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
+        assert response.status_code == 201, response.text
+        assert database.get_terminal_metadata("beef0001")["engine"] == "kas"
+
+    def test_the_bridge_reports_the_engine_it_launched_with(self):
+        from cli_agent_orchestrator.models.kiro_engine import KiroEngine
+        from cli_agent_orchestrator.runtime_channel.bridge import _jsonable
+
+        reported = _jsonable({**LAUNCHED, "provider": "kiro_cli", "engine": KiroEngine.KAS})
+        assert reported["engine"] == "kas"
+
+
+class TestLocalCapacity:
+    def test_remote_terminals_do_not_count_against_the_local_cap(self, monkeypatch):
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        _remote_row("abcd0001", "rt-1")
+        monkeypatch.setenv("CAO_MAX_TERMINALS", "1")
+        # The cap check runs before anything touches tmux; stop right after it.
+        sentinel = RuntimeError("past the cap check")
+
+        def stop(*args, **kwargs):
+            raise sentinel
+
+        monkeypatch.setattr(ts, "generate_terminal_id", stop)
+        with pytest.raises(RuntimeError) as exc:
+            asyncio.run(ts.create_terminal(provider="mock_cli", agent_profile="developer"))
+        assert exc.value is sentinel, f"refused by the cap: {exc.value}"

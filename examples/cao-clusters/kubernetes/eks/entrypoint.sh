@@ -56,6 +56,14 @@ PORT="${CAO_API_PORT:-9889}"
 runtime_token="${CAO_RUNTIME_TOKEN-}"
 unset CAO_RUNTIME_TOKEN
 
+# A bridge's readiness file on a volume that outlives the container (the
+# example's emptyDir) says nothing about this start: a killed cao-bridge could
+# not remove it. Clear it before the setup below, so the pod is not Ready until
+# this start's cao-bridge has connected.
+if [ "${CAO_NODE_MODE:-server}" = "bridge" ] && [ -n "${CAO_BRIDGE_READY_FILE:-}" ]; then
+  rm -f "${CAO_BRIDGE_READY_FILE}"
+fi
+
 exec_with_runtime_token() {
   if [ -n "${runtime_token}" ]; then
     CAO_RUNTIME_TOKEN="${runtime_token}" exec "$@"

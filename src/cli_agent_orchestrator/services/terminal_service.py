@@ -1317,6 +1317,8 @@ async def create_terminal(
     # which is acceptable for the cap's placement-guard purpose.
     max_terminals = get_max_terminals()
     if max_terminals is not None:
+        # Terminals on this host only: one running in an execution runtime
+        # (#745) uses none of this node's capacity (see the count).
         tracked_count = count_runtime_allocated_terminals()
         if tracked_count >= max_terminals:
             raise TerminalLimitError(

@@ -106,6 +106,7 @@ class TestExecute:
                 "agent_profile": "developer",
                 "allowed_tools": ["@builtin"],
                 "status": "idle",
+                "engine": None,  # set for kiro_cli launches (v2 or kas)
             }
         }
 

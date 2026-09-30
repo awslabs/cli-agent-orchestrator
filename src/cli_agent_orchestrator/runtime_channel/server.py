@@ -31,6 +31,7 @@ from cli_agent_orchestrator.clients.database import (
     list_terminal_ids_on_runtime,
     list_terminals_by_session,
 )
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId, TerminalStatus
 from cli_agent_orchestrator.plugins import PostCreateSessionEvent, PostCreateTerminalEvent
@@ -229,6 +230,8 @@ class _Launched(BaseModel):
     agent_profile: Optional[str] = None
     allowed_tools: Optional[List[str]] = None
     status: Optional[TerminalStatus] = None
+    # The Kiro engine the runtime resolved for the launch (v2 or kas).
+    engine: Optional[KiroEngine] = None
 
 
 async def _undo_launch(runtime_id: str, terminal_id: str) -> bool:
@@ -273,6 +276,7 @@ def _record_launch(
                 allowed_tools=launched.allowed_tools,
                 working_directory=working_directory,
                 runtime_id=runtime_id,
+                engine=launched.engine.value if launched.engine else None,
             )
         except Exception:
             runtime_registry.unplace(launched.id, runtime_id)

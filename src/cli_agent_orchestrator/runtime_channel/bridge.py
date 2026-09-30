@@ -349,9 +349,18 @@ class Bridge:
 
 def _jsonable(terminal: Dict[str, Any]) -> Dict[str, Any]:
     """The terminal fields the server records, as plain JSON values."""
-    keys = ("id", "name", "provider", "session_name", "agent_profile", "allowed_tools", "status")
+    keys = (
+        "id",
+        "name",
+        "provider",
+        "session_name",
+        "agent_profile",
+        "allowed_tools",
+        "status",
+        "engine",
+    )
     out = {key: terminal.get(key) for key in keys}
-    for key in ("provider", "status"):
+    for key in ("provider", "status", "engine"):
         out[key] = getattr(out[key], "value", out[key])
     return out
 
