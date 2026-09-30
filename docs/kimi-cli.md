@@ -82,6 +82,16 @@ CAO runs `/swarm on` as a startup control command and requires Kimi's native
 activation confirmation before delivering work. It does not count this command
 or its status bullet as an executed task. Legacy Kimi CLI behavior is unchanged.
 
+For completion attribution, CAO retains the current generation's raw transcript
+in an anonymous spool, using at most 64 KiB before spilling to temporary disk.
+It closes the spool on the next dispatch, buffer-generation reset, or terminal
+cleanup. This preserves quoted and private-output ownership after the rolling
+buffer is cropped. Final-answer verification may temporarily read the complete
+generation, so very large turns require disk and transient memory proportional
+to that turn's output. If recording fails, CAO discards cached completion
+evidence and requires a new generation before trusting a final-answer proof.
+An active live panel takes precedence over an older recorded completion.
+
 ## Dialect Detection
 
 The provider probes the resolved `kimi` binary's `--help` **once per binary

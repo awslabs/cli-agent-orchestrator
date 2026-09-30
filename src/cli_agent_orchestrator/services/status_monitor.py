@@ -236,6 +236,9 @@ class StatusMonitor:
 
         with self._lock:
             buffer = self._buffers.get(terminal_id, "") + chunk
+            recorder = getattr(provider, "record_status_chunk", None)
+            if callable(recorder):
+                recorder(chunk, self._buffer_epochs.get(terminal_id, 0))
             # Acceptance evidence is separate from generic/debounced status.
             # Observe the complete current-generation prefix before eviction,
             # atomically with clear_rolling_buffer's epoch notification.

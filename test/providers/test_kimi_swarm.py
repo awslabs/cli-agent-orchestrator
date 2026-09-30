@@ -292,6 +292,55 @@ def test_swarm_is_observed_after_an_ordinary_thinking_spinner(native_provider):
     assert native_provider._swarm_turn_seen
 
 
+def test_native_swarm_is_busy_after_a_finished_regular_tool():
+    tool = " \x1b[38;5;253m● \x1b[1m\x1b[38;5;111mUsed Read" "\x1b[0m (README.txt) · 1 line\n\n"
+    output = SWARM_ECHO + tool + swarm_panel() + SWARM_FOOTER
+    assert kt.swarm_turn_pending(output) is True
+    assert not kt.has_current_final_response(output)
+    # Status conservatively preserves activity; the output classifier still
+    # owns ambiguous tool payload and cannot use it to accept a new dispatch.
+    assert not kt.has_live_swarm_progress(output)
+    complete = output + SWARM_FINAL
+    assert kt.swarm_turn_pending(complete) is False
+    assert kt.has_current_final_response(complete)
+
+
+def test_swarm_tool_boundary_excludes_the_main_agents_preamble(native_provider):
+    preamble = " \x1b[38;5;253m● \x1b[39mI will delegate the batch.\n"
+    output = SWARM_ECHO + preamble + swarm_panel("Completed.", "✓ ") + SWARM_FINAL
+    assert native_provider.extract_last_message_from_script(output) == "● Batch complete."
+
+
+def test_swarm_main_answer_can_begin_with_a_markdown_fence(native_provider):
+    final = " \x1b[38;5;253m● \x1b[39m```text\nBatch complete.\n```\n"
+    output = SWARM_ECHO + swarm_panel("Completed.", "✓ ") + final
+    assert kt.has_current_final_response(output)
+    assert kt.swarm_turn_pending(output) is False
+    answer = native_provider.extract_last_message_from_script(output)
+    assert "Batch complete." in answer
+    assert "Agent Swarm" not in answer
+
+
+@pytest.mark.parametrize("close", ["", "```\n"])
+def test_quoted_swarm_and_answer_markers_do_not_certify_completion(close):
+    output = SWARM_ECHO + "```text\n" + swarm_panel("Completed.", "✓ ") + SWARM_FINAL + close
+    assert kt.swarm_turn_pending(output) is None
+    assert not kt.has_current_final_response(output)
+
+
+def test_final_before_a_later_swarm_is_not_the_current_main_answer():
+    output = SWARM_ECHO + SWARM_FINAL + swarm_panel()
+    assert not kt.has_current_final_response(output)
+    assert kt.swarm_turn_pending(output) is True
+
+
+def test_previous_swarm_answer_is_excluded_by_next_submission():
+    old = SWARM_ECHO + swarm_panel("Completed.", "✓ ") + SWARM_FINAL
+    output = old + SWARM_ECHO
+    assert not kt.has_current_final_response(output)
+    assert kt.swarm_turn_pending(output) is None
+
+
 def test_profile_swarm_fields_roundtrip_and_omission():
     profile = parse_agent_profile_text(
         "---\nname: kimi-test\ndescription: test\nkimiSwarm: true\n"

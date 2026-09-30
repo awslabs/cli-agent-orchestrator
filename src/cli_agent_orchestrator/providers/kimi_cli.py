@@ -821,6 +821,15 @@ class KimiCliProvider(BaseProvider):
         self._awaiting_turn = False
         self._turn_activity_seen = False
         self._swarm_turn_seen = False
+        self._swarm_main_answer_seen = False
+        self._swarm_stream_lock = threading.RLock()
+        self._swarm_generation = 0
+        self._swarm_revision = 0
+        self._swarm_final_floor = 0
+        self._swarm_stream: Optional[tempfile.SpooledTemporaryFile[str]] = None
+        self._swarm_stream_complete = False
+        self._swarm_storage_failed = False
+        self._swarm_prefix_lost = False
         self.execution_evidence_ambiguous = False
         self._status_buffer_epoch = 0
         # Wallclock of the last send_input() dispatch (terminal_service calls
@@ -887,11 +896,14 @@ class KimiCliProvider(BaseProvider):
         self._begin_execution_generation()
 
     def _begin_execution_generation(self) -> None:
-        self._awaiting_turn = True
-        self._turn_activity_seen = False
-        self._swarm_turn_seen = False
-        self.execution_evidence_ambiguous = False
-        self._execution_observed = False
+        with self._swarm_stream_lock:
+            self._reset_swarm_stream()
+            self._awaiting_turn = True
+            self._turn_activity_seen = False
+            self._swarm_turn_seen = False
+            self._swarm_main_answer_seen = False
+            self.execution_evidence_ambiguous = False
+            self._execution_observed = False
 
     def _new_tui_ready_status(self) -> TerminalStatus:
         """Verdict for a Kimi Code ready frame with no live spinner visible.
@@ -914,9 +926,10 @@ class KimiCliProvider(BaseProvider):
 
     def notify_status_buffer_reset(self, epoch: int) -> None:
         """A new buffer generation still awaits actual activity, not a redraw."""
-        if epoch > self._status_buffer_epoch:
-            self._status_buffer_epoch = epoch
-            self._begin_execution_generation()
+        with self._swarm_stream_lock:
+            if epoch > self._status_buffer_epoch:
+                self._status_buffer_epoch = epoch
+                self._begin_execution_generation()
 
     def _try_load_profile(self):
         """Best-effort profile load for timeout resolution only.
@@ -2223,7 +2236,9 @@ class KimiCliProvider(BaseProvider):
             execution_established=self._execution_observed,
         )
 
-    def _has_live_swarm_pane(self) -> Optional[bool]:
+    def _has_live_swarm_pane(
+        self, generation: Optional[int] = None, revision: Optional[int] = None
+    ) -> Optional[bool]:
         # A composited screen loses SGR, so a copied panel in an answer is
         # indistinguishable from the UI there. Confirm against the same live
         # pane's renderer styling before letting it keep the turn processing.
@@ -2234,31 +2249,229 @@ class KimiCliProvider(BaseProvider):
                 strip_escapes=False,
                 visible_only=True,
             )
-            return self._swarm_pane_pending(pane)
+            return self._swarm_pane_pending(pane, generation, revision)
         except Exception:
             return None
 
-    def _swarm_pane_pending(self, pane: str) -> Optional[bool]:
+    def _swarm_pane_pending(
+        self, pane: str, generation: Optional[int] = None, revision: Optional[int] = None
+    ) -> Optional[bool]:
+        with self._swarm_stream_lock:
+            if generation is None:
+                generation = self._swarm_generation
+            if revision is None:
+                revision = self._swarm_revision
+            if generation != self._swarm_generation or revision != self._swarm_revision:
+                return None
+            final_floor = self._swarm_final_floor
         pending = kt.swarm_turn_pending(pane)
+        pane_active = pending is True and kt.has_active_swarm_panel(pane)
+        proof = None
+        if self._swarm_main_answer_seen or (
+            self._swarm_turn_seen and kt.has_response_marker(kt.strip_sgr(pane))
+        ):
+            proof = self._swarm_proof_output(pane)
+        proof_final = proof is not None and kt.has_current_final_response(
+            proof, minimum_row=final_floor
+        )
+        proof_complete = proof is not None and self._swarm_stream_complete
+        quoted_pane = (
+            pending is True
+            and proof_complete
+            and proof is not None
+            and kt.swarm_pane_is_quoted_suffix(pane, proof)
+        )
+        if quoted_pane:
+            pane_active = False
+        if proof_complete and proof is not None and (pending is not True or quoted_pane):
+            pending = kt.swarm_turn_pending(proof)
+            if pending is False and not proof_final:
+                pending = None
+        with self._swarm_stream_lock:
+            if generation != self._swarm_generation or revision != self._swarm_revision:
+                return None
+            if (
+                pending is True
+                and not quoted_pane
+                and proof_complete
+                and proof is not None
+                and kt.has_current_final_response(proof)
+            ):
+                floor = len(proof.split("\n"))
+                if floor > self._swarm_final_floor or self._swarm_main_answer_seen:
+                    self._swarm_final_floor = max(floor, self._swarm_final_floor)
+                    self._swarm_revision += 1
+                    self._swarm_main_answer_seen = False
+                    proof_final = False
+            return self._commit_swarm_pane_pending(
+                pane, pending, proof_final, proof_complete, pane_active
+            )
+
+    def _commit_swarm_pane_pending(
+        self,
+        pane: str,
+        pending: Optional[bool],
+        proof_final: bool,
+        proof_complete: bool,
+        pane_active: bool,
+    ) -> Optional[bool]:
         if pending is not None:
-            if self._task_dispatched:
+            if pending:
+                # A restored provider has no dispatch timestamp, but a live
+                # native panel still prevents its ready frame from completing.
                 self._swarm_turn_seen = True
+                if (
+                    not self._swarm_main_answer_seen
+                    or pane_active
+                    or kt.has_live_swarm_progress(pane)
+                    or self._swarm_final_before_panel(pane)
+                    or (proof_complete and not proof_final)
+                ):
+                    self._swarm_main_answer_seen = False
+            elif self._swarm_prefix_lost:
+                if not self._swarm_main_answer_seen and (not proof_final):
+                    return None
             return pending
         if not self._swarm_turn_seen:
             return False
-        rows = kt.classify_lines(pane, kt.SpinnerSemantics.CODE, include_unclosed_fences=True)
-        boundary = max(
-            (i for i, (_, _, kind) in enumerate(rows) if kind is kt.KimiLineKind.USER_INPUT),
-            default=-1,
-        )
-        if any(
-            i > boundary
-            and kind is kt.KimiLineKind.FINAL_BULLET
-            and kt.FINAL_ANSWER_BULLET_STYLE_RE.search(raw)
-            for i, (raw, _, kind) in enumerate(rows)
-        ):
+        if self._swarm_main_answer_seen or proof_final:
             return False
         return None
+
+    @staticmethod
+    def _swarm_final_before_panel(output: str) -> bool:
+        return kt.has_final_before_swarm_panel(output)
+
+    def _reset_swarm_stream(self) -> None:
+        with self._swarm_stream_lock:
+            self._swarm_generation += 1
+            self._swarm_revision += 1
+            self._swarm_final_floor = 0
+            stream = self._swarm_stream
+            self._swarm_stream = None
+            self._swarm_stream_complete = False
+            self._swarm_storage_failed = False
+            self._swarm_prefix_lost = False
+            if stream is not None:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    logger.exception(
+                        "Cannot close Kimi generation context for %s", self.terminal_id
+                    )
+
+    def record_status_chunk(self, chunk: str, epoch: int) -> None:
+        """Keep exact generation bytes independently of the monitor's crop.
+
+        The anonymous spool limits retained RAM to 64 KiB and is closed on
+        generation reset or cleanup. Re-parsing a complete stream preserves
+        fences, private ownership, partial SGR and redraw normalization without
+        fabricating a parser prefix from an ambiguous cropped suffix.
+        """
+        if epoch != self._status_buffer_epoch or self._dialect is not KimiDialect.CODE:
+            return
+        with self._swarm_stream_lock:
+            if epoch != self._status_buffer_epoch:
+                return
+            self._swarm_revision += 1
+            try:
+                if self._swarm_stream is None:
+                    self._swarm_stream = tempfile.SpooledTemporaryFile(
+                        max_size=64 * 1024, mode="w+t", encoding="utf-8", newline=""
+                    )
+                    self._swarm_stream_complete = (
+                        self._task_dispatched and not self._swarm_prefix_lost
+                    )
+                self._swarm_stream.seek(0, os.SEEK_END)
+                self._swarm_stream.write(chunk)
+                if not self._swarm_stream_complete:
+                    self._swarm_stream_complete = self._swarm_has_submission(chunk)
+            except (OSError, ValueError):
+                self._swarm_stream_complete = False
+                self._swarm_storage_failed = True
+                self._swarm_prefix_lost = True
+                self._swarm_main_answer_seen = False
+                logger.exception("Cannot retain Kimi generation context for %s", self.terminal_id)
+
+    @staticmethod
+    def _swarm_has_submission(output: str) -> bool:
+        return any(
+            kind is kt.KimiLineKind.USER_INPUT
+            and kt.USER_INPUT_COLOR_INDEX in kt.foreground_color_indices(raw)
+            for raw, _, kind in kt.classify_lines(
+                kt.normalize_activity_rows(output),
+                kt.SpinnerSemantics.CODE,
+                include_unclosed_fences=True,
+            )
+        )
+
+    def _swarm_proof_output(self, fallback: str) -> Optional[str]:
+        with self._swarm_stream_lock:
+            if self._swarm_storage_failed:
+                return None
+            if self._swarm_stream is not None and self._swarm_stream_complete:
+                try:
+                    self._swarm_stream.seek(0)
+                    return kt.normalize_activity_rows(self._swarm_stream.read()).rpartition("\n")[0]
+                except (OSError, ValueError):
+                    self._swarm_revision += 1
+                    self._swarm_stream_complete = False
+                    self._swarm_storage_failed = True
+                    self._swarm_prefix_lost = True
+                    self._swarm_main_answer_seen = False
+                    return None
+            if not self._swarm_prefix_lost or self._swarm_has_submission(fallback):
+                return fallback
+            return None
+
+    def _observe_swarm_turn_state(
+        self, output: str, generation: Optional[int] = None
+    ) -> Optional[bool]:
+        """Retain current-generation swarm ownership before transcript eviction.
+
+        The initial acceptance check still needs a fresh submission and live
+        execution. Once execution is established, structural panel evidence can
+        keep that same turn busy even after the echo or a previous tool header
+        scrolls away. Main-answer evidence is private/fence-aware and cannot
+        make a later pending panel complete.
+        """
+        with self._swarm_stream_lock:
+            if generation is None:
+                generation = self._swarm_generation
+            revision = self._swarm_revision
+            final_floor = self._swarm_final_floor
+        pending = kt.swarm_turn_pending(output)
+        proof = None
+        if (self._swarm_main_answer_seen and pending is not None) or (
+            self._swarm_turn_seen
+            and (kt.has_response_marker(kt.strip_sgr(output)) or "```" in output or "~~~" in output)
+        ):
+            proof = self._swarm_proof_output(output)
+        proof_final = proof is not None and kt.has_current_final_response(
+            proof, minimum_row=final_floor
+        )
+        proof_complete = proof is not None and self._swarm_stream_complete
+        if proof_complete and proof is not None:
+            pending = kt.swarm_turn_pending(proof)
+        with self._swarm_stream_lock:
+            if generation != self._swarm_generation or revision != self._swarm_revision:
+                return None
+            if pending:
+                if self._execution_observed or not self._awaiting_turn:
+                    self._swarm_turn_seen = True
+                    if (
+                        kt.has_live_swarm_progress(output)
+                        or self._swarm_final_before_panel(output)
+                        or (proof_complete and not proof_final)
+                    ):
+                        self._swarm_main_answer_seen = False
+            elif (
+                (self._execution_observed or not self._awaiting_turn)
+                and self._swarm_turn_seen
+                and proof_final
+            ):
+                self._swarm_main_answer_seen = True
+        return pending
 
     def get_status(self, output: str) -> TerminalStatus:
         """Get Kimi CLI status by analyzing terminal output.
@@ -2287,6 +2500,9 @@ class KimiCliProvider(BaseProvider):
         Returns:
             TerminalStatus indicating current state
         """
+        with self._swarm_stream_lock:
+            generation = self._swarm_generation
+            revision = self._swarm_revision
         # Native status (herdr): trust the backend's agent state when available;
         # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
         native = self._resolve_native_status(output)
@@ -2348,6 +2564,11 @@ class KimiCliProvider(BaseProvider):
             #   freshest non-chrome content).
             lines = clean_output.splitlines()
             semantics = self._spinner_semantics()
+            swarm_pending_in_output = None
+            if semantics is kt.SpinnerSemantics.CODE:
+                swarm_pending_in_output = self._observe_swarm_turn_state(
+                    kt.normalize_activity_rows(output).rpartition("\n")[0], generation
+                )
             last_spinner = max(
                 (i for i, line in enumerate(lines) if _is_live_turn_spinner_line(line, semantics)),
                 default=-1,
@@ -2386,7 +2607,13 @@ class KimiCliProvider(BaseProvider):
             # post-dispatch only (boot screens legitimately show braille
             # like '⠧ MCP Servers: 0/1' while idle at the welcome screen,
             # and init readiness is already handled by the stream path).
-            if self._last_dispatch_time or self._swarm_turn_seen:
+            # A current native panel also needs validation after restoration,
+            # when no dispatch in this process has populated those latches.
+            if (
+                self._last_dispatch_time
+                or self._swarm_turn_seen
+                or swarm_pending_in_output is not None
+            ):
                 try:
                     pane = get_backend().get_history(
                         self.session_name,
@@ -2400,22 +2627,24 @@ class KimiCliProvider(BaseProvider):
                     ):
                         return TerminalStatus.PROCESSING
                     if semantics is kt.SpinnerSemantics.CODE:
-                        swarm_pending = self._swarm_pane_pending(pane)
+                        swarm_pending = self._swarm_pane_pending(pane, generation, revision)
                         if swarm_pending is None:
                             return TerminalStatus.UNKNOWN
                         if swarm_pending:
                             return TerminalStatus.PROCESSING
                 except Exception:
                     if semantics is kt.SpinnerSemantics.CODE and (
-                        self._swarm_turn_seen
-                        or kt.has_live_swarm_progress(kt.normalize_activity_rows(output))
+                        self._swarm_turn_seen or swarm_pending_in_output is not None
                     ):
                         return TerminalStatus.UNKNOWN
                     # Pane unavailable (deleted window, backend hiccup) —
                     # fall through to the stream-derived ready status.
                     pass
 
-            return self._new_tui_ready_status()
+            with self._swarm_stream_lock:
+                if generation != self._swarm_generation or revision != self._swarm_revision:
+                    return TerminalStatus.UNKNOWN
+                return self._new_tui_ready_status()
 
         # --- Legacy emoji-prompt TUI ---
         # Check the bottom lines for the idle prompt.
@@ -2535,17 +2764,12 @@ class KimiCliProvider(BaseProvider):
         """
         if epoch != self._status_buffer_epoch:
             return
-        if (
-            not self._swarm_turn_seen
-            and self._task_dispatched
-            and self._dialect is KimiDialect.CODE
-            and kt.has_live_swarm_progress(
-                kt.normalize_activity_rows(output).rpartition("\n")[0], require_submission=True
-            )
-        ):
-            self._swarm_turn_seen = True
         if self._awaiting_turn:
             self.has_execution_evidence(output)
+        if self._dialect is KimiDialect.CODE:
+            self._observe_swarm_turn_state(kt.normalize_activity_rows(output).rpartition("\n")[0])
+            if truncated:
+                self._swarm_prefix_lost = True
         if truncated and not self._execution_observed:
             self.execution_evidence_ambiguous = True
 
@@ -2558,6 +2782,9 @@ class KimiCliProvider(BaseProvider):
         live, and the response bullets are present without eviction. Called by
         the StatusMonitor only on settled / rising-edge frames.
         """
+        with self._swarm_stream_lock:
+            generation = self._swarm_generation
+            revision = self._swarm_revision
         rows = [ln.rstrip() for ln in screen_lines if ln.strip()]
         if not rows:
             return TerminalStatus.UNKNOWN
@@ -2599,7 +2826,7 @@ class KimiCliProvider(BaseProvider):
             if semantics is kt.SpinnerSemantics.CODE and (
                 self._swarm_turn_seen or "Agent Swarm" in joined
             ):
-                swarm_active = self._has_live_swarm_pane()
+                swarm_active = self._has_live_swarm_pane(generation, revision)
                 if swarm_active is None:
                     # No signal cannot certify completion: the monitor's ready
                     # latch would otherwise outlive this transient read failure.
@@ -2613,7 +2840,10 @@ class KimiCliProvider(BaseProvider):
             # post-dispatch stale repaint stays PROCESSING via _awaiting_turn.
             if not self._has_received_input and self._has_response_evidence(joined):
                 self._has_received_input = True
-            return self._new_tui_ready_status()
+            with self._swarm_stream_lock:
+                if generation != self._swarm_generation or revision != self._swarm_revision:
+                    return TerminalStatus.UNKNOWN
+                return self._new_tui_ready_status()
 
         # Legacy emoji-prompt TUI: bare ✨/💫 prompt visible at the bottom.
         if any(re.search(IDLE_PROMPT_PATTERN, ln) for ln in tail):
@@ -3251,12 +3481,15 @@ class KimiCliProvider(BaseProvider):
         if scratch_removed:
             self._temp_dir = None
             self._shell_safe_dir = None
-        self._initialized = False
-        self._has_received_input = False
-        self._execution_observed = False
-        self._awaiting_turn = False
-        self._turn_activity_seen = False
-        self._swarm_turn_seen = False
-        self.execution_evidence_ambiguous = False
-        self._status_buffer_epoch = 0
+        with self._swarm_stream_lock:
+            self._reset_swarm_stream()
+            self._initialized = False
+            self._has_received_input = False
+            self._execution_observed = False
+            self._awaiting_turn = False
+            self._turn_activity_seen = False
+            self._swarm_turn_seen = False
+            self._swarm_main_answer_seen = False
+            self.execution_evidence_ambiguous = False
+            self._status_buffer_epoch = 0
         return scratch_removed and home_removed

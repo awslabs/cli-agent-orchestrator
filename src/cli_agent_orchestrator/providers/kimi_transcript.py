@@ -1785,6 +1785,7 @@ def _swarm_progress_rows(
                     result[index] = (
                         KimiLineKind.TOOL_CHROME if cleans[index].strip() else KimiLineKind.BLANK
                     )
+                result[start] = KimiLineKind.TOOL_CALL
                 if state in {"Working…", "Orchestrating…", "Prompting…", "Rate limited…"}:
                     result[end] = KimiLineKind.LIVE_SWARM_PROGRESS
                 else:
@@ -1826,9 +1827,135 @@ def has_live_swarm_progress(
     )
 
 
-def swarm_turn_pending(output: str) -> Optional[bool]:
-    """A completed child batch still precedes the main agent's final answer."""
+def _swarm_status_context(
+    output: str,
+) -> Tuple[List[Tuple[str, str, KimiLineKind]], dict[int, KimiLineKind], Set[int]]:
+    """Retain native UI activity independently of public-output ownership.
+
+    A previous tool still owns its private payload, but that cannot certify
+    that the subsequent native swarm has finished. Status can conservatively
+    retain a structurally confirmed panel without publishing any of its rows
+    or using a payload-shaped panel to accept a new dispatch.
+    """
     rows = classify_lines(output, SpinnerSemantics.CODE, include_unclosed_fences=True)
+    raws = [raw for raw, _, _ in rows]
+    cleans = [clean for _, clean, _ in rows]
+    initial_kinds = [classify_line(raw, clean, SpinnerSemantics.CODE) for raw, clean, _ in rows]
+    quoted: Set[int] = set()
+    boundaries = (
+        [0]
+        + [
+            i
+            for i, (raw, clean, kind) in enumerate(rows)
+            if i
+            and kind is KimiLineKind.USER_INPUT
+            and is_user_input_start(raw, clean, SpinnerSemantics.CODE)
+        ]
+        + [len(rows)]
+    )
+    for start, end in zip(boundaries, boundaries[1:]):
+        scan = [
+            _answer_fence_scan_text(raws[i], cleans[i], initial_kinds[i], SpinnerSemantics.CODE)
+            for i in range(start, end)
+        ]
+        quoted.update(start + i for i in _quoted_row_indices(scan, include_unclosed=True))
+    return rows, _swarm_progress_rows(raws, cleans, quoted), quoted
+
+
+def _current_final_response_indices(
+    rows: Sequence[Tuple[str, str, KimiLineKind]],
+    quoted: Set[int],
+) -> Set[int]:
+    indices: Set[int] = set()
+    for index, (raw, clean, kind) in enumerate(rows):
+        if not FINAL_ANSWER_BULLET_STYLE_RE.search(raw):
+            continue
+        if kind is KimiLineKind.FINAL_BULLET and index not in quoted:
+            indices.add(index)
+        elif (
+            kind in ANSWER_KINDS
+            and index in quoted
+            and index - 1 not in quoted
+            and _FENCE_RE.match(
+                _answer_fence_scan_text(
+                    raw, clean, classify_line(raw, clean), SpinnerSemantics.CODE
+                )
+            )
+        ):
+            # The renderer's final bullet can introduce a Markdown fence. The
+            # answer owns that opener; quoted bullets inside it do not qualify.
+            indices.add(index)
+    return indices
+
+
+def has_current_final_response(output: str, *, minimum_row: int = 0) -> bool:
+    """Confirm a public main answer after the current submission and panel."""
+    rows, panels, quoted = _swarm_status_context(output)
+    boundary = max(
+        (i for i, (_, _, kind) in enumerate(rows) if kind is KimiLineKind.USER_INPUT),
+        default=-1,
+    )
+    boundary = max(
+        boundary,
+        max(
+            (i for i, (_, _, kind) in enumerate(rows) if kind is KimiLineKind.TOOL_CALL),
+            default=-1,
+        ),
+        max(
+            (
+                i
+                for i, kind in panels.items()
+                if kind in {KimiLineKind.LIVE_SWARM_PROGRESS, KimiLineKind.SWARM_PROGRESS}
+            ),
+            default=-1,
+        ),
+    )
+    return any(
+        i > boundary and i >= minimum_row for i in _current_final_response_indices(rows, quoted)
+    )
+
+
+def has_active_swarm_panel(output: str) -> bool:
+    """A structurally current native panel still has running children."""
+    rows, panels, _ = _swarm_status_context(output)
+    boundary = max(
+        (i for i, (_, _, kind) in enumerate(rows) if kind is KimiLineKind.USER_INPUT),
+        default=-1,
+    )
+    current = [
+        kind
+        for i, kind in panels.items()
+        if i > boundary and kind in {KimiLineKind.LIVE_SWARM_PROGRESS, KimiLineKind.SWARM_PROGRESS}
+    ]
+    return bool(current and current[-1] is KimiLineKind.LIVE_SWARM_PROGRESS)
+
+
+def swarm_pane_is_quoted_suffix(pane: str, proof: str) -> bool:
+    """Map a visible panel and its surrounding rows to a retained quoted suffix.
+
+    A panel header alone cannot establish correspondence. Require the complete
+    nonblank viewport suffix, including any closing fence and footer, and the
+    retained ownership of every panel row.
+    """
+    pane_rows, pane_panels, _ = _swarm_status_context(normalize_activity_rows(pane))
+    proof_rows, _, quoted = _swarm_status_context(proof)
+    visible = [(i, clean.strip()) for i, (_, clean, _) in enumerate(pane_rows) if clean.strip()]
+    retained = [(i, clean.strip()) for i, (_, clean, _) in enumerate(proof_rows) if clean.strip()]
+    if not pane_panels or len(visible) < 3 or len(visible) > len(retained):
+        return False
+    suffix = retained[-len(visible) :]
+    return all(
+        text == retained_text for (_, text), (_, retained_text) in zip(visible, suffix)
+    ) and all(
+        retained_index in quoted
+        for (pane_index, _), (retained_index, _) in zip(visible, suffix)
+        if pane_index in pane_panels
+    )
+
+
+def has_final_before_swarm_panel(output: str) -> bool:
+    """A later batch cannot reuse a main answer preceding its own panel."""
+    rows, panels, quoted = _swarm_status_context(output)
     boundary = max(
         (i for i, (_, _, kind) in enumerate(rows) if kind is KimiLineKind.USER_INPUT),
         default=-1,
@@ -1836,7 +1963,33 @@ def swarm_turn_pending(output: str) -> Optional[bool]:
     last_panel = max(
         (
             i
-            for i, (_, _, kind) in enumerate(rows)
+            for i, kind in panels.items()
+            if i > boundary
+            and kind in {KimiLineKind.LIVE_SWARM_PROGRESS, KimiLineKind.SWARM_PROGRESS}
+        ),
+        default=-1,
+    )
+    last_panel = max(
+        last_panel,
+        max(
+            (i for i, (_, _, kind) in enumerate(rows) if kind is KimiLineKind.TOOL_CALL),
+            default=-1,
+        ),
+    )
+    return any(boundary < i < last_panel for i in _current_final_response_indices(rows, quoted))
+
+
+def swarm_turn_pending(output: str) -> Optional[bool]:
+    """A completed child batch still precedes the main agent's final answer."""
+    rows, panels, quoted = _swarm_status_context(output)
+    boundary = max(
+        (i for i, (_, _, kind) in enumerate(rows) if kind is KimiLineKind.USER_INPUT),
+        default=-1,
+    )
+    last_panel = max(
+        (
+            i
+            for i, kind in panels.items()
             if i > boundary
             and kind in {KimiLineKind.LIVE_SWARM_PROGRESS, KimiLineKind.SWARM_PROGRESS}
         ),
@@ -1844,9 +1997,14 @@ def swarm_turn_pending(output: str) -> Optional[bool]:
     )
     if last_panel < 0:
         return None
-    return not any(
-        i > last_panel and kind is KimiLineKind.FINAL_BULLET for i, (_, _, kind) in enumerate(rows)
+    last_panel = max(
+        last_panel,
+        max(
+            (i for i, (_, _, kind) in enumerate(rows) if kind is KimiLineKind.TOOL_CALL),
+            default=-1,
+        ),
     )
+    return not any(i > last_panel for i in _current_final_response_indices(rows, quoted))
 
 
 def classify_rows(
