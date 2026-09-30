@@ -248,6 +248,12 @@ class StatusMonitor:
         # The status a dispatch found, kept so abort_turn() can put it back when
         # the dispatch fails before any keystroke reached the agent.
         self._pre_dispatch_status: Dict[str, Optional[TerminalStatus]] = {}
+        # The most recent turn opened by a real send (its dispatch cleared the
+        # buffer), and whether that send was still unfinished when the current
+        # turn was dispatched. abort_turn() must not close a failed dispatch past
+        # an accepted message whose first work frame simply has not arrived yet.
+        self._last_real_turn: Dict[str, int] = {}
+        self._real_send_open_at_dispatch: Dict[str, bool] = {}
 
     async def run(self) -> None:
         """Subscribe to output events and detect status changes.
@@ -353,6 +359,7 @@ class StatusMonitor:
         cleared_buffer_turn: Optional[int] = None,
         work_evidence: Optional[bool] = None,
         buffer_epoch: Optional[int] = None,
+        observed_turn: Optional[int] = None,
     ) -> None:
         """Apply the sticky-latch rules to a freshly detected status and publish
         on change. Shared by the raw and pyte detection paths.
@@ -396,6 +403,12 @@ class StatusMonitor:
         clear discarded, so it is dropped — this also covers a read taken after
         notify_input_sent but before clear_rolling_buffer, which carries no turn
         pin yet still holds the previous turn's bytes (PR #812 review, round 8).
+
+        ``observed_turn`` is the turn that was current when a RETAINED or native
+        read began (the pyte screen, a native agent-state query). Those reads carry
+        no buffer pin, since they are never post-dispatch evidence, but a verdict
+        they produce still belongs to the turn it was read in: if a dispatch
+        opened a newer turn meanwhile, the verdict is dropped (round 9).
         """
         with self._lock:
             changed = self._apply_detection_locked(
@@ -406,6 +419,7 @@ class StatusMonitor:
                 cleared_buffer_turn=cleared_buffer_turn,
                 work_evidence=work_evidence,
                 buffer_epoch=buffer_epoch,
+                observed_turn=observed_turn,
             )
         if changed:
             # Publish outside the lock — subscribers must never be able to
@@ -423,6 +437,7 @@ class StatusMonitor:
         cleared_buffer_turn: Optional[int] = None,
         work_evidence: Optional[bool] = None,
         buffer_epoch: Optional[int] = None,
+        observed_turn: Optional[int] = None,
     ) -> bool:
         """Sticky-latch core of _apply_detection. Caller MUST hold self._lock.
 
@@ -450,6 +465,13 @@ class StatusMonitor:
                 f"_apply_detection [{terminal_id}]: discarding {detected.value} — the "
                 f"observation is pinned to turn {cleared_buffer_turn} but the terminal "
                 f"is on turn {self._turn.get(terminal_id, 0)}"
+            )
+            return False
+        if observed_turn is not None and observed_turn != self._turn.get(terminal_id, 0):
+            logger.debug(
+                f"_apply_detection [{terminal_id}]: discarding {detected.value} — read "
+                f"during turn {observed_turn}, terminal is on turn "
+                f"{self._turn.get(terminal_id, 0)}"
             )
             return False
         if buffer_epoch is not None and buffer_epoch != self._buffer_epochs.get(terminal_id, 0):
@@ -765,7 +787,10 @@ class StatusMonitor:
         if loop is None:
             # No event loop (unit tests / offline replay): detect immediately
             # on the current screen — deterministic, no timing.
-            self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
+            pin = self._current_turn(terminal_id)
+            self._apply_detection(
+                terminal_id, self._detect_screen(terminal_id, provider), observed_turn=pin
+            )
             return
 
         with self._lock:
@@ -779,8 +804,12 @@ class StatusMonitor:
             # definition. It is the right moment to notice work starting and the
             # wrong one to conclude work finished — settled=False. The quiescence
             # timer armed below re-reads the same screen once it stops changing.
+            pin = self._current_turn(terminal_id)
             self._apply_detection(
-                terminal_id, self._detect_screen(terminal_id, provider), settled=False
+                terminal_id,
+                self._detect_screen(terminal_id, provider),
+                settled=False,
+                observed_turn=pin,
             )
         else:
             self._midburst_processing_probe(terminal_id, provider)
@@ -830,6 +859,7 @@ class StatusMonitor:
                 return
             self._midburst_probe_at[terminal_id] = now
 
+        pin = self._current_turn(terminal_id)
         lines, _ = self._screen_lines(terminal_id)
         if not lines:
             # Render failed or the screen is empty: no evidence, no verdict. The
@@ -845,7 +875,9 @@ class StatusMonitor:
             # Mid-burst by construction, so settled=False. Harmless here — the probe
             # only ever applies PROCESSING, which the settled guard does not gate —
             # but stated explicitly so the flag stays honest about the frame.
-            self._apply_detection(terminal_id, TerminalStatus.PROCESSING, settled=False)
+            self._apply_detection(
+                terminal_id, TerminalStatus.PROCESSING, settled=False, observed_turn=pin
+            )
 
     def _on_screen_quiescent(self, terminal_id: str, provider) -> None:
         """Quiescence timer fired: output stopped, so the screen has settled.
@@ -858,12 +890,16 @@ class StatusMonitor:
             self._quiesce_handle.pop(terminal_id, None)
 
         async def _detect_and_apply() -> None:
+            pin = self._current_turn(terminal_id)
             detected = await asyncio.to_thread(self._detect_screen, terminal_id, provider)
-            self._apply_detection(terminal_id, detected)
+            self._apply_detection(terminal_id, detected, observed_turn=pin)
 
         loop = self._loop or self._running_loop()
         if loop is None:
-            self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
+            pin = self._current_turn(terminal_id)
+            self._apply_detection(
+                terminal_id, self._detect_screen(terminal_id, provider), observed_turn=pin
+            )
         else:
             self._spawn_tracked(loop, _detect_and_apply())
 
@@ -899,6 +935,11 @@ class StatusMonitor:
             logger.exception("shows_turn_work failed; treating the buffer as no evidence")
             return False
         return answer if isinstance(answer, bool) else None
+
+    def _current_turn(self, terminal_id: str) -> int:
+        """The turn a retained or native read belongs to — take it BEFORE the read."""
+        with self._lock:
+            return self._turn.get(terminal_id, 0)
 
     def _pin_cleared_turn_locked(self, terminal_id: str) -> Optional[int]:
         """Pin the turn whose dispatch cleared the rolling buffer. Caller MUST
@@ -1206,6 +1247,9 @@ class StatusMonitor:
         """
         with self._lock:
             self._pre_dispatch_status[terminal_id] = self._last_status.get(terminal_id)
+            self._real_send_open_at_dispatch[terminal_id] = self._turn_done.get(
+                terminal_id, 0
+            ) < self._last_real_turn.get(terminal_id, 0)
             self._allow_processing_revert[terminal_id] = True
             turn = self._turn.get(terminal_id, 0) + 1
             self._turn[terminal_id] = turn
@@ -1248,9 +1292,12 @@ class StatusMonitor:
 
         - If the turn was already seen working, the agent took (part of) the
           input; leave it to finish normally.
-        - If an older turn is still open, the agent is busy; closing this turn
-          would also report the older one finished. Leave it open so it closes
-          with the older turn, as any input sent to a busy agent does.
+        - If an earlier real send was still unfinished when this one was
+          dispatched, closing this turn would also report that earlier message
+          finished — even when its first work frame has not arrived yet, so the
+          status still reads ready (kiro, grok; round 9). Leave it open so it
+          closes with that message, as any input sent to a busy agent does. Init
+          and special-key turns are never real sends and do not count.
         - The processing revert arm is left as it is: send_keys can fail after
           the paste and first Enter landed, and a real PROCESSING must still get
           through.
@@ -1265,9 +1312,7 @@ class StatusMonitor:
                 return
             if self._turn_started.get(terminal_id, False):
                 return
-            if self._turn_done.get(terminal_id, 0) < turn - 1 and self._older_turn_running_locked(
-                terminal_id, turn
-            ):
+            if self._real_send_open_at_dispatch.get(terminal_id, False):
                 return
             self._turn_done[terminal_id] = turn
             prior = self._pre_dispatch_status.pop(terminal_id, None)
@@ -1281,12 +1326,6 @@ class StatusMonitor:
         logger.warning(f"Terminal {terminal_id}: dispatch of turn {turn} failed; turn closed")
         if restored is not None:
             bus.publish(f"terminal.{terminal_id}.status", {"status": restored.value})
-
-    def _older_turn_running_locked(self, terminal_id: str, turn: int) -> bool:
-        """Whether the status the aborted dispatch found was a busy one. Init and
-        special-key turns are opened and never closed, so an unclosed older turn
-        number alone does not mean the agent is working. Caller holds the lock."""
-        return self._pre_dispatch_status.get(terminal_id) == TerminalStatus.PROCESSING
 
     def notify_input_delivered(self, terminal_id: str) -> None:
         """Re-stamp the current turn's delivery time now the keystrokes have landed.
@@ -1335,6 +1374,7 @@ class StatusMonitor:
             # turn's dispatch — the fact that lets a raw-buffer ready verdict count
             # as current-turn evidence (see _note_turn_progress_locked).
             self._turn_buffer_cleared[terminal_id] = True
+            self._last_real_turn[terminal_id] = self._turn.get(terminal_id, 0)
             if provider is not None:
                 provider.notify_status_buffer_reset(epoch)
 
@@ -1370,6 +1410,8 @@ class StatusMonitor:
             self._turn_delivered_at.pop(terminal_id, None)
             self._turn_buffer_cleared.pop(terminal_id, None)
             self._pre_dispatch_status.pop(terminal_id, None)
+            self._last_real_turn.pop(terminal_id, None)
+            self._real_send_open_at_dispatch.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
@@ -1423,6 +1465,8 @@ class StatusMonitor:
             if provider is not None:
                 with self._lock:
                     buffer = self._buffers.get(terminal_id, "")
+                    # The turn this native read belongs to, taken before the read.
+                    native_turn = self._turn.get(terminal_id, 0)
                 try:
                     # The native (herdr) path ignores the buffer arg; pass the
                     # rolling buffer (empty for herdr) so the rare
@@ -1437,8 +1481,12 @@ class StatusMonitor:
                 # otherwise never advance here and a turn-aware waiter would hang.
                 # A native agent-state query is authoritative rather than a frame
                 # read, so it counts as settled.
+                # Only if no dispatch opened a newer turn during the read (the native
+                # query shells out, so it can straddle one): a delayed verdict for
+                # the previous turn must not close the new one (round 9).
                 with self._lock:
-                    self._note_turn_progress_locked(terminal_id, native_status, True)
+                    if self._turn.get(terminal_id, 0) == native_turn:
+                        self._note_turn_progress_locked(terminal_id, native_status, True)
                 return native_status
 
         with self._lock:
@@ -1502,11 +1550,14 @@ class StatusMonitor:
                 and getattr(provider, "supports_screen_detection", False)
             )
             raw_calibrated = self._is_raw_calibrated(provider)
+            observed_turn: Optional[int] = None
             if use_screen:
+                observed_turn = self._current_turn(terminal_id)
                 fresh = self._detect_screen(terminal_id, provider)
                 # A pyte screen read mid-burst is a half-drawn frame; a retained
-                # screen is never post-dispatch evidence, so it carries no turn
-                # pin and no work evidence.
+                # screen is never post-dispatch evidence, so it carries no buffer
+                # pin and no work evidence — but its verdict still belongs to the
+                # turn it was read in (observed_turn).
                 settled, cleared_turn, epoch = (not bursting), None, None
                 work_evidence = None
             else:
@@ -1546,6 +1597,7 @@ class StatusMonitor:
                     cleared_buffer_turn=cleared_turn,
                     work_evidence=work_evidence,
                     buffer_epoch=epoch,
+                    observed_turn=observed_turn,
                 )
                 # Report what the latch ACCEPTED, not what this read proposed. A
                 # verdict refused as unsettled must not be handed to the caller

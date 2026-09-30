@@ -2369,3 +2369,147 @@ class TestMidburstProbeWhileUnstarted:
         sm._screen_lines = lambda tid: (["✻ Cultivating… (3s)"], None)
         sm._midburst_processing_probe("t1", provider)
         provider.probe_processing_from_screen.assert_not_called()
+
+
+class TestRound9ObservationOwnership:
+    """PR #812 review round 9 (haofeif): a screen or native verdict read during turn 1
+    and applied after turn 2 started must not close turn 2. The raw and capture
+    paths already discard such stale observations; these paths did not."""
+
+    @staticmethod
+    def _send(sm, provider):
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1", provider)
+        sm.notify_input_delivered("t1")
+
+    def _turn_one_done(self, provider):
+        sm = StatusMonitor()
+        self._send(sm, provider)
+        sm._apply_detection("t1", TerminalStatus.PROCESSING)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED)
+        assert sm.turn_state("t1") == (1, 1)
+        return sm
+
+    def _dispatch_turn_two_while_reading(self, sm, provider, verdict):
+        """A read that finishes only after turn 2 was sent and seen working."""
+
+        def slow_read(*_args):
+            self._send(sm, provider)
+            sm._apply_detection("t1", TerminalStatus.PROCESSING)  # turn 2 working
+            return verdict
+
+        return slow_read
+
+    def test_a_delayed_screen_quiescence_verdict_is_discarded(self):
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        sm = self._turn_one_done(provider)
+        sm._detect_screen = self._dispatch_turn_two_while_reading(
+            sm, provider, TerminalStatus.COMPLETED
+        )
+        sm._on_screen_quiescent("t1", provider)  # no loop: detects inline
+        assert sm.turn_state("t1") == (2, 1)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_a_delayed_screen_poll_verdict_is_discarded(self, mock_get_backend, mock_pm):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        mock_pm.get_provider.return_value = provider
+        sm = self._turn_one_done(provider)
+        sm._last_status["t1"] = TerminalStatus.PROCESSING  # get_status re-checks
+        with sm._lock:
+            sm._buffers["t1"] = "screen bytes"
+            sm._bursting["t1"] = False
+        sm._detect_screen = self._dispatch_turn_two_while_reading(
+            sm, provider, TerminalStatus.COMPLETED
+        )
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm.turn_state("t1") == (2, 1)
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_a_delayed_native_verdict_is_discarded(self, mock_get_backend, mock_pm):
+        mock_get_backend.return_value = _backend(event_inbox=True)
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        mock_pm.get_provider.return_value = provider
+        sm = self._turn_one_done(provider)
+        provider.get_status.side_effect = self._dispatch_turn_two_while_reading(
+            sm, provider, TerminalStatus.COMPLETED
+        )
+        sm.get_status("t1")
+        assert sm.turn_state("t1") == (2, 1)
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_a_native_verdict_for_the_current_turn_still_closes_it(self, mock_get_backend, mock_pm):
+        """Guard against over-tightening: no dispatch in between, so it applies."""
+        mock_get_backend.return_value = _backend(event_inbox=True)
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        mock_pm.get_provider.return_value = provider
+        sm = StatusMonitor()
+        self._send(sm, provider)
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        sm.get_status("t1")
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        sm.get_status("t1")
+        assert sm.turn_state("t1") == (1, 1)
+
+
+class TestRound9AbortKeepsEarlierInput:
+    """PR #812 review round 9 (haofeif): turn 1 was delivered but kiro/grok has not
+    drawn any work yet, so the status still reads COMPLETED. A second send then
+    fails. Aborting it must not report turn 1 finished."""
+
+    def test_a_failed_second_send_does_not_finish_an_accepted_first(self):
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1", provider)
+        sm.notify_input_delivered("t1")  # turn 1 accepted, no output yet
+        second = sm.notify_input_sent("t1")  # its send_keys will raise
+
+        sm.abort_turn("t1", second)
+
+        assert sm.turn_state("t1") == (2, 0)
+        sm._apply_detection("t1", TerminalStatus.PROCESSING)  # turn 1 starts working
+        assert sm.turn_state("t1") == (2, 0)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED)  # turn 1's answer
+        assert sm.turn_state("t1") == (2, 2)
+
+    def test_a_failed_send_after_a_finished_turn_still_closes(self):
+        """The round-8 case must keep working: nothing earlier is open."""
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1", provider)
+        sm.notify_input_delivered("t1")
+        sm._apply_detection("t1", TerminalStatus.PROCESSING)
+        sm._apply_detection("t1", TerminalStatus.COMPLETED)
+        second = sm.notify_input_sent("t1", assume_processing=True)
+
+        sm.abort_turn("t1", second)
+
+        assert sm.turn_state("t1") == (2, 2)
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+
+    def test_open_init_turns_do_not_block_the_abort(self):
+        """Init keystroke turns never close and are not real sends."""
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.IDLE
+        for _ in range(3):
+            sm.notify_input_sent("t1")
+        failed = sm.notify_input_sent("t1", assume_processing=True)
+
+        sm.abort_turn("t1", failed)
+
+        assert sm.turn_state("t1") == (4, 4)
+        assert sm._last_status["t1"] == TerminalStatus.IDLE
