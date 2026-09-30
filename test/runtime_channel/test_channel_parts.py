@@ -135,10 +135,36 @@ async def test_a_disconnect_fails_waiting_calls_as_unknown():
     registry = RuntimeRegistry()
     runtime = _FakeRuntime(registry, reply=None)
     call = asyncio.ensure_future(registry.call("rt-1", CommandType.OUTPUT, {}, terminal_id="t1"))
-    await asyncio.sleep(0)
+    for _ in range(100):  # until the command has been written and awaits its result
+        if runtime.sent:
+            break
+        await asyncio.sleep(0)
     registry.unregister("rt-1", runtime.conn)
     with pytest.raises(RemoteOutcomeUnknownError):
         await call
+
+
+@pytest.mark.asyncio
+async def test_a_call_that_cannot_get_the_channel_in_time_is_503_and_never_written():
+    registry = RuntimeRegistry()
+    written = []
+
+    async def stalled(text):
+        written.append(decode(text))
+        await asyncio.Event().wait()  # backpressure: the runtime stopped reading
+
+    conn = registry.register("rt-1", stalled)
+    registry.activate(conn)
+    first = asyncio.ensure_future(conn.call(CommandType.INPUT, {"message": "a"}, "t1", timeout=2))
+    await asyncio.sleep(0.05)
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(RuntimeUnavailableError) as exc:
+        await conn.call(CommandType.KEY, {"key": "Enter"}, "t1", timeout=0.2)
+    elapsed = asyncio.get_running_loop().time() - started
+    assert elapsed < 1.0, f"the timeout covers the wait for the channel ({elapsed:.2f}s)"
+    assert exc.value.status_code == 503, "never written, so safe to retry"
+    assert [c.type for c in written] == [CommandType.INPUT]
+    first.cancel()
 
 
 @pytest.mark.asyncio

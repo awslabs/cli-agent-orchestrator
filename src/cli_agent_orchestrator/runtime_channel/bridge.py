@@ -64,6 +64,8 @@ class Bridge:
         self._send_lock = asyncio.Lock()
         # terminal id -> (lock, number of commands holding or awaiting it)
         self._terminal_locks: Dict[str, Tuple[asyncio.Lock, int]] = {}
+        # launch op id -> set once that launch has settled (see handle()).
+        self._launches: Dict[str, asyncio.Event] = {}
         # Results that could not be sent (no channel at the time), delivered
         # after the next hello: the server acts on results it no longer awaits.
         self._unsent: List[Result] = []
@@ -138,8 +140,20 @@ class Bridge:
         # launches run concurrently.
         try:
             if command.terminal_id is None:
-                payload = await self.execute(command)
+                launching = self._launches.setdefault(command.op_id, asyncio.Event())
+                try:
+                    payload = await self.execute(command)
+                finally:
+                    launching.set()
+                    self._launches.pop(command.op_id, None)
             else:
+                if command.type == CommandType.DELETE:
+                    # The terminal may be one a launch still in progress is
+                    # starting (its row exists before its result is sent): let
+                    # every such launch settle first, so a delete sent after a
+                    # reconnect never tears a pane down under its initialization.
+                    for settled in list(self._launches.values()):
+                        await settled.wait()
                 async with self._terminal_turn(command.terminal_id):
                     payload = await self.execute(command)
             result = Result(op_id=command.op_id, ok=True, payload=payload)
