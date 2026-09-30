@@ -42,6 +42,8 @@ def _ok_run_step_response(terminal_id="dev-term", last_message="task done"):
         "terminal_id": terminal_id,
         "last_message": last_message,
         "status": "completed",
+        "model": "model-x",
+        "model_honored": True,
     }
     resp.raise_for_status.return_value = None
     return resp
@@ -213,6 +215,16 @@ class TestHandoffOutcomes:
         assert result.success is True
         assert result.output == "done"
         assert result.terminal_id == "dev-t1"
+        assert set(result.model_dump()) == {
+            "success",
+            "message",
+            "output",
+            "terminal_id",
+            "job_id",
+            "pending",
+        }
+        assert "model" not in result.model_dump()
+        assert "model_honored" not in result.model_dump()
         # The single combined call requests server-side teardown.
         assert mock_requests.post.call_args[1]["json"]["teardown"] is True
 

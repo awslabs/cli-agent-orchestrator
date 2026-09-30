@@ -10,6 +10,8 @@ from datetime import datetime
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock, call, patch
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.api.main import (
     app,
@@ -17,8 +19,11 @@ from cli_agent_orchestrator.api.main import (
     inbox_reconciliation_daemon,
     opencode_inbox_delivery_daemon,
 )
+from cli_agent_orchestrator.clients import database
+from cli_agent_orchestrator.clients.database import Base
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import Terminal
+from cli_agent_orchestrator.services import session_service, terminal_service
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.terminal_service import (
     IdempotencyKeyConflict,
@@ -987,8 +992,8 @@ class TestGetSession:
     def test_get_session_success(self, client):
         """GET /sessions/{name} returns session details."""
         mock_session = {
-            "id": "test-session",
-            "windows": [{"name": "window-1", "id": "abcd1234"}],
+            "session": {"id": "test-session"},
+            "terminals": [{"id": "abcd1234"}],
         }
         with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
             mock_svc.get_session.return_value = mock_session
@@ -997,7 +1002,8 @@ class TestGetSession:
 
         assert response.status_code == 200
         data = response.json()
-        assert data["id"] == "test-session"
+        assert data["session"]["id"] == "test-session"
+        assert data["terminals"][0]["id"] == "abcd1234"
         mock_svc.get_session.assert_called_once_with("test-session")
 
     def test_get_session_not_found(self, client):
@@ -1129,6 +1135,8 @@ class TestCreateTerminalInSession:
             session_name="test-session",
             provider="claude_code",
             agent_profile="reviewer",
+            model="model-x",
+            model_honored=True,
         )
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             # The endpoint awaits terminal_service.create_terminal, so the
@@ -1147,6 +1155,8 @@ class TestCreateTerminalInSession:
         data = response.json()
         assert data["id"] == "abcd5678"
         assert data["session_name"] == "test-session"
+        assert data["model"] == "model-x"
+        assert data["model_honored"] is True
         call_kwargs = mock_svc.create_terminal.call_args.kwargs
         assert call_kwargs["session_name"] == "test-session"
         assert call_kwargs["new_session"] is False
@@ -1267,8 +1277,16 @@ class TestListTerminalsInSession:
     def test_list_terminals_success(self, client):
         """GET /sessions/{name}/terminals returns terminal list."""
         mock_terminals = [
-            {"id": "abcd1234", "tmux_session": "s1", "provider": "kiro_cli"},
-            {"id": "abcd5678", "tmux_session": "s1", "provider": "claude_code"},
+            {
+                "id": "abcd1234",
+                "tmux_session": "s1",
+                "provider": "kiro_cli",
+            },
+            {
+                "id": "abcd5678",
+                "tmux_session": "s1",
+                "provider": "claude_code",
+            },
         ]
         with patch(
             "cli_agent_orchestrator.services.session_service.list_current_session_terminals",
@@ -1353,6 +1371,91 @@ class TestGetTerminal:
         """GET /terminals/{id} returns 422 for invalid ID format."""
         response = client.get("/terminals/not-valid-hex")
         assert response.status_code == 422
+
+
+def test_launch_model_values_flow_through_real_sqlite_read_surfaces(client, tmp_path, monkeypatch):
+    """Read surfaces must project stored values, not merely echo mocked payloads."""
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'terminal-surfaces.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setattr(
+        database,
+        "SessionLocal",
+        sessionmaker(autocommit=False, autoflush=False, bind=engine),
+    )
+
+    database.create_terminal(
+        "abc12345",
+        "surface-session",
+        "worker-1",
+        "codex",
+        agent_profile="worker",
+        model="model-x",
+        model_honored=True,
+    )
+    database.create_terminal(
+        "def67890",
+        "surface-session",
+        "worker-2",
+        "mock_cli",
+        agent_profile="worker",
+        model="ignored-model",
+        model_honored=False,
+    )
+
+    backend = MagicMock()
+    backend.session_exists.return_value = True
+    backend.list_sessions.return_value = [{"id": "surface-session"}]
+    monkeypatch.setattr(session_service, "get_backend", lambda: backend)
+    monkeypatch.setattr(
+        terminal_service.status_monitor,
+        "get_status",
+        lambda _terminal_id: MagicMock(value="idle"),
+    )
+
+    def assert_launch_values(terminals):
+        by_id = {terminal["id"]: terminal for terminal in terminals}
+        assert by_id["abc12345"]["model"] == "model-x"
+        assert by_id["abc12345"]["model_honored"] is True
+        assert by_id["def67890"]["model"] == "ignored-model"
+        assert by_id["def67890"]["model_honored"] is False
+
+    assert_launch_values(
+        [
+            terminal_service.get_terminal("abc12345"),
+            terminal_service.get_terminal("def67890"),
+        ]
+    )
+    assert_launch_values(session_service.get_session("surface-session")["terminals"])
+
+    terminal_response = client.get("/terminals/abc12345")
+    ignored_response = client.get("/terminals/def67890")
+    assert terminal_response.status_code == ignored_response.status_code == 200
+    assert_launch_values([terminal_response.json(), ignored_response.json()])
+
+    session_response = client.get("/sessions/surface-session")
+    assert session_response.status_code == 200
+    assert_launch_values(session_response.json()["terminals"])
+
+    terminals_response = client.get("/sessions/surface-session/terminals")
+    assert terminals_response.status_code == 200
+    assert_launch_values(terminals_response.json())
+
+    group_response = client.patch(
+        "/terminals/abc12345/group",
+        json={"group": ["surface"]},
+    )
+    assert group_response.status_code == 200
+    assert_launch_values([group_response.json(), terminal_service.get_terminal("def67890")])
+
+    metadata_response = client.patch(
+        "/terminals/abc12345/metadata",
+        json={"metadata": {"task": "surface-test"}},
+    )
+    assert metadata_response.status_code == 200
+    assert_launch_values([metadata_response.json(), terminal_service.get_terminal("def67890")])
 
 
 class TestSendTerminalInput:

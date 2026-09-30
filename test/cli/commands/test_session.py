@@ -28,6 +28,8 @@ class TestListSessions:
             "id": "abc12345",
             "agent_profile": "dev",
             "provider": "kiro_cli",
+            "model": "model-x",
+            "model_honored": True,
             "status": "idle",
         }
         mock_get.side_effect = [sessions_resp, terminals_resp, terminal_resp]
@@ -119,6 +121,8 @@ class TestStatus:
             "id": "abc12345",
             "agent_profile": "dev",
             "provider": "kiro_cli",
+            "model": "model-x",
+            "model_honored": True,
             "status": "completed",
         }
         output_resp = MagicMock(status_code=200)
@@ -130,7 +134,33 @@ class TestStatus:
         assert result.exit_code == 0
         assert "abc12345" in result.output
         assert "completed" in result.output
+        assert "Model:    model-x" in result.output
+        assert "Honored:  yes" in result.output
         assert "Hello world" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
+    def test_status_renders_unknown_for_legacy_launch_model(self, mock_get, runner):
+        terminals_resp = MagicMock(status_code=200)
+        terminals_resp.json.return_value = [{"id": "abc12345"}]
+        terminal_resp = MagicMock(status_code=200)
+        terminal_resp.json.return_value = {
+            "id": "abc12345",
+            "agent_profile": "dev",
+            "provider": "kiro_cli",
+            "model": None,
+            "model_honored": None,
+            "status": "idle",
+        }
+        output_resp = MagicMock(status_code=200)
+        output_resp.json.return_value = {"output": None}
+        mock_get.side_effect = [terminals_resp, terminal_resp, output_resp]
+
+        result = runner.invoke(session, ["status", "cao-test"])
+
+        assert result.exit_code == 0
+        assert "Model:    unknown" in result.output
+        assert "Honored:  unknown" in result.output
+        assert "provider default" not in result.output
 
     @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
     def test_status_json(self, mock_get, runner):
@@ -141,6 +171,8 @@ class TestStatus:
             "id": "abc12345",
             "agent_profile": "dev",
             "provider": "kiro_cli",
+            "model": "model-x",
+            "model_honored": True,
             "status": "idle",
         }
         output_resp = MagicMock(status_code=200)
@@ -150,7 +182,10 @@ class TestStatus:
         result = runner.invoke(session, ["status", "cao-test", "--json"])
 
         assert result.exit_code == 0
-        assert '"status": "idle"' in result.output
+        payload = json.loads(result.output)
+        assert payload["conductor"]["status"] == "idle"
+        assert payload["conductor"]["model"] == "model-x"
+        assert payload["conductor"]["model_honored"] is True
 
     @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
     def test_status_specific_terminal(self, mock_get, runner):
@@ -159,6 +194,8 @@ class TestStatus:
             "id": "xyz99999",
             "agent_profile": "dev",
             "provider": "kiro_cli",
+            "model": None,
+            "model_honored": None,
             "status": "idle",
         }
         output_resp = MagicMock(status_code=200)
@@ -189,6 +226,8 @@ class TestStatus:
         assert result.exit_code == 0
         data = __import__("json").loads(result.output)
         assert data["conductor"]["id"] == "xyz99999"
+        assert data["conductor"]["model"] is None
+        assert data["conductor"]["model_honored"] is None
         assert "workers" not in data
 
     @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
@@ -223,6 +262,41 @@ class TestStatus:
 
         assert result.exit_code == 0
         assert "work5678" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
+    def test_status_workers_render_unknown_for_legacy_launch_model(self, mock_get, runner):
+        terminals_resp = MagicMock(status_code=200)
+        terminals_resp.json.return_value = [
+            {
+                "id": "cond1234",
+                "agent_profile": "conductor",
+                "provider": "kiro_cli",
+                "model": "model-x",
+                "model_honored": True,
+                "status": "idle",
+            },
+            {
+                "id": "work5678",
+                "agent_profile": "dev",
+                "provider": "kiro_cli",
+                "model": None,
+                "model_honored": None,
+                "status": "processing",
+            },
+        ]
+        terminal_resp = MagicMock(status_code=200)
+        terminal_resp.json.return_value = terminals_resp.json.return_value[0]
+        output_resp = MagicMock(status_code=200)
+        output_resp.json.return_value = {"output": None}
+        mock_get.side_effect = [terminals_resp, terminal_resp, output_resp]
+
+        result = runner.invoke(session, ["status", "cao-test", "--workers"])
+
+        assert result.exit_code == 0
+        worker_row = next(line for line in result.output.splitlines() if "work5678" in line)
+        assert "unknown" in worker_row
+        assert "provider default" not in worker_row
+        assert "None" not in worker_row
 
     @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
     def test_status_resolves_the_conductor_from_index_zero(self, mock_get, runner):

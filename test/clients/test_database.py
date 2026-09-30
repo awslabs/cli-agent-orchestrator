@@ -875,6 +875,8 @@ class TestListSiblingsByGroupPrefix:
                     tmux_session="s",
                     tmux_window="w",
                     provider="kiro_cli",
+                    model="model-x",
+                    model_honored=True,
                     group='["tenant_1", "project_5", "folder_1"]',
                     metadata_json='{"task": "reviewing"}',
                 ),
@@ -883,6 +885,8 @@ class TestListSiblingsByGroupPrefix:
                     tmux_session="s",
                     tmux_window="w",
                     provider="kiro_cli",
+                    model="model-y",
+                    model_honored=False,
                     group='["tenant_1", "project_5", "folder_2"]',
                 ),
                 TerminalModel(
@@ -904,6 +908,7 @@ class TestListSiblingsByGroupPrefix:
         assert by_id["sib-1"]["group"] == ["tenant_1", "project_5", "folder_1"]
         assert by_id["sib-1"]["metadata"] == {"task": "reviewing"}
         assert by_id["sib-2"]["metadata"] is None
+        assert all(set(sibling) == {"id", "group", "metadata"} for sibling in result)
 
     def test_caller_excluded_from_its_own_results(self, test_db):
         self._seed(
@@ -1755,7 +1760,9 @@ class TestTerminalsSchemaMigration:
 
         with sqlite3.connect(str(db_file)) as conn:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(terminals)")}
-            rows = conn.execute("SELECT id, caller_id, working_directory FROM terminals").fetchall()
+            rows = conn.execute(
+                "SELECT id, caller_id, working_directory, model, model_honored FROM terminals"
+            ).fetchall()
         assert "caller_id" in columns
         assert "working_directory" in columns
         assert "provider_variant" in columns
@@ -1763,7 +1770,10 @@ class TestTerminalsSchemaMigration:
         assert "deferred_init_external_owner" in columns
         assert "deferred_init_runtime_reclaimed" in columns
         assert "session_incarnation_id" in columns
-        assert rows == [("abc12345", None, None)], "existing rows must get NULL metadata values"
+        assert {"model", "model_honored"} <= columns
+        assert rows == [
+            ("abc12345", None, None, None, None)
+        ], "existing rows must get NULL launch-model values"
 
     def test_migration_is_idempotent(self, tmp_path, monkeypatch):
         """Running the migration twice must not fail or duplicate columns."""
@@ -1798,6 +1808,8 @@ class TestTerminalsSchemaMigration:
         assert columns.count("deferred_init_external_owner") == 1
         assert columns.count("deferred_init_runtime_reclaimed") == 1
         assert columns.count("session_incarnation_id") == 1
+        assert columns.count("model") == 1
+        assert columns.count("model_honored") == 1
 
     def test_group_and_metadata_columns_added_to_legacy_table(self, tmp_path, monkeypatch):
         """#432: a pre-existing terminals table (predating group/metadata) gains both
@@ -1949,6 +1961,8 @@ class TestTerminalsSchemaMigration:
                 assert row["group"] is None, "pre-migration rows must read group as NULL"
                 assert row["metadata"] is None, "pre-migration rows must read metadata as NULL"
                 assert row["provider_variant"] is None
+                assert row["model"] is None
+                assert row["model_honored"] is None
 
             # Original pre-migration data must survive untouched.
             assert aaaa["tmux_session"] == "cao-sess-1"
@@ -1970,6 +1984,8 @@ class TestTerminalsSchemaMigration:
         assert columns.count("group") == 1
         assert columns.count("metadata") == 1
         assert columns.count("provider_variant") == 1
+        assert columns.count("model") == 1
+        assert columns.count("model_honored") == 1
 
 
 class TestTerminalMetadataRoundTrip:
@@ -2050,6 +2066,38 @@ class TestTerminalMetadataRoundTrip:
         assert fetched["session_incarnation_id"] == "inc-123"
         assert list_terminals_by_session("cao-s")[0]["session_incarnation_id"] == "inc-123"
         assert list_terminals_in_sessions(["cao-s"])[0]["session_incarnation_id"] == "inc-123"
+
+    @pytest.mark.parametrize("model_honored", [True, False])
+    def test_launch_model_round_trips_through_terminal_record(
+        self, tmp_path, monkeypatch, model_honored
+    ):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        engine = create_engine(f"sqlite:///{tmp_path / 'model.db'}")
+        Base.metadata.create_all(bind=engine)
+        monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
+
+        created = create_terminal(
+            "abc12345",
+            "cao-s",
+            "w-0",
+            "mock_cli" if not model_honored else "codex",
+            model="model-x",
+            model_honored=model_honored,
+        )
+        fetched = get_terminal_metadata("abc12345")
+        listed = list_terminals_by_session("cao-s")
+
+        assert created["model"] == "model-x"
+        assert created["model_honored"] is model_honored
+        assert fetched is not None
+        assert fetched["model"] == "model-x"
+        assert fetched["model_honored"] is model_honored
+        assert listed[0]["model"] == "model-x"
+        assert listed[0]["model_honored"] is model_honored
 
 
 class TestProjectAliasMigration:
@@ -2443,6 +2491,8 @@ class TestListTerminalsInSessions:
             "tmux_window",
             "provider",
             "agent_profile",
+            "model",
+            "model_honored",
             "working_directory",
             "engine",
             "deferred_init_failure",
