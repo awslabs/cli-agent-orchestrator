@@ -1150,3 +1150,23 @@ class TestFailedRowDelete:
         # The row survives for a retry, and so does its routing.
         assert database.get_terminal_metadata("abcd1234") is not None
         assert runtimes_of(http)["rt-1"]["terminals"] == ["abcd1234"]
+
+
+class TestLaunchIdRace:
+    def test_a_launch_losing_an_id_race_leaves_the_winner_alone(self):
+        registry = registry_mod.runtime_registry
+        # rt-2's launch of beef0001 has claimed the id and is writing its row.
+        registry.place("beef0001", "rt-2")
+        launched = server_mod._Launched.model_validate({**LAUNCHED, "session_name": "cao-other"})
+        conflict = server_mod._record_launch("rt-1", launched, None)
+        assert conflict == "terminal id beef0001 is already in use"
+        assert registry.is_placed("beef0001", "rt-2")
+        assert database.get_terminal_metadata("beef0001") is None
+
+    def test_reservations_of_one_id_on_two_runtimes_do_not_overwrite_each_other(self):
+        registry = registry_mod.runtime_registry
+        registry.reserve("beef0001", "rt-1")
+        registry.reserve("beef0001", "rt-2")
+        registry.release("beef0001", "rt-2")
+        assert registry.is_known("beef0001", "rt-1")
+        assert not registry.is_known("beef0001", "rt-2")

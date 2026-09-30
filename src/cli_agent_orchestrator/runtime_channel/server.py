@@ -235,9 +235,12 @@ def _record_launch(
             return f"terminal id {launched.id} is already in use"
         if list_terminals_by_session(launched.session_name):
             return f"session {launched.session_name} already exists"
-        # Placed before the row is written, so a reconnect in between does not
-        # take the terminal for an unrecorded one.
-        runtime_registry.place(launched.id, runtime_id)
+        # Claimed before the row is written, so a reconnect in between does not
+        # take the terminal for an unrecorded one. Atomic with the check that
+        # no other runtime holds the id: a concurrent launch of the same id in
+        # another session (another lock) cannot overwrite, or later drop, it.
+        if not runtime_registry.claim(launched.id, runtime_id):
+            return f"terminal id {launched.id} is already in use"
         try:
             db_create_terminal(
                 launched.id,
@@ -250,7 +253,7 @@ def _record_launch(
                 runtime_id=runtime_id,
             )
         except Exception:
-            runtime_registry.forget(launched.id)
+            runtime_registry.unplace(launched.id, runtime_id)
             raise
     return None
 
