@@ -1,5 +1,6 @@
 """Minimal database client with only terminal metadata."""
 
+import json as _json
 import logging
 import os
 import uuid
@@ -32,6 +33,20 @@ logger = logging.getLogger(__name__)
 Base: Any = declarative_base()
 
 
+class SessionIncarnationModel(Base):
+    """Current logical lifetime of a reusable session name.
+
+    Keep the pointer after teardown so retries cannot claim historical terminal
+    rows. A successful new-session creation replaces it in the same transaction
+    as its initial terminal; individual terminal deletion never removes it.
+    """
+
+    __tablename__ = "session_incarnations"
+
+    session_name = Column(String, primary_key=True)
+    incarnation_id = Column(String, nullable=False)
+
+
 class TerminalModel(Base):
     """SQLAlchemy model for terminal metadata only."""
 
@@ -62,6 +77,28 @@ class TerminalModel(Base):
     # MetaData object on every mapped class; the DB column itself is still
     # literally named "metadata" per #432's design.
     metadata_json = Column("metadata", Text, nullable=True)
+    # Server-owned durable deferred-init failure. Kept separate from consumer
+    # metadata so PATCH /metadata cannot erase or forge lifecycle truth.
+    deferred_init_failure_json = Column("deferred_init_failure", Text, nullable=True)
+    # Creation-time lifecycle ownership for deferred initialization.  True
+    # means an external observer (rather than CAO itself) owns final failure
+    # settlement, so runtime/lifecycle cleanup may dismantle provider resources
+    # but must retain this registry row until that observer acknowledges it.
+    deferred_init_external_owner = Column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
+    # True once provider/FIFO/worktree runtime state has been fully dismantled
+    # for a retained external-owner tombstone.  The row may remain for durable
+    # failure observation, but it no longer consumes a live runtime slot.
+    deferred_init_runtime_reclaimed = Column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
+    # Durable identity for one logical lifetime of a reusable session name.
+    # Retained deferred-init tombstones can outlive the backend session; when a
+    # later session reuses the same label this value lets read/lifecycle paths
+    # distinguish the old rows from failures that belong to the CURRENT live
+    # session. NULL is reserved for rows created before this column existed.
+    session_incarnation_id = Column(String, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
 
     # ORDERING CONTRACT: the two session-scoped reads -- ``list_terminals_by_session``
@@ -1786,6 +1823,30 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN working_directory TEXT")
             conn.commit()
             logger.info("Migration: added working_directory column to terminals table")
+        if "deferred_init_failure" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN deferred_init_failure TEXT")
+            conn.commit()
+            logger.info("Migration: added deferred_init_failure column to terminals table")
+        if "deferred_init_external_owner" not in columns:
+            conn.execute(
+                "ALTER TABLE terminals ADD COLUMN deferred_init_external_owner "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.commit()
+            logger.info("Migration: added deferred_init_external_owner column to terminals table")
+        if "deferred_init_runtime_reclaimed" not in columns:
+            conn.execute(
+                "ALTER TABLE terminals ADD COLUMN deferred_init_runtime_reclaimed "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.commit()
+            logger.info(
+                "Migration: added deferred_init_runtime_reclaimed column to terminals table"
+            )
+        if "session_incarnation_id" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN session_incarnation_id TEXT")
+            conn.commit()
+            logger.info("Migration: added session_incarnation_id column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -1805,8 +1866,11 @@ def create_terminal(
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     working_directory: Optional[str] = None,
+    deferred_init_external_owner: bool = False,
+    session_incarnation_id: Optional[str] = None,
     idempotency_key: Optional[str] = None,
     request_fingerprint: Optional[str] = None,
+    new_session_incarnation: bool = False,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
 
@@ -1830,6 +1894,18 @@ def create_terminal(
     import json as _json
 
     with SessionLocal() as db:
+        if new_session_incarnation:
+            if not session_incarnation_id:
+                raise ValueError("A new session incarnation requires an incarnation id")
+            incarnation = db.get(SessionIncarnationModel, tmux_session)
+            if incarnation is None:
+                db.add(
+                    SessionIncarnationModel(
+                        session_name=tmux_session, incarnation_id=session_incarnation_id
+                    )
+                )
+            else:
+                incarnation.incarnation_id = session_incarnation_id
         terminal = TerminalModel(
             id=terminal_id,
             tmux_session=tmux_session,
@@ -1847,6 +1923,8 @@ def create_terminal(
             provider_variant=provider_variant,
             group=_json.dumps(group) if group else None,
             metadata_json=_json.dumps(metadata) if metadata else None,
+            deferred_init_external_owner=bool(deferred_init_external_owner),
+            session_incarnation_id=session_incarnation_id,
         )
         db.add(terminal)
         if idempotency_key:
@@ -1884,6 +1962,9 @@ def create_terminal(
             # returns {"group": None}, an API-consistency gap.
             "group": group if group else None,
             "metadata": metadata if metadata else None,
+            "deferred_init_external_owner": bool(deferred_init_external_owner),
+            "deferred_init_runtime_reclaimed": False,
+            "session_incarnation_id": session_incarnation_id,
         }
 
 
@@ -1969,6 +2050,10 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
         allowed_tools = _json.loads(terminal.allowed_tools) if terminal.allowed_tools else None
         group = _json.loads(terminal.group) if terminal.group else None
         metadata = _json.loads(terminal.metadata_json) if terminal.metadata_json else None
+        raw_deferred_failure = getattr(terminal, "deferred_init_failure_json", None)
+        deferred_init_failure = (
+            _json.loads(raw_deferred_failure) if isinstance(raw_deferred_failure, str) else None
+        )
         return {
             "id": terminal.id,
             "tmux_session": terminal.tmux_session,
@@ -1983,6 +2068,14 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "provider_variant": terminal.provider_variant,
             "group": group,
             "metadata": metadata,
+            "deferred_init_failure": deferred_init_failure,
+            "deferred_init_external_owner": bool(
+                getattr(terminal, "deferred_init_external_owner", False)
+            ),
+            "deferred_init_runtime_reclaimed": bool(
+                getattr(terminal, "deferred_init_runtime_reclaimed", False)
+            ),
+            "session_incarnation_id": getattr(terminal, "session_incarnation_id", None),
             "last_active": terminal.last_active,
         }
 
@@ -2011,6 +2104,134 @@ def update_terminal_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]
         terminal.metadata_json = _json.dumps(metadata) if metadata else None
         db.commit()
         return True
+
+
+def update_terminal_deferred_init_failure(
+    terminal_id: str, failure: Optional[Dict[str, Any]]
+) -> bool:
+    """Replace CAO-owned deferred-init failure state for one terminal."""
+
+    import json as _json
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return False
+        terminal.deferred_init_failure_json = _json.dumps(failure) if failure else None
+        db.commit()
+        return True
+
+
+def update_terminal_deferred_init_external_owner(terminal_id: str, owned: bool) -> bool:
+    """Update server-owned deferred-init lifecycle ownership for one terminal."""
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return False
+        terminal.deferred_init_external_owner = bool(owned)
+        db.commit()
+        return True
+
+
+def update_terminal_deferred_init_runtime_reclaimed(terminal_id: str, reclaimed: bool) -> bool:
+    """Persist whether a retained deferred-init row still owns live runtime resources."""
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return False
+        terminal.deferred_init_runtime_reclaimed = bool(reclaimed)
+        db.commit()
+        return True
+
+
+def get_session_incarnation(session_name: str) -> Optional[str]:
+    """Read the durable current pointer, including for an already-deleted session."""
+
+    if not session_name:
+        return None
+    with SessionLocal() as db:
+        incarnation = db.get(SessionIncarnationModel, session_name)
+        return str(incarnation.incarnation_id) if incarnation is not None else None
+
+
+def get_session_incarnations(session_names: List[str]) -> Dict[str, str]:
+    """Read current pointers in one query for a fleet listing."""
+
+    names = [name for name in session_names if name]
+    if not names:
+        return {}
+    with SessionLocal() as db:
+        return {
+            str(row.session_name): str(row.incarnation_id)
+            for row in db.query(SessionIncarnationModel)
+            .filter(SessionIncarnationModel.session_name.in_(names))
+            .all()
+        }
+
+
+def update_terminals_session_incarnation(
+    terminal_ids: List[str], incarnation_id: str, *, session_name: Optional[str] = None
+) -> bool:
+    """Atomically assign one session incarnation to the specified terminal rows.
+
+    Used while the per-session lifecycle lock is held. All requested rows must
+    exist and have no conflicting identity. When session_name is supplied, its
+    durable pointer is committed atomically with the backfill. A conflicting
+    pointer or a row belonging to another session rejects the whole assignment.
+    """
+
+    unique_ids = list(dict.fromkeys(str(terminal_id) for terminal_id in terminal_ids))
+    if not unique_ids and session_name is None:
+        return True
+    with SessionLocal() as db:
+        terminals = db.query(TerminalModel).filter(TerminalModel.id.in_(unique_ids)).all()
+        if len(terminals) != len(unique_ids) or any(
+            (terminal.session_incarnation_id not in (None, incarnation_id))
+            or (session_name is not None and terminal.tmux_session != session_name)
+            for terminal in terminals
+        ):
+            db.rollback()
+            return False
+        if session_name is not None:
+            current = db.get(SessionIncarnationModel, session_name)
+            if current is not None and current.incarnation_id != incarnation_id:
+                db.rollback()
+                return False
+            if current is None:
+                db.add(
+                    SessionIncarnationModel(
+                        session_name=session_name, incarnation_id=incarnation_id
+                    )
+                )
+        for terminal in terminals:
+            terminal.session_incarnation_id = str(incarnation_id)
+        db.commit()
+        return True
+
+
+def list_pending_deferred_init_external_owner_terminal_ids() -> List[str]:
+    """External-owner deferred inits whose background task cannot resume after restart."""
+
+    with SessionLocal() as db:
+        rows = (
+            db.query(TerminalModel.id)
+            .filter(TerminalModel.deferred_init_external_owner.is_(True))
+            .all()
+        )
+        return [str(row[0]) for row in rows]
+
+
+def count_runtime_allocated_terminals() -> int:
+    """Count terminal rows that still represent live/allocated provider runtime."""
+
+    with SessionLocal() as db:
+        return int(
+            db.query(TerminalModel)
+            .filter(TerminalModel.deferred_init_runtime_reclaimed.is_(False))
+            .count()
+        )
 
 
 def get_terminal_group(terminal_id: str) -> Optional[List[str]]:
@@ -2194,6 +2415,15 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "agent_profile": t.agent_profile,
                 "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
+                "deferred_init_failure": (
+                    _json.loads(t.deferred_init_failure_json)
+                    if isinstance(t.deferred_init_failure_json, str)
+                    and t.deferred_init_failure_json
+                    else None
+                ),
+                "deferred_init_external_owner": bool(t.deferred_init_external_owner),
+                "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
+                "session_incarnation_id": t.session_incarnation_id,
                 "last_active": t.last_active,
             }
             for t in terminals
@@ -2286,6 +2516,15 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
                 "agent_profile": t.agent_profile,
                 "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
+                "deferred_init_failure": (
+                    _json.loads(t.deferred_init_failure_json)
+                    if isinstance(t.deferred_init_failure_json, str)
+                    and t.deferred_init_failure_json
+                    else None
+                ),
+                "deferred_init_external_owner": bool(t.deferred_init_external_owner),
+                "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
+                "session_incarnation_id": t.session_incarnation_id,
                 "last_active": t.last_active,
             }
             for t in terminals
@@ -2305,6 +2544,15 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "agent_profile": t.agent_profile,
                 "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
+                "deferred_init_failure": (
+                    _json.loads(t.deferred_init_failure_json)
+                    if isinstance(t.deferred_init_failure_json, str)
+                    and t.deferred_init_failure_json
+                    else None
+                ),
+                "deferred_init_external_owner": bool(t.deferred_init_external_owner),
+                "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
+                "session_incarnation_id": t.session_incarnation_id,
                 "last_active": t.last_active,
             }
             for t in terminals

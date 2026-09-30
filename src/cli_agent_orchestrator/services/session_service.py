@@ -23,14 +23,18 @@ lock in ``services/session_lock.py`` — see ``delete_session`` for why.
 """
 
 import logging
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from cli_agent_orchestrator.backends.base import TerminalBackend
+from cli_agent_orchestrator.backends.base import TerminalBackend, TerminalCleanupOutcome
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     delete_terminals_by_ids,
+    get_session_incarnation,
+    get_session_incarnations,
     list_terminals_by_session,
     list_terminals_in_sessions,
+    update_terminals_session_incarnation,
 )
 from cli_agent_orchestrator.constants import SESSION_PREFIX
 from cli_agent_orchestrator.models.inbox import OrchestrationType
@@ -45,7 +49,11 @@ from cli_agent_orchestrator.plugins import (
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_env import clear_session_env
 from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
-from cli_agent_orchestrator.services.terminal_service import create_terminal
+from cli_agent_orchestrator.services.terminal_service import (
+    TerminalRecordCorruptError,
+    create_terminal,
+    get_deferred_init_failure,
+)
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 
 logger = logging.getLogger(__name__)
@@ -140,7 +148,7 @@ async def create_session(
 
 
 def _terminals_grouped_by_session(session_names: List[str]) -> Dict[str, List[Dict[str, Any]]]:
-    """Group the given sessions' terminals by tmux session name in ONE query.
+    """Group terminals and load incarnation pointers with two bounded queries.
 
     ``list_sessions`` used to reach ``list_terminals_by_session`` once per tmux
     session from inside ``_enrich_session_ownership`` (issue #629): a query per
@@ -161,6 +169,7 @@ def _terminals_grouped_by_session(session_names: List[str]) -> Dict[str, List[Di
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     try:
         terminals = list_terminals_in_sessions(session_names)
+        current_incarnations = get_session_incarnations(session_names)
     except Exception:
         # Swallowed on purpose: a metadata read failure must degrade the
         # ownership fields to None rather than blank the whole session list,
@@ -173,6 +182,20 @@ def _terminals_grouped_by_session(session_names: List[str]) -> Dict[str, List[Di
     # populated by construction — no falsy-key guard needed here.
     for terminal in terminals:
         grouped.setdefault(terminal["tmux_session"], []).append(terminal)
+
+    # A retained deferred-init tombstone deliberately keeps its historical
+    # tmux_session label after the provider runtime is gone. If a replacement
+    # live session later reuses that label, the old failure row must not become
+    # the replacement's conductor/ownership source. Use the same incarnation
+    # selection as terminal listings, including when every current row failed.
+    for session_name, rows in list(grouped.items()):
+        selected, _ = _select_current_incarnation_rows(
+            rows,
+            _collect_deferred_failures(rows),
+            current_incarnations.get(session_name),
+            session_name=session_name,
+        )
+        grouped[session_name] = selected
     return grouped
 
 
@@ -265,6 +288,165 @@ def list_sessions() -> List[Dict]:
         return []
 
 
+def _select_current_incarnation_rows(
+    terminals: List[Dict[str, Any]],
+    failures: Dict[str, Dict[str, Any]],
+    current_incarnation: Optional[str] = None,
+    *,
+    session_name: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    """Select rows belonging to the current live session incarnation.
+
+    Prefer the durable pointer, which survives failure and terminal deletion.
+    Without a pointer, active rows can identify one unambiguous incarnation.
+    Failed-only legacy sessions require exact backend terminal identity proof;
+    historical failures are never claimed just because no healthy row remains.
+    Conflicting active identities fail closed. Untagged failures are included
+    only when their exact terminal identity is still present in this session.
+    """
+
+    if current_incarnation is not None:
+        selected = [
+            terminal
+            for terminal in terminals
+            if terminal.get("session_incarnation_id") == current_incarnation
+        ]
+        selected_ids = {str(terminal["id"]) for terminal in selected}
+        return selected, {key: value for key, value in failures.items() if key in selected_ids}
+
+    active_rows = [
+        terminal
+        for terminal in terminals
+        if str(terminal["id"]) not in failures
+        and not terminal.get("deferred_init_runtime_reclaimed")
+    ]
+    if not active_rows:
+        if not session_name:
+            return [], {}
+        verified_ids = set()
+        for terminal in terminals:
+            if terminal.get("deferred_init_runtime_reclaimed"):
+                continue
+            exact = get_backend().cleanup_terminal_exact(
+                str(terminal["id"]), session_name, terminal.get("tmux_window"), close=False
+            )
+            if exact.outcome == TerminalCleanupOutcome.UNKNOWN:
+                raise TerminalRecordCorruptError(
+                    f"Could not verify session incarnation for {session_name!r}"
+                )
+            if exact.outcome == TerminalCleanupOutcome.STILL_PRESENT:
+                verified_ids.add(str(terminal["id"]))
+        verified_incarnations = {
+            terminal["session_incarnation_id"]
+            for terminal in terminals
+            if str(terminal["id"]) in verified_ids and terminal.get("session_incarnation_id")
+        }
+        if len(verified_incarnations) > 1:
+            raise TerminalRecordCorruptError(
+                f"Session {session_name!r} has conflicting verified incarnation ids"
+            )
+        verified_incarnation = next(iter(verified_incarnations), None)
+        selected = [
+            terminal
+            for terminal in terminals
+            if str(terminal["id"]) in verified_ids
+            or (
+                verified_incarnation is not None
+                and terminal.get("session_incarnation_id") == verified_incarnation
+            )
+        ]
+        selected_ids = {str(terminal["id"]) for terminal in selected}
+        return selected, {key: value for key, value in failures.items() if key in selected_ids}
+
+    active_incarnations = {
+        str(terminal["session_incarnation_id"])
+        for terminal in active_rows
+        if terminal.get("session_incarnation_id")
+    }
+    if len(active_incarnations) > 1:
+        raise TerminalRecordCorruptError(
+            f"Live session rows carry conflicting incarnation ids: {sorted(active_incarnations)}"
+        )
+
+    current_incarnation = next(iter(active_incarnations), None)
+    selected: List[Dict[str, Any]] = []
+    selected_failures: Dict[str, Dict[str, Any]] = {}
+    for terminal in terminals:
+        terminal_id = str(terminal["id"])
+        if terminal_id not in failures and not terminal.get("deferred_init_runtime_reclaimed"):
+            selected.append(terminal)
+            continue
+        if (
+            terminal_id in failures
+            and current_incarnation is not None
+            and terminal.get("session_incarnation_id") == current_incarnation
+        ):
+            selected.append(terminal)
+            selected_failures[terminal_id] = failures[terminal_id]
+        elif (
+            terminal_id in failures
+            and not terminal.get("session_incarnation_id")
+            and not terminal.get("deferred_init_runtime_reclaimed")
+            and session_name
+        ):
+            exact = get_backend().cleanup_terminal_exact(
+                terminal_id, session_name, terminal.get("tmux_window"), close=False
+            )
+            if exact.outcome == TerminalCleanupOutcome.UNKNOWN:
+                raise TerminalRecordCorruptError(
+                    f"Could not verify legacy failed sibling in {session_name!r}"
+                )
+            if exact.outcome == TerminalCleanupOutcome.STILL_PRESENT:
+                selected.append(terminal)
+                selected_failures[terminal_id] = failures[terminal_id]
+    return selected, selected_failures
+
+
+def _collect_deferred_failures(
+    terminals: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """Load durable deferred-init failures for the supplied registry rows."""
+
+    failures: Dict[str, Dict[str, Any]] = {}
+    for terminal in terminals:
+        failure = get_deferred_init_failure(
+            str(terminal["id"]), terminal.get("deferred_init_failure")
+        )
+        if failure is not None:
+            failures[str(terminal["id"])] = failure
+    return failures
+
+
+def list_current_session_terminals(
+    session_name: str,
+    *,
+    backend_exists: bool | None = None,
+) -> List[Dict[str, Any]]:
+    """Return terminal rows belonging to the current live incarnation.
+
+    The database session-name read is intentionally a raw persistence primitive:
+    reconciliation and recovery need retained rows from historical incarnations
+    sharing a reusable label. Live-state consumers must not treat those rows as
+    members of the replacement session.
+
+    When the backend session is absent there is no current live incarnation to
+    select, so preserve the historical/raw behavior and return every durable row.
+    Callers that already established liveness can pass backend_exists to avoid a
+    duplicate backend probe.
+    """
+
+    terminals = list_terminals_by_session(session_name)
+    if backend_exists is None:
+        backend_exists = get_backend().session_exists_strict(session_name)
+    if not backend_exists:
+        return terminals
+    failures = _collect_deferred_failures(terminals)
+    terminals, _ = _select_current_incarnation_rows(
+        terminals, failures, get_session_incarnation(session_name), session_name=session_name
+    )
+    return terminals
+
+
 def get_session(session_name: str) -> Dict:
     """Get session with terminals, oldest first.
 
@@ -277,16 +459,37 @@ def get_session(session_name: str) -> Dict:
     supervisor that will read the first entry as the conductor.
     """
     try:
-        if not get_backend().session_exists(session_name):
-            raise ValueError(f"Session '{session_name}' not found")
-
-        tmux_sessions = get_backend().list_sessions()
-        session_data = next((s for s in tmux_sessions if s["id"] == session_name), None)
-
-        if not session_data:
-            raise ValueError(f"Session '{session_name}' not found")
-
         terminals = list_terminals_by_session(session_name)
+        backend_exists = get_backend().session_exists(session_name)
+        session_data = None
+        if backend_exists:
+            tmux_sessions = get_backend().list_sessions()
+            session_data = next((s for s in tmux_sessions if s["id"] == session_name), None)
+
+        # A deferred-init failure tombstone deliberately outlives its provider
+        # session so an external lifecycle owner can observe the real failure
+        # before reclaiming it. Preserve the old not-found contract for ordinary
+        # missing sessions, but synthesize a terminated session shell when the DB
+        # still carries authoritative failure truth (including sidecar fallback).
+        failures = _collect_deferred_failures(terminals)
+
+        if backend_exists:
+            terminals, failures = _select_current_incarnation_rows(
+                terminals,
+                failures,
+                get_session_incarnation(session_name),
+                session_name=session_name,
+            )
+
+        if session_data is None:
+            if not failures:
+                raise ValueError(f"Session '{session_name}' not found")
+            session_data = {
+                "id": session_name,
+                "name": session_name,
+                "status": "terminated",
+            }
+
         # Enrich each terminal with its live status. list_terminals_by_session
         # reads only the DB row (no status column), but callers monitoring an
         # orchestration — the web UI, and the cao-ops-mcp get_session_info tool
@@ -297,7 +500,14 @@ def get_session(session_name: str) -> Dict:
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         for terminal in terminals:
-            terminal["status"] = status_monitor.get_status(terminal["id"]).value
+            failure = failures.get(str(terminal["id"]))
+            if failure is not None:
+                terminal["deferred_init_failure"] = failure
+                terminal["status"] = "error"
+            elif not backend_exists:
+                terminal["status"] = "unknown"
+            else:
+                terminal["status"] = status_monitor.get_status(terminal["id"]).value
         return {"session": session_data, "terminals": terminals}
 
     except Exception as e:
@@ -328,7 +538,8 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
     stayed torn down, so the "restored" terminal was a zombie, a row that looked
     live with no pipeline behind it. Ordering:
 
-    1. Enumerate the incarnation's rows under the lock. Because the lock also
+    1. Resolve the incarnation's rows under the lock and atomically bind legacy
+       membership before the backend disappears. Because the lock also
        covers creation, this list cannot grow behind us — a concurrent create is
        either fully included or has not started.
     2. Snapshot each terminal's scrollback/metadata
@@ -370,8 +581,8 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
     the session — so this is a partially-complete teardown, which is exactly what
     the caller is told.
 
-    If tmux cannot be confirmed dead we raise having changed nothing but two
-    snapshot files: the surviving session keeps its rows, its FIFO readers, its
+    If tmux cannot be confirmed dead we raise having changed only incarnation
+    backfill and snapshot files: the surviving session keeps its rows, its FIFO readers, its
     status-monitor state and its providers, so it is still a fully working
     session rather than a half-dismantled one, and a re-run reconciles it.
 
@@ -421,6 +632,42 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
         # included (context manager).
         with session_lifecycle_lock(session_name):
             terminals = list_terminals_by_session(session_name)
+            # A session NAME is only a reusable backend label.  Retained
+            # deferred-init failures from an older incarnation can legitimately
+            # share it with the current live replacement.  Build the teardown
+            # worklist from the durable incarnation identity before capturing or
+            # dismantling anything so deleting the replacement cannot erase the
+            # older external owner's failure evidence.  A failed sibling from
+            # the CURRENT incarnation stays in the worklist.
+            failures = _collect_deferred_failures(terminals)
+            current_incarnation = get_session_incarnation(session_name)
+            terminals, _ = _select_current_incarnation_rows(
+                terminals,
+                failures,
+                current_incarnation,
+                session_name=session_name,
+            )
+            # Bind legacy membership before killing the backend: an exact
+            # proof cannot be repeated afterwards, and deferred cleanup must
+            # retain the same worklist across teardown retries.
+            if terminals and current_incarnation is None:
+                known_ids = {
+                    terminal["session_incarnation_id"]
+                    for terminal in terminals
+                    if terminal.get("session_incarnation_id")
+                }
+                incarnation = next(iter(known_ids)) if known_ids else uuid.uuid4().hex
+                legacy_ids = [
+                    str(terminal["id"])
+                    for terminal in terminals
+                    if not terminal.get("session_incarnation_id")
+                ]
+                if not update_terminals_session_incarnation(
+                    legacy_ids, incarnation, session_name=session_name
+                ):
+                    raise TerminalRecordCorruptError(
+                        f"Could not bind teardown incarnation for {session_name!r}"
+                    )
             incarnation_ids = [t["id"] for t in terminals]
 
             # Step 2: read-only scrollback/metadata capture, which has to happen

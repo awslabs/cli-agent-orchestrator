@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 import uuid
-from typing import Callable, Dict, FrozenSet, List, Optional, Tuple, TypeVar
+from typing import Callable, Dict, FrozenSet, List, Optional, Tuple, TypeVar, Union
 
 import libtmux
 from libtmux.constants import PaneDirection
@@ -17,6 +17,10 @@ from libtmux.pane import Pane
 from libtmux.session import Session
 from libtmux.window import Window
 
+from cli_agent_orchestrator.backends.base import (
+    TerminalCleanupOutcome,
+    TerminalCleanupResult,
+)
 from cli_agent_orchestrator.constants import (
     BRACKETED_PASTE_INCOMPATIBLE_SHELLS,
     SESSION_PREFIX,
@@ -39,6 +43,16 @@ logger = logging.getLogger(__name__)
 # reach the tmux socket can set the mark or claim the name, and agents are not
 # isolated from each other here. Treat it as a label, not a credential.
 TERMINAL_MARK_OPTION = "@cao_terminal"
+
+# The terminal's CAO terminal id, written at creation to the tmux object that
+# owns the terminal: a pane-scoped option for a terminal sharing a host window,
+# a window-scoped option for a terminal that IS its window. This is what makes
+# teardown identity-first. TERMINAL_MARK_OPTION above carries the terminal NAME,
+# which is reusable; this carries the id, which is not, so "the pane at the name
+# I remember" and "the pane this terminal owns" stop being the same question.
+# Same provenance caveat as the mark: an object that can reach the socket can
+# set it, so it is a scope identifier, not a credential.
+TERMINAL_ID_OPTION = "@cao_terminal_id"
 
 # How a pane-mode window is re-arranged after each spawn, and the split that
 # feeds it. The split direction is not separately configurable because
@@ -1103,12 +1117,21 @@ class TmuxClient:
                 f"Created tmux session: {session_name} with window: {window_name} in directory: {working_directory}"
             )
             try:
-                window_name_result = self._read_listing(
+                first_window = self._read_listing(
                     f"list-windows for new session '{session_name}'",
-                    lambda: session.windows[0].name,
+                    lambda: session.windows[0],
                 )
+                window_name_result = first_window.name
                 if window_name_result is None:
                     raise ValueError(f"Window name is None for session {session_name}")
+                # Stamp the owning terminal id on the window that owns this
+                # terminal. This is what exact-identity teardown matches on: the
+                # window NAME is reusable (a later terminal may take it), the id
+                # is not. Like the pane mark in create_pane(), identity is part
+                # of the creation contract, so a failure here takes the same
+                # rollback path as an unreadable window -- an unidentifiable
+                # terminal is one teardown can never safely prove ownership of.
+                first_window.set_option(TERMINAL_ID_OPTION, terminal_id)
             except TmuxLookupError:
                 # Same half-state, one step later: the session is up but we
                 # cannot confirm its window. Use the parse-free CLI here too —
@@ -1164,6 +1187,9 @@ class TmuxClient:
                 kwargs["window_shell"] = window_shell
 
             window = session.new_window(**kwargs)
+            # See create_session(): the window carries its terminal id so
+            # teardown can prove ownership instead of trusting a reusable name.
+            window.set_option(TERMINAL_ID_OPTION, terminal_id)
 
             # See the matching comment in create_session(): the provider CLI
             # can rename its own window directly via `tmux rename-window`,
@@ -1353,6 +1379,9 @@ class TmuxClient:
                     # still gets captions for the panes it does hold.
                     self._caption_panes(host_window, host_window_name)
             pane.set_option(TERMINAL_MARK_OPTION, terminal_name)
+            # The mark above carries the terminal NAME, which siblings and later
+            # terminals reuse. The id below is the identity teardown matches on.
+            pane.set_option(TERMINAL_ID_OPTION, terminal_id)
 
             logger.info(
                 f"Created pane '{terminal_name}' in window "
@@ -1916,6 +1945,218 @@ class TmuxClient:
         except Exception as e:
             logger.error(f"Failed to kill window {session_name}:{window_name}: {e}")
             return False
+
+    # ── Exact-identity teardown ──────────────────────────────────────────
+    #
+    # `kill_window` above addresses its target by session/window NAME. Those
+    # names are reused: a retained deferred-init tombstone routinely shares its
+    # window name with a later, unrelated replacement, and killing "the window
+    # called X" would destroy that replacement. The methods below match on the
+    # terminal id stamped at creation instead, so teardown can answer "is THIS
+    # terminal still there?" rather than "is something called that there?".
+
+    @staticmethod
+    def _read_scoped_option(target: Union[Window, Pane], scope: str) -> Optional[str]:
+        """Read this target's own ``@cao_terminal_id`` (``-w``/``-p``), or None.
+
+        Read through ``show-options`` rather than the libtmux accessor, for the
+        same two reasons as ``_pane_mark``: that accessor RAISES for an object
+        carrying no value, and it hands back CONVERTED values, so a terminal id
+        that looks numeric (or like ``on``) stops matching itself. Without
+        ``-A`` we see only what this object sets itself, so its window's or the
+        session's value never answers for it.
+        """
+        prefix = f"{TERMINAL_ID_OPTION} "
+        result = target.cmd("show-options", scope)
+        if result.returncode != 0 or result.stderr:
+            raise TmuxLookupError("Could not read exact terminal identity from tmux options")
+        for line in result.stdout or []:
+            if line.startswith(prefix):
+                return str(line[len(prefix) :])
+        return None
+
+    def _sessions_for_identity_scan(self, session_name: Optional[str]) -> Optional[List[Session]]:
+        """Sessions to search for a terminal id, or None when the hint is absent.
+
+        ``None`` is the only "positively gone" answer here: it means the hinted
+        session does not exist, so no pane inside it can carry the id.
+
+        Raises:
+            TmuxLookupError: The session listing could not be parsed.
+        """
+        if session_name:
+            session = self._find_session(session_name)
+            return None if session is None else [session]
+        return self._read_listing("list-sessions", lambda: list(self.server.sessions))
+
+    def _scan_terminal_identity(
+        self,
+        sessions: List[Session],
+        terminal_id: str,
+        hint_window_name: Optional[str],
+    ) -> Tuple[List[Tuple[str, Union[Window, Pane]]], bool]:
+        """Find every tmux object in ``sessions`` carrying ``terminal_id``.
+
+        Returns ``(matches, ambiguous)`` where ``matches`` are ``(kind, object)``
+        pairs whose own ``@cao_terminal_id`` equals ``terminal_id``. More than
+        one match means the id is ambiguous and must not be acted on.
+
+        ``ambiguous`` is True when an object sits at the caller's
+        ``hint_window_name`` while carrying NO terminal id at all — either a
+        terminal created before the id was stamped, or a foreign object this
+        backend cannot attribute. Absence is only provable when neither case
+        holds, which is what keeps a pre-identity terminal from being reported
+        as gone and torn down as if it were.
+
+        Raises:
+            TmuxLookupError: A listing needed for the scan could not be parsed.
+        """
+        matches: List[Tuple[str, Union[Window, Pane]]] = []
+        ambiguous = False
+        for session in sessions:
+            windows = self._read_listing(
+                "list-windows for an identity scan",
+                lambda: list(session.windows),
+            )
+            for window in windows:
+                window_id = self._read_scoped_option(window, "-w")
+                if window_id == terminal_id:
+                    matches.append(("window", window))
+                elif window_id is None and hint_window_name and window.name == hint_window_name:
+                    ambiguous = True
+                panes = self._read_listing(
+                    "list-panes for an identity scan",
+                    lambda: list(window.panes),
+                )
+                for pane in panes:
+                    pane_id = self._read_scoped_option(pane, "-p")
+                    if pane_id == terminal_id:
+                        matches.append(("pane", pane))
+                    elif (
+                        pane_id is None
+                        and hint_window_name
+                        and self._pane_mark(pane) == hint_window_name
+                    ):
+                        ambiguous = True
+        return matches, ambiguous
+
+    def cleanup_terminal_exact(
+        self,
+        terminal_id: str,
+        session_name: Optional[str] = None,
+        window_name: Optional[str] = None,
+        *,
+        close: bool = True,
+    ) -> TerminalCleanupResult:
+        """Close the exact tmux object owned by ``terminal_id`` and confirm it.
+
+        Identity comes from the ``@cao_terminal_id`` option stamped at creation,
+        never from the reusable session/window name, so a replacement that took
+        over the old terminal's name is never touched. ``session_name`` and
+        ``window_name`` only narrow the search and detect the pre-identity case.
+
+        ``ABSENT`` needs positive proof: either the hinted session is gone, or a
+        readable scan found no object carrying the id AND found nothing
+        unattributed sitting at the hint. ``UNKNOWN`` covers an unreadable
+        listing, an id that resolves to more than one live object, and a close
+        that could not be confirmed. ``DELETED`` is returned only after the
+        post-close scan confirms the id is gone.
+        """
+        if not terminal_id:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                "no terminal id to prove identity with",
+            )
+
+        try:
+            sessions = self._sessions_for_identity_scan(session_name)
+        except TmuxLookupError as e:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                f"could not list tmux sessions: {e}",
+            )
+        except Exception as e:  # noqa: BLE001 — an unreadable scan is not absence
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                f"could not list tmux sessions: {e}",
+            )
+
+        if sessions is None:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.ABSENT,
+                f"session '{session_name}' is gone; no pane in it can carry {terminal_id}",
+            )
+
+        try:
+            matches, ambiguous = self._scan_terminal_identity(sessions, terminal_id, window_name)
+        except TmuxLookupError as e:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                f"could not read tmux identity for {terminal_id}: {e}",
+            )
+        except Exception as e:  # noqa: BLE001 — an unreadable scan is not absence
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                f"could not read tmux identity for {terminal_id}: {e}",
+            )
+
+        if len(matches) > 1:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                f"{len(matches)} tmux objects carry terminal id {terminal_id}; "
+                "refusing to close an ambiguous identity",
+            )
+        if matches:
+            kind, target = matches[0]
+            if not close:
+                return TerminalCleanupResult(
+                    TerminalCleanupOutcome.STILL_PRESENT,
+                    f"{kind} carrying {terminal_id} is present; close not requested",
+                )
+            try:
+                self._read_listing(f"kill-{kind} for terminal {terminal_id}", target.kill)
+            except TmuxLookupError as e:
+                return TerminalCleanupResult(
+                    TerminalCleanupOutcome.UNKNOWN,
+                    f"could not close the {kind} carrying {terminal_id}: {e}",
+                )
+            except Exception as e:  # noqa: BLE001 — a close that raised has not happened
+                return TerminalCleanupResult(
+                    TerminalCleanupOutcome.STILL_PRESENT,
+                    f"closing the {kind} carrying {terminal_id} failed: {e}",
+                )
+            try:
+                after = self._sessions_for_identity_scan(session_name)
+                remaining: List[Tuple[str, Union[Window, Pane]]] = []
+                if after is not None:
+                    remaining, _ = self._scan_terminal_identity(after, terminal_id, None)
+            except Exception as e:  # noqa: BLE001 — closed, but unconfirmed is not DELETED
+                return TerminalCleanupResult(
+                    TerminalCleanupOutcome.UNKNOWN,
+                    f"closed the {kind} carrying {terminal_id} but could not confirm "
+                    f"it is gone: {e}",
+                )
+            if remaining:
+                return TerminalCleanupResult(
+                    TerminalCleanupOutcome.STILL_PRESENT,
+                    f"{kind} carrying {terminal_id} is still present after the close",
+                )
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.DELETED,
+                f"closed the exact {kind} carrying {terminal_id}",
+            )
+
+        if ambiguous:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                f"no tmux object carries terminal id {terminal_id}, but "
+                f"'{window_name}' is occupied by an object with no terminal id; "
+                "cannot prove absence",
+            )
+        return TerminalCleanupResult(
+            TerminalCleanupOutcome.ABSENT,
+            f"no tmux object carries terminal id {terminal_id}",
+        )
 
     def session_exists(self, session_name: str) -> bool:
         """Check if session exists.

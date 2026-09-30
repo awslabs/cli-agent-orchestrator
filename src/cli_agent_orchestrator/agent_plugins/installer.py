@@ -332,8 +332,10 @@ def _snapshot_live_terminals() -> List[_LiveTerminal]:
     """
     snapshot: List[_LiveTerminal] = []
     try:
-        from cli_agent_orchestrator.clients.database import list_terminals_by_session
-        from cli_agent_orchestrator.services.session_service import list_sessions
+        from cli_agent_orchestrator.services.session_service import (
+            list_current_session_terminals,
+            list_sessions,
+        )
         from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
         # One profile load per distinct profile name, not per terminal: several
@@ -342,7 +344,7 @@ def _snapshot_live_terminals() -> List[_LiveTerminal]:
 
         for session in list_sessions():
             session_name = str(session.get("id", ""))
-            for terminal in list_terminals_by_session(session_name):
+            for terminal in list_current_session_terminals(session_name, backend_exists=True):
                 profile_name = terminal.get("agent_profile")
                 if not profile_name:
                     continue
@@ -407,7 +409,7 @@ def affected_sessions_by_plugin(
 
     ``GET /plugins`` needs this for each installed plugin at once. Calling
     :func:`affected_sessions` in a loop re-walked ``list_sessions()`` ×
-    ``list_terminals_by_session()`` × ``load_agent_profile()`` per plugin — work
+    the current-incarnation terminal view × ``load_agent_profile()`` per plugin — work
     that is identical every iteration, on an endpoint a UI panel polls. The
     adoption audit flagged it (finding R2) alongside the missing scope gate,
     because the two together made an unauthenticated quadratic endpoint.

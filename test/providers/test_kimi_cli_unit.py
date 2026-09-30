@@ -30,6 +30,7 @@ from cli_agent_orchestrator.providers.kimi_cli import (
     KimiDialect,
     KimiProbeResult,
     ProviderError,
+    _has_terminal_error,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -54,6 +55,25 @@ def _launch_line(sent_command: str) -> str:
     assert argv[0] == "/bin/sh", sent_command
     assert len(argv) == 2, sent_command
     return Path(argv[1]).read_text(encoding="utf-8")
+
+
+def _observe_turn_execution(provider: KimiCliProvider) -> None:
+    """Drive ``provider`` to "current turn has execution evidence".
+
+    A dispatched turn is only COMPLETED once live activity was observed; the
+    tests below call this instead of fabricating a response marker, mirroring
+    what StatusMonitor's ``observe_execution_output`` does at runtime.
+    """
+
+    provider.mark_input_received()
+    provider.observe_execution_output(
+        "⠙ Thinking… 1s · 4 tokens\n",
+        provider._status_buffer_epoch,
+        truncated=False,
+    )
+    # Expire the dispatch grace so the raw path reaches the ready verdict.
+    provider._last_dispatch_time = 0.0
+    assert provider._execution_observed is True
 
 
 def _legacy_probe_result(binary: str = "/usr/local/bin/kimi") -> KimiProbeResult:
@@ -1197,10 +1217,48 @@ class TestKimiCliProviderPatterns:
         """Test error pattern detection."""
         assert re.search(ERROR_PATTERN, "Error: connection failed", re.MULTILINE)
         assert re.search(ERROR_PATTERN, "ERROR: something went wrong", re.MULTILINE)
+        assert not re.search(
+            ERROR_PATTERN,
+            "   Error: Failed to start a session: Model bad-model is not configured.",
+            re.MULTILINE,
+        )
+        indented = "   Error: Failed to start a session: Model bad-model is not configured."
+        assert _has_terminal_error(indented)
+        quoted = "● The command failed with this message:\n" + indented
+        # The indented startup shape can only be genuine before the current
+        # turn has execution evidence. Once the turn provably ran, the same
+        # text can only be assistant/tool prose — the discriminator is
+        # execution evidence, never a response marker in the frame at hand.
+        assert _has_terminal_error(quoted)
+        assert not _has_terminal_error(quoted, execution_established=True)
+        # Generic column-zero failures stay fatal even after execution evidence.
+        assert _has_terminal_error("● quoted\nError: connection failed", execution_established=True)
         assert re.search(ERROR_PATTERN, "ConnectionError: timeout", re.MULTILINE)
         assert re.search(ERROR_PATTERN, "APIError: rate limited", re.MULTILINE)
         assert re.search(ERROR_PATTERN, "Traceback (most recent call last):", re.MULTILINE)
         assert not re.search(ERROR_PATTERN, "No errors found", re.MULTILINE)
+
+    def test_error_message_returns_real_invalid_model_detail(self):
+        provider = KimiCliProvider("t-error-detail", "s", "w")
+        output = (
+            "\x1b[2K   \x1b[38;5;210mError: Failed to start a session: "
+            'Model "bad-model" is not configured in config.toml.\x1b[39m\n'
+        )
+
+        assert provider.get_error_message(output) == (
+            'Error: Failed to start a session: Model "bad-model" is not configured in config.toml.'
+        )
+
+    def test_error_message_does_not_promote_quoted_session_error_after_execution(self):
+        provider = KimiCliProvider("t-quoted-error", "s", "w")
+        provider._execution_observed = True
+
+        assert (
+            provider.get_error_message(
+                '   Error: Failed to start a session: Model "bad-model" is not configured.'
+            )
+            is None
+        )
 
     def test_status_bar_pattern(self):
         """Test status bar detection."""
@@ -1267,6 +1325,25 @@ class TestKimiCodeNewTuiStatus:
         # Sanity: the completed fixture really does contain stale braille frames.
         assert any("⠀" <= ch <= "⣿" for ch in buf)
         assert self._provider().get_status(buf) != TerminalStatus.PROCESSING
+
+    def test_new_tui_answer_quoting_session_start_error_is_completed(self):
+        """Assistant prose may quote the startup error without becoming ERROR.
+
+        The quoted row is only prose once the current turn has execution
+        evidence; the provider must not re-derive that from the frame's bullet.
+        """
+
+        buf = (
+            "● The command failed with this message:\n"
+            '   Error: Failed to start a session: Model "bad-model" is not configured.\n'
+            "── input ─────────────────────────────────────────────\n"
+            "Never Ask  cliproxy/deepseek-v4.1-flash thinking  /tmp/project\n"
+            "context: 1%\n"
+        )
+        provider = self._provider()
+        _observe_turn_execution(provider)
+
+        assert provider.get_status(buf) == TerminalStatus.COMPLETED
 
 
 class TestKimiCodeNewTuiExtraction:
@@ -1348,11 +1425,55 @@ class TestKimiCodeDispatchGrace:
 
         assert KimiCliProvider.supports_direct_status_probe is True
 
-    def test_grace_expires_to_completed_when_pane_clear(self):
+    def test_ready_repaint_after_dispatch_before_spinner_is_processing(self):
+        """Regression: the ready chrome repaint lands before the first spinner.
+
+        Even with the dispatch grace expired, a frame that has no current-turn
+        execution evidence stays PROCESSING — the status bar redraw must not
+        read as a stale COMPLETED.
+        """
         import time as _time
 
         provider = KimiCliProvider("test123", "test-session", "window-0")
         provider.mark_input_received()
+        provider._last_dispatch_time = _time.time() - 6.0
+        with patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as mock_backend:
+            mock_backend.return_value.get_history.return_value = self.NEW_TUI_READY_CHROME
+            assert provider.get_status(self.NEW_TUI_READY_CHROME) == TerminalStatus.PROCESSING
+
+    def test_stale_previous_answer_repaint_after_new_dispatch_is_processing(self):
+        """Regression: turn N-1's answer repainted into turn N's frame.
+
+        The identical bytes read COMPLETED for the settled turn; after a new
+        dispatch they must read PROCESSING until the new turn has its own
+        execution evidence, or a stale answer would hide the new turn.
+        """
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        _observe_turn_execution(provider)
+        assert provider.get_status(self.NEW_TUI_READY_CHROME) == TerminalStatus.COMPLETED
+
+        provider.mark_input_received()
+        assert provider._execution_observed is False
+        provider._last_dispatch_time = 0.0
+        assert provider.get_status(self.NEW_TUI_READY_CHROME) == TerminalStatus.PROCESSING
+
+    def test_byte_identical_repeated_answers_complete(self):
+        """Regression: a byte-identical second answer still completes.
+
+        Execution evidence is per-turn state (reset and re-observed), not a
+        marker-identity baseline, so two turns producing the exact same answer
+        both settle COMPLETED.
+        """
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        for _ in range(2):
+            _observe_turn_execution(provider)
+            assert provider.get_status(self.NEW_TUI_READY_CHROME) == TerminalStatus.COMPLETED
+
+    def test_completed_after_execution_evidence(self):
+        import time as _time
+
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        _observe_turn_execution(provider)
         provider._last_dispatch_time = _time.time() - 6.0
         with patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as mock_backend:
             # Rendered pane shows the same ready chrome — no live spinner.
@@ -1367,7 +1488,7 @@ class TestKimiCodeDispatchGrace:
         import time as _time
 
         provider = KimiCliProvider("test123", "test-session", "window-0")
-        provider.mark_input_received()
+        _observe_turn_execution(provider)
         provider._last_dispatch_time = _time.time() - 6.0
         pane = self.NEW_TUI_READY_CHROME.replace("── input ─", "⠹ Using handoff({...})\n── input ─")
         with patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as mock_backend:
@@ -1378,7 +1499,7 @@ class TestKimiCodeDispatchGrace:
         import time as _time
 
         provider = KimiCliProvider("test123", "test-session", "window-0")
-        provider.mark_input_received()
+        _observe_turn_execution(provider)
         provider._last_dispatch_time = _time.time() - 6.0
         with patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as mock_backend:
             mock_backend.return_value.get_history.side_effect = RuntimeError("pane gone")
@@ -1389,6 +1510,67 @@ class TestKimiCodeDispatchGrace:
         # bullet in buffer latches _has_received_input → COMPLETED, as before;
         # no dispatch yet → pane confirmation is skipped entirely.
         assert provider.get_status(self.NEW_TUI_READY_CHROME) == TerminalStatus.COMPLETED
+
+    def test_genuine_invalid_model_before_execution_is_error(self):
+        """Regression: a real session-creation failure has no execution evidence."""
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        provider.mark_input_received()
+        provider._last_dispatch_time = 0.0
+        buf = (
+            '   Error: Failed to start a session: Model "bad-model" is not configured.\n'
+            "── input ─────────────────────────────────────────────\n"
+            "Never Ask  bad-model thinking  /tmp/project\n"
+            "context: 0%\n"
+        )
+        assert provider.get_status(buf) == TerminalStatus.ERROR
+
+    def test_generic_fatal_error_after_execution_is_error(self):
+        """Regression: generic column-zero failures stay fatal after execution."""
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        _observe_turn_execution(provider)
+        buf = (
+            "● The tool crashed.\n"
+            "Traceback (most recent call last):\n"
+            "  File 'x.py', line 1\n"
+            "── input ─────────────────────────────────────────────\n"
+            "Never Ask  agent thinking  /tmp/project\n"
+            "context: 0%\n"
+        )
+        assert provider.get_status(buf) == TerminalStatus.ERROR
+
+    def test_quoted_session_error_after_answer_bullet_eviction_stays_completed(self):
+        """Regression: the answer bullet evicts, the quoted startup row stays.
+
+        Execution evidence is the per-turn latch, so a dropped bullet cannot
+        turn previously-owned answer prose into a session-start ERROR.
+        """
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        _observe_turn_execution(provider)
+        quote_only = (
+            '   Error: Failed to start a session: Model "bad-model" is not configured.\n'
+            "── input ─────────────────────────────────────────────\n"
+            "Never Ask  cliproxy/deepseek-v4.1-flash thinking  /tmp/project\n"
+            "context: 1%\n"
+        )
+        assert provider.get_status(quote_only) == TerminalStatus.COMPLETED
+
+    def test_cleanup_and_new_turn_reset_execution_state(self):
+        """Regression: cleanup and a new turn clear current-turn evidence."""
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        _observe_turn_execution(provider)
+        assert provider._execution_observed is True
+
+        provider.mark_input_received()
+        assert (provider._execution_observed, provider._awaiting_turn) == (False, True)
+
+        provider._execution_observed = True
+        provider._awaiting_turn = False
+        with (
+            patch.object(provider, "_remove_managed_scratch", return_value=True),
+            patch.object(provider, "_remove_managed_runtime_home", return_value=True),
+        ):
+            assert provider.cleanup() is True
+        assert (provider._execution_observed, provider._awaiting_turn) == (False, False)
 
 
 class TestKimiScreenDetection:

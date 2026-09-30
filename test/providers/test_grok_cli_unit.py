@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import psutil
 import pytest
+from wcwidth import wcswidth
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -66,6 +67,248 @@ def _completed_turn(query: str, response: str, *, raw: bool = False) -> str:
     )
 
 
+def _scrollable_completed_turn(query: str, response: str) -> str:
+    """Grok 1.0.41 fills the rightmost viewport column while scrolled."""
+
+    return "\n".join(
+        [
+            f"     ❯ {query}",
+            "",
+            f"     {response}     9:34 PM"
+            + " " * (219 - wcswidth(f"     {response}     9:34 PM"))
+            + "█",
+            " ".ljust(219) + "█",
+            "     Worked for 2.5s".ljust(219) + "█",
+            *[" ".ljust(219) + "█"] * 28,
+            "  ╭" + "─" * 214 + "╮",
+            "  │ ❯" + " " * 212 + "│",
+            "  Shift+Tab:mode  │  Ctrl+x:shortcuts",
+        ]
+    )
+
+
+@pytest.mark.parametrize("current_query", ["second query", "first query"])
+def test_scrollbar_capture_recovers_distinct_turn_and_rejects_predecessor(current_query):
+    provider = make_provider()
+    provider.mark_input_received()
+    first = _completed_turn("first query", "first answer")
+    assert provider.get_status(first) == TerminalStatus.COMPLETED
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+    assert (
+        provider.get_status(f"     ❯ {current_query}\nWaiting for response…\nEsc:cancel")
+        == TerminalStatus.PROCESSING
+    )
+    completed = _scrollable_completed_turn(current_query, "second answer")
+    expected = (
+        TerminalStatus.COMPLETED if current_query == "second query" else TerminalStatus.PROCESSING
+    )
+    assert provider.probe_stale_processing_capture(completed) == expected
+    assert provider.probe_stale_processing_capture(completed) == expected
+    assert provider.commit_stale_processing_capture(completed, expected) is True
+
+
+@pytest.mark.parametrize("response", ["grok-followup-42", "😀 中文 e\u0301"])
+def test_extract_scrollable_completion_removes_padding_scrollbar_and_timestamp(response):
+    completed = _scrollable_completed_turn("second query", response)
+    assert make_provider().extract_last_message_from_script(completed) == response
+
+
+def test_extract_preserves_response_block_without_scrollbar_evidence():
+    completed = _completed_turn("query", "     literal block █")
+    assert make_provider().extract_last_message_from_script(completed) == "literal block █"
+
+
+def test_extract_preserves_repeated_literal_blocks_away_from_right_edge():
+    completed = _completed_turn("query", "     █\n     █\n     █")
+    completed += "\n  ╭" + "─" * 214 + "╮"
+    assert make_provider().extract_last_message_from_script(completed) == "█\n█\n█"
+
+
+@pytest.mark.parametrize("pane_query", ["Calculate 9 times 7", "first query"])
+def test_cell_redrawn_dispatch_echo_binds_only_matching_current_completion(pane_query):
+    provider = make_provider()
+    provider.mark_input_received()
+    assert (
+        provider.get_status(_completed_turn("first query", "first answer"))
+        == TerminalStatus.COMPLETED
+    )
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+    provider.record_dispatched_message("Calculate 9 times 7")
+    # Actual pipe-pane echo has no leading query marker or complete rendered
+    # row. A busy marker follows the exact text being dispatched.
+    raw = "Calculate9times7Enter:send\x1b[20;4H⠦ Waiting for response…\nEsc:cancel"
+    assert provider.get_status(raw) == TerminalStatus.PROCESSING
+    assert provider._current_turn_query_identity == "❯Calculate9times7"
+    completed = _scrollable_completed_turn(pane_query + "      9:49 PM", "answer")
+    expected = (
+        TerminalStatus.COMPLETED
+        if pane_query == "Calculate 9 times 7"
+        else TerminalStatus.PROCESSING
+    )
+    assert provider.probe_stale_processing_capture(completed) == expected
+
+
+@patch("cli_agent_orchestrator.backends.registry.get_backend")
+@patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+@pytest.mark.parametrize("observed_query", ["first query", "second query", "third query"])
+def test_two_captures_attribute_busy_query_to_recorded_dispatch(
+    mock_pm, mock_get_backend, observed_query
+):
+    """A delayed A frame after completed A/B must not complete dispatched C."""
+
+    backend = MagicMock()
+    backend.supports_event_inbox.return_value = False
+    backend.get_native_status.return_value = None
+    mock_get_backend.return_value = backend
+    provider = make_provider()
+    mock_pm.get_provider.return_value = provider
+    monitor = StatusMonitor()
+
+    def dispatch(query):
+        monitor.notify_input_sent("test-terminal", assume_processing=True)
+        monitor.clear_rolling_buffer("test-terminal", provider)
+        provider.mark_input_received()
+        provider.record_dispatched_message(query)
+
+    for query in ("first query", "second query"):
+        dispatch(query)
+        monitor._process_chunk(
+            "test-terminal", f"     ❯ {query}\nWaiting for response…\nEsc:cancel\n"
+        )
+        monitor._process_chunk("test-terminal", _completed_turn(query, "answer"))
+        assert monitor.get_status("test-terminal") == TerminalStatus.COMPLETED
+
+    predecessor_identity = provider._last_completion_identity
+    dispatch("third query")
+    # The new paste may have been dropped. Both A and B can repaint after the
+    # reset; being distinct from immediate predecessor B cannot attribute A.
+    monitor._process_chunk(
+        "test-terminal", f"     ❯ {observed_query}\nWaiting for response…\nEsc:cancel"
+    )
+    monitor._buffer_changed_at["test-terminal"] = -1000.0
+    backend.get_history.return_value = _completed_turn(observed_query, "answer")
+
+    assert monitor.get_status("test-terminal") == TerminalStatus.PROCESSING
+    monitor._last_stale_capture_check["test-terminal"] = None
+    expected = (
+        TerminalStatus.COMPLETED if observed_query == "third query" else TerminalStatus.PROCESSING
+    )
+    assert monitor.get_status("test-terminal") == expected
+    assert monitor._last_status["test-terminal"] == expected
+    assert backend.get_history.call_count == 2
+    if expected == TerminalStatus.PROCESSING:
+        assert provider._turn_activity_seen is False
+        assert provider._current_turn_query_identity is None
+        assert provider._last_completion_identity == predecessor_identity
+
+
+def test_old_busy_query_cannot_replace_attributed_current_dispatch():
+    provider = make_provider()
+    provider.mark_input_received()
+    assert (
+        provider.get_status(_completed_turn("second query", "answer")) == TerminalStatus.COMPLETED
+    )
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+    provider.record_dispatched_message("third query")
+    assert (
+        provider.get_status("     ❯ third   query     9:49 PM\nWaiting for response…\nEsc:cancel")
+        == TerminalStatus.PROCESSING
+    )
+    assert provider._current_turn_query_identity == "❯thirdquery"
+
+    assert (
+        provider.get_status("     ❯ first query\nWaiting for response…\nEsc:cancel")
+        == TerminalStatus.PROCESSING
+    )
+    assert provider._turn_activity_seen is True
+    assert provider._current_turn_query_identity == "❯thirdquery"
+    assert (
+        provider.probe_stale_processing_capture(_completed_turn("first query", "answer"))
+        == TerminalStatus.PROCESSING
+    )
+    assert (
+        provider.probe_stale_processing_capture(_completed_turn("third query", "answer"))
+        == TerminalStatus.COMPLETED
+    )
+
+
+@pytest.mark.parametrize(
+    ("previous_query", "dispatched_query", "observed_query"),
+    [
+        ("third query", "third query", "third query"),
+        ("third", "third query", "third query"),
+        ("third query extended", "third query", "third query"),
+        ("second query", "third query extended", "third query"),
+        ("second query", "third query", "third query extended"),
+    ],
+)
+def test_recorded_dispatch_does_not_disambiguate_repeated_or_prefix_queries(
+    previous_query, dispatched_query, observed_query
+):
+    provider = make_provider()
+    provider.mark_input_received()
+    assert (
+        provider.get_status(_completed_turn(previous_query, "answer")) == TerminalStatus.COMPLETED
+    )
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+    provider.record_dispatched_message(dispatched_query)
+    assert (
+        provider.get_status(f"     ❯ {observed_query}\nWaiting for response…\nEsc:cancel")
+        == TerminalStatus.PROCESSING
+    )
+    assert provider._turn_activity_seen is False
+    assert provider._current_turn_query_identity is None
+    assert (
+        provider.probe_stale_processing_capture(_completed_turn(observed_query, "new answer"))
+        == TerminalStatus.PROCESSING
+    )
+
+
+def test_dispatched_text_without_busy_evidence_cannot_complete_current_turn():
+    provider = make_provider()
+    provider.mark_input_received()
+    assert (
+        provider.get_status(_completed_turn("first query", "first answer"))
+        == TerminalStatus.COMPLETED
+    )
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+    provider.record_dispatched_message("Calculate 9 times 7")
+    provider.get_status("Calculate9times7Enter:send\nCtrl+x:shortcuts")
+    assert provider._turn_activity_seen is False
+    assert (
+        provider.probe_stale_processing_capture(_completed_turn("Calculate 9 times 7", "answer"))
+        == TerminalStatus.PROCESSING
+    )
+
+
+def test_current_timestamp_cannot_make_repeated_query_distinct():
+    provider = make_provider()
+    provider.mark_input_received()
+    assert (
+        provider.get_status(_completed_turn("repeat query     9:48 PM", "answer"))
+        == TerminalStatus.COMPLETED
+    )
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+    provider.record_dispatched_message("repeat query")
+    assert (
+        provider.get_status("repeatqueryEnter:send\nWaiting for response…\nEsc:cancel")
+        == TerminalStatus.PROCESSING
+    )
+    assert provider._turn_activity_seen is False
+    assert (
+        provider.probe_stale_processing_capture(
+            _completed_turn("repeat query     9:49 PM", "answer")
+        )
+        == TerminalStatus.PROCESSING
+    )
+
+
 def test_prompt_submission_and_lifecycle_properties():
     provider = make_provider()
     assert provider.paste_enter_count == 1
@@ -74,6 +317,7 @@ def test_prompt_submission_and_lifecycle_properties():
     assert provider.exit_cli() == "/quit"
     assert provider.supports_screen_detection is False
     assert provider.supports_direct_status_probe is False
+    assert provider.supports_stale_processing_capture is True
 
 
 @pytest.mark.parametrize(
@@ -520,14 +764,17 @@ def test_byte_identical_consecutive_turns_have_distinct_generations():
     assert provider.get_status(completed + "\n" + completed) == TerminalStatus.COMPLETED
 
 
-def test_buffer_clear_generation_accepts_coalesced_identical_completion():
-    """A real send-input boundary must not wedge a fast repeated turn.
+def test_buffer_clear_generation_rejects_coalesced_identical_completion_replay():
+    """A busy frame in a fresh generation is NOT ownership of the new turn.
 
     This drives the same order used by ``terminal_service.send_input``:
     completed first turn, arm StatusMonitor, clear its rolling buffer while
     notifying Grok, mark the input received, then receive one FIFO chunk with
-    both the current processing marker and a byte-identical completion.  The
-    second direct status lookup models StatusMonitor's settled recheck.
+    both a processing marker and a BYTE-IDENTICAL completion. A dropped paste
+    whose old busy frame and finished frame are replayed after the clear
+    produces exactly those bytes, and the stream coordinate space restarts at
+    the reset, so neither the generation change nor the spinner proves which
+    turn drew them. The completion must therefore stay PROCESSING.
     """
 
     provider = make_provider()
@@ -541,17 +788,13 @@ def test_buffer_clear_generation_accepts_coalesced_identical_completion():
         provider.mark_input_received()
         monitor._process_chunk("test-terminal", completed)
         assert monitor._last_status["test-terminal"] == TerminalStatus.COMPLETED
+        assert provider._last_completion_identity is not None
 
         monitor.notify_input_sent("test-terminal")
         monitor.clear_rolling_buffer("test-terminal", provider)
         provider.mark_input_received()
         monitor._process_chunk("test-terminal", coalesced)
-        assert monitor._last_status["test-terminal"] == TerminalStatus.COMPLETED
-
-        # While cached PROCESSING, get_status performs a direct settled
-        # recheck; pin the successful state through the same code path too.
-        monitor._last_status["test-terminal"] = TerminalStatus.PROCESSING
-        assert monitor.get_status("test-terminal") == TerminalStatus.COMPLETED
+        assert monitor._last_status["test-terminal"] == TerminalStatus.PROCESSING
 
 
 def test_buffer_clear_generation_rejects_stale_identical_completion_without_activity():
@@ -574,6 +817,787 @@ def test_buffer_clear_generation_rejects_stale_identical_completion_without_acti
         monitor._process_chunk("test-terminal", completed)
 
     assert monitor._last_status["test-terminal"] == TerminalStatus.PROCESSING
+
+
+@patch("cli_agent_orchestrator.backends.registry.get_backend")
+@patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+def test_stale_processing_direct_probe_recovers_rendered_completion(mock_pm, mock_get_backend):
+    """A quiet stale raw PROCESSING buffer self-heals from the live Grok pane.
+
+    Regression guard for #813: the pipe-pane stream can retain the turn's busy
+    markers after Grok has already rendered ``Worked for ...`` and returned to
+    the empty composer.  Grok now opts into StatusMonitor's rendered
+    capture-pane fallback, which still requires two matching ready reads before
+    changing the latched status.
+    """
+
+    backend = MagicMock()
+    backend.supports_event_inbox.return_value = False
+    backend.get_native_status.return_value = None
+    backend.get_history.return_value = load_fixture("grok_cli_completed.txt")
+    mock_get_backend.return_value = backend
+
+    provider = make_provider()
+    provider.mark_input_received()
+    processing = load_fixture("grok_cli_processing.txt")
+    assert provider.get_status(processing) == TerminalStatus.PROCESSING
+    raw_fifo_baseline = provider._last_status_buffer
+    raw_fifo_stream_start = provider._last_status_buffer_stream_start
+    mock_pm.get_provider.return_value = provider
+
+    monitor = StatusMonitor()
+    # PROCESSING was genuinely observed in the current input generation; that
+    # is what authorizes stale-pane recovery once the raw buffer goes quiet.
+    monitor._apply_detection("test-terminal", TerminalStatus.PROCESSING)
+    monitor._buffers["test-terminal"] = processing
+    monitor._buffer_changed_at["test-terminal"] = -1000.0
+
+    # First rendered ready sample is only a candidate.
+    assert monitor.get_status("test-terminal") == TerminalStatus.PROCESSING
+    assert monitor._last_status["test-terminal"] == TerminalStatus.PROCESSING
+    assert provider._last_completion_identity is None
+    assert provider._awaiting_turn_activity is True
+    assert provider._last_status_buffer == raw_fifo_baseline
+    assert provider._last_status_buffer_stream_start == raw_fifo_stream_start
+
+    # The second matching sample confirms the live viewport and heals the
+    # stale raw-stream classification.
+    monitor._last_stale_capture_check["test-terminal"] = None
+    assert monitor.get_status("test-terminal") == TerminalStatus.COMPLETED
+    assert monitor._last_status["test-terminal"] == TerminalStatus.COMPLETED
+    assert provider._last_completion_identity is not None
+    assert provider._last_completion_stream_offset is None
+    assert provider._awaiting_turn_activity is False
+    assert provider._last_status_buffer == raw_fifo_baseline
+    assert provider._last_status_buffer_stream_start == raw_fifo_stream_start
+    backend.get_history.assert_called_with(
+        "test-session", "test-window", strip_escapes=True, visible_only=True
+    )
+
+
+@patch("cli_agent_orchestrator.backends.registry.get_backend")
+@patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+def test_direct_probe_does_not_complete_new_turn_from_previous_rendered_completion(
+    mock_pm, mock_get_backend
+):
+    """A previous turn's settled viewport is not completion evidence for a new turn."""
+
+    backend = MagicMock()
+    backend.supports_event_inbox.return_value = False
+    backend.get_native_status.return_value = None
+    mock_get_backend.return_value = backend
+
+    provider = make_provider()
+    completed = load_fixture("grok_cli_completed.txt")
+    provider.mark_input_received()
+    assert provider.get_status(completed) == TerminalStatus.COMPLETED
+
+    # Arm a second turn, but let capture-pane still show the previous completed
+    # frame.  Grok's completion identity guard must keep the direct probe busy.
+    provider.mark_input_received()
+    mock_pm.get_provider.return_value = provider
+
+    backend.get_history.return_value = completed
+
+    monitor = StatusMonitor()
+    monitor._last_status["test-terminal"] = TerminalStatus.PROCESSING
+    monitor._buffers["test-terminal"] = ""
+    monitor._buffer_changed_at["test-terminal"] = -1000.0
+
+    assert monitor.get_status("test-terminal") == TerminalStatus.PROCESSING
+    monitor._last_stale_capture_check["test-terminal"] = None
+    assert monitor.get_status("test-terminal") == TerminalStatus.PROCESSING
+    assert monitor._last_status["test-terminal"] == TerminalStatus.PROCESSING
+
+
+@patch("cli_agent_orchestrator.backends.registry.get_backend")
+@patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+def test_monitor_pane_fallback_rejects_identical_turn_after_fresh_processing(
+    mock_pm, mock_get_backend
+):
+    """The pane fallback must not finish a byte-identical replay of the old turn.
+
+    Turn 1 was recovered from the rendered pane, so its completion has no raw
+    stream coordinate. Turn 2's paste is dropped, but a busy frame and turn 1's
+    byte-identical completion are replayed into the new generation. That busy
+    frame is not ownership: the predecessor's own busy frame is replayed too.
+    The two-read capture-pane fallback must stay PROCESSING instead of latching
+    COMPLETED from the stale pane.
+    """
+
+    backend = MagicMock()
+    backend.supports_event_inbox.return_value = False
+    backend.get_native_status.return_value = None
+    mock_get_backend.return_value = backend
+
+    provider = make_provider()
+    completed = _completed_turn("repeat query", "same answer")
+    backend.get_history.return_value = completed
+    provider.mark_input_received()
+    detected = provider.probe_stale_processing_capture(completed)
+    assert detected == TerminalStatus.COMPLETED
+    assert provider.commit_stale_processing_capture(completed, detected) is True
+    assert provider._last_completion_stream_offset is None
+    mock_pm.get_provider.return_value = provider
+
+    monitor = StatusMonitor()
+    monitor.notify_input_sent("test-terminal")
+    monitor.clear_rolling_buffer("test-terminal", provider)
+    provider.mark_input_received()
+
+    processing = "     ❯ repeat query\nWaiting for response…\nEsc:cancel"
+    assert provider.get_status(processing) == TerminalStatus.PROCESSING
+    monitor._apply_detection("test-terminal", TerminalStatus.PROCESSING)
+    monitor._buffers["test-terminal"] = processing
+    monitor._buffer_changed_at["test-terminal"] = -1000.0
+
+    assert monitor.get_status("test-terminal") == TerminalStatus.PROCESSING
+    monitor._last_stale_capture_check["test-terminal"] = None
+    assert monitor.get_status("test-terminal") == TerminalStatus.PROCESSING
+    assert monitor._last_status["test-terminal"] == TerminalStatus.PROCESSING
+
+
+def test_stale_processing_capture_opt_in_does_not_certify_deferred_task_pickup():
+    """A retained old completion must not disable dropped-paste recovery.
+
+    Grok returns PROCESSING for that frame after a new dispatch on purpose: it
+    means "do not finish the new turn from stale completion", not "the new task
+    definitely started". The stale-PROCESSING recovery opt-in must therefore
+    remain separate from terminal_service's deferred-init direct probe.
+    """
+
+    from cli_agent_orchestrator.services import terminal_service as ts
+
+    provider = make_provider()
+    completed = load_fixture("grok_cli_completed.txt")
+    provider.mark_input_received()
+    assert provider.get_status(completed) == TerminalStatus.COMPLETED
+    provider.mark_input_received()
+    assert provider.get_status(completed) == TerminalStatus.PROCESSING
+
+    with (
+        patch.object(ts, "_worker_is_started_direct") as direct_probe,
+        patch.object(ts, "_message_visible_in_box", return_value=False),
+        patch.object(ts, "send_input") as resend,
+    ):
+        assert ts.redeliver_dropped_message("test-terminal", "new task", 1, provider) is False
+
+    direct_probe.assert_not_called()
+    resend.assert_called_once()
+
+
+@patch("cli_agent_orchestrator.backends.registry.get_backend")
+@patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+def test_unparsed_previous_completion_cannot_complete_new_dropped_turn(mock_pm, mock_get_backend):
+    """A PROCESSING latch from turn 1 cannot heal turn 2 from turn-1's pane.
+
+    This is the #813 wedge that a completion-identity-only guard cannot cover:
+    turn 1's raw FIFO never parses its completion, so Grok has no previous
+    completion identity.  If turn 2 is dispatched and its paste is dropped,
+    the rendered pane still shows turn 1's completion.  The old PROCESSING
+    observation belongs to the previous input generation and therefore cannot
+    authorize stale-pane recovery for turn 2.
+    """
+
+    provider = make_provider()
+    processing = load_fixture("grok_cli_processing.txt")
+    completed = load_fixture("grok_cli_completed.txt")
+
+    backend = MagicMock()
+    backend.supports_event_inbox.return_value = False
+    backend.get_native_status.return_value = None
+    backend.get_history.return_value = completed
+    mock_get_backend.return_value = backend
+
+    provider.mark_input_received()
+    assert provider.get_status(processing) == TerminalStatus.PROCESSING
+    assert provider._last_completion_identity is None
+    mock_pm.get_provider.return_value = provider
+
+    monitor = StatusMonitor()
+    monitor._apply_detection("test-terminal", TerminalStatus.PROCESSING)
+    monitor._buffers["test-terminal"] = processing
+    monitor._buffer_changed_at["test-terminal"] = -1000.0
+    assert monitor._processing_generation["test-terminal"] == 0
+
+    # Turn 2 begins, but no real provider output follows: cached PROCESSING is
+    # retained while the capture generation advances to 1.
+    monitor.notify_input_sent("test-terminal")
+    monitor.clear_rolling_buffer("test-terminal", provider)
+    provider.mark_input_received()
+    monitor._buffer_changed_at["test-terminal"] = -1000.0
+
+    assert monitor.get_status("test-terminal") == TerminalStatus.PROCESSING
+    monitor._last_stale_capture_check["test-terminal"] = None
+    assert monitor.get_status("test-terminal") == TerminalStatus.PROCESSING
+    assert monitor._last_status["test-terminal"] == TerminalStatus.PROCESSING
+    assert provider._last_completion_identity is None
+    # Recovery is ineligible before current-generation PROCESSING evidence, so
+    # the stale rendered pane is never sampled at all.
+    backend.get_history.assert_not_called()
+
+
+@patch("cli_agent_orchestrator.backends.registry.get_backend")
+@patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+def test_unparsed_previous_completion_stays_blocked_after_fresh_processing_redetect(
+    mock_pm, mock_get_backend
+):
+    """Generic PROCESSING is not enough to attribute an identity-less old pane.
+
+    A post-dispatch repaint can make raw status detection say PROCESSING even
+    when the new paste was never accepted.  That legitimately marks the monitor
+    generation as active, but turn 1's completion is still unattributable
+    because Grok never parsed/committed its identity.  The rendered fallback
+    must therefore stay PROCESSING rather than complete turn 2 from the stale
+    pane.
+    """
+
+    provider = make_provider()
+    processing = load_fixture("grok_cli_processing.txt")
+    completed = load_fixture("grok_cli_completed.txt")
+
+    backend = MagicMock()
+    backend.supports_event_inbox.return_value = False
+    backend.get_native_status.return_value = None
+    backend.get_history.return_value = completed
+    mock_get_backend.return_value = backend
+
+    provider.mark_input_received()
+    assert provider.get_status(processing) == TerminalStatus.PROCESSING
+    assert provider._last_completion_identity is None
+    mock_pm.get_provider.return_value = provider
+
+    monitor = StatusMonitor()
+    monitor._apply_detection("test-terminal", TerminalStatus.PROCESSING)
+    monitor.notify_input_sent("test-terminal")
+    monitor.clear_rolling_buffer("test-terminal", provider)
+    provider.mark_input_received()
+
+    # Model the review finding: some fresh post-dispatch redraw is classified
+    # PROCESSING even though the paste itself was dropped.  This makes the
+    # monitor's generation gate eligible, but is not completion attribution.
+    monitor._apply_detection("test-terminal", TerminalStatus.PROCESSING)
+    monitor._buffer_changed_at["test-terminal"] = -1000.0
+
+    assert monitor.get_status("test-terminal") == TerminalStatus.PROCESSING
+    monitor._last_stale_capture_check["test-terminal"] = None
+    assert monitor.get_status("test-terminal") == TerminalStatus.PROCESSING
+    assert monitor._last_status["test-terminal"] == TerminalStatus.PROCESSING
+    assert provider._last_completion_identity is None
+    assert backend.get_history.call_count == 2
+
+
+def test_unparsed_previous_completion_cannot_complete_new_turn_via_raw_redraw():
+    """A delayed raw redraw cannot attribute turn N-1's pane to turn N.
+
+    This is the raw-FIFO sibling of the stale-capture generation guard.  A
+    dropped new paste may still be followed by delayed redraw bytes from the
+    previous completed screen; the prefix can look PROCESSING and the full
+    redraw can look structurally COMPLETED. Without a predecessor completion
+    identity, neither frame proves that the new turn ran.
+    """
+
+    provider = make_provider()
+    processing = load_fixture("grok_cli_processing.txt")
+    old_completion = load_fixture("grok_cli_completed.txt")
+
+    provider.mark_input_received()
+    assert provider.get_status(processing) == TerminalStatus.PROCESSING
+    assert provider._last_completion_identity is None
+
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+    provider._last_dispatch_time -= 10
+
+    assert provider.get_status(old_completion[:256]) == TerminalStatus.PROCESSING
+    assert provider.get_status(old_completion) == TerminalStatus.PROCESSING
+    assert provider._last_completion_identity is None
+
+
+def test_full_redelivery_is_not_a_new_logical_turn():
+    """A redelivered dropped paste must complete its own first turn.
+
+    First delivery of turn 1 is dropped, then CAO re-delivers the SAME dispatch
+    via ``send_input()``.  The second delivery is another *attempt*, not a new
+    logical turn: counting it as one would leave ``_turns == 2`` with no
+    predecessor completion identity, which the fail-closed guards then treat as
+    an unattributable old pane and reject the genuinely successful resend's real
+    completion forever.
+    """
+
+    provider = make_provider()
+    processing = load_fixture("grok_cli_processing.txt")
+    completed = load_fixture("grok_cli_completed.txt")
+
+    provider.mark_input_received()
+    assert provider._turns == 1
+    assert provider._last_completion_identity is None
+
+    # ``send_input`` clears the rolling buffer (fresh byte-generation) and then
+    # marks the redelivery instead of a new dispatch.
+    provider.notify_status_buffer_reset(1)
+    provider.mark_redelivery_received()
+
+    assert provider._turns == 1
+    assert provider._awaiting_turn_activity is True
+    assert provider._turn_activity_seen is False
+    assert provider._last_completion_identity is None
+
+    assert provider.get_status(processing) == TerminalStatus.PROCESSING
+    assert provider.get_status(processing + "\n" + completed) == TerminalStatus.COMPLETED
+    assert provider._last_completion_identity is not None
+
+
+@patch("cli_agent_orchestrator.backends.registry.get_backend")
+@patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+def test_redelivered_turn_recovers_stale_processing_from_rendered_pane(mock_pm, mock_get_backend):
+    """The redelivered first turn still self-heals a stale PROCESSING latch.
+
+    The stale-pane probe's identity-less fail-closed guard is keyed on the
+    logical turn count, so a redelivery must not push turn 1 past it.
+    """
+
+    backend = MagicMock()
+    backend.supports_event_inbox.return_value = False
+    backend.get_native_status.return_value = None
+    backend.get_history.return_value = load_fixture("grok_cli_completed.txt")
+    mock_get_backend.return_value = backend
+
+    provider = make_provider()
+    processing = load_fixture("grok_cli_processing.txt")
+    provider.mark_input_received()
+    provider.mark_redelivery_received()
+    assert provider._turns == 1
+    mock_pm.get_provider.return_value = provider
+
+    monitor = StatusMonitor()
+    monitor._apply_detection("test-terminal", TerminalStatus.PROCESSING)
+    monitor._buffers["test-terminal"] = processing
+    monitor._buffer_changed_at["test-terminal"] = -1000.0
+
+    assert monitor.get_status("test-terminal") == TerminalStatus.PROCESSING
+    monitor._last_stale_capture_check["test-terminal"] = None
+    assert monitor.get_status("test-terminal") == TerminalStatus.COMPLETED
+    assert monitor._last_status["test-terminal"] == TerminalStatus.COMPLETED
+    assert provider._last_completion_identity is not None
+
+
+def test_pane_recovered_completion_cannot_complete_dropped_next_turn():
+    """Unknown raw offset after pane recovery must not bless an old query redraw."""
+
+    provider = make_provider()
+    completed = _completed_turn("first query", "first answer")
+    provider.mark_input_received()
+
+    detected = provider.probe_stale_processing_capture(completed)
+    assert detected == TerminalStatus.COMPLETED
+    assert provider.commit_stale_processing_capture(completed, detected) is True
+    assert provider._last_completion_stream_offset is None
+    assert provider._last_completion_query_identity is not None
+
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+
+    # Turn 2's paste is dropped. The previous completed pane is redrawn into
+    # the fresh raw generation. Its old query must not count as turn-2 activity.
+    assert provider.get_status(completed) == TerminalStatus.PROCESSING
+    assert provider._turn_activity_seen is False
+
+
+def test_pane_recovered_predecessor_replay_cannot_complete_dropped_turn():
+    """A replayed busy frame is NOT ownership of the dropped new turn (#813).
+
+    Turn 1 was recovered from the rendered pane, so its completion has no raw
+    stream coordinate. Turn 2 is dispatched and its paste is dropped, but turn
+    1's busy frame and turn 1's completion are replayed into the fresh buffer
+    generation. The predecessor's own busy frame is replayed right along with
+    it, so neither the generation change nor the spinner proves which turn drew
+    these bytes. The byte-identical completion must stay PROCESSING.
+    """
+
+    provider = make_provider()
+    completed = _completed_turn("repeat query", "same answer")
+    provider.mark_input_received()
+    detected = provider.probe_stale_processing_capture(completed)
+    assert detected == TerminalStatus.COMPLETED
+    assert provider.commit_stale_processing_capture(completed, detected) is True
+    assert provider._last_completion_stream_offset is None
+    predecessor_identity = provider._last_completion_identity
+
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+    busy = "     ❯ repeat query\nWaiting for response…\nEsc:cancel"
+    assert provider.get_status(busy) == TerminalStatus.PROCESSING
+    # A same-query spinner is not attributable, in this or any generation.
+    assert provider._turn_activity_seen is False
+
+    # Delayed replay: the old busy frame and the old completion in one chunk.
+    assert provider.get_status(busy + "\n" + completed) == TerminalStatus.PROCESSING
+    assert provider._last_completion_identity == predecessor_identity
+    assert provider._awaiting_turn_activity is True
+
+
+def test_known_offset_predecessor_replay_cannot_complete_dropped_turn():
+    """The same replay must fail closed when the predecessor's raw offset IS known.
+
+    A known offset cannot attribute a fresh-generation completion: the rolling
+    stream coordinate space restarts at the dispatch reset, so a replayed
+    completion lands at a small viewport-relative position that says nothing
+    about the predecessor. The busy frame is replayed too, so it is not
+    ownership either.
+    """
+
+    provider = make_provider()
+    completed = _completed_turn("repeat query", "same answer")
+    provider.mark_input_received()
+    assert provider.get_status(completed) == TerminalStatus.COMPLETED
+    assert provider._last_completion_stream_offset is not None
+    predecessor_identity = provider._last_completion_identity
+
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+    busy = "     ❯ repeat query\nWaiting for response…\nEsc:cancel"
+    assert provider.get_status(busy) == TerminalStatus.PROCESSING
+
+    assert provider.get_status(busy + "\n" + completed) == TerminalStatus.PROCESSING
+    assert provider._last_completion_identity == predecessor_identity
+    assert provider._awaiting_turn_activity is True
+
+
+@pytest.mark.parametrize(
+    "rendered_query", ["repeat query", "repeat\n       query", "repeat que\nry"]
+)
+def test_raw_completion_replayed_as_rendered_pane_stays_processing(rendered_query):
+    provider = make_provider()
+    raw = _completed_turn("repeat query", "same answer", raw=True)
+    rendered = _completed_turn(rendered_query, "same answer")
+    provider.mark_input_received()
+    assert provider.get_status(raw) == TerminalStatus.COMPLETED
+    previous_identity = provider._last_completion_identity
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+    busy = "     ❯ repeat query\nWaiting for response…\nEsc:cancel"
+    assert provider.get_status(busy) == TerminalStatus.PROCESSING
+    assert provider.probe_stale_processing_capture(rendered) == TerminalStatus.PROCESSING
+    assert provider._last_completion_identity == previous_identity
+    assert provider._awaiting_turn_activity is True
+
+
+@patch("cli_agent_orchestrator.backends.registry.get_backend")
+@patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+@pytest.mark.parametrize("raw_busy_chrome", [False, True])
+@pytest.mark.parametrize(
+    "rendered_query", ["repeat query", "repeat\n       query", "repeat que\nry"]
+)
+def test_two_rendered_captures_do_not_complete_dropped_turn_after_raw_predecessor(
+    mock_pm, mock_get_backend, raw_busy_chrome, rendered_query
+):
+    backend = MagicMock()
+    backend.supports_event_inbox.return_value = False
+    backend.get_native_status.return_value = None
+    backend.get_history.return_value = _completed_turn(rendered_query, "same answer")
+    mock_get_backend.return_value = backend
+    provider = make_provider()
+    mock_pm.get_provider.return_value = provider
+    provider.mark_input_received()
+    raw = _completed_turn("repeat query", "same answer", raw=True)
+    if raw_busy_chrome:
+        raw = raw.replace("\n\nsame answer", "\nWaiting for response…\nEsc:cancel\n\nsame answer")
+    assert provider.get_status(raw) == TerminalStatus.COMPLETED
+    previous_identity = provider._last_completion_identity
+    monitor = StatusMonitor()
+    monitor.notify_input_sent("test-terminal")
+    monitor.clear_rolling_buffer("test-terminal", provider=provider)
+    provider.mark_input_received()
+    busy = f"     ❯ {rendered_query}\nWaiting for response…\nEsc:cancel"
+    monitor._buffers["test-terminal"] = busy
+    monitor._buffer_changed_at["test-terminal"] = -1000.0
+    monitor._apply_detection("test-terminal", provider.get_status(busy))
+    assert monitor.get_status("test-terminal") == TerminalStatus.PROCESSING
+    monitor._last_stale_capture_check["test-terminal"] = None
+    assert monitor.get_status("test-terminal") == TerminalStatus.PROCESSING
+    assert backend.get_history.call_count == 2
+    assert provider._last_completion_identity == previous_identity
+    assert provider._awaiting_turn_activity is True
+
+
+def test_cross_generation_completion_without_query_stays_processing():
+    """A fresh-generation completion with no preceding query has nothing to attribute.
+
+    A truncated replay can leave only the old ``Worked for`` chrome plus a
+    replayed busy marker; with the query evicted there is no current-turn query
+    identity to compare, so the completion must fail closed.
+    """
+
+    provider = make_provider()
+    completed = _completed_turn("repeat query", "same answer")
+    provider.mark_input_received()
+    detected = provider.probe_stale_processing_capture(completed)
+    assert provider.commit_stale_processing_capture(completed, detected) is True
+
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+    chrome = "     Worked for 2.0s\n\n  Shift+Tab:mode  │  Ctrl+x:shortcuts"
+    assert (
+        provider.get_status("Waiting for response…\nEsc:cancel\n" + chrome)
+        == TerminalStatus.PROCESSING
+    )
+
+
+def test_pane_probe_rejects_replayed_identical_turn_after_dropped_paste():
+    """The rendered-pane route must not use a replayed busy frame as ownership."""
+
+    provider = make_provider()
+    completed = _completed_turn("repeat query", "same answer")
+    provider.mark_input_received()
+    detected = provider.probe_stale_processing_capture(completed)
+    assert detected == TerminalStatus.COMPLETED
+    assert provider.commit_stale_processing_capture(completed, detected) is True
+    assert provider._last_completion_stream_offset is None
+    predecessor_identity = provider._last_completion_identity
+
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+    processing = "     ❯ repeat query\nWaiting for response…\nEsc:cancel"
+    assert provider.get_status(processing) == TerminalStatus.PROCESSING
+
+    # The settled pane carries no busy frame, but the replayed old completion is
+    # still unattributable without an independent current-turn signal.
+    assert provider.probe_stale_processing_capture(completed) == TerminalStatus.PROCESSING
+    assert provider._last_completion_identity == predecessor_identity
+
+
+def test_pane_recovered_replay_without_busy_frame_stays_processing():
+    """A stale previous-pane replay that brings no busy frame is not a new turn."""
+
+    provider = make_provider()
+    completed = _completed_turn("first query", "first answer")
+    provider.mark_input_received()
+    detected = provider.probe_stale_processing_capture(completed)
+    assert detected == TerminalStatus.COMPLETED
+    assert provider.commit_stale_processing_capture(completed, detected) is True
+    assert provider._last_completion_stream_offset is None
+
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+
+    # Turn 2's paste is dropped, so only the old completed screen comes back.
+    assert provider.get_status(completed) == TerminalStatus.PROCESSING
+    assert provider._turn_activity_seen is False
+    assert provider.probe_stale_processing_capture(completed) == TerminalStatus.PROCESSING
+
+
+def test_distinct_query_can_use_pane_recovery_after_interrupted_predecessor(
+    monkeypatch,
+):
+    """Distinct current-turn activity re-enables #813 pane recovery without an old completion ID."""
+
+    provider = make_provider()
+    provider.mark_input_received()
+    assert (
+        provider.get_status("     ❯ first query\nWaiting for response…\nEsc:cancel")
+        == TerminalStatus.PROCESSING
+    )
+    assert provider._last_completion_identity is None
+
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+    assert (
+        provider.get_status("     ❯ second query\nWaiting for response…\nEsc:cancel")
+        == TerminalStatus.PROCESSING
+    )
+    assert provider._turn_activity_seen is True
+    assert provider._current_turn_query_identity != provider._previous_turn_query_identity
+
+    completed = _completed_turn("second query", "second answer")
+    detected = provider.probe_stale_processing_capture(completed)
+    assert detected == TerminalStatus.COMPLETED
+    assert provider.commit_stale_processing_capture(completed, detected) is True
+    assert provider._last_completion_identity is not None
+
+
+def test_same_query_different_answer_is_unattributable_after_dispatch_reset():
+    """Different raw/pane content alone cannot attribute a repeated-query turn."""
+
+    provider = make_provider()
+    first = _completed_turn("repeat query", "first answer")
+    provider.mark_input_received()
+    detected = provider.probe_stale_processing_capture(first)
+    assert detected == TerminalStatus.COMPLETED
+    assert provider.commit_stale_processing_capture(first, detected) is True
+    assert provider._last_completion_stream_offset is None
+
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+    processing = "     ❯ repeat query\nWaiting for response…\nEsc:cancel"
+    assert provider.get_status(processing) == TerminalStatus.PROCESSING
+    assert provider._turn_activity_seen is False
+
+    second = _completed_turn("repeat query", "different answer")
+    assert provider.get_status(processing + "\n" + second) == TerminalStatus.PROCESSING
+    assert provider._last_completion_identity is not None
+
+
+def test_distinct_query_recovers_after_unparsed_predecessor_completion():
+    """Fresh distinct query+processing can re-establish ownership without an old completion ID."""
+
+    provider = make_provider()
+    first_processing = "     ❯ first query\nWaiting for response…\nEsc:cancel"
+    provider.mark_input_received()
+    assert provider.get_status(first_processing) == TerminalStatus.PROCESSING
+    assert provider._last_completion_identity is None
+    assert provider._current_turn_query_identity is not None
+
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+    second_processing = "     ❯ second query\nWaiting for response…\nEsc:cancel"
+    assert provider.get_status(second_processing) == TerminalStatus.PROCESSING
+    assert provider._turn_activity_seen is True
+
+    second_completed = _completed_turn("second query", "second answer")
+    assert (
+        provider.get_status(second_processing + "\n" + second_completed) == TerminalStatus.COMPLETED
+    )
+    assert provider._last_completion_identity is not None
+
+
+def test_coalesced_processing_and_completion_recovers_without_predecessor_identity():
+    """A distinct turn whose busy and finished frames share one burst must complete.
+
+    Turn 1 is interrupted while still busy, so no completion identity is ever
+    parsed for it. Turn 2's processing and completion then arrive in the SAME
+    raw observation. The completion is newer, so the position branch never ran:
+    without recording the busy frame first, ``_turn_activity_seen`` stays False
+    and the identity-less guard rejects the distinct turn forever.
+    """
+
+    provider = make_provider()
+    first_processing = "     ❯ first query\nWaiting for response…\nEsc:cancel"
+    provider.mark_input_received()
+    assert provider.get_status(first_processing) == TerminalStatus.PROCESSING
+    assert provider._last_completion_identity is None
+
+    provider.notify_status_buffer_reset(1)
+    provider.mark_input_received()
+    second_processing = "     ❯ second query\nWaiting for response…\nEsc:cancel"
+    second_completed = _completed_turn("second query", "second answer")
+
+    coalesced = second_processing + "\n" + second_completed
+    assert provider.get_status(coalesced) == TerminalStatus.COMPLETED
+    assert provider._last_completion_identity is not None
+    assert provider._turn_activity_seen is True
+
+
+def test_redeliver_dropped_message_full_resend_preserves_logical_turn(monkeypatch):
+    """End-to-end: the real redelivery boundary forwards a same-turn redelivery.
+
+    Drives ``redeliver_dropped_message`` -> ``send_input`` -> provider hook so
+    the distinction is exercised where it is owned, not only through the
+    provider API: the dropped paste's full re-send must leave the logical turn
+    count alone while the redelivered turn really running still completes.
+    """
+
+    from cli_agent_orchestrator.services import terminal_service as ts
+
+    processing = load_fixture("grok_cli_processing.txt")
+    completed = load_fixture("grok_cli_completed.txt")
+
+    monitor = StatusMonitor()
+    provider = make_provider(terminal_id="grok-redelivery")
+    provider.mark_input_received()
+    assert provider._turns == 1
+
+    backend = MagicMock()
+    backend.supports_event_inbox.return_value = False
+    backend.get_native_status.return_value = None
+
+    monkeypatch.setattr(ts, "status_monitor", monitor)
+    monkeypatch.setattr(ts, "get_backend", lambda: backend)
+    monkeypatch.setattr(
+        ts, "get_terminal_metadata", lambda _: {"tmux_session": "s", "tmux_window": "w"}
+    )
+    monkeypatch.setattr(ts.provider_manager, "get_provider", lambda _: provider)
+    monkeypatch.setattr(ts, "inject_memory_context", lambda message, *_: message)
+    monkeypatch.setattr(ts, "update_last_active", lambda _: None)
+    monkeypatch.setattr(ts, "_message_visible_in_box", lambda *_: False)
+
+    assert ts.redeliver_dropped_message("grok-redelivery", "do the task", 1, provider) is False
+    backend.send_keys.assert_called_once()
+
+    assert provider._turns == 1
+    assert provider.get_status(processing) == TerminalStatus.PROCESSING
+    assert provider.get_status(processing + "\n" + completed) == TerminalStatus.COMPLETED
+
+
+def test_stale_capture_commit_is_pure_after_off_lock_probe():
+    """Commit must not re-run get_status while StatusMonitor holds its lock."""
+
+    provider = make_provider()
+    completed = load_fixture("grok_cli_completed.txt")
+    provider.mark_input_received()
+    provider._last_dispatch_time -= 10
+
+    detected = provider.probe_stale_processing_capture(completed)
+    assert detected == TerminalStatus.COMPLETED
+
+    with patch.object(provider, "get_status", side_effect=AssertionError("commit re-probed")):
+        assert provider.commit_stale_processing_capture(completed, detected) is True
+
+    assert provider._last_completion_identity is not None
+
+
+def test_stale_capture_probe_cannot_rollback_concurrent_new_turn():
+    """Speculative rollback must not erase a concurrent new-turn boundary."""
+
+    import threading
+
+    provider = make_provider()
+    completed = load_fixture("grok_cli_completed.txt")
+    provider.mark_input_received()
+    assert provider.get_status(completed) == TerminalStatus.COMPLETED
+    assert provider._turns == 1
+    assert provider._awaiting_turn_activity is False
+
+    probe_entered = threading.Event()
+    release_probe = threading.Event()
+    mark_started = threading.Event()
+    mark_finished = threading.Event()
+    original = provider._get_status_unlocked
+
+    def blocked_probe(output):
+        probe_entered.set()
+        assert release_probe.wait(2.0)
+        return original(output)
+
+    probe_result = []
+    with patch.object(provider, "_get_status_unlocked", side_effect=blocked_probe):
+        probe_thread = threading.Thread(
+            target=lambda: probe_result.append(provider.probe_stale_processing_capture(completed))
+        )
+        probe_thread.start()
+        assert probe_entered.wait(1.0)
+
+        def begin_new_turn():
+            mark_started.set()
+            provider.mark_input_received()
+            mark_finished.set()
+
+        mark_thread = threading.Thread(target=begin_new_turn)
+        mark_thread.start()
+        assert mark_started.wait(1.0)
+        # The new-turn mutation is serialized behind the speculative probe.
+        assert mark_finished.wait(0.05) is False
+
+        release_probe.set()
+        probe_thread.join(2.0)
+        mark_thread.join(2.0)
+
+    assert not probe_thread.is_alive()
+    assert not mark_thread.is_alive()
+    assert probe_result
+    assert provider._turns == 2
+    assert provider._awaiting_turn_activity is True
+    assert provider._turn_activity_seen is False
 
 
 @pytest.mark.parametrize("raw", [False, True])

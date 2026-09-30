@@ -700,9 +700,50 @@ def _is_live_turn_spinner_line(
 BULLET_LINE_PATTERN = kt.BULLET_ANY_RE
 
 # Generic error patterns for detecting failure states in terminal output.
+# Legacy/plain failures begin at column zero.
 ERROR_PATTERN = (
     r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|ConnectionError:|APIError:)"
 )
+
+# Kimi Code 2.1.1 renders a launch/session failure indented inside the TUI
+# content column. Keep this OUT of the generic pattern: a perfectly valid
+# assistant answer can quote the same text as an indented continuation row.
+# The shape is a *session-creation* failure, so it can only be genuine before
+# the current turn has established execution evidence: an invalid model fails
+# session creation before the first spinner is ever drawn. ``_has_terminal_error``
+# therefore treats it as fatal only while ``execution_established`` is False.
+# Generic, column-zero failures stay authoritative either way, so a genuine
+# fatal error logged after an answer is never hidden.
+INDENTED_SESSION_START_ERROR_PATTERN = r"^[^\S\n]+Error:\s+Failed to start a session:"
+
+
+def _terminal_error_message(text: str, *, execution_established: bool = False) -> Optional[str]:
+    """Return the fatal provider error line represented by ``text``.
+
+    ``execution_established`` is the caller's per-turn latch: True once the
+    CURRENT turn has shown live execution evidence (``_execution_observed``,
+    ``_awaiting_turn`` cleared). It only downgrades the indented session-start
+    shape, whose contract is exactly "no execution can have happened in this
+    turn" — an invalid model fails before the first spinner. Assistant prose
+    that merely quotes the text therefore stays non-ERROR once the turn
+    provably ran, while a fresh turn (or one still awaiting its first activity)
+    surfaces the real failure as ERROR.
+    """
+    for line in text.splitlines():
+        if re.match(ERROR_PATTERN, line):
+            return line.strip()
+    if execution_established:
+        return None
+    for line in text.splitlines():
+        if re.match(INDENTED_SESSION_START_ERROR_PATTERN, line):
+            return line.strip()
+    return None
+
+
+def _has_terminal_error(text: str, *, execution_established: bool = False) -> bool:
+    """Whether ``text`` carries a fatal provider error."""
+
+    return _terminal_error_message(text, execution_established=execution_established) is not None
 
 
 class KimiCliProvider(BaseProvider):
@@ -837,6 +878,25 @@ class KimiCliProvider(BaseProvider):
         self._turn_activity_seen = False
         self.execution_evidence_ambiguous = False
         self._execution_observed = False
+
+    def _new_tui_ready_status(self) -> TerminalStatus:
+        """Verdict for a Kimi Code ready frame with no live spinner visible.
+
+        Completion requires the CURRENT turn's execution evidence. A ready
+        repaint — the previous answer or the status bar — can land after
+        dispatch but before the turn's first live spinner; ``_awaiting_turn``
+        marks that window, so it stays PROCESSING instead of reading a stale
+        COMPLETED that the StatusMonitor ready-latch would then pin for the
+        whole turn. ``_execution_observed`` is the latched proof and outlives
+        viewport / rolling-buffer eviction, so a finished turn keeps reading
+        COMPLETED after its answer bullet scrolls away. A terminal that never
+        dispatched (restored capture) keeps the settled-input verdict.
+        """
+        if self._execution_observed:
+            return TerminalStatus.COMPLETED
+        if self._awaiting_turn:
+            return TerminalStatus.PROCESSING
+        return TerminalStatus.COMPLETED if self._has_received_input else TerminalStatus.IDLE
 
     def notify_status_buffer_reset(self, epoch: int) -> None:
         """A new buffer generation still awaits actual activity, not a redraw."""
@@ -1259,11 +1319,25 @@ class KimiCliProvider(BaseProvider):
             system_prompt = profile.system_prompt
         system_prompt = self._apply_skill_prompt(system_prompt)
 
-        # Prepend security constraints for soft enforcement. Kimi Code's
-        # `tools`/`disallowedTools` frontmatter could enforce this natively, but
-        # CAO keeps the prompt-level guarantee for this change: kimi_cli is
-        # registered as a soft-enforcement provider and silently upgrading an
-        # advisory restriction to a hard one is a separate decision.
+        # Kimi Code's Markdown agent format declares a native ``tools``
+        # allowlist. Keep emitting it for forward compatibility and prompt/tool
+        # shaping, but do NOT rely on it as the security boundary: Kimi Code
+        # 2.1.1 interactive main-agent launches still expose write/exec tools
+        # under ``--auto`` despite this frontmatter. The matching profile list
+        # is therefore also enforced in the private runtime home's
+        # ``[tools].enabled`` by KimiCodeRuntimeHomeBuilder below.
+        # AgentProfile validates this field as ``list[str] | None``. Some
+        # provider tests and third-party seams use lightweight mocks whose
+        # undeclared ``.tools`` attribute is itself a MagicMock; treating that
+        # as an explicit empty policy would unexpectedly fail closed. Only a
+        # concrete list is an intentional native Kimi tool declaration.
+        profile_tools = profile.tools if profile is not None else None
+        native_tools = profile_tools if isinstance(profile_tools, list) else None
+
+        # Preserve the existing CAO-vocabulary prompt restriction as
+        # defense-in-depth.  ``native_tools`` is provider vocabulary while
+        # ``allowedTools`` is CAO vocabulary; profiles that do not opt into a
+        # native list retain today's soft-enforcement behavior unchanged.
         if self._allowed_tools is not None and "*" not in self._allowed_tools:
             from cli_agent_orchestrator.constants import SECURITY_PROMPT
             from cli_agent_orchestrator.utils.tool_mapping import (
@@ -1273,15 +1347,19 @@ class KimiCliProvider(BaseProvider):
             tool_constraint = f"\n{tool_constraint_instruction(self._allowed_tools)}\n"
             system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
 
-        if not system_prompt.strip():
+        if not system_prompt.strip() and native_tools is None:
             return None
 
         name = kimi_agent_name(self.terminal_id)
         description = json.dumps(f"CAO launch-scoped agent for terminal {self.terminal_id}"[:200])
+        tools_frontmatter = ""
+        if native_tools is not None:
+            tools_frontmatter = f"tools: {json.dumps(native_tools, ensure_ascii=False)}\n"
         return (
             "---\n"
             f"name: {name}\n"
             f"description: {description}\n"
+            f"{tools_frontmatter}"
             "---\n"
             "\n"
             "${base_prompt}\n"
@@ -1370,7 +1448,11 @@ class KimiCliProvider(BaseProvider):
         mcp_servers = profile.mcpServers if profile is not None else None
         builder = KimiCodeRuntimeHomeBuilder(source_home, terminal_dir)
         try:
-            runtime = builder.build(mcp_servers)
+            profile_tools = profile.tools if profile is not None else None
+            runtime = builder.build(
+                mcp_servers,
+                tool_allowlist=profile_tools if isinstance(profile_tools, list) else None,
+            )
         except RuntimeHomeError as exc:
             raise ProviderError(f"Failed to build Kimi Code runtime home: {exc}") from exc
         self._runtime_home_builder = builder
@@ -2011,6 +2093,23 @@ class KimiCliProvider(BaseProvider):
             return kt.SpinnerSemantics.CODE
         return kt.SpinnerSemantics.LEGACY
 
+    def get_error_message(self, buffer: str) -> Optional[str]:
+        """Return the exact Kimi error line that can justify ``ERROR``.
+
+        Reuse the status detector's ownership rule: an indented Kimi Code
+        session-start error is fatal only before this turn has execution
+        evidence, while a column-zero generic provider error remains fatal.
+        This prevents quoted assistant prose from becoming durable lifecycle
+        error text.
+        """
+
+        if not buffer:
+            return None
+        return _terminal_error_message(
+            strip_terminal_escapes(buffer),
+            execution_established=self._execution_observed,
+        )
+
     def get_status(self, output: str) -> TerminalStatus:
         """Get Kimi CLI status by analyzing terminal output.
 
@@ -2064,11 +2163,12 @@ class KimiCliProvider(BaseProvider):
         if re.search(NEW_TUI_STATUS_PATTERN, clean_output):
             # A response bullet appears only once a turn produces output
             # (thinking or response); the welcome banner / update nag have none.
-            # Latch it so a long response that scrolls the bullets out of the
-            # rolling buffer still reads COMPLETED rather than IDLE. Crucially,
-            # nothing latches at init, so a freshly-launched terminal reads IDLE
-            # (not COMPLETED), avoiding a premature-completion race when the
-            # first task is sent.
+            # Latch it so a settled capture (restored terminal, direct probe)
+            # distinguishes "input already happened" from a fresh boot. The
+            # COMPLETED verdict itself still needs execution evidence (see
+            # _new_tui_ready_status), and nothing latches at init, so a
+            # freshly-launched terminal reads IDLE rather than a premature
+            # COMPLETED when the first task is sent.
             #
             # The shared helper requires a bullet *plus a payload*, so a wrapped
             # status-bar fragment (`●)`) does not latch a terminal that never
@@ -2110,6 +2210,13 @@ class KimiCliProvider(BaseProvider):
             if spinner_in_tail or last_spinner > last_bullet:
                 return TerminalStatus.PROCESSING
 
+            # A genuine provider failure outranks the dispatch grace and the
+            # ready chrome. The indented session-start shape only counts before
+            # this turn has execution evidence; a top-level failure is fatal
+            # regardless (see _has_terminal_error).
+            if _has_terminal_error(clean_output, execution_established=self._execution_observed):
+                return TerminalStatus.ERROR
+
             # Dispatch grace: for a few seconds after send_input(), trust the
             # dispatch over the chrome. The paste repaints the status bar
             # (ready chrome lands LAST in the stream) before the turn's first
@@ -2147,10 +2254,7 @@ class KimiCliProvider(BaseProvider):
                     # fall through to the stream-derived ready status.
                     pass
 
-            if re.search(ERROR_PATTERN, clean_output, re.MULTILINE):
-                return TerminalStatus.ERROR
-
-            return TerminalStatus.COMPLETED if self._has_received_input else TerminalStatus.IDLE
+            return self._new_tui_ready_status()
 
         # --- Legacy emoji-prompt TUI ---
         # Check the bottom lines for the idle prompt.
@@ -2205,7 +2309,7 @@ class KimiCliProvider(BaseProvider):
             return TerminalStatus.IDLE
 
         # No idle prompt at bottom — check for errors before assuming processing
-        if re.search(ERROR_PATTERN, clean_output, re.MULTILINE):
+        if _has_terminal_error(clean_output, execution_established=self._execution_observed):
             return TerminalStatus.ERROR
 
         # No prompt visible and no error: Kimi is actively processing/streaming
@@ -2263,9 +2367,10 @@ class KimiCliProvider(BaseProvider):
         could own a quoted spinner. If we lose context before seeing activity,
         leave acceptance unconfirmed and disallow an unsafe full resend.
         """
-        if epoch != self._status_buffer_epoch or not self._awaiting_turn:
+        if epoch != self._status_buffer_epoch:
             return
-        self.has_execution_evidence(output)
+        if self._awaiting_turn:
+            self.has_execution_evidence(output)
         if truncated and not self._execution_observed:
             self.execution_evidence_ambiguous = True
 
@@ -2314,19 +2419,23 @@ class KimiCliProvider(BaseProvider):
             semantics = self._spinner_semantics()
             if any(_is_live_turn_spinner_line(ln, semantics) for ln in tail):
                 return TerminalStatus.PROCESSING
-            if re.search(ERROR_PATTERN, joined, re.MULTILINE):
+            if _has_terminal_error(joined, execution_established=self._execution_observed):
                 return TerminalStatus.ERROR
-            return (
-                TerminalStatus.COMPLETED if kt.has_response_marker(joined) else TerminalStatus.IDLE
-            )
+            # Distinguish a settled capture (restored terminal) from a fresh
+            # boot. Unlike the raw path, dispatch does not clear the composited
+            # screen, so this latch is only a "input happened" marker: the
+            # COMPLETED verdict still requires execution evidence, and a
+            # post-dispatch stale repaint stays PROCESSING via _awaiting_turn.
+            if not self._has_received_input and kt.has_response_marker(joined):
+                self._has_received_input = True
+            return self._new_tui_ready_status()
 
         # Legacy emoji-prompt TUI: bare ✨/💫 prompt visible at the bottom.
         if any(re.search(IDLE_PROMPT_PATTERN, ln) for ln in tail):
-            return (
-                TerminalStatus.COMPLETED if kt.has_response_marker(joined) else TerminalStatus.IDLE
-            )
+            owns_response = self._has_received_input or kt.has_response_marker(joined)
+            return TerminalStatus.COMPLETED if owns_response else TerminalStatus.IDLE
 
-        if re.search(ERROR_PATTERN, joined, re.MULTILINE):
+        if _has_terminal_error(joined, execution_established=self._execution_observed):
             return TerminalStatus.ERROR
         # No Kimi TUI chrome on the composited screen at all (boot screen, or a
         # torn-down pane back at the shell). On the RAW path "no prompt = still
