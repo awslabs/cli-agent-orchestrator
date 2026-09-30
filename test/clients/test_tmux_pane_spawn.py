@@ -189,7 +189,7 @@ class TestCreatePane:
         return session, host_window
 
     def test_marks_the_new_pane_with_the_terminal_name(self, tmux, tmp_path):
-        from cli_agent_orchestrator.clients.tmux import TERMINAL_MARK_OPTION
+        from cli_agent_orchestrator.clients.tmux import TERMINAL_ID_OPTION, TERMINAL_MARK_OPTION
 
         _, host_window = self._session(tmux)
         new_pane = host_window.split.return_value
@@ -197,7 +197,12 @@ class TestCreatePane:
         result = tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
 
         assert result == "coder-3"
-        new_pane.set_option.assert_called_once_with(TERMINAL_MARK_OPTION, "coder-3")
+        # The name mark addresses the pane for lookups; the id mark is what
+        # exact-identity teardown matches on, and both are stamped at creation.
+        assert new_pane.set_option.call_args_list == [
+            call(TERMINAL_MARK_OPTION, "coder-3"),
+            call(TERMINAL_ID_OPTION, "tid"),
+        ]
 
     def test_rebalances_the_window(self, tmux, tmp_path):
         _, host_window = self._session(tmux)
@@ -278,7 +283,7 @@ class TestCreatePane:
 
     def test_an_absent_host_window_is_created(self, tmux, tmp_path):
         """Nothing in CAO makes this window, so the first pane terminal must."""
-        from cli_agent_orchestrator.clients.tmux import TERMINAL_MARK_OPTION
+        from cli_agent_orchestrator.clients.tmux import TERMINAL_ID_OPTION, TERMINAL_MARK_OPTION
 
         session = session_with()
         tmux.server.sessions.get.return_value = session
@@ -286,7 +291,10 @@ class TestCreatePane:
 
         assert tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path)) == "coder-3"
         assert session.new_window.call_args.kwargs["window_name"] == "cao-agents"
-        new_pane.set_option.assert_called_once_with(TERMINAL_MARK_OPTION, "coder-3")
+        assert new_pane.set_option.call_args_list == [
+            call(TERMINAL_MARK_OPTION, "coder-3"),
+            call(TERMINAL_ID_OPTION, "tid"),
+        ]
 
     def test_a_full_host_window_asks_for_a_window_instead(self, tmux, tmp_path):
         """tmux refuses a split for want of space with a plain LibTmuxException."""

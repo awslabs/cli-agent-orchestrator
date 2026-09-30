@@ -127,6 +127,12 @@ class TestCreateTerminalCleanup:
 
         mock_tmux.session_exists.return_value = True
         mock_tmux.create_window.return_value = "w1"
+        # The mocked insert must publish the same incarnation as a real row.
+        mock_db_create.side_effect = lambda *args, **kwargs: (
+            _mock_get_terminal_metadata.return_value.update(
+                session_incarnation_id=kwargs["session_incarnation_id"]
+            )
+        )
         mock_load_profile.return_value = AgentProfile(name="dev", description="Dev")
 
         mock_provider = MagicMock()
@@ -239,6 +245,12 @@ class TestCreateTerminalCleanup:
 
         mock_tmux.session_exists.return_value = True
         mock_tmux.create_window.return_value = "w1"
+        # The mocked insert must publish the same incarnation as a real row.
+        mock_db_create.side_effect = lambda *args, **kwargs: (
+            _mock_get_terminal_metadata.return_value.update(
+                session_incarnation_id=kwargs["session_incarnation_id"]
+            )
+        )
         mock_tmux.kill_window.side_effect = Exception("kill_window error")
         mock_load_profile.return_value = AgentProfile(name="dev", description="Dev")
 

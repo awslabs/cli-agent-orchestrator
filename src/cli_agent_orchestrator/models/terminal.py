@@ -103,6 +103,20 @@ class Terminal(BaseModel):
     metadata: Optional[Dict[str, Any]] = Field(
         None, description="Free-form, consumer-defined JSON describing what this terminal is doing"
     )
+    deferred_init_failure: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "CAO-owned durable deferred-initialization failure metadata. "
+            "Separate from consumer metadata so clients cannot overwrite lifecycle truth."
+        ),
+    )
+    session_incarnation_id: Optional[str] = Field(
+        None,
+        description=(
+            "Durable CAO session incarnation identifier. Session names may be reused; "
+            "this value distinguishes retained rows from a later replacement."
+        ),
+    )
     status: Optional[TerminalStatus] = Field(
         None, description="Current terminal status (live only)"
     )

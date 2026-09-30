@@ -236,18 +236,28 @@ class FifoManager:
 
         logger.info("Started FIFO reader for terminal %s", terminal_id)
 
-    def stop_reader(self, terminal_id: str) -> None:
+    def stop_reader(self, terminal_id: str) -> bool:
         """Stop the reader thread (if running) and delete the FIFO file.
 
-        The unlink is best-effort and runs even when no in-memory reader is
-        tracked for ``terminal_id`` — e.g. retention cleanup iterating DB
-        terminals after a server restart, where ``_readers`` is empty but stale
-        ``*.fifo`` files may still be on disk. Without it those files would
-        accumulate unbounded.
+        Returns True only when the tracked reader has actually exited and the
+        FIFO path is gone. Most callers ignore this — they tear down for side
+        effects — but the deferred-init tombstone reclaimer uses it as a hard
+        completeness signal, so a leaked reader thread or an unremovable file
+        keeps the runtime cleanup retryable instead of being recorded as done.
+        Timed-out readers remain tracked, with their stop flags set, until a
+        later call observes their exit. They cannot be replaced in the meantime.
+
+        The unlink is best-effort about the ABSENT case and runs even when no
+        in-memory reader is tracked for ``terminal_id`` — e.g. retention cleanup
+        iterating DB terminals after a server restart, where ``_readers`` is
+        empty but stale ``*.fifo`` files may still be on disk. Without it those
+        files would accumulate unbounded.
         """
         with self._lock:
-            stop_flag = self._readers.pop(terminal_id, None)
-            thread = self._threads.pop(terminal_id, None)
+            stop_flag = self._readers.get(terminal_id)
+            thread = self._threads.get(terminal_id)
+            if stop_flag is not None:
+                stop_flag.set()
             # Drop watchdog bookkeeping so a re-created terminal starts clean and
             # the watchdog stops probing a gone pane.
             self._pane_probe.pop(terminal_id, None)
@@ -272,33 +282,52 @@ class FifoManager:
         # actually torn down at process shutdown (api/main.py's lifespan).
         fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
 
-        if stop_flag and thread:
+        complete = True
+        if thread is not None:
             # The reader never blocks in open()/read() (non-blocking fd +
-            # select with a timeout), so setting the flag is sufficient — it is
-            # observed within one poll interval. No write-side "wakeup" open is
+            # select with a timeout), so setting the flag is sufficient once
+            # any in-flight publish finishes. No write-side "wakeup" open is
             # needed; the old wakeup raced with the reader's reopen cycle and
             # could strand the thread forever in a blocking FIFO open on an
             # unlinked inode (issue #382).
-            stop_flag.set()
             thread.join(timeout=2.0)
             if thread.is_alive():
-                # Never silent: a leaked reader thread was how #382's wedge
-                # built up. With the non-blocking loop this should not happen.
+                # A slow in-flight publish can outlast the join even though
+                # FIFO I/O is non-blocking. Keep it tracked for the next stop.
                 logger.warning(
                     "FIFO reader thread for terminal %s did not exit "
-                    "within 2s; leaking a daemon thread",
+                    "within 2s; retaining it for cleanup retry",
                     terminal_id,
                 )
+                complete = False
             else:
                 logger.info("Stopped FIFO reader for terminal %s", terminal_id)
 
-        # Best-effort unlink regardless of whether a reader was tracked — when
-        # none is tracked there is no active reader holding the FIFO, so removing
-        # a stale file on disk is safe.
-        try:
-            fifo_path.unlink()
-        except OSError:
-            pass
+        with self._lock:
+            # Another stop may have finished this generation and a subsequent
+            # create may have replaced it while we joined. Never remove that
+            # replacement's references or FIFO, or report it as reclaimed.
+            if (
+                self._readers.get(terminal_id) is not stop_flag
+                or self._threads.get(terminal_id) is not thread
+            ):
+                return False
+            if complete:
+                self._readers.pop(terminal_id, None)
+                self._threads.pop(terminal_id, None)
+
+            # Unlink even for an untracked stale FIFO or a pending stop. Keep
+            # this under the creation lock so a new reader cannot claim the
+            # path between dropping the exited reader and removing its FIFO.
+            try:
+                fifo_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                complete = False
+                logger.warning("Failed to remove FIFO for terminal %s: %s", terminal_id, exc)
+
+        return complete
 
     def _reader_loop(self, terminal_id: str, fifo_path, stop_flag: threading.Event) -> None:
         """Read chunks from FIFO and publish to the event bus.
@@ -373,19 +402,16 @@ class FifoManager:
                         # schedule below — the watchdog cares whether the FIFO
                         # delivered data, not whether/when a batch flushed.
                         #
-                        # Guarded by membership rather than unconditional: if
-                        # stop_reader already popped this terminal (torn down
-                        # while this thread was mid-read, before it noticed
-                        # stop_flag), writing here would resurrect a dict entry
-                        # nothing will ever clean up again — a slow leak across
-                        # create/stop churn. The check-then-write must happen
-                        # under _lock as one critical section: a stop_reader()
-                        # pop between an unlocked check and the assignment
-                        # could still resurrect the entry (round-3 Copilot
-                        # review on #397). Cheap and non-blocking either way —
-                        # this is a plain dict write, not the slow tmux probe.
+                        # Only the current, active reader may update watchdog
+                        # state. stop_reader keeps timed-out readers tracked
+                        # but drops their liveness state immediately; a late
+                        # read must not resurrect it. Check the generation and
+                        # stop flag under the same lock as teardown and writes.
                         with self._lock:
-                            if terminal_id in self._readers:
+                            if (
+                                self._readers.get(terminal_id) is stop_flag
+                                and not stop_flag.is_set()
+                            ):
                                 self._last_data_at[terminal_id] = time.monotonic()
                                 self._ever_delivered[terminal_id] = True
                         if not pending:

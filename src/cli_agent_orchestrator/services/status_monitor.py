@@ -154,6 +154,11 @@ class StatusMonitor:
         # stale screen redraw.
         self._buffer_epochs: Dict[str, int] = {}
         self._last_status: Dict[str, TerminalStatus] = {}
+        # Generation in which PROCESSING was last established from provider
+        # output/screen evidence. A cached PROCESSING latch can survive
+        # notify_input_sent() into the next turn, so the status value alone is
+        # not enough to authorize stale-pane self-heal for that new turn.
+        self._processing_generation: Dict[str, int] = {}
         # Per-terminal flag: when True, the next provider-detected PROCESSING
         # is honored and stickiness reset. Set by notify_input_sent() whenever
         # external input is sent to the terminal (paste-bombed by send_input
@@ -186,6 +191,13 @@ class StatusMonitor:
         # still current, so a read that straddled a turn/output boundary can never
         # seed (or confirm) a candidate — see _fresh_capture_pane_status.
         self._pending_stale_capture: Dict[str, Tuple[TerminalStatus, float, int]] = {}
+        # A twice-confirmed narrow stale-capture verdict that still awaits the
+        # final generation/status apply gate.  Grok's detector is stateful, so
+        # speculative pane reads are side-effect-free and only this payload is
+        # allowed to commit provider state once the monitor is ready to latch it.
+        self._confirmed_stale_capture_commit: Dict[str, Tuple[int, object, str, TerminalStatus]] = (
+            {}
+        )
         # Per-terminal turn/output generation. Bumped under the lock by
         # notify_input_sent (a new turn began) and by _process_chunk (real output
         # arrived). A capture-pane verdict is only applied if the generation it was
@@ -345,6 +357,7 @@ class StatusMonitor:
             self._buffer_changed_at[terminal_id] = time.monotonic()
             self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
             self._pending_stale_capture.pop(terminal_id, None)
+            self._confirmed_stale_capture_commit.pop(terminal_id, None)
             # Pinned in the SAME critical section as the buffer snapshot above,
             # so a verdict from this content can only ever be applied to the turn
             # it belongs to (see _pin_cleared_turn_locked).
@@ -382,6 +395,7 @@ class StatusMonitor:
         buffer_epoch: Optional[int] = None,
         observed_turn: Optional[int] = None,
         observed_started: Optional[bool] = None,
+        processing_evidence: bool = True,
     ) -> None:
         """Apply the sticky-latch rules to a freshly detected status and publish
         on change. Shared by the raw and pyte detection paths.
@@ -449,6 +463,7 @@ class StatusMonitor:
                 buffer_epoch=buffer_epoch,
                 observed_turn=observed_turn,
                 observed_started=observed_started,
+                processing_evidence=processing_evidence,
             )
         if changed:
             # Publish outside the lock — subscribers must never be able to
@@ -468,6 +483,7 @@ class StatusMonitor:
         buffer_epoch: Optional[int] = None,
         observed_turn: Optional[int] = None,
         observed_started: Optional[bool] = None,
+        processing_evidence: bool = True,
     ) -> bool:
         """Sticky-latch core of _apply_detection. Caller MUST hold self._lock.
 
@@ -521,6 +537,13 @@ class StatusMonitor:
                 "rolling buffer it was read from has since been cleared"
             )
             return False
+
+        # #841: seeing real PROCESSING in this generation is what makes a later
+        # quiet-buffer capture eligible for recovery. Refreshed even if PROCESSING is
+        # already cached, but only for an observation that passed the ownership
+        # checks above and is a reading rather than an assumption.
+        if detected == TerminalStatus.PROCESSING and processing_evidence and observed:
+            self._processing_generation[terminal_id] = self._capture_generation.get(terminal_id, 0)
 
         # Turn bookkeeping runs on the VERDICT, before any early return, because a
         # verdict that leaves the latched status alone is still evidence about the
@@ -766,7 +789,41 @@ class StatusMonitor:
         if scr is None:
             import pyte
 
-            screen = pyte.Screen(PYTE_SCREEN_COLS, PYTE_SCREEN_ROWS)
+            class _StatusScreen(pyte.Screen):
+                """Passive compositor with a pyte 0.8.2 private-DSR shim.
+
+                ``pyte.Stream`` dispatches DEC-private device-status reports
+                (for example ``CSI ? 6 n``) as
+                ``report_device_status(..., private=True)``, but the released
+                0.8.2 ``Screen.report_device_status`` signature accepts only
+                ``mode``. Modern TUIs, including Kimi Code 2.1.x, emit those
+                queries during ordinary redraws, so an otherwise harmless DSR
+                used to raise ``TypeError`` and abort this chunk before screen
+                detection was scheduled.
+
+                CAO uses pyte only as a passive renderer; it never feeds the
+                terminal responses generated by DSR back to the provider. A
+                private DSR therefore has no useful side effect here and can be
+                ignored safely. Non-private DSR keeps pyte's normal behaviour.
+                """
+
+                def report_device_status(self, mode: int, **kwargs) -> None:
+                    if kwargs.get("private"):
+                        return
+                    super().report_device_status(mode)
+
+                def report_device_attributes(self, *modes: int, **kwargs) -> None:
+                    # ``pyte.Stream`` also forwards every CSI parameter in a
+                    # device-attributes sequence positionally. pyte 0.8.2's
+                    # Screen method accepts at most one, so a VT-style
+                    # ``CSI ? 1 ; 2 c`` / ``CSI 1 ; 2 c`` frame otherwise
+                    # raises before the rest of the TUI redraw is composited.
+                    # CAO never wires Screen.write_process_input back to the
+                    # provider, so DA replies have no useful side effect here;
+                    # consume the query/response shape exactly like private DSR.
+                    return
+
+            screen = _StatusScreen(PYTE_SCREEN_COLS, PYTE_SCREEN_ROWS)
             stream = pyte.Stream(screen)
             scr = (screen, stream)
             self._screens[terminal_id] = scr
@@ -1352,12 +1409,20 @@ class StatusMonitor:
             # get_status() that sampled the pane before this input must not stamp its
             # stale verdict over the new turn (and consume the revert arm just set).
             self._pending_stale_capture.pop(terminal_id, None)
+            self._confirmed_stale_capture_commit.pop(terminal_id, None)
             self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
         if assume_processing:
             # observed=False: this is an assumption about a paste, not a reading of
             # the agent. Letting it mark the turn started would hand the very next
             # stale ready frame the corroboration it needs to close the new turn.
-            self._apply_detection(terminal_id, TerminalStatus.PROCESSING, observed=False)
+            # processing_evidence=False: nor may it authorize stale-pane recovery
+            # for the new generation (#841).
+            self._apply_detection(
+                terminal_id,
+                TerminalStatus.PROCESSING,
+                observed=False,
+                processing_evidence=False,
+            )
         return turn
 
     def abort_turn(self, terminal_id: str, turn: int) -> None:
@@ -1506,6 +1571,7 @@ class StatusMonitor:
             self._buffers.pop(terminal_id, None)
             self._buffer_epochs.pop(terminal_id, None)
             self._last_status.pop(terminal_id, None)
+            self._processing_generation.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
             self._midburst_probe_at.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
@@ -1513,6 +1579,7 @@ class StatusMonitor:
             self._last_stale_capture_check.pop(terminal_id, None)
             self._buffer_changed_at.pop(terminal_id, None)
             self._pending_stale_capture.pop(terminal_id, None)
+            self._confirmed_stale_capture_commit.pop(terminal_id, None)
             self._capture_generation.pop(terminal_id, None)
             self._turn.pop(terminal_id, None)
             self._turn_done.pop(terminal_id, None)
@@ -1541,6 +1608,7 @@ class StatusMonitor:
         with self._lock:
             self._buffers[terminal_id] = ""
             self._last_status.pop(terminal_id, None)
+            self._processing_generation.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
             self._midburst_probe_at.pop(terminal_id, None)
             # Drop the rendered screen too so the relaunched CLI mode is
@@ -1550,6 +1618,7 @@ class StatusMonitor:
             self._last_stale_capture_check.pop(terminal_id, None)
             self._buffer_changed_at.pop(terminal_id, None)
             self._pending_stale_capture.pop(terminal_id, None)
+            self._confirmed_stale_capture_commit.pop(terminal_id, None)
             self._capture_generation.pop(terminal_id, None)
             # Turn counters are NOT reset: this is one terminal relaunching its CLI
             # in a different mode during init, and a caller may already be holding a
@@ -1786,19 +1855,46 @@ class StatusMonitor:
                                 and current_last_status == TerminalStatus.PROCESSING
                             )
                             if apply_ok:
-                                changed = self._apply_detection_locked(terminal_id, fresh_capture)
-                                # Read back what the latch ACCEPTED inside the same
-                                # critical section. The turn guard can refuse a
-                                # confirmed ready capture (dispatch assumed
-                                # processing, agent not yet seen working): the pane
-                                # is RETAINED state, so what it shows is the
-                                # previous turn. Returning fresh_capture regardless
-                                # handed exactly that refused stale verdict to the
-                                # API, the pre-send busy check and InboxService
-                                # while the latch stayed PROCESSING (PR #812
-                                # review) — the same rule the cheap-buffer branch
-                                # above already applies.
-                                latched_capture = self._last_status.get(terminal_id)
+                                commit_payload = self._confirmed_stale_capture_commit.pop(
+                                    terminal_id, None
+                                )
+                                if commit_payload is not None:
+                                    (
+                                        commit_generation,
+                                        commit_provider,
+                                        commit_output,
+                                        commit_expected,
+                                    ) = commit_payload
+                                    commit = getattr(
+                                        commit_provider,
+                                        "commit_stale_processing_capture",
+                                        None,
+                                    )
+                                    if (
+                                        commit_generation != generation
+                                        or commit_expected != fresh_capture
+                                        or not callable(commit)
+                                        or commit(commit_output, commit_expected) is not True
+                                    ):
+                                        apply_ok = False
+                                if apply_ok:
+                                    changed = self._apply_detection_locked(
+                                        terminal_id, fresh_capture
+                                    )
+                                    # Read back what the latch ACCEPTED inside the same
+                                    # critical section. The turn guard can refuse a
+                                    # confirmed ready capture (dispatch assumed
+                                    # processing, agent not yet seen working): the pane
+                                    # is RETAINED state, so what it shows is the
+                                    # previous turn. Returning fresh_capture regardless
+                                    # handed exactly that refused stale verdict to the
+                                    # API, the pre-send busy check and InboxService
+                                    # while the latch stayed PROCESSING (PR #812
+                                    # review) — the same rule the cheap-buffer branch
+                                    # above already applies.
+                                    latched_capture = self._last_status.get(terminal_id)
+                            else:
+                                self._confirmed_stale_capture_commit.pop(terminal_id, None)
                         if apply_ok:
                             if changed:
                                 bus.publish(
@@ -1859,10 +1955,12 @@ class StatusMonitor:
         of the turn. So the capture is routed through the two existing opt-in predicates:
         ``supports_screen_detection`` providers get their purpose-built
         ``get_status_from_screen()`` (calibrated for exactly this composited-viewport
-        shape), ``supports_direct_status_probe`` providers get ``get_status()`` (declared
-        safe on rendered snapshots — the same contract terminal_service's deferred-init
-        direct probe relies on), and providers with neither flag fail CLOSED: no capture,
-        no verdict, the terminal stays PROCESSING until the pipeline resolves it.
+        shape). Providers that opt into either ``supports_direct_status_probe`` or the
+        narrower ``supports_stale_processing_capture`` get ``get_status()``; the latter
+        exists for detectors that are snapshot-safe here but whose conservative
+        PROCESSING verdict is NOT valid proof that a newly delivered task started.
+        Providers with none of these flags fail CLOSED: no capture, no verdict, the
+        terminal stays PROCESSING until the pipeline resolves it.
         The read is viewport-only (``visible_only=True`` — capture-pane ``-S 0``): a
         ``tail_lines`` read would include scrollback ABOVE the viewport, and detectors
         that match anywhere in their input (kimi/kiro ERROR indicators) would resurrect
@@ -1904,13 +2002,28 @@ class StatusMonitor:
             return None
 
         use_screen = getattr(provider, "supports_screen_detection", False)
-        if not use_screen and not getattr(provider, "supports_direct_status_probe", False):
+        direct_probe = getattr(provider, "supports_direct_status_probe", False)
+        stale_capture = getattr(provider, "supports_stale_processing_capture", False) is True
+        if not use_screen and not direct_probe and not stale_capture:
             # Raw-stream-tuned detector with no snapshot-safe alternative (kiro_cli,
             # cursor_cli): a rendered frame cannot be trusted as its input — see the
             # docstring — so don't capture at all. Self-heal is opt-in via either flag,
             # never a guess; these providers stay PROCESSING until the pipeline resolves
             # them.
             return None
+
+        # The narrow stale-capture contract (currently Grok) is intentionally
+        # stronger than the legacy screen/direct-probe routes: a cached
+        # PROCESSING latch can survive notify_input_sent() across turn
+        # generations, so it may authorize recovery only when PROCESSING was
+        # actually re-established from provider evidence in THIS generation.
+        # Without this, a new turn whose paste was dropped can inherit turn 1's
+        # PROCESSING latch and then "heal" from turn 1's still-rendered
+        # completion pane.
+        if stale_capture:
+            with self._lock:
+                if self._processing_generation.get(terminal_id) != generation:
+                    return None
 
         try:
             from cli_agent_orchestrator.backends.registry import get_backend
@@ -1937,6 +2050,15 @@ class StatusMonitor:
         try:
             if use_screen:
                 detected = provider.get_status_from_screen(fresh_output.splitlines())
+            elif stale_capture:
+                probe = getattr(provider, "probe_stale_processing_capture", None)
+                if not callable(probe):
+                    # The narrow capability is transactional by contract: if a
+                    # provider opts in but cannot classify a pane without
+                    # mutating its detector state, fail closed rather than let
+                    # an unconfirmed sample advance turn bookkeeping.
+                    return None
+                detected = probe(fresh_output)
             else:
                 detected = provider.get_status(fresh_output)
         except Exception as e:
@@ -1953,6 +2075,7 @@ class StatusMonitor:
             with self._lock:
                 if self._capture_generation.get(terminal_id, 0) == generation:
                     self._pending_stale_capture.pop(terminal_id, None)
+                    self._confirmed_stale_capture_commit.pop(terminal_id, None)
             return detected
 
         now = time.monotonic()
@@ -1980,6 +2103,13 @@ class StatusMonitor:
                 # Second consecutive matching read, in time and within the same
                 # turn/output generation — honor it.
                 self._pending_stale_capture.pop(terminal_id, None)
+                if stale_capture:
+                    self._confirmed_stale_capture_commit[terminal_id] = (
+                        generation,
+                        provider,
+                        fresh_output,
+                        detected,
+                    )
                 confirmed = True
             else:
                 # First sighting, a different candidate than the pending one, or a

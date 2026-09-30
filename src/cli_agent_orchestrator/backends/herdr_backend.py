@@ -22,6 +22,8 @@ from typing import Dict, List, Optional, cast
 from cli_agent_orchestrator.backends.base import (
     TerminalBackend,
     TerminalBackendError,
+    TerminalCleanupOutcome,
+    TerminalCleanupResult,
     TerminalNotFoundError,
 )
 from cli_agent_orchestrator.constants import BRACKETED_PASTE_INCOMPATIBLE_SHELLS
@@ -448,6 +450,181 @@ class HerdrBackend(TerminalBackend):
             logger.info(f"Killed herdr pane {pane_id} for {session_name}:{window_name}")
             return True
         return False
+
+    def _fetch_identity_panes(self) -> Optional[List[Dict[str, object]]]:
+        """One fresh ``api snapshot``'s panes, or None when it cannot be trusted.
+
+        Identity decisions are only as good as the snapshot they read, so every
+        way the read can fail answers None rather than a partial list: non-zero
+        exit, a raising subprocess (timeout, missing binary, permissions),
+        unparseable JSON, or a shape that is not a dict with a list of pane
+        dicts. Never a cached snapshot, and never a label-derived one — a stale
+        or guessed view is exactly what turns "I could not see it" into "it is
+        gone".
+        """
+        try:
+            result = self._run_herdr(["api", "snapshot"], check=False)
+            if result.returncode != 0:
+                return None
+            data = self._parse_herdr_json(result.stdout)
+            if not isinstance(data, dict):
+                return None
+            snapshot = data.get("snapshot", data)
+            if not isinstance(snapshot, dict):
+                return None
+            panes = snapshot.get("panes")
+            if not isinstance(panes, list):
+                return None
+            typed: List[Dict[str, object]] = []
+            for pane in panes:
+                if not isinstance(pane, dict):
+                    return None
+                typed.append(pane)
+            return typed
+        except (
+            TerminalBackendError,
+            subprocess.SubprocessError,
+            OSError,
+            json.JSONDecodeError,
+            AttributeError,
+            TypeError,
+            KeyError,
+        ):
+            return None
+
+    @staticmethod
+    def _matching_panes(
+        panes: List[Dict[str, object]], terminal_id: str
+    ) -> Optional[List[Dict[str, object]]]:
+        """Panes in a snapshot carrying ``terminal_id``, or None if malformed.
+
+        A pane whose ``terminal_id`` is present but not a string is not an
+        identity this code can compare, so the whole snapshot's identity is
+        reported as malformed (None) rather than silently read as "no such
+        terminal". Missing/empty ids are ordinary non-CAO panes and are simply
+        not matches.
+        """
+        matches: List[Dict[str, object]] = []
+        for pane in panes:
+            value = pane.get("terminal_id")
+            if value is not None and not isinstance(value, str):
+                return None
+            if value == terminal_id:
+                matches.append(pane)
+        return matches
+
+    def cleanup_terminal_exact(
+        self,
+        terminal_id: str,
+        session_name: Optional[str] = None,
+        window_name: Optional[str] = None,
+        *,
+        close: bool = True,
+    ) -> TerminalCleanupResult:
+        """Close the exact herdr pane owned by ``terminal_id`` and confirm it.
+
+        Identity comes from the pane's own ``terminal_id`` in a FRESH
+        ``api snapshot``. The workspace/tab labels are deliberately not used:
+        they are reusable, and a deferred-init tombstone routinely shares its
+        session name (and tab label) with a later, unrelated replacement. A
+        tombstone must never be torn down by label.
+
+        Duplicate matches, a match with no usable ``pane_id``, or an
+        unreadable/malformed snapshot all return ``UNKNOWN`` and close nothing.
+        ``ABSENT`` is returned only when a trustworthy snapshot enumerates no
+        pane carrying the id. A close is confirmed against a SECOND fresh
+        snapshot: absence after the attempt is ``DELETED``, continued presence is
+        ``STILL_PRESENT``, and an unconfirmable result is ``UNKNOWN``.
+
+        KNOWN LIMITATION / TOCTOU: herdr exposes no atomic compare-and-close, so
+        the pane is proven at snapshot time and closed by ``pane_id`` a moment
+        later. If that pane dies and another is created reusing the same
+        ``pane_id`` in between, the close can hit the replacement. The
+        post-close snapshot is what the caller's verdict is based on, so the
+        report stays truthful, but the window itself cannot be closed from here.
+        That is why this path is used only for destructive teardown of a
+        tombstone we already own, and why every uncertain answer stays retryable
+        instead of being recorded as reclaimed.
+        """
+        if not terminal_id:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                "no terminal id to prove identity with",
+            )
+
+        panes = self._fetch_identity_panes()
+        if panes is None:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                "herdr api snapshot unavailable or malformed; cannot prove "
+                f"terminal identity for {terminal_id}",
+            )
+
+        matches = self._matching_panes(panes, terminal_id)
+        if matches is None:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                "a herdr pane reports a non-string terminal id; the snapshot's "
+                f"identity is untrustworthy, so absence of {terminal_id} cannot be proven",
+            )
+        if len(matches) > 1:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                f"{len(matches)} herdr panes report terminal id {terminal_id}; "
+                "refusing to close an ambiguous identity",
+            )
+        if not matches:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.ABSENT,
+                f"no herdr pane carries terminal id {terminal_id} in a fresh snapshot",
+            )
+
+        pane_id = matches[0].get("pane_id")
+        if not isinstance(pane_id, str) or not pane_id:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                f"herdr pane for terminal id {terminal_id} has no usable pane id",
+            )
+
+        if not close:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.STILL_PRESENT,
+                f"herdr pane {pane_id} carries {terminal_id}; close not requested",
+            )
+
+        close_error: Optional[str] = None
+        try:
+            result = self._run_herdr(["pane", "close", pane_id], check=False)
+            if result.returncode != 0:
+                close_error = f"pane close exited {result.returncode}"
+        except Exception as e:  # noqa: BLE001 — the confirm below decides the outcome
+            close_error = str(e)
+
+        confirmed = self._fetch_identity_panes()
+        if confirmed is None:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                f"closed herdr pane {pane_id} for {terminal_id} but could not confirm "
+                f"it is gone{'' if close_error is None else f' (close error: {close_error})'}",
+            )
+        confirmed_matches = self._matching_panes(confirmed, terminal_id)
+        if confirmed_matches is None:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.UNKNOWN,
+                f"closed herdr pane {pane_id} for {terminal_id} but the confirming "
+                "snapshot's identity is malformed",
+            )
+        if confirmed_matches:
+            return TerminalCleanupResult(
+                TerminalCleanupOutcome.STILL_PRESENT,
+                f"herdr still reports terminal id {terminal_id} after closing pane "
+                f"{pane_id}{'' if close_error is None else f' (close error: {close_error})'}",
+            )
+        return TerminalCleanupResult(
+            TerminalCleanupOutcome.DELETED,
+            f"closed herdr pane {pane_id} carrying {terminal_id}, confirmed absent in a "
+            f"fresh snapshot{'' if close_error is None else f' (close reported: {close_error})'}",
+        )
 
     # --- Input ---
 

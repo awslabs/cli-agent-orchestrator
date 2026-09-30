@@ -1876,6 +1876,131 @@ def test_post_commit_window_rollback_leaves_a_window_it_no_longer_owns_alone(
     assert runtime.is_fully_live("t-peer")
 
 
+@pytest.mark.parametrize("new_session", [True, False], ids=["session", "window"])
+def test_failure_rollback_does_not_treat_a_retained_row_as_current_ownership(
+    real_db, runtime, monkeypatch, new_session
+):
+    """A retained row from the old generation cannot authorize killing its replacement."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    name = "cao-retained-rebuilt"
+    if not new_session:
+        _seed(backend, name, [("t-peer", "w-peer")], runtime)
+    _fail_in_provider_init(monkeypatch)
+    captured = {}
+
+    def _retain_and_rebuild(tid):
+        runtime.fifo_readers.discard(tid)
+        row = database.get_terminal_metadata(tid)
+        captured["old_incarnation"] = row["session_incarnation_id"]
+        # Unlike the older row-deletion tests, keep this row as a retry handle.
+        # Reuse even the window label to ensure a name-only check is insufficient.
+        backend.kill_session(name)
+        backend.add_session(name, {row["tmux_window"]})
+        database.create_terminal(
+            terminal_id="t-new",
+            tmux_session=name,
+            tmux_window=row["tmux_window"],
+            provider="claude_code",
+            agent_profile="developer",
+            session_incarnation_id="inc-new",
+            new_session_incarnation=True,
+        )
+        session_env.set_session_env(name, {"KEEP": "replacement"})
+
+    monkeypatch.setattr(terminal_service.fifo_manager, "stop_reader", _retain_and_rebuild)
+    # A deferred provider cleanup must retain its old row for a later retry.
+    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", lambda tid: False)
+
+    with pytest.raises(RuntimeError, match="provider init boom"):
+        _create_in_thread_kw(session_name=name, new_session=new_session)
+
+    assert captured["old_incarnation"] != "inc-new"
+    assert backend.kill_session_calls == 1  # Only the simulated teardown.
+    assert backend.kill_window_calls == 0
+    assert backend.session_exists(name)
+    assert database.get_terminal_metadata("t-new") is not None
+    assert database.get_session_incarnation(name) == "inc-new"
+    assert session_env.get_session_env(name) == {"KEEP": "replacement"}
+
+
+@pytest.mark.parametrize("new_session", [True, False], ids=["session", "window"])
+def test_cancelled_failure_rollback_clears_external_owner_and_retains_cleanup_retry(
+    real_db, runtime, monkeypatch, new_session
+):
+    """Cancellation protection must preserve the PR's owner and retry bookkeeping."""
+    import asyncio
+
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    name = "cao-owner-cleanup-retry"
+    if not new_session:
+        _seed(backend, name, [("t-peer", "w-peer")], runtime)
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    captured = {}
+
+    def _hold_lock():
+        with session_lock.session_lifecycle_lock(name):
+            lock_held.set()
+            release_lock.wait(DEADLOCK_TIMEOUT)
+
+    holder = threading.Thread(target=_hold_lock, daemon=True)
+
+    def _fail_before_scheduling(provider, tid, *args, **kwargs):
+        captured["terminal_id"] = tid
+        assert terminal_service._is_deferred_init_external_owner_active(tid)
+        holder.start()
+        assert lock_held.wait(DEADLOCK_TIMEOUT)
+        raise RuntimeError("provider construction boom")
+
+    monkeypatch.setattr(
+        terminal_service.provider_manager, "create_provider", _fail_before_scheduling
+    )
+    cleanup = MagicMock(return_value=False)
+    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", cleanup)
+
+    async def scenario():
+        task = asyncio.create_task(
+            terminal_service.create_terminal(
+                provider="grok_cli",
+                agent_profile="developer",
+                session_name=name,
+                new_session=new_session,
+                defer_init=True,
+            )
+        )
+        await asyncio.to_thread(_wait_until_lock_contended, name, 2)
+        task.cancel()
+        release_lock.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(task), DEADLOCK_TIMEOUT)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release_lock.set()
+        holder.join(timeout=DEADLOCK_TIMEOUT)
+        if "terminal_id" in captured:
+            was_active = terminal_service._is_deferred_init_external_owner_active(
+                captured["terminal_id"]
+            )
+            terminal_service._clear_deferred_init_external_owner_active(captured["terminal_id"])
+
+    tid = captured["terminal_id"]
+    assert not was_active
+    cleanup.assert_called_once_with(tid)
+    assert database.get_terminal_metadata(tid) is not None
+    assert tid not in runtime.fifo_readers
+    assert tid not in runtime.status_buffers
+    if new_session:
+        assert not backend.session_exists(name)
+    else:
+        assert backend.windows(name) == {"w-peer"}
+        assert runtime.is_fully_live("t-peer")
+    assert session_lock._session_locks == {}
+
+
 def test_post_commit_failure_rollback_waits_for_the_lock_off_the_event_loop(
     real_db, runtime, monkeypatch
 ):
@@ -2025,6 +2150,81 @@ def test_cancelled_create_compensation_leaves_a_replacement_alone(real_db, runti
     assert backend.windows(name) == {"w-new"}
     assert {r["id"] for r in database.list_terminals_by_session(name)} == {"t-new"}
     assert session_env.get_session_env(name) == {"KEEP": "me"}
+    assert session_lock._session_locks == {}
+
+
+@pytest.mark.parametrize("created_session", [True, False], ids=["session", "window"])
+def test_cancelled_create_compensation_reclaims_only_its_retained_pending_row(
+    real_db, runtime, created_session
+):
+    """The old pending row is ours to delete, but its replacement runtime is not."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    name = "cao-cancel-retained"
+    for tid, incarnation in (("t-old", "inc-old"), ("t-new", "inc-new")):
+        database.create_terminal(
+            terminal_id=tid,
+            tmux_session=name,
+            tmux_window="same-window",
+            provider="grok_cli",
+            agent_profile="developer",
+            deferred_init_external_owner=True,
+            session_incarnation_id=incarnation,
+            new_session_incarnation=True,
+        )
+    backend.add_session(name, {"same-window"})
+    session_env.set_session_env(name, {"KEEP": "replacement"})
+
+    terminal_service._roll_back_cancelled_create(
+        name, "t-old", "same-window", created_session=created_session
+    )
+
+    assert backend.kill_session_calls == 0
+    assert backend.kill_window_calls == 0
+    assert backend.windows(name) == {"same-window"}
+    assert database.get_terminal_metadata("t-old") is None
+    assert database.get_terminal_metadata("t-new") is not None
+    assert session_env.get_session_env(name) == {"KEEP": "replacement"}
+    assert session_lock._session_locks == {}
+
+
+@pytest.mark.parametrize("pointer_unavailable", ["missing", "raises"])
+def test_failure_rollback_does_not_kill_without_a_durable_ownership_witness(
+    real_db, runtime, monkeypatch, pointer_unavailable
+):
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    name = "cao-unknown-incarnation"
+    database.create_terminal(
+        terminal_id="t-old",
+        tmux_session=name,
+        tmux_window="w-old",
+        provider="grok_cli",
+        session_incarnation_id="inc-old",
+        new_session_incarnation=True,
+    )
+    backend.add_session(name, {"w-old"})
+    session_env.set_session_env(name, {"KEEP": "unverified"})
+    read_pointer = MagicMock(return_value=None)
+    if pointer_unavailable == "raises":
+        read_pointer.side_effect = RuntimeError("pointer read unavailable")
+    monkeypatch.setattr(terminal_service, "get_session_incarnation", read_pointer)
+    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", lambda tid: False)
+
+    terminal_service._roll_back_failed_create(
+        "t-old",
+        name,
+        "w-old",
+        session_created=True,
+        window_created=False,
+        worktree_repo_root=None,
+    )
+
+    assert backend.kill_session_calls == 0
+    assert backend.kill_window_calls == 0
+    assert backend.windows(name) == {"w-old"}
+    assert database.get_terminal_metadata("t-old") is not None
+    assert session_env.get_session_env(name) == {"KEEP": "unverified"}
     assert session_lock._session_locks == {}
 
 

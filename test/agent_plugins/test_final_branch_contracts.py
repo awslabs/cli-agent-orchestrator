@@ -2,7 +2,7 @@
 
 A note on method, because the first attempt at several of these was wrong in a way
 worth recording: ``affected_sessions`` imports ``list_sessions``,
-``list_terminals_by_session`` and ``load_agent_profile`` **inside the function
+``list_current_session_terminals`` and ``load_agent_profile`` **inside the function
 body**, so ``monkeypatch.setattr(installer, "list_sessions", ...)`` creates a new
 module attribute that the real code never reads. With ``raising=False`` that is
 silent — the test passes and asserts nothing. Everything here patches the module
@@ -32,7 +32,7 @@ from .conftest import build_plugin
 from .test_store import make_record
 
 SESSION_SRC = "cli_agent_orchestrator.services.session_service.list_sessions"
-TERMINALS_SRC = "cli_agent_orchestrator.clients.database.list_terminals_by_session"
+TERMINALS_SRC = "cli_agent_orchestrator.services.session_service.list_current_session_terminals"
 PROFILE_SRC = "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile"
 
 
@@ -45,7 +45,8 @@ class TestAffectedSessionsWalksRealLiveState:
     def test_a_terminal_with_no_profile_is_skipped(self, claimed, monkeypatch):
         monkeypatch.setattr(SESSION_SRC, lambda: [{"name": "s1"}])
         monkeypatch.setattr(
-            TERMINALS_SRC, lambda _s: [{"id": "t1"}, {"id": "t2", "agent_profile": ""}]
+            TERMINALS_SRC,
+            lambda _s, **_kwargs: [{"id": "t1"}, {"id": "t2", "agent_profile": ""}],
         )
 
         assert affected_sessions("demo", store=claimed) == []
@@ -53,7 +54,10 @@ class TestAffectedSessionsWalksRealLiveState:
     def test_a_terminal_whose_profile_vanished_is_skipped(self, claimed, monkeypatch):
         """Unresolvable filter: the profile is gone, so nothing can be asserted."""
         monkeypatch.setattr(SESSION_SRC, lambda: [{"name": "s1"}])
-        monkeypatch.setattr(TERMINALS_SRC, lambda _s: [{"id": "t1", "agent_profile": "vanished"}])
+        monkeypatch.setattr(
+            TERMINALS_SRC,
+            lambda _s, **_kwargs: [{"id": "t1", "agent_profile": "vanished"}],
+        )
         monkeypatch.setattr(
             PROFILE_SRC, lambda _n: (_ for _ in ()).throw(FileNotFoundError("vanished"))
         )
@@ -68,7 +72,10 @@ class TestAffectedSessionsWalksRealLiveState:
             skills = None
 
         monkeypatch.setattr(SESSION_SRC, lambda: [{"name": "s1"}])
-        monkeypatch.setattr(TERMINALS_SRC, lambda _s: [{"id": "t1", "agent_profile": "worker"}])
+        monkeypatch.setattr(
+            TERMINALS_SRC,
+            lambda _s, **_kwargs: [{"id": "t1", "agent_profile": "worker"}],
+        )
         monkeypatch.setattr(PROFILE_SRC, lambda _n: Profile())
 
         affected = affected_sessions("demo", store=claimed)
@@ -85,7 +92,7 @@ class TestAffectedSessionsWalksRealLiveState:
         monkeypatch.setattr(SESSION_SRC, lambda: [{"name": "s1"}])
         monkeypatch.setattr(
             TERMINALS_SRC,
-            lambda _s: [{"id": f"t{i}", "agent_profile": "worker"} for i in range(3)],
+            lambda _s, **_kwargs: [{"id": f"t{i}", "agent_profile": "worker"} for i in range(3)],
         )
 
         def counting(name):

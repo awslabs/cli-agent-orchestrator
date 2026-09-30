@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import terminal_service as ts
 
 
@@ -365,6 +366,22 @@ class TestConfirmWorkerStartedOrResubmit:
 
 class TestWorkerIsStartedDirect:
     """Unit tests for the capture-pane direct status probe."""
+
+    def test_execution_evidence_provider_error_stops_redelivery(self):
+        provider = MagicMock(
+            supports_direct_status_probe=True,
+            requires_execution_evidence=True,
+        )
+        with (
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "s1", "tmux_window": "w1"},
+            ),
+            patch.object(ts.status_monitor, "probe_execution_evidence", return_value=False),
+            patch.object(ts.status_monitor, "get_status", return_value=TerminalStatus.ERROR),
+        ):
+            assert ts._worker_is_started_direct("t1", provider) is True
 
     def test_returns_false_when_metadata_is_none(self):
         with patch.object(ts, "get_terminal_metadata", return_value=None):

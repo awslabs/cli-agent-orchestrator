@@ -1271,7 +1271,7 @@ class TestListTerminalsInSession:
             {"id": "abcd5678", "tmux_session": "s1", "provider": "claude_code"},
         ]
         with patch(
-            "cli_agent_orchestrator.clients.database.list_terminals_by_session",
+            "cli_agent_orchestrator.services.session_service.list_current_session_terminals",
             return_value=mock_terminals,
         ):
             response = client.get("/sessions/s1/terminals")
@@ -1283,7 +1283,7 @@ class TestListTerminalsInSession:
     def test_list_terminals_empty(self, client):
         """GET /sessions/{name}/terminals returns empty list."""
         with patch(
-            "cli_agent_orchestrator.clients.database.list_terminals_by_session",
+            "cli_agent_orchestrator.services.session_service.list_current_session_terminals",
             return_value=[],
         ):
             response = client.get("/sessions/empty-session/terminals")
@@ -1294,7 +1294,7 @@ class TestListTerminalsInSession:
     def test_list_terminals_server_error(self, client):
         """GET /sessions/{name}/terminals returns 500 on error."""
         with patch(
-            "cli_agent_orchestrator.clients.database.list_terminals_by_session",
+            "cli_agent_orchestrator.services.session_service.list_current_session_terminals",
             side_effect=Exception("DB error"),
         ):
             response = client.get("/sessions/s1/terminals")

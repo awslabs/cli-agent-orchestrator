@@ -36,7 +36,7 @@ class TestStopReader:
         assert fifo_path.exists()
 
         # No create_reader() was called, so _readers/_threads are empty.
-        manager.stop_reader("term-stale")
+        assert manager.stop_reader("term-stale") is True
 
         assert not fifo_path.exists()
 
@@ -47,7 +47,150 @@ class TestStopReader:
         manager = FifoManager()
 
         # Must not raise even though there is nothing to stop or unlink.
-        manager.stop_reader("term-missing")
+        assert manager.stop_reader("term-missing") is True
+
+    def test_unlink_failure_remains_retryable(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(fr, "FIFO_DIR", tmp_path)
+        manager = FifoManager()
+        fifo_path = tmp_path / "term-unlink-retry.fifo"
+        os.mkfifo(fifo_path)
+
+        with patch.object(type(fifo_path), "unlink", side_effect=PermissionError("busy")):
+            assert manager.stop_reader("term-unlink-retry") is False
+
+        assert fifo_path.exists()
+        assert manager.stop_reader("term-unlink-retry") is True
+        assert not fifo_path.exists()
+
+    @pytest.mark.parametrize("blocked_at", ["read", "publish"])
+    def test_retries_track_reader_until_thread_exits(self, tmp_path, monkeypatch, blocked_at):
+        """A timed-out stop must stay incomplete until the real FIFO reader exits."""
+        monkeypatch.setattr(fr, "FIFO_DIR", tmp_path)
+        manager = FifoManager()
+        monkeypatch.setattr(manager, "_ensure_watchdog", lambda: None)
+        blocked = threading.Event()
+        release = threading.Event()
+        real_read = os.read
+
+        def wait_for_release():
+            blocked.set()
+            assert release.wait(timeout=5.0)
+
+        def delayed_read(fd, size):
+            data = real_read(fd, size)
+            if blocked_at == "read":
+                wait_for_release()
+            return data
+
+        def delayed_publish(topic, payload):
+            if blocked_at == "publish":
+                wait_for_release()
+
+        monkeypatch.setattr(fr.os, "read", delayed_read)
+        monkeypatch.setattr(fr.bus, "publish", delayed_publish)
+        terminal_id = "term-stop-retry"
+        manager.create_reader(terminal_id, pane_probe=lambda: "pane", rearm=lambda: None)
+        thread = manager._threads[terminal_id]
+        stop_flag = manager._readers[terminal_id]
+        real_join = thread.join
+        # Keep the regression fast while still joining the actual live thread.
+        monkeypatch.setattr(thread, "join", lambda timeout=None: real_join(timeout=0.01))
+        fifo_path = tmp_path / f"{terminal_id}.fifo"
+        writer = os.open(fifo_path, os.O_RDWR | os.O_NONBLOCK)
+        try:
+            os.write(writer, b"last output")
+            assert blocked.wait(timeout=2.0)
+
+            assert manager.stop_reader(terminal_id) is False
+            assert manager.stop_reader(terminal_id) is False
+            assert thread.is_alive()
+            assert manager._threads[terminal_id] is thread
+            assert manager._readers[terminal_id] is stop_flag
+            assert stop_flag.is_set()
+            assert not fifo_path.exists()
+            for state in (
+                manager._pane_probe,
+                manager._rearm,
+                manager._liveness,
+                manager._last_data_at,
+                manager._registered_at,
+                manager._ever_delivered,
+                manager._cold_start_attempts,
+                manager._rearm_failures,
+                manager._probe_failures,
+            ):
+                assert terminal_id not in state
+
+            # The pending generation still owns this ID, even after unlink.
+            manager.create_reader(terminal_id)
+            assert manager._threads[terminal_id] is thread
+            assert not fifo_path.exists()
+
+            release.set()
+            real_join(timeout=2.0)
+            assert not thread.is_alive()
+            # A read that completes after stop must not revive watchdog state.
+            assert terminal_id not in manager._last_data_at
+            assert terminal_id not in manager._ever_delivered
+            assert manager.stop_reader(terminal_id) is True
+            assert terminal_id not in manager._readers
+            assert terminal_id not in manager._threads
+
+            manager.create_reader(terminal_id)
+            assert manager._threads[terminal_id] is not thread
+            assert fifo_path.exists()
+        finally:
+            release.set()
+            os.close(writer)
+            real_join(timeout=2.0)
+            manager.stop_reader(terminal_id)
+
+    def test_concurrent_stop_does_not_remove_replacement(self, tmp_path, monkeypatch):
+        """A late stop of the previous generation cannot unlink a replacement FIFO."""
+        monkeypatch.setattr(fr, "FIFO_DIR", tmp_path)
+        manager = FifoManager()
+        manager.create_reader("term-replaced")
+        old_thread = manager._threads["term-replaced"]
+        real_join = old_thread.join
+        joined = threading.Event()
+        release = threading.Event()
+        results = []
+
+        def delayed_join(timeout=None):
+            real_join(timeout=timeout)
+            if threading.current_thread() is stopper:
+                joined.set()
+                assert release.wait(timeout=5.0)
+
+        monkeypatch.setattr(old_thread, "join", delayed_join)
+        stopper = threading.Thread(
+            target=lambda: results.append(manager.stop_reader("term-replaced")), daemon=True
+        )
+        try:
+            stopper.start()
+            assert joined.wait(timeout=3.0)
+            assert not old_thread.is_alive()
+            assert manager.stop_reader("term-replaced") is True
+            manager.create_reader("term-replaced")
+            new_thread = manager._threads["term-replaced"]
+            new_stop_flag = manager._readers["term-replaced"]
+            fifo_path = tmp_path / "term-replaced.fifo"
+            inode = fifo_path.stat().st_ino
+
+            release.set()
+            stopper.join(timeout=2.0)
+
+            assert not stopper.is_alive()
+            assert results == [False]
+            assert manager._threads["term-replaced"] is new_thread
+            assert manager._readers["term-replaced"] is new_stop_flag
+            assert not new_stop_flag.is_set()
+            assert fifo_path.stat().st_ino == inode
+            assert "term-replaced" in manager._last_data_at
+        finally:
+            release.set()
+            stopper.join(timeout=3.0)
+            manager.stop_reader("term-replaced")
 
 
 class TestReaderThreadLifecycle:
@@ -982,7 +1125,8 @@ class TestConcurrencyRaces:
         manager = FifoManager()
         terminal_id = "term-race"
         # Enroll by hand (no create_reader/watchdog needed for this race).
-        manager._readers[terminal_id] = threading.Event()
+        stop_flag = threading.Event()
+        manager._readers[terminal_id] = stop_flag
         manager._last_data_at[terminal_id] = 0.0
 
         entered_write_section = threading.Event()
@@ -993,8 +1137,6 @@ class TestConcurrencyRaces:
             entered_write_section.set()
             release_write_section.wait(timeout=2.0)
             return real_monotonic()
-
-        stop_flag = threading.Event()
 
         with (
             patch("cli_agent_orchestrator.services.fifo_reader.bus.publish"),
