@@ -106,3 +106,38 @@ def test_the_runtime_token_never_reaches_a_pane():
     env = {}
     TmuxClient._merge_extra_env(env, {TOKEN_ENV: "secret", "OK": "y"})
     assert env == {"OK": "y"}
+
+
+def test_rows_whose_pane_died_with_the_last_container_are_dropped(db, monkeypatch):
+    # The runtime's state volume outlives the container; its tmux does not.
+    from cli_agent_orchestrator.backends import registry as backend_registry
+    from cli_agent_orchestrator.runtime_channel import bridge as bridge_mod
+
+    _, engine = db
+    database.init_runtime_db()
+    database.create_terminal("aaaa0001", "cao-live", "dev-a", "mock_cli", "developer")
+    database.create_terminal("aaaa0002", "cao-gone", "dev-b", "mock_cli", "developer")
+
+    class Tmux:
+        def session_exists_strict(self, name):
+            return name == "cao-live"
+
+    monkeypatch.setattr(backend_registry, "_backend", Tmux())
+    assert bridge_mod._drop_stale_rows() == 1
+    assert [t["id"] for t in database.list_all_terminals()] == ["aaaa0001"]
+
+
+def test_rows_are_kept_when_tmux_cannot_be_asked(db, monkeypatch):
+    from cli_agent_orchestrator.backends import registry as backend_registry
+    from cli_agent_orchestrator.runtime_channel import bridge as bridge_mod
+
+    database.init_runtime_db()
+    database.create_terminal("aaaa0001", "cao-a", "dev-a", "mock_cli", "developer")
+
+    class Broken:
+        def session_exists_strict(self, name):
+            raise RuntimeError("tmux did not answer")
+
+    monkeypatch.setattr(backend_registry, "_backend", Broken())
+    assert bridge_mod._drop_stale_rows() == 0
+    assert [t["id"] for t in database.list_all_terminals()] == ["aaaa0001"]
