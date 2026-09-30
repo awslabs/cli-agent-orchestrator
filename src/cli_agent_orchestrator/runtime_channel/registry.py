@@ -85,7 +85,14 @@ class RuntimeConnection:
                 # finds a waiter.
                 self._pending[op_id] = future
                 try:
-                    await self._send_text(encode(frame))
+                    # Bounded too: a runtime that stops reading stalls the send
+                    # under backpressure, and the lock with it.
+                    await asyncio.wait_for(self._send_text(encode(frame)), timeout)
+                except asyncio.TimeoutError as exc:
+                    raise RemoteOutcomeUnknownError(
+                        f"sending {command_type.value} to runtime {self.runtime_id} timed out; "
+                        "outcome unknown"
+                    ) from exc
                 except Exception as exc:  # noqa: BLE001 - the frame may have been written
                     raise RemoteOutcomeUnknownError(
                         f"sending {command_type.value} to runtime {self.runtime_id} failed: {exc}"

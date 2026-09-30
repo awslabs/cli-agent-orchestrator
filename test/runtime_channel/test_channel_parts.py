@@ -142,6 +142,24 @@ async def test_a_disconnect_fails_waiting_calls_as_unknown():
 
 
 @pytest.mark.asyncio
+async def test_a_send_the_runtime_never_reads_times_out_and_frees_the_channel():
+    registry = RuntimeRegistry()
+
+    async def stalled(text):
+        await asyncio.Event().wait()  # backpressure: the runtime stopped reading
+
+    conn = registry.register("rt-1", stalled)
+    registry.activate(conn)
+    first = conn.call(CommandType.INPUT, {"message": "a"}, "t1", timeout=0.2)
+    with pytest.raises(RemoteOutcomeUnknownError):
+        await asyncio.wait_for(first, 2)
+    # The send lock is free again: the next command gets its own bounded try.
+    second = conn.call(CommandType.KEY, {"key": "Enter"}, "t1", timeout=0.2)
+    with pytest.raises(RemoteOutcomeUnknownError):
+        await asyncio.wait_for(second, 2)
+
+
+@pytest.mark.asyncio
 async def test_a_call_queued_behind_a_send_is_never_written_once_replaced():
     registry = RuntimeRegistry()
     written, release = [], asyncio.Event()
@@ -172,7 +190,10 @@ async def test_a_result_for_a_call_that_already_gave_up_is_unclaimed():
     registry = RuntimeRegistry()
     runtime = _FakeRuntime(registry, reply=None)
     call = asyncio.ensure_future(registry.call("rt-1", CommandType.LAUNCH, {}, timeout=10))
-    await asyncio.sleep(0)
+    for _ in range(100):  # until the command has been written
+        if runtime.sent:
+            break
+        await asyncio.sleep(0)
     conn = registry.connection("rt-1")
     (waiting,) = conn._pending.values()
     # The caller gave up (timeout or cancellation) but has not cleaned up yet.
