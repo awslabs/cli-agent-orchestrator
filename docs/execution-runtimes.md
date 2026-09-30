@@ -57,7 +57,9 @@ If the server cannot record a launched terminal, it sends `delete` to the
 runtime. The `500` it then returns says whether the agent may still be
 running. The server also deletes any terminal a runtime runs that it has no
 record of: one listed in the runtime's hello, or one in a launch result that
-arrives after the launch timed out or its connection dropped. A runtime that
+arrives after the launch timed out or its connection dropped. It retries that
+delete until the runtime confirms it, or the connection ends (the runtime's
+next hello lists the terminal again). A runtime that
 starts an agent but cannot report it stops it, and the launch fails with `502`
 naming the terminal. So a lost launch result cannot leave an agent running
 unseen. Nor can a cancelled request: once the agent runs, recording it (or

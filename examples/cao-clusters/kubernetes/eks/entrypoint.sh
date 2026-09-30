@@ -59,9 +59,9 @@ unset CAO_RUNTIME_TOKEN
 # A bridge's readiness file on a volume that outlives the container (the
 # example's emptyDir) says nothing about this start: a killed cao-bridge could
 # not remove it. Clear it before the setup below, so the pod is not Ready until
-# this start's cao-bridge has connected.
-if [ "${CAO_NODE_MODE:-server}" = "bridge" ] && [ -n "${CAO_BRIDGE_READY_FILE:-}" ]; then
-  rm -f "${CAO_BRIDGE_READY_FILE}"
+# this start's cao-bridge has connected. The default is cao-bridge's own.
+if [ "${CAO_NODE_MODE:-server}" = "bridge" ]; then
+  rm -f "${CAO_BRIDGE_READY_FILE:-${CAO_HOME_DIR:-${HOME}/.aws/cli-agent-orchestrator}/bridge-ready}"
 fi
 
 exec_with_runtime_token() {

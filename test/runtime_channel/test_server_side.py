@@ -1229,3 +1229,82 @@ class TestLocalCapacity:
         with pytest.raises(RuntimeError) as exc:
             asyncio.run(ts.create_terminal(provider="mock_cli", agent_profile="developer"))
         assert exc.value is sentinel, f"refused by the cap: {exc.value}"
+
+
+class TestUnrecordedCleanupPersists:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failures", ["deferred", "failed"])
+    async def test_cleanup_keeps_retrying_while_the_connection_is_up(self, monkeypatch, failures):
+        registry = RuntimeRegistry()
+        deletes = []
+
+        async def send_text(text):
+            command = decode(text)
+            deletes.append(command)
+            done = len(deletes) >= 9  # more attempts than any fixed cap
+            if failures == "failed" and not done:
+                reply = Result(op_id=command.op_id, ok=False, error="pane busy")
+            else:
+                reply = Result(op_id=command.op_id, ok=True, payload={"deleted": done})
+            asyncio.get_running_loop().call_soon(conn.resolve, reply)
+
+        conn = registry.register("rt-1", send_text)
+        registry.activate(conn)
+        monkeypatch.setattr(server_mod, "UNRECORDED_RETRY_DELAY", 0.001)
+        server_mod._delete_unrecorded(conn, "beef0009")
+        for _ in range(500):
+            if len(deletes) >= 9 and not server_mod._teardowns:
+                break
+            await asyncio.sleep(0.01)
+        assert len(deletes) == 9, "retried until the runtime confirmed the delete"
+        assert not server_mod._teardowns
+
+    @pytest.mark.asyncio
+    async def test_cleanup_ends_with_its_connection(self, monkeypatch):
+        registry = RuntimeRegistry()
+        deletes = []
+
+        async def send_text(text):
+            command = decode(text)
+            deletes.append(command)
+            reply = Result(op_id=command.op_id, ok=True, payload={"deleted": False})
+            asyncio.get_running_loop().call_soon(conn.resolve, reply)
+
+        conn = registry.register("rt-1", send_text)
+        registry.activate(conn)
+        monkeypatch.setattr(server_mod, "UNRECORDED_RETRY_DELAY", 0.01)
+        server_mod._delete_unrecorded(conn, "beef0009")
+        await asyncio.sleep(0.05)
+        registry.unregister("rt-1", conn)  # the next hello lists it again
+        for _ in range(100):
+            if not server_mod._teardowns:
+                break
+            await asyncio.sleep(0.01)
+        assert not server_mod._teardowns, "the retries stop with the connection"
+
+
+class TestRemoteApproval:
+    @pytest.mark.asyncio
+    async def test_the_approval_prompt_of_a_remote_terminal_is_read_from_its_runtime(
+        self, monkeypatch
+    ):
+        from cli_agent_orchestrator.services.agui.approval_bridge import ApprovalBridge
+
+        calls = []
+
+        def get_output(terminal_id, *args, **kwargs):
+            # The real remote path blocks on the channel loop: refuse to run there.
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                calls.append(terminal_id)
+                return "Allow this command? (y/n)"
+            raise RuntimeError("call_blocking used on the channel loop; await call() instead")
+
+        monkeypatch.setattr(terminal_service, "get_output", get_output)
+        from unittest.mock import MagicMock
+
+        construct = MagicMock()
+        bridge = ApprovalBridge(construct, get_provider_fn=lambda tid: "claude_code")
+        await bridge._on_waiting("abcd1234")
+        assert calls == ["abcd1234"], "the prompt must be read off the event loop"
