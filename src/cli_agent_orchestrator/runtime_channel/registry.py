@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from typing import Any, Awaitable, Callable, Dict, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, Optional, Set, Tuple
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.runtime_channel.protocol import Command, CommandType, Result, encode
@@ -214,9 +214,9 @@ class RuntimeRegistry:
         self._runtimes: Dict[str, RuntimeConnection] = {}
         # terminal id -> runtime id, for terminals whose status the runtime may report.
         self._placement: Dict[str, str] = {}
-        # terminal id -> runtime id, for launches whose result has arrived and
-        # is being recorded: not placed yet, but not unrecorded either.
-        self._reserved: Dict[str, str] = {}
+        # (terminal id, runtime id) of launches whose result has arrived and is
+        # being recorded: not placed yet, but not unrecorded either.
+        self._reserved: Set[Tuple[str, str]] = set()
         self._status: Dict[str, TerminalStatus] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -239,7 +239,7 @@ class RuntimeRegistry:
             for terminal_id, placed_on in self._placement.items():
                 if placed_on == runtime_id:
                     self._status.pop(terminal_id, None)
-            for terminal_id, reserved_on in self._reserved.items():
+            for terminal_id, reserved_on in self._reserved:
                 if reserved_on == runtime_id:
                     self._status.pop(terminal_id, None)
         if previous is not None:
@@ -304,12 +304,12 @@ class RuntimeRegistry:
     def reserve(self, terminal_id: str, runtime_id: str) -> None:
         """Mark a launch whose result arrived as being recorded (see ``is_known``)."""
         with self._lock:
-            self._reserved[terminal_id] = runtime_id
+            self._reserved.add((terminal_id, runtime_id))
 
     def release(self, terminal_id: str, runtime_id: str) -> None:
         with self._lock:
-            if self._reserved.get(terminal_id) == runtime_id:
-                del self._reserved[terminal_id]
+            if (terminal_id, runtime_id) in self._reserved:
+                self._reserved.discard((terminal_id, runtime_id))
                 if self._placement.get(terminal_id) != runtime_id:
                     # Undone, not recorded: a status it reported goes with it.
                     self._status.pop(terminal_id, None)
@@ -317,7 +317,18 @@ class RuntimeRegistry:
     def is_known(self, terminal_id: str, runtime_id: str) -> bool:
         """Placed on the runtime, or its launch there is still being recorded."""
         with self._lock:
-            return runtime_id in (self._placement.get(terminal_id), self._reserved.get(terminal_id))
+            return (
+                self._placement.get(terminal_id) == runtime_id
+                or (terminal_id, runtime_id) in self._reserved
+            )
+
+    def claim(self, terminal_id: str, runtime_id: str) -> bool:
+        """Place a newly launched terminal, unless another runtime holds its id."""
+        with self._lock:
+            if self._placement.get(terminal_id) not in (None, runtime_id):
+                return False
+            self._placement[terminal_id] = runtime_id
+            return True
 
     def set_status(
         self,
@@ -331,9 +342,9 @@ class RuntimeRegistry:
         with self._lock:
             if conn is not None and self._runtimes.get(runtime_id) is not conn:
                 return False
-            if runtime_id not in (
-                self._placement.get(terminal_id),
-                self._reserved.get(terminal_id),
+            if (
+                self._placement.get(terminal_id) != runtime_id
+                and (terminal_id, runtime_id) not in self._reserved
             ):
                 return False
             # For a launch still being recorded, kept but not shown until the
