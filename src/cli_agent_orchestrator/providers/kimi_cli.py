@@ -362,6 +362,13 @@ def kimi_trust_opt_in(environ: Optional[Mapping[str, str]] = None) -> bool:
 #: Seconds to wait for the launch shell to report its ``kimi`` resolution.
 KIMI_PROBE_TIMEOUT_SECONDS = 20.0
 
+KIMI_SWARM_MAX_CONCURRENCY_ENV = "KIMI_CODE_AGENT_SWARM_MAX_CONCURRENCY"
+KIMI_SWARM_DEFAULT_ENV = "CAO_KIMI_SWARM_DEFAULT"
+KIMI_SWARM_CAP_SHA256_ENV = "CAO_KIMI_SWARM_CAP_SHA256"
+KIMI_SWARM_CONCURRENCY_CEILING = 10
+KIMI_SWARM_ACTIVATION_TIMEOUT_SECONDS = 10.0
+KIMI_SWARM_ACTIVATED_PATTERN = re.compile(r"(?m)^[ \t]*●[ \t]+Swarm activated[ \t]*$")
+
 #: Last line the probe command writes into the probe file. Its presence proves
 #: the `--help` dump finished; the pane is never consulted (it echoes the typed
 #: command, which would match this marker before the command even ran).
@@ -420,6 +427,8 @@ def shell_safe_temp_root() -> str:
 KIMI_PROBE_PROGRAM = (
     "{ printf 'CAO_KIMI_BIN=%s\\n' \"$(command -v kimi 2>/dev/null)\"; "
     "printf 'CAO_KIMI_HOME=%s\\n' \"${KIMI_CODE_HOME:-$HOME/.kimi-code}\"; "
+    "printf 'CAO_KIMI_SWARM_MAX_CONCURRENCY=%s\\n' "
+    '"${KIMI_CODE_AGENT_SWARM_MAX_CONCURRENCY:-}"; '
     "kimi --help 2>&1; "
     "printf '\\n%s\\n' '" + KIMI_PROBE_END_MARKER + '\'; } > "$1" 2>&1'
 )
@@ -811,6 +820,7 @@ class KimiCliProvider(BaseProvider):
         self._execution_observed = False
         self._awaiting_turn = False
         self._turn_activity_seen = False
+        self._swarm_turn_seen = False
         self.execution_evidence_ambiguous = False
         self._status_buffer_epoch = 0
         # Wallclock of the last send_input() dispatch (terminal_service calls
@@ -836,6 +846,9 @@ class KimiCliProvider(BaseProvider):
         self._kimi_binary: Optional[str] = None
         # Effective source KIMI_CODE_HOME, captured by the same launch-shell probe.
         self._kimi_source_home: Optional[Path] = None
+        self._kimi_swarm_concurrency_env: Optional[str] = None
+        self._kimi_swarm_requested = False
+        self._kimi_swarm_concurrency: Optional[int] = None
         # Per-worker runtime home builder (Kimi Code only).
         self._runtime_home_builder: Optional[KimiCodeRuntimeHomeBuilder] = None
         # Latched once the workspace-trust dialog has been answered, so its
@@ -876,6 +889,7 @@ class KimiCliProvider(BaseProvider):
     def _begin_execution_generation(self) -> None:
         self._awaiting_turn = True
         self._turn_activity_seen = False
+        self._swarm_turn_seen = False
         self.execution_evidence_ambiguous = False
         self._execution_observed = False
 
@@ -1226,12 +1240,15 @@ class KimiCliProvider(BaseProvider):
 
         binary = ""
         source_home_raw = ""
+        swarm_concurrency_raw = ""
         help_lines: List[str] = []
         for line in text.splitlines():
             if line.startswith("CAO_KIMI_BIN="):
                 binary = line[len("CAO_KIMI_BIN=") :].strip()
             elif line.startswith("CAO_KIMI_HOME="):
                 source_home_raw = line[len("CAO_KIMI_HOME=") :].strip()
+            elif line.startswith("CAO_KIMI_SWARM_MAX_CONCURRENCY="):
+                swarm_concurrency_raw = line[len("CAO_KIMI_SWARM_MAX_CONCURRENCY=") :].strip()
             elif line.strip() == KIMI_PROBE_END_MARKER:
                 continue
             else:
@@ -1259,6 +1276,7 @@ class KimiCliProvider(BaseProvider):
         self._dialect = dialect
         self._kimi_binary = binary
         self._kimi_source_home = resolve_source_home(source_home_raw)
+        self._kimi_swarm_concurrency_env = swarm_concurrency_raw or None
         logger.info(
             "kimi_dialect_resolved terminal=%s dialect=%s binary=%s source_home=%s flags=%s",
             self.terminal_id,
@@ -1367,6 +1385,55 @@ class KimiCliProvider(BaseProvider):
             f"{system_prompt}\n"
         )
 
+    def _configure_kimi_swarm(self, profile: Any) -> None:
+        """Resolve the resource policy without changing native tool permissions."""
+
+        operator_default = os.environ.get(KIMI_SWARM_DEFAULT_ENV, "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        requested = getattr(profile, "kimiSwarm", None) if profile is not None else None
+        if not isinstance(requested, bool):
+            requested = operator_default
+        limit = getattr(profile, "kimiSwarmMaxConcurrency", None) if profile is not None else None
+        expected = os.environ.get(KIMI_SWARM_CAP_SHA256_ENV, "").strip().lower()
+        managed_cap = requested or operator_default or bool(expected) or isinstance(limit, int)
+        if not managed_cap:
+            self._kimi_swarm_requested = False
+            self._kimi_swarm_concurrency = None
+            return
+        if limit is None or not isinstance(limit, int) or isinstance(limit, bool):
+            limit = KIMI_SWARM_CONCURRENCY_CEILING
+        if not 1 <= limit <= KIMI_SWARM_CONCURRENCY_CEILING:
+            raise ProviderError("Kimi swarm concurrency must be an integer from 1 to 10")
+        if self._kimi_swarm_concurrency_env is not None:
+            raw = self._kimi_swarm_concurrency_env
+            if not re.fullmatch(r"[0-9]+", raw) or int(raw) <= 0:
+                raise ProviderError(f"{KIMI_SWARM_MAX_CONCURRENCY_ENV} must be a positive integer")
+            limit = min(limit, int(raw))
+        if managed_cap:
+            if not re.fullmatch(r"[0-9a-f]{64}", expected):
+                raise ProviderError(
+                    "Native Kimi swarm requires a verified executable with the retry-path "
+                    f"concurrency fix; configure {KIMI_SWARM_CAP_SHA256_ENV}"
+                )
+            digest = hashlib.sha256()
+            try:
+                with open(self._kimi_binary or "", "rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            except OSError as exc:
+                raise ProviderError(f"Cannot verify the Kimi swarm executable: {exc}") from exc
+            if digest.hexdigest() != expected:
+                raise ProviderError(
+                    "Kimi executable does not match the verified swarm concurrency fix; "
+                    "refusing to launch an unbounded native swarm runtime"
+                )
+        self._kimi_swarm_requested = requested
+        self._kimi_swarm_concurrency = limit
+
     def _build_kimi_code_command(self) -> str:
         """Build the Kimi Code launch command.
 
@@ -1416,6 +1483,7 @@ class KimiCliProvider(BaseProvider):
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
         temp_dir = self._ensure_temp_dir()
+        self._configure_kimi_swarm(profile)
         source_home = self._kimi_source_home or resolve_source_home(None)
 
         # The runtime home is CAO-managed state, not scratch: it belongs at the
@@ -1469,6 +1537,8 @@ class KimiCliProvider(BaseProvider):
                 f"KIMI_MCP_STARTUP_TIMEOUT_MS={KIMI_MCP_STARTUP_TIMEOUT_MS}",
             ]
         )
+        if self._kimi_swarm_concurrency is not None:
+            command_parts.append(f"{KIMI_SWARM_MAX_CONCURRENCY_ENV}={self._kimi_swarm_concurrency}")
         for key, value in KIMI_NO_AUTO_UPDATE_ENV.items():
             command_parts.append(f"{key}={value}")
 
@@ -2073,8 +2143,43 @@ class KimiCliProvider(BaseProvider):
         ):
             raise TimeoutError(f"Kimi CLI initialization timed out after {ready_timeout} seconds")
 
+        if self._dialect is KimiDialect.CODE and self._kimi_swarm_requested:
+            await self._activate_kimi_swarm()
+
         self._initialized = True
         return True
+
+    async def _activate_kimi_swarm(self) -> None:
+        """Enter the native mode before task delivery, without marking a user turn."""
+
+        await asyncio.to_thread(
+            get_backend().send_keys,
+            self.session_name,
+            self.window_name,
+            "/swarm on",
+            enter_count=self.paste_enter_count,
+            force_bracketed_paste=True,
+            submit_delay=self.paste_submit_delay,
+        )
+        deadline = time.monotonic() + KIMI_SWARM_ACTIVATION_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            output = await asyncio.to_thread(
+                get_backend().get_history,
+                self.session_name,
+                self.window_name,
+                strip_escapes=True,
+                visible_only=True,
+            )
+            if KIMI_SWARM_ACTIVATED_PATTERN.search(output):
+                return
+            error = self.get_error_message(output)
+            if error:
+                raise ProviderError(error)
+            await asyncio.sleep(0.1)
+        raise ProviderError(
+            "Kimi did not confirm native swarm activation; set kimiSwarm: false "
+            "to launch without swarm"
+        )
 
     def _spinner_semantics(self) -> "kt.SpinnerSemantics":
         """The spinner rules for the dialect this terminal resolved to.
@@ -2093,6 +2198,14 @@ class KimiCliProvider(BaseProvider):
             return kt.SpinnerSemantics.CODE
         return kt.SpinnerSemantics.LEGACY
 
+    def _has_response_evidence(self, output: str) -> bool:
+        # A fresh native-mode activation paints a response-shaped status bullet,
+        # but no model task has been dispatched. Restored terminals do not run
+        # the launch builder, so their existing response inference is preserved.
+        if self._kimi_swarm_requested and not self._task_dispatched:
+            return False
+        return kt.has_response_marker(output)
+
     def get_error_message(self, buffer: str) -> Optional[str]:
         """Return the exact Kimi error line that can justify ``ERROR``.
 
@@ -2109,6 +2222,43 @@ class KimiCliProvider(BaseProvider):
             strip_terminal_escapes(buffer),
             execution_established=self._execution_observed,
         )
+
+    def _has_live_swarm_pane(self) -> Optional[bool]:
+        # A composited screen loses SGR, so a copied panel in an answer is
+        # indistinguishable from the UI there. Confirm against the same live
+        # pane's renderer styling before letting it keep the turn processing.
+        try:
+            pane = get_backend().get_history(
+                self.session_name,
+                self.window_name,
+                strip_escapes=False,
+                visible_only=True,
+            )
+            return self._swarm_pane_pending(pane)
+        except Exception:
+            return None
+
+    def _swarm_pane_pending(self, pane: str) -> Optional[bool]:
+        pending = kt.swarm_turn_pending(pane)
+        if pending is not None:
+            if self._task_dispatched:
+                self._swarm_turn_seen = True
+            return pending
+        if not self._swarm_turn_seen:
+            return False
+        rows = kt.classify_lines(pane, kt.SpinnerSemantics.CODE, include_unclosed_fences=True)
+        boundary = max(
+            (i for i, (_, _, kind) in enumerate(rows) if kind is kt.KimiLineKind.USER_INPUT),
+            default=-1,
+        )
+        if any(
+            i > boundary
+            and kind is kt.KimiLineKind.FINAL_BULLET
+            and kt.FINAL_ANSWER_BULLET_STYLE_RE.search(raw)
+            for i, (raw, _, kind) in enumerate(rows)
+        ):
+            return False
+        return None
 
     def get_status(self, output: str) -> TerminalStatus:
         """Get Kimi CLI status by analyzing terminal output.
@@ -2173,7 +2323,7 @@ class KimiCliProvider(BaseProvider):
             # The shared helper requires a bullet *plus a payload*, so a wrapped
             # status-bar fragment (`●)`) does not latch a terminal that never
             # received input (A3-1).
-            if kt.has_response_marker(clean_output):
+            if self._has_response_evidence(clean_output):
                 self._has_received_input = True
 
             # PROCESSING vs ready. A spinner-vs-status-bar position compare is
@@ -2236,20 +2386,31 @@ class KimiCliProvider(BaseProvider):
             # post-dispatch only (boot screens legitimately show braille
             # like '⠧ MCP Servers: 0/1' while idle at the welcome screen,
             # and init readiness is already handled by the stream path).
-            if self._last_dispatch_time:
+            if self._last_dispatch_time or self._swarm_turn_seen:
                 try:
-                    pane_tail = get_backend().get_history(
+                    pane = get_backend().get_history(
                         self.session_name,
                         self.window_name,
-                        tail_lines=25,
-                        strip_escapes=True,
+                        strip_escapes=False,
+                        visible_only=True,
                     )
                     if any(
                         _is_live_turn_spinner_line(line, semantics)
-                        for line in pane_tail.splitlines()
+                        for line in pane.splitlines()[-25:]
                     ):
                         return TerminalStatus.PROCESSING
+                    if semantics is kt.SpinnerSemantics.CODE:
+                        swarm_pending = self._swarm_pane_pending(pane)
+                        if swarm_pending is None:
+                            return TerminalStatus.UNKNOWN
+                        if swarm_pending:
+                            return TerminalStatus.PROCESSING
                 except Exception:
+                    if semantics is kt.SpinnerSemantics.CODE and (
+                        self._swarm_turn_seen
+                        or kt.has_live_swarm_progress(kt.normalize_activity_rows(output))
+                    ):
+                        return TerminalStatus.UNKNOWN
                     # Pane unavailable (deleted window, backend hiccup) —
                     # fall through to the stream-derived ready status.
                     pass
@@ -2353,7 +2514,12 @@ class KimiCliProvider(BaseProvider):
         # retains the unfinished suffix and supplies it again with later bytes.
         rows = rows.rpartition("\n")[0]
         kinds = kt.classify_lines(rows, self._spinner_semantics(), include_unclosed_fences=True)
-        if any(kind is kt.KimiLineKind.LIVE_SPINNER for _, _, kind in kinds):
+        swarm_activity = self._dialect is KimiDialect.CODE and kt.has_live_swarm_progress(
+            rows, require_submission=True
+        )
+        if swarm_activity:
+            self._swarm_turn_seen = True
+        if any(kind is kt.KimiLineKind.LIVE_SPINNER for _, _, kind in kinds) or swarm_activity:
             self._turn_activity_seen = True
         if self._turn_activity_seen:
             self._execution_observed = True
@@ -2369,6 +2535,15 @@ class KimiCliProvider(BaseProvider):
         """
         if epoch != self._status_buffer_epoch:
             return
+        if (
+            not self._swarm_turn_seen
+            and self._task_dispatched
+            and self._dialect is KimiDialect.CODE
+            and kt.has_live_swarm_progress(
+                kt.normalize_activity_rows(output).rpartition("\n")[0], require_submission=True
+            )
+        ):
+            self._swarm_turn_seen = True
         if self._awaiting_turn:
             self.has_execution_evidence(output)
         if truncated and not self._execution_observed:
@@ -2421,18 +2596,28 @@ class KimiCliProvider(BaseProvider):
                 return TerminalStatus.PROCESSING
             if _has_terminal_error(joined, execution_established=self._execution_observed):
                 return TerminalStatus.ERROR
+            if semantics is kt.SpinnerSemantics.CODE and (
+                self._swarm_turn_seen or "Agent Swarm" in joined
+            ):
+                swarm_active = self._has_live_swarm_pane()
+                if swarm_active is None:
+                    # No signal cannot certify completion: the monitor's ready
+                    # latch would otherwise outlive this transient read failure.
+                    return TerminalStatus.UNKNOWN
+                if swarm_active:
+                    return TerminalStatus.PROCESSING
             # Distinguish a settled capture (restored terminal) from a fresh
             # boot. Unlike the raw path, dispatch does not clear the composited
             # screen, so this latch is only a "input happened" marker: the
             # COMPLETED verdict still requires execution evidence, and a
             # post-dispatch stale repaint stays PROCESSING via _awaiting_turn.
-            if not self._has_received_input and kt.has_response_marker(joined):
+            if not self._has_received_input and self._has_response_evidence(joined):
                 self._has_received_input = True
             return self._new_tui_ready_status()
 
         # Legacy emoji-prompt TUI: bare ✨/💫 prompt visible at the bottom.
         if any(re.search(IDLE_PROMPT_PATTERN, ln) for ln in tail):
-            owns_response = self._has_received_input or kt.has_response_marker(joined)
+            owns_response = self._has_received_input or self._has_response_evidence(joined)
             return TerminalStatus.COMPLETED if owns_response else TerminalStatus.IDLE
 
         if _has_terminal_error(joined, execution_established=self._execution_observed):
@@ -3071,6 +3256,7 @@ class KimiCliProvider(BaseProvider):
         self._execution_observed = False
         self._awaiting_turn = False
         self._turn_activity_seen = False
+        self._swarm_turn_seen = False
         self.execution_evidence_ambiguous = False
         self._status_buffer_epoch = 0
         return scratch_removed and home_removed

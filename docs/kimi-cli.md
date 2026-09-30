@@ -52,6 +52,36 @@ cao launch --agents code_supervisor --provider kimi_cli
 
 The dialect is detected automatically; no configuration selects it.
 
+## Native Swarm Mode
+
+Kimi Code profiles can set `kimiSwarm: true` to enter native swarm mode before
+the first task, or `kimiSwarm: false` to skip automatic activation. Omission
+inherits the operator's `CAO_KIMI_SWARM_DEFAULT` setting, which is off unless
+explicitly enabled. This is a mode setting: it does not add `AgentSwarm` or any
+other tool to a native `tools` allowlist. A read-only profile keeps its existing
+runtime tool restrictions.
+
+`kimiSwarmMaxConcurrency` accepts integers from 1 to 10. The operator's bounded
+runtime policy defaults to 10 concurrent subagents per `AgentSwarm` batch, not
+10 total subagents over the session and not a shared budget across CAO workers.
+A smaller limit captured from the launch shell is preserved. Setting
+`kimiSwarm: false` does not bypass that resource policy; tool-triggered swarms
+remain capped when their tool is available.
+
+The native Kimi 2.1.1 retry scheduler did not enforce its environment concurrency
+limit after provider rate limits. Enabling this policy therefore requires an
+executable whose retry path has been fixed and tested. Set
+`CAO_KIMI_SWARM_CAP_SHA256` on the CAO server to that executable's SHA256, and set
+`CAO_KIMI_SWARM_DEFAULT=1` to enable startup swarm by default. CAO verifies the
+actual launch-shell-resolved executable before every managed native launch and
+refuses a replacement that does not match. An explicit profile limit also
+requires verification. Unconfigured default-off launches retain their prior
+behavior without claiming an enforced cap.
+
+CAO runs `/swarm on` as a startup control command and requires Kimi's native
+activation confirmation before delivering work. It does not count this command
+or its status bullet as an executed task. Legacy Kimi CLI behavior is unchanged.
+
 ## Dialect Detection
 
 The provider probes the resolved `kimi` binary's `--help` **once per binary
