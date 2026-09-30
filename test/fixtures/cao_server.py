@@ -50,6 +50,7 @@ import importlib
 import json
 import os
 import pkgutil
+import shutil
 import signal
 import socket
 import socketserver
@@ -391,6 +392,61 @@ def _seed_omp_e2e_state(home_dir: Path) -> None:
             shutil.copy2(examples_dir / f"{name}.md", target)
 
 
+def _kiro_cli_seed_paths() -> list[Path]:
+    """HOME-relative paths kiro-cli must find to run logged in from a redirected HOME.
+
+    kiro-cli keeps its login and its state under ``$HOME``, so to the CLI the
+    managed server spawns a fresh HOME is a logged-out kiro: it drops into the
+    SSO device-login flow ("Opening browser...") and never reaches the agent
+    prompt, and CAO reports "Kiro CLI initialization timed out waiting for the
+    agent prompt". Measured with an IAM Identity Center login on macOS
+    (kiro-cli 2.25.0) and Linux (2.22.0): with these three present the same
+    invocation answers in a few seconds.
+
+    * ``.aws/sso`` -- the Identity Center token cache kiro reads through
+      ``aws-config`` (``sso/cache``).
+    * ``.local/bin`` -- kiro-cli launches its ``kiro-cli-chat`` helper from
+      ``$HOME/.local/bin`` and fails outright ("failed to launch
+      $HOME/.local/bin/kiro-cli-chat") when it is not there.
+    * the data dir -- ``Library/Application Support/kiro-cli`` on macOS,
+      ``.local/share/kiro-cli`` elsewhere (``data.sqlite3``, history). When
+      ``XDG_DATA_HOME`` is set it is absolute and shared by both HOMEs, so
+      there is nothing to seed.
+    """
+    paths = [Path(".aws") / "sso", Path(".local") / "bin"]
+    if sys.platform == "darwin":
+        paths.append(Path("Library") / "Application Support" / "kiro-cli")
+    elif not os.environ.get("XDG_DATA_HOME"):
+        paths.append(Path(".local") / "share" / "kiro-cli")
+    return paths
+
+
+def _seed_kiro_e2e_state(home_dir: Path, real_home: Optional[Path] = None) -> None:
+    """Link kiro-cli's login and helper paths from the real HOME into ``home_dir``.
+
+    Symlinks, not copies: no credential bytes land in the tmp HOME, and kiro
+    reads and refreshes its token in the real cache exactly as a normal run
+    does. Only paths that exist are linked, an existing destination is left
+    alone, and nothing happens at all when kiro-cli is not installed or the
+    two HOMEs are the same directory. ``real_home`` is the developer's HOME
+    (``$HOME`` of the test process) unless a test supplies one.
+    """
+    if shutil.which("kiro-cli") is None:
+        return
+    source_home = (
+        real_home if real_home is not None else Path(os.environ.get("HOME") or Path.home())
+    )
+    if source_home.resolve() == home_dir.resolve():
+        return
+    for rel in _kiro_cli_seed_paths():
+        src = source_home / rel
+        dest = home_dir / rel
+        if not src.exists() or dest.exists() or dest.is_symlink():
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.symlink_to(src, target_is_directory=True)
+
+
 def _start_cao_server(
     home_dir: Path,
     port: int,
@@ -407,6 +463,7 @@ def _start_cao_server(
     home_dir.mkdir(parents=True, exist_ok=True)
     _seed_packaged_skills(home_dir)
     _seed_omp_e2e_state(home_dir)
+    _seed_kiro_e2e_state(home_dir)
     log_path = home_dir / "server.log"
     log_handle = open(log_path, "ab")  # noqa: SIM115 — handle lifetime is in stop()
 

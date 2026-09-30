@@ -202,15 +202,16 @@ CAO defines a universal tool vocabulary (`execute_bash`, `fs_read`, `fs_write`, 
 
 **Providers that need translation** — Claude Code, Copilot CLI, and Grok Build CLI each have their own native tool names (e.g., Claude Code and Grok call bash execution `Bash`, while Copilot calls it `shell`). CAO uses an internal `TOOL_MAPPING` to translate the CAO vocabulary to provider-native names, then computes which native tools to block and passes them as CLI flags (e.g., `--disallowedTools Bash`, `--deny-tool shell`, or `--deny Bash`).
 
-| CAO Tool | Claude Code | Copilot CLI | Grok Build CLI |
-|----------|-------------|-------------|----------------|
-| `execute_bash` | `Bash` | `shell` | `Bash` |
-| `fs_read` | `Read` | `read` | `Read`, `NotebookRead` |
-| `fs_write` | `Edit`, `Write` | `write` | `Edit`, `Write`, `NotebookEdit` |
-| `fs_list` | `Glob`, `Grep` | `list`, `grep` | `Grep`, `Glob` |
-| `web_fetch` | `WebFetch`, `WebSearch` | (not mapped) | `WebFetch`, `WebSearch` + disabled web search |
+| CAO Tool | Claude Code | Copilot CLI | Grok Build CLI | Kiro CLI (`tools` at install) |
+|----------|-------------|-------------|----------------|-------------------------------|
+| `execute_bash` | `Bash` | `shell` | `Bash` | `shell`, `subagent`, `use_aws` (+ alias `execute_bash`) |
+| `fs_read` | `Read` | `read` | `Read`, `NotebookRead` | `read`, `knowledge` (+ alias `fs_read`) |
+| `fs_write` | `Edit`, `Write` | `write` | `Edit`, `Write`, `NotebookEdit` | `write`, `code` (+ alias `fs_write`) |
+| `fs_list` | `Glob`, `Grep` | `list`, `grep` | `Grep`, `Glob` | `glob`, `grep` |
+| `web_fetch` | `WebFetch`, `WebSearch` | (not mapped) | `WebFetch`, `WebSearch` + disabled web search | `web_fetch`, `web_search` |
+| `@builtin` | (selector) | (selector) | (selector) | `goal`, `introspect`, `todo_list` only; a bare `@builtin` would mean every built-in, shell included |
 
-**Providers that accept CAO vocabulary directly** — Kiro CLI accepts `allowedTools` in the agent JSON at install time, using the same vocabulary as CAO. No translation needed, but note that Kiro treats `allowedTools` as the set of tools that run *without an approval prompt*, not as a restriction, and CAO launches Kiro with `--trust-all-tools`, so the list has no restricting effect at runtime (see the table below). Kimi CLI, MiniMax Code, and Codex use system prompt instructions to enforce restrictions. CAO passes the `allowedTools` list directly without translation — so no `TOOL_MAPPING` entry exists for them, and none is needed.
+**Providers that accept CAO vocabulary directly** — Kimi CLI, MiniMax Code, and Codex use system prompt instructions to enforce restrictions, and CAO passes the `allowedTools` list directly without translation, so no `TOOL_MAPPING` entry exists for them. Kiro CLI *also* accepts the CAO vocabulary in `allowedTools`, but in Kiro that list only names the tools that run *without an approval prompt*; what the agent can use at all is `tools`, so CAO translates the resolved policy into `tools` at install time (see the table above and the Kiro entry below).
 
 #### MCP-side enforcement for tools that launch an agent
 
@@ -277,7 +278,7 @@ As described in [How Tool Restrictions Are Enforced](#how-tool-restrictions-are-
 | Provider | Enforcement | How it works |
 |----------|------------|-------------|
 | **Claude Code** | Hard | `--disallowedTools` flags block specific tools |
-| **Kiro CLI** | None (default profiles) | Launched `--trust-all-tools` on every profile; `allowedTools` in the agent JSON only suppresses approval prompts and `tools` is `["*"]` unless the profile sets its own `tools` list, so the CAO policy is not applied at runtime |
+| **Kiro CLI** | Hard (install time) | `tools` in the agent JSON is written from the resolved `allowedTools` by `cao install`; `--trust-all-tools` only suppresses prompts for the tools that remain; launch-time `--allowed-tools` and role overrides select the installed agent and do not change its `tools`. Profiles installed before this change still carry `tools: ["*"]` until reinstalled |
 | **Copilot CLI** | Hard | `--deny-tool` flags override `--allow-all` |
 | **OpenCode CLI** | Hard | `permission:` YAML frontmatter enforced natively at install time; launch-time `--allowed-tools` and role overrides select the installed agent and do not change its permissions |
 | **Grok Build CLI** | Native (mapped families) | Restricted profiles use deny-by-default `--permission-mode dontAsk` with explicit native/MCP allows and defense-in-depth denies; native subagents are disabled |
@@ -302,14 +303,20 @@ claude --dangerously-skip-permissions --disallowedTools Bash --disallowedTools E
 
 `permissionMode` is a separate axis from `--disallowedTools`: `permissionMode` controls which permission tier the session runs under (unconditional bypass vs. classifier-gated tiers like `auto`), while `--disallowedTools` enforces the per-tool denylist. The two stack — a profile can set `permissionMode: auto` *and* a tool denylist, and both apply on the launch command. See [Permission Mode Override](claude-code.md#permission-mode-override) for full details.
 
-**Kiro CLI** — Writes `allowedTools` into the agent JSON at install time:
+**Kiro CLI** — Writes both `allowedTools` and `tools` into the agent JSON at install time:
 ```json
-{ "allowedTools": ["@cao-mcp-server", "fs_read", "fs_list"] }
+{
+  "allowedTools": ["@cao-mcp-server", "fs_read", "fs_list"],
+  "tools": ["@cao-mcp-server", "fs_read", "glob", "grep", "knowledge", "read"]
+}
 ```
-In Kiro this list only names tools that run without an approval prompt; `tools`
-(written as `["*"]` unless the profile sets it) decides availability, and CAO
-passes `--trust-all-tools`, so nothing is restricted at runtime. To actually
-limit a Kiro agent, set `tools` in the profile.
+In Kiro `allowedTools` only names tools that run without an approval prompt
+(and CAO passes `--trust-all-tools`, so every remaining tool runs unprompted);
+`tools` decides what exists for the agent, and that is where the CAO policy is
+applied. An unrestricted policy writes `tools: ["*"]`; a profile that sets its
+own `tools` list keeps it. Enforcement is therefore install-time: change the
+profile, re-run `cao install`. Profiles installed before CAO wrote `tools`
+still carry `["*"]`; `cao launch` warns when it finds one.
 
 **Copilot CLI** — Adds `--deny-tool` flags that override `--allow-all`:
 ```bash
@@ -384,7 +391,7 @@ Each agent is restricted based on its own profile, not its parent's permissions.
 
 1. **Use `role: supervisor` for orchestrators.** They only need MCP tools + file reading for context.
 2. **Don't use `--yolo` in production.** It grants unrestricted access and skips all safety prompts.
-3. **Prefer hard-enforcement providers** (Claude Code, Copilot CLI, Grok Build CLI, OpenCode CLI) for sensitive workloads. Kiro CLI, the default provider, does not apply the CAO tool policy at runtime.
+3. **Prefer hard-enforcement providers** (Claude Code, Copilot CLI, Grok Build CLI, OpenCode CLI, Kiro CLI) for sensitive workloads. Kiro CLI and OpenCode CLI enforce at install time: reinstall a profile after changing its policy.
 4. **Review the confirmation prompt.** It shows exactly what tools are allowed and blocked before you proceed.
 5. **Prompt-only providers (Kimi CLI, MiniMax Code, Codex, Antigravity CLI, OMP; see the table) use soft enforcement** — use these only for non-critical tasks.
 

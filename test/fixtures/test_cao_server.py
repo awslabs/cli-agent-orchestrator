@@ -20,7 +20,9 @@ from test.fixtures.cao_server import (
     AuthCaoServer,
     CaoServer,
     _JWKSServer,
+    _kiro_cli_seed_paths,
     _pick_free_port,
+    _seed_kiro_e2e_state,
     _seed_omp_e2e_state,
     _session_rsa_keys,
     _start_cao_server,
@@ -76,6 +78,108 @@ def test_omp_e2e_seed_is_idempotent(tmp_path: Path) -> None:
     assert (tmp_path / ".omp" / "agent" / "config.yml").read_text(
         encoding="utf-8"
     ) == "setupVersion: 1\n"
+
+
+def _fake_kiro_home(root: Path, *, with_data_dir: bool = True) -> Path:
+    """A stand-in for the developer's HOME with kiro's login/helper paths present."""
+    real_home = root / "real-home"
+    for rel in _kiro_cli_seed_paths():
+        if not with_data_dir and rel.parts[-1] == "kiro-cli":
+            continue
+        (real_home / rel).mkdir(parents=True)
+        (real_home / rel / "marker").write_text("x", encoding="utf-8")
+    return real_home
+
+
+def test_kiro_seed_links_every_present_path_by_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each kiro path that exists in the real HOME becomes a symlink in the
+    server HOME pointing at the original: nothing is copied."""
+    import test.fixtures.cao_server as fixture_mod
+
+    monkeypatch.setattr(fixture_mod.shutil, "which", lambda name: "/usr/bin/kiro-cli")
+    real_home = _fake_kiro_home(tmp_path)
+    home_dir = tmp_path / "server-home"
+    home_dir.mkdir()
+
+    _seed_kiro_e2e_state(home_dir, real_home=real_home)
+
+    assert _kiro_cli_seed_paths(), "the seed list is empty"
+    for rel in _kiro_cli_seed_paths():
+        dest = home_dir / rel
+        assert dest.is_symlink(), f"{rel} was not linked"
+        assert dest.resolve() == (real_home / rel).resolve()
+        assert (dest / "marker").read_text(encoding="utf-8") == "x"
+
+
+def test_kiro_seed_skips_paths_missing_from_the_real_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path the developer does not have is not invented; the others still link."""
+    import test.fixtures.cao_server as fixture_mod
+
+    monkeypatch.setattr(fixture_mod.shutil, "which", lambda name: "/usr/bin/kiro-cli")
+    real_home = _fake_kiro_home(tmp_path, with_data_dir=False)
+    home_dir = tmp_path / "server-home"
+    home_dir.mkdir()
+
+    _seed_kiro_e2e_state(home_dir, real_home=real_home)
+
+    data_dirs = [rel for rel in _kiro_cli_seed_paths() if rel.parts[-1] == "kiro-cli"]
+    for rel in data_dirs:
+        assert not (home_dir / rel).exists() and not (home_dir / rel).is_symlink()
+    for rel in _kiro_cli_seed_paths():
+        if rel not in data_dirs:
+            assert (home_dir / rel).is_symlink()
+
+
+def test_kiro_seed_is_a_noop_without_kiro_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import test.fixtures.cao_server as fixture_mod
+
+    monkeypatch.setattr(fixture_mod.shutil, "which", lambda name: None)
+    real_home = _fake_kiro_home(tmp_path)
+    home_dir = tmp_path / "server-home"
+    home_dir.mkdir()
+
+    _seed_kiro_e2e_state(home_dir, real_home=real_home)
+
+    assert list(home_dir.iterdir()) == []
+
+
+def test_kiro_seed_is_idempotent_and_leaves_an_existing_destination_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import test.fixtures.cao_server as fixture_mod
+
+    monkeypatch.setattr(fixture_mod.shutil, "which", lambda name: "/usr/bin/kiro-cli")
+    real_home = _fake_kiro_home(tmp_path)
+    home_dir = tmp_path / "server-home"
+    own_sso = home_dir / ".aws" / "sso"
+    own_sso.mkdir(parents=True)
+    (own_sso / "mine").write_text("keep", encoding="utf-8")
+
+    _seed_kiro_e2e_state(home_dir, real_home=real_home)
+    _seed_kiro_e2e_state(home_dir, real_home=real_home)
+
+    assert not own_sso.is_symlink() and (own_sso / "mine").read_text(encoding="utf-8") == "keep"
+    assert (home_dir / ".local" / "bin").is_symlink()
+
+
+def test_kiro_seed_never_links_a_home_onto_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import test.fixtures.cao_server as fixture_mod
+
+    monkeypatch.setattr(fixture_mod.shutil, "which", lambda name: "/usr/bin/kiro-cli")
+    real_home = _fake_kiro_home(tmp_path)
+
+    _seed_kiro_e2e_state(real_home, real_home=real_home)
+
+    for rel in _kiro_cli_seed_paths():
+        assert not (real_home / rel).is_symlink()
 
 
 def test_log_file_populated(cao_server: CaoServer) -> None:

@@ -221,9 +221,19 @@ class HerdrBackend(TerminalBackend):
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             if check and result.returncode != 0:
+                # stderr stays in the server log. The exception text travels to
+                # API clients as an HTTP 500 detail, and herdr's stderr can name
+                # local paths, socket locations and flags that a client has no
+                # business seeing.
+                logger.error(
+                    "herdr command failed (exit %s): %s\nstderr: %s",
+                    result.returncode,
+                    " ".join(cmd_display),
+                    result.stderr.strip(),
+                )
                 raise TerminalBackendError(
-                    f"herdr command failed: {' '.join(cmd_display)}\n"
-                    f"stderr: {result.stderr.strip()}"
+                    f"herdr command failed: {' '.join(cmd_display)} "
+                    f"(exit {result.returncode}; stderr is in the cao-server log)"
                 )
             return result
         except subprocess.TimeoutExpired as e:
@@ -877,8 +887,8 @@ class HerdrBackend(TerminalBackend):
         """Build ``--env KEY=VALUE`` argument pairs for a create command.
 
         Operator-forwarded vars are merged first, filtered with the same policy
-        TmuxClient applies to its ``-e`` argv (blocked prefixes, per-value byte
-        cap). The two CAO identity vars are assigned LAST so an operator
+        TmuxClient applies to its ``-e`` argv (blocked provider prefixes, the
+        startup-hijack keys from ``utils.forwarded_env``, per-value byte cap). The two CAO identity vars are assigned LAST so an operator
         ``--env CAO_TERMINAL_ID=...`` cannot override the real terminal identity
         (mirrors TmuxClient, which forces these to win). Native ``--env``
         replaces the former shell ``export`` injection, removing the
@@ -896,7 +906,7 @@ class HerdrBackend(TerminalBackend):
         env: Dict[str, str] = {}
         for key, value in (extra_env or {}).items():
             if TmuxClient._is_blocked_env_key(key):
-                logger.warning("Dropping forwarded env var with blocked prefix: %s", key)
+                logger.warning("Dropping forwarded env var with blocked key: %s", key)
                 continue
             if len(value.encode("utf-8")) >= TmuxClient._MAX_ENV_VALUE_BYTES:
                 logger.warning("Dropping forwarded env var %s -- exceeds byte cap", key)

@@ -23,13 +23,16 @@ def test_grok_uses_runtime_skills_with_native_tool_enforcement():
 
 
 def test_none_enforcement_providers_are_in_the_soft_set():
-    """kiro_cli (the default provider), hermes and cursor_cli apply no restriction, so
-    the create-terminal warning must fire for a restricted profile on them, and must
-    not for a provider that enforces natively."""
+    """hermes and cursor_cli apply no restriction, so the create-terminal warning
+    must fire for a restricted profile on them, and must not for a provider that
+    enforces natively. kiro_cli (the default provider) left this set when
+    `cao install` started writing the policy into the agent JSON's `tools`; a
+    profile installed before that is caught by the stale-install warning instead
+    (see kiro_install_predates_native_enforcement)."""
     from cli_agent_orchestrator.services.terminal_service import SOFT_ENFORCEMENT_PROVIDERS
 
-    assert {"kiro_cli", "hermes", "cursor_cli"} <= SOFT_ENFORCEMENT_PROVIDERS
-    assert {"claude_code", "copilot_cli", "opencode_cli", "grok_cli"}.isdisjoint(
+    assert {"hermes", "cursor_cli"} <= SOFT_ENFORCEMENT_PROVIDERS
+    assert {"claude_code", "copilot_cli", "opencode_cli", "grok_cli", "kiro_cli"}.isdisjoint(
         SOFT_ENFORCEMENT_PROVIDERS
     )
 

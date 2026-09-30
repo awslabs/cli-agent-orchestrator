@@ -3,10 +3,13 @@
 import pytest
 
 from cli_agent_orchestrator.utils.tool_mapping import (
+    ALL_NATIVE_TOOLS,
+    KIRO_BUILTIN_CHROME,
     format_tool_summary,
     get_allowed_tools,
     get_disallowed_tools,
     granted_mcp_servers,
+    kiro_agent_tools,
     resolve_allowed_tools,
     tool_constraint_instruction,
 )
@@ -450,3 +453,111 @@ class TestGrantedMcpServers:
 
     def test_non_string_entries_are_ignored(self):
         assert granted_mcp_servers(["@plugin-*", None, 7], self.SERVERS) == ["plugin-tools"]
+
+
+class TestKiroAgentTools:
+    """``kiro_agent_tools`` writes the resolved CAO policy into Kiro's ``tools``.
+
+    On Kiro ``tools`` is availability: a tool not listed does not exist for the
+    agent. ``allowedTools`` (which CAO also writes) only names what runs without
+    a prompt, and CAO launches ``--trust-all-tools``, so ``tools`` is the only
+    field that restricts anything. Measured on kiro-cli 2.25.0 (2026-09-29):
+    the inventory under ``tools: ["*"]`` is the 14 names in
+    ``KIRO_NATIVE_INVENTORY_2_25`` below, the older ``fs_read``/``execute_bash``
+    spellings still work as aliases, an unknown name is ignored, and a bare
+    ``@builtin`` grants every built-in INCLUDING the shell.
+    """
+
+    # What `tools: ["*"]` exposes on kiro-cli 2.25.0. If Kiro adds a tool, this
+    # test fails until someone decides which CAO capability gates it; until
+    # then the new tool is simply unavailable to restricted profiles, which is
+    # the safe direction.
+    KIRO_NATIVE_INVENTORY_2_25 = {
+        "code",
+        "glob",
+        "goal",
+        "grep",
+        "introspect",
+        "knowledge",
+        "read",
+        "shell",
+        "subagent",
+        "todo_list",
+        "use_aws",
+        "web_fetch",
+        "web_search",
+        "write",
+    }
+    SHELL_CLASS = {"shell", "execute_bash", "subagent", "use_aws"}
+    WRITE_CLASS = {"write", "fs_write", "code"}
+
+    def test_wildcard_stays_wildcard(self):
+        assert kiro_agent_tools(["*"]) == ["*"]
+        assert kiro_agent_tools(["fs_read", "*"]) == ["*"]
+
+    def test_empty_allowlist_is_an_agent_with_no_tools(self):
+        assert kiro_agent_tools([]) == []
+
+    def test_supervisor_default_has_no_shell_write_or_network(self):
+        tools = set(kiro_agent_tools(resolve_allowed_tools(None, "supervisor", ["cao-mcp-server"])))
+        assert "@cao-mcp-server" in tools
+        assert {"read", "fs_read", "glob", "grep", "knowledge"} <= tools
+        assert not (tools & self.SHELL_CLASS), tools
+        assert not (tools & self.WRITE_CLASS), tools
+        assert not (tools & {"web_fetch", "web_search"}), tools
+
+    def test_builtin_grants_chrome_only_never_the_shell(self):
+        """A bare ``@builtin`` in Kiro's ``tools`` is every built-in, shell included.
+
+        The reviewer default carries ``@builtin``; written through it would hand
+        a read-only reviewer a shell. It must become the harmless chrome only.
+        """
+        assert set(kiro_agent_tools(["@builtin"])) == set(KIRO_BUILTIN_CHROME)
+        reviewer = set(
+            kiro_agent_tools(resolve_allowed_tools(None, "reviewer", ["cao-mcp-server"]))
+        )
+        assert "@builtin" not in reviewer
+        assert not (reviewer & self.SHELL_CLASS), reviewer
+        assert not (reviewer & self.WRITE_CLASS), reviewer
+        assert set(KIRO_BUILTIN_CHROME) <= reviewer
+
+    def test_developer_default_covers_every_measured_builtin(self):
+        """The unrestricted role must lose nothing: every 2.25.0 built-in is granted."""
+        developer = set(
+            kiro_agent_tools(resolve_allowed_tools(None, "developer", ["cao-mcp-server"]))
+        )
+        assert self.KIRO_NATIVE_INVENTORY_2_25 <= developer, (
+            self.KIRO_NATIVE_INVENTORY_2_25 - developer
+        )
+        assert "@cao-mcp-server" in developer
+
+    def test_mapping_knows_exactly_the_measured_inventory(self):
+        """Every native name the mapping grants is a real 2.25.0 tool (or its alias),
+        and every real tool is gated by some capability -- no tool is unreachable
+        for the unrestricted role, none is invented."""
+        aliases = {"fs_read", "fs_write", "execute_bash"}
+        mapped = (ALL_NATIVE_TOOLS["kiro_cli"] - aliases) | set(KIRO_BUILTIN_CHROME)
+        assert mapped == self.KIRO_NATIVE_INVENTORY_2_25, sorted(
+            mapped ^ self.KIRO_NATIVE_INVENTORY_2_25
+        )
+        # The chrome is not gated by any capability, only by @builtin.
+        assert not (set(KIRO_BUILTIN_CHROME) & ALL_NATIVE_TOOLS["kiro_cli"])
+
+    def test_privilege_equivalent_tools_gate_with_the_capability_they_equal(self):
+        assert self.SHELL_CLASS <= set(kiro_agent_tools(["execute_bash"]))
+        assert self.WRITE_CLASS <= set(kiro_agent_tools(["fs_write"]))
+        assert "knowledge" in kiro_agent_tools(["fs_read"])
+        assert set(kiro_agent_tools(["fs_list"])) == {"glob", "grep"}
+        assert set(kiro_agent_tools(["web_fetch"])) == {"web_fetch", "web_search"}
+
+    def test_mcp_references_pass_through_verbatim(self):
+        assert kiro_agent_tools(["@probe", "@probe/ping", "fs_read"]) == sorted(
+            {"@probe", "@probe/ping", "fs_read", "read", "knowledge"}
+        )
+
+    def test_unknown_capability_grants_nothing(self):
+        assert kiro_agent_tools(["not_a_capability"]) == []
+
+    def test_output_is_sorted_and_deduplicated(self):
+        out = kiro_agent_tools(["fs_*", "fs_read", "fs_write", "fs_list"])
+        assert out == sorted(set(out))

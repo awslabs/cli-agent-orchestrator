@@ -15,6 +15,9 @@ from cli_agent_orchestrator.constants import (
     SERVER_PORT,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.services.install_service import (
+    kiro_install_predates_native_enforcement,
+)
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.enforcement import (
     NATIVE,
@@ -139,8 +142,9 @@ def _parse_env_pairs(pairs):
     metavar="KEY=VALUE",
     help="Forward an env var to the supervisor AND every worker spawned later "
     "in the same session. Repeatable. Values travel in the request body, not "
-    "the URL. Blocked prefixes (CLAUDE/CODEX_/__MISE_) and >=2048-byte values "
-    "are rejected. See issue #248.",
+    "the URL. Rejected: provider prefixes (CLAUDE/CODEX_/__MISE_), the loader, "
+    "shell, interpreter and AWS-config startup keys listed in docs/tmux.md, and "
+    ">=2048-byte values. See issue #248.",
 )
 @click.option(
     "--resume-session-id",
@@ -242,6 +246,18 @@ def launch(
                         "  Note: kiro_cli's --trust-all-tools consent dialog will be "
                         "auto-answered at startup.\n"
                     )
+                    # --trust-all-tools only suppresses prompts. What the agent
+                    # can use is the installed agent JSON's `tools`, written by
+                    # `cao install` from the profile, so --yolo cannot widen it.
+                    click.echo(
+                        click.style(
+                            "  Note: --yolo does not widen kiro_cli's tool set.\n"
+                            "  Availability is the installed agent's `tools` list, set at\n"
+                            "  cao install time. To get unrestricted access, set\n"
+                            "  'allowedTools: [\"*\"]' in the profile and re-run 'cao install'.\n",
+                            fg="yellow",
+                        )
+                    )
                 elif provider == "opencode_cli":
                     # opencode's TUI has no runtime skip-permissions flag
                     # (tracked upstream in sst/opencode#8463). Permissions are
@@ -262,15 +278,28 @@ def launch(
                 blocked_summary = ", ".join(blocked) if blocked else "(none)"
                 level = enforcement_for(provider)
                 if is_install_time(provider):
-                    # opencode enforces the permission block `cao install` wrote
-                    # from the profile, and ignores the list resolved here. There
-                    # is no TOOL_MAPPING for it either, so the deny list is empty
-                    # whatever the installed agent denies. Say where the policy
-                    # lives rather than printing "(none)" next to a native promise.
+                    # opencode enforces the permission block, and kiro the
+                    # `tools` list, that `cao install` wrote from the profile;
+                    # both ignore the list resolved here. Say where the policy
+                    # lives rather than printing a deny list next to a native
+                    # promise that the installed file may not keep.
                     blocked_summary = (
-                        "(set at install time from the installed agent's permissions; "
+                        "(set at install time from the installed agent's policy; "
                         "not shown here, and --allowed-tools does not change it)"
                     )
+                    if provider == "kiro_cli" and kiro_install_predates_native_enforcement(
+                        agents, resolved_allowed_tools
+                    ):
+                        click.echo(
+                            click.style(
+                                f"\n  WARNING: the installed Kiro agent '{agents}' has "
+                                'tools: ["*"]: it was installed before CAO wrote the\n'
+                                "  tool policy into `tools`, so this restriction is NOT "
+                                "applied. Re-run:\n"
+                                f"    cao install {agents} --provider kiro_cli\n",
+                                fg="yellow",
+                            )
+                        )
                 elif level != NATIVE and is_restricted(resolved_allowed_tools) and not blocked:
                     # Providers with no TOOL_MAPPING entry return an empty
                     # deny list; "(none)" would read as "nothing is blocked

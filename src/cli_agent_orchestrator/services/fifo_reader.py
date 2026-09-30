@@ -3,9 +3,11 @@
 Publisher: terminal.{id}.output
 """
 
+import errno
 import logging
 import os
 import select
+import stat
 import threading
 import time
 from typing import Callable, Dict, Optional, Tuple
@@ -52,6 +54,44 @@ _COALESCE_MAX_BYTES = 64 * 1024
 # fakes. terminal_service wires the real backend calls at create_reader time.
 PaneProbe = Callable[[], str]  # returns the live pane content (tmux capture-pane tail)
 RearmPipe = Callable[[], None]  # re-attaches pipe-pane (stop then start, NOT a bare toggle)
+
+
+def _ensure_fifo(fifo_path) -> None:
+    """Create ``fifo_path`` as an owner-only FIFO, or accept an existing FIFO.
+
+    ``os.mkfifo`` is exclusive by nature (it fails with EEXIST rather than
+    replacing anything), so a leftover FIFO from an earlier run is kept while a
+    regular file or a symlink planted at the predictable path is refused.
+    ``lstat`` rather than ``stat``: a symlink AT the path is the thing to
+    refuse, whatever it points to. The mode is 0600 on top of the 0700
+    ``FIFO_DIR``; the tmux pipe-pane writer runs as the same user.
+    """
+    try:
+        os.mkfifo(fifo_path, 0o600)
+    except FileExistsError:
+        pass
+    if not stat.S_ISFIFO(os.lstat(fifo_path).st_mode):
+        raise OSError(errno.EEXIST, f"{fifo_path} exists and is not a FIFO; refusing to use it")
+
+
+def _open_fifo(fifo_path, flags: int) -> int:
+    """``os.open`` the FIFO with ``O_NOFOLLOW`` and confirm the descriptor is a FIFO.
+
+    Closes the window between :func:`_ensure_fifo` and the open: a symlink
+    swapped in meanwhile fails the open (ELOOP), and anything that is not a
+    FIFO once opened is closed and refused instead of being read from or
+    written to.
+    """
+    # O_NOFOLLOW is POSIX.1-2008; every platform with os.mkfifo that CAO runs
+    # on (Linux, macOS, the BSDs) has it.
+    fd = os.open(str(fifo_path), flags | os.O_NOFOLLOW)
+    try:
+        if not stat.S_ISFIFO(os.fstat(fd).st_mode):
+            raise OSError(errno.EEXIST, f"{fifo_path} is not a FIFO; refusing to use it")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 class FifoManager:
@@ -169,8 +209,7 @@ class FifoManager:
             if terminal_id in self._readers:
                 return
 
-            if not fifo_path.exists():
-                os.mkfifo(fifo_path)
+            _ensure_fifo(fifo_path)
 
             stop_flag = threading.Event()
             thread = threading.Thread(
@@ -308,9 +347,9 @@ class FifoManager:
         try:
             # Non-blocking read open of a FIFO succeeds immediately (POSIX),
             # writer attached or not.
-            read_fd = os.open(str(fifo_path), os.O_RDONLY | os.O_NONBLOCK)
+            read_fd = _open_fifo(fifo_path, os.O_RDONLY | os.O_NONBLOCK)
             # With our read end open, a non-blocking write open cannot ENXIO.
-            keepalive_fd = os.open(str(fifo_path), os.O_WRONLY | os.O_NONBLOCK)
+            keepalive_fd = _open_fifo(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
 
             while not stop_flag.is_set():
                 # Wait at most _COALESCE_WINDOW so we always flush pending data

@@ -179,6 +179,7 @@ from cli_agent_orchestrator.services.workflow_journal import (
 from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.forwarded_env import ForwardedEnvError, validate_forwarded_env
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
@@ -342,6 +343,25 @@ class CreateSessionBody(CreateTerminalBody):
     env_vars: Optional[Dict[str, str]] = None
     group: Optional[List[str]] = None
     metadata: Optional[Dict] = None
+
+    @field_validator("env_vars")
+    @classmethod
+    def validate_env_vars(cls, v: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+        """Apply the shared forwarded-env rules at the HTTP boundary.
+
+        ``cao launch --env`` and the ops-MCP tool already validate before
+        sending, but a direct HTTP caller reached ``TmuxClient._merge_extra_env``
+        unchecked, where a violating key was dropped with only a server-side
+        warning. Rejecting here makes the loader/shell/interpreter denylist
+        (``LD_PRELOAD``, ``BASH_ENV``, ...) a 422 instead of a silent drop.
+        The shared messages name the key and rule only, never the value.
+        """
+        if v is None:
+            return v
+        try:
+            return validate_forwarded_env(v)
+        except ForwardedEnvError as exc:
+            raise ValueError(str(exc)) from None
 
     @field_validator("group")
     @classmethod
@@ -3435,6 +3455,14 @@ async def delete_session(
         validate_tmux_name(session_name, "session_name")
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    # Same naming contract as POST /sessions: a bare name is the caller's alias
+    # for the prefixed CAO session, never a reference to a personal tmux session
+    # of that name. Canonicalise here so DELETE /sessions/dev tears down
+    # cao-dev and can never reach an operator's own "dev".
+    from cli_agent_orchestrator.constants import SESSION_PREFIX
+
+    if not session_name.startswith(SESSION_PREFIX):
+        session_name = f"{SESSION_PREFIX}{session_name}"
     try:
         # Off the event loop: teardown is fully synchronous (tmux kills, FIFO
         # cleanup, DB writes) and has wedged the whole server — /health
