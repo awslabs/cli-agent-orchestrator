@@ -50,7 +50,7 @@
     "node": ">=20.0"
   },
   "overrides": {
-    "brace-expansion": "^5.0.9",
+    "brace-expansion": "^5.0.12",
     "fast-uri": "^3.1.7",
     "image-size": "npm:image-size-safe@2.0.3",
     "js-yaml": "^4.3.2",
