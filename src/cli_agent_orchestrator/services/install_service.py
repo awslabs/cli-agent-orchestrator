@@ -97,7 +97,7 @@ _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # Context-copy provenance marker — stamped into <context dir>/<name>.md
 # frontmatter to record the original install source stem (the stem/name passed to
-# `cao install`). Used by the opencode collision guard to distinguish a profile's
+# `cao install`). Used by the ownership guard to distinguish a profile's
 # own installed copy from a different profile that resolves to the same agent id.
 _CONTEXT_SOURCE_STEM_KEY = "x-cao-source-stem"
 _CONTEXT_SOURCE_STEM_RE = re.compile(rf"^\s*{re.escape(_CONTEXT_SOURCE_STEM_KEY)}\s*:")
@@ -465,7 +465,7 @@ def _context_dir() -> Path:
     """Resolve the shared context directory the way profile discovery does.
 
     Discovery scans the ``cao_installed`` entry of ``agents.dirs`` (see
-    ``utils/agent_profiles.py``), and the opencode collision guard reads its
+    ``utils/agent_profiles.py``), and the ownership guard reads its
     candidates from there. The writer has to deposit copies in the SAME place,
     or an operator who overrides ``cao_installed`` gets copies discovery never
     sees -- and a guard that is blind to exactly the files it protects.
@@ -504,14 +504,15 @@ def _context_lookup_dirs() -> List[Path]:
     return installed_context_lookup_dirs(AGENT_CONTEXT_DIR)
 
 
-def _installed_context_copy_path(stem: str, directory: Optional[Path] = None) -> Path:
+def _installed_context_copy_path(stem: str, directory: Path) -> Path:
     """Return the installed context path for ``stem`` in ``directory``.
 
     Prefers the flat ``<stem>.md`` the writer produces; falls back to the
     directory-style ``<stem>/agent.md`` discovery also recognises, so an
     operator-arranged copy in that shape still counts as occupying the id.
+    Callers pass each ``_context_lookup_dirs()`` entry explicitly.
     """
-    installed_dir = _context_dir() if directory is None else directory
+    installed_dir = directory
     flat = installed_dir / f"{stem}.md"
     if flat.exists():
         return flat
@@ -644,7 +645,7 @@ def _write_context_file(agent_name: str, raw_content: str, source_name: str) -> 
     ``<context dir>/<resolved-name>.md`` (see ``_context_dir``), NOT under the original install
     stem. ``source_name`` is the install *source handle* (the stem/name passed
     to ``cao install``), so it can be stamped into the copy's frontmatter under
-    ``_CONTEXT_SOURCE_STEM_KEY``. The opencode collision guard later uses that
+    ``_CONTEXT_SOURCE_STEM_KEY``. The ownership guard later uses that
     marker to prove "this installed-dir
     artifact is a prior copy of the profile being reinstalled" versus "this is
     a different profile that resolves to the same agent id" (see
@@ -789,6 +790,170 @@ def _build_provider_config(
     )
 
 
+def _provider_artifact_path(provider: str, profile_name: str) -> Optional[Path]:
+    """The per-agent file ``install_agent`` writes for ``provider``, or ``None``.
+
+    Mirrors the three provider sinks in :func:`install_agent` (Kiro's agent
+    JSON, Copilot's ``.agent.md``, OpenCode's ``<id>.md``); a provider with no
+    per-agent file (claude_code, codex, ...) returns ``None`` because the shared
+    context copy is its only artifact. ``test_install_ownership_guard`` pins
+    this against what an install actually reports as ``agent_file``.
+    """
+    safe_filename = flatten_path_separators(profile_name)
+    if provider == ProviderType.KIRO_CLI.value:
+        return KIRO_AGENTS_DIR / f"{safe_filename}.json"
+    if provider == ProviderType.COPILOT_CLI.value:
+        return COPILOT_AGENTS_DIR / f"{safe_filename}.agent.md"
+    if _is_opencode(provider):
+        return OPENCODE_AGENTS_DIR / f"{to_opencode_agent_id(profile_name)}.md"
+    return None
+
+
+def _entry_occupying(path: Path) -> Optional[str]:
+    """Name of the directory entry ``path`` lands on under that directory's own rules.
+
+    ``None`` when nothing is there. The name comes from the directory listing,
+    not from ``path``: on a case-folding or Unicode-normalising filesystem the
+    entry a write to ``Agent.md`` would replace may be spelled ``agent.md``, and
+    that spelling is what identifies its owner. Identity is by device and inode,
+    so a symlink entry is matched by its own lstat, never by its target. Falls
+    back to ``path.name`` if the listing cannot be read or no entry matches (a
+    rename between the two calls), which is the exact-spelling answer.
+    """
+    try:
+        target = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    try:
+        for entry in os.listdir(path.parent):
+            try:
+                st = os.lstat(path.parent / entry)
+            except OSError:
+                continue
+            if (st.st_dev, st.st_ino) == (target.st_dev, target.st_ino):
+                return entry
+    except OSError:
+        pass
+    return path.name
+
+
+def _artifact_stem(entry_name: str, suffix: str) -> str:
+    """``agent`` from ``agent.json`` / ``agent.agent.md`` / ``agent.md`` given the sink's suffix."""
+    return entry_name[: -len(suffix)] if entry_name.endswith(suffix) else entry_name
+
+
+def _context_record_owner(stem: str) -> Tuple[Optional[str], Optional[Path]]:
+    """``(provenance stem, path)`` of the installed context copy for ``stem``, if any.
+
+    ``(None, path)`` means a copy exists but carries no (or an unreadable)
+    marker; ``(None, None)`` means no copy in any lookup directory.
+    """
+    for context_dir in _context_lookup_dirs():
+        candidate = _installed_context_copy_path(stem, context_dir)
+        try:
+            occupant = _entry_occupying(candidate)
+            if occupant is None:
+                continue
+            candidate = candidate.parent / occupant
+            if not stat.S_ISREG(os.lstat(candidate).st_mode):
+                continue
+            raw = candidate.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None, candidate
+        try:
+            return _context_source_stem(raw), candidate
+        except Exception:
+            return None, candidate
+    return None, None
+
+
+def _guard_provider_artifact_ownership(
+    source_name: str, profile_name: str, provider: str, target_id: str, *, self_owned: bool
+) -> None:
+    """Refuse an install whose provider artifact would land on another profile's file.
+
+    The context probe above establishes occupancy under the CONTEXT directory's
+    case rules. The provider directory can live on a different filesystem: with
+    ``agents.dirs.cao_installed`` on case-sensitive storage and the provider
+    directory under a case-insensitive home, ``alpha`` (``name: agent``) and
+    ``beta`` (``name: Agent``) hold two distinct context records while OpenCode's
+    ``Agent.md`` write replaces ``agent.md`` -- the overwrite this guard exists to
+    prevent, through a gap the context probe cannot see (round-5 review of
+    #493). So the destination that is actually written is probed as well, by
+    asking the filesystem which entry a write there would replace:
+
+    * nothing there: free;
+    * the entry is spelled exactly as ours and the context probe found this
+      profile's own record (``self_owned``): a reinstall;
+    * the entry is spelled differently (an alias) and the context record for
+      THAT spelling names this profile: the same profile renamed its own case;
+    * otherwise the file belongs to another profile -- named through its
+      context record when one exists -- or to no record at all (an orphan left
+      by a hand-deleted context copy, which the probe likewise refuses to
+      overwrite on a guess). Both block, with the file and the remedy named.
+    """
+    destination = _provider_artifact_path(provider, profile_name)
+    if destination is None:
+        return
+    entry = _entry_occupying(destination)
+    if entry is None:
+        return
+    try:
+        if not stat.S_ISREG(os.lstat(destination.parent / entry).st_mode):
+            # Not a file CAO wrote; the sink's own write reports the real problem.
+            return
+    except FileNotFoundError:
+        return
+
+    if entry == destination.name:
+        if self_owned:
+            return
+        owner_stem, record = None, None
+    else:
+        owner_stem, record = _context_record_owner(
+            _artifact_stem(entry, _artifact_suffix(provider))
+        )
+        if owner_stem == source_name:
+            return
+
+    aliased = (
+        ""
+        if entry == destination.name
+        else f" (spelled '{entry}' on disk; that filesystem treats it as the same file)"
+    )
+    if owner_stem:
+        owner = f"the existing profile '{owner_stem}.md' (installed copy at '{record}')"
+    elif record is not None:
+        owner = f"an installed copy without CAO source provenance at '{record}'"
+    else:
+        owner = "no installed profile CAO knows of"
+    remedy = (
+        f" {_installed_context_copy_remedy(record)}"
+        if record is not None and not owner_stem
+        else (
+            f" If '{destination}' is a leftover from an uninstalled or hand-deleted "
+            "profile, delete it and reinstall."
+            if owner_stem is None
+            else " Rename one of these profiles (their frontmatter 'name:' must differ)."
+        )
+    )
+    raise _collision_error_class(provider)(
+        f"Installing '{source_name}.md' (name '{profile_name}') for {provider} would "
+        f"overwrite the {provider} agent file '{destination}'{aliased}, which belongs to "
+        f"{owner}. The install was refused rather than silently replace it.{remedy}"
+    )
+
+
+def _artifact_suffix(provider: str) -> str:
+    if provider == ProviderType.KIRO_CLI.value:
+        return ".json"
+    if provider == ProviderType.COPILOT_CLI.value:
+        return ".agent.md"
+    return ".md"
+
+
 def _guard_installed_copy_ownership(source_name: str, profile_name: str, provider: str) -> None:
     """Refuse an install that would overwrite a context copy owned by another profile.
 
@@ -810,7 +975,9 @@ def _guard_installed_copy_ownership(source_name: str, profile_name: str, provide
     a ``~`` spelling or a discovery failure erased the evidence outright. The
     files a second install overwrites are at known paths, so those paths are what
     is probed: ``_context_lookup_dirs()`` (the configured directory, plus the
-    legacy default when an override is active) for ``<id>.md``.
+    legacy default when an override is active) for ``<id>.md``, and then the
+    provider's own artifact destination, whose filesystem may fold case where
+    the context directory's does not (:func:`_guard_provider_artifact_ownership`).
 
     **Ownership is the provenance marker.** ``_write_context_file`` stamps each
     copy with ``_CONTEXT_SOURCE_STEM_KEY`` naming the install stem it came from.
@@ -839,8 +1006,19 @@ def _guard_installed_copy_ownership(source_name: str, profile_name: str, provide
     safe_name = validate_path_component(profile_name, description="profile name")
     target_id = to_opencode_agent_id(safe_name)
 
+    self_owned = False
     for context_dir in _context_lookup_dirs():
         candidate_path = _installed_context_copy_path(target_id, context_dir)
+        # Resolved through the directory's own rules (case folding, Unicode
+        # normalisation): the entry a write here would replace, by its on-disk
+        # spelling. ``None`` means the slot is free in THIS directory.
+        try:
+            occupant = _entry_occupying(candidate_path)
+        except OSError as exc:
+            _raise_unreadable_installed_copy(target_id, source_name, candidate_path, exc, provider)
+        if occupant is None:
+            continue
+        candidate_path = candidate_path.parent / occupant
         try:
             entry = os.lstat(candidate_path)
         except FileNotFoundError:
@@ -867,6 +1045,7 @@ def _guard_installed_copy_ownership(source_name: str, profile_name: str, provide
             )
         if provenance_stem == source_name:
             # Our own earlier copy (possibly in the legacy directory): a reinstall.
+            self_owned = True
             continue
 
         existing = _installed_copy_display(provenance_stem, candidate_path)
@@ -891,6 +1070,12 @@ def _guard_installed_copy_ownership(source_name: str, profile_name: str, provide
                 "(their frontmatter 'name:' must differ)."
             )
         raise _collision_error_class(provider)(message + recovery)
+
+    # The context directory's case rules are not necessarily the provider
+    # directory's; probe the file the install will actually write as well.
+    _guard_provider_artifact_ownership(
+        source_name, profile_name, provider, target_id, self_owned=self_owned
+    )
 
 
 def _materialize_opencode_mcp(
@@ -1198,6 +1383,15 @@ def install_agent(
         # and design §3.1 for why the guard is here at the caller's request rather
         # than a change to the rewrite itself: the rewrite is correct whenever an
         # operator asked for it.
+        # The ownership guard runs BEFORE any write this install performs, for
+        # every provider. The local-store rewrite just below is the first of
+        # them: it re-serialises this profile's own store copy to record the
+        # provider, and a refused install must leave even that byte-identical
+        # (round-5 review of #493). The shared context copy follows -- the
+        # artifact every provider's agent reads -- and, for OpenCode, the agent
+        # file and config section it also shares.
+        _guard_installed_copy_ownership(agent_name, profile.name, provider)
+
         if profile.provider != provider and not preserve_recorded_provider:
             stored = frontmatter.loads(raw_content)
             stored["provider"] = provider
@@ -1224,12 +1418,8 @@ def install_agent(
         # a new caller appears.
         safe_filename = flatten_path_separators(profile.name)
 
-        # The ownership guard runs BEFORE any destructive write, for every
-        # provider: the shared context copy is the first thing an install
-        # overwrites and the artifact every provider's agent reads, so a rejected
-        # install must leave it -- and, for OpenCode, the agent file and config
-        # section it also shares -- untouched.
-        _guard_installed_copy_ownership(agent_name, profile.name, provider)
+        # Ownership was established above, before the local-store rewrite; the
+        # shared context copy is the next thing this install writes.
         context_file = _write_context_file(profile.name, raw_content, agent_name)
 
         if provider == ProviderType.KIRO_CLI.value:

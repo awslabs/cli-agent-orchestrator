@@ -5,46 +5,26 @@ for OpenCode. Round 3 (haofeif) showed six ways that let the silent overwrite
 through; every case below failed on ``db57df34`` and passes with the guard
 reading the destination path itself and running for every provider.
 
-The ``workspace`` fixture is the one ``test_install_opencode_provenance`` uses:
-``AGENT_CONTEXT_DIR`` and the default ``cao_installed`` mapping both point at
-the same temp context dir, exactly as in production.
+The ``workspace`` fixture (``conftest.py``) points ``AGENT_CONTEXT_DIR`` and the
+default ``cao_installed`` mapping at the same temp context dir, exactly as in
+production; the install helpers come from ``install_helpers.py``.
 """
 
 import logging
 import os
 from pathlib import Path
-from test.cli.commands.test_install_opencode_provenance import (  # noqa: F401
-    _install,
-    _write_profile,
-    runner,
-    workspace,
-)
+from test.cli.commands.install_helpers import _install, _install_for, _ok, _refused, _write_profile
 from typing import Any, Dict
 
 import pytest
 from click.testing import CliRunner
 
-from cli_agent_orchestrator.cli.commands.install import install
 from cli_agent_orchestrator.services import install_service, settings_service
 from cli_agent_orchestrator.services.install_service import (
     _CONTEXT_SOURCE_STEM_KEY,
     _write_context_file,
 )
 from cli_agent_orchestrator.utils import skill_injection
-
-
-def _install_for(runner: CliRunner, stem: str, provider: str):
-    return runner.invoke(install, [stem, "--provider", provider])
-
-
-def _ok(result) -> None:
-    assert result.exit_code == 0 and "Error:" not in result.output, result.output
-
-
-def _refused(result) -> None:
-    assert result.exit_code == 0  # failure result, not a crash
-    assert "Error:" in result.output, result.output
-
 
 # ---------------------------------------------------------------------------
 # Finding 1: occupancy comes from the destination, not from lossy discovery.
@@ -456,3 +436,231 @@ class TestSourceDeclaredMarkerIsReplacedNotRefused:
         copy = (workspace["context_dir"] / "shared.md").read_text()
         assert f"{_CONTEXT_SOURCE_STEM_KEY}: 'alpha'" in copy
         assert "somebody-else" not in copy
+
+
+# ---------------------------------------------------------------------------
+# Round 5 (haofeif P2): the context directory's case rules are not the provider
+# directory's. ``_entry_occupying`` is the one seam through which the guard asks
+# a directory which entry a write would replace, so a per-directory rule table
+# stands in for the two filesystems and the scenario runs the same way on a
+# case-folding macOS tmp and a case-sensitive Linux one.
+# ---------------------------------------------------------------------------
+
+
+def _rules_filesystem(rules: Dict[Path, str]):
+    """``_entry_occupying`` under per-directory rules: ``sensitive`` or ``folding``.
+
+    Directories not in ``rules`` keep the real filesystem's answer.
+    """
+    real = install_service._entry_occupying
+
+    def fake(path: Path):
+        rule = rules.get(path.parent)
+        if rule is None:
+            return real(path)
+        try:
+            names = os.listdir(path.parent)
+        except FileNotFoundError:
+            return None
+        if rule == "sensitive":
+            return path.name if path.name in names else None
+        assert rule == "folding"
+        return next((n for n in names if n.casefold() == path.name.casefold()), None)
+
+    return fake
+
+
+class TestMixedCaseRulesAcrossContextAndProviderDirectories:
+    def _mixed(
+        self, monkeypatch: pytest.MonkeyPatch, workspace: Dict[str, Any], provider_dir: Path
+    ):
+        monkeypatch.setattr(
+            install_service,
+            "_entry_occupying",
+            _rules_filesystem({workspace["context_dir"]: "sensitive", provider_dir: "folding"}),
+        )
+
+    def test_opencode_alias_at_the_provider_destination_is_refused(
+        self, runner: CliRunner, workspace: Dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """haofeif's reproduction: ``agent`` then ``Agent`` with a case-sensitive
+        context dir and a case-folding OpenCode dir. On ``6d3d522e`` both installs
+        succeeded, two context records existed, and ``Agent.md`` had replaced
+        alpha's body at the same physical provider file."""
+        self._mixed(monkeypatch, workspace, workspace["agents_dir"])
+        store = workspace["local_store"]
+        _write_profile(store / "alpha.md", name="agent", body="ALPHA-BODY")
+        _ok(_install(runner, "alpha"))
+
+        _write_profile(store / "beta.md", name="Agent", body="BETA-BODY")
+        r2 = _install(runner, "beta")
+
+        _refused(r2)
+        assert "alpha" in r2.output and "beta" in r2.output
+        assert "spelled 'agent.md' on disk" in r2.output, r2.output
+        assert "Rename one of these profiles" in r2.output
+        # One context record, one provider file, alpha's body untouched.
+        assert sorted(p.name for p in workspace["context_dir"].iterdir()) == ["agent.md"]
+        assert sorted(p.name for p in workspace["agents_dir"].iterdir()) == ["agent.md"]
+        assert "ALPHA-BODY" in (workspace["agents_dir"] / "agent.md").read_text()
+        # ...and nothing landed in opencode.json for the refused id (the file
+        # may not exist at all: a profile without mcpServers writes none).
+        config_file = workspace["config_file"]
+        assert not config_file.exists() or '"Agent"' not in config_file.read_text()
+
+    def test_kiro_alias_at_the_provider_destination_is_refused(
+        self, runner: CliRunner, workspace: Dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every provider sink is probed, not only OpenCode's."""
+        self._mixed(monkeypatch, workspace, workspace["kiro_agents_dir"])
+        store = workspace["local_store"]
+        _write_profile(store / "alpha.md", name="agent", body="ALPHA-BODY")
+        _ok(_install_for(runner, "alpha", "kiro_cli"))
+        before = (workspace["kiro_agents_dir"] / "agent.json").read_text()
+
+        _write_profile(store / "beta.md", name="Agent", body="BETA-BODY")
+        r2 = _install_for(runner, "beta", "kiro_cli")
+
+        _refused(r2)
+        assert "kiro_cli agent file" in r2.output, r2.output
+        assert "spelled 'agent.json' on disk" in r2.output
+        assert sorted(p.name for p in workspace["kiro_agents_dir"].iterdir()) == ["agent.json"]
+        assert (workspace["kiro_agents_dir"] / "agent.json").read_text() == before
+        assert sorted(p.name for p in workspace["context_dir"].iterdir()) == ["agent.md"]
+
+    def test_the_same_profile_may_change_the_case_of_its_own_name(
+        self, runner: CliRunner, workspace: Dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The alias is owned by the installing stem: a rename of ``alpha``'s own
+        ``name:`` from ``agent`` to ``Agent`` replaces alpha's own provider file."""
+        self._mixed(monkeypatch, workspace, workspace["agents_dir"])
+        store = workspace["local_store"]
+        _write_profile(store / "alpha.md", name="agent", body="OLD-CASE")
+        _ok(_install(runner, "alpha"))
+
+        _write_profile(store / "alpha.md", name="Agent", body="NEW-CASE")
+        _ok(_install(runner, "alpha"))
+
+    def test_distinct_case_names_both_install_where_neither_directory_folds(
+        self, runner: CliRunner, workspace: Dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Control: with both directories case-sensitive the two really are distinct
+        files, and the probe must not refuse what the filesystem keeps apart."""
+        monkeypatch.setattr(
+            install_service,
+            "_entry_occupying",
+            _rules_filesystem(
+                {workspace["context_dir"]: "sensitive", workspace["agents_dir"]: "sensitive"}
+            ),
+        )
+        store = workspace["local_store"]
+        _write_profile(store / "alpha.md", name="agent")
+        _ok(_install(runner, "alpha"))
+        _write_profile(store / "beta.md", name="Agent")
+        r2 = _install(runner, "beta")
+        folds_for_real = (workspace["agents_dir"] / "AGENT.MD").exists()
+        if folds_for_real:
+            # The real tmp dir folds case (macOS): the write would alias after
+            # all, and the guard's answer is whatever ``_entry_occupying``
+            # says; this control is about the probe's logic, not the host.
+            return
+        _ok(r2)
+        assert sorted(p.name for p in workspace["agents_dir"].iterdir()) == ["Agent.md", "agent.md"]
+
+
+class TestOrphanedProviderArtifact:
+    def test_a_provider_file_with_no_context_record_is_not_overwritten(
+        self, runner: CliRunner, workspace: Dict[str, Any]
+    ) -> None:
+        """Ownership used to be keyed solely on the context copy, so a hand-deleted
+        copy left the provider file free to be silently replaced (gutosantos82)."""
+        store = workspace["local_store"]
+        _write_profile(store / "alpha.md", name="shared", body="ALPHA-BODY")
+        _ok(_install(runner, "alpha"))
+        (workspace["context_dir"] / "shared.md").unlink()
+
+        _write_profile(store / "beta.md", name="shared", body="BETA-BODY")
+        r2 = _install(runner, "beta")
+
+        _refused(r2)
+        assert "no installed profile CAO knows of" in r2.output, r2.output
+        assert "delete it and reinstall" in r2.output
+        assert "ALPHA-BODY" in (workspace["agents_dir"] / "shared.md").read_text()
+
+        # The remedy works: remove the orphan and the install goes through.
+        (workspace["agents_dir"] / "shared.md").unlink()
+        _ok(_install(runner, "beta"))
+        assert "BETA-BODY" in (workspace["agents_dir"] / "shared.md").read_text()
+
+    def test_self_reinstall_over_own_provider_file_still_works(
+        self, runner: CliRunner, workspace: Dict[str, Any]
+    ) -> None:
+        store = workspace["local_store"]
+        _write_profile(store / "alpha.md", name="shared", body="V1")
+        _ok(_install(runner, "alpha"))
+        _write_profile(store / "alpha.md", name="shared", body="V2")
+        _ok(_install(runner, "alpha"))
+        assert "V2" in (workspace["agents_dir"] / "shared.md").read_text()
+
+
+class TestRefusedInstallWritesNothing:
+    def test_local_store_copy_is_byte_identical_after_a_refusal(
+        self, runner: CliRunner, workspace: Dict[str, Any]
+    ) -> None:
+        """The guard runs before the local-store ``provider:`` rewrite, not only
+        before the context write (gutosantos82, round 5). On ``6d3d522e`` a refused
+        ``beta`` still came back re-serialised with ``provider: opencode_cli``."""
+        store = workspace["local_store"]
+        _write_profile(store / "alpha.md", name="shared", body="ALPHA")
+        _ok(_install(runner, "alpha"))
+
+        _write_profile(store / "beta.md", name="shared", body="BETA")
+        before = (store / "beta.md").read_bytes()
+        assert b"provider:" not in before
+
+        _refused(_install(runner, "beta"))
+        assert (store / "beta.md").read_bytes() == before
+
+
+class TestProviderArtifactPathMirrorsTheInstaller:
+    @pytest.mark.parametrize("provider", ["opencode_cli", "kiro_cli", "copilot_cli"])
+    def test_guard_probes_the_file_the_install_reports(
+        self, runner: CliRunner, workspace: Dict[str, Any], provider: str
+    ) -> None:
+        """``_provider_artifact_path`` is a mirror of the installer's sinks; if a
+        sink moves, this is the test that notices."""
+        store = workspace["local_store"]
+        _write_profile(store / "alpha.md", name="mirror_me", body="You are an agent.")
+        result = install_service.install_agent("alpha", provider)
+        assert result.success, result.message
+        assert result.agent_file is not None
+        assert install_service._provider_artifact_path(provider, "mirror_me") == Path(
+            result.agent_file
+        )
+
+    def test_providers_without_a_per_agent_file_probe_nothing(self) -> None:
+        assert install_service._provider_artifact_path("claude_code", "x") is None
+
+
+class TestEntryOccupying:
+    def test_missing_path_is_free(self, tmp_path: Path) -> None:
+        assert install_service._entry_occupying(tmp_path / "nothing.md") is None
+
+    def test_exact_file_is_named(self, tmp_path: Path) -> None:
+        (tmp_path / "agent.md").write_text("x")
+        assert install_service._entry_occupying(tmp_path / "agent.md") == "agent.md"
+
+    def test_alias_is_named_by_its_on_disk_spelling_where_the_directory_folds(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "agent.md").write_text("x")
+        answer = install_service._entry_occupying(tmp_path / "Agent.md")
+        if (tmp_path / "AGENT.MD").exists():  # case-folding tmp (macOS default)
+            assert answer == "agent.md"
+        else:
+            assert answer is None
+
+    def test_symlink_entry_is_matched_as_itself(self, tmp_path: Path) -> None:
+        (tmp_path / "real.md").write_text("x")
+        os.symlink(tmp_path / "real.md", tmp_path / "link.md")
+        assert install_service._entry_occupying(tmp_path / "link.md") == "link.md"

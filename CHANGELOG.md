@@ -66,7 +66,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   packaged built-in, or a local-store profile that has not been installed —
   does not block the install, since it owns no file yet; installing a profile
   whose `name:` matches one of the built-ins therefore still works, and the
-  same profile still installs for any number of providers
+  same profile still installs for any number of providers. The provider's own
+  agent file (OpenCode `<id>.md`, Kiro `<name>.json`, Copilot `<name>.agent.md`)
+  is probed as well, under that directory's case rules, so a context directory
+  on case-sensitive storage can no longer let `Agent` silently replace an
+  installed `agent` in a case-folding provider directory, and a provider file
+  left behind by a hand-deleted context copy is refused rather than overwritten.
 
 - the shared context copy is written to the configured installed-profile
   directory (`agents.dirs.cao_installed`), the directory profile discovery, the
@@ -81,7 +86,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write root; the Settings API still reports the value as saved. With an
   override configured, the guard and the probe also consult the default
   directory, so ownership records written there by earlier releases stay in
-  force (#493)
+  force (#493).
 
 - **Workflow script run-step refusals now retain their typed reason in run
   records.** When a structured HTTP error includes a string `detail.kind`,
@@ -388,12 +393,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   different profile that resolves to the same OpenCode agent id. The key is
   CAO-written: a source profile that declares it has that line replaced by CAO's
   own at install, and the install is refused when the result does not read back
-  as the marker CAO wrote (#493)
+  as the marker CAO wrote (#493).
 
 - write the shared context copy atomically, via a same-directory temporary file
   and `os.replace`, so an interrupted install cannot leave a truncated copy; a new
   copy is created `0o600` regardless of umask, and a reinstall preserves the
-  existing file's mode (#493)
+  existing file's mode (#493).
 
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped
   silently, so `limit=500` keeps working rather than becoming a 422.

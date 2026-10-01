@@ -174,10 +174,14 @@ uninstalled local profile with the same `name:` does not block. Ownership is
 read from the installed context copy at its destination path (the configured
 `agents.dirs.cao_installed` directory, and the default directory as well when an
 override is configured), not from profile discovery, and the same check guards
-installs for every provider, since they all write that copy. A context copy
+installs for every provider, since they all write that copy. The agent file in
+`OPENCODE_AGENTS_DIR` is probed too, under that directory's own case rules, so a
+name that differs from an installed one only in case is refused where that
+directory folds case even when the context directory does not. A context copy
 written by a CAO version before the `x-cao-source-stem` marker existed cannot
 prove which profile it belongs to; the error tells you to delete that copy and
-reinstall.
+reinstall, and an agent file left behind by a deleted context copy is refused
+the same way.
 
 ### Your `agent.<id>` entry is yours to edit
 
