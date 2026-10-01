@@ -1330,6 +1330,31 @@ async def lifespan(app: FastAPI):
         deferred_init_recovery_task = asyncio.create_task(
             terminal_service.retry_interrupted_deferred_init_external_owners()
         )
+    from cli_agent_orchestrator.decisions.engine import DecisionEngine
+    from cli_agent_orchestrator.decisions.registry import DeciderRegistry
+    from cli_agent_orchestrator.decisions.settings import load_settings
+    from cli_agent_orchestrator.decisions.shadow import ShadowRunner
+    from cli_agent_orchestrator.decisions.store import DecisionStore
+
+    decision_settings = load_settings(environment=dict(os.environ))
+    decision_environment = dict(os.environ)
+    decision_store = DecisionStore()
+    decision_store.sweep()
+    decision_registry = DeciderRegistry()
+    decision_runner = ShadowRunner(
+        decision_store,
+        max_concurrent=decision_settings.max_concurrent,
+        max_pending=decision_settings.max_pending,
+    )
+    app.state.decision_engine = DecisionEngine(
+        decision_registry,
+        decision_store,
+        decision_runner,
+        settings_loader=lambda: load_settings(environment=decision_environment),
+    )
+    logger.info(
+        "Decision states: %s", {p: v.state.value for p, v in decision_settings.points.items()}
+    )
     _seed_default_skills_at_startup()
     _reconcile_memory_at_startup()
     registry = PluginRegistry()
@@ -1474,6 +1499,8 @@ async def lifespan(app: FastAPI):
     # asyncio.gather with the tasks above.
     fifo_manager.stop_watchdog()
 
+    await decision_runner.close()
+    await decision_registry.close()
     await registry.teardown()
     # OpenTelemetry (ported): flush + shut down exporters (no-op when disabled).
     try:
@@ -8583,7 +8610,20 @@ def main():
         default=None,
         help="Terminal backend to use, overriding terminal_backend in config.json",
     )
+    parser.add_argument(
+        "--decision",
+        action="append",
+        default=[],
+        help="Point state override: <point>=off|shadow|on (repeatable)",
+    )
     args = parser.parse_args()
+    if args.decision:
+        from cli_agent_orchestrator.decisions.settings import apply_flags
+
+        try:
+            apply_flags(args.decision)
+        except ValueError as error:
+            parser.error(str(error))
 
     if args.agents_dir:
         os.environ["CAO_AGENTS_DIR"] = args.agents_dir

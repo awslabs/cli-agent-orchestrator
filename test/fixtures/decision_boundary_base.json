@@ -1,0 +1,19 @@
+{
+  "memory_store_description": "Store a persistent memory. Content is saved to a wiki file and indexed.\n\nIdentical key+scope combinations are updated (upsert) \u2014 new content is appended\nas a timestamped entry. If key is omitted, it is auto-generated as a slug of the\nfirst 6 words of content.\n\nUse this to persist facts, decisions, user preferences, and project conventions\nthat should be available across agent sessions.",
+  "workflow_resume_description": "Resume a crashed or failed workflow run from its durable journal (issue #312, N6).\n\nA thin HTTP client over ``POST /workflows/runs/{run_id}/resume`` (single seam):\nthe server re-drives the snapshotted spec in-process and this tool blocks until\nthe run finishes (like ``workflow_run``). Returns a structured envelope on EVERY\npath \u2014 it never raises into the agent loop. ``ok=False`` carries the server error\ndetail (unknown run, a terminal/live run that cannot be resumed, a corrupt\nsnapshot, etc.).\n\nA script-tier resume RE-EXECUTES THE SCRIPT TOP-TO-BOTTOM; completed steps are\nNOT skipped. Each step call is decided as it arrives and lands on one of three\noutcomes: REPLAYED (the stored result is returned and nothing runs \u2014 the\nhandle's ``replayed`` is True and its ``terminal_id`` names a terminal that no\nlonger exists), EXECUTED (it runs again), or HALTED (CAO will not decide alone,\nso the run stops there for a human \u2014 see ``decisions``). A fourth outcome ends\nthe run rather than one step: a step whose script changed at the same key\nDIVERGES and the run fails.\n\n``decisions`` (issue #583, ``recovery-decision-intake``, FR-7) resolves a halted\nstep. The closed set is validated HERE against the same ``RecoveryDecision``\nvocabulary the CLI and the route use (BR-10/TD-7) \u2014 one enum, one\n``parse_decision``, so no surface accepts a value another rejects \u2014 and a\nrejection is returned as this tool's ordinary ``ok=False`` envelope rather than\nraised, exactly like every other failure path. The server re-validates and is the\nauthority; this check only saves a round trip and gives the agent the accepted\nvalues. The tool's contract is otherwise unchanged: a 400 from the route is still\njust another ``ok=False`` detail.",
+  "workflow_resume_input_decisions": {
+    "anyOf": [
+      {
+        "additionalProperties": {
+          "type": "string"
+        },
+        "type": "object"
+      },
+      {
+        "type": "null"
+      }
+    ],
+    "default": null,
+    "description": "Optional per-step recovery decisions for a halted script run: {step_id: 'rerun'|'skip'}. 'rerun' authorises re-executing the step; 'skip' authorises using its stored result. Applied before the script is spawned; an unknown step id or value applies nothing at all. Each decision authorises exactly ONE attempt: if that attempt crashes before it settles, the next resume asks again rather than re-executing on old consent, so a decision is never standing authorisation for a later resume and must not be presented to a user as one."
+  }
+}
