@@ -27,6 +27,7 @@ from typing import Any, Dict
 
 import frontmatter
 import pytest
+import yaml
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.install import install
@@ -978,3 +979,231 @@ class TestContextDirFollowsConfiguredInstalledDir:
         assert r.exit_code == 0 and "Error:" not in r.output, r.output
         assert (workspace["context_dir"] / "solo.md").exists()
         assert not Path(default).joinpath("solo.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# Round 6 (haofeif P2 x2): the textual inserter must touch only the TOP-LEVEL
+# provenance entry, and must keep a valid flow-style mapping valid.
+# ---------------------------------------------------------------------------
+
+
+def _assert_only_our_line_was_added(raw: str, stamped: str, source_name: str) -> None:
+    """Like ``_assert_inserted_marker_only`` for sources whose own text already
+    spells the key (so counting occurrences proves nothing): the readback must
+    be ours, and removing the one line CAO added must give the source back."""
+    assert _context_source_stem(stamped) == source_name
+    assert _remove_marker_line(stamped).encode("utf-8") == raw.encode("utf-8")
+
+
+class TestOnlyTheTopLevelMarkerIsReplaced:
+    """The whitespace-tolerant line regex matched every frontmatter line that
+    merely LOOKED like the marker: a literal scalar's indented text and a nested
+    mapping's key were deleted as if they were CAO's own provenance line."""
+
+    def test_literal_scalar_text_that_spells_the_key_is_preserved(self) -> None:
+        raw = (
+            "---\n"
+            "name: literal-agent\n"
+            "description: |\n"
+            "  Explains the marker:\n"
+            f"  {_CONTEXT_SOURCE_STEM_KEY}: literal-example\n"
+            "---\n"
+            "Body\n"
+        )
+
+        stamped = _context_content_with_provenance(raw, "profile-a")
+
+        _assert_only_our_line_was_added(raw, stamped, "profile-a")
+        post = frontmatter.loads(stamped)
+        assert post.metadata["description"] == (
+            f"Explains the marker:\n{_CONTEXT_SOURCE_STEM_KEY}: literal-example\n"
+        )
+
+    def test_literal_scalar_followed_by_another_line_stays_valid_yaml(self) -> None:
+        """On ``3b6d94da`` deleting the scalar's middle line left the trailing
+        line orphaned and the readback refused the install."""
+        raw = (
+            "---\n"
+            "name: literal-agent\n"
+            "description: |\n"
+            f"  {_CONTEXT_SOURCE_STEM_KEY}: literal-example\n"
+            "  and a following line\n"
+            "---\n"
+            "Body\n"
+        )
+
+        stamped = _context_content_with_provenance(raw, "profile-a")
+
+        _assert_only_our_line_was_added(raw, stamped, "profile-a")
+        post = frontmatter.loads(stamped)
+        assert post.metadata["description"] == (
+            f"{_CONTEXT_SOURCE_STEM_KEY}: literal-example\nand a following line\n"
+        )
+
+    def test_nested_mapping_key_that_spells_the_key_is_preserved(self) -> None:
+        """An MCP server that happens to be named after the marker is the
+        operator's data, not CAO's provenance; it used to vanish, leaving
+        ``mcpServers: null``."""
+        raw = (
+            "---\n"
+            "name: nested-agent\n"
+            "mcpServers:\n"
+            f"  {_CONTEXT_SOURCE_STEM_KEY}:\n"
+            "    command: echo\n"
+            "---\n"
+            "Body\n"
+        )
+
+        stamped = _context_content_with_provenance(raw, "profile-a")
+
+        _assert_only_our_line_was_added(raw, stamped, "profile-a")
+        post = frontmatter.loads(stamped)
+        assert post.metadata["mcpServers"] == {_CONTEXT_SOURCE_STEM_KEY: {"command": "echo"}}
+
+    def test_top_level_duplicates_are_still_all_replaced(self) -> None:
+        """Narrowing to the top level must not reopen the duplicate-key case."""
+        raw = (
+            "---\n"
+            f"{_CONTEXT_SOURCE_STEM_KEY}: 'z'\n"
+            "name: shared\n"
+            "settings:\n"
+            f"  {_CONTEXT_SOURCE_STEM_KEY}: keep-me\n"
+            f"{_CONTEXT_SOURCE_STEM_KEY}: 'y'\n"
+            "---\n"
+            "Body\n"
+        )
+
+        stamped = _context_content_with_provenance(raw, "profile-a")
+
+        assert _context_source_stem(stamped) == "profile-a"
+        post = frontmatter.loads(stamped)
+        assert post.metadata["settings"] == {_CONTEXT_SOURCE_STEM_KEY: "keep-me"}
+        # One top-level marker line; the nested spelling is the only other one.
+        assert stamped.count(f"{_CONTEXT_SOURCE_STEM_KEY}:") == 2
+
+    def test_indented_block_only_replaces_at_the_block_indent(self) -> None:
+        raw = (
+            "---\n"
+            " name: indented\n"
+            " description: |\n"
+            f"   {_CONTEXT_SOURCE_STEM_KEY}: literal\n"
+            "---\n"
+            "Body\n"
+        )
+
+        stamped = _context_content_with_provenance(raw, "profile-a")
+
+        _assert_only_our_line_was_added(raw, stamped, "profile-a")
+        assert frontmatter.loads(stamped).metadata["description"] == (
+            f"{_CONTEXT_SOURCE_STEM_KEY}: literal\n"
+        )
+
+    @pytest.mark.parametrize("provider", ["kiro_cli", "opencode_cli"])
+    def test_end_to_end_install_keeps_the_scalar_text(
+        self, runner: CliRunner, workspace: Dict[str, Any], provider: str
+    ) -> None:
+        store = workspace["local_store"]
+        (store / "literal.md").write_text(
+            "---\n"
+            "name: literal-agent\n"
+            "description: |\n"
+            "  Explains the marker:\n"
+            f"  {_CONTEXT_SOURCE_STEM_KEY}: literal-example\n"
+            "  and more\n"
+            "---\n"
+            "Body\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(install, ["literal", "--provider", provider])
+
+        assert result.exit_code == 0 and "Error:" not in result.output, result.output
+        post = frontmatter.loads(
+            (workspace["context_dir"] / "literal-agent.md").read_text(encoding="utf-8")
+        )
+        assert post.metadata[_CONTEXT_SOURCE_STEM_KEY] == "literal"
+        assert "literal-example" in post.metadata["description"]
+        assert "and more" in post.metadata["description"]
+
+
+class TestFlowStyleFrontmatterIsPreserved:
+    """A frontmatter mapping written in flow style (``{name: x, ...}``) is valid
+    YAML that profile validation accepts. Inserting a block-style marker line in
+    front of it made the copy invalid, so the readback refused the install and
+    told the operator to repair syntax that was never broken."""
+
+    def test_single_line_flow_mapping_gets_the_marker_inside_the_braces(self) -> None:
+        raw = (
+            "---\n"
+            "{name: structured-context, description: Ordinary flow mapping, provider: kiro_cli}\n"
+            "---\n"
+            "Body\n"
+        )
+
+        stamped = _context_content_with_provenance(raw, "profile-a")
+
+        assert _context_source_stem(stamped) == "profile-a"
+        post = frontmatter.loads(stamped)
+        assert post.metadata["name"] == "structured-context"
+        assert post.metadata["description"] == "Ordinary flow mapping"
+        assert post.metadata["provider"] == "kiro_cli"
+        assert post.content.strip() == "Body"
+        # Still one flow mapping, now carrying the marker.
+        assert stamped.startswith("---\n{")
+        assert stamped.count(f"{_CONTEXT_SOURCE_STEM_KEY}:") == 1
+
+    @pytest.mark.parametrize(
+        "label,block",
+        [
+            ("empty flow mapping", "{}"),
+            ("trailing comma", "{name: a, description: b,}"),
+            ("inner spaces", "{ name: a , description: b }"),
+            ("multi-line flow mapping", "{\n  name: a,\n  description: b\n}"),
+            ("CRLF flow mapping", "{name: a, description: b}"),
+        ],
+    )
+    def test_flow_mapping_shapes_read_back_and_keep_their_keys(
+        self, label: str, block: str
+    ) -> None:
+        newline = "\r\n" if label.startswith("CRLF") else "\n"
+        raw = f"---{newline}{block.replace(chr(10), newline)}{newline}---{newline}Body{newline}"
+
+        stamped = _context_content_with_provenance(raw, "profile-a")
+
+        assert _context_source_stem(stamped) == "profile-a", label
+        post = frontmatter.loads(stamped)
+        expected = yaml.safe_load(block) or {}
+        expected[_CONTEXT_SOURCE_STEM_KEY] = "profile-a"
+        assert post.metadata == expected, label
+        assert post.content.strip() == "Body", label
+
+    def test_flow_mapping_that_declares_the_marker_is_still_refused(self) -> None:
+        """Round-3's spoof case must stay closed: CAO cannot textually replace a
+        key inside a flow mapping, so it refuses rather than append a second
+        one and rely on the reader's last-wins duplicate handling."""
+        raw = "---\n{x-cao-source-stem: profile-b, name: shared}\n---\nBody\n"
+
+        with pytest.raises(ValueError, match=_CONTEXT_SOURCE_STEM_KEY):
+            _context_content_with_provenance(raw, "profile-a")
+
+    @pytest.mark.parametrize("provider", ["kiro_cli", "opencode_cli"])
+    def test_end_to_end_install_of_flow_mapping_frontmatter_succeeds(
+        self, runner: CliRunner, workspace: Dict[str, Any], provider: str
+    ) -> None:
+        store = workspace["local_store"]
+        (store / "flow.md").write_text(
+            "---\n"
+            "{name: structured-context, description: Ordinary flow mapping}\n"
+            "---\n"
+            "Body\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(install, ["flow", "--provider", provider])
+
+        assert result.exit_code == 0 and "Error:" not in result.output, result.output
+        post = frontmatter.loads(
+            (workspace["context_dir"] / "structured-context.md").read_text(encoding="utf-8")
+        )
+        assert post.metadata[_CONTEXT_SOURCE_STEM_KEY] == "flow"
+        assert post.metadata["name"] == "structured-context"

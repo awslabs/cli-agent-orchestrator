@@ -100,7 +100,12 @@ _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # `cao install`). Used by the ownership guard to distinguish a profile's
 # own installed copy from a different profile that resolves to the same agent id.
 _CONTEXT_SOURCE_STEM_KEY = "x-cao-source-stem"
-_CONTEXT_SOURCE_STEM_RE = re.compile(rf"^\s*{re.escape(_CONTEXT_SOURCE_STEM_KEY)}\s*:")
+# Matches the plain, unquoted key at the start of a line body that has ALREADY
+# had the frontmatter block's own indentation removed (see
+# ``_top_level_marker_indices``). Deliberately not whitespace-tolerant: a line
+# indented deeper than the block's keys is a literal scalar's text or a nested
+# mapping's key, which only looks like the marker and must be left alone.
+_CONTEXT_SOURCE_STEM_RE = re.compile(rf"^{re.escape(_CONTEXT_SOURCE_STEM_KEY)}\s*:")
 _TEMP_FILE_NAME_ATTEMPTS = 100
 _FRONTMATTER_DELIMITER_RE = re.compile(r"^-{3,}$")
 
@@ -347,6 +352,79 @@ def _frontmatter_block_indent(lines: List[str], opening_idx: int, closing_idx: i
     return ""
 
 
+def _top_level_marker_indices(
+    lines: List[str], opening_idx: int, closing_idx: int, indent: str
+) -> List[int]:
+    """Indexes of the block's TOP-LEVEL ``x-cao-source-stem`` lines.
+
+    A top-level key sits at exactly the block's indentation. YAML requires a
+    block scalar's text and a nested mapping's keys to be indented deeper than
+    the key they belong to, so anything the regex would match at a deeper
+    indent is scalar text (``description: |`` quoting the marker's name) or a
+    nested key (an MCP server named after it) -- the operator's data, which the
+    round-6 review of #493 found this writer deleting as if it were CAO's own
+    provenance line.
+    """
+    found = []
+    for idx in range(opening_idx + 1, closing_idx):
+        body, _ = _line_body_and_ending(lines[idx])
+        if not body.startswith(indent):
+            continue
+        if _CONTEXT_SOURCE_STEM_RE.match(body[len(indent) :]):
+            found.append(idx)
+    return found
+
+
+def _flow_mapping_span(lines: List[str], opening_idx: int, closing_idx: int) -> Optional[int]:
+    """Index of the line holding the closing ``}`` when the block is one flow mapping.
+
+    ``None`` for block-style frontmatter. A flow-style block is one whose first
+    content line (blank lines and comments skipped) opens with ``{`` and whose
+    last content line ends with ``}``; the block already parsed as a mapping in
+    :func:`_find_frontmatter_block`, so that is what those braces delimit. A
+    flow mapping followed by a trailing comment line is not recognised and
+    falls through to the readback refusal, as before.
+    """
+    first = last = None
+    for idx in range(opening_idx + 1, closing_idx):
+        body, _ = _line_body_and_ending(lines[idx])
+        stripped = body.strip(" \t")
+        if stripped == "" or stripped.startswith("#"):
+            continue
+        if first is None:
+            first = idx
+        last = idx
+    if first is None or last is None:
+        return None
+    first_body, _ = _line_body_and_ending(lines[first])
+    last_body, _ = _line_body_and_ending(lines[last])
+    if first_body.lstrip(" \t").startswith("{") and last_body.rstrip(" \t").endswith("}"):
+        return last
+    return None
+
+
+def _insert_marker_into_flow_mapping(block_text: str, source_name: str) -> str:
+    """Return the flow-mapping block text with the marker entry added.
+
+    Inserted immediately before the closing ``}``, separated with a comma unless
+    the mapping is empty or already ends in one; that keeps every existing entry
+    byte-for-byte and the mapping valid, which a block-style line in front of
+    ``{...}`` is not.
+    """
+    close_idx = block_text.rstrip().rfind("}")
+    assert close_idx >= 0
+    before = block_text[:close_idx]
+    entry = f"{_CONTEXT_SOURCE_STEM_KEY}: {_yaml_single_quoted(source_name)}"
+    trail = before.rstrip(" \t\r\n")
+    if trail.endswith("{"):
+        separator = ""
+    elif trail.endswith(","):
+        separator = " "
+    else:
+        separator = ", "
+    return f"{before}{separator}{entry}{block_text[close_idx:]}"
+
+
 def _yaml_single_quoted(value: str) -> str:
     """Render a one-line YAML string scalar."""
     if "\n" in value or "\r" in value:
@@ -361,17 +439,23 @@ def _context_marker_line(source_name: str, newline: str) -> str:
 def _context_content_with_provenance(raw_content: str, source_name: str) -> str:
     """Return context markdown annotated without reserializing frontmatter.
 
-    If a leading frontmatter block exists, every textually-matching marker
-    line is removed and a single clean one is inserted in the first matched
-    line's place (or at the top of the block if none matched). Documents
-    without a leading block get a minimal frontmatter block prepended,
-    leaving the original content byte-for-byte intact after that inserted
-    block.
+    If a leading frontmatter block exists, every TOP-LEVEL marker line (plain
+    key at the block's own indentation; see :func:`_top_level_marker_indices`)
+    is removed and a single clean one is inserted in the first matched line's
+    place (or at the top of the block if none matched). A block written as one
+    flow mapping (``{name: x, ...}``) gets the marker as a new entry before its
+    closing brace instead, since a block-style line in front of ``{`` is not
+    YAML; if that mapping already declares the key, the install is refused
+    (the key cannot be textually replaced inside the braces, and appending a
+    second one would hand the answer to the reader's duplicate-key handling).
+    Documents without a leading block get a minimal frontmatter block
+    prepended, leaving the original content byte-for-byte intact after that
+    inserted block.
 
-    The line-regex insertion above only recognises an unquoted, column-0
-    ``x-cao-source-stem:`` key. A source profile can carry a marker spelled a
-    way the regex cannot see (a quoted key, a folded/multi-line value, a
-    flow-mapping frontmatter document) while PyYAML's parser — the reader
+    The line-regex insertion above only recognises an unquoted key at the
+    block's indentation. A source profile can carry a marker spelled a way the
+    regex cannot see (a quoted key, a folded/multi-line value, a flow-mapping
+    entry) while PyYAML's parser — the reader
     every consumer of this content actually uses — sees it as the *same* key
     and would resolve it (last-wins on duplicates) to a value CAO never
     wrote. Trusting the regex's view there would let profile content dictate
@@ -393,18 +477,32 @@ def _context_content_with_provenance(raw_content: str, source_name: str) -> str:
         opening_idx, closing_idx = block
         _, opening_newline = _line_body_and_ending(lines[opening_idx])
         newline = opening_newline or _first_newline(raw_content)
-        indent = _frontmatter_block_indent(lines, opening_idx, closing_idx)
-        marker = indent + _context_marker_line(source_name, newline)
+        flow_close_idx = _flow_mapping_span(lines, opening_idx, closing_idx)
+        if flow_close_idx is not None:
+            declared = yaml.safe_load("".join(lines[opening_idx + 1 : closing_idx])) or {}
+            if _CONTEXT_SOURCE_STEM_KEY in declared:
+                raise ValueError(
+                    "Refusing to write context copy: could not stamp a trustworthy "
+                    f"'{_CONTEXT_SOURCE_STEM_KEY}' provenance marker for install "
+                    f"source '{source_name}' because the source profile's flow-style "
+                    f"frontmatter already declares '{_CONTEXT_SOURCE_STEM_KEY}', which "
+                    "CAO cannot replace inside a flow mapping. Remove that key from the "
+                    "source profile, then reinstall."
+                )
+            lines[opening_idx + 1 : closing_idx] = [
+                _insert_marker_into_flow_mapping(
+                    "".join(lines[opening_idx + 1 : closing_idx]), source_name
+                )
+            ]
+        else:
+            indent = _frontmatter_block_indent(lines, opening_idx, closing_idx)
+            marker = indent + _context_marker_line(source_name, newline)
 
-        existing_indices = [
-            idx
-            for idx in range(opening_idx + 1, closing_idx)
-            if _CONTEXT_SOURCE_STEM_RE.match(_line_body_and_ending(lines[idx])[0])
-        ]
-        insert_at = existing_indices[0] if existing_indices else opening_idx + 1
-        for idx in reversed(existing_indices):
-            del lines[idx]
-        lines.insert(insert_at, marker)
+            existing_indices = _top_level_marker_indices(lines, opening_idx, closing_idx, indent)
+            insert_at = existing_indices[0] if existing_indices else opening_idx + 1
+            for idx in reversed(existing_indices):
+                del lines[idx]
+            lines.insert(insert_at, marker)
         content = "".join(lines)
 
     try:
@@ -451,11 +549,10 @@ def _context_source_stem(raw_content: str) -> Optional[str]:
         return None
 
     opening_idx, closing_idx = block
-    for idx in range(opening_idx + 1, closing_idx):
+    indent = _frontmatter_block_indent(lines, opening_idx, closing_idx)
+    for idx in _top_level_marker_indices(lines, opening_idx, closing_idx, indent):
         body, _ = _line_body_and_ending(lines[idx])
-        if not _CONTEXT_SOURCE_STEM_RE.match(body):
-            continue
-        marker_post = frontmatter.loads(f"---\n{body}\n---\n")
+        marker_post = frontmatter.loads(f"---\n{body[len(indent):]}\n---\n")
         marker_value = marker_post.metadata.get(_CONTEXT_SOURCE_STEM_KEY)
         return marker_value if isinstance(marker_value, str) else None
     return None
