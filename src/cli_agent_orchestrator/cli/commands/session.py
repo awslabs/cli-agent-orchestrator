@@ -6,10 +6,10 @@ import time
 from urllib.parse import quote
 
 import click
-import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.utils import api_http
 from cli_agent_orchestrator.utils.terminal import poll_until_done
 
 # Default poll timeout for sync send (seconds). Pass --timeout to override.
@@ -17,25 +17,25 @@ _DEFAULT_SEND_TIMEOUT = 300
 
 
 def _get_sessions():
-    response = requests.get(f"{API_BASE_URL}/sessions")
+    response = api_http.get(f"{API_BASE_URL}/sessions")
     response.raise_for_status()
     return response.json()
 
 
 def _get_terminals(session_name):
-    response = requests.get(f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/terminals")
+    response = api_http.get(f"{API_BASE_URL}/sessions/{quote(session_name, safe='')}/terminals")
     response.raise_for_status()
     return response.json()
 
 
 def _get_terminal(terminal_id):
-    response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
+    response = api_http.get(f"{API_BASE_URL}/terminals/{terminal_id}")
     response.raise_for_status()
     return response.json()
 
 
 def _get_terminal_output(terminal_id):
-    response = requests.get(
+    response = api_http.get(
         f"{API_BASE_URL}/terminals/{terminal_id}/output", params={"mode": "last"}
     )
     response.raise_for_status()
@@ -67,7 +67,7 @@ def list_sessions(as_json):
     """List all active CAO sessions."""
     try:
         sessions = _get_sessions()
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {e}")
 
     if not sessions:
@@ -86,7 +86,7 @@ def list_sessions(as_json):
             if conductor:
                 conductor = _get_terminal(conductor["id"])
             rows.append((s["name"], conductor, len(terminals)))
-        except requests.exceptions.RequestException:
+        except api_http.exceptions.RequestException:
             continue
 
     if as_json:
@@ -136,13 +136,13 @@ def status(session_name, terminal_id, workers, as_json):
         else:
             conductor_raw, all_terminals = _resolve_conductor(session_name)
             target = _get_terminal(conductor_raw["id"])
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {e}")
 
     try:
         output_data = _get_terminal_output(target["id"])
         last_output = output_data.get("output")
-    except requests.exceptions.RequestException:
+    except api_http.exceptions.RequestException:
         last_output = None
 
     if as_json:
@@ -222,7 +222,7 @@ def send(session_name, message, terminal_id, is_async, timeout):
             conductor, _ = _resolve_conductor(session_name)
             target_id = conductor["id"]
 
-        status_resp = requests.get(f"{API_BASE_URL}/terminals/{target_id}")
+        status_resp = api_http.get(f"{API_BASE_URL}/terminals/{target_id}")
         status_resp.raise_for_status()
         current_status = status_resp.json().get("status")
         # "completed" is a valid pre-send state: the terminal has finished its
@@ -232,12 +232,12 @@ def send(session_name, message, terminal_id, is_async, timeout):
                 f"Terminal {target_id} is currently {current_status}. Wait for it to finish before sending."
             )
 
-        response = requests.post(
+        response = api_http.post(
             f"{API_BASE_URL}/terminals/{target_id}/input",
             params={"message": message},
         )
         response.raise_for_status()
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {e}")
 
     # The turn this message started. Waiting on it is what makes "done" mean
@@ -283,7 +283,7 @@ def send(session_name, message, terminal_id, is_async, timeout):
         interrupted = True
 
     try:
-        output_resp = requests.get(
+        output_resp = api_http.get(
             f"{API_BASE_URL}/terminals/{target_id}/output",
             params={"mode": "last"},
         )
@@ -291,7 +291,7 @@ def send(session_name, message, terminal_id, is_async, timeout):
         output = output_resp.json().get("output", "")
         if output:
             click.echo(output)
-    except requests.exceptions.RequestException:
+    except api_http.exceptions.RequestException:
         pass
 
     if interrupted:

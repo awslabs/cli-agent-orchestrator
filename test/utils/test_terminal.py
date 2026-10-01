@@ -341,7 +341,7 @@ class TestWaitUntilStatus:
 class TestWaitUntilTerminalStatus:
     """Tests for wait_until_terminal_status function."""
 
-    @patch("cli_agent_orchestrator.utils.terminal.requests.get")
+    @patch("cli_agent_orchestrator.utils.terminal.api_http.get")
     def test_wait_until_terminal_status_success(self, mock_get):
         """Test successful terminal status wait."""
         mock_response = MagicMock()
@@ -355,7 +355,7 @@ class TestWaitUntilTerminalStatus:
 
         assert result is True
 
-    @patch("cli_agent_orchestrator.utils.terminal.requests.get")
+    @patch("cli_agent_orchestrator.utils.terminal.api_http.get")
     def test_wait_until_terminal_status_timeout(self, mock_get):
         """Test terminal status wait timeout."""
         mock_response = MagicMock()
@@ -369,7 +369,7 @@ class TestWaitUntilTerminalStatus:
 
         assert result is False
 
-    @patch("cli_agent_orchestrator.utils.terminal.requests.get")
+    @patch("cli_agent_orchestrator.utils.terminal.api_http.get")
     def test_wait_until_terminal_status_api_error(self, mock_get):
         """Test terminal status wait with API error."""
         mock_get.side_effect = Exception("Connection error")
@@ -380,7 +380,7 @@ class TestWaitUntilTerminalStatus:
 
         assert result is False
 
-    @patch("cli_agent_orchestrator.utils.terminal.requests.get")
+    @patch("cli_agent_orchestrator.utils.terminal.api_http.get")
     def test_wait_until_terminal_status_non_200(self, mock_get):
         """Test terminal status wait with non-200 response."""
         mock_response = MagicMock()
@@ -393,7 +393,7 @@ class TestWaitUntilTerminalStatus:
 
         assert result is False
 
-    @patch("cli_agent_orchestrator.utils.terminal.requests.get")
+    @patch("cli_agent_orchestrator.utils.terminal.api_http.get")
     def test_wait_until_terminal_status_multi_status_set(self, mock_get):
         """Test waiting for multiple target statuses (set)."""
         mock_response = MagicMock()
@@ -410,7 +410,7 @@ class TestWaitUntilTerminalStatus:
 
         assert result is True
 
-    @patch("cli_agent_orchestrator.utils.terminal.requests.get")
+    @patch("cli_agent_orchestrator.utils.terminal.api_http.get")
     def test_wait_until_terminal_status_multi_status_no_match(self, mock_get):
         """Test multi-status wait times out when status doesn't match any target."""
         mock_response = MagicMock()
@@ -441,7 +441,7 @@ class TestSyncBackendFromServer:
         mock_resp.raise_for_status.return_value = None
 
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get", return_value=mock_resp),
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get", return_value=mock_resp),
             patch("cli_agent_orchestrator.backends.factory.BackendFactory.create") as mock_create,
             patch("cli_agent_orchestrator.backends.registry.set_backend") as mock_set,
         ):
@@ -460,7 +460,7 @@ class TestSyncBackendFromServer:
         mock_resp.raise_for_status.return_value = None
 
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get", return_value=mock_resp),
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get", return_value=mock_resp),
             patch("cli_agent_orchestrator.backends.factory.BackendFactory.create") as mock_create,
             patch("cli_agent_orchestrator.backends.registry.set_backend") as mock_set,
         ):
@@ -477,7 +477,7 @@ class TestSyncBackendFromServer:
         import requests as _requests
 
         with patch(
-            "cli_agent_orchestrator.utils.terminal.requests.get",
+            "cli_agent_orchestrator.utils.terminal.api_http.get",
             side_effect=_requests.exceptions.ConnectionError("refused"),
         ):
             # Must not raise
@@ -490,7 +490,7 @@ class TestSyncBackendFromServer:
         mock_resp.raise_for_status.return_value = None
 
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get", return_value=mock_resp),
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get", return_value=mock_resp),
             patch("cli_agent_orchestrator.backends.registry.set_backend") as mock_set,
         ):
             sync_backend_from_server()
@@ -518,7 +518,7 @@ class TestPollUntilDone:
         from cli_agent_orchestrator.utils.terminal import poll_until_done
 
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.return_value = self._resp("completed")
@@ -537,7 +537,7 @@ class TestPollUntilDone:
             self._resp("idle"),  # 3rd stable idle -> return
         ]
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.side_effect = seq
@@ -558,7 +558,7 @@ class TestPollUntilDone:
         # advance to force a timeout after a few polls.
         times = iter([0, 0.5, 1.0, 1.5, 2.0, 2.5, 100.0])
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
             patch(
                 "cli_agent_orchestrator.utils.terminal.time.time", side_effect=lambda: next(times)
@@ -582,7 +582,7 @@ class TestPollUntilDone:
             self._resp("idle"),  # now stable -> return
         ]
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.side_effect = seq
@@ -600,7 +600,7 @@ class TestPollUntilDone:
             self._resp("completed"),  # definitive -> return now
         ]
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.side_effect = seq
@@ -620,7 +620,7 @@ class TestPollUntilDone:
 
         times = iter([0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 100.0])
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
             patch(
                 "cli_agent_orchestrator.utils.terminal.time.time", side_effect=lambda: next(times)
@@ -644,7 +644,7 @@ class TestPollUntilDone:
             self._resp("idle"),  # stable -> return
         ]
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.side_effect = seq
@@ -657,7 +657,7 @@ class TestPollUntilDone:
         from cli_agent_orchestrator.utils.terminal import poll_until_done
 
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.return_value = self._resp("error")
@@ -696,7 +696,7 @@ class TestPollUntilDoneTurnGate:
             self._resp("completed", turn_completed=2),  # now it is
         ]
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.side_effect = seq
@@ -709,7 +709,7 @@ class TestPollUntilDoneTurnGate:
 
         seq = [self._resp("idle", turn_completed=4)] * 5 + [self._resp("idle", turn_completed=5)]
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.side_effect = seq
@@ -727,7 +727,7 @@ class TestPollUntilDoneTurnGate:
 
         seq = [self._resp("idle", turn_completed=1)] * 3
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.side_effect = seq
@@ -747,7 +747,7 @@ class TestPollUntilDoneTurnGate:
             self._resp("processing", turn_completed=2, turn=3),  # ours done; next queued
         ]
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.side_effect = seq
@@ -766,7 +766,7 @@ class TestPollUntilDoneTurnGate:
             self._resp("completed", turn_completed=0, turn=0),  # restarted server
         ]
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.side_effect = seq
@@ -779,7 +779,7 @@ class TestPollUntilDoneTurnGate:
         from cli_agent_orchestrator.utils.terminal import poll_until_done
 
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.return_value = self._resp("completed")  # no turn_completed key at all
@@ -797,7 +797,7 @@ class TestPollUntilDoneTurnGate:
         from cli_agent_orchestrator.utils.terminal import poll_until_done
 
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.return_value = self._resp("error", turn_completed=0)
