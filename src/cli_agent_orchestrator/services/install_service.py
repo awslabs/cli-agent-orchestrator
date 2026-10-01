@@ -597,6 +597,19 @@ def _raise_unreadable_installed_copy(
     )
 
 
+def _raise_unreadable_provider_artifact(
+    source_name: str, profile_name: str, destination: Path, exc: OSError, provider: str
+) -> None:
+    """Block an install whose provider agent file CAO could not inspect (an I/O fault)."""
+    raise _collision_error_class(provider)(
+        f"Installing '{source_name}.md' (name '{profile_name}') for {provider} would write the "
+        f"{provider} agent file '{destination}', which could not be read "
+        f"({exc.strerror or exc.__class__.__name__}), so CAO cannot tell whether it already "
+        "belongs to another profile. The install was refused rather than overwrite it. Fix the "
+        "file's permissions (or the underlying I/O problem) and reinstall; do not delete it."
+    )
+
+
 def _non_regular_target_error(context_file: Path) -> ValueError:
     return ValueError(
         f"Context file '{context_file}' is already occupied by a non-regular "
@@ -897,15 +910,19 @@ def _guard_provider_artifact_ownership(
     destination = _provider_artifact_path(provider, profile_name)
     if destination is None:
         return
-    entry = _entry_occupying(destination)
-    if entry is None:
-        return
     try:
+        entry = _entry_occupying(destination)
+        if entry is None:
+            return
         if not stat.S_ISREG(os.lstat(destination.parent / entry).st_mode):
             # Not a file CAO wrote; the sink's own write reports the real problem.
             return
     except FileNotFoundError:
         return
+    except OSError as exc:
+        # Same rule as the context probe: an I/O fault is not evidence the slot is
+        # free, and the remedy is access, not deletion.
+        _raise_unreadable_provider_artifact(source_name, profile_name, destination, exc, provider)
 
     if entry == destination.name:
         if self_owned:

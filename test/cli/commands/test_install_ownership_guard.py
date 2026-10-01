@@ -419,6 +419,35 @@ class TestUnreadableCopyIsAnIoFaultNotAnOrphan:
         assert "ALPHA" in (workspace["agents_dir"] / "shared.md").read_text()
 
 
+class TestUnreadableProviderArtifactIsAccessNotDeletion:
+    def test_permission_denied_at_the_provider_destination_names_access(
+        self, runner: CliRunner, workspace: Dict[str, Any]
+    ) -> None:
+        """The provider probe must refuse an I/O fault the same way the context probe
+        does: naming access as the remedy, never deletion. Reached by leaving the
+        context slot free (an orphaned provider file) so the provider probe is the
+        one that meets the unreadable directory."""
+        if os.geteuid() == 0:
+            pytest.skip("root ignores file modes")
+        store = workspace["local_store"]
+        _write_profile(store / "alpha.md", name="shared", body="ALPHA")
+        _ok(_install(runner, "alpha"))
+        (workspace["context_dir"] / "shared.md").unlink()
+        agents_dir = workspace["agents_dir"]
+        agents_dir.chmod(0)
+        try:
+            _write_profile(store / "beta.md", name="shared", body="BETA")
+            r2 = _install(runner, "beta")
+        finally:
+            agents_dir.chmod(0o700)
+
+        _refused(r2)
+        assert "could not be read" in r2.output, r2.output
+        assert "Fix the file's permissions" in r2.output
+        assert "delete it and reinstall" not in r2.output
+        assert "ALPHA" in (agents_dir / "shared.md").read_text()
+
+
 class TestSourceDeclaredMarkerIsReplacedNotRefused:
     def test_plain_declaration_is_restamped_with_the_real_stem(
         self, runner: CliRunner, workspace: Dict[str, Any]
