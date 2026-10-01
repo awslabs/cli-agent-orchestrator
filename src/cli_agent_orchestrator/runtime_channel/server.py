@@ -444,10 +444,15 @@ async def launch_on_runtime(
             detail=f"runtime {runtime_id} is not connected",
         )
 
+    sent = asyncio.Event()
+
     async def launch_and_settle() -> Dict[str, Any]:
         try:
             result = await conn.call(
-                CommandType.LAUNCH, body.model_dump(exclude_none=True), timeout=_launch_timeout()
+                CommandType.LAUNCH,
+                body.model_dump(exclude_none=True),
+                timeout=_launch_timeout(),
+                on_sent=sent.set,
             )
         except RemoteRuntimeError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc))
@@ -462,13 +467,22 @@ async def launch_on_runtime(
 
     # From the moment the command is sent, the runtime may start an agent: the
     # launch and its settlement (record it, or undo it) are one task, shielded
-    # from this request's cancellation, so a client that goes away can never
-    # leave an agent running unrecorded, or a reservation behind.
+    # from this request's cancellation once the command is written, so a client
+    # that goes away can never leave an agent running unrecorded, or a
+    # reservation behind. Before that, cancelling the request cancels the launch.
     operation = asyncio.ensure_future(launch_and_settle())
     _settlements.add(operation)
     operation.add_done_callback(_settlements.discard)
     operation.add_done_callback(lambda done: done.cancelled() or done.exception())
-    return await asyncio.shield(operation)
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        if not sent.is_set():
+            # Not written yet: nothing can have started, so the launch is
+            # cancelled outright. (Cancelled mid-send, the frame may still
+            # arrive; its late result is then deleted as an unrecorded launch.)
+            operation.cancel()
+        raise
 
 
 @router.get("/runtimes")

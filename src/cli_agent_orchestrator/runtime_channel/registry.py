@@ -105,8 +105,10 @@ class RuntimeConnection:
         payload: Dict[str, Any],
         terminal_id: Optional[str] = None,
         timeout: float = COMMAND_TIMEOUT,
+        on_sent: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
-        """Send one command and return its result payload.
+        """Send one command and return its result payload. ``on_sent`` is called
+        once the frame has been written.
 
         ``timeout`` bounds the whole call: waiting for the channel, the send and
         the result. Not yet written when it runs out: 503, safe to retry.
@@ -140,6 +142,8 @@ class RuntimeConnection:
                     # Bounded too: a runtime that stops reading stalls the send
                     # under backpressure, and the lock with it.
                     await asyncio.wait_for(self._send_text(encode(frame)), left())
+                    if on_sent is not None:
+                        on_sent()
                 except asyncio.TimeoutError as exc:
                     raise RemoteOutcomeUnknownError(
                         f"sending {command_type.value} to runtime {self.runtime_id} timed out; "
