@@ -2168,6 +2168,16 @@ class TestKiroCli225Tui:
         )
         assert message == "SECOND42"
 
+    def test_225_extractor_returns_none_without_a_bullet_reply(self):
+        """A 2.25 turn with no assistant bullet must not reuse chrome as the answer."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        lines = [
+            "▸ Credits: turn 0.08 • session 0.08 | Time: 1s",
+            "› ask a question or describe a task ↵",
+            "▸ Credits: turn 0.12 • session 0.20 | Time: 2s",
+        ]
+        assert provider._extract_tui_225_message(lines, 2) is None
+
     @pytest.mark.parametrize(
         "line",
         [

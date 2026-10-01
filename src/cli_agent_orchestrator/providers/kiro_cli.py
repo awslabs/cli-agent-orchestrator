@@ -813,9 +813,6 @@ class KiroCliProvider(BaseProvider):
         response_lines = lines[reply_start:credits_idx]
         response_lines[0] = re.sub(r"^\s*•\s+", "", response_lines[0], count=1)
         final_answer = "\n".join(response_lines).strip()
-        if not final_answer:
-            return None
-
         final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, "", final_answer)
         final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
         return final_answer.strip()
