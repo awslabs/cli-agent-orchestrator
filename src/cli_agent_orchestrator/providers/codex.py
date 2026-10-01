@@ -1497,7 +1497,7 @@ class CodexProvider(BaseProvider):
         if self._agent_profile is None:
             return None
         try:
-            return load_agent_profile(self._agent_profile)
+            return _with_plugin_mcp(load_agent_profile(self._agent_profile), "codex")
         except Exception:
             return None
 
