@@ -310,6 +310,14 @@ fn route(id: CommandId) -> Option<Route> {
         // ── `cao config *`, `cao env *` ───────────────────────────────────────────────────
         // HIDE, and genuinely routeless: `cao env *` reads and writes the managed env store
         // in-process. These are the routeless commands BR-18's `NoRoute` variant was named for.
+        CommandId::DecisionsStatus => None,
+        CommandId::DecisionsSet => None,
+        CommandId::DecisionsTier => None,
+        CommandId::DecisionsTable => None,
+        CommandId::DecisionsExclude => None,
+        CommandId::DecisionsTune => None,
+        CommandId::DecisionsList => None,
+        CommandId::DecisionsPurge => None,
         CommandId::ConfigGet => None,
         CommandId::ConfigList => None,
         CommandId::ConfigPath => None,

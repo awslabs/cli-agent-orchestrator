@@ -35,7 +35,7 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, cast
 
 from cli_agent_orchestrator.constants import (
     API_BASE_URL,
@@ -394,6 +394,17 @@ async def _reconcile_orphans(run_id: str) -> None:
 # ---------------------------------------------------------------------------
 # BR-31 in-memory terminal recorder — wired into the server-side run-step path
 # ---------------------------------------------------------------------------
+def script_step_of(env_vars: Optional[Mapping[str, str]]) -> Optional[Tuple[str, str]]:
+    """Identify a marked step of a live server-side script run."""
+    if not env_vars:
+        return None
+    run_id = env_vars.get("CAO_WORKFLOW_RUN_ID")
+    step_id = env_vars.get("CAO_WORKFLOW_STEP_ID")
+    if not run_id or not step_id or not isinstance(run_registry.get(run_id), ScriptRunRecord):
+        return None
+    return run_id, step_id
+
+
 def make_step_terminal_recorder(
     env_vars: Optional[Dict[str, str]],
 ) -> Optional[Callable[[str, str], None]]:
@@ -428,15 +439,11 @@ def make_step_terminal_recorder(
     caller catches, because failing to record a RUNNING row degrades resumability
     and must never fail a step that is about to run.
     """
-    if not env_vars:
+    step = script_step_of(env_vars)
+    if step is None:
         return None
-    run_id = env_vars.get("CAO_WORKFLOW_RUN_ID")
-    step_id = env_vars.get("CAO_WORKFLOW_STEP_ID")
-    if not run_id or not step_id:
-        return None
-    record = run_registry.get(run_id)
-    if not isinstance(record, ScriptRunRecord):
-        return None
+    run_id, step_id = step
+    record = cast(ScriptRunRecord, run_registry[run_id])
 
     def _record(terminal_id: str, call_fingerprint: str) -> None:
         from cli_agent_orchestrator.models.workflow import StepState
@@ -505,15 +512,11 @@ def record_step_replay(env_vars: Optional[Dict[str, str]]) -> Optional[Callable[
     an unreadable row degrades the run's step LIST — a reporting loss — and must never fail a
     step, so the caller wraps this and the body degrades to a minimal state rather than raising.
     """
-    if not env_vars:
+    step = script_step_of(env_vars)
+    if step is None:
         return None
-    run_id = env_vars.get("CAO_WORKFLOW_RUN_ID")
-    step_id = env_vars.get("CAO_WORKFLOW_STEP_ID")
-    if not run_id or not step_id:
-        return None
-    record = run_registry.get(run_id)
-    if not isinstance(record, ScriptRunRecord):
-        return None
+    run_id, step_id = step
+    record = cast(ScriptRunRecord, run_registry[run_id])
 
     def _record_replay() -> None:
         from cli_agent_orchestrator.models.workflow import StepState
@@ -785,15 +788,11 @@ def record_step_completion(
     A journal failure only degrades durable status; it never fails the step
     (INV-4/BR-10).
     """
-    if not env_vars:
+    step = script_step_of(env_vars)
+    if step is None:
         return None
-    run_id = env_vars.get("CAO_WORKFLOW_RUN_ID")
-    step_id = env_vars.get("CAO_WORKFLOW_STEP_ID")
-    if not run_id or not step_id:
-        return None
-    record = run_registry.get(run_id)
-    if not isinstance(record, ScriptRunRecord):
-        return None
+    run_id, step_id = step
+    record = cast(ScriptRunRecord, run_registry[run_id])
 
     def _settle(
         terminal_id: Optional[str],
