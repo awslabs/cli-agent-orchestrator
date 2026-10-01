@@ -180,11 +180,13 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   terminal and expect two separate answers. claude_code and kiro-cli fold input that
   arrives mid-turn into the running turn and reply once, so both turns close on that
   one reply and `?mode=last` shows it; if no work is drawn after the new input, the
-  later turn closes at the 60s backstop instead. An agent that QUEUES mid-turn input
-  would have its queued turn reported done with the running turn's answer: the turn
-  counter cannot tell which work frame belongs to which input. `cao session send`
-  already refuses to send while the terminal is busy. A server that omits the fields
-  is older than this contract.
+  later turn closes at the 60s backstop instead. If the running turn finishes before
+  the new input's keys land, it closes on its own answer and the new turn waits for
+  its own work. An agent that QUEUES mid-turn input would have its queued turn
+  reported done with the running turn's answer: the turn counter cannot tell which
+  work frame belongs to which input. Dispatches to one terminal run one at a time.
+  `cao session send` already refuses to send while the terminal is busy. A server
+  that omits the fields is older than this contract.
 - Terminal creation accepts `use_worktree` (bool, default `false`, issue #100
   Phase 1): provisions an isolated `git worktree` on its own branch instead of
   sharing `working_directory` as given, requiring the resolved directory to be

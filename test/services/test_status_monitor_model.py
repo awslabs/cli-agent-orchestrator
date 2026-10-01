@@ -25,6 +25,11 @@ Each provider shape runs twice: with no event loop (every read inline) and with 
 fake loop whose timers fire on demand, so the real burst/quiescence scheduling, the
 rising edge and the mid-burst probe run as they do live.
 
+A send runs in send_input's own steps: open the turn, clear the buffer, type, mark
+it delivered. Other events land between them (round 10: haofeif found output read
+between the first two closing the turn). An earlier model made a send one step and
+so could not see that.
+
 Raw output is modelled as tokens ("|W3" work sign for turn 3, "|D3" its answer, "|I0"
 an idle prompt, "|P" a half-received repaint), which the fake raw detector reads the
 way kiro's and grok's do. A "delayed read" runs other events inside the detector call,
@@ -44,7 +49,7 @@ from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 
 TID = "t1"
 KINDS = ("kiro", "grok", "claude", "native")
-_RAW = {"W": S.PROCESSING, "P": S.PROCESSING, "D": S.COMPLETED, "I": S.IDLE}
+_RAW = {"W": S.PROCESSING, "P": S.PROCESSING, "U": S.UNKNOWN, "D": S.COMPLETED, "I": S.IDLE}
 _SCREEN = {"work": S.PROCESSING, "done": S.COMPLETED, "idle": S.IDLE}
 
 
@@ -120,6 +125,8 @@ class _Provider:
         self.assume_processing_on_dispatch = kind == "claude"
         self.observe_execution_output = None
         self.read_hook = None
+        self.last_answer = None  # grok: the last answer read, kept across a clear
+        self.answer_before_clear = None
 
     def get_status(self, buffer):
         hook, self.read_hook = self.read_hook, None
@@ -132,13 +139,21 @@ class _Provider:
         if hook:
             hook()
         toks = [t for t in buffer.split("|") if t]
-        return _RAW.get(toks[-1][0], S.UNKNOWN) if toks else S.UNKNOWN
+        if not toks:
+            return S.UNKNOWN
+        if self.kind == "grok" and toks[-1][0] == "D":
+            # #841: an answer byte-identical to the one on screen before the clear
+            # may be a redraw of it, so it stays PROCESSING.
+            if toks[-1] == self.answer_before_clear:
+                return S.PROCESSING
+            self.last_answer = toks[-1]
+        return _RAW.get(toks[-1][0], S.UNKNOWN)
 
     def shows_turn_work(self, buffer):
         return ("|W" in buffer) if self.kind == "kiro" else None
 
     def notify_status_buffer_reset(self, epoch):
-        pass
+        self.answer_before_clear = self.last_answer
 
     def mark_input_received(self):
         pass
@@ -167,27 +182,54 @@ def _run(kind, rng, trace, loop_mode=False):
             # screen scheduling, exactly as live output does
             sm._process_chunk(TID, "|" + token(frame))
 
+    in_send = [False]
+
+    def gap(name, events):
+        # send_input runs in steps, and the terminal does not wait for it: reads,
+        # repaints and the agent's work on EARLIER input can land between any two
+        # of them (round 10). No other send can, as send_input holds the
+        # terminal's dispatch lock.
+        for _ in range(rng.choice([0, 0, 1, 2])):
+            trace.append(f"  [{name}]")
+            rng.choice(events)()
+
     def send(fail=False):
-        turn = sm.notify_input_sent(
-            TID, assume_processing=prov.assume_processing_on_dispatch, real_send=True
-        )
-        sm.clear_rolling_buffer(TID, prov, turn=turn)
-        if fail:
-            sm.abort_turn(TID, turn)
-            trace.append(f"send(turn={turn}) FAILED")
+        if in_send[0]:
             return
-        sm.notify_input_delivered(TID)
-        delivered.append(turn)
-        delivered_at[turn] = clock.t
-        if agent.working is not None:
-            agent.working.add(turn)
-            agent.animate = True
-            folded.add(turn)
-        else:
-            agent.pending.append(turn)
-        trace.append(f"send(turn={turn})")
+        in_send[0] = True
+        try:
+            turn = sm.notify_input_sent(
+                TID, assume_processing=prov.assume_processing_on_dispatch, real_send=True
+            )
+            trace.append(f"send(turn={turn}) opened")
+            anything = [repaint, quiesce, poll, work_frame, finish, tick, delayed]
+            gap("before its buffer clear", anything)
+            sm.clear_rolling_buffer(TID, prov, turn=turn)
+            gap("before its keys land", anything)
+            if fail:
+                sm.abort_turn(TID, turn)
+                trace.append(f"send(turn={turn}) FAILED")
+                return
+            delivered.append(turn)
+            delivered_at[turn] = clock.t
+            if agent.working is not None:
+                agent.working.add(turn)
+                agent.animate = True
+                agent.work_since = clock.t  # folded input takes as long as any turn
+                folded.add(turn)
+            else:
+                agent.pending.append(turn)
+            trace.append(f"send(turn={turn}) keys landed")
+            # send_keys returns and notify_input_delivered runs at once: only a
+            # read already under way can land here, not more of the agent's work.
+            gap("before notify_input_delivered", [repaint, quiesce, poll])
+            sm.notify_input_delivered(TID)
+        finally:
+            in_send[0] = False
 
     def special():
+        if in_send[0]:
+            return
         trace.append(f"special_key(turn={sm.notify_input_sent(TID)})")
 
     def pickup():
@@ -224,7 +266,13 @@ def _run(kind, rng, trace, loop_mode=False):
             sm._process_chunk(TID, "|P")  # half-received: no prompt yet, no sign
             if agent.screen[0] != "work":
                 sm._process_chunk(TID, "|" + token(agent.screen))
-        elif kind in ("grok", "claude"):
+        elif kind == "grok":
+            # Half-received. grok reads busy only from its busy markers, which a
+            # redraw of an idle or finished screen does not draw (kiro reads busy
+            # from any frame without its prompt).
+            sm._process_chunk(TID, "|U")
+            sm._process_chunk(TID, "|" + token(agent.screen))
+        elif kind == "claude":
             sm._process_chunk(TID, "|" + token(agent.screen))
 
     def quiesce():
@@ -349,7 +397,12 @@ def _run(kind, rng, trace, loop_mode=False):
         # its dispatch (the model's agent folds it, as claude_code and kiro-cli do),
         # and at the backstop when the answer lands before any such frame is read.
         prompt = [t for t in delivered if t not in folded]
-        if kind != "native" and prompt and sm.turn_state(TID)[1] < max(prompt):
+        # Also exempt: grok holding an answer PROCESSING because it is identical to
+        # the one before a clear (#841). After a send that failed past its clear,
+        # nothing new arrives to release it, and abort_turn cannot undo grok's own
+        # state, so the status stays PROCESSING (on main too).
+        held = kind == "grok" and prov.answer_before_clear == token(agent.screen)
+        if kind != "native" and prompt and not held and sm.turn_state(TID)[1] < max(prompt):
             return (
                 f"SLOW: everything answered, but turn_state={sm.turn_state(TID)} "
                 f"leaves turn {max(prompt)} for the backstop"
@@ -361,7 +414,8 @@ def _run(kind, rng, trace, loop_mode=False):
             repaint()
             poll()
         turn, done = sm.turn_state(TID)
-        if done < turn:
+        held = kind == "grok" and prov.answer_before_clear == token(agent.screen)
+        if done < turn and not held:  # held: see SLOW above
             return f"STUCK: agent idle and backstop passed, turn_state={(turn, done)}"
         return early("final")
 

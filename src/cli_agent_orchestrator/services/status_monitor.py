@@ -281,6 +281,22 @@ class StatusMonitor:
         # closes up to it even while the new turn itself cannot close yet, so the
         # earlier sender is not held to the new turn's backstop (round 9 model check).
         self._busy_carry: Dict[str, int] = {}
+        # Whether the current turn was opened by a real send (send_input), set in
+        # the same critical section that opens it. Until that send's buffer clear,
+        # the buffer still holds the previous turn's bytes, so nothing read can
+        # start or close the new turn (round 10; see _turn_fenced_locked).
+        self._turn_real_send: Dict[str, bool] = {}
+        # A real send dispatched to a busy agent, until its keystrokes land
+        # (notify_input_delivered). Work seen before then is the running turn's.
+        self._turn_sent_busy: Dict[str, bool] = {}
+        # Where that busy send's keystrokes landed in the rolling buffer. The bytes
+        # before it are the running turn's, work sign included, so a work sign is
+        # looked for only after it (_evidence_view_locked).
+        self._evidence_mark: Dict[str, int] = {}
+        # The mark a clear discarded, for abort_turn to put back with the bytes.
+        self._pre_clear_mark: Dict[str, Optional[int]] = {}
+        # Work seen while the current turn was fenced (see _note_turn_progress_locked).
+        self._fenced_work_seen: Dict[str, bool] = {}
 
     async def run(self) -> None:
         """Subscribe to output events and detect status changes.
@@ -346,8 +362,14 @@ class StatusMonitor:
                     truncated=len(buffer) > state_buffer_max,
                 )
             if len(buffer) > state_buffer_max:
+                trimmed = len(buffer) - state_buffer_max
                 buffer = buffer[-state_buffer_max:]
+                if terminal_id in self._evidence_mark:
+                    self._evidence_mark[terminal_id] = max(
+                        0, self._evidence_mark[terminal_id] - trimmed
+                    )
             self._buffers[terminal_id] = buffer
+            evidence_buffer = self._evidence_view_locked(terminal_id, buffer)
             # Real new output just landed — the stale-PROCESSING quiet gate keys off this
             # (see STALE_PROCESSING_BUFFER_QUIET_S). It also advances the capture
             # generation and kills any pending capture candidate: output arriving
@@ -377,7 +399,13 @@ class StatusMonitor:
             # before re-detecting (catches IDLE/COMPLETED without running costly
             # regex on every single chunk during bursts).
             self._schedule_raw_detection(
-                terminal_id, buffer, provider, cleared_turn, epoch, started_at_read
+                terminal_id,
+                buffer,
+                provider,
+                cleared_turn,
+                epoch,
+                started_at_read,
+                evidence_buffer=evidence_buffer,
             )
             return
 
@@ -657,12 +685,35 @@ class StatusMonitor:
         turn = self._turn.get(terminal_id, 0)
         if turn == 0 or self._turn_done.get(terminal_id, 0) >= turn:
             return False
+        if self._turn_fenced_locked(terminal_id):
+            return True
         if self._turn_started.get(terminal_id, False):
             return False
         delivered = self._turn_delivered_at.get(terminal_id)
         if delivered is None:
             return False
         return time.monotonic() - delivered < TURN_START_BACKSTOP_S
+
+    def _turn_fenced_locked(self, terminal_id: str) -> bool:
+        """True while nothing read can belong to the current real send yet.
+
+        Two windows inside send_input (round 10):
+
+        - before its buffer clear: the buffer is still the previous turn's, so a
+          half-received repaint of the old answer read PROCESSING and the full one
+          COMPLETED, and that closed a turn nothing had been typed for (haofeif);
+        - for a send to a busy agent, before its keystrokes land: work seen then is
+          the running turn's, and if that turn finished in the submit delay, its
+          answer closed the new turn too (round 10 model check).
+
+        A previous turn seen working still closes on its own answer (_busy_carry).
+        Caller holds the lock.
+        """
+        if not self._turn_real_send.get(terminal_id, False):
+            return False
+        return not self._turn_buffer_cleared.get(terminal_id, False) or self._turn_sent_busy.get(
+            terminal_id, False
+        )
 
     def _note_turn_progress_locked(
         self,
@@ -719,13 +770,20 @@ class StatusMonitor:
             self._turn_buffer_cleared.get(terminal_id, False)
             or self._turn_continuation.get(terminal_id, False)
         )
+        fenced = self._turn_fenced_locked(terminal_id)
         # Evidence counts only from a buffer cleared for THIS turn. A turn opened
         # without a clear (init, special keys) still holds the previous turn's
         # bytes, work sign included, so there the legacy rule applies unchanged.
-        if provider_decides and work_evidence is True:
+        if provider_decides and work_evidence is True and not fenced:
             self._turn_started[terminal_id] = True
+        if fenced and (
+            work_evidence is True or (work_evidence is None and detected in _ACTIVE_STATUSES)
+        ):
+            # The previous turn's work, not this send's. Only abort_turn uses it, when
+            # it hands this turn back to that earlier send.
+            self._fenced_work_seen[terminal_id] = True
         if detected in _ACTIVE_STATUSES:
-            if not provider_decides:
+            if not provider_decides and not fenced:
                 self._turn_started[terminal_id] = True
             return
         if detected not in _TURN_END_STATUSES or not settled:
@@ -1049,6 +1107,12 @@ class StatusMonitor:
             return False
         return answer if isinstance(answer, bool) else None
 
+    def _evidence_view_locked(self, terminal_id: str, buffer: str) -> str:
+        """The part of ``buffer`` a work sign may come from. Caller holds the lock
+        and passes the buffer it just snapshotted."""
+        mark = self._evidence_mark.get(terminal_id)
+        return buffer if mark is None else buffer[mark:]
+
     def _observation_pin(self, terminal_id: str) -> Tuple[int, bool]:
         """(turn, seen working yet) for a retained or native read — take it BEFORE
         the read, and pass both to _apply_detection."""
@@ -1083,6 +1147,7 @@ class StatusMonitor:
         cleared_buffer_turn: Optional[int] = None,
         buffer_epoch: Optional[int] = None,
         observed_started: Optional[bool] = None,
+        evidence_buffer: Optional[str] = None,
     ) -> None:
         """Edge-debounce detection on the raw rolling buffer.
 
@@ -1108,6 +1173,8 @@ class StatusMonitor:
                 provider = None
         raw_calibrated = self._is_raw_calibrated(provider)
         cleared_turn = cleared_buffer_turn
+        if evidence_buffer is None:
+            evidence_buffer = buffer
 
         if loop is None:
             # No loop ever captured (unit tests / offline replay): detect
@@ -1116,7 +1183,7 @@ class StatusMonitor:
                 terminal_id,
                 self._detect_status(terminal_id, buffer),
                 cleared_buffer_turn=cleared_turn,
-                work_evidence=self._work_evidence(provider, buffer),
+                work_evidence=self._work_evidence(provider, evidence_buffer),
                 buffer_epoch=buffer_epoch,
                 observed_started=observed_started,
             )
@@ -1162,7 +1229,7 @@ class StatusMonitor:
                 detected,
                 settled=raw_calibrated,
                 cleared_buffer_turn=cleared_turn,
-                work_evidence=self._work_evidence(provider, buffer),
+                work_evidence=self._work_evidence(provider, evidence_buffer),
                 buffer_epoch=buffer_epoch,
                 observed_started=observed_started,
             )
@@ -1274,6 +1341,7 @@ class StatusMonitor:
             self._bursting[terminal_id] = False
             self._quiesce_handle.pop(terminal_id, None)
             buffer = self._buffers.get(terminal_id, "")
+            evidence_buffer = self._evidence_view_locked(terminal_id, buffer)
             # Same critical section as the buffer snapshot — see
             # _pin_cleared_turn_locked for why the pin may not be taken later.
             cleared_turn = self._pin_cleared_turn_locked(terminal_id)
@@ -1290,7 +1358,7 @@ class StatusMonitor:
                 terminal_id,
                 detected,
                 cleared_buffer_turn=cleared_turn,
-                work_evidence=self._work_evidence(quiesce_provider, buffer),
+                work_evidence=self._work_evidence(quiesce_provider, evidence_buffer),
                 buffer_epoch=epoch,
                 observed_started=started_at_read,
             )
@@ -1301,7 +1369,7 @@ class StatusMonitor:
                 terminal_id,
                 self._detect_status(terminal_id, buffer),
                 cleared_buffer_turn=cleared_turn,
-                work_evidence=self._work_evidence(quiesce_provider, buffer),
+                work_evidence=self._work_evidence(quiesce_provider, evidence_buffer),
                 buffer_epoch=epoch,
                 observed_started=started_at_read,
             )
@@ -1382,13 +1450,22 @@ class StatusMonitor:
                 terminal_id, 0
             ) < self._last_real_turn.get(terminal_id, 0)
             previous = turn - 1
-            if (
-                real_send
-                and previous > 0
-                and self._turn_done.get(terminal_id, 0) < previous
-                and self._turn_started.get(terminal_id, False)
-            ):
+            previous_open = previous > 0 and self._turn_done.get(terminal_id, 0) < previous
+            if real_send and previous_open and self._turn_started.get(terminal_id, False):
                 self._busy_carry[terminal_id] = previous
+            self._turn_real_send[terminal_id] = real_send
+            self._fenced_work_seen[terminal_id] = False
+            # Busy: the previous turn is unfinished and was seen working, or an
+            # earlier real send is unfinished (the agent may be about to start it).
+            self._turn_sent_busy[terminal_id] = (
+                real_send
+                and previous_open
+                and (
+                    self._turn_started.get(terminal_id, False)
+                    or self._turn_done.get(terminal_id, 0)
+                    < self._last_real_turn.get(terminal_id, 0)
+                )
+            )
             self._turn_continuation[terminal_id] = continuation
             if not continuation:
                 self._turn_started[terminal_id] = False
@@ -1456,6 +1533,9 @@ class StatusMonitor:
                 or self._turn_done.get(terminal_id, 0) >= turn
             ):
                 return
+            # Nothing more is coming for this send, so lift its fence.
+            self._turn_real_send[terminal_id] = False
+            self._turn_sent_busy[terminal_id] = False
             if self._turn_started.get(terminal_id, False):
                 return
             # Nothing was typed, so undo the failed dispatch's buffer clear: the
@@ -1466,6 +1546,10 @@ class StatusMonitor:
             self._buffers[terminal_id] = self._pre_clear_buffer.pop(
                 terminal_id, ""
             ) + self._buffers.get(terminal_id, "")
+            # The mark is an offset into the restored prefix, so it still holds.
+            mark = self._pre_clear_mark.pop(terminal_id, None)
+            if mark is not None:
+                self._evidence_mark[terminal_id] = mark
             last = self._last_real_turn.get(terminal_id, 0)
             earlier_real = self._prev_real_turn.get(terminal_id, 0) if last >= turn else last
             if self._turn_done.get(terminal_id, 0) < earlier_real:
@@ -1474,7 +1558,9 @@ class StatusMonitor:
                 # state), or that send could not close until the backstop even
                 # after its answer arrived (round 9 review).
                 self._turn_continuation[terminal_id] = True
-                self._turn_started[terminal_id] = self._pre_dispatch_started.get(terminal_id, False)
+                self._turn_started[terminal_id] = self._pre_dispatch_started.get(
+                    terminal_id, False
+                ) or self._fenced_work_seen.get(terminal_id, False)
                 return
             self._turn_done[terminal_id] = turn
             prior = self._pre_dispatch_status.pop(terminal_id, None)
@@ -1499,6 +1585,11 @@ class StatusMonitor:
         """
         with self._lock:
             self._turn_delivered_at[terminal_id] = time.monotonic()
+            # The keystrokes have landed, so work seen from now on can be this
+            # send's (see _turn_fenced_locked). A busy send's buffer still holds the
+            # running turn's work sign, so it no longer counts.
+            if self._turn_sent_busy.pop(terminal_id, False):
+                self._evidence_mark[terminal_id] = len(self._buffers.get(terminal_id, ""))
 
     def turn_state(self, terminal_id: str) -> Tuple[int, int]:
         """Return ``(turn, turn_done)`` for a terminal (#735).
@@ -1533,6 +1624,7 @@ class StatusMonitor:
         with self._lock:
             self._pre_clear_buffer[terminal_id] = self._buffers.get(terminal_id, "")
             self._buffers[terminal_id] = ""
+            self._pre_clear_mark[terminal_id] = self._evidence_mark.pop(terminal_id, None)
             epoch = self._buffer_epochs.get(terminal_id, 0) + 1
             self._buffer_epochs[terminal_id] = epoch
             # From here on, every byte in the rolling buffer arrived after this
@@ -1593,6 +1685,11 @@ class StatusMonitor:
             self._prev_real_turn.pop(terminal_id, None)
             self._turn_continuation.pop(terminal_id, None)
             self._busy_carry.pop(terminal_id, None)
+            self._turn_real_send.pop(terminal_id, None)
+            self._turn_sent_busy.pop(terminal_id, None)
+            self._evidence_mark.pop(terminal_id, None)
+            self._pre_clear_mark.pop(terminal_id, None)
+            self._fenced_work_seen.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
@@ -1607,6 +1704,7 @@ class StatusMonitor:
         """
         with self._lock:
             self._buffers[terminal_id] = ""
+            self._evidence_mark.pop(terminal_id, None)
             self._last_status.pop(terminal_id, None)
             self._processing_generation.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
@@ -1692,6 +1790,7 @@ class StatusMonitor:
             # PROCESSING→ready transition without waiting for stream silence.
             if cached == TerminalStatus.PROCESSING:
                 buffer = self._buffers.get(terminal_id, "")
+                evidence_buffer = self._evidence_view_locked(terminal_id, buffer)
                 # A terminal mid-burst is still streaming, so nothing read here can be
                 # a settled frame. Sampled under the lock with the buffer it describes,
                 # as is the evidence pin — see _pin_cleared_turn_locked.
@@ -1701,6 +1800,7 @@ class StatusMonitor:
                 raw_started_at_read = self._turn_started.get(terminal_id, False)
             else:
                 buffer = ""
+                evidence_buffer = ""
                 bursting = False
                 epoch = None
                 raw_started_at_read = None
@@ -1779,7 +1879,7 @@ class StatusMonitor:
                         and changed_at is not None
                         and time.monotonic() - changed_at >= STALE_PROCESSING_BUFFER_QUIET_S
                     )
-                work_evidence = self._work_evidence(provider, buffer)
+                work_evidence = self._work_evidence(provider, evidence_buffer)
             logger.debug(
                 f"get_status [{terminal_id}]: cached=PROCESSING, "
                 f"fresh={fresh.value}, buffer_len={len(buffer)}, bursting={bursting}, "

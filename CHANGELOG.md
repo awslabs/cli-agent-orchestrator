@@ -67,6 +67,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - kiro_cli: only kiro's live work sign starts a turn, so a pane resize that
     repaints the old answer can't close the new one. The sign's forms were checked
     on kiro-cli 2.8.0 to 2.25.0.
+  - Nothing read before a send clears the buffer can start or close its turn, nor,
+    for a send to a busy agent, anything read before its keys land. Dispatches to
+    one terminal run one at a time.
   - Costs: a fast reply that is never seen working closes at the 60s backstop.
     kiro's work sign avoids this; other providers (grok, cursor, hermes) have none
     yet. With `CAO_PYTE_STATUS=false`, screen-calibrated providers are slower:

@@ -10,6 +10,8 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.status_monitor import (
     STALE_PROCESSING_BUFFER_QUIET_S,
@@ -2959,3 +2961,178 @@ class TestRound9BusySendAndAbortBuffer:
             sm._buffers["t1"] = "late chunk"
         sm.abort_turn("t1", failed)
         assert sm._buffers["t1"] == "turn 1 answer and idle promptlate chunk"
+
+
+class _StepProvider:
+    """A raw provider for the round-10 tests. Tokens: "|WORK" is busy with the work
+    sign, "|HALF" busy without it (a half-received repaint), "|DONE" an answer."""
+
+    supports_screen_detection = False
+
+    def __init__(self, sign=True):
+        self.sign = sign
+
+    def get_status(self, buffer):
+        last = buffer.rsplit("|", 1)[-1]
+        return {"WORK": TerminalStatus.PROCESSING, "HALF": TerminalStatus.PROCESSING}.get(
+            last, TerminalStatus.COMPLETED if last == "DONE" else TerminalStatus.UNKNOWN
+        )
+
+    def shows_turn_work(self, buffer):
+        return ("|WORK" in buffer) if self.sign else None
+
+    def notify_status_buffer_reset(self, epoch):
+        pass
+
+
+class TestRound10DispatchSteps:
+    """send_input opens a turn, clears the buffer, types, then marks delivery, and
+    output can arrive between any two steps (PR #812 round 10)."""
+
+    @staticmethod
+    def _monitor(provider, buffer_max=100000):
+        sm = StatusMonitor()
+        patches = [
+            patch("cli_agent_orchestrator.services.status_monitor.provider_manager"),
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.get_server_settings",
+                return_value={"state_buffer_max": buffer_max},
+            ),
+        ]
+        patches[0].start().get_provider.return_value = provider
+        patches[1].start()
+        sm._last_status["t1"] = TerminalStatus.IDLE
+        return sm, patches
+
+    @staticmethod
+    def _feed(sm, *tokens):
+        for token in tokens:
+            sm._process_chunk("t1", "|" + token)
+
+    def _warm(self, sm, provider):
+        turn = sm.notify_input_sent("t1", real_send=True)
+        sm.clear_rolling_buffer("t1", provider, turn=turn)
+        sm.notify_input_delivered("t1")
+        self._feed(sm, "WORK", "DONE")
+        assert sm.turn_state("t1") == (1, 1)
+
+    @pytest.mark.parametrize("sign", [True, False], ids=["work-sign", "no-work-sign"])
+    def test_output_before_the_clear_cannot_start_or_close_the_send(self, sign):
+        """haofeif's case: the buffer is still the previous turn's until the clear,
+        so even real-looking work in it is not this send's."""
+        provider = _StepProvider(sign)
+        sm, patches = self._monitor(provider)
+        try:
+            self._warm(sm, provider)
+            turn = sm.notify_input_sent("t1", real_send=True)
+            self._feed(sm, "HALF", "WORK", "DONE")
+            assert sm.turn_state("t1") == (2, 1)
+            sm.clear_rolling_buffer("t1", provider, turn=turn)
+            sm.notify_input_delivered("t1")
+            self._feed(sm, "WORK", "DONE")
+            assert sm.turn_state("t1") == (2, 2)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_a_busy_sends_turn_ignores_work_before_its_keys_land(self):
+        """Turn 1 finishes during turn 2's submit delay: its answer closes turn 1
+        only, and its work sign, still in the buffer, does not count for turn 2."""
+        provider = _StepProvider()
+        sm, patches = self._monitor(provider)
+        try:
+            turn = sm.notify_input_sent("t1", real_send=True)
+            sm.clear_rolling_buffer("t1", provider, turn=turn)
+            sm.notify_input_delivered("t1")
+            self._feed(sm, "WORK")  # turn 1 working
+            turn = sm.notify_input_sent("t1", real_send=True)
+            sm.clear_rolling_buffer("t1", provider, turn=turn)
+            self._feed(sm, "WORK", "DONE")  # turn 1 ends before turn 2's keys land
+            assert sm.turn_state("t1") == (2, 1)
+            sm.notify_input_delivered("t1")
+            self._feed(sm, "HALF", "DONE")  # a repaint of turn 1's answer
+            assert sm.turn_state("t1") == (2, 1)
+            self._feed(sm, "WORK", "DONE")
+            assert sm.turn_state("t1") == (2, 2)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_a_send_behind_a_special_key_is_still_busy(self):
+        """A special key sent while send 1 was open continues it; send 3 after it
+        still goes to a busy agent, so work before its keys land is send 1's."""
+        provider = _StepProvider(sign=False)
+        sm, patches = self._monitor(provider)
+        try:
+            turn = sm.notify_input_sent("t1", real_send=True)
+            sm.clear_rolling_buffer("t1", provider, turn=turn)
+            sm.notify_input_delivered("t1")
+            sm.notify_input_sent("t1")  # special key, turn 2
+            turn = sm.notify_input_sent("t1", real_send=True)
+            sm.clear_rolling_buffer("t1", provider, turn=turn)
+            self._feed(sm, "WORK", "DONE")  # send 1's work and answer
+            assert sm.turn_state("t1")[1] < 3
+            sm.notify_input_delivered("t1")
+            self._feed(sm, "WORK", "DONE")
+            assert sm.turn_state("t1") == (3, 3)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_the_mark_follows_a_trimmed_buffer(self):
+        provider = _StepProvider()
+        sm, patches = self._monitor(provider, buffer_max=12)
+        try:
+            with sm._lock:
+                sm._buffers["t1"] = "AAAA|WORK"
+                sm._evidence_mark["t1"] = 9
+            self._feed(sm, "DONE")  # 14 chars, trimmed by 2
+            with sm._lock:
+                assert sm._evidence_view_locked("t1", sm._buffers["t1"]) == "|DONE"
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_an_aborted_send_gives_back_the_mark(self):
+        """The abort restores the bytes a failed clear discarded; the mark into them
+        must come back too, or the running turn's old work sign counts again."""
+        provider = _StepProvider()
+        sm, patches = self._monitor(provider)
+        try:
+            turn = sm.notify_input_sent("t1", real_send=True)
+            sm.clear_rolling_buffer("t1", provider, turn=turn)
+            sm.notify_input_delivered("t1")
+            self._feed(sm, "WORK")
+            turn = sm.notify_input_sent("t1", real_send=True)
+            sm.clear_rolling_buffer("t1", provider, turn=turn)
+            self._feed(sm, "WORK", "DONE")
+            sm.notify_input_delivered("t1")  # busy: mark after the old work
+            failed = sm.notify_input_sent("t1", real_send=True)
+            sm.clear_rolling_buffer("t1", provider, turn=failed)
+            sm.abort_turn("t1", failed)
+            with sm._lock:
+                view = sm._evidence_view_locked("t1", sm._buffers["t1"])
+            assert "|WORK" not in view
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_work_seen_while_fenced_is_given_back_on_abort(self):
+        """Send 1 was accepted but unseen; the agent works on it while send 2 is
+        fenced, then send 2 fails. Send 1 must close on its answer, not at the
+        60s backstop."""
+        provider = _StepProvider(sign=False)
+        sm, patches = self._monitor(provider)
+        try:
+            turn = sm.notify_input_sent("t1", real_send=True)
+            sm.clear_rolling_buffer("t1", provider, turn=turn)
+            sm.notify_input_delivered("t1")
+            failed = sm.notify_input_sent("t1", real_send=True)
+            sm.clear_rolling_buffer("t1", provider, turn=failed)
+            self._feed(sm, "WORK")  # send 1's work, while send 2 is fenced
+            sm.abort_turn("t1", failed)
+            self._feed(sm, "DONE")
+            assert sm.turn_state("t1") == (2, 2)
+        finally:
+            for p in patches:
+                p.stop()

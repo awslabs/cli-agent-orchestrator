@@ -557,6 +557,70 @@ class TestKiroCliProviderStatusDetection:
             for p in patches:
                 p.stop()
 
+    @pytest.mark.parametrize("quiesce", [False, True], ids=["per-chunk", "quiescence"])
+    @pytest.mark.parametrize("piece", [1024, 4096, 16384])
+    def test_output_before_the_buffer_clear_cannot_finish_the_send(self, piece, quiesce):
+        """haofeif's PR #812 round-10 case, through the real send_input: the same
+        recorded repaint, processed after the send opens its turn but before it
+        clears the buffer. That turn was treated like an init turn, so the
+        repaint's PROCESSING started it and its COMPLETED closed it — (2, 2) with
+        nothing typed, and the real answer's waiter released at once."""
+        from cli_agent_orchestrator.services import terminal_service as ts
+        from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+        blob = (FIXTURES_DIR / "kiro_cli_2_24_resize_repaint_after_send.bin").read_bytes()
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        provider._initialized = True
+        monitor = StatusMonitor()
+        backend = Mock()
+        real_clear = monitor.clear_rolling_buffer
+        seen_before_clear = []
+
+        def replay_then_clear(*args, **kwargs):
+            if monitor.turn_state("test1234")[0] == 2:
+                for i in range(0, len(blob), piece):
+                    chunk = blob[i : i + piece].decode("utf-8", "replace")
+                    monitor._process_chunk("test1234", chunk)
+                if quiesce:
+                    monitor._on_raw_quiescent("test1234")
+                seen_before_clear.append(monitor.turn_state("test1234"))
+            return real_clear(*args, **kwargs)
+
+        monitor.clear_rolling_buffer = replay_then_clear
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as sm_pm,
+            patch.object(ts, "provider_manager") as ts_pm,
+            patch.object(ts, "status_monitor", monitor),
+            patch.object(
+                ts, "get_terminal_metadata", return_value={"tmux_session": "s", "tmux_window": "w"}
+            ),
+            patch.object(ts, "inject_memory_context", side_effect=lambda m, *_: m),
+            patch.object(ts, "update_last_active"),
+            patch.object(ts, "get_backend", return_value=backend),
+            patch("cli_agent_orchestrator.providers.kiro_cli.get_backend"),
+        ):
+            sm_pm.get_provider.return_value = provider
+            ts_pm.get_provider.return_value = provider
+            monitor._last_status["test1234"] = TerminalStatus.IDLE
+            assert ts.send_input("test1234", "warm-up") == 1
+            monitor._process_chunk("test1234", self.LIVE_WORK_SIGNS["spinner-2.19-2.24"])
+            # The warm-up's answer as kiro drew it: what the repaint redraws.
+            monitor._process_chunk("test1234", blob.decode("utf-8", "replace"))
+            assert monitor.turn_state("test1234") == (1, 1)
+
+            assert ts.send_input("test1234", "the real task") == 2
+            # The repaint parses as a finished answer, so this tests something.
+            assert provider.get_status(blob.decode("utf-8", "replace")) == TerminalStatus.COMPLETED
+            assert seen_before_clear == [(2, 1)]
+            assert monitor.turn_state("test1234") == (2, 1)
+
+            # The new task's own work and answer close it.
+            monitor._process_chunk("test1234", self.LIVE_WORK_SIGNS["composer-2.22-2.24"])
+            assert monitor.get_status("test1234") == TerminalStatus.PROCESSING
+            assert monitor.turn_state("test1234") == (2, 1)
+            monitor._process_chunk("test1234", load_fixture("kiro_cli_completed_output.txt"))
+            assert monitor.turn_state("test1234") == (2, 2)
+
     def test_repaint_quoting_the_work_signs_does_not_close_the_new_turn(self):
         """A repaint of an old answer that QUOTES both signs stays a repaint."""
         completed = load_fixture("kiro_cli_completed_output.txt").replace(

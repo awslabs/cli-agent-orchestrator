@@ -2368,6 +2368,69 @@ class TestSendInput:
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_dispatches_to_one_terminal_do_not_interleave(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_update,
+        mock_status_monitor,
+        mock_memory_service,
+    ):
+        """A second send_input, or a special key, waits for the first dispatch to
+        finish: interleaved, their keys landed in a different order from their turn
+        numbers (PR #812 round 10)."""
+        import threading
+        import time
+
+        from cli_agent_orchestrator.services.terminal_service import send_special_key
+
+        mock_memory_service.return_value.get_curated_memory_context.return_value = ""
+        mock_get_metadata.return_value = {"tmux_session": "s", "tmux_window": "w"}
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.paste_enter_count = 1
+        mock_provider.paste_submit_delay = 0.3
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        steps = []
+        typing = threading.Event()
+        release = threading.Event()
+        mock_status_monitor.notify_input_sent.side_effect = lambda *a, **k: (
+            steps.append("open") or len(steps)
+        )
+
+        def slow_keys(_session, _window, message, **_kwargs):
+            steps.append(f"keys {message}")
+            if message == "first":
+                typing.set()
+                assert release.wait(5)
+
+        mock_tmux.send_keys.side_effect = slow_keys
+        mock_tmux.send_special_key.side_effect = lambda *a: steps.append("special")
+        first = threading.Thread(target=send_input, args=("test1234", "first"))
+        first.start()
+        assert typing.wait(5)
+        others = [
+            threading.Thread(target=send_input, args=("test1234", "second")),
+            threading.Thread(target=send_special_key, args=("test1234", "Enter")),
+        ]
+        for t in others:
+            t.start()
+        time.sleep(0.2)
+        assert steps == ["open", "keys first"]
+        release.set()
+        for t in [first, *others]:
+            t.join(5)
+        # Each dispatch opens its turn and types before the next one opens.
+        assert steps[0::2] == ["open"] * 3
+        assert steps[1] == "keys first"
+        assert sorted(steps[1::2]) == ["keys first", "keys second", "special"]
+
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_input_assumes_processing_when_the_provider_declares_it(
         self,
         mock_get_metadata,

@@ -206,6 +206,19 @@ CROSS_NODE_NOTIFY_TIMEOUT = 10.0
 _memory_injected_terminals: set = set()
 _memory_injected_lock = threading.Lock()
 
+# One dispatch at a time per terminal. send_input opens a turn, clears the status
+# buffer and types in separate steps; two sends interleaving those steps typed
+# their keys in a different order from their turn numbers, so a waiter could be
+# released by the other message's answer (#735, PR #812 round 10).
+_dispatch_locks: dict[str, threading.RLock] = {}
+_dispatch_locks_guard = threading.Lock()
+
+
+def _dispatch_lock(terminal_id: str) -> threading.RLock:
+    with _dispatch_locks_guard:
+        return _dispatch_locks.setdefault(terminal_id, threading.RLock())
+
+
 _CURRENT_COMPOSER_PROBE_MAX_CHARS = 64
 
 # Strong references to in-flight deferred-init background tasks. asyncio keeps
@@ -3331,72 +3344,73 @@ def send_input(
         # Check how many Enter keys the provider needs after paste
         enter_count = provider.paste_enter_count if provider else 1
 
-        # Arm the StatusMonitor stickiness gate so that the next provider-
-        # detected PROCESSING transition is honored (overriding the latched
-        # IDLE/COMPLETED). Without this, sticky ready-status would block
-        # the genuine PROCESSING signal that arrives once the agent starts
-        # working on the new message.
-        if provider and provider.assume_processing_on_dispatch is True:
-            turn = status_monitor.notify_input_sent(
-                terminal_id, assume_processing=True, real_send=True
-            )
-        else:
-            turn = status_monitor.notify_input_sent(terminal_id, real_send=True)
+        with _dispatch_lock(terminal_id):
+            # Arm the StatusMonitor stickiness gate so that the next provider-
+            # detected PROCESSING transition is honored (overriding the latched
+            # IDLE/COMPLETED). Without this, sticky ready-status would block
+            # the genuine PROCESSING signal that arrives once the agent starts
+            # working on the new message.
+            if provider and provider.assume_processing_on_dispatch is True:
+                turn = status_monitor.notify_input_sent(
+                    terminal_id, assume_processing=True, real_send=True
+                )
+            else:
+                turn = status_monitor.notify_input_sent(terminal_id, real_send=True)
 
-        # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
-        # prompts from BEFORE the input can't trigger a false COMPLETED
-        # (kiro-cli 2.11's TUI keeps the "ask a question" placeholder in the raw
-        # buffer, which combined with input_received=True would return COMPLETED
-        # within seconds of send_input). Clearing here — not after send_keys —
-        # avoids a race: send_keys includes a submit-delay sleep during which
-        # the agent can begin emitting output; a post-send_keys clear would wipe
-        # that newly-emitted first chunk of the turn (lost from
-        # GET /terminals/{id}/output?mode=full and from early detection). This
-        # uses clear_rolling_buffer (byte-only), which preserves the sticky-latch
-        # arm set by notify_input_sent above; reset_buffer would wipe the arm and
-        # latch-block the IDLE→PROCESSING transition for the whole turn.
-        # Give stateful providers the same explicit generation boundary as the
-        # rolling byte buffer.  Grok uses this to distinguish a new,
-        # byte-identical completion from a retained completion screen.
-        try:
-            status_monitor.clear_rolling_buffer(terminal_id, provider, turn=turn)
+            # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
+            # prompts from BEFORE the input can't trigger a false COMPLETED
+            # (kiro-cli 2.11's TUI keeps the "ask a question" placeholder in the raw
+            # buffer, which combined with input_received=True would return COMPLETED
+            # within seconds of send_input). Clearing here — not after send_keys —
+            # avoids a race: send_keys includes a submit-delay sleep during which
+            # the agent can begin emitting output; a post-send_keys clear would wipe
+            # that newly-emitted first chunk of the turn (lost from
+            # GET /terminals/{id}/output?mode=full and from early detection). This
+            # uses clear_rolling_buffer (byte-only), which preserves the sticky-latch
+            # arm set by notify_input_sent above; reset_buffer would wipe the arm and
+            # latch-block the IDLE→PROCESSING transition for the whole turn.
+            # Give stateful providers the same explicit generation boundary as the
+            # rolling byte buffer.  Grok uses this to distinguish a new,
+            # byte-identical completion from a retained completion screen.
+            try:
+                status_monitor.clear_rolling_buffer(terminal_id, provider, turn=turn)
 
-            # Mark the provider before send_keys rather than after it.  send_keys
-            # includes the provider-specific submit delay, during which a fast CLI
-            # can already emit its first processing and completion frames.  Those
-            # frames must be parsed as belonging to this turn, not as a stale
-            # post-clear redraw.  StatusMonitor has already armed and cleared the
-            # same dispatch boundary above.
-            #
-            # A redelivery re-sends the dispatch CAO is still waiting on, so it gets
-            # the same boundary but must not be counted as a new logical turn.
-            if provider:
-                if redelivery:
-                    provider.mark_redelivery_received()
-                else:
-                    provider.mark_input_received()
-                provider.record_dispatched_message(message)
+                # Mark the provider before send_keys rather than after it.  send_keys
+                # includes the provider-specific submit delay, during which a fast CLI
+                # can already emit its first processing and completion frames.  Those
+                # frames must be parsed as belonging to this turn, not as a stale
+                # post-clear redraw.  StatusMonitor has already armed and cleared the
+                # same dispatch boundary above.
+                #
+                # A redelivery re-sends the dispatch CAO is still waiting on, so it gets
+                # the same boundary but must not be counted as a new logical turn.
+                if provider:
+                    if redelivery:
+                        provider.mark_redelivery_received()
+                    else:
+                        provider.mark_input_received()
+                    provider.record_dispatched_message(message)
 
-            get_backend().send_keys(
-                metadata["tmux_session"],
-                metadata["tmux_window"],
-                message,
-                enter_count=enter_count,
-                force_bracketed_paste=True,
-                submit_delay=provider.paste_submit_delay if provider else 0.3,
-            )
-        except Exception:
-            # Nothing reached the agent. Close the turn rather than leave it open
-            # and never started, which held the terminal "processing" until the
-            # 60s backstop (PR #812 review, round 8).
-            status_monitor.abort_turn(terminal_id, turn)
-            raise
+                get_backend().send_keys(
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    message,
+                    enter_count=enter_count,
+                    force_bracketed_paste=True,
+                    submit_delay=provider.paste_submit_delay if provider else 0.3,
+                )
+            except Exception:
+                # Nothing reached the agent. Close the turn rather than leave it open
+                # and never started, which held the terminal "processing" until the
+                # 60s backstop (PR #812 review, round 8).
+                status_monitor.abort_turn(terminal_id, turn)
+                raise
 
-        # The turn's keystrokes have now cleared send_keys' submit delay, so the
-        # agent has actually been handed the prompt. The turn-start backstop
-        # (TURN_START_BACKSTOP_S) is measured from here rather than from
-        # notify_input_sent above (#735).
-        status_monitor.notify_input_delivered(terminal_id)
+            # The turn's keystrokes have now cleared send_keys' submit delay, so the
+            # agent has actually been handed the prompt. The turn-start backstop
+            # (TURN_START_BACKSTOP_S) is measured from here rather than from
+            # notify_input_sent above (#735).
+            status_monitor.notify_input_delivered(terminal_id)
 
         update_last_active(terminal_id)
         logger.info(f"Sent input to terminal: {terminal_id}")
@@ -3465,8 +3479,9 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         # prompt, C-c interrupting work, C-d sending EOF) all initiate a new
         # processing cycle that must be allowed to push past any latched
         # ready status.
-        status_monitor.notify_input_sent(terminal_id)
-        get_backend().send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
+        with _dispatch_lock(terminal_id):
+            status_monitor.notify_input_sent(terminal_id)
+            get_backend().send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
 
         update_last_active(terminal_id)
         logger.info(f"Sent special key '{key}' to terminal: {terminal_id}")
@@ -3988,6 +4003,8 @@ def dismantle_terminal_runtime(
         status_monitor.clear_terminal(terminal_id)
     except Exception as e:
         logger.warning(f"Failed to clear state detector for {terminal_id}: {e}")
+    with _dispatch_locks_guard:
+        _dispatch_locks.pop(terminal_id, None)
 
     if metadata:
         if kill_window and not tombstone:
