@@ -2146,7 +2146,27 @@ class TestKiroCli225Tui:
         message = provider.extract_last_message_from_script(
             load_fixture("kiro_cli_tui_2_25_completed_output.txt")
         )
-        assert "SLEEP-MARK" in message or "done" in message, message
+        assert "SLEEP-MARK" in message
+        assert "done" in message
+        assert "What's new" not in message
+        assert "Run this exact shell command" not in message
+        assert "Trust All Tools active" not in message
+
+    def test_first_turn_extracts_only_the_one_word_reply(self):
+        """A one-word reply must not absorb the startup banner or echoed prompt."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        message = provider.extract_last_message_from_script(
+            load_fixture("kiro_cli_tui_2_25_first_turn_zebra42.txt")
+        )
+        assert message == "ZEBRA42"
+
+    def test_multiturn_extracts_only_the_latest_reply(self):
+        """The previous turn, footer band, and current prompt echo are not reply text."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        message = provider.extract_last_message_from_script(
+            load_fixture("kiro_cli_tui_2_25_multiturn_output.txt")
+        )
+        assert message == "SECOND42"
 
     @pytest.mark.parametrize(
         "line",

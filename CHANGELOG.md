@@ -68,7 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   task and then IDLE forever while the pane showed the finished response, so a
   supervisor never saw its worker complete and the Kiro e2e cases timed out.
   The marker now accepts a word between `Credits:` and the number; fixtures cut
-  from live 2.25.0 frames pin idle, working and finished (#837)
+  from live 2.25.0 frames pin idle, working and finished. The 2.25 reply
+  extractor also anchors extraction to the turn's Credits lines and starts at
+  the bullet-prefixed assistant row, so the startup banner, echoed prompt and
+  `Trust All Tools` footer are no longer returned as the answer (#832, #837)
 
 - **The `cao` CLI and the bundled Web UI can now talk to an auth-enabled
   server.** Neither presented a bearer, so with an IdP or a standalone

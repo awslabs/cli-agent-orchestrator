@@ -100,6 +100,13 @@ _NON_SGR_CSI = re.compile(r"\x1b\[[0-9;?]*[^m]")
 # "turn" (and any other single word) before the first number.
 TUI_CREDITS_PATTERN = r"▸\s*Credits:\s*(?:[A-Za-z]+\s+)?[\d.]+"
 
+# 2.25's turn/session form is adopted because that release also moved the
+# assistant text onto a bullet-prefixed line. Unlike the pre-2.25 layout, the
+# reply is not reliably separated from the echoed prompt by a blank line, so
+# extraction uses the credits anchors and the bullet line as the reply start.
+TUI_225_CREDITS_PATTERN = r"▸\s*Credits:\s*turn\s+[\d.]+"
+TUI_225_REPLY_PATTERN = r"^\s*•\s+\S"
+
 # TUI processing indicator: ghost text shown while agent is working.
 # kiro-cli 2.11+ replaced "Kiro is working" with "Thinking..." (with an
 # optional "(esc to cancel)" suffix). Match either variant.
@@ -777,6 +784,42 @@ class KiroCliProvider(BaseProvider):
 
         return final_answer.strip()
 
+    def _extract_tui_225_message(self, lines: list[str], credits_idx: int) -> str | None:
+        """Extract a 2.25 TUI reply using turn anchors instead of paragraphs.
+
+        The pre-2.25 layout reliably places the echoed prompt in the first
+        paragraph inside the response box.  2.25 moved the assistant text to a
+        bullet-prefixed line and can render a one-word reply immediately below
+        the echoed prompt, so paragraph splitting cannot distinguish the two.
+        Keep the previous Credits line as the start anchor and the current
+        Credits line as the end anchor; within that turn, the first bullet line
+        is the assistant's reply.
+        """
+        prev_credits_idx = -1
+        for i in range(credits_idx - 1, -1, -1):
+            if re.search(TUI_CREDITS_PATTERN, lines[i]):
+                prev_credits_idx = i
+                break
+
+        reply_start = None
+        for i in range(prev_credits_idx + 1, credits_idx):
+            if re.search(TUI_225_REPLY_PATTERN, lines[i]):
+                reply_start = i
+                break
+
+        if reply_start is None:
+            return None
+
+        response_lines = lines[reply_start:credits_idx]
+        response_lines[0] = re.sub(r"^\s*•\s+", "", response_lines[0], count=1)
+        final_answer = "\n".join(response_lines).strip()
+        if not final_answer:
+            return None
+
+        final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, "", final_answer)
+        final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
+        return final_answer.strip()
+
     def _extract_tui_message(self, clean_output: str) -> str:
         """Extract agent response from pure TUI output (no green arrows).
 
@@ -807,6 +850,11 @@ class KiroCliProvider(BaseProvider):
             if re.search(TUI_CREDITS_PATTERN, lines[i]):
                 credits_idx = i
                 break
+
+        if credits_idx is not None and re.search(TUI_225_CREDITS_PATTERN, lines[credits_idx]):
+            response = self._extract_tui_225_message(lines, credits_idx)
+            if response is not None:
+                return response
 
         if credits_idx is None:
             # Kiro CLI 2.3.0+ may not emit a Credits line. Fall back to
