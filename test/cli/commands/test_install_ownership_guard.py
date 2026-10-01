@@ -738,7 +738,14 @@ class TestUnenumerableProviderDirectory:
     context record via ``claude_code`` -- was accepted for the target provider
     and physically overwrote alpha's ``agent.md``."""
 
-    def _deny_listing_of(self, monkeypatch: pytest.MonkeyPatch, directory: Path) -> None:
+    @staticmethod
+    def _listing_denied(directory: Path):
+        """Deny ``os.listdir`` on ``directory`` for the duration of the ``with``.
+
+        Scoped, not fixture-wide: ``install_service.os`` is the ``os`` module
+        itself, and ``Path.iterdir`` goes through ``os.listdir`` on some Python
+        versions, so the test's own directory assertions must run outside it.
+        """
         real_listdir = os.listdir
 
         def listdir_denied(path):
@@ -746,7 +753,7 @@ class TestUnenumerableProviderDirectory:
                 raise PermissionError(13, "Permission denied", str(path))
             return real_listdir(path)
 
-        monkeypatch.setattr(install_service.os, "listdir", listdir_denied)
+        return patch.object(install_service.os, "listdir", listdir_denied)
 
     def test_haofeif_alias_sequence_is_refused_naming_access(
         self, runner: CliRunner, workspace: Dict[str, Any], monkeypatch: pytest.MonkeyPatch
@@ -764,8 +771,8 @@ class TestUnenumerableProviderDirectory:
         _write_profile(store / "beta.md", name="Agent", body="BETA-BODY")
         _ok(_install_for(runner, "beta", "claude_code"))
 
-        self._deny_listing_of(monkeypatch, agents_dir)
-        r3 = _install(runner, "beta")
+        with self._listing_denied(agents_dir):
+            r3 = _install(runner, "beta")
 
         if (agents_dir / "AGENT.MD").exists():
             # The provider directory folds case: ``Agent.md`` lands on alpha's
@@ -783,7 +790,7 @@ class TestUnenumerableProviderDirectory:
         assert "ALPHA-BODY" in (agents_dir / "agent.md").read_text()
 
     def test_exact_spelling_reinstall_is_refused_when_the_listing_cannot_confirm_it(
-        self, runner: CliRunner, workspace: Dict[str, Any], monkeypatch: pytest.MonkeyPatch
+        self, runner: CliRunner, workspace: Dict[str, Any]
     ) -> None:
         """Platform-independent form of the boundary: even a profile's own
         reinstall is refused (access, not deletion, as the remedy) when the
@@ -793,8 +800,8 @@ class TestUnenumerableProviderDirectory:
         _write_profile(store / "alpha.md", name="shared", body="V1")
         _ok(_install(runner, "alpha"))
 
-        self._deny_listing_of(monkeypatch, workspace["agents_dir"])
-        r2 = _install(runner, "alpha")
+        with self._listing_denied(workspace["agents_dir"]):
+            r2 = _install(runner, "alpha")
 
         _refused(r2)
         assert "could not be read" in r2.output, r2.output
