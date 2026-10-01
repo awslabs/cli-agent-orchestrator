@@ -72,6 +72,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on case-sensitive storage can no longer let `Agent` silently replace an
   installed `agent` in a case-folding provider directory, and a provider file
   left behind by a hand-deleted context copy is refused rather than overwritten.
+  That last rule holds for every provider's file, not only the one being
+  installed for: while any provider's agent file for a name has no context
+  record vouching for it, no install may create a new record for that name
+  (which would otherwise let a later install for that provider replace the
+  file on the strength of the new record). A provider directory whose listing
+  cannot be read is refused as an I/O fault rather than treated as confirming
+  the requested spelling. And an import — a local `.md` file or a URL — is
+  written to the local store only after this check accepts it, so a refused
+  import leaves the previously stored profile of that stem byte-identical.
 
 - the shared context copy is written to the configured installed-profile
   directory (`agents.dirs.cao_installed`), the directory profile discovery, the
@@ -391,9 +400,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - record the originating install handle in each shared context copy's frontmatter
   (`x-cao-source-stem`), so a reinstall can tell its own prior copy apart from a
   different profile that resolves to the same OpenCode agent id. The key is
-  CAO-written: a source profile that declares it has that line replaced by CAO's
-  own at install, and the install is refused when the result does not read back
-  as the marker CAO wrote (#493).
+  CAO-written: a source profile that declares it at the top level of its
+  frontmatter has that line replaced by CAO's own at install, and the install is
+  refused when the result does not read back as the marker CAO wrote. Only the
+  top-level entry is touched — a literal scalar whose text mentions the key, or
+  a nested mapping key spelled the same way, is left as written — and
+  frontmatter written as a single flow mapping (`{name: x, ...}`) receives the
+  marker as an entry inside the braces, so valid flow-style profiles install
+  (#493).
 
 - write the shared context copy atomically, via a same-directory temporary file
   and `os.replace`, so an interrupted install cannot leave a truncated copy; a new

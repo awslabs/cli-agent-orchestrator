@@ -156,10 +156,15 @@ Installing writes a copy of the profile to the shared context directory
 (`agents.dirs.cao_installed`, `~/.aws/cli-agent-orchestrator/agent-context` by
 default). CAO stamps that copy's frontmatter with `x-cao-source-stem`, the
 name the profile was installed under. The key is reserved: it is written by
-CAO, not authored: a source profile that declares it has that line replaced by
-CAO's own at install, and the install is refused if the result does not read
-back as the marker CAO wrote (a quoted, folded or flow-mapping spelling that the
-YAML parser would resolve to a different value).
+CAO, not authored: a source profile that declares it at the top level of its
+frontmatter has that line replaced by CAO's own at install, and the install is
+refused if the result does not read back as the marker CAO wrote (a quoted or
+folded spelling that the YAML parser would resolve to a different value, or the
+key declared inside flow-style `{...}` frontmatter, where CAO cannot replace
+it). Only that top-level entry is CAO's: text inside a `description: |` scalar
+or a nested key spelled the same way is left exactly as written, and
+frontmatter written as one flow mapping gets the marker as an entry inside the
+braces.
 It lets a reinstall recognise its own earlier copy, and lets `cao install`
 refuse -- for every provider -- a different profile whose `name:` would
 overwrite an installed one: the context copy is what the installed agent reads
