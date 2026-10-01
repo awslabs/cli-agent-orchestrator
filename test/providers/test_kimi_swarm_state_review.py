@@ -540,6 +540,104 @@ def test_restored_seen_swarm_can_finish_with_main_answer_outside_viewport(provid
     assert provider.get_status_from_screen(screen(FOOTER)) is TerminalStatus.COMPLETED
 
 
+@pytest.mark.parametrize("state_buffer_max", [1024, 32 * 1024])
+@pytest.mark.parametrize(
+    "echo_chunks",
+    [
+        (ECHO,),
+        (ECHO[:6], ECHO[6:]),
+        (ECHO[: ECHO.index("✨")], ECHO[ECHO.index("✨") :]),
+        tuple(ECHO),
+        ("✨ Run this batch.\n", "\x1b[38;5;222mContinuation.\x1b[39m\n\n"),
+        ("✨ Run this batch.\n", "\x1b[38;5;22", "2mContinuation.\x1b[39m\n\n"),
+        ("✨ Run this batch.\n", "\x1b[1;38;5;222m\n", "Continuation.\x1b[39m\n\n"),
+    ],
+    ids=[
+        "unsplit",
+        "inside-sgr",
+        "before-prompt",
+        "character-chunks",
+        "styled-continuation",
+        "split-continuation-sgr",
+        "inherited-continuation-sgr",
+    ],
+)
+@pytest.mark.parametrize("restored", [True, False], ids=["restored", "dispatched"])
+def test_chunked_submission_completes_after_monitor_crop(
+    provider, backend, monkeypatch, state_buffer_max, echo_chunks, restored
+):
+    settings = lambda: {"state_buffer_max": state_buffer_max}
+    monkeypatch.setattr(kimi_module, "get_server_settings", settings)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.get_server_settings", settings
+    )
+    monkeypatch.setattr("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", False)
+    if not restored:
+        provider.mark_input_received()
+        provider._last_dispatch_time = time.time() - 20
+    monitor = processing_monitor(provider, "")
+    monkeypatch.setattr(monitor, "_schedule_raw_detection", lambda *args: None)
+    for chunk in echo_chunks:
+        monitor._process_chunk(provider.terminal_id, chunk)
+    monitor._process_chunk(provider.terminal_id, panel() + THINKING + FOOTER)
+    assert monitor.get_status(provider.terminal_id) is TerminalStatus.PROCESSING
+
+    progress = "Task progress.\n" * (state_buffer_max // len("Task progress.\n") + 80)
+    monitor._process_chunk(provider.terminal_id, progress + FOOTER)
+    assert "✨" not in monitor._buffers[provider.terminal_id]
+    assert monitor.get_status(provider.terminal_id) is TerminalStatus.PROCESSING
+    body = "Answer body.\n" * (state_buffer_max // len("Answer body.\n") + 80)
+    monitor._process_chunk(provider.terminal_id, panel("Completed.") + FINAL + body + FOOTER)
+    assert "✨" not in monitor._buffers[provider.terminal_id]
+    assert "The main answer" not in monitor._buffers[provider.terminal_id]
+    for _ in range(3):
+        assert monitor.get_status(provider.terminal_id) is TerminalStatus.COMPLETED
+
+
+@pytest.mark.parametrize("state_buffer_max", [1024, 32 * 1024])
+@pytest.mark.parametrize(
+    ("private_prefix", "private_final", "closer"),
+    [
+        ("```text\n", FINAL, "```\n"),
+        ("~~~~text\n", FINAL, "~~~~\n"),
+        (TOOL, "  \x1b[2m● A private tool result.\x1b[0m\n", ""),
+        (TOOL + "```text\n", FINAL, "```\n"),
+    ],
+    ids=["fenced", "long-fence", "tool-result", "fenced-tool-result"],
+)
+def test_restored_chunked_submission_preserves_private_answer_ownership(
+    provider, backend, monkeypatch, state_buffer_max, private_prefix, private_final, closer
+):
+    settings = lambda: {"state_buffer_max": state_buffer_max}
+    monkeypatch.setattr(kimi_module, "get_server_settings", settings)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.status_monitor.get_server_settings", settings
+    )
+    monkeypatch.setattr("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", False)
+    monitor = processing_monitor(provider, "")
+    monkeypatch.setattr(monitor, "_schedule_raw_detection", lambda *args: None)
+    for chunk in (ECHO[:6], ECHO[6:], panel() + THINKING + FOOTER):
+        monitor._process_chunk(provider.terminal_id, chunk)
+    body = "Private body.\n" * (state_buffer_max // len("Private body.\n") + 80)
+    monitor._process_chunk(provider.terminal_id, panel("Completed.") + private_prefix + body)
+    monitor._process_chunk(provider.terminal_id, private_final + FOOTER)
+    assert monitor.get_status(provider.terminal_id) is TerminalStatus.PROCESSING
+
+    monitor._process_chunk(provider.terminal_id, closer + FINAL + FOOTER)
+    assert monitor.get_status(provider.terminal_id) is TerminalStatus.COMPLETED
+
+
+def test_restored_progress_does_not_rescan_a_growing_generation(provider, monkeypatch):
+    provider.record_status_chunk(THINKING * 2000, provider._status_buffer_epoch)
+    stream = provider._swarm_stream
+    assert stream is not None and stream._rolled
+    read = MagicMock(wraps=stream.read)
+    monkeypatch.setattr(stream, "read", read)
+    for _ in range(10):
+        provider.record_status_chunk(THINKING, provider._status_buffer_epoch)
+    read.assert_not_called()
+
+
 @pytest.mark.parametrize("fence", ["```", "````", "~~~", "~~~~"])
 def test_exact_stream_preserves_quoted_final_across_escape_and_buffer_cuts(
     provider, backend, monkeypatch, fence

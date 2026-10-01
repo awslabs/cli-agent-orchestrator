@@ -829,6 +829,9 @@ class KimiCliProvider(BaseProvider):
         self._swarm_final_floor = 0
         self._swarm_stream: Optional[tempfile.SpooledTemporaryFile[str]] = None
         self._swarm_stream_complete = False
+        self._swarm_submission_probe_pending = False
+        self._swarm_submission_color_active = False
+        self._swarm_submission_sgr_tail = ""
         self._swarm_storage_failed = False
         self._swarm_prefix_lost = False
         self.execution_evidence_ambiguous = False
@@ -2356,6 +2359,9 @@ class KimiCliProvider(BaseProvider):
             stream = self._swarm_stream
             self._swarm_stream = None
             self._swarm_stream_complete = False
+            self._swarm_submission_probe_pending = False
+            self._swarm_submission_color_active = False
+            self._swarm_submission_sgr_tail = ""
             self._swarm_storage_failed = False
             self._swarm_prefix_lost = False
             if stream is not None:
@@ -2390,14 +2396,54 @@ class KimiCliProvider(BaseProvider):
                     )
                 self._swarm_stream.seek(0, os.SEEK_END)
                 self._swarm_stream.write(chunk)
-                if not self._swarm_stream_complete:
-                    self._swarm_stream_complete = self._swarm_has_submission(chunk)
+                if (
+                    not self._swarm_stream_complete
+                    and not self._swarm_storage_failed
+                    and self._swarm_submission_probe_needed(chunk)
+                ):
+                    # FIFO boundaries can separate a prompt from its SGR style.
+                    # Keep the preceding ownership context when recognizing it.
+                    self._swarm_stream.seek(0)
+                    self._swarm_stream_complete = self._swarm_has_submission(
+                        self._swarm_stream.read()
+                    )
             except (OSError, ValueError):
                 self._swarm_stream_complete = False
                 self._swarm_storage_failed = True
                 self._swarm_prefix_lost = True
                 self._swarm_main_answer_seen = False
                 logger.exception("Cannot retain Kimi generation context for %s", self.terminal_id)
+
+    def _swarm_submission_probe_needed(self, chunk: str) -> bool:
+        """Filter impossible echo chunks without accepting partial context."""
+        fragment = self._swarm_submission_sgr_tail + chunk
+        trailing_sgr = re.search(r"\x1b(?:\[[0-9;]*)?$", fragment)
+        self._swarm_submission_sgr_tail = trailing_sgr.group(0) if trailing_sgr else ""
+        styles = "".join(re.findall(r"\x1b\[[0-9;]*m", fragment))
+        color_was_active = self._swarm_submission_color_active
+        if color_was_active:
+            styles = f"\x1b[38;5;{kt.USER_INPUT_COLOR_INDEX}m" + styles
+        # No graphics precede the sentinel, so normalization materializes only
+        # the final SGR state. Wrapped echo rows can inherit the prior colour.
+        self._swarm_submission_color_active = kt.USER_INPUT_COLOR_INDEX in (
+            kt.foreground_color_indices(kt.normalize_activity_rows(styles + "x"))
+        )
+        has_prompt = "✨" in chunk or "💫" in chunk
+        needed = (
+            self._swarm_submission_probe_pending
+            or color_was_active
+            or has_prompt
+            or kt.USER_INPUT_COLOR_INDEX in kt.foreground_color_indices(fragment)
+        )
+        # A glyph-only chunk still needs the following whitespace and text.
+        # LF closes that candidate; later styled continuations remain candidates
+        # through the independently retained foreground state.
+        self._swarm_submission_probe_pending = (
+            "✨" in chunk.rpartition("\n")[2] or "💫" in chunk.rpartition("\n")[2]
+            if "\n" in chunk
+            else self._swarm_submission_probe_pending or has_prompt
+        )
+        return needed
 
     @staticmethod
     def _swarm_has_submission(output: str) -> bool:
