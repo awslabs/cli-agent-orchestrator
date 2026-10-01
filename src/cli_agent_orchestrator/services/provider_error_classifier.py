@@ -22,7 +22,9 @@ prose are therefore answers, not refusals. The runtime-side companion of
 from __future__ import annotations
 
 import re
-from typing import NamedTuple, Optional, Tuple
+from typing import Any, NamedTuple, Optional, Tuple
+
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 # Only outputs at most this long are candidates: two orders of magnitude above a
 # refusal banner, far below a real answer.
@@ -61,7 +63,7 @@ _ROWS = (
     # colon; an ordinary answer opening with "API Error:" is not provider refusal.
     (
         "api_error",
-        r"API ?Error(?:\s*\([^)\n]{1,80}\))?\s*:\s*\d{3}\b.*",
+        r"API ?Error(?:\s*\([^)\n]{1,80}\))?\s*:\s*[45]\d{2}\b.*",
         ("claude_code", "codex"),
     ),
     # Model rejection, with or without the leading HTTP status code.
@@ -114,6 +116,16 @@ _SIGNATURES: Tuple[ProviderErrorSignature, ...] = tuple(
     for slug, pattern, providers in _ROWS
 )
 
+# A rendered assistant message owns its text.  These markers are structural
+# evidence from the provider's terminal UI, not another answer-shaped pattern:
+# the same first line is a provider refusal when it appears as bare chrome and is
+# an ordinary answer when it follows the adapter's response marker.
+_ASSISTANT_MARKERS = {
+    "claude_code": re.compile(r"^[ \t]*[⏺●][ \t]*"),
+    "codex": re.compile(r"^[ \t]*(?:(?:assistant|codex|agent)\s*:|•)[ \t]*", re.I),
+}
+_CONTEXT_UNSET: Any = object()
+
 
 class ProviderErrorMatch(NamedTuple):
     """The verdict: which family matched, and the bounded raw detail."""
@@ -125,14 +137,50 @@ class ProviderErrorMatch(NamedTuple):
     kind: str = KIND_PROVIDER_ERROR
 
 
-def classify_provider_error(provider: str, output: Optional[str]) -> Optional[ProviderErrorMatch]:
+def _provider_owns_error_line(provider: str, error_line: str, script_output: str) -> bool:
+    """Whether the last matching rendered line is provider chrome, not assistant text.
+
+    The final-message extractor intentionally removes the provider's response marker,
+    so the extracted text alone cannot establish ownership.  Walk the raw script
+    capture and let the LAST occurrence decide: an unmarked occurrence is provider
+    chrome, while one owned by the adapter's assistant marker is an answer.  No
+    marker vocabulary for a provider means no positive ownership evidence, so the
+    caller must not classify it.
+    """
+    marker = _ASSISTANT_MARKERS.get(provider)
+    found = False
+    assistant_owned = False
+    for raw_line in strip_terminal_escapes(script_output).splitlines():
+        line = raw_line.strip()
+        if line == error_line:
+            found = True
+            assistant_owned = False
+            continue
+        if marker is None:
+            continue
+        match = marker.match(line)
+        if match and line[match.end() :].strip() == error_line:
+            found = True
+            assistant_owned = True
+    return found and not assistant_owned
+
+
+def classify_provider_error(
+    provider: str,
+    output: Optional[str],
+    *,
+    script_output: Any = _CONTEXT_UNSET,
+) -> Optional[ProviderErrorMatch]:
     """Classify ``output`` as an in-band provider error, or return ``None``.
 
     ``provider`` scopes every signature to adapters that actually emit that chrome.
     ``None`` is returned when the output is empty, longer than
     :data:`PROVIDER_ERROR_MAX_CHARS`, or has a first non-empty line matching no
-    eligible signature. Each signature consumes the whole first non-empty line, so
-    ordinary prose that merely starts with an error word is not provider-owned evidence.
+    eligible signature. Each signature consumes the whole first non-empty line.
+
+    ``script_output`` is the raw adapter capture when production has it.  Supplying
+    it activates the ownership check above; omitting it preserves the historical
+    two-argument API for callers that already hold independently-trusted chrome.
     The RAW text is never rewritten or truncated here.
     """
     if output is None or len(output) > PROVIDER_ERROR_MAX_CHARS:
@@ -143,10 +191,15 @@ def classify_provider_error(provider: str, output: Optional[str]) -> Optional[Pr
         return None
 
     for signature in _SIGNATURES:
-        if signature.applies_to(provider) and signature.pattern.fullmatch(first_line):
-            return ProviderErrorMatch(
-                provider=provider, slug=signature.slug, line=first_line, detail=output
-            )
+        if not signature.applies_to(provider) or not signature.pattern.fullmatch(first_line):
+            continue
+        if script_output is not _CONTEXT_UNSET and not _provider_owns_error_line(
+            provider, first_line, script_output or ""
+        ):
+            return None
+        return ProviderErrorMatch(
+            provider=provider, slug=signature.slug, line=first_line, detail=output
+        )
     return None
 
 

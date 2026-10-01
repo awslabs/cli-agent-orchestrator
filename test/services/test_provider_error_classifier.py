@@ -46,6 +46,8 @@ _NON_REFUSALS = (
     # ... and ordinary prose about errors, without the provider chrome.
     ("codex", "API Error handling should preserve context."),
     ("codex", "API Error: none found - all 42 endpoints return 2xx."),
+    ("codex", "API Error: 200 endpoints were audited; none failed."),
+    ("codex", "API Error: 123 is not an HTTP status class."),
     ("codex", "429"),
     ("claude_code", "Rate limiting protects APIs from burst traffic."),
     ("codex", "Unknown model types use the fallback serializer."),
@@ -105,3 +107,70 @@ def test_a_provider_scoped_row_is_only_eligible_for_its_provider():
     scoped = ProviderErrorSignature("scoped", re.compile(r"NOPE"), ("one",))
     assert scoped.applies_to("one") is True
     assert scoped.applies_to("two") is False
+
+
+def test_context_distinguishes_provider_error_from_assistant_prose():
+    """The final-message text alone is ambiguous; ownership comes from the adapter's
+    rendered response marker.  An unmarked line is provider chrome; a line owned by
+    the assistant marker is an answer even when the text happens to look like one."""
+    refusal = "API Error: 404 is the response for an unknown route."
+
+    codex_provider = f"› inspect routes\n{refusal}\n›"
+    codex_answer = f"› inspect routes\n• {refusal}\n›"
+    assert classify_provider_error("codex", refusal, script_output=codex_provider) is not None
+    assert classify_provider_error("codex", refusal, script_output=codex_answer) is None
+
+    claude_provider = f"{refusal}\n❯"
+    claude_answer = f"⏺ {refusal}\n❯"
+    assert (
+        classify_provider_error("claude_code", refusal, script_output=claude_provider) is not None
+    )
+    assert classify_provider_error("claude_code", refusal, script_output=claude_answer) is None
+
+
+def test_context_uses_the_latest_turn_not_stale_error_history():
+    """Multi-turn stability: the old turn's refusal must not taint a later answer,
+    and a later provider failure must still be classified after an earlier answer."""
+    refusal = "API Error: 404 is the response for an unknown route."
+
+    later_answer = f"› first\n{refusal}\n› retry\n• {refusal}\n›"
+    assert classify_provider_error("codex", refusal, script_output=later_answer) is None
+
+    later_failure = f"› first\n• {refusal}\n› retry\n{refusal}\n›"
+    assert classify_provider_error("codex", refusal, script_output=later_failure) is not None
+
+
+def test_real_adapters_extract_and_preserve_ownership():
+    """Cross the real extraction boundary the review reproduced, including two turns."""
+    from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+    from cli_agent_orchestrator.providers.codex import CodexProvider
+
+    refusal = "API Error: 404 is the response for an unknown route."
+    codex = CodexProvider("terminal", "session", "window")
+    claude = ClaudeCodeProvider("terminal", "session", "window")
+
+    provider_raw = f"› inspect routes\n{refusal}\n› "
+    extracted_provider_error = codex.extract_last_message_from_script(provider_raw)
+    assert extracted_provider_error == refusal
+    assert (
+        classify_provider_error("codex", extracted_provider_error, script_output=provider_raw)
+        is not None
+    )
+
+    codex_multi_turn = f"› first\n{refusal}\n› retry\n• {refusal}\n› "
+    extracted_codex_answer = codex.extract_last_message_from_script(codex_multi_turn)
+    assert extracted_codex_answer == f"• {refusal}"
+    assert (
+        classify_provider_error("codex", extracted_codex_answer, script_output=codex_multi_turn)
+        is None
+    )
+
+    claude_multi_turn = f"⏺ first answer\n❯ \n⏺ {refusal}\n❯ "
+    extracted_claude_answer = claude.extract_last_message_from_script(claude_multi_turn)
+    assert extracted_claude_answer == refusal
+    assert (
+        classify_provider_error(
+            "claude_code", extracted_claude_answer, script_output=claude_multi_turn
+        )
+        is None
+    )

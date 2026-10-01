@@ -958,7 +958,7 @@ def _delete_temp_file(path: Optional[str]) -> None:
 # ---------------------------------------------------------------------------
 # _finalize (INV-5) — construct the tier-neutral WorkflowRunResult
 # ---------------------------------------------------------------------------
-def _journal_run_state(record: ScriptRunRecord, error: Optional[str]) -> None:
+def _journal_run_state(record: ScriptRunRecord, error: Optional[str], kind: Optional[str]) -> None:
     """Best-effort terminal-state write-through (INV-4/INV-5). Never raises."""
     try:
         workflow_journal.update_run_state(
@@ -966,6 +966,7 @@ def _journal_run_state(record: ScriptRunRecord, error: Optional[str]) -> None:
             record.state.value,
             record.finished_at,
             error,
+            kind,
         )
     except (
         Exception
@@ -1014,7 +1015,7 @@ async def _finalize(
     record.state = state
     record.current_step_id = None
     record.finished_at = _now()
-    await asyncio.to_thread(_journal_run_state, record, _sanitise_error(error))
+    await asyncio.to_thread(_journal_run_state, record, _sanitise_error(error), kind)
     # ``WorkflowRunResult`` has no top-level ``error`` field (per-step only), so a
     # run-level error (stderr tail on crash/timeout) is surfaced in ``warnings`` —
     # the FAILED state + ``kind`` already carry the failure semantics; the tail is

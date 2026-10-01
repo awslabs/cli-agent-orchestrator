@@ -6528,9 +6528,12 @@ def _resolve_error_kind(row: Any, steps: List[Any]) -> Optional[str]:
 
     1. State-first (RP-4): COMPLETED or non-terminal -> ``None``; CANCELLED ->
        ``"cancelled"``. A retained step kind never changes the run-level verdict.
-    2. FAILED, column-first (RP-1): a durable ``error_kind`` on the step projection
-       wins authoritatively — the inference is NOT consulted.
-    3. FAILED, inference fallback (RP-2, pre-migration rows only) — the RR-4 floor:
+    2. FAILED, run-level column-first (PR #849 review): the terminal ``kind``
+       persisted by the finalizer is authoritative, so a later unrelated exit is
+       not misattributed to a caught provider_error/timeout step.
+    3. FAILED, step fallback (RP-1) for pre-kind rows: a durable ``error_kind`` on
+       the step projection wins authoritatively — the inference is NOT consulted.
+    4. FAILED, inference fallback (RP-2, pre-migration rows only) — the RR-4 floor:
        a step error matching /timeout/i -> ``"timeout"``; otherwise ``"error"``.
 
     The timeout branch is a conservative case-insensitive substring match, never a
@@ -6548,7 +6551,12 @@ def _resolve_error_kind(row: Any, steps: List[Any]) -> Optional[str]:
     if run_state != RunState.FAILED:
         return None
 
-    # FAILED only: durable kind is authoritative when present.
+    # FAILED only: the run-level terminal kind is authoritative when present.
+    run_kind = getattr(row, "kind", None)
+    if isinstance(run_kind, str):
+        return run_kind
+
+    # Legacy rows only: fall back to the durable step kind.
     durable = _durable_error_kind(steps)
     if durable is not None:
         return durable

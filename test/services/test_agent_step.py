@@ -1151,6 +1151,25 @@ class TestInBandProviderError:
         "openai.gpt-5.6-terra isn't supported."
     )
 
+    @staticmethod
+    def _context(provider, output, *, provider_owned=False):
+        """Return a minimal rendered capture with the provider's ownership marker."""
+        if provider == "claude_code":
+            prefix = "" if provider_owned else "⏺ "
+            return f"{prefix}{output}\n❯"
+        prefix = "" if provider_owned else "• "
+        return f"› user\n{prefix}{output}\n›"
+
+    @staticmethod
+    def _context_patch(provider, output, *, provider_owned=False):
+        return patch(
+            f"{_MODULE}.terminal_service.get_output_context",
+            return_value=TestInBandProviderError._context(
+                provider, output, provider_owned=provider_owned
+            ),
+            create=True,
+        )
+
     @pytest.mark.parametrize(
         ("provider", "output"),
         (
@@ -1173,7 +1192,16 @@ class TestInBandProviderError:
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
             output=output
         )
-        with create, send, delete, get_output, exit_cli, wait, status:
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            self._context_patch(provider, output),
+        ):
             result = asyncio.run(run_agent_step(provider, "dev", "x"))
 
         assert result.status == TerminalStatus.COMPLETED
@@ -1187,11 +1215,74 @@ class TestInBandProviderError:
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
             output=output
         )
-        with create, send, delete, get_output, exit_cli, wait, status:
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            self._context_patch(provider, output),
+        ):
             result = asyncio.run(run_agent_step(provider, "dev", "x"))
 
         assert result.status == TerminalStatus.COMPLETED
         assert result.last_message == output
+
+    @pytest.mark.parametrize(
+        ("provider", "output"),
+        (
+            ("codex", "API Error: 404 is the response for an unknown route."),
+            ("claude_code", "API Error: 404 is the response for an unknown route."),
+            ("codex", "Unknown model: a model type absent from the serializer registry."),
+        ),
+    )
+    def test_provider_shaped_assistant_text_completes(self, provider, output):
+        """The same words are an answer when the adapter renders them as assistant output."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output=output
+        )
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            self._context_patch(provider, output),
+        ):
+            result = asyncio.run(run_agent_step(provider, "dev", "x"))
+
+        assert result.status == TerminalStatus.COMPLETED
+        assert result.last_message == output
+
+    def test_a_stale_provider_error_does_not_taint_a_later_assistant_answer(self):
+        """Multi-turn stability: ownership is resolved against the latest matching turn."""
+        refusal = "API Error: 404 is the response for an unknown route."
+        raw = f"› first\n{refusal}\n› retry\n• {refusal}\n›"
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output=refusal
+        )
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}.terminal_service.get_output_context",
+                return_value=raw,
+                create=True,
+            ),
+        ):
+            result = asyncio.run(run_agent_step("codex", "dev", "x"))
+
+        assert result.status == TerminalStatus.COMPLETED
+        assert result.last_message == refusal
 
     def test_provider_error_raises_and_leaves_the_terminal_alive(self):
         """The step FAILS, the raw text stays retrievable, and — mirroring the
@@ -1200,7 +1291,16 @@ class TestInBandProviderError:
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
             output=self.ERROR
         )
-        with create, send, delete as m_delete, get_output, exit_cli as m_exit, wait, status:
+        with (
+            create,
+            send,
+            delete as m_delete,
+            get_output,
+            exit_cli as m_exit,
+            wait,
+            status,
+            self._context_patch("codex", self.ERROR, provider_owned=True),
+        ):
             with pytest.raises(StepExecutionError) as excinfo:
                 asyncio.run(run_agent_step("codex", "dev", "x"))
 

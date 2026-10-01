@@ -814,7 +814,8 @@ async def run_agent_step(
     # ``replay_single_step`` reclaims it, while the drive loop retains it on the
     # step for inspection. The RAW text travels on the exception so it stays
     # retrievable after the step fails.
-    provider_error = classify_provider_error(provider, last_message)
+    script_output = await asyncio.to_thread(terminal_service.get_output_context, terminal_id)
+    provider_error = classify_provider_error(provider, last_message, script_output=script_output)
     if provider_error is not None:
         raise StepExecutionError(
             f"provider error ({provider_error.slug}) from {provider}: {provider_error.detail}",

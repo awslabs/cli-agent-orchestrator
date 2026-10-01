@@ -90,6 +90,7 @@ _REQUIRED_RUN_COLUMNS = frozenset(
         # exists to catch.
         "manifest_json",
         "error",
+        "kind",
     }
 )
 _REQUIRED_STEP_COLUMNS = frozenset(
@@ -132,6 +133,11 @@ class RunRow:
     manifest_json: Optional[str] = None
     # Issue #753: redacted, bounded script-level failure diagnostic.
     error: Optional[str] = None
+    # PR #849 review: run-level terminal verdict persisted independently of the
+    # per-step diagnostic.  A script can catch a provider_error/timeout step and
+    # later fail for an unrelated reason; this column keeps live and cold reads
+    # aligned on the run's actual terminal kind.
+    kind: Optional[str] = None
 
 
 @dataclass
@@ -554,13 +560,16 @@ def update_run_state(
     state: str,
     finished_at: Optional[str],
     error: Optional[str] = None,
+    kind: Optional[str] = None,
 ) -> None:
-    """UPDATE run state, finish time, and optional run-level diagnostic (E1).
+    """UPDATE run state, finish time, optional diagnostic, and terminal kind (E1).
 
     ``finished_at`` is set on a terminal transition and cleared (``None``) when a
     resume re-opens a previously-settled run (business-logic-model §3).
-    ``error`` is cleared by every caller that omits it, preventing a resumed or
-    subsequently completed run from retaining a stale script failure.
+    ``error`` and ``kind`` are cleared by every caller that omits them, preventing a
+    resumed or subsequently completed run from retaining a stale script failure or
+    verdict.  ``kind`` is a trailing additive parameter; older callers keep the
+    existing three- or four-argument behaviour unchanged.
 
     UNCONDITIONAL BY CONTRACT. Do NOT add a ``WHERE state = ...`` predicate here:
     the resume path calls this to write state BACK to ``running`` on an already
@@ -571,8 +580,9 @@ def update_run_state(
     """
     with _connect() as conn:
         conn.execute(
-            "UPDATE workflow_run SET state = ?, finished_at = ?, error = ? WHERE run_id = ?",
-            (state, finished_at, error, run_id),
+            "UPDATE workflow_run SET state = ?, finished_at = ?, error = ?, "
+            "kind = ? WHERE run_id = ?",
+            (state, finished_at, error, kind, run_id),
         )
 
 
@@ -874,8 +884,8 @@ def get_run(run_id: str) -> Optional[RunRow]:
     with _connect() as conn:
         row = conn.execute(
             "SELECT run_id, workflow_name, spec_snapshot, inputs_json, state, "
-            "current_step_id, started_at, finished_at, tier, generation, manifest_json, error "
-            "FROM workflow_run WHERE run_id = ?",
+            "current_step_id, started_at, finished_at, tier, generation, manifest_json, error, "
+            "kind FROM workflow_run WHERE run_id = ?",
             (run_id,),
         ).fetchone()
     if row is None:
@@ -895,6 +905,7 @@ def get_run(run_id: str) -> Optional[RunRow]:
         # failed. Both read back as None, which the resume gate refuses when enforcement is on.
         manifest_json=row[10],
         error=row[11],
+        kind=row[12],
     )
 
 
