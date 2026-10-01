@@ -160,11 +160,22 @@ CAO translates `allowedTools` into each provider's native restriction mechanism:
 
 | Provider | Enforcement | Mechanism |
 |----------|------------|-----------|
-| Kiro CLI | Hard | `allowedTools` in agent JSON (at install time) |
 | Claude Code | Hard | `--disallowedTools` flags block specific tools |
 | Copilot CLI | Hard | `--deny-tool` flags override `--allow-all` |
+| OpenCode CLI | Hard | `permission:` block written at install time from the profile; launch-time `--allowed-tools` and role overrides do not change it |
+| Grok Build CLI | Hard | `--permission-mode dontAsk` with `--allow`/`--deny` |
 | Kimi CLI | Soft | Security system prompt (no native mechanism) |
 | Codex | Soft | Security system prompt (no native mechanism) |
+| Antigravity CLI | Soft | Security system prompt (no native mechanism) |
+| OMP | Soft | Security system prompt (no native mechanism) |
+| MiniMax Code | Soft | Security bootstrap prompt (no native mechanism) |
+| Kiro CLI | Hard (install time) | `tools` (what the agent can use at all) is written at install time from the resolved `allowedTools`; `--trust-all-tools` only suppresses prompts for the tools that remain; launch-time `--allowed-tools` and role overrides do not change it. A profile installed before this change still carries `tools: ["*"]` until reinstalled, and the launch gate warns |
+| Hermes | None | Launched `--yolo --accept-hooks`; restrict tools inside the Hermes profile |
+| Cursor CLI | None | Launched `--force`; `allowedTools` is not applied |
+
+`cao launch` prints an `Enforcement:` line with the confirmation prompt. On a
+Soft or None provider a restricted profile runs unrestricted; the server logs a
+warning at launch and the prompt says so.
 
 ### Resolution Order
 
@@ -231,7 +242,7 @@ When using CLI Agent Orchestrator:
 
 8. **Review tool summaries.** The confirmation prompt shows exactly what tools are allowed and blocked — read it before confirming.
 
-9. **Prefer hard-enforcement providers** (Kiro CLI, Claude Code, Copilot CLI) for sensitive workloads.
+9. **Prefer hard-enforcement providers** (Claude Code, Copilot CLI, Grok Build CLI, OpenCode CLI, Kiro CLI) for sensitive workloads. Kiro CLI and OpenCode CLI enforce at install time: reinstall a profile after changing its policy, and reinstall Kiro profiles that predate native enforcement.
 
 ## Dependency Management
 

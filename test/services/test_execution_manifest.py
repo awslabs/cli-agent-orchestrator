@@ -84,6 +84,20 @@ def test_a_secret_used_as_a_dict_key_is_redacted():
     assert envelope.redacted is True
 
 
+def test_a_secret_access_key_under_its_key_is_redacted_and_flagged():
+    """The text pattern needs an ``aws … secret`` context word; in a parsed document the
+    KEY is that context, and losing it made the manifest persist the key with ``redacted=False``."""
+    aws_sample = "wJalrXUtn" + "FEMI/K7MD" + "ENG/bPxRf" + "iCYEXAMPL" + "EKEY"
+    envelope = _build(inputs={"sts": {"Credentials": {"SecretAccessKey": aws_sample}}})
+    assert aws_sample not in em.serialise(envelope)
+    assert envelope.redacted is True
+    env_entries = _build(
+        permissions={"env": [{"name": "AWS_SECRET_ACCESS_KEY", "value": aws_sample}]}
+    )
+    assert aws_sample not in em.serialise(env_entries)
+    assert env_entries.redacted is True
+
+
 def test_redacted_is_false_when_nothing_matches():
     envelope = _build(inputs={"harmless": "value"}, memory_content="nothing secret here")
     assert envelope.redacted is False

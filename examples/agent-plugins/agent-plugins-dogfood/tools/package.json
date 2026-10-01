@@ -1,0 +1,15 @@
+{
+  "name": "cao-agent-plugins-dogfood-recorder",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Dev/CI tooling: shift-left dog-food recorder for the Agent Plugins pipeline. Runs the asserting run.sh (CAO installing its own `cao` package through its own plugin pipeline) and exports a gated proof-of-work GIF to docs/media/. A broken pipeline cannot print the PASS marker, so it cannot produce a green recording. Not required to use Agent Plugins.",
+  "scripts": {
+    "record": "node record-dogfood-demo.mjs",
+    "playwright:install": "playwright install --with-deps chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1",
+    "ffmpeg-static": "5.2.0"
+  }
+}

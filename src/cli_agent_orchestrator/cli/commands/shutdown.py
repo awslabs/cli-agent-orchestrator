@@ -1,23 +1,23 @@
 """Shutdown command for CLI Agent Orchestrator."""
 
 import click
-import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
+from cli_agent_orchestrator.utils import api_http
 
 
 def _list_sessions():
     try:
-        response = requests.get(f"{API_BASE_URL}/sessions")
+        response = api_http.get(f"{API_BASE_URL}/sessions")
         response.raise_for_status()
         return response.json()
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {e}")
 
 
 def _delete_session(name):
     try:
-        response = requests.delete(f"{API_BASE_URL}/sessions/{name}")
+        response = api_http.delete(f"{API_BASE_URL}/sessions/{name}")
         if response.status_code == 404:
             click.echo(f"Session '{name}' already removed", err=True)
             return False
@@ -37,7 +37,7 @@ def _delete_session(name):
                 "Grok processes exit"
             )
         return True
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {e}")
 
 

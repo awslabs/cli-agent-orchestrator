@@ -325,6 +325,22 @@ LOCAL_AGENT_STORE_DIR = CAO_HOME_DIR / "agent-store"
 # Local skill store for installed CAO skills
 SKILLS_DIR = CAO_HOME_DIR / "skills"
 
+# =============================================================================
+# Agent Plugins (the portable open specification — NOT the event-plugin system
+# under ``plugins/``; see docs/agent-plugins.md vs docs/plugins.md)
+# =============================================================================
+# Installed Agent Plugins. Each child directory is one plugin's PLUGIN_ROOT and
+# holds the exact package bytes, which CAO never mutates. CAO-owned install
+# records live in the dot-prefixed ``.state/`` sibling so they can never be
+# mistaken for a plugin root.
+AGENT_PLUGINS_DIR = CAO_HOME_DIR / "agent-plugins"
+
+# Per-plugin PLUGIN_DATA (Agent Plugins 1.0.0 §9.1). Deliberately OUTSIDE
+# AGENT_PLUGINS_DIR so an update that replaces a plugin's package bytes cannot
+# destroy its persistent state — §9.1 requires PLUGIN_DATA contents survive a
+# plugin update.
+AGENT_PLUGIN_DATA_DIR = CAO_HOME_DIR / "agent-plugin-data"
+
 # Confinement root for graph-layer sink exports (Issue #348, B3). Every graph
 # sink writes ONLY under this directory: ``dest`` is treated as a path
 # relative to this root and joined via ``safe_join_under_base`` (realpath
@@ -764,12 +780,16 @@ MEMORY_ARCHIVE_MAX_GZIP_RATIO = 100  # reject > 100x expansion
 # Users can define custom roles in settings.json under "roles".
 # CAO vocabulary: execute_bash, fs_read, fs_write, fs_list, fs_*, web_fetch,
 # @builtin, @cao-mcp-server, discovery.
-# web_fetch is granted only to developer: supervisor/reviewer are intentionally
-# kept off the network (no WebFetch/WebSearch), shrinking their exfiltration surface.
+# web_fetch is granted only to developer: supervisor/reviewer/workflow_scout
+# are intentionally kept off the network (no WebFetch/WebSearch), shrinking
+# their exfiltration surface.
+# workflow_scout matches the shipped profile comment: read + cao workflow
+# list/get via execute_bash, no fs_write and no web_fetch.
 ROLE_TOOL_DEFAULTS = {
     "supervisor": ["@cao-mcp-server", "fs_read", "fs_list"],
     "reviewer": ["@builtin", "fs_read", "fs_list", "@cao-mcp-server"],
     "developer": ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"],
+    "workflow_scout": ["@builtin", "fs_read", "execute_bash", "@cao-mcp-server"],
 }
 
 # Issue #432 design discussion (tedswinyar + klabulan, 2026-07-17/18): sibling
@@ -868,6 +888,14 @@ WORKFLOW_NAME_RE = r"^[A-Za-z0-9_-]{1,64}$"
 # run_agent_step server-side: the engine (N5) in-process, the handoff MCP client
 # over this single HTTP route (replacing its former six granular round-trips).
 TERMINALS_RUN_STEP_ROUTE = "/terminals/run-step"
+
+# Durable handoff-result retrieval endpoint (issue #447). Held as the FastAPI
+# path TEMPLATE so the route decorator and the MCP client's ``requests.get`` read
+# the SAME literal -- the client formats it (``.format(job_id=...)``) rather than
+# rebuilding the path. job_id is the sole retrieval capability for a row that can
+# carry worker output, so a silent typo on either side is a retrieval outage, not
+# a 404 the caller can act on.
+HANDOFF_RESULTS_ROUTE = "/handoff-results/{job_id}"
 
 # Default directory scanned for workflow spec YAML files when no --dir is given
 # (Bolt 2, N2). Spec files on disk are the single source of truth; the

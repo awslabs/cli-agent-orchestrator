@@ -21,16 +21,15 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.plugins import PostCreateTerminalEvent, hook
 from cli_agent_orchestrator.plugins.base import CaoPlugin
-from cli_agent_orchestrator.services.memory_gateway import (
-    memory_context_for_terminal,
-    remote_memory_url,
-)
-from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.backends.base import TerminalBackend
+    from cli_agent_orchestrator.services.memory_service import MemoryService as _MemoryService
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +39,38 @@ logger = logging.getLogger(__name__)
 BEGIN_MARKER = "<!-- cao-memory:begin -->"
 END_MARKER = "<!-- cao-memory:end -->"
 AGENTS_FILENAME = "AGENTS.md"
+
+
+def get_backend() -> "TerminalBackend":
+    """Resolve the backend only on the server-side handler path."""
+    from cli_agent_orchestrator.backends.registry import get_backend as _get_backend
+
+    return _get_backend()
+
+
+def remote_memory_url() -> str | None:
+    """Resolve the memory gateway only on the server-side handler path."""
+    from cli_agent_orchestrator.services.memory_gateway import (
+        remote_memory_url as _remote_memory_url,
+    )
+
+    return _remote_memory_url()
+
+
+def memory_context_for_terminal(terminal_id: str, task_description: str = "") -> str:
+    """Delegate to the memory gateway without importing it during discovery."""
+    from cli_agent_orchestrator.services.memory_gateway import (
+        memory_context_for_terminal as _memory_context_for_terminal,
+    )
+
+    return _memory_context_for_terminal(terminal_id, task_description)
+
+
+def MemoryService() -> "_MemoryService":
+    """Construct the local service without importing it during discovery."""
+    from cli_agent_orchestrator.services.memory_service import MemoryService as _MemoryService
+
+    return _MemoryService()
 
 
 def get_terminal_metadata(terminal_id: str):

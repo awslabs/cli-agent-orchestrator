@@ -3,7 +3,6 @@
 import os
 
 import click
-import requests
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import (
@@ -14,7 +13,19 @@ from cli_agent_orchestrator.constants import (
     SERVER_PORT,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.services.install_service import (
+    kiro_install_predates_native_enforcement,
+)
 from cli_agent_orchestrator.services.settings_service import get_server_settings
+from cli_agent_orchestrator.utils import api_http
+from cli_agent_orchestrator.utils.enforcement import (
+    NATIVE,
+    describe_enforcement,
+    enforcement_for,
+    is_install_time,
+    is_restricted,
+    native_providers,
+)
 from cli_agent_orchestrator.utils.forwarded_env import (
     ForwardedEnvError,
     validate_forwarded_env,
@@ -82,14 +93,14 @@ def _is_waiting_on_user(terminal_id: str) -> bool:
     function's local except is here to prevent.
     """
     try:
-        resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
+        resp = api_http.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
         if resp.status_code == 200:
             payload = resp.json()
             if isinstance(payload, dict):
                 # bool(): ``payload.get`` is Any, so the comparison is too, and
                 # this function is annotated ``-> bool``.
                 return bool(payload.get("status") == TerminalStatus.WAITING_USER_ANSWER.value)
-    except requests.exceptions.RequestException:
+    except api_http.exceptions.RequestException:
         pass
     return False
 
@@ -148,7 +159,10 @@ def _parse_env_pairs(pairs):
 @click.option(
     "--auto-approve",
     is_flag=True,
-    help="Skip confirmation prompt (restrictions still enforced).",
+    help=(
+        "Skip the confirmation prompt. Does not change the tool policy; whether that "
+        "policy is enforced depends on the provider (see the Enforcement line)."
+    ),
 )
 @click.option(
     "--yolo",
@@ -174,8 +188,9 @@ def _parse_env_pairs(pairs):
     metavar="KEY=VALUE",
     help="Forward an env var to the supervisor AND every worker spawned later "
     "in the same session. Repeatable. Values travel in the request body, not "
-    "the URL. Blocked prefixes (CLAUDE/CODEX_/__MISE_) and >=2048-byte values "
-    "are rejected. See issue #248.",
+    "the URL. Rejected: provider prefixes (CLAUDE/CODEX_/__MISE_), the loader, "
+    "shell, interpreter and AWS-config startup keys listed in docs/tmux.md, and "
+    ">=2048-byte values. See issue #248.",
 )
 @click.option(
     "--resume-session-id",
@@ -208,6 +223,7 @@ def launch(
         forwarded_env = _parse_env_pairs(env_pairs) if env_pairs else {}
 
         # Resolve allowedTools: --yolo > --allowed-tools CLI > profile/role defaults
+        from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
         from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
         from cli_agent_orchestrator.utils.tool_mapping import (
             format_tool_summary,
@@ -225,7 +241,7 @@ def launch(
             # Load profile to get role-based defaults
             try:
                 profile = load_agent_profile(agents)
-                mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+                mcp_server_names = grantable_server_names(profile)
                 no_role_set = not profile.role and not profile.allowedTools
                 resolved_allowed_tools = resolve_allowed_tools(
                     profile.allowedTools, profile.role, mcp_server_names
@@ -276,6 +292,18 @@ def launch(
                         "  Note: kiro_cli's --trust-all-tools consent dialog will be "
                         "auto-answered at startup.\n"
                     )
+                    # --trust-all-tools only suppresses prompts. What the agent
+                    # can use is the installed agent JSON's `tools`, written by
+                    # `cao install` from the profile, so --yolo cannot widen it.
+                    click.echo(
+                        click.style(
+                            "  Note: --yolo does not widen kiro_cli's tool set.\n"
+                            "  Availability is the installed agent's `tools` list, set at\n"
+                            "  cao install time. To get unrestricted access, set\n"
+                            "  'allowedTools: [\"*\"]' in the profile and re-run 'cao install'.\n",
+                            fg="yellow",
+                        )
+                    )
                 elif provider == "opencode_cli":
                     # opencode's TUI has no runtime skip-permissions flag
                     # (tracked upstream in sst/opencode#8463). Permissions are
@@ -294,13 +322,54 @@ def launch(
                 tool_summary = format_tool_summary(resolved_allowed_tools)
                 blocked = get_disallowed_tools(provider, resolved_allowed_tools)
                 blocked_summary = ", ".join(blocked) if blocked else "(none)"
+                level = enforcement_for(provider)
+                if is_install_time(provider):
+                    # opencode enforces the permission block, and kiro the
+                    # `tools` list, that `cao install` wrote from the profile;
+                    # both ignore the list resolved here. Say where the policy
+                    # lives rather than printing a deny list next to a native
+                    # promise that the installed file may not keep.
+                    blocked_summary = (
+                        "(set at install time from the installed agent's policy; "
+                        "not shown here, and --allowed-tools does not change it)"
+                    )
+                    if provider == "kiro_cli" and kiro_install_predates_native_enforcement(
+                        agents, resolved_allowed_tools
+                    ):
+                        click.echo(
+                            click.style(
+                                f"\n  WARNING: the installed Kiro agent '{agents}' has "
+                                'tools: ["*"]: it was installed before CAO wrote the\n'
+                                "  tool policy into `tools`, so this restriction is NOT "
+                                "applied. Re-run:\n"
+                                f"    cao install {agents} --provider kiro_cli\n",
+                                fg="yellow",
+                            )
+                        )
+                elif level != NATIVE and is_restricted(resolved_allowed_tools) and not blocked:
+                    # Providers with no TOOL_MAPPING entry return an empty
+                    # deny list; "(none)" would read as "nothing is blocked
+                    # because nothing needs to be", which is the opposite of
+                    # what is true here.
+                    blocked_summary = "(not translated for this provider)"
 
                 click.echo(
                     f"\nAgent '{agents}' launching on {provider}:\n"
                     f"  Allowed:  {tool_summary}\n"
                     f"  Blocked:  {blocked_summary}\n"
+                    f"  Enforcement: {describe_enforcement(provider, resolved_allowed_tools)}\n"
                     f"  Directory: {display_dir}\n"
                 )
+                if level != NATIVE and is_restricted(resolved_allowed_tools):
+                    click.echo(
+                        click.style(
+                            "  WARNING: this provider does not enforce the Blocked list. "
+                            "The agent can use any tool.\n"
+                            f"  For enforced restrictions use one of: "
+                            f"{', '.join(native_providers())}.\n",
+                            fg="yellow",
+                        )
+                    )
                 if no_role_set:
                     click.echo(
                         "  Note: No role or allowedTools set — defaulting to 'developer'.\n"
@@ -375,7 +444,7 @@ def launch(
         if body:
             post_kwargs["json"] = body
 
-        response = requests.post(url, **post_kwargs)
+        response = api_http.post(url, **post_kwargs)
         response.raise_for_status()
 
         terminal = response.json()
@@ -456,7 +525,7 @@ def launch(
             poll_until_done(
                 terminal["id"], timeout=_READINESS_WAIT_TIMEOUT + _HEADLESS_TASK_TIMEOUT
             )
-            output_resp = requests.get(
+            output_resp = api_http.get(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/output",
                 params={"mode": "last"},
                 timeout=settings["mcp_request_timeout"],
@@ -466,7 +535,7 @@ def launch(
             if output:
                 click.echo(output)
 
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {str(e)}")
     except click.ClickException:
         raise

@@ -48,24 +48,25 @@ class McpAppsPlugin(CaoPlugin):
         from cli_agent_orchestrator.mcp_server.app_tools import register_app_tools
         from cli_agent_orchestrator.security.auth import is_auth_enabled
 
-        # Startup posture warning: the surface is enabled but no IdP is
+        # Startup posture warning: the surface is enabled but no credential is
         # configured, so the auth layer returns the full scope set and enforces
         # nothing. The ``submit_command`` choke point (assign / interrupt /
         # shutdown_session / ...) then rides CAO's existing localhost-trust model
         # unauthenticated — fine on a private loopback box, but surface it
         # explicitly so an operator who flips the flag on a shared or
         # port-forwarded host isn't surprised. Set ``AUTH0_DOMAIN`` or
-        # ``CAO_AUTH_JWKS_URI`` to enforce ``cao:read`` / ``cao:write`` /
-        # ``cao:admin`` scopes on mutations.
+        # ``CAO_AUTH_JWKS_URI`` (IdP) or a standalone ``CAO_AUTH_LOCAL_TOKEN`` to
+        # require a bearer on every call.
         if _surface_enabled() and not is_auth_enabled():
             logger.warning(
-                "CAO_MCP_APPS_ENABLED is set but no IdP is configured "
-                "(AUTH0_DOMAIN / CAO_AUTH_JWKS_URI unset): the MCP Apps surface is "
-                "mounted with authorization off, so submit_command mutations "
-                "(assign, interrupt, shutdown_session, ...) inherit CAO's "
-                "unauthenticated localhost-trust model. Set AUTH0_DOMAIN or "
-                "CAO_AUTH_JWKS_URI to enforce cao:read/cao:write/cao:admin scopes "
-                "before exposing the surface beyond a trusted loopback host."
+                "CAO_MCP_APPS_ENABLED is set but no IdP and no local token is configured "
+                "(AUTH0_DOMAIN / CAO_AUTH_JWKS_URI / CAO_AUTH_LOCAL_TOKEN unset): the "
+                "MCP Apps surface is mounted with authorization off, so "
+                "submit_command mutations (assign, interrupt, shutdown_session, ...) "
+                "inherit CAO's unauthenticated localhost-trust model. Set AUTH0_DOMAIN "
+                "or CAO_AUTH_JWKS_URI (IdP) or CAO_AUTH_LOCAL_TOKEN (shared secret) to "
+                "require a bearer token before exposing the surface beyond a trusted "
+                "loopback host."
             )
 
         # register_app_tools also registers the ui://cao/* resources. Each call
