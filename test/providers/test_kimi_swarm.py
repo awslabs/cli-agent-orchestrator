@@ -415,6 +415,17 @@ def test_explicit_opt_in_requires_same_binary(native_provider, monkeypatch):
     assert native_provider._runtime_home_builder is None
 
 
+def test_missing_verified_executable_refuses_launch_before_private_home_creation(
+    native_provider, monkeypatch
+):
+    set_profile(native_provider, monkeypatch, kimiSwarm=True)
+    verify_binary(native_provider, monkeypatch)
+    Path(native_provider._kimi_binary).unlink()
+    with pytest.raises(ProviderError, match="Cannot verify the Kimi swarm executable"):
+        native_provider._build_kimi_code_command()
+    assert native_provider._runtime_home_builder is None
+
+
 @pytest.mark.parametrize(
     ("profile_limit", "inherited", "expected"),
     [(None, None, 10), (None, "20", 10), (5, "3", 3), (3, "5", 3), (None, "1", 1)],

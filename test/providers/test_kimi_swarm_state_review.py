@@ -349,6 +349,54 @@ def test_later_batch_revokes_monitor_ready_latch_without_a_new_dispatch(provider
     assert monitor.get_status(provider.terminal_id) is TerminalStatus.COMPLETED
 
 
+def test_pending_batch_revokes_cached_completion_before_debounced_detection(
+    provider, backend, monkeypatch
+):
+    monkeypatch.setattr("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", False)
+    begin(provider)
+    monitor = processing_monitor(provider, "")
+    complete = ECHO + panel("Completed.") + FINAL + FOOTER
+    backend.get_history.return_value = complete
+    monitor._process_chunk(provider.terminal_id, complete)
+    assert monitor.get_status(provider.terminal_id) is TerminalStatus.COMPLETED
+
+    # Continuous TUI redraws can defer status detection until quiescence, while
+    # the exact stream observer already has proof of a later native batch.
+    monkeypatch.setattr(monitor, "_schedule_raw_detection", lambda *_: None)
+    later = TOOL + panel() + THINKING + FOOTER
+    backend.get_history.return_value = later
+    monitor._process_chunk(provider.terminal_id, later)
+    assert monitor._last_status[provider.terminal_id] is TerminalStatus.COMPLETED
+    assert provider.has_pending_native_swarm
+
+    events = []
+
+    def lock_available_to_another_thread():
+        acquired = monitor._lock.acquire(blocking=False)
+        if acquired:
+            monitor._lock.release()
+        return acquired
+
+    def publish(topic, payload):
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            assert executor.submit(lock_available_to_another_thread).result(timeout=2)
+        events.append((topic, payload["status"]))
+
+    monkeypatch.setattr("cli_agent_orchestrator.services.status_monitor.bus.publish", publish)
+    assert monitor.get_status(provider.terminal_id) is TerminalStatus.PROCESSING
+    assert (
+        monitor._processing_generation[provider.terminal_id]
+        == monitor._capture_generation[provider.terminal_id]
+    )
+    assert events == [(f"terminal.{provider.terminal_id}.status", "processing")]
+
+    final = panel("Completed.") + FINAL + FOOTER
+    backend.get_history.return_value = final
+    monitor._process_chunk(provider.terminal_id, final)
+    assert monitor.get_status(provider.terminal_id) is TerminalStatus.COMPLETED
+    assert events[-1] == (f"terminal.{provider.terminal_id}.status", "completed")
+
+
 def test_quoted_activity_after_ready_does_not_revoke_monitor_latch(provider, backend):
     begin(provider)
     monitor = processing_monitor(provider, "")
