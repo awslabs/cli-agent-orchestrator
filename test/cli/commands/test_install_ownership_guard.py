@@ -693,3 +693,108 @@ class TestEntryOccupying:
         (tmp_path / "real.md").write_text("x")
         os.symlink(tmp_path / "real.md", tmp_path / "link.md")
         assert install_service._entry_occupying(tmp_path / "link.md") == "link.md"
+
+    def test_listing_failure_is_raised_not_guessed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Round 6 (haofeif): when the directory permits lookup but not
+        enumeration, ``path.name`` used to be returned as if the listing had
+        confirmed the exact spelling. A folding directory can alias the request
+        to another profile's file, so the failure must propagate to the guard's
+        unreadable-artifact refusal instead of being turned into evidence."""
+        (tmp_path / "agent.md").write_text("x")
+        real_listdir = os.listdir
+
+        def listdir_denied(path):
+            if Path(path) == tmp_path:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_listdir(path)
+
+        monkeypatch.setattr(install_service.os, "listdir", listdir_denied)
+        with pytest.raises(PermissionError):
+            install_service._entry_occupying(tmp_path / "agent.md")
+
+    def test_entry_missing_from_the_listing_is_raised_not_guessed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other way the listing can fail to confirm the spelling: nothing
+        in it has the lstat'd inode (a rename between the two calls). That is
+        not exact-spelling evidence either."""
+        (tmp_path / "agent.md").write_text("x")
+        monkeypatch.setattr(install_service.os, "listdir", lambda path: [])
+        with pytest.raises(OSError) as excinfo:
+            install_service._entry_occupying(tmp_path / "agent.md")
+        assert not isinstance(excinfo.value, FileNotFoundError)
+
+
+class TestUnenumerableProviderDirectory:
+    """Round 6 (haofeif P2): the provider directory permits lookup (``lstat``
+    works) but ``os.listdir`` is denied. The old fallback made the guard trust
+    the requested spelling, so with a case-sensitive context directory and a
+    case-folding provider directory ``beta`` (``name: Agent``) -- holding its own
+    context record via ``claude_code`` -- was accepted for the target provider
+    and physically overwrote alpha's ``agent.md``."""
+
+    def _deny_listing_of(self, monkeypatch: pytest.MonkeyPatch, directory: Path) -> None:
+        real_listdir = os.listdir
+
+        def listdir_denied(path):
+            if Path(path) == directory:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_listdir(path)
+
+        monkeypatch.setattr(install_service.os, "listdir", listdir_denied)
+
+    def test_haofeif_alias_sequence_is_refused_naming_access(
+        self, runner: CliRunner, workspace: Dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agents_dir = workspace["agents_dir"]
+        # Context directory with case-sensitive rules; provider directory real.
+        monkeypatch.setattr(
+            install_service,
+            "_entry_occupying",
+            _rules_filesystem({workspace["context_dir"]: "sensitive"}),
+        )
+        store = workspace["local_store"]
+        _write_profile(store / "alpha.md", name="agent", body="ALPHA-BODY")
+        _ok(_install(runner, "alpha"))
+        _write_profile(store / "beta.md", name="Agent", body="BETA-BODY")
+        _ok(_install_for(runner, "beta", "claude_code"))
+
+        self._deny_listing_of(monkeypatch, agents_dir)
+        r3 = _install(runner, "beta")
+
+        if (agents_dir / "AGENT.MD").exists():
+            # The provider directory folds case: ``Agent.md`` lands on alpha's
+            # file and the listing that would have said so cannot be read.
+            _refused(r3)
+            assert "could not be read" in r3.output, r3.output
+            assert "Fix the file's permissions" in r3.output
+            assert "delete it and reinstall" not in r3.output
+            assert sorted(p.name for p in agents_dir.iterdir()) == ["agent.md"]
+        else:
+            # Case-sensitive provider directory: the write really is to a new
+            # file, which the lstat probe establishes before any listing.
+            _ok(r3)
+            assert sorted(p.name for p in agents_dir.iterdir()) == ["Agent.md", "agent.md"]
+        assert "ALPHA-BODY" in (agents_dir / "agent.md").read_text()
+
+    def test_exact_spelling_reinstall_is_refused_when_the_listing_cannot_confirm_it(
+        self, runner: CliRunner, workspace: Dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Platform-independent form of the boundary: even a profile's own
+        reinstall is refused (access, not deletion, as the remedy) when the
+        provider directory cannot be enumerated, because exact spelling is
+        exactly what the listing is there to prove."""
+        store = workspace["local_store"]
+        _write_profile(store / "alpha.md", name="shared", body="V1")
+        _ok(_install(runner, "alpha"))
+
+        self._deny_listing_of(monkeypatch, workspace["agents_dir"])
+        r2 = _install(runner, "alpha")
+
+        _refused(r2)
+        assert "could not be read" in r2.output, r2.output
+        assert "Fix the file's permissions" in r2.output
+        assert "delete it and reinstall" not in r2.output
+        assert "V1" in (workspace["agents_dir"] / "shared.md").read_text()

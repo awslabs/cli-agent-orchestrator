@@ -926,25 +926,32 @@ def _entry_occupying(path: Path) -> Optional[str]:
     not from ``path``: on a case-folding or Unicode-normalising filesystem the
     entry a write to ``Agent.md`` would replace may be spelled ``agent.md``, and
     that spelling is what identifies its owner. Identity is by device and inode,
-    so a symlink entry is matched by its own lstat, never by its target. Falls
-    back to ``path.name`` if the listing cannot be read or no entry matches (a
-    rename between the two calls), which is the exact-spelling answer.
+    so a symlink entry is matched by its own lstat, never by its target.
+
+    The listing is the only evidence of the spelling, so when it cannot supply
+    one this raises rather than guessing: a directory that permits lookup but
+    not enumeration (``lstat`` succeeds, ``listdir`` is denied) propagates that
+    ``OSError`` to the caller's unreadable-artifact refusal, and a listing with
+    no entry of the lstat'd inode (a rename between the two calls) raises a
+    plain ``OSError`` -- never ``FileNotFoundError``, which callers read as
+    "free". Returning ``path.name`` in either case would turn a failed
+    enumeration into exact-spelling evidence and let an alias through (round-6
+    review of #493).
     """
     try:
         target = os.lstat(path)
     except FileNotFoundError:
         return None
-    try:
-        for entry in os.listdir(path.parent):
-            try:
-                st = os.lstat(path.parent / entry)
-            except OSError:
-                continue
-            if (st.st_dev, st.st_ino) == (target.st_dev, target.st_ino):
-                return entry
-    except OSError:
-        pass
-    return path.name
+    for entry in os.listdir(path.parent):
+        try:
+            st = os.lstat(path.parent / entry)
+        except OSError:
+            continue
+        if (st.st_dev, st.st_ino) == (target.st_dev, target.st_ino):
+            return entry
+    raise OSError(
+        f"the listing of '{path.parent}' did not contain the entry occupying '{path.name}'"
+    )
 
 
 def _artifact_stem(entry_name: str, suffix: str) -> str:
