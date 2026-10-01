@@ -726,7 +726,9 @@ def _sanitise_output_json(output_json: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 def record_step_completion(
     env_vars: Optional[Dict[str, str]],
-) -> Optional[Callable[[Optional[str], Optional[str], Optional[str], Optional[str]], None]]:
+) -> Optional[
+    Callable[[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]], None]
+]:
     """Build the RUNNING->COMPLETED/FAILED transition for a script-tier step.
 
     Mirrors ``make_step_terminal_recorder``'s guard exactly (BR-31 pattern):
@@ -800,6 +802,7 @@ def record_step_completion(
         error: Optional[str],
         last_message: Optional[str],
         response_status: Optional[str] = None,
+        error_kind: Optional[str] = None,
     ) -> None:
         st = record.step_states.get(step_id)
         if st is None:
@@ -814,6 +817,7 @@ def record_step_completion(
         if error is not None:
             st.state = StepState.FAILED
             st.error = error
+            st.error_kind = error_kind
         else:
             # Adopt any structured output the worker returned via
             # ``workflow_return`` (keyed by the same run/step ids). A present but
@@ -826,6 +830,7 @@ def record_step_completion(
             else:
                 st.state = StepState.COMPLETED
             st.error = None
+            st.error_kind = None
 
         # ONE best-effort durable write (BR-6): state, attempts, envelope, output and
         # error settle atomically, so the row can never read settled with no result.
@@ -861,6 +866,7 @@ def record_step_completion(
                 ),
                 output_json=_sanitise_output_json(raw_output_json),
                 error=_sanitise_error(st.error),
+                error_kind=st.error_kind,
             )
             if not existed:
                 # AN OBSERVATION, NEVER A CONCLUSION (BR-7/SR-8, unit 6 TD-2a). The

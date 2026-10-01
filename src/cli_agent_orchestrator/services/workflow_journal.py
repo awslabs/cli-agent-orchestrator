@@ -1164,6 +1164,7 @@ def settle_step(
     result_json: Optional[str],
     output_json: Optional[str],
     error: Optional[str],
+    error_kind: Optional[str] = None,
 ) -> bool:
     """Settle a script call's row — state, count, envelope, output, error — atomically (B).
 
@@ -1254,17 +1255,27 @@ def settle_step(
         )
         conn.execute(
             "INSERT INTO workflow_run_step "
-            "(run_id, step_id, state, attempts, output_json, error, updated_at, "
-            " result_json) "
-            "VALUES (?, ?, ?, 1, ?, ?, ?, ?) "
+            "(run_id, step_id, state, attempts, output_json, error, error_kind, "
+            " updated_at, result_json) "
+            "VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?) "
             "ON CONFLICT(run_id, step_id) DO UPDATE SET "
             "state = excluded.state, "
             "attempts = workflow_run_step.attempts + 1, "
             "output_json = excluded.output_json, "
             "error = excluded.error, "
+            "error_kind = excluded.error_kind, "
             "updated_at = excluded.updated_at, "
             "result_json = excluded.result_json",
-            (run_id, step_id, state, output_json, error, updated_at, result_json),
+            (
+                run_id,
+                step_id,
+                state,
+                output_json,
+                error,
+                error_kind,
+                updated_at,
+                result_json,
+            ),
         )
     return existed
 

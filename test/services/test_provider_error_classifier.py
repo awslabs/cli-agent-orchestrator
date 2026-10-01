@@ -38,6 +38,9 @@ _NON_REFUSALS = (
     "Here is the handler you asked for:\n\nAPI Error: 401 invalid_api_key",
     # ... and ordinary prose about errors, without the provider chrome.
     "API Error handling should preserve context.",
+    "429",
+    "Rate limiting protects APIs from burst traffic.",
+    "Unknown model types use the fallback serializer.",
     "The function returns None when the request fails.",
     "",
     None,

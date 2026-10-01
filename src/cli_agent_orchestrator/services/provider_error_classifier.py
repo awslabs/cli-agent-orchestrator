@@ -58,7 +58,11 @@ _ROWS = (
     ("api_error", r"API ?Error(?:\s*\([^)\n]{1,80}\))?\s*:", None),
     # Model rejection, with or without the leading HTTP status code.
     ("model_not_available", r"(?:\d{3}\s+)?Invocation of model ID\b", None),
-    ("model_not_available", r"(?:Unknown|Unsupported|Invalid|Undefined) model\b", None),
+    (
+        "model_not_available",
+        r"(?:Unknown|Unsupported|Invalid|Undefined) model\b\s*[:'\"`]",
+        None,
+    ),
     (
         "model_not_available",
         r"Model\b.{0,80}?\b(?:isn't supported|is not supported|not found|unavailable)",
@@ -72,7 +76,11 @@ _ROWS = (
         None,
     ),
     # Throttling: the upstream refused the call, so the step produced no answer.
-    ("rate_limited", r"(?:Rate limit|rate_limit|429(?:\s+Too Many Requests)?\b)", None),
+    (
+        "rate_limited",
+        r"(?:Rate limit exceeded\b|rate_limit\b|429\s*:\s*rate limit\b|429\s+Too Many Requests\b)",
+        None,
+    ),
     # Transport failures the provider reports IN BAND, as assistant text.
     ("connection_error", r"(?:ConnectionError|APIConnectionError):", None),
 )

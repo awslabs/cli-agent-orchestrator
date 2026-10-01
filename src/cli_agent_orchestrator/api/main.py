@@ -4246,6 +4246,7 @@ async def run_step(
         error: Optional[str],
         last_message: Optional[str] = None,
         response_status: Optional[str] = None,
+        error_kind: Optional[str] = None,
     ) -> None:
         # ``last_message`` is the step's own text result and defaults to None because
         # every FAILURE arm below has none to give: the step never produced one. Only
@@ -4256,7 +4257,7 @@ async def run_step(
         if on_step_settled is None:
             return
         try:
-            on_step_settled(terminal_id, error, last_message, response_status)
+            on_step_settled(terminal_id, error, last_message, response_status, error_kind)
         except Exception:  # noqa: BLE001 — step bookkeeping is best-effort; never fail the step
             logger.warning("run_step: script step completion bookkeeping failed", exc_info=True)
 
@@ -4554,7 +4555,7 @@ async def run_step(
         # structured object carrying terminal_id, so callers read it as a field
         # rather than regex-scraping the message (the future engine reads it too).
         # Transition the script step RUNNING->FAILED (no-op for non-script callers).
-        _settle_step(e.terminal_id, str(e))
+        _settle_step(e.terminal_id, str(e), error_kind=e.kind)
         await _record_job_state(job_id, "error", terminal_id=e.terminal_id, error_message=str(e))
         # issue #638: kind="provider_error" (the upstream refused the call in
         # band) is an UPSTREAM failure — 502, the same class as a crashed worker.
