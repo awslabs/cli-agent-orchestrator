@@ -1715,7 +1715,15 @@ async def create_terminal(
                 get_backend().stop_pipe_pane(s, w)
                 get_backend().pipe_pane(s, w, p)
 
-            fifo_manager.create_reader(terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe)
+            def _probe_fifo_buffer(tid=terminal_id) -> str:
+                return status_monitor.get_buffer(tid)
+
+            fifo_manager.create_reader(
+                terminal_id,
+                pane_probe=_probe_pane,
+                rearm=_rearm_pipe,
+                fifo_buffer_probe=_probe_fifo_buffer,
+            )
 
             # Configure pipe-pane to stream output to the FIFO. This enables
             # real-time event-driven processing via StatusMonitor and LogWriter

@@ -111,6 +111,7 @@ class TestStopReader:
             for state in (
                 manager._pane_probe,
                 manager._rearm,
+                manager._fifo_buffer_probe,
                 manager._liveness,
                 manager._last_data_at,
                 manager._registered_at,
@@ -673,6 +674,52 @@ class TestPipeLivenessWatchdog:
         manager._check_pipe_liveness("term")
         assert rearm_calls == [True], "must not spuriously re-arm again once healthy"
 
+    def test_single_interval_burst_stall_settle_keeps_pre_stall_baseline(
+        self, tmp_path, monkeypatch
+    ):
+        """A burst, forwarder stall, and pane settle can all happen between two
+        liveness checks. Bytes arrived during that interval, but the FIFO buffer
+        proves it never reached the settled frame, so the check must keep the
+        pre-stall baseline and let the silent checks accumulate strikes."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 2)
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "idle prompt"}
+        fifo_buffer = {"content": "\x1b[32midle prompt\x1b[0m"}
+        rearm_calls: list = []
+        self._enroll(
+            manager,
+            "term",
+            pane,
+            rearm_calls,
+            last_data_at=time.monotonic(),
+            fifo_buffer=fifo_buffer,
+        )
+
+        manager._check_pipe_liveness("term")  # pre-stall baseline
+        assert manager._liveness["term"][0] == "idle prompt"
+
+        # The FIFO forwards only the first part of the burst. The pane then
+        # renders the rest and settles before the next watchdog check.
+        fifo_buffer["content"] += "\r\n\x1b[32mburst part 1\x1b[0m"
+        pane["content"] = "idle prompt\nburst part 1\nsettled frame"
+        manager._last_data_at["term"] = time.monotonic()
+        manager._check_pipe_liveness("term")
+
+        assert (
+            manager._liveness["term"][0] == "idle prompt"
+        ), "the settled post-stall frame must not become the new baseline"
+        assert manager._liveness["term"][2] == 0
+        assert rearm_calls == []
+
+        # Once the FIFO goes silent, the sticky pre-stall baseline continues
+        # accumulating strikes against the settled frame.
+        manager._check_pipe_liveness("term")
+        assert manager._liveness["term"][2] == 1
+        assert rearm_calls == []
+        manager._check_pipe_liveness("term")
+        assert manager._liveness["term"][0] == "idle prompt"
+        assert rearm_calls == [True]
+
     def test_stop_during_probe_does_not_resurrect_state(self, tmp_path, monkeypatch):
         """Regression for the round-2 review's stop-during-probe race:
         ``_check_pipe_liveness`` calls the injected ``probe()`` (a slow tmux
@@ -820,15 +867,18 @@ class TestPipeLivenessWatchdog:
                 "term-enroll",
                 pane_probe=lambda: "content",
                 rearm=lambda: None,
+                fifo_buffer_probe=lambda: "content",
             )
             assert "term-enroll" in manager._pane_probe
             assert "term-enroll" in manager._rearm
+            assert "term-enroll" in manager._fifo_buffer_probe
             assert manager._watchdog_thread is not None
             assert manager._watchdog_thread.is_alive()
 
             manager.stop_reader("term-enroll")
             assert "term-enroll" not in manager._pane_probe
             assert "term-enroll" not in manager._rearm
+            assert "term-enroll" not in manager._fifo_buffer_probe
             assert "term-enroll" not in manager._liveness
         finally:
             manager.stop_watchdog()
