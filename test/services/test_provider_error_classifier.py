@@ -26,6 +26,7 @@ _REFUSALS = (
     "API Error: 401 invalid_api_key",
     "Authentication failed: no credentials configured",
     "Rate limit exceeded, retry after 30s",
+    "429: rate limit exceeded",
     "ConnectionError: upstream refused the connection",
     "Unknown model 'gpt-5.6-terra'",
     "Model gpt-5.6-terra is not supported by this account",
@@ -36,6 +37,7 @@ _NON_REFUSALS = (
     # anchoring guard rejects it before the signature table runs.
     "Here is the handler you asked for:\n\nAPI Error: 401 invalid_api_key",
     # ... and ordinary prose about errors, without the provider chrome.
+    "API Error handling should preserve context.",
     "The function returns None when the request fails.",
     "",
     None,
@@ -65,6 +67,14 @@ def test_long_output_is_out_of_scope_however_it_begins():
 def test_only_the_first_non_empty_line_can_match():
     assert classify_provider_error("codex", "\n\n" + _REFUSALS[0]) is not None
     assert classify_provider_error("codex", "ok\n" + _REFUSALS[0]) is None
+
+
+def test_full_bounded_output_travels_as_detail():
+    output = "API Error: 401 invalid_api_key\nsecond line keeps provider detail"
+    match = classify_provider_error("codex", output)
+    assert match is not None
+    assert match.line == "API Error: 401 invalid_api_key"
+    assert match.detail == output
 
 
 def test_a_provider_scoped_row_is_only_eligible_for_its_provider():

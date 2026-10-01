@@ -53,8 +53,9 @@ class ProviderErrorSignature(NamedTuple):
 # The ordered table; first match wins. Each row is (slug, start-anchored pattern,
 # adapters-or-None), applied with ``re.match`` against the first non-empty line.
 _ROWS = (
-    ("api_error", r"API ?Error\b", None),
-    ("api_error", r"APIError:", None),
+    # Require the provider chrome's colon; short prose such as "API Error
+    # handling should preserve context." is an answer, not a refusal.
+    ("api_error", r"API ?Error(?:\s*\([^)\n]{1,80}\))?\s*:", None),
     # Model rejection, with or without the leading HTTP status code.
     ("model_not_available", r"(?:\d{3}\s+)?Invocation of model ID\b", None),
     ("model_not_available", r"(?:Unknown|Unsupported|Invalid|Undefined) model\b", None),
@@ -71,7 +72,7 @@ _ROWS = (
         None,
     ),
     # Throttling: the upstream refused the call, so the step produced no answer.
-    ("rate_limited", r"(?:Rate limit|rate_limit|429 Too Many Requests)", None),
+    ("rate_limited", r"(?:Rate limit|rate_limit|429(?:\s+Too Many Requests)?\b)", None),
     # Transport failures the provider reports IN BAND, as assistant text.
     ("connection_error", r"(?:ConnectionError|APIConnectionError):", None),
 )
@@ -83,11 +84,12 @@ _SIGNATURES: Tuple[ProviderErrorSignature, ...] = tuple(
 
 
 class ProviderErrorMatch(NamedTuple):
-    """The verdict: which family matched, and on which line."""
+    """The verdict: which family matched, and the bounded raw detail."""
 
     provider: str
     slug: str
     line: str
+    detail: str
     kind: str = KIND_PROVIDER_ERROR
 
 
@@ -108,7 +110,9 @@ def classify_provider_error(provider: str, output: Optional[str]) -> Optional[Pr
 
     for signature in _SIGNATURES:
         if signature.applies_to(provider) and signature.pattern.match(first_line):
-            return ProviderErrorMatch(provider=provider, slug=signature.slug, line=first_line)
+            return ProviderErrorMatch(
+                provider=provider, slug=signature.slug, line=first_line, detail=output
+            )
     return None
 
 

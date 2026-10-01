@@ -336,7 +336,8 @@ def _render_snapshot(snapshot):
     click.echo(f"State:   {snapshot.get('state')}")
     click.echo(f"Current: {snapshot.get('current_step_id') or '(none)'}")
     for step in snapshot.get("steps", []):
-        click.echo(f"  - {step['id']}: {step['state']} (attempts={step.get('attempts')})")
+        kind = f" [{step['error_kind']}]" if step.get("error_kind") else ""
+        click.echo(f"  - {step['id']}: {step['state']}{kind} (attempts={step.get('attempts')})")
 
 
 def _render_result(result):

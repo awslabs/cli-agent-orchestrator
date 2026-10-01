@@ -813,7 +813,7 @@ async def run_agent_step(
     provider_error = classify_provider_error(provider, last_message)
     if provider_error is not None:
         raise StepExecutionError(
-            f"provider error ({provider_error.slug}) from {provider}: {provider_error.line}",
+            f"provider error ({provider_error.slug}) from {provider}: {provider_error.detail}",
             kind=provider_error.kind,
             terminal_id=terminal_id,
         )
