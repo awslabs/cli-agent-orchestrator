@@ -4,10 +4,10 @@ import json
 import os
 
 import click
-import requests
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import API_BASE_URL, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.utils import api_http
 from cli_agent_orchestrator.utils.terminal import sync_backend_from_server
 
 
@@ -42,13 +42,13 @@ def restore(terminal_id: str):
 
     # Verify session exists
     try:
-        response = requests.get(f"{API_BASE_URL}/sessions/{session_name}")
+        response = api_http.get(f"{API_BASE_URL}/sessions/{session_name}")
         if response.status_code == 404:
             raise click.ClickException(
                 f"Session '{session_name}' no longer exists. Cannot restore."
             )
         response.raise_for_status()
-    except requests.exceptions.ConnectionError:
+    except api_http.exceptions.ConnectionError:
         raise click.ClickException("Failed to connect to cao-server")
 
     # Create a plain window (no agent) in the existing session

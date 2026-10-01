@@ -13,7 +13,7 @@ on this machine at all.
 | `cao session` and the [session-management skill](../skills/cao-session-management/SKILL.md) | Inbound | Human, script, CI job, or shell-capable agent | Shell to HTTP | Portable automation and one-off commands |
 | `cao-ops-mcp` | Inbound | External MCP-capable agent | MCP stdio to HTTP | Typed fleet-management tools |
 | `cao fleet` and `cao worker` | Inbound | Human or script, from outside the cluster | Shell to HTTP, through a worker broker | Managing agents that run somewhere else |
-| [Plugins](plugins.md) | Outbound | `cao-server` | Python hooks to an external destination | Notifications, audit records, and observability |
+| [Event Plugins](plugins.md) | Outbound | `cao-server` | Python hooks to an external destination | Notifications, audit records, and observability |
 
 These surfaces manage CAO from outside a session. The separate
 `cao-mcp-server` is an orthogonal, in-session surface through which CAO agents
@@ -25,9 +25,9 @@ and the guide to
 ## Inbound and outbound traffic
 
 The Web UI, shell CLI, and `cao-ops-mcp` send management requests into CAO.
-Plugins receive events from CAO and send them outward. A bidirectional
+Event plugins receive events from CAO and send them outward. A bidirectional
 integration therefore needs both an inbound command path and an outbound
-plugin.
+event plugin.
 
 All inbound surfaces ultimately use the HTTP API. See the
 [API overview](api.md) for route families and generated OpenAPI for individual
@@ -153,14 +153,15 @@ Choose the surface by caller:
 | Operator of agents running in a cluster | `cao fleet` and `cao worker` |
 | Custom application | [HTTP API](api.md) |
 
-## Outbound plugins
+## Outbound event plugins
 
-Plugins are Python extensions loaded by `cao-server`. They subscribe to
+Event plugins are Python extensions loaded by `cao-server`. They subscribe to
 lifecycle and message events and can forward those events to chat systems,
 logs, metrics, or other destinations. They are event consumers, not an inbound
-management protocol.
+management protocol. They are unrelated to [Agent Plugins](agent-plugins.md),
+which are portable packages of skills and MCP servers.
 
-The [plugins guide](plugins.md) owns installation, supported events,
+The [event plugins guide](plugins.md) owns installation, supported events,
 troubleshooting, and authoring. The
 [`cao-plugin` skill](../skills/cao-plugin/SKILL.md) provides guided
 scaffolding.
@@ -169,7 +170,7 @@ scaffolding.
 
 - [Web UI](web-ui.md)
 - [HTTP API and PTY WebSocket](api.md)
-- [Plugin guide](plugins.md)
+- [Event Plugin guide](plugins.md)
 - [Session-management commands](../skills/cao-session-management/SKILL.md#commands)
 - [In-session MCP tools](../skills/cao-supervisor-protocols/SKILL.md#core-mcp-tools)
 - [Assign and handoff selection](../skills/cao-supervisor-protocols/SKILL.md#choosing-between-assign-and-handoff)

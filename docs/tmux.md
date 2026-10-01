@@ -47,6 +47,7 @@ The flag is repeatable. Values travel in the request body, not the URL, so secre
 Rejected at the CLI boundary:
 
 - Keys matching `CLAUDE` / `CODEX_` / `__MISE_` (reserved for provider auth — the 6 `CLAUDE_CODE_USE_*` / `CLAUDE_CODE_SKIP_*` auth flags are explicitly allowlisted).
+- Keys that decide what the pane runs before the provider CLI's first tool call: the `LD_*` and `DYLD_*` loader families and `GCONV_PATH`; `PATH`, `HOME` and `SHELL`, which pick the program and rc files the shell starts with; the shell hooks `BASH_ENV`, `ENV`, `ZDOTDIR`, `PROMPT_COMMAND`, `PS0`, `PS1`, `PS2`, `PS4`; the interpreter hooks `PYTHONSTARTUP`, `PYTHONPATH`, `PYTHONHOME`, `PYTHONUSERBASE`, `PERL5OPT`, `PERL5LIB`, `PERLLIB`, `NODE_OPTIONS`, `NODE_PATH`, `RUBYOPT`, `RUBYLIB`; and `AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE`, which the AWS SDK reads when the provider CLI authenticates at startup (a profile's `credential_process` runs the command the file names). A value in any of these would execute as the operator before the agent's first tool call, so there is no allowlist. This is a denylist and will trail new providers and startup hooks. Variables that only act when the agent itself runs a program (`GIT_SSH_COMMAND`, `EDITOR`, `PAGER`) are not refused: whether the agent may run programs is the tool policy's decision.
 - Keys outside `[A-Za-z_][A-Za-z0-9_]*` (non-POSIX names break the shell).
 - Values ≥ 2048 bytes (per-var cap that keeps the tmux argv under the kernel limit — see PR #246).
 
@@ -68,14 +69,16 @@ launch_session(
 )
 ```
 
-The same three rules are enforced at the tool boundary — blocked
+The same rules are enforced at the tool boundary — blocked
 `CLAUDE` / `CODEX_` / `__MISE_` prefixes (with the 6 `CLAUDE_CODE_USE_*` /
-`CLAUDE_CODE_SKIP_*` flags allowlisted), non-POSIX keys, and values ≥ 2048 bytes
-— so an entry the server would silently drop fails the tool call loudly instead
-of vanishing. The CLI and the ops-MCP tool share one validator
-(`utils/forwarded_env.py`) so the two paths cannot drift.
+`CLAUDE_CODE_SKIP_*` flags allowlisted), the loader/shell/interpreter startup
+keys above, non-POSIX keys, and values ≥ 2048 bytes — so an entry the server
+would refuse fails the tool call loudly instead of vanishing. The CLI, the
+ops-MCP tool and `POST /sessions` itself share one validator
+(`utils/forwarded_env.py`) so the paths cannot drift; a direct HTTP caller gets
+a 422 naming the key.
 
 ## Notes
 
-- CAO session names are automatically prefixed with `cao-`. Use the prefixed name (e.g. `cao-my-task`) when referencing a session in `tmux attach`, `cao session send`, or `cao shutdown`.
+- CAO session names are automatically prefixed with `cao-`. Use the prefixed name (e.g. `cao-my-task`) when referencing a session in `tmux attach`, `cao session send`, or `cao shutdown`. Teardown never leaves that namespace: `cao shutdown --session my-task` and `DELETE /sessions/my-task` act on `cao-my-task`, and CAO refuses to kill a tmux session whose name lacks the prefix, so a personal session that shares the operator's tmux server is out of reach.
 - Prefer `cao shutdown` over `tmux kill-session`: `cao shutdown` exits each provider cleanly before tearing down the tmux session, which avoids leaked CLI processes.

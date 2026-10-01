@@ -819,6 +819,77 @@ class TestStaleProcessingCapturePane:
 class TestScreenDetection:
     """Rendered-screen detection should fail soft and keep monitoring alive."""
 
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_kimi_private_dsr_invalid_model_frame_latches_error(self, mock_pm, mock_settings):
+        """Regression for the live Kimi Code 2.1.1 invalid-model incident.
+
+        The same output burst contains a DEC-private DSR query and an indented
+        ``Error: Failed to start a session`` row. Before this fix pyte raised on
+        the DSR before rendered-screen detection ran; even when replayed past
+        that crash, Kimi's top-anchored error regex missed the indented row and
+        the empty composer read as ready. Feed the whole shape through the real
+        StatusMonitor ingestion path and pin the required terminal verdict.
+        """
+
+        from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider, KimiDialect
+
+        provider = KimiCliProvider("t1", "s", "w")
+        provider._dialect = KimiDialect.CODE
+        mock_pm.get_provider.return_value = provider
+        mock_settings.return_value = {"state_buffer_max": 32768}
+
+        sm = StatusMonitor()
+        sm._process_chunk(
+            "t1",
+            "\x1b[?6n"
+            '   Error: Failed to start a session: Model "bad-model" is\r\n'
+            " not configured in config.toml.\r\n"
+            "╭────────────────────────────────────────────╮\r\n"
+            "│ >                                          │\r\n"
+            "╰────────────────────────────────────────────╯\r\n"
+            "Never Ask  bad-model thinking  /tmp/project\r\n"
+            "context: 0%\r\n",
+        )
+
+        assert sm._last_status["t1"] is TerminalStatus.ERROR
+
+    def test_private_device_status_query_does_not_break_pyte_feed(self):
+        """pyte 0.8.2 passes ``private=True`` to DSR handlers.
+
+        Kimi Code 2.1.x emits ``CSI ? 6 n`` during ordinary TUI redraws. The
+        stock ``pyte.Screen.report_device_status(mode)`` rejects that keyword,
+        which used to abort the output chunk before StatusMonitor could
+        schedule rendered-screen detection. CAO only needs a passive
+        compositor, so the private query is ignored and the rest of the frame
+        must still render.
+        """
+
+        sm = StatusMonitor()
+        with sm._lock:
+            sm._feed_screen_locked(
+                "t1",
+                '\x1b[?6nError: Failed to start a session: Model "bad" is not configured.\r\n',
+            )
+
+        rendered, _ = sm._screen_lines("t1")
+        assert rendered is not None
+        assert any("Failed to start a session" in line for line in rendered)
+
+    def test_multi_parameter_device_attributes_do_not_break_pyte_feed(self):
+        """Passive composition ignores DA frames pyte 0.8.2 cannot dispatch."""
+
+        sm = StatusMonitor()
+        with sm._lock:
+            sm._feed_screen_locked(
+                "t1",
+                "\x1b[?1;2c\x1b[1;2cKimi frame survived\r\n",
+            )
+
+        rendered, _ = sm._screen_lines("t1")
+        assert rendered is not None
+        assert any("Kimi frame survived" in line for line in rendered)
+
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     def test_render_error_falls_back_to_raw_buffer_detection(self, mock_pm):
         class BrokenScreen:

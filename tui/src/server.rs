@@ -468,6 +468,14 @@ fn route(id: CommandId) -> Option<Route> {
         CommandId::MemoryLint => None,
         CommandId::MemoryPromote => None,
         CommandId::MemoryRepair => None,
+        // HIDE: U11-A vault maintenance commands intentionally have no TUI route or MCP
+        // equivalent. A rescan may read a curator's files, so only an operator-selected CLI
+        // invocation can trigger it. U11-B may add a read-only status endpoint separately.
+        CommandId::MemoryVaultMigrate => None,
+        CommandId::MemoryVaultRebuild => None,
+        CommandId::MemoryVaultReconcile => None,
+        CommandId::MemoryVaultScan => None,
+        CommandId::MemoryVaultStatus => None,
 
         // ── `cao profile *` ──────────────────────────────────────────────────────────────
         CommandId::ProfileList => plain(Method::Get, "/agents/profiles"),
@@ -581,6 +589,22 @@ fn route(id: CommandId) -> Option<Route> {
         CommandId::SessionStatus => {
             templated(Method::Get, "/terminals/{terminal_id}", &["terminal_id"])
         }
+
+        // ── `cao plugin *` — HIDE, all four ───────────────────────────────────────────────
+        // Routeless on purpose, not for want of endpoints: `/plugins` exists (and now carries a
+        // read-scope gate). `catalog.rs` classifies all four as `Policy::Hidden`, which is what
+        // requirements.md 16.5 requires while the verb is unresolved (M1): a HANDOFF row is
+        // offered in navigation and drives the terminal, so it would ship the surface just as
+        // much as IN-APP, and only HIDE is "not offered at all" (FR-4.3).
+        //
+        // **When M1 lands these become HANDOFF, not IN-APP**, and they stay routeless even then:
+        // `remove` requires a warn-then-confirm exchange that a captured one-shot request cannot
+        // carry, and `add` runs untrusted content whose warning belongs on real stdio. Wiring a
+        // route here would satisfy the table while defeating the confirmation.
+        CommandId::PluginAdd => None,
+        CommandId::PluginList => None,
+        CommandId::PluginRemove => None,
+        CommandId::PluginValidate => None,
 
         // ── `cao skills *` — HANDOFF, all three (OQ-6) ───────────────────────────────────
         // The entire group is routeless. `GET/POST /settings/skill-dirs` is NOT this: it returns
@@ -2646,7 +2670,7 @@ mod tests {
 
     /// **23 routes for the 24 IN-APP commands, and `profile find` is the one without.**
     ///
-    /// The distribution is settled ground truth — 24 IN-APP / 18 HANDOFF / 44 HIDE = 86 — and
+    /// The distribution is settled ground truth — 24 IN-APP / 18 HANDOFF / 49 HIDE = 91 — and
     /// every number below is a **hard-coded literal**. Deriving any of them from `route()` or
     /// from the catalog would compare production against itself, which is the vacuous shape this
     /// project has hit repeatedly.
@@ -2710,7 +2734,7 @@ mod tests {
             .count();
         assert_eq!(
             in_app, 24,
-            "the settled distribution is 24 IN-APP / 18 HANDOFF / 44 HIDE = 86; if this moved, \
+            "the settled distribution is 24 IN-APP / 18 HANDOFF / 49 HIDE = 91; if this moved, \
              the 23-route figure above needs re-deriving rather than adjusting"
         );
     }

@@ -85,6 +85,13 @@ Hermes reads MCP servers from the selected Hermes profile configuration. CAO
 launches Hermes with the right `CAO_TERMINAL_ID` environment variable, but it
 does not mutate Hermes profile files or create a temporary overlay config.
 
+Because CAO writes no MCP configuration for Hermes, MCP servers declared by
+installed [agent plugins](agent-plugins.md) are **not delivered** to it, and
+`cao install --provider hermes` reports each one it could not deliver
+(`mcp.provider_unsupported`). Agent-plugin *skills* are delivered normally. To
+give a Hermes agent an agent plugin's MCP server, add it to the Hermes profile by
+hand, as below.
+
 To let a Hermes supervisor call CAO orchestration tools such as `assign`,
 `handoff`, and `send_message`, add `cao-mcp-server` to the Hermes profile used
 by `hermesProfile`:

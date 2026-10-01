@@ -1765,3 +1765,690 @@ def test_cancelled_create_rolls_back_worker_blocked_in_row_write(real_db, runtim
     assert backend.session_exists("cao-cancel-row") is False
     assert database.list_terminals_by_session("cao-cancel-row") == []
     assert session_lock._session_locks == {}
+
+
+# ---------------------------------------------------------------------------
+# Post-commit failure rollback must not kill a NEWER incarnation of the name.
+#
+# Provider initialisation runs after the locked create transaction returned. If
+# it fails, the outer handler in create_terminal rolls the backend session back.
+# That rollback used to be an unlocked kill_session(session_name): a teardown
+# plus a fresh create of the SAME name that landed in between was destroyed,
+# and its registry row was left pointing at nothing.
+# ---------------------------------------------------------------------------
+
+
+def _fail_in_provider_init(monkeypatch):
+    def _boom(provider, terminal_id, *args, **kwargs):
+        raise RuntimeError("provider init boom")
+
+    monkeypatch.setattr(terminal_service.provider_manager, "create_provider", _boom)
+
+
+def test_post_commit_failure_rollback_kills_the_session_it_created(real_db, runtime, monkeypatch):
+    """Control: with nobody else touching the name, the failed create still cleans up."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    _fail_in_provider_init(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="provider init boom"):
+        _create_in_thread_kw(session_name="cao-lonely", new_session=True)
+
+    assert backend.kill_session_calls == 1
+    assert backend.session_exists("cao-lonely") is False
+    assert database.list_terminals_by_session("cao-lonely") == []
+
+
+def test_post_commit_failure_rollback_leaves_a_newer_incarnation_alone(
+    real_db, runtime, monkeypatch
+):
+    """A teardown + recreate of the same name between the failure and the rollback
+    must survive: the rollback owns only the incarnation whose row it wrote."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    _fail_in_provider_init(monkeypatch)
+    name = "cao-rebuilt"
+
+    def _teardown_and_rebuild_between_failure_and_rollback(tid):
+        # Runs inside the outer failure handler, BEFORE the backend rollback:
+        # models another caller tearing the name down and rebuilding it.
+        runtime.fifo_readers.discard(tid)
+        database.delete_terminals_by_session(name)
+        backend.kill_session(name)
+        backend.add_session(name, {"w-new"})
+        database.create_terminal(
+            terminal_id="t-new",
+            tmux_session=name,
+            tmux_window="w-new",
+            provider="claude_code",
+            agent_profile="developer",
+        )
+
+    monkeypatch.setattr(
+        terminal_service.fifo_manager,
+        "stop_reader",
+        _teardown_and_rebuild_between_failure_and_rollback,
+    )
+
+    with pytest.raises(RuntimeError, match="provider init boom"):
+        _create_in_thread_kw(session_name=name, new_session=True)
+
+    # Exactly one kill: the simulated teardown's own. The rollback saw that its
+    # row was gone and left the rebuilt session alone.
+    assert backend.kill_session_calls == 1
+    assert backend.session_exists(name) is True
+    assert backend.windows(name) == {"w-new"}
+    assert {r["id"] for r in database.list_terminals_by_session(name)} == {"t-new"}
+
+
+def test_post_commit_window_rollback_leaves_a_window_it_no_longer_owns_alone(
+    real_db, runtime, monkeypatch
+):
+    """new_session=False mirror of the ownership witness: if this create's row is
+    gone by the time the rollback runs, the window under that name is somebody
+    else's and must not be killed. The pre-existing session and its peer are
+    untouched throughout."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    _seed(backend, "cao-existing", [("t-peer", "w-peer")], runtime)
+    _fail_in_provider_init(monkeypatch)
+
+    def _someone_else_took_over_the_window(tid):
+        # Runs inside the outer failure handler, BEFORE the backend rollback:
+        # another lifecycle operation removed this terminal's row (a
+        # delete_terminal by id), so the name is no longer ours to clean up.
+        runtime.fifo_readers.discard(tid)
+        database.delete_terminal(tid)
+
+    monkeypatch.setattr(
+        terminal_service.fifo_manager, "stop_reader", _someone_else_took_over_the_window
+    )
+
+    with pytest.raises(RuntimeError, match="provider init boom"):
+        _create_in_thread_kw(session_name="cao-existing", new_session=False)
+
+    # Row gone -> the rollback did not kill anything, window or session.
+    assert backend.kill_window_calls == 0
+    assert backend.kill_session_calls == 0
+    assert backend.session_exists("cao-existing") is True
+    assert "w-peer" in backend.windows("cao-existing")
+    assert {r["id"] for r in database.list_terminals_by_session("cao-existing")} == {"t-peer"}
+    assert runtime.is_fully_live("t-peer")
+
+
+@pytest.mark.parametrize("new_session", [True, False], ids=["session", "window"])
+def test_failure_rollback_does_not_treat_a_retained_row_as_current_ownership(
+    real_db, runtime, monkeypatch, new_session
+):
+    """A retained row from the old generation cannot authorize killing its replacement."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    name = "cao-retained-rebuilt"
+    if not new_session:
+        _seed(backend, name, [("t-peer", "w-peer")], runtime)
+    _fail_in_provider_init(monkeypatch)
+    captured = {}
+
+    def _retain_and_rebuild(tid):
+        runtime.fifo_readers.discard(tid)
+        row = database.get_terminal_metadata(tid)
+        captured["old_incarnation"] = row["session_incarnation_id"]
+        # Unlike the older row-deletion tests, keep this row as a retry handle.
+        # Reuse even the window label to ensure a name-only check is insufficient.
+        backend.kill_session(name)
+        backend.add_session(name, {row["tmux_window"]})
+        database.create_terminal(
+            terminal_id="t-new",
+            tmux_session=name,
+            tmux_window=row["tmux_window"],
+            provider="claude_code",
+            agent_profile="developer",
+            session_incarnation_id="inc-new",
+            new_session_incarnation=True,
+        )
+        session_env.set_session_env(name, {"KEEP": "replacement"})
+
+    monkeypatch.setattr(terminal_service.fifo_manager, "stop_reader", _retain_and_rebuild)
+    # A deferred provider cleanup must retain its old row for a later retry.
+    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", lambda tid: False)
+
+    with pytest.raises(RuntimeError, match="provider init boom"):
+        _create_in_thread_kw(session_name=name, new_session=new_session)
+
+    assert captured["old_incarnation"] != "inc-new"
+    assert backend.kill_session_calls == 1  # Only the simulated teardown.
+    assert backend.kill_window_calls == 0
+    assert backend.session_exists(name)
+    assert database.get_terminal_metadata("t-new") is not None
+    assert database.get_session_incarnation(name) == "inc-new"
+    assert session_env.get_session_env(name) == {"KEEP": "replacement"}
+
+
+@pytest.mark.parametrize("new_session", [True, False], ids=["session", "window"])
+def test_cancelled_failure_rollback_clears_external_owner_and_retains_cleanup_retry(
+    real_db, runtime, monkeypatch, new_session
+):
+    """Cancellation protection must preserve the PR's owner and retry bookkeeping."""
+    import asyncio
+
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    name = "cao-owner-cleanup-retry"
+    if not new_session:
+        _seed(backend, name, [("t-peer", "w-peer")], runtime)
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    captured = {}
+
+    def _hold_lock():
+        with session_lock.session_lifecycle_lock(name):
+            lock_held.set()
+            release_lock.wait(DEADLOCK_TIMEOUT)
+
+    holder = threading.Thread(target=_hold_lock, daemon=True)
+
+    def _fail_before_scheduling(provider, tid, *args, **kwargs):
+        captured["terminal_id"] = tid
+        assert terminal_service._is_deferred_init_external_owner_active(tid)
+        holder.start()
+        assert lock_held.wait(DEADLOCK_TIMEOUT)
+        raise RuntimeError("provider construction boom")
+
+    monkeypatch.setattr(
+        terminal_service.provider_manager, "create_provider", _fail_before_scheduling
+    )
+    cleanup = MagicMock(return_value=False)
+    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", cleanup)
+
+    async def scenario():
+        task = asyncio.create_task(
+            terminal_service.create_terminal(
+                provider="grok_cli",
+                agent_profile="developer",
+                session_name=name,
+                new_session=new_session,
+                defer_init=True,
+            )
+        )
+        await asyncio.to_thread(_wait_until_lock_contended, name, 2)
+        task.cancel()
+        release_lock.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(task), DEADLOCK_TIMEOUT)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release_lock.set()
+        holder.join(timeout=DEADLOCK_TIMEOUT)
+        if "terminal_id" in captured:
+            was_active = terminal_service._is_deferred_init_external_owner_active(
+                captured["terminal_id"]
+            )
+            terminal_service._clear_deferred_init_external_owner_active(captured["terminal_id"])
+
+    tid = captured["terminal_id"]
+    assert not was_active
+    cleanup.assert_called_once_with(tid)
+    assert database.get_terminal_metadata(tid) is not None
+    assert tid not in runtime.fifo_readers
+    assert tid not in runtime.status_buffers
+    if new_session:
+        assert not backend.session_exists(name)
+    else:
+        assert backend.windows(name) == {"w-peer"}
+        assert runtime.is_fully_live("t-peer")
+    assert session_lock._session_locks == {}
+
+
+def test_post_commit_failure_rollback_waits_for_the_lock_off_the_event_loop(
+    real_db, runtime, monkeypatch
+):
+    """A same-name teardown holding the lifecycle lock must park the rollback's
+    THREAD, not the API event loop.
+
+    The lock is a ``threading.Lock``. Acquired synchronously inside the async
+    ``create_terminal`` failure handler it stalled every coroutine on the loop
+    (requests for unrelated sessions included) until the teardown finished.
+    Construction, not clock: the holder takes the lock after the create
+    transaction committed and before provider init fails; the rollback is
+    provably contending (``_wait_until_lock_contended``); and a coroutine on the
+    SAME loop must still get to run while it waits. On the old code that
+    coroutine never resumes, because the loop thread is inside ``lock.acquire``.
+    """
+    import asyncio
+
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    name = "cao-loop-free"
+
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+
+    def _hold_lock():
+        with session_lock.session_lifecycle_lock(name):
+            lock_held.set()
+            release_lock.wait(DEADLOCK_TIMEOUT)
+
+    holder = threading.Thread(target=_hold_lock, daemon=True)
+
+    def _boom_with_the_lock_taken(provider, terminal_id, *args, **kwargs):
+        # The create transaction has committed and released the lock by now
+        # (provider init runs outside it), so the holder acquires promptly.
+        holder.start()
+        assert lock_held.wait(DEADLOCK_TIMEOUT), "holder never took the lock"
+        raise RuntimeError("provider init boom")
+
+    monkeypatch.setattr(
+        terminal_service.provider_manager, "create_provider", _boom_with_the_lock_taken
+    )
+
+    loop_still_turning = threading.Event()
+    outcome: Dict[str, BaseException] = {}
+
+    def _run_loop():
+        async def scenario():
+            task = asyncio.create_task(
+                terminal_service.create_terminal(
+                    provider="claude_code",
+                    agent_profile="developer",
+                    session_name=name,
+                    new_session=True,
+                )
+            )
+            # holder (1) + the rollback (2): the rollback is committed to
+            # lock.acquire(). If that acquire ran on the loop thread, this
+            # to_thread result could never be delivered and we would hang here.
+            await asyncio.to_thread(_wait_until_lock_contended, name, 2)
+            loop_still_turning.set()
+            release_lock.set()
+            try:
+                await task
+            except RuntimeError as exc:
+                outcome["create"] = exc
+
+        asyncio.run(scenario())
+
+    loop_thread = threading.Thread(target=_run_loop, daemon=True)
+    loop_thread.start()
+    try:
+        assert loop_still_turning.wait(
+            DEADLOCK_TIMEOUT
+        ), "the event loop was blocked while the rollback waited for the lifecycle lock"
+    finally:
+        release_lock.set()
+        loop_thread.join(timeout=DEADLOCK_TIMEOUT)
+        holder.join(timeout=DEADLOCK_TIMEOUT)
+
+    assert not loop_thread.is_alive(), "scenario did not finish"
+    assert "provider init boom" in str(outcome.get("create"))
+    # Once the holder let go, the rollback ran and cleaned up its own session.
+    assert backend.kill_session_calls == 1
+    assert backend.session_exists(name) is False
+    assert database.list_terminals_by_session(name) == []
+    assert session_lock._session_locks == {}
+
+
+def test_cancelled_create_compensation_leaves_a_replacement_alone(real_db, runtime, monkeypatch):
+    """The lock serializes; it does not establish ownership of a LATER incarnation.
+
+    Cancel while the worker is inside the row write, let it commit, and park
+    the compensation before it takes the lock. In that window a real teardown
+    and a fresh create of the same name both complete. The compensator must
+    then find its own row gone and leave the replacement's session, window,
+    row and forwarded env untouched, instead of killing by name.
+    """
+    import asyncio
+
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    name = "cao-cancel-replaced"
+
+    worker_blocked = threading.Event()
+    release_worker = threading.Event()
+    compensated = threading.Event()
+
+    real_create = terminal_service.db_create_terminal
+
+    def gated_create(*args, **kwargs):
+        worker_blocked.set()
+        assert release_worker.wait(DEADLOCK_TIMEOUT), "scenario never released the row write"
+        return real_create(*args, **kwargs)
+
+    monkeypatch.setattr(terminal_service, "db_create_terminal", gated_create)
+
+    real_compensate = terminal_service._roll_back_cancelled_create
+
+    def replaced_then_compensate(session_name, terminal_id, window_name, *, created_session):
+        # On the compensator's worker thread, BEFORE it acquires the lock:
+        # models a delete_session plus a successful new create reusing the name.
+        database.delete_terminals_by_session(session_name)
+        backend.kill_session(session_name)
+        backend.add_session(session_name, {"w-new"})
+        database.create_terminal(
+            terminal_id="t-new",
+            tmux_session=session_name,
+            tmux_window="w-new",
+            provider="claude_code",
+            agent_profile="developer",
+        )
+        session_env.set_session_env(session_name, {"KEEP": "me"})
+        try:
+            real_compensate(session_name, terminal_id, window_name, created_session=created_session)
+        finally:
+            compensated.set()
+
+    monkeypatch.setattr(terminal_service, "_roll_back_cancelled_create", replaced_then_compensate)
+
+    raised = _cancel_create_scenario(name, worker_blocked, release_worker, compensated)
+
+    assert isinstance(raised, asyncio.CancelledError), f"expected CancelledError, got {raised!r}"
+    # Exactly one kill: the simulated teardown's own. The compensator saw its
+    # row was gone and left the replacement alone, env included.
+    assert backend.kill_session_calls == 1
+    assert backend.session_exists(name) is True
+    assert backend.windows(name) == {"w-new"}
+    assert {r["id"] for r in database.list_terminals_by_session(name)} == {"t-new"}
+    assert session_env.get_session_env(name) == {"KEEP": "me"}
+    assert session_lock._session_locks == {}
+
+
+@pytest.mark.parametrize("created_session", [True, False], ids=["session", "window"])
+def test_cancelled_create_compensation_reclaims_only_its_retained_pending_row(
+    real_db, runtime, created_session
+):
+    """The old pending row is ours to delete, but its replacement runtime is not."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    name = "cao-cancel-retained"
+    for tid, incarnation in (("t-old", "inc-old"), ("t-new", "inc-new")):
+        database.create_terminal(
+            terminal_id=tid,
+            tmux_session=name,
+            tmux_window="same-window",
+            provider="grok_cli",
+            agent_profile="developer",
+            deferred_init_external_owner=True,
+            session_incarnation_id=incarnation,
+            new_session_incarnation=True,
+        )
+    backend.add_session(name, {"same-window"})
+    session_env.set_session_env(name, {"KEEP": "replacement"})
+
+    terminal_service._roll_back_cancelled_create(
+        name, "t-old", "same-window", created_session=created_session
+    )
+
+    assert backend.kill_session_calls == 0
+    assert backend.kill_window_calls == 0
+    assert backend.windows(name) == {"same-window"}
+    assert database.get_terminal_metadata("t-old") is None
+    assert database.get_terminal_metadata("t-new") is not None
+    assert session_env.get_session_env(name) == {"KEEP": "replacement"}
+    assert session_lock._session_locks == {}
+
+
+@pytest.mark.parametrize("pointer_unavailable", ["missing", "raises"])
+def test_failure_rollback_does_not_kill_without_a_durable_ownership_witness(
+    real_db, runtime, monkeypatch, pointer_unavailable
+):
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    name = "cao-unknown-incarnation"
+    database.create_terminal(
+        terminal_id="t-old",
+        tmux_session=name,
+        tmux_window="w-old",
+        provider="grok_cli",
+        session_incarnation_id="inc-old",
+        new_session_incarnation=True,
+    )
+    backend.add_session(name, {"w-old"})
+    session_env.set_session_env(name, {"KEEP": "unverified"})
+    read_pointer = MagicMock(return_value=None)
+    if pointer_unavailable == "raises":
+        read_pointer.side_effect = RuntimeError("pointer read unavailable")
+    monkeypatch.setattr(terminal_service, "get_session_incarnation", read_pointer)
+    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", lambda tid: False)
+
+    terminal_service._roll_back_failed_create(
+        "t-old",
+        name,
+        "w-old",
+        session_created=True,
+        window_created=False,
+        worktree_repo_root=None,
+    )
+
+    assert backend.kill_session_calls == 0
+    assert backend.kill_window_calls == 0
+    assert backend.windows(name) == {"w-old"}
+    assert database.get_terminal_metadata("t-old") is not None
+    assert session_env.get_session_env(name) == {"KEEP": "unverified"}
+    assert session_lock._session_locks == {}
+
+
+def _fail_in_initialize_with_the_lock_taken(monkeypatch, name, captured):
+    """Register the provider (as a real create does), then fail its ``initialize``
+    once a same-name holder has the lifecycle lock.
+
+    Different from ``_fail_in_provider_init``: there ``create_provider`` itself
+    raises, so nothing is ever registered with the provider manager and a
+    skipped ``cleanup_provider`` would go unnoticed. Here the provider IS
+    registered, so the rollback has all four things to undo: reader, status
+    buffer, provider registration and row.
+    """
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+
+    def _hold_lock():
+        with session_lock.session_lifecycle_lock(name):
+            lock_held.set()
+            release_lock.wait(DEADLOCK_TIMEOUT)
+
+    holder = threading.Thread(target=_hold_lock, daemon=True)
+    fixture_create = terminal_service.provider_manager.create_provider
+
+    def _create_then_fail_init(provider, terminal_id, *args, **kwargs):
+        stub = fixture_create(provider, terminal_id, *args, **kwargs)
+        captured["terminal_id"] = terminal_id
+
+        async def _init_boom():
+            # The create transaction committed and released the lock before
+            # initialize runs, so the holder acquires promptly.
+            holder.start()
+            assert lock_held.wait(DEADLOCK_TIMEOUT), "holder never took the lock"
+            raise RuntimeError("provider init boom")
+
+        stub.initialize = _init_boom
+        return stub
+
+    monkeypatch.setattr(
+        terminal_service.provider_manager, "create_provider", _create_then_fail_init
+    )
+    return holder, release_lock
+
+
+@pytest.mark.parametrize("new_session", [True, False], ids=["session", "window"])
+@pytest.mark.parametrize("cancel", [True, False], ids=["cancelled", "not-cancelled"])
+def test_failure_rollback_completes_even_if_cancelled_at_the_lock(
+    real_db, runtime, monkeypatch, new_session, cancel
+):
+    """The failure handler's rollback must run to the END even when the create
+    request is cancelled while it waits for the lifecycle lock.
+
+    Moving the backend rollback off the loop (``asyncio.to_thread``) put an
+    ``await`` inside the ``except Exception`` handler. A cancellation landing
+    there escaped the handler: the detached thread still killed the backend
+    session/window once the lock came free, but nothing after it ran --
+    ``cleanup_provider``, the row delete and the worktree removal were skipped,
+    leaving a registered provider and a registry row for a terminal that no
+    longer exists. Four cases: the session arm and the window arm, each with
+    and without a cancellation arriving while the rollback is provably
+    contending for the lock. The two controls pass either way; the two
+    cancelled arms are the finding. The cancellation is still what the caller
+    sees, but only after the cleanup is durable.
+    """
+    import asyncio
+
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+    name = "cao-cancel-at-rollback"
+    if not new_session:
+        _seed(backend, name, [("t-peer", "w-peer")], runtime)
+
+    captured: Dict[str, str] = {}
+    holder, release_lock = _fail_in_initialize_with_the_lock_taken(monkeypatch, name, captured)
+
+    async def scenario():
+        task = asyncio.create_task(
+            terminal_service.create_terminal(
+                provider="claude_code",
+                agent_profile="developer",
+                session_name=name,
+                new_session=new_session,
+            )
+        )
+        # holder (1) + the rollback thread (2): the rollback is committed to
+        # lock.acquire() and the create task is parked on that await.
+        await asyncio.to_thread(_wait_until_lock_contended, name, 2)
+        if cancel:
+            task.cancel()
+        release_lock.set()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), DEADLOCK_TIMEOUT)
+        except BaseException as exc:  # noqa: BLE001 -- the type IS the assertion
+            return exc
+        return None
+
+    try:
+        raised = asyncio.run(scenario())
+    finally:
+        release_lock.set()
+        holder.join(timeout=DEADLOCK_TIMEOUT)
+
+    if cancel:
+        assert isinstance(raised, asyncio.CancelledError), raised
+    else:
+        assert isinstance(raised, RuntimeError) and "provider init boom" in str(raised), raised
+
+    tid = captured["terminal_id"]
+    # By the time the task finished, the WHOLE rollback had run: no reader, no
+    # status buffer, no provider registration, no row -- not just no backend.
+    assert runtime.is_fully_gone(tid), (
+        runtime.fifo_readers,
+        runtime.status_buffers,
+        runtime.providers,
+    )
+    if new_session:
+        assert backend.kill_session_calls == 1
+        assert backend.session_exists(name) is False
+        assert database.list_terminals_by_session(name) == []
+    else:
+        assert backend.kill_window_calls == 1
+        assert backend.kill_session_calls == 0
+        assert backend.session_exists(name) is True
+        assert backend.windows(name) == {"w-peer"}
+        assert {r["id"] for r in database.list_terminals_by_session(name)} == {"t-peer"}
+        assert runtime.is_fully_live("t-peer")
+    assert session_lock._session_locks == {}
+
+
+def test_failure_before_the_worker_runs_raises_the_cause_and_touches_nothing(
+    real_db, runtime, monkeypatch
+):
+    """A failure BEFORE the create worker (capability probe, worktree, name
+    generation) reaches the same handler with nothing built yet: the handler
+    must raise the original error, not trip over state that was never assigned,
+    and must leave both stores as it found them."""
+    backend = FakeTmuxBackend()
+    set_backend(backend)
+
+    def _boom(agent_profile):
+        raise RuntimeError("pre-worker boom")
+
+    monkeypatch.setattr(terminal_service, "generate_window_name", _boom)
+
+    with pytest.raises(RuntimeError, match="pre-worker boom"):
+        _create_in_thread_kw(session_name="cao-never-built", new_session=True)
+
+    assert backend.kill_session_calls == 0
+    assert backend.kill_window_calls == 0
+    assert backend.session_exists("cao-never-built") is False
+    assert database.list_terminals_by_session("cao-never-built") == []
+    assert session_lock._session_locks == {}
+
+
+def test_runner_shutdown_during_failed_create_rollback_terminates(real_db, runtime, monkeypatch):
+    """Whole-runner shutdown while the failure rollback waits for the lifecycle
+    lock must terminate once the cleanup thread finishes.
+
+    ``asyncio.run`` (and uvicorn) end by cancelling every Task on the loop and
+    gathering them. With the cleanup thread wrapped in a Task, that shutdown
+    cancelled the Task itself; ``await shield(job)`` then raised on every
+    iteration without yielding and ``asyncio.run`` never returned, even after
+    the thread had completed the backend and row cleanup. Construction: fail
+    provider init while a same-name holder has the lock, return from the
+    runner's main coroutine while the rollback is provably contending, release
+    the lock 150 ms later, and require ``asyncio.run`` to come back with the
+    two stores clean. Session and window arms.
+    """
+    import asyncio
+
+    for new_session in (True, False):
+        session_lock._session_locks.clear()
+        backend = FakeTmuxBackend()
+        set_backend(backend)
+        name = f"cao-shutdown-{'s' if new_session else 'w'}"
+        if not new_session:
+            _seed(backend, name, [("t-peer", "w-peer")], runtime)
+        captured: Dict[str, str] = {}
+        holder, release_lock = _fail_in_initialize_with_the_lock_taken(monkeypatch, name, captured)
+
+        async def main():
+            asyncio.create_task(
+                terminal_service.create_terminal(
+                    provider="claude_code",
+                    agent_profile="developer",
+                    session_name=name,
+                    new_session=new_session,
+                )
+            )
+            # holder (1) + the rollback thread (2): the create task is parked on
+            # the cleanup await. Returning now makes asyncio.run cancel it.
+            await asyncio.to_thread(_wait_until_lock_contended, name, 2)
+            threading.Timer(0.15, release_lock.set).start()
+
+        finished = threading.Event()
+
+        def _run():
+            try:
+                asyncio.run(main())
+            finally:
+                finished.set()
+
+        runner = threading.Thread(target=_run, daemon=True)
+        runner.start()
+        try:
+            assert finished.wait(DEADLOCK_TIMEOUT), (
+                f"asyncio.run did not return after runner shutdown ({name}): the cleanup "
+                "await is spinning on a cancelled task"
+            )
+        finally:
+            release_lock.set()
+            holder.join(timeout=DEADLOCK_TIMEOUT)
+            runner.join(timeout=DEADLOCK_TIMEOUT)
+
+        tid = captured["terminal_id"]
+        assert runtime.is_fully_gone(tid), (
+            runtime.fifo_readers,
+            runtime.status_buffers,
+            runtime.providers,
+        )
+        if new_session:
+            assert backend.session_exists(name) is False
+            assert database.list_terminals_by_session(name) == []
+        else:
+            assert backend.windows(name) == {"w-peer"}
+            assert {r["id"] for r in database.list_terminals_by_session(name)} == {"t-peer"}
+        assert session_lock._session_locks == {}

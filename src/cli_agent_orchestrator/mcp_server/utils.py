@@ -13,7 +13,7 @@ import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.security.auth import get_local_bearer
-from cli_agent_orchestrator.utils.orchestration import _mcp_timeout
+from cli_agent_orchestrator.utils.orchestration import _is_local_api, _mcp_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -26,10 +26,27 @@ def _auth_headers() -> Dict[str, str]:
     mapping default-off so the no-auth posture is byte-for-byte unchanged. Reads
     are not scope-gated today, but the header is attached for consistency so the
     whole MCP->API hop behaves the same with auth on.
+
+    For requests to ``API_BASE_URL`` only. A call whose base URL came from a
+    ``target_host`` argument goes through ``_auth_headers_for(base_url)`` so the
+    token is never sent to another node.
     """
 
     token = get_local_bearer()
     return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def _auth_headers_for(base_url: str) -> Dict[str, str]:
+    """``_auth_headers()`` when ``base_url`` is this node's API; empty otherwise.
+
+    Same contract as ``utils.orchestration._auth_headers_for``, and the same
+    ``_is_local_api`` decides which URLs count as this node, so there is one
+    spelling of "local" for every egress site. ``CAO_AUTH_LOCAL_TOKEN`` is the
+    operator's loopback credential; a remote node has its own, and sending ours
+    there discloses it to whoever answers at that URL.
+    """
+
+    return _auth_headers() if _is_local_api(base_url) else {}
 
 
 def get_json(path: str, *, timeout: Optional[float] = None, **params: Any) -> Any:

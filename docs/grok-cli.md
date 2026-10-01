@@ -58,7 +58,11 @@ cao launch --agents developer --provider grok_cli
 Profile instructions use the normal Markdown format. The body is appended to
 Grok's native system prompt with `--rules`, together with the runtime CAO skill
 catalog. This preserves Grok's coding-agent behavior while applying the
-profile's role and protocols.
+profile's role and protocols. The text is written to `rules.md` inside the
+terminal's private `GROK_HOME` and the launch line references it with
+`"$(cat …)"`, so a long profile or skill catalog never lengthens the line
+typed into the pane (the tty cuts lines past 4096 bytes) and the permission
+flags always come first on that line.
 
 Set a default model in profile frontmatter:
 
@@ -90,8 +94,9 @@ The command has this shape:
 ```text
 env GROK_SUBAGENTS=0 GROK_WORKFLOWS=0 GROK_GOAL=0 \
   grok --no-alt-screen --no-subagents \
-  [--model MODEL] [--rules RULES] \
-  [--permission-mode dontAsk --allow RULE ... --deny RULE ...]
+  [--model MODEL] \
+  [--permission-mode dontAsk --allow RULE ... --deny RULE ... | --always-approve] \
+  [--rules "$(cat GROK_HOME/rules.md)"]
 ```
 
 - `--no-alt-screen` keeps the rendered conversation observable by CAO.
@@ -121,6 +126,47 @@ env GROK_SUBAGENTS=0 GROK_WORKFLOWS=0 GROK_GOAL=0 \
   picker to be the newest thing on screen: status is read from an append-only
   raw buffer, so a picker a later frame erased or a transcript that quotes one
   loses to the newer processing frame and the turn keeps running.
+- A stale raw-FIFO `Waiting for response…` marker can outlive the turn it came
+  from (#813). For a quiet terminal stuck on PROCESSING, CAO re-checks the
+  rendered pane and honors a ready verdict only after two matching reads, and
+  only when PROCESSING was re-established from provider evidence after the last
+  dispatch. A full re-delivery of a dropped paste is another delivery attempt
+  of the same logical turn rather than a new turn, so a genuinely successful
+  resend can still complete even though it is the second paste CAO sent.
+  Grok Build 1.0.41 can paint a right-edge scrollbar beside the completion
+  marker and across blank rows. Rendered recovery removes that scrollbar and
+  its cell padding only when the composer width and repeated blank rows agree;
+  response extraction uses display-cell widths to preserve Unicode text.
+  When a per-cell redraw omits the query marker, an exact echo of the dispatched
+  text followed by busy chrome can establish the current query. The completed
+  pane must still show that same distinct query; clock suffixes do not establish
+  a new query or turn.
+- Completion attribution requires an independently attributable current-turn
+  signal; a busy frame is not one. A completion is attributed to the current
+  turn after a dispatch reset only when its query differs from the predecessor's
+  query and matches attributable current processing evidence. Within the SAME
+  buffer generation, an advanced stream position can establish a later
+  completion. Grok can emit the busy frame
+  and the finished frame in one FIFO burst, so a busy frame cannot be required
+  either — but neither can it stand in for ownership. A dropped paste whose old
+  busy frame and old finished frame are replayed after the dispatch boundary
+  produces exactly the bytes of a genuine byte-identical repeat, and the rolling
+  stream coordinate space restarts at that reset, so neither the generation
+  change nor the spinner proves which turn drew them.
+- Completion fingerprints ignore whitespace so raw cursor-positioned output and
+  rendered panes, including indentation and wrapping changes, identify the same
+  completion. Whitespace alone cannot prove that another turn ran.
+- The safety trade-off for that rule is explicit: a repeated query separated by
+  a dispatch-boundary reset stays PROCESSING even if the answer or duration
+  changes. Raw streams retain transient busy chrome that rendered panes erase,
+  so a changed fingerprint cannot prove a new turn. Prefix-related query
+  fragments are also ambiguous: a shorter visible line may be a soft-wrapped
+  predecessor query. Such queries, and unmatched queries without attributable
+  processing evidence, stay PROCESSING. CAO prefers to fail closed
+  here and let its dropped-paste re-delivery and timeout paths decide, rather
+  than ever report a turn that may never have run. The first turn is exempt (it
+  has no predecessor) and is the #813 recovery case itself; a replay that brings
+  only the old screen back with no fresh generation still reads PROCESSING.
 
 ### Native workflow opt-in
 
@@ -155,9 +201,14 @@ CAO creates a private Grok home for every terminal and launches Grok with
 generated config atomically with mode `0600`. It does not run `grok mcp add`
 and does not modify the user's `~/.grok/config.toml`.
 
-The isolated config contains the profile's MCP servers. CAO injects the
-terminal-specific `CAO_TERMINAL_ID` into stdio MCP server environments so
-`cao-mcp-server` can route `assign`, `handoff`, and `send_message` correctly.
+The isolated config contains the profile's MCP servers, plus any declared by
+installed [agent plugins](agent-plugins.md) — merged at launch time and
+recomputed on every terminal creation rather than persisted, so the paths never
+go stale. Grok names the streamable-HTTP transport `http`, so CAO writes a
+`streamable-http` server as `type = "http"`; `sse` is preserved as `sse`. CAO
+injects the terminal-specific `CAO_TERMINAL_ID` into stdio MCP server
+environments so `cao-mcp-server` can route `assign`, `handoff`, and
+`send_message` correctly.
 Existing login state is reused without copying credential contents into CAO
 logs or the repository. Generated state is removed when the terminal is
 cleaned up.
@@ -172,6 +223,12 @@ user's privileges; selecting No quits Grok. If that screen is detected, CAO
 fails startup with an actionable error. Review and remove project-local
 configuration such as `.mcp.json` or `.grok/` before launching the CAO
 terminal, or use standalone Grok when you intentionally want to trust it.
+
+
+### Agent-plugin MCP working directory
+
+Its MCP config format has no working-directory key (checked against the vendor's own MCP documentation, 2026-09-16), so CAO carries an agent plugin's declared `cwd` by launching the server through `/bin/sh -c 'cd -- "$1" && shift && exec "$@"'`. `exec` replaces the shell, the environment passes through, and argument boundaries survive because each argument stays a separate argv element. On a host with no `/bin/sh` such a server is skipped with `mcp.cwd_unsupported` rather than started in the wrong directory.
+See [Agent Plugins](agent-plugins.md) for the full per-provider table.
 
 ## Tool Restrictions
 

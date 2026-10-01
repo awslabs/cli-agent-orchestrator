@@ -8,10 +8,9 @@ import time
 import uuid
 from typing import Callable, Optional, Union
 
-import requests
-
 from cli_agent_orchestrator.constants import API_BASE_URL, SESSION_PREFIX
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.utils import api_http
 
 logger = logging.getLogger(__name__)
 
@@ -229,7 +228,7 @@ def sync_backend_from_server() -> None:
     from cli_agent_orchestrator.backends.registry import set_backend
 
     try:
-        resp = requests.get(f"{API_BASE_URL}/health", timeout=2.0)
+        resp = api_http.get(f"{API_BASE_URL}/health", timeout=2.0)
         resp.raise_for_status()
         data = resp.json()
         backend_name = data.get("terminal_backend")
@@ -295,7 +294,7 @@ def poll_until_done(
             else:
                 # Per-request timeout so a stalled server/network can't block past
                 # the outer timeout budget (matches wait_until_terminal_status).
-                resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
+                resp = api_http.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
                 resp.raise_for_status()
                 status = resp.json().get("status")
             if status == TerminalStatus.COMPLETED.value:
@@ -328,7 +327,7 @@ def poll_until_done(
                 # UNKNOWN or any other non-ready status: not evidence of work.
                 # Reset the idle streak but do not flip observed_working.
                 consecutive_idle = 0
-        except requests.exceptions.RequestException as e:
+        except api_http.exceptions.RequestException as e:
             raise click.ClickException(f"Failed to poll terminal status: {e}")
         time.sleep(polling_interval)
 
@@ -365,7 +364,7 @@ def wait_until_terminal_status(
     while time.time() - start_time < timeout:
         poll_count += 1
         try:
-            response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
+            response = api_http.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
             if response.status_code == 200:
                 current_status = response.json().get("status")
                 last_seen = current_status
