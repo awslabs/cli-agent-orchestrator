@@ -160,6 +160,38 @@ class TestValidateFrontmatter:
 class TestValidateProfileText:
     """Tests for validate_profile_text."""
 
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            "kimiSwarm: true",
+            "kimiSwarm: false",
+            "kimiSwarm: null",
+            "kimiSwarmMaxConcurrency: 1",
+            "kimiSwarmMaxConcurrency: 10",
+            "kimiSwarmMaxConcurrency: null",
+            "kimiSwarm: true\nkimiSwarmMaxConcurrency: 4",
+        ],
+    )
+    def test_swarm_frontmatter_passes_public_validation(self, fields):
+        text = f"---\nname: bounded-kimi\nprovider: kimi_cli\n{fields}\n---\nReview the input."
+        assert validate_profile_text(text) == []
+
+    @pytest.mark.parametrize(
+        "fields, path",
+        [
+            ('kimiSwarm: "true"', "kimiSwarm"),
+            ("kimiSwarm: 1", "kimiSwarm"),
+            ("kimiSwarmMaxConcurrency: 0", "kimiSwarmMaxConcurrency"),
+            ("kimiSwarmMaxConcurrency: 11", "kimiSwarmMaxConcurrency"),
+            ("kimiSwarmMaxConcurrency: 1.5", "kimiSwarmMaxConcurrency"),
+            ("kimiSwarmMaxConcurrency: true", "kimiSwarmMaxConcurrency"),
+            ('kimiSwarmMaxConcurrency: "4"', "kimiSwarmMaxConcurrency"),
+        ],
+    )
+    def test_invalid_swarm_frontmatter_has_a_field_error(self, fields, path):
+        text = f"---\nname: bounded-kimi\nprovider: kimi_cli\n{fields}\n---\nReview the input."
+        assert any(f.severity == "error" and f.path == path for f in validate_profile_text(text))
+
     def test_parses_frontmatter_and_delegates(self) -> None:
         text = "---\nname: agent\ndescription: d\n---\n\nBody.\n"
 
