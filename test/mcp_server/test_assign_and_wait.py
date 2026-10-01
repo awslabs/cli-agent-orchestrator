@@ -201,3 +201,40 @@ def test_managed_async_worker_delivers_callback_normally_not_deferred():
         "[Managed worker callback assignment_id=assign-async-1]\nworker-result",
         defer_delivery=False,
     )
+
+
+def test_claim_managed_callback_scopes_lookup_by_sender_and_status():
+    """A long-lived supervisor inbox must not crowd a fresh callback out of an
+    oldest-100 page over all rows: the lookup queries per status with a
+    server-side sender filter, so pending work is always visible."""
+    filler = {"id": 1, "sender_id": "cccc3333", "status": "delivered", "message": "old"}
+    calls = []
+
+    def fake_get(url, params=None, timeout=None):
+        calls.append(dict(params or {}))
+        if params and params.get("status") == "pending":
+            assert params.get("sender_id") == "bbbb2222"
+            return _response(
+                [{"id": 900, "sender_id": "bbbb2222", "status": "pending",
+                  "message": "fresh callback"}]
+            )
+        return _response([filler] * 100)
+
+    with (
+        patch.object(server.requests, "get", side_effect=fake_get),
+        patch.object(
+            server.requests,
+            "post",
+            return_value=_response(
+                {"message_id": 900, "message": "fresh callback", "status": "pending"}
+            ),
+        ),
+    ):
+        result = server._claim_managed_callback("aaaa1111", "bbbb2222", timeout=2)
+
+    assert result["success"] is True
+    assert result["message_id"] == 900
+    assert result["callback"] == "fresh callback"
+    assert calls, "lookup never queried the inbox"
+    assert all(c.get("sender_id") == "bbbb2222" for c in calls)
+    assert any(c.get("status") == "pending" for c in calls)

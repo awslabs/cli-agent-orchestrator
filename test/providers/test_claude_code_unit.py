@@ -209,13 +209,13 @@ class TestClaudeCodeProviderInitialization:
         """A Claude profile can pin the exact conversation CAO must resume."""
         session_id = "bcff4abd-706a-4d78-97f2-7edc9361d4b7"
         mock_load.return_value = AgentProfile(
-            name="aiva",
-            description="AIVA",
+            name="team-lead",
+            description="Team lead",
             provider="claude_code",
             claudeSessionId=session_id,
         )
 
-        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "aiva")
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "team-lead")
         command = provider._build_claude_command()
         args = shlex.split(command.split(";", 1)[1].strip())
 
@@ -226,8 +226,8 @@ class TestClaudeCodeProviderInitialization:
         """An explicitly configured resume id cannot silently degrade to blank."""
         with pytest.raises(ValueError):
             AgentProfile(
-                name="aiva",
-                description="AIVA",
+                name="team-lead",
+                description="Team lead",
                 provider="claude_code",
                 claudeSessionId="",
             )

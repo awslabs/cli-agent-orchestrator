@@ -57,8 +57,8 @@ ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "true")
 
 # Persistent-agent routing is deliberately opt-in. A CAO MCP server is mounted
 # in many supervisors/workers; enabling semantic cross-session discovery for all
-# of them would widen their routing surface. The production AIVA profile enables
-# this explicitly, while department heads/workers leave it disabled.
+# of them would widen their routing surface. A production top-level profile can
+# enable this explicitly, while department heads/workers leave it disabled.
 ENABLE_PERSISTENT_AGENT_ROUTING = (
     os.getenv("CAO_ENABLE_PERSISTENT_AGENT_ROUTING", "false").lower() == "true"
 )
@@ -68,8 +68,8 @@ ENABLE_PERSISTENT_AGENT_ROUTING = (
 REQUIRE_SEMANTIC_PERSISTENT_ROUTING = (
     os.getenv("CAO_REQUIRE_SEMANTIC_PERSISTENT_ROUTING", "false").lower() == "true"
 )
-# Canonical AIVA can require synchronous semantic requests for persistent
-# department work. When enabled, fire-and-forget semantic sends are rejected so
+# A top-level orchestrator can require synchronous semantic requests for
+# persistent department work. When enabled, fire-and-forget semantic sends are rejected so
 # the orchestrator cannot report completion before the persistent head's reviewed
 # turn has actually finished.
 REQUIRE_PERSISTENT_AGENT_REQUEST = (
@@ -1500,16 +1500,36 @@ def _claim_managed_callback(supervisor_id: str, worker_id: str, timeout: int) ->
     """Wait for and claim one durable callback row from a specific worker."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        response = requests.get(
-            f"{API_BASE_URL}/terminals/{supervisor_id}/inbox/messages",
-            params={"limit": 100},
-            timeout=_mcp_timeout(),
-        )
-        response.raise_for_status()
-        rows = response.json()
+        # Query per status with a server-side sender filter. A single
+        # oldest-100 window over ALL rows lets a long-lived supervisor's
+        # delivered history crowd a fresh callback out of the page entirely;
+        # filtering server-side keeps every window bounded to the rows that
+        # matter for this worker.
+        rows = []
+        for status_value in ("pending", "delivered", "failed"):
+            response = requests.get(
+                f"{API_BASE_URL}/terminals/{supervisor_id}/inbox/messages",
+                params={"limit": 100, "status": status_value, "sender_id": worker_id},
+                timeout=_mcp_timeout(),
+            )
+            response.raise_for_status()
+            rows.extend(response.json())
+            if any(
+                isinstance(row, dict)
+                and row.get("sender_id") == worker_id
+                and row.get("status") == "pending"
+                for row in rows
+            ):
+                break  # a claimable pending row exists; later statuses are moot
         matches = [
             row for row in rows if isinstance(row, dict) and row.get("sender_id") == worker_id
         ]
+        # Pending rows come first in `rows`; within a status the list is
+        # oldest-first, so pending drains FIFO. Non-pending rows only matter
+        # when no pending row exists (failed reporting / delivery race).
+        pending_matches = [row for row in matches if row.get("status") == "pending"]
+        ordered = pending_matches + [row for row in matches if row.get("status") != "pending"]
+        matches = ordered
         if matches:
             row = matches[-1]
             status_value = row.get("status")

@@ -5640,6 +5640,9 @@ async def get_inbox_messages_endpoint(
     status_param: Optional[str] = Query(
         default=None, alias="status", description="Filter by message status"
     ),
+    sender_id: Optional[str] = Query(
+        default=None, description="Filter by sender terminal ID"
+    ),
 ) -> List[Dict]:
     """Get inbox messages for a terminal.
 
@@ -5664,7 +5667,9 @@ async def get_inbox_messages_endpoint(
                 )
 
         # Get messages using existing database function
-        messages = get_inbox_messages(terminal_id, limit=limit, status=status_filter)
+        messages = get_inbox_messages(
+            terminal_id, limit=limit, status=status_filter, sender_id=sender_id
+        )
 
         # Convert to response format
         result = []

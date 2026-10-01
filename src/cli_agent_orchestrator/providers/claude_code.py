@@ -389,7 +389,7 @@ class ClaudeCodeProvider(BaseProvider):
         # Resume a specific Claude Code conversation when the profile pins one.
         # This is intentionally profile-owned rather than inferred from CAO's
         # tmux/session name: a CAO runtime session and a Claude conversation are
-        # different identities, and supervisors such as AIVA need the latter to
+        # different identities, and long-lived supervisors need the latter to
         # survive CAO restarts unchanged. Claude Code accepts --resume alongside
         # the prompt/MCP flags CAO adds below.
         claude_session_id = getattr(profile, "claudeSessionId", None) if profile else None

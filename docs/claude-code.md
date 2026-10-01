@@ -125,10 +125,10 @@ A Claude Code profile can pin an existing Claude conversation with `claudeSessio
 
 ```markdown
 ---
-name: aiva
-description: Long-lived executive assistant
+name: team-lead
+description: Long-lived team orchestrator
 provider: claude_code
-claudeSessionId: bcff4abd-706a-4d78-97f2-7edc9361d4b7
+claudeSessionId: 01234567-89ab-4cde-8f01-23456789abcd
 ---
 ```
 

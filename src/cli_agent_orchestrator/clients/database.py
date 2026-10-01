@@ -1428,7 +1428,10 @@ def find_inbox_message_by_marker(receiver_id: str, marker: str) -> Optional[Inbo
 
 
 def get_inbox_messages(
-    receiver_id: str, limit: int = 10, status: Optional[MessageStatus] = None
+    receiver_id: str,
+    limit: int = 10,
+    status: Optional[MessageStatus] = None,
+    sender_id: Optional[str] = None,
 ) -> List[InboxMessage]:
     """Get inbox messages with optional status filter ordered by created_at ASC (oldest first).
 
@@ -1445,6 +1448,9 @@ def get_inbox_messages(
 
         if status is not None:
             query = query.filter(InboxModel.status == status.value)
+
+        if sender_id is not None:
+            query = query.filter(InboxModel.sender_id == sender_id)
 
         messages = query.order_by(InboxModel.created_at.asc()).limit(limit).all()
 
