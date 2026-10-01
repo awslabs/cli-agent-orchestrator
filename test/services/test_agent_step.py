@@ -1151,6 +1151,43 @@ class TestInBandProviderError:
         "openai.gpt-5.6-terra isn't supported."
     )
 
+    @pytest.mark.parametrize("provider", ("codex", "claude_code"))
+    @pytest.mark.parametrize(
+        "output",
+        (
+            "429",
+            "Rate limiting protects APIs from burst traffic.",
+            "Unknown model types use the fallback serializer.",
+            "Rate limit exceeded is a common HTTP 429 explanation.",
+            "Unknown model 'placeholder' is a useful teaching example.",
+            "Authentication failed is an expected unit-test outcome.",
+        ),
+    )
+    def test_ordinary_short_answers_complete(self, provider, output):
+        """Common words and status-shaped values are answers without provider-owned chrome."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output=output
+        )
+        with create, send, delete, get_output, exit_cli, wait, status:
+            result = asyncio.run(run_agent_step(provider, "dev", "x"))
+
+        assert result.status == TerminalStatus.COMPLETED
+        assert result.last_message == output
+
+    @pytest.mark.parametrize("provider", ("codex", "claude_code"))
+    def test_long_answer_is_not_classified_below_the_cap(self, provider):
+        """A long answer that begins with error vocabulary remains a legitimate answer."""
+        output = "429: rate limit exceeded\n\n" + ("context " * 80)
+        assert len(output) > 512
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output=output
+        )
+        with create, send, delete, get_output, exit_cli, wait, status:
+            result = asyncio.run(run_agent_step(provider, "dev", "x"))
+
+        assert result.status == TerminalStatus.COMPLETED
+        assert result.last_message == output
+
     def test_provider_error_raises_and_leaves_the_terminal_alive(self):
         """The step FAILS, the raw text stays retrievable, and — mirroring the
         ``kind="error"`` crash contract — the pane is NOT reclaimed, so an operator

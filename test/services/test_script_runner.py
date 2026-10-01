@@ -1086,6 +1086,38 @@ def test_completion_creates_step_state_when_missing(_patched_journal):
 
     assert "s1" in record.step_states
     assert record.step_states["s1"].state == StepState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_script_result_preserves_provider_error_kind(_patched_journal):
+    """The final script ``WorkflowRunResult`` carries the settled structured kind."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    run_id = "run-provider-result"
+    workflow_journal.insert_run(
+        run_id=run_id,
+        workflow_name="wf",
+        spec_snapshot="{}",
+        inputs_json="{}",
+        state=RunState.RUNNING.value,
+        started_at="2026-07-08T00:00:00Z",
+        tier="script",
+    )
+    record = _make_record(run_id, process=None, generation="1")
+    record.step_states["s1"] = StepRunState(step_id="s1", state=StepState.RUNNING)
+    workflow_service.run_registry[run_id] = record
+
+    settle = record_step_completion(_kw(run_id, "s1"))
+    assert settle is not None
+    settle("term-provider", "provider error (api_error)", None, None, "provider_error")
+
+    result = await script_runner._finalize(
+        record, state=RunState.FAILED, kind="provider_error", error="provider error"
+    )
+
+    assert len(result.steps) == 1
+    assert result.steps[0].state == StepState.FAILED
+    assert result.steps[0].error_kind == "provider_error"
     assert record.step_states["s1"].attempts == 1
 
 

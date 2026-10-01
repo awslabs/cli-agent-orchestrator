@@ -362,6 +362,15 @@ class TestRunStepEndpoint:
             started_at="2026-07-15T00:00:00Z",
             finished_at=None,
         )
+        workflow_journal.insert_run(
+            run_id=run_id,
+            workflow_name="wf",
+            spec_snapshot="{}",
+            inputs_json="{}",
+            state=RunState.RUNNING.value,
+            started_at="2026-07-15T00:00:00Z",
+            tier="script",
+        )
         monkeypatch.setitem(workflow_service.run_registry, run_id, record)
         monkeypatch.setattr(workflow_journal, "append_step", lambda *args, **kwargs: None)
         monkeypatch.setattr(workflow_journal, "update_step", lambda *args, **kwargs: None)
@@ -388,6 +397,15 @@ class TestRunStepEndpoint:
         row = workflow_journal.get_step(run_id, "step-1")
         assert row is not None
         assert row.error_kind == "provider_error"
+
+        inspection = client.get(f"/workflows/runs/{run_id}")
+        assert inspection.status_code == 200
+        assert inspection.json()["steps"][0]["error_kind"] == "provider_error"
+
+        workflow_service.run_registry.pop(run_id)
+        cold_inspection = client.get(f"/workflows/runs/{run_id}")
+        assert cold_inspection.status_code == 200, cold_inspection.text
+        assert cold_inspection.json()["steps"][0]["error_kind"] == "provider_error"
 
     def test_missing_required_field_is_422(self, client):
         # Pydantic request-model validation rejects a missing prompt.

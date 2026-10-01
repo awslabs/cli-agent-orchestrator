@@ -985,6 +985,7 @@ def _build_steps(record: ScriptRunRecord) -> List[StepResult]:
                 attempts=st.attempts,
                 output=st.output.output if st.output is not None else None,
                 error=st.error,
+                error_kind=st.error_kind,
             )
         )
     return steps
