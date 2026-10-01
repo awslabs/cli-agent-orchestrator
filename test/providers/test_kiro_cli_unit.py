@@ -2178,10 +2178,7 @@ class TestKiroCli225Tui:
             "• There are two public endpoints.",
             "▸ Credits: turn 0.12 • session 0.20 | Time: 2s",
         ]
-        assert (
-            provider._extract_tui_225_message(lines, 4)
-            == "There are two public endpoints."
-        )
+        assert provider._extract_tui_225_message(lines, 4) == "There are two public endpoints."
 
     def test_225_extractor_returns_none_without_a_bullet_reply(self):
         """A 2.25 turn with no assistant bullet must not reuse chrome as the answer."""
@@ -2192,6 +2189,69 @@ class TestKiroCli225Tui:
             "▸ Credits: turn 0.12 • session 0.20 | Time: 2s",
         ]
         assert provider._extract_tui_225_message(lines, 2) is None
+
+    def test_225_ignores_indented_single_line_prompt_echo(self):
+        """An indented echoed bullet must not be prepended when no blank line follows."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        output = "\n".join(
+            [
+                "▸ Credits: turn 0.08 • session 0.08 | Time: 1s",
+                "  • Map the public endpoints.",
+                "• There are two public endpoints.",
+                "▸ Credits: turn 0.12 • session 0.20 | Time: 2s",
+            ]
+        )
+
+        assert (
+            provider.extract_last_message_from_script(output) == "There are two public endpoints."
+        )
+
+    def test_225_ignores_multiline_prompt_echo_bullets(self):
+        """Every indented bullet in a multiline prompt echo is prompt, not reply."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        output = "\n".join(
+            [
+                "▸ Credits: turn 0.08 • session 0.08 | Time: 1s",
+                "  • Map the public endpoints.",
+                "  • Include their HTTP methods.",
+                "• There are two public endpoints.",
+                "▸ Credits: turn 0.12 • session 0.20 | Time: 2s",
+            ]
+        )
+
+        assert (
+            provider.extract_last_message_from_script(output) == "There are two public endpoints."
+        )
+
+    def test_225_colored_tool_bullet_is_not_part_of_final_reply(self):
+        """The blue assistant bullet is the boundary even if a green tool row touches it."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        output = (
+            "▸ Credits: turn 0.08 • session 0.08 | Time: 1s\n"
+            "\x1b[38;2;0;215;135m•\x1b[39m Shell echo SLEEP-MARK\n"
+            "\x1b[38;2;95;135;215m•\x1b[39m done\n"
+            "▸ Credits: turn 0.12 • session 0.20 | Time: 2s\n"
+        )
+
+        message = provider.extract_last_message_from_script(output)
+
+        assert message == "done"
+        assert "SLEEP-MARK" not in message
+
+    def test_225_colored_tool_block_without_assistant_reply_is_not_reply(self):
+        """A green tool row must not be recycled as the assistant reply."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        output = (
+            "▸ Credits: turn 0.08 • session 0.08 | Time: 1s\n"
+            "────────────────────────────────────────────────────────────────────\n"
+            "\x1b[38;2;0;215;135m•\x1b[39m Shell echo SLEEP-MARK\n"
+            "    ╰ output:\n"
+            "        SLEEP-MARK\n"
+            "▸ Credits: turn 0.12 • session 0.20 | Time: 2s\n"
+        )
+
+        with pytest.raises(ValueError):
+            provider.extract_last_message_from_script(output)
 
     @pytest.mark.parametrize(
         "line",

@@ -105,7 +105,12 @@ TUI_CREDITS_PATTERN = r"▸\s*Credits:\s*(?:[A-Za-z]+\s+)?[\d.]+"
 # reply is not reliably separated from the echoed prompt by a blank line, so
 # extraction uses the credits anchors and the bullet line as the reply start.
 TUI_225_CREDITS_PATTERN = r"▸\s*Credits:\s*turn\s+[\d.]+"
-TUI_225_REPLY_PATTERN = r"^\s*•\s+\S"
+# The assistant's final reply bullet is truecolor blue; tool rows use green.
+# Keep the raw color marker for extraction, then fall back to a column-zero
+# bullet for uncolored captures (manual fixtures and older terminal records).
+TUI_225_ASSISTANT_BULLET_PATTERN = r"\x1b\[38;2;95;135;215m•"
+TUI_225_COLORED_BULLET_PATTERN = r"\x1b\[38;2;\d+;\d+;\d+m•"
+TUI_225_REPLY_PATTERN = r"^•\s+\S"
 
 # TUI processing indicator: ghost text shown while agent is working.
 # kiro-cli 2.11+ replaced "Kiro is working" with "Thinking..." (with an
@@ -748,7 +753,7 @@ class KiroCliProvider(BaseProvider):
 
         if not green_arrows:
             # Fallback: try TUI extraction (separator + Credits pattern)
-            return self._extract_tui_message(clean_output)
+            return self._extract_tui_message(clean_output, script_output)
 
         if not idle_prompts and not new_tui_idles:
             raise ValueError("Incomplete Kiro CLI response - no final prompt detected")
@@ -784,18 +789,28 @@ class KiroCliProvider(BaseProvider):
 
         return final_answer.strip()
 
-    def _extract_tui_225_message(self, lines: list[str], credits_idx: int) -> str | None:
+    def _extract_tui_225_message(
+        self, lines: list[str], credits_idx: int, raw_output: str | None = None
+    ) -> str | None:
         """Extract a 2.25 TUI reply using turn anchors instead of paragraphs.
 
         The pre-2.25 layout reliably places the echoed prompt in the first
         paragraph inside the response box.  2.25 moved the assistant text to a
         bullet-prefixed line and can render a one-word reply immediately below
         the echoed prompt, so paragraph splitting cannot distinguish the two.
-        Keep the previous Credits line as the start anchor and the current
-        Credits line as the end anchor. The prompt echo and tool rows can also
-        be bullet-prefixed, so use the final contiguous bullet block before the
-        Credits line as the assistant reply boundary.
+        When the capture retains ANSI colors, the blue assistant bullet is the
+        exact boundary; green tool rows are never candidates. Uncolored live
+        captures fall back to the final column-zero bullet block.
         """
+        if raw_output is not None:
+            raw_reply = self._extract_tui_225_raw_reply(raw_output)
+            if raw_reply is not None:
+                return raw_reply
+            if re.search(TUI_225_COLORED_BULLET_PATTERN, raw_output):
+                # The capture has colored bullet rows, so a missing blue assistant
+                # bullet means this turn ended in tool chrome, not assistant text.
+                return None
+
         prev_credits_idx = -1
         for i in range(credits_idx - 1, -1, -1):
             if re.search(TUI_CREDITS_PATTERN, lines[i]):
@@ -816,13 +831,41 @@ class KiroCliProvider(BaseProvider):
             return None
 
         response_lines = lines[reply_start:credits_idx]
-        response_lines[0] = re.sub(r"^\s*•\s+", "", response_lines[0], count=1)
+        response_lines[0] = re.sub(r"^•\s+", "", response_lines[0], count=1)
         final_answer = "\n".join(response_lines).strip()
         final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, "", final_answer)
         final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
         return final_answer.strip()
 
-    def _extract_tui_message(self, clean_output: str) -> str:
+    def _extract_tui_225_raw_reply(self, raw_output: str) -> str | None:
+        """Return the last blue assistant bullet block in the final 2.25 turn."""
+        credits: list[tuple[int, int]] = []
+        offset = 0
+        for line in raw_output.splitlines(keepends=True):
+            if re.search(TUI_225_CREDITS_PATTERN, strip_terminal_escapes(line)):
+                credits.append((offset, offset + len(line.rstrip("\r\n"))))
+            offset += len(line)
+        if not credits:
+            return None
+
+        turn_start = credits[-2][1] if len(credits) > 1 else 0
+        turn_end = credits[-1][0]
+        assistant_bullets = [
+            match
+            for match in re.finditer(TUI_225_ASSISTANT_BULLET_PATTERN, raw_output)
+            if turn_start <= match.start() < turn_end
+        ]
+        if not assistant_bullets:
+            return None
+
+        response = raw_output[assistant_bullets[-1].start() : turn_end]
+        response = strip_terminal_escapes(response)
+        response = re.sub(r"^\s*•\s+", "", response, count=1)
+        response = re.sub(ESCAPE_SEQUENCE_PATTERN, "", response)
+        response = re.sub(CONTROL_CHAR_PATTERN, "", response)
+        return response.strip()
+
+    def _extract_tui_message(self, clean_output: str, raw_output: str | None = None) -> str:
         """Extract agent response from pure TUI output (no green arrows).
 
         TUI format:
@@ -854,9 +897,11 @@ class KiroCliProvider(BaseProvider):
                 break
 
         if credits_idx is not None and re.search(TUI_225_CREDITS_PATTERN, lines[credits_idx]):
-            response = self._extract_tui_225_message(lines, credits_idx)
+            response = self._extract_tui_225_message(lines, credits_idx, raw_output)
             if response is not None:
                 return response
+            if raw_output is not None and re.search(TUI_225_COLORED_BULLET_PATTERN, raw_output):
+                raise ValueError("No Kiro CLI assistant reply found in colored 2.25 TUI output")
 
         if credits_idx is None:
             # Kiro CLI 2.3.0+ may not emit a Credits line. Fall back to
