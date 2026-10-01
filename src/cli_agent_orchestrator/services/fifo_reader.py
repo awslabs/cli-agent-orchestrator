@@ -3,6 +3,7 @@
 Publisher: terminal.{id}.output
 """
 
+import codecs
 import errno
 import logging
 import os
@@ -226,7 +227,7 @@ class FifoManager:
             self._last_data_at[terminal_id] = now
             self._registered_at[terminal_id] = now
             self._ever_delivered[terminal_id] = False
-            if enroll:
+            if pane_probe is not None and rearm is not None:
                 self._pane_probe[terminal_id] = pane_probe
                 self._rearm[terminal_id] = rearm
             thread.start()
@@ -371,6 +372,7 @@ class FifoManager:
         read_fd = -1
         keepalive_fd = -1
         pending = bytearray()
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         # Time at which the currently-accumulating batch started.
         batch_start = 0.0
         try:
@@ -428,7 +430,9 @@ class FifoManager:
                     or len(pending) >= _COALESCE_MAX_BYTES
                     or not readable
                 ):
-                    bus.publish(topic, {"data": pending.decode("utf-8", errors="replace")})
+                    text = decoder.decode(pending)
+                    if text:
+                        bus.publish(topic, {"data": text})
                     pending.clear()
         except Exception as e:
             if not stop_flag.is_set():
@@ -436,11 +440,12 @@ class FifoManager:
         finally:
             # Flush any unpublished bytes so the last frame of a torn-down
             # terminal isn't lost — status/log consumers may need it.
-            if pending:
-                try:
-                    bus.publish(topic, {"data": pending.decode("utf-8", errors="replace")})
-                except Exception:
-                    pass
+            try:
+                text = decoder.decode(pending, final=True)
+                if text:
+                    bus.publish(topic, {"data": text})
+            except Exception:
+                pass
             for fd in (read_fd, keepalive_fd):
                 if fd >= 0:
                     try:

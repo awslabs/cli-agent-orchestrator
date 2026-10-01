@@ -413,6 +413,44 @@ class TestReaderLoopCoalescing:
         combined = "".join(p["data"] for p in published)
         assert "lonely-chunk" in combined
 
+    @pytest.mark.parametrize("tail", [b"\x97\x8f done\n", b""])
+    def test_utf8_split_across_batches_and_stop_flush(self, tmp_path, monkeypatch, tail):
+        fifo_path = tmp_path / "term-utf8.fifo"
+        os.mkfifo(fifo_path)
+        monkeypatch.setattr(fr, "_COALESCE_MAX_BYTES", 1)
+        monkeypatch.setattr(fr, "_POLL_INTERVAL", 0.01)
+        received = []
+        first = threading.Event()
+        second = threading.Event()
+
+        def publish(topic, payload):
+            received.append(payload["data"])
+            first.set()
+            if "done" in payload["data"]:
+                second.set()
+
+        manager = FifoManager()
+        stop_flag = threading.Event()
+        reader = threading.Thread(
+            target=manager._reader_loop, args=("term-utf8", fifo_path, stop_flag), daemon=True
+        )
+        with patch.object(fr.bus, "publish", side_effect=publish):
+            reader.start()
+            writer = os.open(fifo_path, os.O_WRONLY)
+            try:
+                os.write(writer, b"final \xe2")
+                assert first.wait(2)
+                assert received == ["final "]
+                if tail:
+                    os.write(writer, tail)
+                    assert second.wait(2)
+            finally:
+                os.close(writer)
+                stop_flag.set()
+                reader.join(2)
+        assert not reader.is_alive()
+        assert "".join(received) == (b"final \xe2" + tail).decode("utf-8", errors="replace")
+
 
 class TestPipeLivenessWatchdog:
     """Issue #388: tmux's pipe-pane forwarder can silently stop delivering bytes
