@@ -190,17 +190,21 @@ def _allowed_download_hosts() -> frozenset:
     return _DEFAULT_ALLOWED_HOSTS
 
 
-def _download_agent(source: str) -> str:
-    """Download an agent profile from an https:// URL into the local store.
+def _download_agent(source: str) -> Tuple[str, str]:
+    """Download an agent profile from an https:// URL; return ``(stem, text)``.
+
+    Nothing is written here. ``install_agent`` stores the text itself, after
+    the ownership guard has accepted the incoming profile, so a refused import
+    cannot replace the previous profile of the same stem with the rejected input
+    (round-6 review of #493).
 
     File-path handling deliberately does NOT live in this module: only the CLI
     has legitimate filesystem trust, and keeping Path(user_input) out of the
     HTTP-reachable layer closes an entire class of py/path-injection alerts
     (CodeQL #49/#61 kept reopening while this lived here). The CLI entry point
-    resolves the local file itself and stores it via profile_store, then calls
-    install_agent() with the bare stem, which flows through the "name" branch.
-    This function only ever hands profile_store a stem it has already validated,
-    never a caller-supplied path.
+    reads the local file itself and calls install_agent() with the bare stem
+    and the file's text, which flows through the same import path as a URL.
+    The stem this returns has been validated, never a caller-supplied path.
     """
     # SSRF hardening: narrow what a caller-provided URL can reach before any
     # network I/O happens. https-only rules out http://169.254.169.254/...;
@@ -242,12 +246,8 @@ def _download_agent(source: str) -> str:
         raise ValueError("Redirects are not allowed for profile downloads.")
     response.raise_for_status()
 
-    # The stem was validated against _PROFILE_NAME_RE above; profile_store owns
-    # the store join and the atomic write. overwrite=True preserves the
-    # pre-existing re-download behaviour of replacing the stored copy.
-    stem = filename[: -len(".md")]
-    write_profile(stem, response.text, overwrite=True)
-    return stem
+    # The stem was validated against _PROFILE_NAME_RE above.
+    return filename[: -len(".md")], response.text
 
 
 def parse_env_assignment(env_assignment: str) -> Tuple[str, str]:
@@ -1430,6 +1430,8 @@ def install_agent(
     provider: Optional[str] = None,
     env_vars: Optional[Dict[str, str]] = None,
     preserve_recorded_provider: bool = False,
+    *,
+    profile_content: Optional[str] = None,
 ) -> InstallResult:
     """Install an agent profile for the requested provider.
 
@@ -1453,11 +1455,17 @@ def install_agent(
 
     ``source`` must be either an https:// URL on the allowlist or a bare
     profile name matching ``_PROFILE_NAME_RE``. Local ``.md`` file paths
-    are deliberately NOT accepted here — the CLI copies user files into
-    the local store itself and then calls this function with the resulting
-    bare stem. This split is what lets the HTTP/MCP surface share this
-    function safely: every caller reaches the same two sanitised shapes,
+    are deliberately NOT accepted here — the CLI reads user files itself and
+    then calls this function with the file's stem as ``source`` and its text
+    as ``profile_content``. This split is what lets the HTTP/MCP surface share
+    this function safely: every caller reaches the same two sanitised shapes,
     and no call site constructs ``Path(user_input)`` through this module.
+
+    ``profile_content`` (keyword-only) marks an import: the text is what the
+    install reads, and it is written to the local store as ``<source>.md``
+    only after the ownership guard has accepted it. A URL source is an import
+    in the same sense. Either way a refused import leaves the previously
+    stored profile of that stem byte-identical (round-6 review of #493).
     """
     try:
         valid_providers = [provider_type.value for provider_type in ProviderType]
@@ -1473,8 +1481,11 @@ def install_agent(
                 ),
             )
 
-        if source.startswith(("http://", "https://")):
-            agent_name = _download_agent(source)
+        # ``incoming`` is the text an import brings with it (URL body or the
+        # CLI's local file); it reaches the store only after the guard below.
+        incoming: Optional[str] = None
+        if profile_content is None and source.startswith(("http://", "https://")):
+            agent_name, incoming = _download_agent(source)
             source_kind: Literal["url", "name"] = "url"
         else:
             # `source` is treated as a bare profile name and feeds
@@ -1492,12 +1503,13 @@ def install_agent(
                 )
             agent_name = source
             source_kind = "name"
+            incoming = profile_content
 
         if env_vars:
             for key, value in env_vars.items():
                 set_env_var(key, value)
 
-        raw_content = _read_agent_profile_source(agent_name)
+        raw_content = incoming if incoming is not None else _read_agent_profile_source(agent_name)
         resolved_content = resolve_env_vars(raw_content)
         profile = parse_agent_profile_text(resolved_content, agent_name)
 
@@ -1582,18 +1594,28 @@ def install_agent(
         # than a change to the rewrite itself: the rewrite is correct whenever an
         # operator asked for it.
         # The ownership guard runs BEFORE any write this install performs, for
-        # every provider. The local-store rewrite just below is the first of
-        # them: it re-serialises this profile's own store copy to record the
-        # provider, and a refused install must leave even that byte-identical
-        # (round-5 review of #493). The shared context copy follows -- the
-        # artifact every provider's agent reads -- and, for OpenCode, the agent
-        # file and config section it also shares.
+        # every provider. The local-store write just below is the first of
+        # them: for an import it is the store copy itself, and for every
+        # install it is the re-serialisation that records the provider. A
+        # refused install must leave the stored profile byte-identical -- an
+        # import used to be stored before this point, so a refused one had
+        # already replaced the previous profile of that stem with the rejected
+        # input (rounds 5 and 6 of #493). The shared context copy follows --
+        # the artifact every provider's agent reads -- and, for OpenCode, the
+        # agent file and config section it also shares.
         _guard_installed_copy_ownership(agent_name, profile.name, provider)
 
-        if profile.provider != provider and not preserve_recorded_provider:
-            stored = frontmatter.loads(raw_content)
-            stored["provider"] = provider
-            write_profile(agent_name, frontmatter.dumps(stored), overwrite=True)
+        record_provider = profile.provider != provider and not preserve_recorded_provider
+        if incoming is not None or record_provider:
+            stored_text = raw_content
+            if record_provider:
+                stored = frontmatter.loads(raw_content)
+                stored["provider"] = provider
+                stored_text = frontmatter.dumps(stored)
+            # overwrite=True keeps the pre-existing re-import behaviour of
+            # replacing the stored copy; the guard above is what decides whether
+            # this install may proceed at all.
+            write_profile(agent_name, stored_text, overwrite=True)
 
         unresolved_vars = sorted(set(re.findall(r"\$\{(\w+)\}", resolved_content)))
 

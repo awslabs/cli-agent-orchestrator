@@ -15,10 +15,13 @@ import os
 from pathlib import Path
 from test.cli.commands.install_helpers import _install, _install_for, _ok, _refused, _write_profile
 from typing import Any, Dict
+from unittest.mock import MagicMock, patch
 
+import frontmatter
 import pytest
 from click.testing import CliRunner
 
+from cli_agent_orchestrator.cli.commands.install import install
 from cli_agent_orchestrator.services import install_service, settings_service
 from cli_agent_orchestrator.services.install_service import (
     _CONTEXT_SOURCE_STEM_KEY,
@@ -908,3 +911,127 @@ class TestRecreatedContextRecordDoesNotAdoptOrphans:
         _write_profile(store / "gamma.md", name="other", body="GAMMA")
         _ok(_install_for(runner, "gamma", "claude_code"))
         _ok(_install(runner, "gamma"))
+
+
+class TestRefusedImportPreservesTheStoredProfile:
+    """Round 6 (haofeif P2): the guard ran before the ``provider:`` rewrite but
+    AFTER the import itself. A local-file or URL import wrote the incoming text
+    into ``agent-store/<stem>.md`` first, so a refused import had already
+    replaced the previous profile of that stem with the rejected input. The
+    store must be written only once the incoming profile has passed the guard."""
+
+    IMPORTED = "---\nname: shared\ndescription: Updated beta\n---\nUPDATED-BETA\n"
+
+    def _seed(self, runner: CliRunner, workspace: Dict[str, Any], provider: str) -> bytes:
+        store = workspace["local_store"]
+        _write_profile(store / "alpha.md", name="shared", body="ALPHA-BODY")
+        _ok(_install_for(runner, "alpha", provider))
+        _write_profile(store / "beta.md", name="beta-original", body="BETA-ORIGINAL")
+        _ok(_install_for(runner, "beta", provider))
+        return (store / "beta.md").read_bytes()
+
+    @pytest.mark.parametrize("provider", ["kiro_cli", "opencode_cli"])
+    def test_local_file_import_that_is_refused_leaves_the_store_untouched(
+        self, runner: CliRunner, workspace: Dict[str, Any], tmp_path: Path, provider: str
+    ) -> None:
+        before = self._seed(runner, workspace, provider)
+        incoming = tmp_path / "incoming" / "beta.md"
+        incoming.parent.mkdir()
+        incoming.write_text(self.IMPORTED, encoding="utf-8")
+
+        r = runner.invoke(install, [str(incoming), "--provider", provider])
+
+        _refused(r)
+        assert "Copied agent from file" not in r.output
+        assert (workspace["local_store"] / "beta.md").read_bytes() == before
+        assert "ALPHA-BODY" in (workspace["context_dir"] / "shared.md").read_text()
+
+    @pytest.mark.parametrize("provider", ["kiro_cli", "opencode_cli"])
+    def test_url_import_that_is_refused_leaves_the_store_untouched(
+        self, runner: CliRunner, workspace: Dict[str, Any], provider: str
+    ) -> None:
+        before = self._seed(runner, workspace, provider)
+        response = MagicMock()
+        response.text = self.IMPORTED
+        response.is_redirect = False
+        response.raise_for_status.return_value = None
+
+        with patch(
+            "cli_agent_orchestrator.services.install_service.requests.get",
+            return_value=response,
+        ):
+            r = runner.invoke(
+                install,
+                ["https://raw.githubusercontent.com/org/repo/main/beta.md", "--provider", provider],
+            )
+
+        _refused(r)
+        assert "Downloaded agent" not in r.output
+        assert (workspace["local_store"] / "beta.md").read_bytes() == before
+        assert "ALPHA-BODY" in (workspace["context_dir"] / "shared.md").read_text()
+
+    def test_accepted_imports_still_replace_the_stored_profile(
+        self, runner: CliRunner, workspace: Dict[str, Any], tmp_path: Path
+    ) -> None:
+        """Control: an import that passes the guard is stored, with the provider
+        recorded, exactly as before."""
+        store = workspace["local_store"]
+        _write_profile(store / "beta.md", name="beta-original", body="BETA-ORIGINAL")
+        _ok(_install(runner, "beta"))
+
+        incoming = tmp_path / "incoming" / "beta.md"
+        incoming.parent.mkdir()
+        _write_profile(incoming, name="beta-original", body="BETA-V2")
+        r = runner.invoke(install, [str(incoming), "--provider", "opencode_cli"])
+        _ok(r)
+        assert "Copied agent from file to local store" in r.output
+        stored = frontmatter.loads((store / "beta.md").read_text(encoding="utf-8"))
+        assert stored.content.strip() == "BETA-V2"
+        assert stored.metadata["provider"] == "opencode_cli"
+        assert "BETA-V2" in (workspace["agents_dir"] / "beta-original.md").read_text()
+
+        response = MagicMock()
+        response.text = "---\nname: beta-original\ndescription: D\n---\nBETA-V3\n"
+        response.is_redirect = False
+        response.raise_for_status.return_value = None
+        with patch(
+            "cli_agent_orchestrator.services.install_service.requests.get",
+            return_value=response,
+        ):
+            r = runner.invoke(
+                install,
+                [
+                    "https://raw.githubusercontent.com/org/repo/main/beta.md",
+                    "--provider",
+                    "kiro_cli",
+                ],
+            )
+        _ok(r)
+        assert "Downloaded agent from URL to local store" in r.output
+        stored = frontmatter.loads((store / "beta.md").read_text(encoding="utf-8"))
+        assert stored.content.strip() == "BETA-V3"
+        assert stored.metadata["provider"] == "kiro_cli"
+
+    def test_import_whose_env_placeholder_name_resolves_to_a_taken_name_is_refused(
+        self, runner: CliRunner, workspace: Dict[str, Any], tmp_path: Path, monkeypatch
+    ) -> None:
+        """The preflight must see the incoming profile with ``--env`` applied, as
+        the install itself does, or a ``${VAR}``-named profile could slip past."""
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.install_service.set_env_var", lambda k, v: None
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.install_service.resolve_env_vars",
+            lambda text: text.replace("${ALIAS}", "shared"),
+        )
+        before = self._seed(runner, workspace, "opencode_cli")
+        incoming = tmp_path / "incoming" / "beta.md"
+        incoming.parent.mkdir()
+        _write_profile(incoming, name="${ALIAS}", body="UPDATED-BETA")
+
+        r = runner.invoke(
+            install, [str(incoming), "--provider", "opencode_cli", "--env", "ALIAS=x"]
+        )
+
+        _refused(r)
+        assert (workspace["local_store"] / "beta.md").read_bytes() == before

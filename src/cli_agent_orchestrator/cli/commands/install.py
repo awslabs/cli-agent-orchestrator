@@ -2,7 +2,7 @@
 
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import click
 
@@ -12,7 +12,6 @@ from cli_agent_orchestrator.constants import (
     PROVIDERS,
 )
 from cli_agent_orchestrator.services.install_service import install_agent, parse_env_assignment
-from cli_agent_orchestrator.services.profile_store import write_profile
 
 # Profile names are used as filesystem path segments; this matches the stricter
 # validator inside install_service.py (kept duplicated deliberately — the CLI
@@ -20,12 +19,17 @@ from cli_agent_orchestrator.services.profile_store import write_profile
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
-def _copy_local_profile_to_store(agent_source: str) -> Optional[str]:
-    """If ``agent_source`` is a local ``.md`` file, copy it into the agent store.
+def _read_local_profile(agent_source: str) -> Optional[Tuple[str, str]]:
+    """If ``agent_source`` is a local ``.md`` file, return its ``(stem, text)``.
 
-    Returns the validated stem on success, or ``None`` if the input is not a
-    file-path shape (so the caller should pass ``agent_source`` through as a
-    bare name or URL instead).
+    Returns ``None`` if the input is not a file-path shape (so the caller
+    should pass ``agent_source`` through as a bare name or URL instead).
+
+    Nothing is written here. The text goes to ``install_agent`` as
+    ``profile_content`` and reaches the local store only after the ownership
+    guard has accepted it, so a refused import cannot replace the previously
+    stored profile of the same stem with the rejected input (round-6 review of
+    #493).
 
     File-handling deliberately lives in the CLI rather than ``install_service``:
     only the CLI has legitimate filesystem trust, and keeping
@@ -52,10 +56,8 @@ def _copy_local_profile_to_store(agent_source: str) -> Optional[str]:
         )
 
     # Pass the validated stem, not source_path.name, so nothing from the
-    # user-provided string reaches the destination path. overwrite=True keeps
-    # the pre-existing re-install behaviour of replacing the stored copy.
-    write_profile(stem, source_path.read_text(encoding="utf-8"), overwrite=True)
-    return stem
+    # user-provided string reaches the destination path.
+    return stem, source_path.read_text(encoding="utf-8")
 
 
 @click.command()
@@ -105,26 +107,20 @@ def install(agent_source: str, provider: Optional[str], env_vars: tuple[str, ...
         raise click.BadParameter(str(exc), param_hint="--env") from exc
 
     # Handle the file-path shape here in the CLI. If it was a local .md file,
-    # it's now copied into the agent store and `service_source` is just the
-    # bare stem — which install_agent() accepts through its safe "name" branch.
-    copied_from_file = False
-    try:
-        copied_stem = _copy_local_profile_to_store(agent_source)
-    except click.ClickException:
-        raise
-    if copied_stem is not None:
-        service_source = copied_stem
-        copied_from_file = True
+    # the service receives the bare stem — which install_agent() accepts through
+    # its safe "name" branch — plus the file's text to store once accepted.
+    local_profile = _read_local_profile(agent_source)
+    if local_profile is not None:
+        stem, content = local_profile
+        result = install_agent(stem, provider, parsed_env or None, profile_content=content)
     else:
-        service_source = agent_source
-
-    result = install_agent(service_source, provider, parsed_env or None)
+        result = install_agent(agent_source, provider, parsed_env or None)
 
     if not result.success:
         click.echo(f"Error: {result.message}", err=True)
         return
 
-    if copied_from_file:
+    if local_profile is not None:
         click.echo("✓ Copied agent from file to local store")
     elif result.source_kind == "url":
         click.echo("✓ Downloaded agent from URL to local store")

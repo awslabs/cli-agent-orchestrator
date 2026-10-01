@@ -197,7 +197,7 @@ class TestInstallAgent:
     ) -> None:
         """Bare names resolved from the local store should be converted for Copilot.
 
-        File-path handling moved to the CLI (``_copy_local_profile_to_store``)
+        File-path handling moved to the CLI (``_read_local_profile``)
         so the service only ever sees the bare stem. That's the shape under
         test here.
         """
