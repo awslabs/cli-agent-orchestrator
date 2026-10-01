@@ -102,6 +102,12 @@ class AgentProfile(BaseModel):
     # the Hermes provider launches the default `hermes` command.
     hermesProfile: Optional[str] = Field(default=None, min_length=1)
 
+    # Kimi Code-only. Omission inherits the operator's swarm default; false
+    # opts out. The provider requires a verified bounded Kimi executable before
+    # enabling swarm and never expands the profile's native tool allowlist.
+    kimiSwarm: Optional[bool] = Field(default=None, strict=True)
+    kimiSwarmMaxConcurrency: Optional[int] = Field(default=None, ge=1, le=10, strict=True)
+
     # Claude Code-only. Per-agent Claude Code knobs mapped to CLI flags at
     # launch: {"effort": "<low|medium|high|xhigh>"} -> `--effort <level>` and
     # {"fallback_model": "<model>"} -> `--fallback-model <model>`. Lets a

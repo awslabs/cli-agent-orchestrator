@@ -18,18 +18,30 @@
  * A relative `--base` such as `./` cannot work for runtime calls and is not
  * supported; use an absolute prefix.
  */
+import { tokenQuery, withAuth } from './auth'
+
 const BASE = import.meta.env.BASE_URL.replace(/\/$/, '')
 
-/** URL for the terminal's xterm WebSocket, honouring BASE. */
+/**
+ * URL for the terminal's xterm WebSocket, honouring BASE. Carries the stored
+ * bearer as `?token=` when one is set: a browser cannot put a header on a
+ * WebSocket handshake, and the server accepts the token from that query
+ * parameter (and redacts it from its access log).
+ */
 export function terminalSocketUrl(terminalId: string): string {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${protocol}//${location.host}${BASE}/terminals/${terminalId}/ws`
+  return `${protocol}//${location.host}${BASE}/terminals/${terminalId}/ws${tokenQuery('token', false)}`
 }
 
-/** URL for a workflow run's SSE event stream, honouring BASE. */
+/**
+ * URL for a workflow run's SSE event stream, honouring BASE. Carries the stored
+ * bearer as `?access_token=` when one is set, which is what the route accepts
+ * for clients that cannot send headers; the `fetch`-based follower sends the
+ * header as well.
+ */
 export function eventStreamUrl(runId: string, afterSeq?: number): string {
   const q = afterSeq != null ? `?after_seq=${afterSeq}` : ''
-  return `${BASE}/workflows/runs/${encodeURIComponent(runId)}/events${q}`
+  return `${BASE}/workflows/runs/${encodeURIComponent(runId)}/events${q}${tokenQuery('access_token', q !== '')}`
 }
 
 /**
@@ -50,7 +62,7 @@ async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: numb
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), opts?.timeoutMs ?? 10000)
   try {
-    const res = await fetch(`${BASE}${url}`, { ...opts, signal: controller.signal })
+    const res = await fetch(`${BASE}${url}`, { ...opts, headers: withAuth(opts?.headers), signal: controller.signal })
     if (!res.ok) {
       // Best-effort read of the JSON error body to expose the server's
       // `detail` without leaking a full response. A non-JSON body is fine —
