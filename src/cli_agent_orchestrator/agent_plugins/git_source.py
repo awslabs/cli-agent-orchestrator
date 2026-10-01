@@ -85,23 +85,28 @@ _SCP_TARGET_RE = re.compile(
     r":(?P<path>(?!/)[^\s:]+)$"
 )
 _HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$")
-# A user name for ssh: must not begin with ``-`` (an ssh option) and carries no
-# shell metacharacters.
-_USER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-# One path segment of a hosted repository: no leading ``-`` (an option to the
-# remote ``git-upload-pack``), no ``.``/``..``, no shell or URL metacharacters.
-_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
+# A user name for ssh: no shell metacharacters, and it must not begin with
+# ``-`` (an ssh option) or ``.``. A leading ``_`` is a real convention
+# (``_git`` on some hosted forges), so it stays.
+_USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
+# One path segment of a hosted repository: no shell or URL metacharacters and
+# no leading ``-`` (an option to the remote ``git-upload-pack``). A leading
+# ``.`` or ``_`` is a legitimate repository name (GitHub's ``.github``,
+# ``.dotfiles``); the two traversal segments are refused by name in
+# ``_repository_path_ok`` rather than by narrowing the first character.
+_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._-]*$")
+_TRAVERSAL_SEGMENTS: FrozenSet[str] = frozenset({".", ".."})
 
 
 def _repository_path_ok(path: str) -> bool:
     """Every segment of ``path`` is a plain repository path segment.
 
     Empty segments are allowed only as the trailing slash. ``.`` and ``..`` are
-    refused (``_SEGMENT_RE`` requires a leading word character), as is a
-    segment beginning with ``-``.
+    refused explicitly, as is a segment beginning with ``-`` or carrying any
+    character outside ``_SEGMENT_RE``.
     """
     segments = path.strip("/").split("/") if path.strip("/") else []
-    return all(_SEGMENT_RE.match(seg) for seg in segments)
+    return all(seg not in _TRAVERSAL_SEGMENTS and _SEGMENT_RE.match(seg) for seg in segments)
 
 
 def allowed_hosts() -> FrozenSet[str]:
@@ -203,7 +208,14 @@ def _validated_clone_target(target: str) -> str:
         raise _refused(target, "it contains whitespace or control characters")
 
     if "://" in target:
-        parsed = urlsplit(target)
+        try:
+            parsed = urlsplit(target)
+        except ValueError:
+            # The parser's own refusals (an unmatched ``[`` in the authority, a
+            # netloc that fails the NFKC check) are a verdict about the string
+            # too, and must not escape as a 500 where the port guard below
+            # would have been a 400.
+            raise _refused(target, "it is not a well-formed URL") from None
         scheme = parsed.scheme.lower()
         if scheme not in ALLOWED_SCHEMES:
             raise _refused(target, f"the '{scheme}' transport is not allowed")

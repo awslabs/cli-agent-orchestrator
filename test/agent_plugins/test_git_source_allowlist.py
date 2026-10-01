@@ -308,3 +308,97 @@ class TestSecondPassHardening:
     )
     def test_ordinary_repository_paths_still_pass(self, location, expected):
         assert git_clone_target(location) == expected
+
+
+class TestReviewRoundOne:
+    """haofeif's review of the first head (PR #847).
+
+    P2: the first-character rule on path segments and user names rejected safe
+    names the base revision accepted -- GitHub's dot-prefixed repositories and
+    the ``_git`` ssh user -- with no allowlist setting that could restore them.
+    P3: ``urlsplit`` raises its own ``ValueError`` before the port guard, which
+    nothing converted, so two malformed URLs were a 500 instead of a refusal.
+    """
+
+    @pytest.mark.parametrize(
+        "location,expected",
+        [
+            ("https://github.com/example/.github", "https://github.com/example/.github"),
+            ("git+https://github.com/example/.github", "https://github.com/example/.github"),
+            ("git@github.com:example/.dotfiles.git", "git@github.com:example/.dotfiles.git"),
+            (
+                "ssh://git@github.com/example/.dotfiles.git",
+                "ssh://git@github.com/example/.dotfiles.git",
+            ),
+            ("https://github.com/_org/_repo", "https://github.com/_org/_repo"),
+            ("https://github.com/org/...", "https://github.com/org/..."),
+            ("https://github.com/org/.repo.git/", "https://github.com/org/.repo.git/"),
+        ],
+    )
+    def test_safe_leading_dots_and_underscores_in_repository_paths_pass(self, location, expected):
+        assert git_clone_target(location) == expected
+
+    @pytest.mark.parametrize(
+        "location,expected",
+        [
+            (
+                "ssh://_git@git.corp.example/team/plugin.git",
+                "ssh://_git@git.corp.example/team/plugin.git",
+            ),
+            ("_git@git.corp.example:team/plugin.git", "_git@git.corp.example:team/plugin.git"),
+            (
+                "git+ssh://_git@git.corp.example/team/plugin.git",
+                "ssh://_git@git.corp.example/team/plugin.git",
+            ),
+        ],
+    )
+    def test_an_underscore_prefixed_ssh_user_passes_for_an_allowed_host(
+        self, monkeypatch, location, expected
+    ):
+        monkeypatch.setenv(ALLOWED_HOSTS_ENV, "git.corp.example")
+        assert git_clone_target(location) == expected
+
+    @pytest.mark.parametrize(
+        "location,reason",
+        [
+            # the forbidden cases the first-character rule was standing in for
+            ("https://github.com/org/./repo", "repository path"),
+            ("https://github.com/org/../repo", "repository path"),
+            ("https://github.com/./repo", "repository path"),
+            ("https://github.com/..", "repository path"),
+            ("git@github.com:./repo", "repository path"),
+            ("git@github.com:org/..", "repository path"),
+            ("git@github.com:..", "repository path"),
+            ("https://github.com/org/-repo", "repository path"),
+            ("https://github.com/org/--upload-pack=x", "repository path"),
+            ("git@github.com:org/-repo", "repository path"),
+            ("https://github.com/org/re$po", "repository path"),
+            ("https://github.com/org/re`po", "repository path"),
+            ("https://github.com/org/re|po", "repository path"),
+            ("https://github.com/org/re\\po", "repository path"),
+            ("https://github.com/org/r%2fepo", "repository path"),
+            ("ssh://-git@github.com/org/repo", "user name"),
+            ("ssh://.git@github.com/org/repo", "user name"),
+            ("ssh://gi$t@github.com/org/repo", "user name"),
+            ("-git@github.com:org/repo", "user name"),
+        ],
+    )
+    def test_the_actual_forbidden_cases_are_still_refused(self, location, reason):
+        with pytest.raises(UnsupportedGitSourceError) as exc:
+            git_clone_target(location)
+        assert reason.lower() in str(exc.value).lower(), str(exc.value)
+
+    @pytest.mark.parametrize(
+        "location",
+        [
+            "https://[github.com/example/plugin",  # unmatched IPv6 bracket
+            "https://github.com：443/example/plugin",  # full-width colon, NFKC check
+            "git+https://[github.com/example/plugin",
+            "ssh://git@[github.com/example/plugin",
+        ],
+    )
+    def test_a_url_the_parser_itself_rejects_is_a_refusal_not_a_crash(self, location):
+        with pytest.raises(UnsupportedGitSourceError) as exc:
+            git_clone_target(location)
+        assert "not a well-formed url" in str(exc.value).lower(), str(exc.value)
+        assert ALLOWED_HOSTS_ENV in str(exc.value)

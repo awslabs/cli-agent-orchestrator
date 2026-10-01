@@ -61,6 +61,53 @@ def test_validate_route_refuses_the_same_way(client, plugins_enabled, no_git):
     assert no_git == []
 
 
+@pytest.mark.parametrize("route", ["/plugins", "/plugins/validate"])
+@pytest.mark.parametrize(
+    "source",
+    [
+        "https://[github.com/example/plugin",
+        "https://github.com：443/example/plugin",
+    ],
+)
+def test_a_url_the_parser_rejects_is_a_400_not_a_500(
+    client, plugins_enabled, no_git, route, source
+):
+    """P3 (haofeif): ``urlsplit`` raises its own ValueError before the port
+    guard; uncaught, both routes answered 500 for a malformed location."""
+    resp = client.post(route, json={"kind": "git", "source": source})
+    assert resp.status_code == 400, resp.text
+    assert "Refusing plugin git source" in resp.json()["detail"]
+    assert no_git == []
+
+
+@pytest.mark.parametrize("route", ["/plugins", "/plugins/validate"])
+@pytest.mark.parametrize(
+    "source",
+    [
+        "https://github.com/example/.github",
+        "git@github.com:example/.dotfiles.git",
+        "git+https://github.com/example/.github",
+    ],
+)
+def test_a_dot_prefixed_repository_reaches_git(client, plugins_enabled, monkeypatch, route, source):
+    """P2 (haofeif): GitHub's dot-prefixed repositories passed the base revision
+    and must not be refused by the allowlist; the control is that git is
+    actually spawned for them, like the dotless form."""
+    seen = []
+
+    def fake_run(command, **kwargs):
+        seen.append(command)
+        import subprocess
+
+        raise subprocess.CalledProcessError(128, command, stderr="fatal: could not read")
+
+    monkeypatch.setattr(resolver.subprocess, "run", fake_run)
+    resp = client.post(route, json={"kind": "git", "source": source})
+    assert resp.status_code == 400, resp.text
+    assert "Refusing plugin git source" not in resp.json()["detail"]
+    assert seen and seen[0][0] == "git", seen
+
+
 def test_an_allowed_https_source_does_reach_git(client, plugins_enabled, monkeypatch):
     """Control: the allowlist refuses by verdict, not by breaking the route."""
     seen = []
