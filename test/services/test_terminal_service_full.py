@@ -1,5 +1,6 @@
 """Full tests for terminal service."""
 
+import asyncio
 import os
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -4424,6 +4425,27 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
         fake_monitor = MagicMock()
         fake_monitor.get_status.side_effect = fake_get_status
 
+        # Round-9 review (gutosantos82): the generation gate must be exercised with
+        # real integers, not an unconfigured MagicMock (``MagicMock() > 0`` is
+        # truthy). The fake stamps a reading with 1 only once it is a status the
+        # worker EARNED after dispatch; the stale pre-send IDLE keeps stamp 0, the
+        # same shape the real monitor produces.
+        def fake_observation(terminal_id):
+            from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+            status = fake_get_status(terminal_id)
+            earned = dispatched.is_set() and status in (
+                TerminalStatus.PROCESSING,
+                TerminalStatus.COMPLETED,
+                TerminalStatus.WAITING_USER_ANSWER,
+            )
+            return StatusObservation(status, 1 if earned else 0)
+
+        fake_monitor.status_observation.side_effect = fake_observation
+        fake_monitor.output_generation.side_effect = lambda terminal_id: (
+            1 if dispatched.is_set() else 0
+        )
+
         def fake_send_input(terminal_id, message, **kwargs):
             _time.sleep(PRE_DISPATCH_SECONDS)
             dispatched_at["t"] = _time.monotonic()
@@ -4494,9 +4516,13 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
         ``_confirm_worker_started_or_resubmit`` as a flat 1.5s sleep that returned
         True regardless of status, so holding the mark across it necessarily
         stranded the poller. The real function's first action is
-        ``wait_until_status(_DEFERRED_STARTED_STATUSES, polling_interval=0.5)``,
-        and that set contains COMPLETED — so it returns as soon as a completion is
-        visible, and the mark lifts with it.
+        ``_wait_for_post_dispatch_start`` over ``_DEFERRED_STARTED_STATUSES``
+        (polling every 0.5s), and that set contains COMPLETED — so it returns as
+        soon as a completion EARNED AFTER the dispatch boundary is visible, and
+        the mark lifts with it. Round-9 review (gutosantos82): this used to patch
+        ``send_input`` while ``_run`` dispatches via ``dispatch_input``, so the
+        real call raised (no tmux), the mask cleared in ``finally`` and the
+        scenario was never exercised; it now patches the function ``_run`` calls.
 
         Here a turn finishes without the pipeline ever publishing PROCESSING
         (IDLE -> COMPLETED directly), which is the case that release point existed
@@ -4549,6 +4575,27 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
 
         fake_monitor = MagicMock()
         fake_monitor.get_status.side_effect = fake_get_status
+
+        # Round-9 review (gutosantos82): the generation gate must be exercised with
+        # real integers, not an unconfigured MagicMock (``MagicMock() > 0`` is
+        # truthy). The fake stamps a reading with 1 only once it is a status the
+        # worker EARNED after dispatch; the stale pre-send IDLE keeps stamp 0, the
+        # same shape the real monitor produces.
+        def fake_observation(terminal_id):
+            from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+            status = fake_get_status(terminal_id)
+            earned = dispatched.is_set() and status in (
+                TerminalStatus.PROCESSING,
+                TerminalStatus.COMPLETED,
+                TerminalStatus.WAITING_USER_ANSWER,
+            )
+            return StatusObservation(status, 1 if earned else 0)
+
+        fake_monitor.status_observation.side_effect = fake_observation
+        fake_monitor.output_generation.side_effect = lambda terminal_id: (
+            1 if dispatched.is_set() else 0
+        )
 
         def fake_send_input(terminal_id, message, **kwargs):
             dispatched_at["t"] = _time.monotonic()
@@ -4648,7 +4695,7 @@ class TestListSiblingsMasksPendingDelivery:
 
 
 class TestConfirmationRequiresPostDispatchEvidence:
-    """Round-6 review (haofeif), P1: a cached pre-dispatch COMPLETED is not evidence.
+    """Round-6 and round-9 reviews (haofeif), P1: a cached pre-dispatch COMPLETED is not evidence.
 
     Provider startup output can legitimately parse as COMPLETED, which then latches
     (``_STICKY_READY_STATUSES``), and ``send_input`` only ARMS the next transition
@@ -4656,22 +4703,56 @@ class TestConfirmationRequiresPostDispatchEvidence:
     instantly on a status earned BEFORE the send -- measured at 0.008s on an exact
     head -- releasing the pending-delivery mask before the task emitted anything.
 
-    Every prior test in this area seeded IDLE and produced COMPLETED afterwards, so
-    none of them could see this. These seed the completion FIRST.
+    Round 9 closed the second half: reading the status and the GLOBAL output
+    generation as two values let any unrelated post-boundary frame pair with the
+    sticky COMPLETED. The gate now reads one ``status_observation`` -- the status
+    and the generation it was EARNED at -- and compares that stamp with the
+    boundary. These tests drive the gate through that observation.
     """
+
+    @staticmethod
+    def _monitor(status, earned_at):
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+        fake_monitor = MagicMock()
+        fake_monitor.status_observation.return_value = StatusObservation(status, earned_at)
+        fake_monitor.get_status.return_value = status
+        return fake_monitor
 
     @pytest.mark.asyncio
     async def test_pre_dispatch_completed_does_not_confirm_the_send(self):
-        """The reviewer's case: COMPLETED cached before dispatch, no new output."""
+        """The reviewer's case: COMPLETED earned before dispatch, no new output."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _wait_for_post_dispatch_start,
+        )
+
+        fake_monitor = self._monitor(TerminalStatus.COMPLETED, earned_at=7)
+        with patch("cli_agent_orchestrator.services.terminal_service.status_monitor", fake_monitor):
+            confirmed = await _wait_for_post_dispatch_start(
+                "abcd1234", dispatch_generation=7, timeout=0.25, polling_interval=0.05
+            )
+
+        assert confirmed is False, (
+            "confirmation accepted a COMPLETED earned before dispatch, so the send read as "
+            "started and the delivery mask would clear on the previous turn's result"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unrelated_post_boundary_output_does_not_launder_a_stale_completed(self):
+        """Round-9 P1 exactly: the counter moved, the COMPLETED's own stamp did not."""
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
         from cli_agent_orchestrator.services.terminal_service import (
             _wait_for_post_dispatch_start,
         )
 
         fake_monitor = MagicMock()
-        # Status is COMPLETED throughout, and the generation NEVER advances --
-        # exactly the shape of a completion left over from provider startup.
+        # A spinner redraw landed after the boundary (the global counter reads 9)
+        # but the cached COMPLETED was earned at 7, before the dispatch at 7.
+        fake_monitor.status_observation.return_value = StatusObservation(
+            TerminalStatus.COMPLETED, 7
+        )
         fake_monitor.get_status.return_value = TerminalStatus.COMPLETED
-        fake_monitor.output_generation.return_value = 7
+        fake_monitor.output_generation.return_value = 9
 
         with patch("cli_agent_orchestrator.services.terminal_service.status_monitor", fake_monitor):
             confirmed = await _wait_for_post_dispatch_start(
@@ -4679,57 +4760,229 @@ class TestConfirmationRequiresPostDispatchEvidence:
             )
 
         assert confirmed is False, (
-            "confirmation accepted a COMPLETED cached before dispatch: the generation "
-            "never advanced, so no output arrived for this task, yet the send read as "
-            "started and the delivery mask would clear on the previous turn's result"
+            "an unrelated post-boundary frame bumped the global generation and the gate "
+            "paired it with a COMPLETED earned before the send: a swallowed Enter would be "
+            "confirmed as delivered and the previous response returned as this task's"
         )
+        fake_monitor.output_generation.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_post_dispatch_output_does_confirm(self):
-        """The discriminating half: same status, but the generation advanced."""
+        """The discriminating half: the status itself was earned after the boundary."""
         from cli_agent_orchestrator.services.terminal_service import (
             _wait_for_post_dispatch_start,
         )
 
-        fake_monitor = MagicMock()
-        fake_monitor.get_status.return_value = TerminalStatus.COMPLETED
-        fake_monitor.output_generation.return_value = 8  # real output landed
-
+        fake_monitor = self._monitor(TerminalStatus.COMPLETED, earned_at=8)
         with patch("cli_agent_orchestrator.services.terminal_service.status_monitor", fake_monitor):
             confirmed = await _wait_for_post_dispatch_start(
                 "abcd1234", dispatch_generation=7, timeout=0.25, polling_interval=0.05
             )
 
         assert confirmed is True, (
-            "a COMPLETED with an advanced generation IS this turn's completion and "
-            "must confirm -- otherwise a genuine fast turn burns every resubmit and "
-            "the worker is torn down"
+            "a COMPLETED earned after the boundary IS this turn's completion and must "
+            "confirm -- otherwise a genuine fast turn burns every resubmit and the worker "
+            "is torn down"
         )
 
     @pytest.mark.asyncio
-    async def test_event_inbox_backends_are_not_gated_on_generation(self):
-        """herdr runs no FIFO reader, so the generation never advances from output.
+    async def test_event_inbox_backends_are_judged_by_transition_not_generation(self):
+        """herdr runs no FIFO reader, so no output generation ever advances for it.
 
-        Gating it would make confirmation unsatisfiable and tear down working
-        workers. ``dispatch_generation=None`` opts out, and their status is derived
-        on demand so there is no stale cached value to defend against.
+        Gating it on the generation would make confirmation unsatisfiable and tear
+        down working workers, so ``dispatch_generation=None``. Round 9 named the
+        old unconditional pass as a bypass -- ``get_native_status`` can keep
+        reporting the PREVIOUS turn's COMPLETED until the new inbox event lands --
+        so the recency check for them is a transition from the status sampled
+        immediately before dispatch.
         """
         from cli_agent_orchestrator.services.terminal_service import (
             _wait_for_post_dispatch_start,
         )
 
-        fake_monitor = MagicMock()
-        fake_monitor.get_status.return_value = TerminalStatus.COMPLETED
-        fake_monitor.output_generation.return_value = 0  # never advances for herdr
-
+        # Pre-dispatch IDLE, now COMPLETED: a transition, confirmed.
+        fake_monitor = self._monitor(TerminalStatus.COMPLETED, earned_at=None)
         with patch("cli_agent_orchestrator.services.terminal_service.status_monitor", fake_monitor):
             confirmed = await _wait_for_post_dispatch_start(
-                "abcd1234", dispatch_generation=None, timeout=0.25, polling_interval=0.05
+                "abcd1234",
+                dispatch_generation=None,
+                timeout=0.25,
+                polling_interval=0.05,
+                pre_dispatch_status=TerminalStatus.IDLE,
             )
-
         assert (
             confirmed is True
-        ), "an event-inbox backend was gated on a generation it can never advance"
+        ), "a herdr worker whose native status changed was gated on a generation it can never advance"
+
+    @pytest.mark.asyncio
+    async def test_event_inbox_stale_completed_from_the_previous_turn_does_not_confirm(self):
+        """Round-9 P1, herdr half: the same COMPLETED before and after dispatch is not evidence."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _wait_for_post_dispatch_start,
+        )
+
+        fake_monitor = self._monitor(TerminalStatus.COMPLETED, earned_at=None)
+        with patch("cli_agent_orchestrator.services.terminal_service.status_monitor", fake_monitor):
+            confirmed = await _wait_for_post_dispatch_start(
+                "abcd1234",
+                dispatch_generation=None,
+                timeout=0.25,
+                polling_interval=0.05,
+                pre_dispatch_status=TerminalStatus.COMPLETED,
+            )
+        assert confirmed is False, (
+            "herdr's native status still reported the previous turn's COMPLETED and the "
+            "gate accepted it before the task started"
+        )
+
+    @pytest.mark.asyncio
+    async def test_event_inbox_processing_is_always_live_evidence(self):
+        """herdr's ``working`` is a live state, never a retained verdict."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _wait_for_post_dispatch_start,
+        )
+
+        fake_monitor = self._monitor(TerminalStatus.PROCESSING, earned_at=None)
+        with patch("cli_agent_orchestrator.services.terminal_service.status_monitor", fake_monitor):
+            confirmed = await _wait_for_post_dispatch_start(
+                "abcd1234",
+                dispatch_generation=None,
+                timeout=0.25,
+                polling_interval=0.05,
+                pre_dispatch_status=TerminalStatus.PROCESSING,
+            )
+        assert confirmed is True
+
+
+class TestConfirmationIsCausalOnTheRealMonitor:
+    """The round-9 P1 reproduced against the REAL ``StatusMonitor``, not a fake.
+
+    Sequence: provider startup output parses as COMPLETED and latches; the send
+    arms the monitor, clears the buffer and samples the boundary; then output
+    lands that re-parses as the SAME COMPLETED (a full-screen repaint) -- the
+    global generation advances, the status does not change. The previous head's
+    two-read gate confirmed that; the stamped observation must not.
+    """
+
+    def _monitor_with_sticky_startup_completed(self, provider):
+        from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+        sm = StatusMonitor()
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        sm._process_chunk("t1", "Welcome. Previous session restored.\n> ")
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        assert sm.status_observation("t1").output_generation == 1
+        # The dispatch boundary, exactly as dispatch_input samples it.
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1")
+        boundary = sm.output_generation("t1")
+        assert boundary == 1
+        return sm, boundary
+
+    @staticmethod
+    def _tmux_backend():
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        return backend
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_stale_completed_plus_unrelated_output_is_not_confirmed(
+        self, mock_pm, mock_settings, mock_backend
+    ):
+        mock_backend.return_value = self._tmux_backend()
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        mock_pm.get_provider.return_value = provider
+        sm, boundary = self._monitor_with_sticky_startup_completed(provider)
+
+        # Post-boundary frame that is NOT the task: the repaint re-parses as the
+        # same COMPLETED. Global counter moves; the applied status does not.
+        sm._process_chunk("t1", "\x1b[2J\x1b[H(previous answer) ✓ Done\n> ")
+        assert sm.output_generation("t1") == boundary + 1
+        observation = sm.status_observation("t1")
+        assert observation.status == TerminalStatus.COMPLETED
+        assert (
+            observation.output_generation == 1
+        ), "an unchanged re-detection re-stamped a ready status"
+
+        from cli_agent_orchestrator.services.terminal_service import (
+            _wait_for_post_dispatch_start,
+        )
+
+        with patch("cli_agent_orchestrator.services.terminal_service.status_monitor", sm):
+            confirmed = asyncio.run(
+                _wait_for_post_dispatch_start("t1", boundary, timeout=0.2, polling_interval=0.05)
+            )
+        assert confirmed is False, (
+            "the real monitor's cached startup COMPLETED was confirmed as this task "
+            "starting because an unrelated frame advanced the output generation"
+        )
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_status_earned_from_post_boundary_output_is_confirmed(
+        self, mock_pm, mock_settings, mock_backend
+    ):
+        mock_backend.return_value = self._tmux_backend()
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        mock_pm.get_provider.return_value = provider
+        sm, boundary = self._monitor_with_sticky_startup_completed(provider)
+
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        sm._process_chunk("t1", "⠋ Thinking…")
+        observation = sm.status_observation("t1")
+        assert observation.status == TerminalStatus.PROCESSING
+        assert observation.output_generation == boundary + 1
+
+        from cli_agent_orchestrator.services.terminal_service import (
+            _wait_for_post_dispatch_start,
+        )
+
+        with patch("cli_agent_orchestrator.services.terminal_service.status_monitor", sm):
+            confirmed = asyncio.run(
+                _wait_for_post_dispatch_start("t1", boundary, timeout=0.2, polling_interval=0.05)
+            )
+        assert confirmed is True
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_optimistic_dispatch_latch_is_not_evidence_but_real_processing_is(
+        self, mock_pm, mock_settings, mock_backend
+    ):
+        """``assume_processing_on_dispatch`` latches PROCESSING at the send; that is a
+        guess, stamped at the pre-send generation, and must not confirm. The first
+        real PROCESSING detection afterwards re-earns the (unchanged) status and must."""
+        mock_backend.return_value = self._tmux_backend()
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        mock_pm.get_provider.return_value = provider
+        sm, _ = self._monitor_with_sticky_startup_completed(provider)
+
+        sm.notify_input_sent("t1", assume_processing=True)
+        sm.clear_rolling_buffer("t1")
+        boundary = sm.output_generation("t1")
+        optimistic = sm.status_observation("t1")
+        assert optimistic.status == TerminalStatus.PROCESSING
+        assert (
+            optimistic.output_generation <= boundary
+        ), "the optimistic latch was stamped as if earned"
+
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        sm._process_chunk("t1", "⠋ Working…")
+        earned = sm.status_observation("t1")
+        assert earned.status == TerminalStatus.PROCESSING
+        assert earned.output_generation == boundary + 1, (
+            "real PROCESSING evidence on an already-PROCESSING terminal did not move the "
+            "stamp, so a long task could never confirm and would be resubmitted"
+        )
 
 
 class TestPendingMarkNeverLeaks:
@@ -4947,9 +5200,14 @@ class TestDispatchBoundaryIsSampledBeforeKeys:
             _wait_for_post_dispatch_start,
         )
 
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
         fake_monitor = MagicMock()
         # After the send: the worker emitted once (3 -> 4) and completed; nothing
-        # further will ever arrive.
+        # further will ever arrive. The completion was EARNED at 4.
+        fake_monitor.status_observation.return_value = StatusObservation(
+            TerminalStatus.COMPLETED, 4
+        )
         fake_monitor.get_status.return_value = TerminalStatus.COMPLETED
         fake_monitor.output_generation.return_value = 4
         inner_boundary = 3  # what dispatch_input returned
@@ -5003,3 +5261,377 @@ class TestDispatchBoundaryIsSampledBeforeKeys:
 
         assert send_input("test1234", "hello") is True
         mock_tmux.send_keys.assert_called_once()
+
+
+class TestEventInboxWiringInTheDeferredRun:
+    """Round-9 review (gutosantos82, minor 9): the ``None if supports_event_inbox()``
+    branch of ``_run``'s confirmation wiring was only ever exercised on the
+    ``else`` side. This drives the event-inbox side through the real scheduler and
+    pins that the herdr recency rule is wired, not just defined: no generation,
+    and the pre-dispatch status sampled BEFORE ``dispatch_input`` ran.
+    """
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._persist_initial_delivery")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_terminal_shell_command")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service._clear_deferred_init_external_owner",
+        new_callable=AsyncMock,
+    )
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service._confirm_worker_started_or_resubmit",
+        new_callable=AsyncMock,
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.dispatch_input")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    async def test_event_inbox_backend_confirms_by_transition_from_the_pre_dispatch_status(
+        self,
+        mock_meta,
+        mock_monitor,
+        mock_backend,
+        mock_dispatch,
+        mock_confirm,
+        mock_clear_owner,
+        mock_update_shell,
+        mock_persist,
+    ):
+        from cli_agent_orchestrator.services.terminal_service import (
+            _deferred_init_tasks,
+            _schedule_deferred_init,
+        )
+
+        mock_meta.return_value = {"caller_id": None}
+        mock_backend.return_value.supports_event_inbox.return_value = True
+        # herdr's on-demand status before anything is sent: the previous turn's
+        # COMPLETED. If dispatch_input had run first this would be unobservable.
+        order = []
+        mock_monitor.get_status.side_effect = lambda tid: (
+            order.append("sample") or TerminalStatus.COMPLETED
+        )
+        mock_dispatch.side_effect = lambda *a, **k: order.append("dispatch") or 5
+        mock_confirm.return_value = True
+        provider_instance = AsyncMock()
+        provider_instance.initialize.return_value = True
+        provider_instance.shell_baseline = None
+        provider_instance.requires_execution_evidence = False
+
+        before = set(_deferred_init_tasks)
+        _schedule_deferred_init(
+            provider_instance, "herd1234", "task", OrchestrationType.ASSIGN, None
+        )
+        (task,) = set(_deferred_init_tasks) - before
+        await task
+
+        assert order[:2] == ["sample", "dispatch"], "pre-dispatch status was sampled after the send"
+        kwargs = mock_confirm.call_args.kwargs
+        assert kwargs["dispatch_generation"] is None, "herdr was gated on an output generation"
+        assert kwargs["pre_dispatch_status"] == TerminalStatus.COMPLETED
+        mock_persist.assert_any_call("herd1234", "delivered")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._persist_initial_delivery")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_terminal_shell_command")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service._clear_deferred_init_external_owner",
+        new_callable=AsyncMock,
+    )
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service._confirm_worker_started_or_resubmit",
+        new_callable=AsyncMock,
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.dispatch_input")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    async def test_pipe_pane_backend_passes_the_inner_boundary_and_no_pre_status(
+        self,
+        mock_meta,
+        mock_monitor,
+        mock_backend,
+        mock_dispatch,
+        mock_confirm,
+        mock_clear_owner,
+        mock_update_shell,
+        mock_persist,
+    ):
+        from cli_agent_orchestrator.services.terminal_service import (
+            _deferred_init_tasks,
+            _schedule_deferred_init,
+        )
+
+        mock_meta.return_value = {"caller_id": None}
+        mock_backend.return_value.supports_event_inbox.return_value = False
+        mock_dispatch.return_value = 11
+        mock_confirm.return_value = True
+        provider_instance = AsyncMock()
+        provider_instance.initialize.return_value = True
+        provider_instance.shell_baseline = None
+        provider_instance.requires_execution_evidence = False
+
+        before = set(_deferred_init_tasks)
+        _schedule_deferred_init(
+            provider_instance, "tmux1234", "task", OrchestrationType.ASSIGN, None
+        )
+        (task,) = set(_deferred_init_tasks) - before
+        await task
+
+        kwargs = mock_confirm.call_args.kwargs
+        assert kwargs["dispatch_generation"] == 11
+        assert kwargs["pre_dispatch_status"] is None
+        mock_monitor.get_status.assert_not_called()
+
+
+class TestGetTerminalMasksPendingDelivery:
+    """Round-9 review (gutosantos82, nit 15): the ``GET /terminals/{id}`` surface
+    had no dedicated wiring test mirroring get_session/list_siblings."""
+
+    @pytest.mark.parametrize("raw", [TerminalStatus.IDLE, TerminalStatus.COMPLETED])
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_completable_status_reads_unknown_while_delivery_is_pending(self, mock_meta, raw):
+        from cli_agent_orchestrator.services import terminal_service
+
+        mock_meta.return_value = {
+            "id": "pend5678",
+            "tmux_window": "developer-pend",
+            "tmux_session": "cao-session",
+            "provider": "kiro_cli",
+            "agent_profile": "developer",
+            "metadata": None,
+            "deferred_init_failure": None,
+            "initial_delivery": {"state": "pending"},
+            "last_active": datetime.now(),
+        }
+        fake_monitor = MagicMock()
+        fake_monitor.get_status.return_value = raw
+        with (
+            patch.object(terminal_service, "_pending_initial_delivery", {"pend5678"}),
+            patch.object(terminal_service, "status_monitor", fake_monitor),
+        ):
+            payload = terminal_service.get_terminal("pend5678")
+        assert payload["status"] == TerminalStatus.UNKNOWN.value
+        assert payload["initial_delivery"] == {"state": "pending"}
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_status_is_unmasked_once_delivery_is_settled(self, mock_meta):
+        from cli_agent_orchestrator.services import terminal_service
+
+        mock_meta.return_value = {
+            "id": "done5678",
+            "tmux_window": "developer-done",
+            "tmux_session": "cao-session",
+            "provider": "kiro_cli",
+            "agent_profile": "developer",
+            "metadata": None,
+            "deferred_init_failure": None,
+            "initial_delivery": {"state": "delivered"},
+            "last_active": datetime.now(),
+        }
+        fake_monitor = MagicMock()
+        fake_monitor.get_status.return_value = TerminalStatus.COMPLETED
+        with (
+            patch.object(terminal_service, "_pending_initial_delivery", set()),
+            patch.object(terminal_service, "status_monitor", fake_monitor),
+        ):
+            payload = terminal_service.get_terminal("done5678")
+        assert payload["status"] == TerminalStatus.COMPLETED.value
+        assert payload["initial_delivery"] == {"state": "delivered"}
+
+
+class TestInitialDeliveryIsDurable:
+    """Round-9 review (haofeif), P1: ``--async`` success needs an observable durable
+    outcome. The deferred task settles ``initial_delivery`` on the terminal row.
+    """
+
+    def _provider(self):
+        provider_instance = AsyncMock()
+        provider_instance.initialize.return_value = True
+        provider_instance.shell_baseline = None
+        provider_instance.requires_execution_evidence = False
+        return provider_instance
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._persist_initial_delivery")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_terminal_shell_command")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service._clear_deferred_init_external_owner",
+        new_callable=AsyncMock,
+    )
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service._confirm_worker_started_or_resubmit",
+        new_callable=AsyncMock,
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.dispatch_input")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    async def test_delivered_is_persisted_before_the_mask_lifts(
+        self,
+        mock_meta,
+        mock_backend,
+        mock_dispatch,
+        mock_confirm,
+        mock_clear,
+        mock_shell,
+        mock_persist,
+    ):
+        from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.terminal_service import (
+            _deferred_init_tasks,
+            _schedule_deferred_init,
+        )
+
+        mock_meta.return_value = {"caller_id": None}
+        mock_backend.return_value.supports_event_inbox.return_value = False
+        mock_dispatch.return_value = 0
+        mock_confirm.return_value = True
+        masked_at_persist = {}
+
+        def record(terminal_id, state, **kwargs):
+            masked_at_persist[state] = terminal_service.initial_delivery_pending(terminal_id)
+            return True
+
+        mock_persist.side_effect = record
+
+        before = set(_deferred_init_tasks)
+        _schedule_deferred_init(self._provider(), "dur1234", "task", OrchestrationType.ASSIGN, None)
+        (task,) = set(_deferred_init_tasks) - before
+        await task
+
+        mock_persist.assert_called_once_with("dur1234", "delivered")
+        assert masked_at_persist["delivered"] is True, (
+            "the in-memory mask lifted before the durable verdict was written, so a client "
+            "could read an unmasked status before `delivered`"
+        )
+        assert terminal_service.initial_delivery_pending("dur1234") is False
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service._persist_initial_delivery")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_terminal_shell_command")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service._clear_deferred_init_external_owner",
+        new_callable=AsyncMock,
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.dispatch_input")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    async def test_startup_prompt_settles_failed_waiting_user_answer_without_teardown(
+        self,
+        mock_meta,
+        mock_backend,
+        mock_dispatch,
+        mock_clear,
+        mock_shell,
+        mock_persist,
+        mock_notify,
+    ):
+        from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError
+        from cli_agent_orchestrator.services.terminal_service import (
+            _deferred_init_tasks,
+            _schedule_deferred_init,
+        )
+
+        mock_meta.return_value = {"caller_id": None}
+        mock_backend.return_value.supports_event_inbox.return_value = False
+        mock_dispatch.side_effect = TerminalInputBlockedError("waiting for a user answer")
+
+        before = set(_deferred_init_tasks)
+        _schedule_deferred_init(self._provider(), "blk1234", "task", OrchestrationType.ASSIGN, None)
+        (task,) = set(_deferred_init_tasks) - before
+        await task
+
+        args, kwargs = mock_persist.call_args
+        assert args == ("blk1234", "failed")
+        assert kwargs["kind"] == "waiting_user_answer"
+        assert "not delivered" in kwargs["message"]
+        # Alive and answerable: notified, not torn down.
+        assert mock_notify.call_args.kwargs.get("delete_worker") is False
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._notify_caller_of_deferred_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service._persist_initial_delivery")
+    @patch("cli_agent_orchestrator.services.terminal_service._persist_deferred_init_failure")
+    async def test_surfacing_a_deferred_failure_settles_the_delivery_too(
+        self, mock_persist_failure, mock_persist_delivery, mock_notify
+    ):
+        from cli_agent_orchestrator.services.terminal_service import (
+            _surface_deferred_init_failure,
+        )
+
+        mock_persist_failure.return_value = {"phase": "deferred_init", "kind": "task_not_started"}
+        await _surface_deferred_init_failure(
+            "fail1234",
+            kind="task_not_started",
+            message="never started",
+            registry=None,
+            delete_on_failure=True,
+        )
+        mock_persist_delivery.assert_called_once_with(
+            "fail1234", "failed", kind="task_not_started", message="never started"
+        )
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._persist_deferred_init_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service._persist_initial_delivery")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.list_pending_initial_delivery_terminal_ids"
+    )
+    async def test_restart_sweep_settles_stranded_pending_rows_as_interrupted(
+        self, mock_list, mock_persist_delivery, mock_meta, mock_persist_failure
+    ):
+        """A restart loses the in-memory task; the row must not stay pending forever."""
+        from cli_agent_orchestrator.services import terminal_service
+
+        mock_list.return_value = ["old1234", "live5678"]
+        mock_persist_delivery.return_value = True
+        mock_meta.return_value = {"deferred_init_failure": None}
+
+        with patch.object(terminal_service, "_pending_initial_delivery", {"live5678"}):
+            complete = await terminal_service.recover_interrupted_initial_deliveries()
+
+        assert complete is True
+        # The current-process delivery is left alone; the stranded one is settled.
+        settled = [c.args[0] for c in mock_persist_delivery.call_args_list]
+        assert settled == ["old1234"]
+        assert mock_persist_delivery.call_args.args[1] == "failed"
+        assert mock_persist_delivery.call_args.kwargs["kind"] == "interrupted"
+        mock_persist_failure.assert_called_once()
+        assert mock_persist_failure.call_args.args == ("old1234",)
+        assert mock_persist_failure.call_args.kwargs["kind"] == "interrupted_init"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service._persist_deferred_init_failure")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service._persist_initial_delivery")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.list_pending_initial_delivery_terminal_ids"
+    )
+    async def test_restart_sweep_keeps_an_existing_failure_marker(
+        self, mock_list, mock_persist_delivery, mock_meta, mock_persist_failure
+    ):
+        from cli_agent_orchestrator.services import terminal_service
+
+        mock_list.return_value = ["old1234"]
+        mock_persist_delivery.return_value = True
+        mock_meta.return_value = {
+            "deferred_init_failure": {"phase": "deferred_init", "kind": "provider_init_error"}
+        }
+        with patch.object(terminal_service, "_pending_initial_delivery", set()):
+            assert await terminal_service.recover_interrupted_initial_deliveries() is True
+        mock_persist_failure.assert_not_called()
+
+    def test_persist_helper_only_settles_a_pending_row(self):
+        from cli_agent_orchestrator.services import terminal_service
+
+        with patch.object(
+            terminal_service, "update_terminal_initial_delivery", return_value=False
+        ) as upd:
+            assert (
+                terminal_service._persist_initial_delivery("x", "failed", kind="k", message="m")
+                is False
+            )
+        payload = upd.call_args.args[1]
+        assert payload == {"state": "failed", "kind": "k", "message": "m"}
+        assert upd.call_args.kwargs == {"only_if_pending": True}

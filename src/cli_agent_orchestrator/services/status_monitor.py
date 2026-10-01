@@ -8,7 +8,7 @@ import asyncio
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 # Statuses that represent a stable "ready" state — the agent has finished
 # producing output and is waiting for further input. Once latched, the
 # StatusMonitor will not regress to PROCESSING until ``notify_input_sent``
@@ -43,6 +44,13 @@ logger = logging.getLogger(__name__)
 # wait_until_status (server-side) and the e2e tests' HTTP polling miss the
 # brief "ready" windows and time out (PR #273 codex 60s init timeouts,
 # completion-timeout failures).
+class StatusObservation(NamedTuple):
+    """A terminal status plus the output generation it was earned at (None for herdr)."""
+
+    status: TerminalStatus
+    output_generation: Optional[int]
+
+
 _STICKY_READY_STATUSES = frozenset(
     {
         TerminalStatus.IDLE,
@@ -173,6 +181,16 @@ class StatusMonitor:
         # either: it advances on CLEAR, never on output, so it cannot say whether
         # anything arrived after the boundary.
         self._output_generation: Dict[str, int] = {}
+        # Per-terminal OUTPUT generation at which ``_last_status`` was last EARNED:
+        # stamped under the lock whenever a detected status is applied (a change)
+        # or genuine PROCESSING evidence is re-observed. A status VALUE cannot
+        # say when it was earned; this says which output it was computed from.
+        # Delivery confirmation (PR #566, review round 9) compares it with the
+        # generation sampled at the dispatch boundary: only a status whose OWN
+        # stamp is newer than the dispatch is evidence for that dispatch. A
+        # sticky pre-dispatch COMPLETED keeps its old stamp no matter how many
+        # unrelated frames bump ``_output_generation`` afterwards.
+        self._status_generation: Dict[str, int] = {}
         # --- pyte rendered-screen detection state (only used when CAO_PYTE_STATUS
         # is on AND the provider opts in via supports_screen_detection) ---
         # Per-terminal pyte Screen+Stream that composites the raw byte stream
@@ -319,6 +337,19 @@ class StatusMonitor:
                     terminal_id, 0
                 )
             changed = self._apply_detection_locked(terminal_id, detected)
+            if (
+                not changed
+                and detected == TerminalStatus.PROCESSING
+                and processing_evidence
+                and self._last_status.get(terminal_id) == TerminalStatus.PROCESSING
+            ):
+                # Still PROCESSING on fresh evidence: the cached value is
+                # re-earned by this output, so its stamp moves with it. Ready
+                # statuses are deliberately NOT re-stamped on an unchanged
+                # re-detection -- a full-screen repaint composites the previous
+                # turn's completion box and re-parses as the same COMPLETED, and
+                # that is exactly the stale reading a stamp must not refresh.
+                self._status_generation[terminal_id] = self._output_generation.get(terminal_id, 0)
         if changed:
             # Publish outside the lock — subscribers must never be able to
             # re-enter StatusMonitor while the latch state is mid-update.
@@ -381,6 +412,12 @@ class StatusMonitor:
             return False
 
         self._last_status[terminal_id] = detected
+        # Earned now, from whatever output has landed so far (see
+        # ``status_observation``). Optimistic latches arrive here too
+        # (notify_input_sent(assume_processing=True)); they are stamped with
+        # the pre-send generation, which is by construction not newer than the
+        # dispatch boundary sampled right after, so they never confirm a send.
+        self._status_generation[terminal_id] = self._output_generation.get(terminal_id, 0)
         if detected == TerminalStatus.PROCESSING:
             self._allow_processing_revert[terminal_id] = False
         elif detected in _STICKY_READY_STATUSES and last not in _STICKY_READY_STATUSES:
@@ -776,6 +813,39 @@ class StatusMonitor:
         with self._lock:
             return self._output_generation.get(terminal_id, 0)
 
+    def status_observation(self, terminal_id: str) -> "StatusObservation":
+        """Return the terminal's applied status together with the output generation it was earned at.
+
+        ``get_status`` answers *what* the status is; this answers *what output it
+        came from*. The pair is what a caller needs to decide whether a status is
+        evidence for a particular dispatch: a status counts for a send only when
+        its own ``output_generation`` is strictly greater than the generation
+        sampled at that send's dispatch boundary (``dispatch_input``). Reading
+        ``get_status()`` and ``output_generation()`` separately cannot establish
+        that -- a COMPLETED latched from provider startup stays cached while an
+        unrelated spinner redraw advances the counter, and the two reads then
+        pair a pre-dispatch value with post-dispatch output (PR #566, round 9).
+
+        Runs ``get_status`` first so the cached-PROCESSING fresh re-detections it
+        performs are applied (and stamped) before the pair is read under the
+        lock. The observation reports the APPLIED value: when a fresh detection
+        is refused by the sticky latch, the applied status, not the refused one,
+        is what every other reader sees, and it is the conservative choice here.
+
+        Event-inbox backends (herdr) derive status on demand and never advance
+        the output generation; for them the generation is reported as ``None``
+        and callers must judge recency another way (see
+        ``terminal_service._wait_for_post_dispatch_start``).
+        """
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        status = self.get_status(terminal_id)
+        if get_backend().supports_event_inbox():
+            return StatusObservation(status, None)
+        with self._lock:
+            applied = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            return StatusObservation(applied, self._status_generation.get(terminal_id, 0))
+
     def notify_input_sent(self, terminal_id: str, *, assume_processing: bool = False) -> None:
         """Arm the next PROCESSING transition.
 
@@ -858,6 +928,7 @@ class StatusMonitor:
             self._confirmed_stale_capture_commit.pop(terminal_id, None)
             self._capture_generation.pop(terminal_id, None)
             self._output_generation.pop(terminal_id, None)
+            self._status_generation.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
@@ -886,6 +957,7 @@ class StatusMonitor:
             self._confirmed_stale_capture_commit.pop(terminal_id, None)
             self._capture_generation.pop(terminal_id, None)
             self._output_generation.pop(terminal_id, None)
+            self._status_generation.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 

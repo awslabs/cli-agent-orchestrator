@@ -57,12 +57,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already done it.** The initial message is now delivered by the server as
   part of `POST /sessions` instead of a second request that raced provider
   startup, and the terminal reads as not-yet-completable until that delivery
-  has been made and the worker has produced output for it. Confirmation gates
-  on an output-only generation sampled at the dispatch boundary, inside the
-  send, so neither a completion cached from provider startup nor a redelivery's
-  own keystrokes can pass for this task starting, and a worker fast enough to
-  finish before the send returns is confirmed rather than resubmitted to and
-  deleted (#566)
+  has been made and the worker has produced output for it. Confirmation is
+  causal: `StatusMonitor` stamps every applied status with the output
+  generation it was earned at, and a send is confirmed only by a started
+  status whose own stamp is newer than the dispatch boundary sampled inside
+  the send -- so neither a completion cached from provider startup, nor an
+  unrelated redraw that merely advances the counter afterwards, nor a
+  redelivery's own keystrokes can pass for this task starting, while a worker
+  fast enough to finish before the send returns is confirmed rather than
+  resubmitted to and deleted. Event-inbox backends (herdr), which have no
+  output generation, are judged by a transition from the status read
+  immediately before dispatch instead of being exempt. The outcome of that
+  delivery is now durable: `GET /terminals/{id}` carries `initial_delivery`
+  (`pending` -> `delivered`, or `failed` with a `kind` and `message`,
+  including `waiting_user_answer` when the worker parked on a prompt and
+  `interrupted` when cao-server restarted before confirming), and `cao launch
+  --async` exits 0 only once it reads `delivered`, non-zero with the reason
+  otherwise, instead of reporting success the moment the session row existed.
+  The synchronous headless run waits for that verdict with an allowance
+  derived from the provider's `provider_init_timeout` (profile override
+  honoured) and only then starts the task's own 300s budget, so a slow but
+  valid init no longer eats the task's time (#566)
 
 - **Workflow script run-step refusals now retain their typed reason in run
   records.** When a structured HTTP error includes a string `detail.kind`,

@@ -1340,8 +1340,9 @@ class ClaudeCodeProvider(BaseProvider):
         recognized choice-prompt, classifying it WAITING_USER_ANSWER instead of
         tearing the session down (see the WAITING_USER_ANSWER acceptance in
         initialize() above). Without this override, the deferred-init path
-        (_schedule_deferred_init -> send_input(initial_message)) would proceed
-        straight through send_input's guard (services/terminal_service.py) — which
+        (_schedule_deferred_init -> dispatch_input(initial_message)) would proceed
+        straight through dispatch_input's guard (services/terminal_service.py;
+        send_input is a thin wrapper over it) — which
         only fires when this property is True — and paste the assigned task text
         plus Enter into the live widget, auto-confirming whichever option happens
         to be highlighted. That is exactly the "auto-answer a prompt a human should

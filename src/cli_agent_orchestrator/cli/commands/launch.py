@@ -33,6 +33,7 @@ from cli_agent_orchestrator.utils.forwarded_env import (
 from cli_agent_orchestrator.utils.terminal import (
     poll_until_done,
     sync_backend_from_server,
+    wait_for_initial_delivery,
     wait_until_terminal_status,
 )
 
@@ -57,15 +58,51 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
 # the two client paths cannot drift) and are mirrored server-side in
 # ``TmuxClient._merge_extra_env``. See issue #248.
 
-# How long the CLI allows for server-side provider init: the pre-attach
-# readiness poll on the non-headless path, and the init allowance folded into
-# the headless wait (where init now runs inside ``poll_until_done``'s window
-# rather than in a separate poll before a client-side send).
+# How long the non-headless path waits for the provider to settle before
+# attaching (advisory; see the attach block below).
 _READINESS_WAIT_TIMEOUT = 120
 
-# How long the agent gets to finish MESSAGE on the headless non-async path,
-# on top of ``_READINESS_WAIT_TIMEOUT``.
+# How long the agent gets to finish MESSAGE on the headless non-async path.
+# This budget starts only once the server has CONFIRMED delivery of MESSAGE
+# (``wait_for_initial_delivery``), never while the provider is still
+# initializing -- otherwise a legitimately slow init consumed the task's time
+# and a client deadline could fire while the server went on to run the task,
+# so a retry duplicated the work (PR #566 review, haofeif).
 _HEADLESS_TASK_TIMEOUT = 300
+
+# Worst case of the server's confirm-and-resubmit loop after the send
+# (``_DEFERRED_SUBMIT_CONFIRM_TIMEOUT`` x (1 + ``_DEFERRED_SUBMIT_MAX_RESUBMITS``)
+# = 32s) with headroom for the pre-dispatch work (memory injection) and polling.
+_DELIVERY_CONFIRM_ALLOWANCE = 60
+
+# Provider init is not one wait of ``provider_init_timeout`` (T). A successful
+# path legitimately spans several T-bounded phases: Claude's shell wait +
+# startup-prompt handler + readiness wait is 3T (+ settle), Kimi's is up to
+# T + 2*max(120, T), Kiro's legacy fallback 4T. The client allowance has to
+# cover the longest of those or a valid init blows the deadline while the
+# server later runs the task anyway.
+_INIT_PHASES = 4
+
+
+def _init_allowance(agent_profile: str, settings: dict) -> int:
+    """Client-side allowance for server-side provider init plus delivery confirmation.
+
+    Derived from the SAME value the server will use: the profile's
+    ``provider_init_timeout`` when it declares one (``BaseProvider.get_init_timeout``
+    prefers it), else the server setting. A profile that cannot be loaded here
+    falls back to the server default rather than failing the launch -- the
+    server resolves the real profile itself; this only sizes the wait.
+    """
+    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+
+    base = int(settings["provider_init_timeout"])
+    try:
+        profile = load_agent_profile(agent_profile)
+    except (FileNotFoundError, RuntimeError):
+        profile = None
+    if profile is not None and profile.provider_init_timeout is not None:
+        base = int(profile.provider_init_timeout)
+    return _INIT_PHASES * base + _DELIVERY_CONFIRM_ALLOWANCE
 
 
 def _is_waiting_on_user(terminal_id: str) -> bool:
@@ -508,23 +545,27 @@ def launch(
             get_backend().attach_session(terminal["session_name"])
         elif message:
             # Nothing to send: the server took MESSAGE in the create body above
-            # and owns init, delivery and re-submission. There is also nothing
-            # left to wait for before delivery — waiting for IDLE here is what
-            # used to gate a send that no longer happens.
+            # and owns init, delivery and re-submission. What the CLI waits for
+            # is the server's DURABLE verdict on that delivery, not a status
+            # sample: ``initial_delivery`` on the terminal row goes pending ->
+            # delivered once the worker has been observed working on MESSAGE
+            # (post-dispatch evidence), or -> failed with the reason (init error,
+            # task never started, worker parked on a prompt, server restarted
+            # before confirmation). Waiting on it here restores the contract the
+            # client-side send had -- ``--async`` exits 0 only once the message
+            # is known to have reached the agent, and non-zero with the reason
+            # otherwise -- without reintroducing the request that raced init.
+            # The allowance is sized from the provider's real init path, not a
+            # flat 120s (see ``_init_allowance``).
+            wait_for_initial_delivery(terminal["id"], timeout=_init_allowance(agents, settings))
             if is_async:
-                click.echo(
-                    f"Message accepted for {terminal['name']}; the server delivers it "
-                    "once provider init completes. Running in background."
-                )
+                click.echo(f"Message delivered to {terminal['name']}. Running in background.")
                 return
-            # Provider init now happens inside this wait instead of in a
-            # separate readiness poll before the send, so the budget covers
-            # both. A deferred terminal reports UNKNOWN until init finishes,
-            # which ``poll_until_done`` deliberately does not count as "started"
-            # — it returns only once the agent has been observed working.
-            poll_until_done(
-                terminal["id"], timeout=_READINESS_WAIT_TIMEOUT + _HEADLESS_TASK_TIMEOUT
-            )
+            # The task budget starts HERE, at confirmed delivery, so a slow but
+            # successful init cannot eat into it. The terminal is no longer
+            # masked, so ``poll_until_done``'s own working-then-idle gate judges
+            # completion on the task's activity only.
+            poll_until_done(terminal["id"], timeout=_HEADLESS_TASK_TIMEOUT)
             output_resp = api_http.get(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/output",
                 params={"mode": "last"},

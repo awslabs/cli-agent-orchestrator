@@ -110,6 +110,14 @@ class Terminal(BaseModel):
             "Separate from consumer metadata so clients cannot overwrite lifecycle truth."
         ),
     )
+    initial_delivery: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "Durable outcome of the initial message this terminal was created with "
+            "(deferred init): state pending/delivered/failed plus kind and message. "
+            "None when no initial message was accepted at creation."
+        ),
+    )
     session_incarnation_id: Optional[str] = Field(
         None,
         description=(

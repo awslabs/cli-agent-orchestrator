@@ -332,6 +332,74 @@ def poll_until_done(
         time.sleep(polling_interval)
 
 
+def wait_for_initial_delivery(
+    terminal_id: str,
+    timeout: float,
+    polling_interval: float = 1.0,
+) -> dict:
+    """Block until the server has settled the initial message this terminal was created with.
+
+    ``POST /sessions`` with ``initial_message`` returns as soon as the terminal
+    row exists; provider init, the send and its confirmation then run server-side
+    (``terminal_service._schedule_deferred_init``). The outcome is persisted on
+    the terminal row as ``initial_delivery`` -- ``pending`` until the worker has
+    been observed working on the message, then ``delivered``, or ``failed`` with
+    a ``kind`` and ``message`` -- so a client can wait for a durable verdict
+    rather than inferring one from status samples, and so a cao-server restart
+    (which sweeps a stranded ``pending`` to ``failed``/``interrupted``) cannot
+    leave it waiting on a task that no longer exists. ``cao launch`` uses this
+    for both ``--async`` (exit only once delivery is confirmed, or non-zero with
+    the reason) and the synchronous headless run (start the task budget here).
+
+    Returns the terminal payload once ``initial_delivery.state == "delivered"``.
+    Raises ``click.ClickException`` when the delivery failed, when the terminal
+    reached ERROR first (``deferred_init_failure`` carries the detail), on
+    timeout, or on a transport failure.
+    """
+    import click
+
+    start = time.time()
+    while True:
+        elapsed = time.time() - start
+        if elapsed > timeout:
+            raise click.ClickException(
+                f"Timed out after {int(elapsed)}s waiting for the initial message to be "
+                f"delivered to terminal {terminal_id}; the server may still be initializing "
+                "the provider. Inspect it with `cao terminal`."
+            )
+        try:
+            resp = api_http.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
+            resp.raise_for_status()
+            payload = resp.json()
+        except api_http.exceptions.RequestException as e:
+            raise click.ClickException(f"Failed to poll terminal delivery state: {e}")
+        if not isinstance(payload, dict):
+            payload = {}
+        delivery = payload.get("initial_delivery")
+        delivery = delivery if isinstance(delivery, dict) else {}
+        state = delivery.get("state")
+        if state == "delivered":
+            return payload
+        if state == "failed":
+            kind = delivery.get("kind") or "failed"
+            detail = delivery.get("message") or "no detail recorded"
+            raise click.ClickException(
+                f"Initial message was not delivered to terminal {terminal_id} ({kind}): {detail}"
+            )
+        if payload.get("status") == TerminalStatus.ERROR.value:
+            failure = payload.get("deferred_init_failure")
+            detail = (
+                failure.get("message")
+                if isinstance(failure, dict) and failure.get("message")
+                else None
+            )
+            raise click.ClickException(
+                f"Terminal {terminal_id} reached ERROR before the initial message was delivered"
+                + (f": {detail}" if detail else "")
+            )
+        time.sleep(polling_interval)
+
+
 def wait_until_terminal_status(
     terminal_id: str,
     target_status: Union[TerminalStatus, set],
