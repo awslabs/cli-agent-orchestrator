@@ -18,6 +18,7 @@ Generalized from the single-endpoint pattern in ``test_handoff_equivalence.py``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from test.fixtures.decision_runtime import default_decision_runtime  # noqa: F401
 from typing import Any, Dict, List, Optional
 
 import pytest

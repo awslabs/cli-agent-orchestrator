@@ -67,6 +67,7 @@ from cli_agent_orchestrator.constants import (
     API_BASE_URL,
     CAO_HOME_DIR,
     CORS_ORIGINS,
+    DECISION_RESPONSE_HEADER,
     DEFAULT_PROVIDER,
     HANDOFF_RESULTS_ROUTE,
     INBOX_POLLING_INTERVAL,
@@ -89,6 +90,16 @@ from cli_agent_orchestrator.constants import (
     is_http_origin_allowed,
     is_ws_origin_allowed,
 )
+from cli_agent_orchestrator.decisions.engine import (
+    DelegationRequest,
+    bind_launch,
+    launch_note,
+    prepare_launch,
+)
+from cli_agent_orchestrator.decisions.owner import WORKFLOW_STEP, launch_owner
+from cli_agent_orchestrator.decisions.policy import DecisionInputError
+from cli_agent_orchestrator.decisions.targets import profile_source
+from cli_agent_orchestrator.decisions.types import LaunchPlan
 from cli_agent_orchestrator.ext_apps import mount_widget_static
 from cli_agent_orchestrator.graph.models import GraphView
 from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider
@@ -268,7 +279,22 @@ class TerminalOutputRange(BaseModel):
     data: str
 
 
-class CreateTerminalBody(BaseModel):
+def _check_create_delegation(
+    kind: Optional[str], message: Optional[str], initial: Optional[str], initial_type: Optional[str]
+) -> None:
+    if kind is not None:
+        if message is None or initial is not None:
+            raise ValueError("delegation_kind requires delegation_message and no initial_message")
+    elif message is not None and not (initial is not None and initial_type == "assign"):
+        raise ValueError("delegation_message requires delegation_kind or an ASSIGN initial_message")
+
+
+class _CreateMessageBody(BaseModel):
+    initial_message: Optional[str] = None
+    initial_message_orchestration_type: Optional[str] = None
+
+
+class CreateTerminalBody(_CreateMessageBody):
     """Optional JSON body for POST /sessions/{name}/terminals.
 
     Carries the deferred-init message payload OUT of the query string:
@@ -278,8 +304,18 @@ class CreateTerminalBody(BaseModel):
     message content lives here.
     """
 
-    initial_message: Optional[str] = None
-    initial_message_orchestration_type: Optional[str] = None
+    delegation_message: Optional[str] = Field(default=None, min_length=1)
+    delegation_kind: Optional[Literal["handoff"]] = None
+
+    @model_validator(mode="after")
+    def validate_delegation(self) -> "CreateTerminalBody":
+        _check_create_delegation(
+            self.delegation_kind,
+            self.delegation_message,
+            self.initial_message,
+            self.initial_message_orchestration_type,
+        )
+        return self
 
 
 def _check_group_size(group: Optional[List[str]]) -> Optional[List[str]]:
@@ -325,7 +361,7 @@ def _check_metadata_size(metadata: Optional[Dict]) -> Optional[Dict]:
     return metadata
 
 
-class CreateSessionBody(CreateTerminalBody):
+class CreateSessionBody(_CreateMessageBody):
     """Optional JSON body for POST /sessions.
 
     Reuses the terminal-creation message payload and keeps operator-forwarded
@@ -374,6 +410,19 @@ class CreateSessionBody(CreateTerminalBody):
     @classmethod
     def validate_metadata(cls, v: Optional[Dict]) -> Optional[Dict]:
         return _check_metadata_size(v)
+
+    delegation_message: Optional[str] = Field(default=None, min_length=1)
+    delegation_kind: Optional[Literal["handoff"]] = None
+
+    @model_validator(mode="after")
+    def validate_delegation(self) -> "CreateSessionBody":
+        _check_create_delegation(
+            self.delegation_kind,
+            self.delegation_message,
+            self.initial_message,
+            self.initial_message_orchestration_type,
+        )
+        return self
 
 
 RESUME_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,63}\Z")
@@ -638,6 +687,17 @@ class RunStepRequest(BaseModel):
                 f"{info.field_name} must be a 32-character lowercase hex string (e.g. uuid4().hex)"
             )
         return v
+
+    delegation_message: Optional[str] = Field(default=None, min_length=1)
+    orchestration_type: Optional[Literal["handoff"]] = None
+
+    @model_validator(mode="after")
+    def validate_delegation(self) -> "RunStepRequest":
+        if (self.orchestration_type is None) != (self.delegation_message is None):
+            raise ValueError("orchestration_type and delegation_message must travel together")
+        if self.orchestration_type is not None and self.reuse_terminal_id is not None:
+            raise ValueError("delegation fields cannot be combined with reuse_terminal_id")
+        return self
 
 
 class RunStepResponse(BaseModel):
@@ -3381,9 +3441,32 @@ async def uninstall_agent_plugin(
     return outcome.to_dict()
 
 
+def _launch_options(plan: LaunchPlan | None) -> dict[str, Any]:
+    return {"launch_plan": plan} if plan is not None else {}
+
+
+def _bind_unlaunched(plan: LaunchPlan | None) -> None:
+    if plan is not None:
+        try:
+            bind_launch(plan, launch_status="not_launched")
+        except Exception:
+            logger.warning("Decision launch cleanup bind failed", exc_info=True)
+
+
+def _set_launch_note(response: Response, plan: LaunchPlan | None) -> None:
+    if plan is not None:
+        try:
+            note = launch_note(plan)
+            if note:
+                response.headers[DECISION_RESPONSE_HEADER] = note
+        except Exception:
+            logger.warning("Decision response header could not be built", exc_info=True)
+
+
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
 async def create_session(
     request: Request,
+    response: Response,
     background_tasks: BackgroundTasks,
     agent_profile: str,
     provider: Optional[str] = None,
@@ -3457,6 +3540,7 @@ async def create_session(
     # enforced by CreateSessionBody's own field_validators above — invalid
     # values fail Pydantic body parsing and FastAPI returns 422 automatically,
     # before this function body ever runs.
+    launch_plan: LaunchPlan | None = None
     try:
         if session_name is not None:
             # terminal_service.create_terminal prepends SESSION_PREFIX
@@ -3493,8 +3577,26 @@ async def create_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
+        launch_provider = provider
+        if body and body.delegation_message is not None:
+            decision_provider = provider
+            if decision_provider is None:
+                decision_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
+            launch_provider = decision_provider
+            launch_plan = await prepare_launch(
+                DelegationRequest(
+                    kind="handoff" if body.delegation_kind else "assign",
+                    provider=decision_provider,
+                    agent_profile=agent_profile,
+                    model=model,
+                    message=body.delegation_message,
+                    use_worktree=use_worktree,
+                    owner=launch_owner("create_session", body),
+                    target_kind=profile_source(agent_profile),
+                )
+            )
         result = await session_service.create_session(
-            provider=provider,
+            provider=launch_provider,
             agent_profile=agent_profile,
             session_name=session_name,
             working_directory=working_directory,
@@ -3510,6 +3612,7 @@ async def create_session(
             resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
+            **_launch_options(launch_plan),
         )
 
         if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
@@ -3558,6 +3661,7 @@ async def create_session(
 
             background_tasks.add_task(_spawn_sidecar)
 
+        _set_launch_note(response, launch_plan)
         return result
 
     except IdempotencyKeyConflict as e:
@@ -3574,6 +3678,8 @@ async def create_session(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except EphemeralPolicyError as e:
         raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
+    except DecisionInputError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except WorktreeError as e:
@@ -3586,6 +3692,9 @@ async def create_session(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create session: {str(e)}",
         )
+
+    finally:
+        _bind_unlaunched(launch_plan)
 
 
 @app.get("/sessions")
@@ -3688,6 +3797,7 @@ async def delete_session(
 )
 async def create_terminal_in_session(
     request: Request,
+    response: Response,
     session_name: str,
     agent_profile: str,
     provider: Optional[str] = None,
@@ -3746,6 +3856,7 @@ async def create_terminal_in_session(
     terminal has since been torn down is stale, not conflicting, and simply
     creates fresh.
     """
+    launch_plan: LaunchPlan | None = None
     try:
         validate_tmux_name(session_name, "session_name")
         if model is not None:
@@ -3798,6 +3909,20 @@ async def create_terminal_in_session(
                     ),
                 )
 
+        # A claimed (ephemeral) launch has its own decision path; this site skips it.
+        if body and body.delegation_message is not None and claim_id is None:
+            launch_plan = await prepare_launch(
+                DelegationRequest(
+                    kind="handoff" if body.delegation_kind else "assign",
+                    provider=resolved_provider,
+                    agent_profile=agent_profile,
+                    model=model,
+                    message=body.delegation_message,
+                    use_worktree=use_worktree,
+                    owner=launch_owner("create_terminal_in_session", body),
+                    target_kind=profile_source(agent_profile),
+                )
+            )
         result = await terminal_service.create_terminal(
             provider=resolved_provider,
             agent_profile=agent_profile,
@@ -3815,7 +3940,9 @@ async def create_terminal_in_session(
             use_worktree=use_worktree,
             idempotency_key=idempotency_key,
             claim_id=claim_id,
+            **_launch_options(launch_plan),
         )
+        _set_launch_note(response, launch_plan)
         return result
     except HTTPException:
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
@@ -3840,6 +3967,8 @@ async def create_terminal_in_session(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except EphemeralPolicyError as e:
         raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
+    except DecisionInputError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except WorktreeError as e:
@@ -3852,6 +3981,9 @@ async def create_terminal_in_session(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create terminal: {str(e)}",
         )
+
+    finally:
+        _bind_unlaunched(launch_plan)
 
 
 @app.get("/sessions/{session_name}/terminals")
@@ -4329,6 +4461,7 @@ async def _record_job_state(job_id: Optional[str], state: str, **fields: Any) ->
 )
 async def run_step(
     request: Request,
+    response: Response,
     background_tasks: BackgroundTasks,
     body: RunStepRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
@@ -4542,6 +4675,7 @@ async def run_step(
             ),
         )
 
+    launch_plan: LaunchPlan | None = None
     try:
         # The branch sits AFTER the generation fence and BEFORE ``run_agent_step``,
         # and both directions are load-bearing (BR-1). After the fence: a
@@ -4633,6 +4767,29 @@ async def run_step(
                 )
             # EXECUTE falls through — the step runs normally.
 
+        owner = launch_owner("run_step", body)
+        # A claimed (ephemeral) launch has its own decision path; this site skips it.
+        if (
+            body.reuse_terminal_id is None
+            and body.claim_id is None
+            and (body.orchestration_type is not None or owner == WORKFLOW_STEP)
+        ):
+            launch_plan = await prepare_launch(
+                DelegationRequest(
+                    kind="handoff",
+                    provider=body.provider,
+                    agent_profile=body.agent,
+                    model=body.model,
+                    message=(
+                        body.delegation_message
+                        if body.delegation_message is not None
+                        else body.prompt
+                    ),
+                    use_worktree=body.use_worktree,
+                    owner=owner,
+                    target_kind=profile_source(body.agent),
+                )
+            )
         result = await run_agent_step(
             provider=body.provider,
             agent=body.agent,
@@ -4657,6 +4814,7 @@ async def run_step(
             use_worktree=body.use_worktree,
             job_id=job_id,
             claim_id=body.claim_id,
+            **_launch_options(launch_plan),
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure
@@ -4678,6 +4836,7 @@ async def run_step(
         # Persisting only after this call returns would run after the terminal
         # (the only other copy of the result) has already been torn down,
         # contradicting the "persist result, then tear down" requirement.
+        _set_launch_note(response, launch_plan)
         return RunStepResponse(
             terminal_id=result.terminal_id,
             last_message=result.last_message,
@@ -4796,6 +4955,10 @@ async def run_step(
         _settle_step(None, str(e))
         await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
+    except DecisionInputError as e:
+        _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
         await _record_job_state(job_id, "error", error_message=str(e))
@@ -4814,6 +4977,9 @@ async def run_step(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to run step: {str(e)}",
         )
+
+    finally:
+        _bind_unlaunched(launch_plan)
 
 
 # =============================================================================

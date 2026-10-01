@@ -25,7 +25,7 @@ it to an ``HTTPException``.
 import asyncio
 import logging
 import time
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from cli_agent_orchestrator.clients.database import upsert_handoff_result
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, parse_kiro_engine
@@ -41,6 +41,10 @@ from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
 from cli_agent_orchestrator.services.terminal_service import OutputMode
 from cli_agent_orchestrator.utils.terminal import wait_until_status
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.decisions.types import LaunchPlan
+
 
 logger = logging.getLogger(__name__)
 
@@ -450,6 +454,7 @@ async def run_agent_step(
     use_worktree: bool = False,
     job_id: Optional[str] = None,
     claim_id: Optional[str] = None,
+    launch_plan: "LaunchPlan | None" = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -679,6 +684,9 @@ async def run_agent_step(
 
         # create_terminal already runs provider.initialize() (which waits for
         # IDLE); a failure raises (ValueError/TimeoutError) and propagates.
+        launch_options: dict[str, Any] = (
+            {"launch_plan": launch_plan} if launch_plan is not None else {}
+        )
         terminal = await terminal_service.create_terminal(
             provider,
             agent,
@@ -692,6 +700,7 @@ async def run_agent_step(
             model=model,
             use_worktree=use_worktree,
             claim_id=claim_id,
+            **launch_options,
         )
         terminal_id = terminal.id
 

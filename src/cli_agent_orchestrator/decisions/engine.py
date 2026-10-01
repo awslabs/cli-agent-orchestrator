@@ -9,7 +9,9 @@ import uuid
 from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any, Callable, Literal, Mapping, cast
+from urllib.parse import quote
 
+from cli_agent_orchestrator.constants import MODEL_ID_RE
 from cli_agent_orchestrator.decisions.owner import DELEGATION, WORKFLOW_STEP
 from cli_agent_orchestrator.decisions.policy import (
     IDENTITY_POLICY,
@@ -507,6 +509,10 @@ def render_note(row: Mapping[str, Any]) -> str | None:
     ):
         return None
     model = row.get("launched_model") if row.get("model_honored") else None
+    if model:
+        model = "".join(
+            char if re.fullmatch(MODEL_ID_RE, char) else quote(char, safe="") for char in model
+        )
     prefix = f"ran on {model}" if model else "ran on provider default"
     outcome = row.get("outcome")
     if outcome == "fallback" and row.get("reason") in FALLBACK_REASONS:
