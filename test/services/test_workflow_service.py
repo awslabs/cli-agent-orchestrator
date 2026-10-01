@@ -865,3 +865,45 @@ async def test_drive_failure_journals_generic_error_resolver_infers_error(monkey
     row = workflow_journal.get_run("u9-error")
     steps = workflow_journal.get_steps("u9-error")
     assert _resolve_error_kind(row, steps) == "error"
+
+
+# ---------------------------------------------------------------------------
+# issue #638 — an in-band provider error is a step FAILURE, never a replayable
+# COMPLETED row. The engine classifies, journals honestly, and halts.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_provider_error_step_fails_and_journals_no_replayable_output(monkeypatch):
+    """The load-bearing half of #638 is what is NOT written.
+
+    A ``completed`` journal row is what a replay-safe resume serves WITHOUT launching
+    a terminal, so persisting a provider refusal as one would make the fault permanent
+    and free. The row must read ``failed`` with NO output, which forces re-execution.
+    """
+    from cli_agent_orchestrator.services import workflow_journal
+
+    refusal = "API Error (openai.gpt-5.6-terra): 400 Invocation of model ID is not supported."
+    monkeypatch.setattr(
+        ws,
+        "run_agent_step",
+        AsyncMock(
+            side_effect=StepExecutionError(
+                f"provider error (model_not_available) from codex: {refusal}",
+                kind="provider_error",
+                terminal_id="t-provider",
+            )
+        ),
+    )
+
+    res = await ws.start_run(_spec(retries=0, on_failure="halt"), {}, "runProviderErr")
+
+    assert res.state == RunState.FAILED
+    step = res.steps[0]
+    # Criterion 5: the RESULT distinguishes a provider refusal from a worker crash
+    # (``error``) and a timeout (``timeout``) without scraping text; criterion 2
+    # keeps the raw provider text retrievable.
+    assert (step.state, step.error_kind) == (StepState.FAILED, "provider_error")
+    assert refusal in (step.error or "")
+
+    row = workflow_journal.get_step("runProviderErr", "s1")
+    assert row is not None
+    assert (row.state, row.error_kind, row.output_json) == ("failed", "provider_error", None)

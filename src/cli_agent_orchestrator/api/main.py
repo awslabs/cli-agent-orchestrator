@@ -159,6 +159,7 @@ from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.profile_search import (
     DEFAULT_LIMIT as PROFILE_SEARCH_DEFAULT_LIMIT,
 )
+from cli_agent_orchestrator.services.provider_error_classifier import KIND_PROVIDER_ERROR
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import (
@@ -4555,7 +4556,16 @@ async def run_step(
         # Transition the script step RUNNING->FAILED (no-op for non-script callers).
         _settle_step(e.terminal_id, str(e))
         await _record_job_state(job_id, "error", terminal_id=e.terminal_id, error_message=str(e))
-        code = status.HTTP_502_BAD_GATEWAY if e.kind == "error" else status.HTTP_504_GATEWAY_TIMEOUT
+        # issue #638: kind="provider_error" (the upstream refused the call in
+        # band) is an UPSTREAM failure — 502, the same class as a crashed worker.
+        # Leaving it on the else arm would have reported a provider refusal as
+        # 504 Gateway Timeout, which tells the caller to wait longer for a step
+        # that will never answer.
+        code = (
+            status.HTTP_502_BAD_GATEWAY
+            if e.kind in ("error", KIND_PROVIDER_ERROR)
+            else status.HTTP_504_GATEWAY_TIMEOUT
+        )
         raise HTTPException(
             status_code=code,
             detail={"message": str(e), "kind": e.kind, "terminal_id": e.terminal_id},
@@ -6642,6 +6652,10 @@ async def get_workflow_run_result_endpoint(
             attempts=s.attempts,
             output=_json_or_none(s.output_json),
             error=s.error,
+            # Issue #638: carry the durable structured kind onto the RESULT too, so
+            # a cold read distinguishes a provider refusal from a crash or a
+            # timeout exactly as the live run and the failure envelope do.
+            error_kind=getattr(s, "error_kind", None),
         )
         for s in steps
     ]

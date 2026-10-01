@@ -240,6 +240,13 @@ class StepResult(BaseModel):
     attempts: int
     output: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    # ADDITIVE (issue #638): the structured failure kind, mirroring the durable
+    # ``workflow_run_step.error_kind`` column, so a consumer of the RESULT can tell
+    # a provider refusal (``"provider_error"``) from a worker crash (``"error"``)
+    # and a timeout (``"timeout"``) without regex-scraping ``error``. ``None`` on a
+    # step that settled successfully and on every row written before this column
+    # existed, so no existing response shape changes.
+    error_kind: Optional[str] = None
 
 
 class WorkflowRunResult(BaseModel):

@@ -1136,3 +1136,49 @@ class TestOutputExtractionTeardown:
         m_out.assert_called_once_with("reuse99", OutputMode.LAST)
         m_delete.assert_not_called()
         m_exit.assert_not_called()
+
+
+class TestInBandProviderError:
+    """Issue #638: the RUNTIME — not the workflow author — classifies an in-band
+    provider error. A provider that cannot load a model answers the transport
+    perfectly: the terminal reaches COMPLETED and the *error text* sits exactly
+    where the model's answer belongs, so the substrate must distinguish them.
+    """
+
+    # The exact shape from the issue report (a model id the provider rejects).
+    ERROR = (
+        "API Error (openai.gpt-5.6-terra): 400 Invocation of model ID "
+        "openai.gpt-5.6-terra isn't supported."
+    )
+
+    def test_provider_error_raises_and_leaves_the_terminal_alive(self):
+        """The step FAILS, the raw text stays retrievable, and — mirroring the
+        ``kind="error"`` crash contract — the pane is NOT reclaimed, so an operator
+        (and ``replay_single_step``) can still read the real refusal."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output=self.ERROR
+        )
+        with create, send, delete as m_delete, get_output, exit_cli as m_exit, wait, status:
+            with pytest.raises(StepExecutionError) as excinfo:
+                asyncio.run(run_agent_step("codex", "dev", "x"))
+
+        assert excinfo.value.kind == "provider_error"
+        assert self.ERROR in str(excinfo.value)  # criterion 2: text retrievable
+        m_delete.assert_not_called()
+        m_exit.assert_not_called()
+
+    def test_long_answer_quoting_a_provider_error_and_normal_answers_complete(self):
+        """Regression (criterion 4): quoting an error is not an error, and the
+        ordinary success path is untouched."""
+        quoted = "The provider replied:\n\nAPI Error (openai.gpt-5.6-terra): 400 " + (
+            "context " * 40
+        )
+        for output in (quoted, "The answer is 42."):
+            create, send, delete, get_output, exit_cli, get_wd, wait, status = (
+                _patch_terminal_layer(output=output)
+            )
+            with create, send, delete, get_output, exit_cli, wait, status:
+                result = asyncio.run(run_agent_step("codex", "dev", "x"))
+
+            assert result.status == TerminalStatus.COMPLETED
+            assert result.last_message == output

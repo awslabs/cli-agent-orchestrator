@@ -33,6 +33,9 @@ from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStat
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.services import frozen_run_memory, terminal_service
+from cli_agent_orchestrator.services.provider_error_classifier import (
+    classify_provider_error,
+)
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
 from cli_agent_orchestrator.services.terminal_service import OutputMode
@@ -116,15 +119,19 @@ async def _validate_reused_terminal(
 class StepExecutionError(Exception):
     """A step failed to complete successfully.
 
-    Raised for a readiness/completion timeout or a terminal that reached
-    ``TerminalStatus.ERROR``. Narrow by design so the caller (engine) can map
+    Raised for a readiness/completion timeout, a terminal that reached
+    ``TerminalStatus.ERROR``, or an in-band provider error (issue #638,
+    ``"provider_error"``). Narrow by design so the caller (engine) can map
     it to its retry policy and the API boundary can map it to an HTTPException.
 
     Carries two structured fields so callers never have to scrape the message:
 
     - ``kind`` distinguishes a worker that *ran long* (``"timeout"``) from one
-      that *crashed* (``"error"``, i.e. the terminal reached ERROR). The two
-      were previously indistinguishable — both surfaced as a 504 "timed out".
+      that *crashed* (``"error"``, i.e. the terminal reached ERROR) — the two
+      were previously indistinguishable, both surfacing as a 504 "timed out" —
+      and, additively, from one whose provider refused the call *in band*
+      (``"provider_error"``), which the step produced no answer for. A consumer
+      that switches on ``kind`` must therefore not assume only two members.
     - ``terminal_id`` is the live terminal the step ran on (when known), so a
       failed caller can report/clean it up without regex-scraping the message.
     """
@@ -791,6 +798,25 @@ async def run_agent_step(
         if teardown and created_here:
             await _best_effort_teardown(terminal_id, registry)
         raise
+
+    # In-band provider-error classification (issue #638). The transport succeeded
+    # — the CLI printed the refusal and settled — so everything below would have
+    # reported a successful step carrying the ERROR TEXT as its answer, and a
+    # replay-safe resume would then serve that text forever without ever
+    # launching a terminal. Classify BEFORE the result is built so the step is
+    # NEVER journaled as a replayable completed outcome.
+    #
+    # The terminal is deliberately left ALIVE (no teardown), exactly like the
+    # ``kind="error"`` crash path: an operator, and ``replay_single_step``, need
+    # the live pane to read the actual provider error. The RAW text travels on
+    # the exception so it stays retrievable after the step fails.
+    provider_error = classify_provider_error(provider, last_message)
+    if provider_error is not None:
+        raise StepExecutionError(
+            f"provider error ({provider_error.slug}) from {provider}: {provider_error.line}",
+            kind=provider_error.kind,
+            terminal_id=terminal_id,
+        )
 
     result = AgentStepResult(
         terminal_id=terminal_id,
