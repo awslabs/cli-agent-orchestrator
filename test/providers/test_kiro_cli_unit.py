@@ -2146,8 +2146,8 @@ class TestKiroCli225Tui:
         message = provider.extract_last_message_from_script(
             load_fixture("kiro_cli_tui_2_25_completed_output.txt")
         )
-        assert "SLEEP-MARK" in message
-        assert "done" in message
+        assert message == "done"
+        assert "SLEEP-MARK" not in message
         assert "What's new" not in message
         assert "Run this exact shell command" not in message
         assert "Trust All Tools active" not in message
@@ -2167,6 +2167,21 @@ class TestKiroCli225Tui:
             load_fixture("kiro_cli_tui_2_25_multiturn_output.txt")
         )
         assert message == "SECOND42"
+
+    def test_225_extractor_uses_the_final_bullet_block_for_the_reply(self):
+        """A bulleted prompt echo must not be prepended to the assistant reply."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        lines = [
+            "▸ Credits: turn 0.08 • session 0.08 | Time: 1s",
+            "  • Map the public endpoints.",
+            "",
+            "• There are two public endpoints.",
+            "▸ Credits: turn 0.12 • session 0.20 | Time: 2s",
+        ]
+        assert (
+            provider._extract_tui_225_message(lines, 4)
+            == "There are two public endpoints."
+        )
 
     def test_225_extractor_returns_none_without_a_bullet_reply(self):
         """A 2.25 turn with no assistant bullet must not reuse chrome as the answer."""

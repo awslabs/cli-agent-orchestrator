@@ -792,8 +792,9 @@ class KiroCliProvider(BaseProvider):
         bullet-prefixed line and can render a one-word reply immediately below
         the echoed prompt, so paragraph splitting cannot distinguish the two.
         Keep the previous Credits line as the start anchor and the current
-        Credits line as the end anchor; within that turn, the first bullet line
-        is the assistant's reply.
+        Credits line as the end anchor. The prompt echo and tool rows can also
+        be bullet-prefixed, so use the final contiguous bullet block before the
+        Credits line as the assistant reply boundary.
         """
         prev_credits_idx = -1
         for i in range(credits_idx - 1, -1, -1):
@@ -802,9 +803,13 @@ class KiroCliProvider(BaseProvider):
                 break
 
         reply_start = None
-        for i in range(prev_credits_idx + 1, credits_idx):
+        for i in range(credits_idx - 1, prev_credits_idx, -1):
             if re.search(TUI_225_REPLY_PATTERN, lines[i]):
                 reply_start = i
+                while reply_start - 1 > prev_credits_idx and re.search(
+                    TUI_225_REPLY_PATTERN, lines[reply_start - 1]
+                ):
+                    reply_start -= 1
                 break
 
         if reply_start is None:
