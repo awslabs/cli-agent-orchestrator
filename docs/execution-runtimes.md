@@ -102,9 +102,9 @@ retried until the runtime confirms it (see [Commands](#commands)).
   `CAO_RUNTIME_TOKEN`; both are then removed from the process environment.
   `cao-server` reads it first thing at startup, before any event plugin loads.
   tmux never passes either variable to a pane. The EKS image's entrypoint
-  removes it before its setup steps (`cao init`, `cao install`, the provider
-  warm-up) and passes it only to the `cao-bridge` or `cao-server` it finally
-  starts.
+  removes both forms before its setup steps (`cao init`, `cao install`, the
+  provider warm-up) and passes them only to the `cao-bridge` or `cao-server`
+  it finally starts.
 - A command that has not been written when its connection is replaced or
   drops is never written; it fails with `503`.
 - The token authenticates a runtime, not an agent. Agents in a runtime run as

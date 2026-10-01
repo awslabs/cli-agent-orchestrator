@@ -23,6 +23,7 @@ pytestmark = pytest.mark.skipif(BASH is None, reason="needs bash")
 # file was still there.
 RECORDER = """#!/bin/sh
 printf '%s %s TOKEN=%s\\n' "$(basename "$0")" "$*" "${CAO_RUNTIME_TOKEN-<unset>}" >> "$STUB_LOG"
+printf '%s %s\\n' "$(basename "$0")" "${CAO_RUNTIME_TOKEN_FILE-<unset>}" >> "$STUB_LOG.file"
 if [ -n "${CAO_BRIDGE_READY_FILE:-}" ] && [ -e "$CAO_BRIDGE_READY_FILE" ]; then
   echo "$(basename "$0") $1" >> "$STUB_LOG.ready"
 elif [ -n "${CAO_WATCH_READY:-}" ] && [ -e "$CAO_WATCH_READY" ]; then
@@ -105,3 +106,15 @@ def test_the_default_readiness_file_is_cleared_too(tmp_path):
     _run(tmp_path, CAO_NODE_MODE="bridge", CAO_WATCH_READY=str(ready))
     seen = tmp_path / "calls.log.ready"
     assert not seen.exists(), f"ran while the old readiness file was there: {seen.read_text()}"
+
+
+@pytest.mark.parametrize("mode,final", [("bridge", "cao-bridge"), ("server", "cao-server")])
+def test_only_the_final_process_learns_where_the_token_file_is(tmp_path, mode, final):
+    # The file form names a readable, mounted Secret: as good as the token.
+    _run(tmp_path, CAO_NODE_MODE=mode, CAO_RUNTIME_TOKEN_FILE="/var/run/cao/runtime-token/token")
+    seen = dict(
+        line.split(" ", 1) for line in (tmp_path / "calls.log.file").read_text().splitlines()
+    )
+    assert seen.pop(final) == "/var/run/cao/runtime-token/token"
+    assert set(seen) == {"cao", "claude"}
+    assert set(seen.values()) == {"<unset>"}, seen
