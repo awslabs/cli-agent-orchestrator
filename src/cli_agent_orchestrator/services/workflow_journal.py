@@ -1169,11 +1169,13 @@ def settle_step(
     """Settle a script call's row — state, count, envelope, output, error — atomically (B).
 
     The second half of the split write, and the whole of FR-4 guard 1: ``state``,
-    ``attempts``, ``result_json``, ``output_json`` and ``error`` land in ONE
-    statement on ONE connection, so there is no window in which the row reads
-    settled and carries no result (BR-1, INV-1). A failure writes nothing and
-    leaves the row as :func:`begin_step` set it — ``running``, which is not
-    settled (BR-2). Atomic means never half-written, not never-failing.
+    ``attempts``, ``result_json``, ``output_json``, ``error`` and the optional
+    ``error_kind`` land in ONE statement on ONE connection, so there is no window
+    in which the row reads settled and carries no result (BR-1, INV-1). A failure
+    writes nothing and leaves the row as :func:`begin_step` set it — ``running``,
+    which is not settled (BR-2). Atomic means never half-written, not never-failing.
+    ``error_kind`` is a trailing additive parameter; its default preserves every
+    existing seven-argument caller.
 
     Returns ``True`` when a row already existed and ``False`` when this settle
     created it — the no-begin rescue path below. The caller logs that

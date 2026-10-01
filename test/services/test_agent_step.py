@@ -1151,16 +1151,21 @@ class TestInBandProviderError:
         "openai.gpt-5.6-terra isn't supported."
     )
 
-    @pytest.mark.parametrize("provider", ("codex", "claude_code"))
     @pytest.mark.parametrize(
-        "output",
+        ("provider", "output"),
         (
-            "429",
-            "Rate limiting protects APIs from burst traffic.",
-            "Unknown model types use the fallback serializer.",
-            "Rate limit exceeded is a common HTTP 429 explanation.",
-            "Unknown model 'placeholder' is a useful teaching example.",
-            "Authentication failed is an expected unit-test outcome.",
+            ("codex", "429"),
+            ("codex", "Rate limiting protects APIs from burst traffic."),
+            ("codex", "Unknown model types use the fallback serializer."),
+            ("codex", "Rate limit exceeded is a common HTTP 429 explanation."),
+            ("codex", "Unknown model 'placeholder' is a useful teaching example."),
+            ("codex", "API Error: none found - all 42 endpoints return 2xx."),
+            ("codex", "rate_limit = 100"),
+            ("codex", "Model weights not found."),
+            ("claude_code", "Rate limit exceeded."),
+            ("claude_code", "Authentication failed."),
+            ("claude_code", "Authentication failed is an expected unit-test outcome."),
+            ("claude_code", "Unknown model 'gpt-4o-mini'"),
         ),
     )
     def test_ordinary_short_answers_complete(self, provider, output):

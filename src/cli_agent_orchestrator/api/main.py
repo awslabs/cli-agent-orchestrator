@@ -6521,31 +6521,23 @@ def _durable_error_kind(steps: List[Any]) -> Optional[str]:
 def _resolve_error_kind(row: Any, steps: List[Any]) -> Optional[str]:
     """Resolve the terminal ``kind`` for an assembled ``WorkflowRunResult`` (U4 seam).
 
-    U4 shipped the CALL SITE plus the ADR-5 inference FLOOR; U9 enriches this SAME
+    U4 shipped the CALL SITE plus the ADR-5 inference FLOOR; U9 enriched this SAME
     function with column-first precedence (kept a single module-level function so
-    the swap is confined, RP-5). Precedence:
+    the swap is confined, RP-5). Run state is now the OUTER decision, because a
+    completed script may retain a failed step it caught deliberately:
 
-    1. Column-first (RP-1): a durable ``error_kind`` on the step projection wins
-       authoritatively — the inference is NOT consulted. INERT until #504's column
-       lands (``_durable_error_kind`` returns ``None`` for pre-migration rows).
-    2. Inference fallback (RP-2, pre-migration rows only) — the RR-4 floor:
-
-       - CANCELLED run                                 -> ``"cancelled"``
-       - FAILED run with a step error matching /timeout/i -> ``"timeout"``
-       - FAILED run otherwise                          -> ``"error"``
-       - COMPLETED / RUNNING / anything else           -> ``None``
+    1. State-first (RP-4): COMPLETED or non-terminal -> ``None``; CANCELLED ->
+       ``"cancelled"``. A retained step kind never changes the run-level verdict.
+    2. FAILED, column-first (RP-1): a durable ``error_kind`` on the step projection
+       wins authoritatively — the inference is NOT consulted.
+    3. FAILED, inference fallback (RP-2, pre-migration rows only) — the RR-4 floor:
+       a step error matching /timeout/i -> ``"timeout"``; otherwise ``"error"``.
 
     The timeout branch is a conservative case-insensitive substring match, never a
     parse, and no kind is ever fabricated for a completed/non-terminal run (RP-4).
     """
     from cli_agent_orchestrator.models.workflow_runtime import RunState
 
-    # Column-first (RP-1): authoritative when present; inert (None) pre-migration.
-    durable = _durable_error_kind(steps)
-    if durable is not None:
-        return durable
-
-    # Inference fallback (RP-2) — the ADR-5 floor for pre-migration rows.
     try:
         run_state = RunState(row.state)
     except ValueError:
@@ -6553,12 +6545,19 @@ def _resolve_error_kind(row: Any, steps: List[Any]) -> Optional[str]:
 
     if run_state == RunState.CANCELLED:
         return "cancelled"
-    if run_state == RunState.FAILED:
-        for s in steps:
-            if s.error and re.search(r"timeout", s.error, re.IGNORECASE):
-                return "timeout"
-        return "error"
-    return None
+    if run_state != RunState.FAILED:
+        return None
+
+    # FAILED only: durable kind is authoritative when present.
+    durable = _durable_error_kind(steps)
+    if durable is not None:
+        return durable
+
+    # Inference fallback (RP-2) — the ADR-5 floor for pre-migration rows.
+    for s in steps:
+        if s.error and re.search(r"timeout", s.error, re.IGNORECASE):
+            return "timeout"
+    return "error"
 
 
 def _build_failure_envelope(

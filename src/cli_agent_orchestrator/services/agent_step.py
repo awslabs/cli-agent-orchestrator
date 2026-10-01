@@ -16,9 +16,10 @@ backend alone, with no per-step tmux/herdr branching.
 Failure contract (RD-2.1 / REL-3.3): ``run_agent_step`` returns an
 ``AgentStepResult`` ONLY on success (status COMPLETED). Every failure mode —
 the readiness/completion wait timing out, the terminal reaching
-``TerminalStatus.ERROR`` — RAISES a narrow exception. It NEVER returns a falsy
-or ``None`` "success". The caller (engine) maps the raised exception to its 3x
-retry policy (FR-5.3); the HTTP handler maps it to an ``HTTPException``.
+``TerminalStatus.ERROR``, or an in-band provider refusal — RAISES a narrow
+exception. It NEVER returns a falsy or ``None`` "success". The caller (engine)
+maps the raised exception to its 3x retry policy (FR-5.3); the HTTP handler maps
+it to an ``HTTPException``.
 """
 
 import asyncio
@@ -572,8 +573,9 @@ async def run_agent_step(
         ``AgentStepResult`` with status COMPLETED — ONLY on success.
 
     Raises:
-        StepExecutionError: readiness/completion wait timed out (``kind="timeout"``)
-            or the terminal reached ``TerminalStatus.ERROR`` (``kind="error"``).
+        StepExecutionError: readiness/completion wait timed out (``kind="timeout"``),
+            the terminal reached ``TerminalStatus.ERROR`` (``kind="error"``), or the
+            provider refused the call in band (``kind="provider_error"``).
             ``terminal_id`` carries the live terminal so the caller can clean up.
         StepCancelledError: ``cancel_event`` fired during the completion wait
             (issue #409b) — a cancellation, NOT a run-failure (do not retry).
@@ -807,9 +809,11 @@ async def run_agent_step(
     # NEVER journaled as a replayable completed outcome.
     #
     # The terminal is deliberately left ALIVE (no teardown), exactly like the
-    # ``kind="error"`` crash path: an operator, and ``replay_single_step``, need
-    # the live pane to read the actual provider error. The RAW text travels on
-    # the exception so it stays retrievable after the step fails.
+    # ``kind="error"`` crash path, so the calling engine can keep the live pane
+    # available to an operator. Teardown remains the caller's decision:
+    # ``replay_single_step`` reclaims it, while the drive loop retains it on the
+    # step for inspection. The RAW text travels on the exception so it stays
+    # retrievable after the step fails.
     provider_error = classify_provider_error(provider, last_message)
     if provider_error is not None:
         raise StepExecutionError(

@@ -9,12 +9,12 @@ from "the model refused to load", so the RUNTIME classifies it: CAO launched the
 CLI and knows its error signatures.
 
 DELIBERATELY NARROW (issue #638, criterion 4). A MISSED classification degrades to
-today's behaviour; a false one would fail a step that really answered. So three
+today's behaviour; a false one would fail a step that really answered. So four
 independent guards: only the FIRST non-empty line is tested; any output longer than
-:data:`PROVIDER_ERROR_MAX_CHARS` is out of scope; and only a fixed table of
-provider-owned error shapes that consume the WHOLE line can match. Common words or
-status-code prefixes in ordinary prose are therefore answers without matching chrome,
-not refusals. The runtime-side companion of
+:data:`PROVIDER_ERROR_MAX_CHARS` is out of scope; each row applies only to the
+provider adapters that emit that chrome; and the pattern must consume the WHOLE line.
+Common words, status-code values, or error vocabulary in another adapter's ordinary
+prose are therefore answers, not refusals. The runtime-side companion of
 :meth:`BaseProvider.get_error_message`, which asks the same question of a provider
 *instance* holding a live terminal buffer.
 """
@@ -34,7 +34,7 @@ KIND_PROVIDER_ERROR = "provider_error"
 
 
 class ProviderErrorSignature(NamedTuple):
-    """One start-anchored provider-error signature.
+    """One full-line, provider-scoped error signature.
 
     ``slug`` names the refusal *family* for diagnostics only; it is NOT what travels
     as ``kind``, because the recovery decision (retry, never replay) is identical for
@@ -57,47 +57,56 @@ class ProviderErrorSignature(NamedTuple):
 # line. The full-line requirement is the false-positive guard: matching a common
 # prefix inside arbitrary assistant prose is not provider-owned evidence.
 _ROWS = (
-    # Require the provider chrome's colon; short prose such as "API Error
-    # handling should preserve context." is an answer, not a refusal.
-    ("api_error", r"API ?Error(?:\s*\([^)\n]{1,80}\))?\s*:.*", None),
+    # Codex/Claude transport chrome. Require a structured HTTP status after the
+    # colon; an ordinary answer opening with "API Error:" is not provider refusal.
+    (
+        "api_error",
+        r"API ?Error(?:\s*\([^)\n]{1,80}\))?\s*:\s*\d{3}\b.*",
+        ("claude_code", "codex"),
+    ),
     # Model rejection, with or without the leading HTTP status code.
     (
         "model_not_available",
         r"(?:\d{3}\s+)?Invocation of model ID\s+.+?\s+"
         r"(?:isn't supported|is not supported|not found|unavailable|is invalid)\s*[.!]?",
-        None,
+        ("codex",),
+    ),
+    # Colon/equals forms are provider chrome. Quoted names are deliberately NOT
+    # enough: "Unknown model 'x'" is also a plausible one-line answer.
+    (
+        "model_not_available",
+        r"(?:Unknown|Unsupported|Invalid|Undefined)\s+model\s*[:=]\s*\S.*",
+        ("claude_code", "codex", "grok_cli"),
     ),
     (
         "model_not_available",
-        r"(?:Unknown|Unsupported|Invalid|Undefined) model\s+" r"(?:['\"`][^'\"`\n]+['\"`]|[:=].+)",
-        None,
-    ),
-    (
-        "model_not_available",
-        r"Model\s+\S.+?\s+(?:isn't supported|is not supported|not found|unavailable)"
+        r"Model\s+(?=[A-Za-z0-9._/-]*[0-9._-])[A-Za-z0-9][A-Za-z0-9._/-]*"
+        r"\s+(?:isn't supported|is not supported|not found|unavailable)"
         r"(?:\s+by this account)?\s*[.!]?",
-        None,
+        ("codex",),
     ),
-    # Credential / quota refusals — the provider started but cannot reach a model.
+    # Credential / quota refusals from adapters whose documented status detector
+    # owns these strings. Require a colon/equals detail; a terminal period alone is
+    # indistinguishable from ordinary prose.
     (
         "auth_or_quota",
         r"(?:Authentication failed|Not authenticated|Sign in required|Invalid API key|"
         r"invalid_api_key|insufficient_quota|quota exceeded)"
-        r"(?:\s*[:=]\s*.+|\s*[.!])?",
-        None,
+        r"\s*[:=]\s*\S.+",
+        ("grok_cli", "mcode"),
     ),
-    # Throttling: the upstream refused the call, so the step produced no answer.
+    # Throttling. The status/diagnostic forms carry enough structure to be chrome;
+    # bare "Rate limit exceeded." or "rate_limit = 100" do not.
     (
         "rate_limited",
-        r"(?:Rate limit exceeded(?:\s*[,.:]\s*(?:retry|try|please).*)?|"
-        r"rate_limit(?:\s*[:=]\s*.+)?|"
+        r"(?:Rate limit exceeded\s*[,.:]\s*(?:retry|try|please)\b.*|"
+        r"rate_limit(?:_error)?\s*[:=]\s*(?:rate limit|too many|exceeded|retry|try)\b.*|"
         r"429\s*:\s*rate limit(?:ing|ed)?(?:\s+exceeded)?(?:\s*[,.:].*)?|"
-        r"429\s+Too Many Requests)"
-        r"\s*[.!]?",
-        None,
+        r"429\s+Too Many Requests)",
+        ("claude_code", "codex"),
     ),
-    # Transport failures the provider reports IN BAND, as assistant text.
-    ("connection_error", r"(?:ConnectionError|APIConnectionError):.*", None),
+    # Kimi reports transport failures as column-zero terminal chrome.
+    ("connection_error", r"(?:ConnectionError|APIConnectionError):\s*\S.*", ("kimi_cli",)),
 )
 
 _SIGNATURES: Tuple[ProviderErrorSignature, ...] = tuple(
@@ -119,10 +128,10 @@ class ProviderErrorMatch(NamedTuple):
 def classify_provider_error(provider: str, output: Optional[str]) -> Optional[ProviderErrorMatch]:
     """Classify ``output`` as an in-band provider error, or return ``None``.
 
-    ``provider`` selects eligible signatures only — it never decides whether the
-    output is a refusal at all. ``None`` is returned when the output is empty,
-    longer than :data:`PROVIDER_ERROR_MAX_CHARS`, or has a first non-empty line
-    matching no signature. Each signature consumes the whole first non-empty line, so
+    ``provider`` scopes every signature to adapters that actually emit that chrome.
+    ``None`` is returned when the output is empty, longer than
+    :data:`PROVIDER_ERROR_MAX_CHARS`, or has a first non-empty line matching no
+    eligible signature. Each signature consumes the whole first non-empty line, so
     ordinary prose that merely starts with an error word is not provider-owned evidence.
     The RAW text is never rewritten or truncated here.
     """

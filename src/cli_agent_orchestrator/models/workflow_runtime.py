@@ -243,9 +243,10 @@ class StepResult(BaseModel):
     # ADDITIVE (issue #638): the structured failure kind, mirroring the durable
     # ``workflow_run_step.error_kind`` column, so a consumer of the RESULT can tell
     # a provider refusal (``"provider_error"``) from a worker crash (``"error"``)
-    # and a timeout (``"timeout"``) without regex-scraping ``error``. ``None`` on a
-    # step that settled successfully and on every row written before this column
-    # existed, so no existing response shape changes.
+    # and a timeout (``"timeout"``) without regex-scraping ``error``. Because this
+    # model dumps defaults, existing result/`--json` response shapes gain a nullable
+    # ``error_kind`` key on every step; the value is ``None`` for successful steps
+    # and rows written before this column existed.
     error_kind: Optional[str] = None
 
 

@@ -1086,6 +1086,7 @@ def test_completion_creates_step_state_when_missing(_patched_journal):
 
     assert "s1" in record.step_states
     assert record.step_states["s1"].state == StepState.COMPLETED
+    assert record.step_states["s1"].attempts == 1
 
 
 @pytest.mark.asyncio

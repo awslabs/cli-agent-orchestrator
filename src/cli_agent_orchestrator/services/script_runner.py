@@ -749,7 +749,8 @@ def record_step_completion(
     - ``StepExecutionError`` (a crashed/timed-out step) -> ``FAILED`` with the
       error string recorded.
 
-    THE CALLBACK TAKES ``(terminal_id, error, last_message, response_status=None)``.
+    THE CALLBACK TAKES
+    ``(terminal_id, error, last_message, response_status=None, error_kind=None)``.
     ``last_message`` is the step's raw text result, needed for the durable result
     envelope: a settled row with no envelope is precisely what FR-4 guard 1 exists
     to prevent, and an envelope built without the step's own output would satisfy
@@ -761,7 +762,9 @@ def record_step_completion(
     ``last_message`` and ``response_status`` are both ``None`` on every failure arm,
     where the step produced no message — a FAILED step still gets an envelope (unit
     2 BR-1), because envelope ABSENCE must keep meaning *a crash between the
-    writes* and never *the step failed*.
+    writes* and never *the step failed*. ``error_kind`` is an additive trailing
+    optional argument carrying ``StepExecutionError.kind`` onto a failed step; its
+    default preserves every existing four-argument callback call.
 
     ``provider``/``agent``/``prompt`` WERE PARAMETERS AND ARE GONE (TD-5). They
     existed only to compute the call fingerprint here, and the fingerprint no longer
