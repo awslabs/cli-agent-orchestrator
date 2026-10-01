@@ -1014,19 +1014,9 @@ def _guard_provider_artifact_ownership(
     destination = _provider_artifact_path(provider, profile_name)
     if destination is None:
         return
-    try:
-        entry = _entry_occupying(destination)
-        if entry is None:
-            return
-        if not stat.S_ISREG(os.lstat(destination.parent / entry).st_mode):
-            # Not a file CAO wrote; the sink's own write reports the real problem.
-            return
-    except FileNotFoundError:
+    entry = _regular_entry_occupying(destination, source_name, profile_name, provider)
+    if entry is None:
         return
-    except OSError as exc:
-        # Same rule as the context probe: an I/O fault is not evidence the slot is
-        # free, and the remedy is access, not deletion.
-        _raise_unreadable_provider_artifact(source_name, profile_name, destination, exc, provider)
 
     if entry == destination.name:
         if self_owned:
@@ -1065,6 +1055,88 @@ def _guard_provider_artifact_ownership(
         f"overwrite the {provider} agent file '{destination}'{aliased}, which belongs to "
         f"{owner}. The install was refused rather than silently replace it.{remedy}"
     )
+
+
+def _regular_entry_occupying(
+    destination: Path, source_name: str, profile_name: str, provider: str
+) -> Optional[str]:
+    """The regular-file entry a write to ``destination`` would replace, or ``None``.
+
+    ``None`` when nothing is there or the occupant is not a regular file (not a
+    file CAO wrote; the sink's own write reports the real problem). An I/O
+    fault is refused the same way as at the context probe: it is not evidence
+    the slot is free, and the remedy is access, not deletion.
+    """
+    try:
+        entry = _entry_occupying(destination)
+        if entry is None:
+            return None
+        if not stat.S_ISREG(os.lstat(destination.parent / entry).st_mode):
+            return None
+        return entry
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        _raise_unreadable_provider_artifact(source_name, profile_name, destination, exc, provider)
+    return None
+
+
+# Every provider whose install writes a per-agent file next to the shared
+# context copy; the others (claude_code, codex, ...) leave only that copy.
+_ARTIFACT_PROVIDERS = (
+    ProviderType.KIRO_CLI.value,
+    ProviderType.COPILOT_CLI.value,
+    ProviderType.OPENCODE_CLI.value,
+)
+
+
+def _guard_no_orphaned_artifact_is_adopted(
+    source_name: str, profile_name: str, provider: str
+) -> None:
+    """Refuse to create a context record while another provider's file for the name is orphaned.
+
+    Reached only when no context record exists for ``profile_name`` in any lookup
+    directory, so the install is about to write the first one. That record is
+    what every later install reads as proof of ownership -- including the
+    provider probe, which lets a ``self_owned`` install replace its own file.
+    So the record must not be created while a file this profile did not write
+    is sitting at any provider's destination for the name with no record to
+    vouch for it: ``alpha`` installed for OpenCode, its context copy hand-deleted,
+    then a distinct ``beta`` of the same name installed for ``claude_code`` (or
+    Kiro) used to get a fresh record carrying beta's marker, and beta's next
+    OpenCode install overwrote alpha's file on the strength of it (round-6
+    review of #493). The target provider's own destination is handled, with
+    its alias cases, by :func:`_guard_provider_artifact_ownership`; this covers
+    the destinations the install will NOT write.
+
+    Only orphans block: a file whose on-disk spelling resolves to a record
+    naming another profile belongs to that profile's own install for that
+    provider and is not this sink's concern.
+    """
+    for artifact_provider in _ARTIFACT_PROVIDERS:
+        if artifact_provider == provider:
+            continue
+        destination = _provider_artifact_path(artifact_provider, profile_name)
+        if destination is None:
+            continue
+        entry = _regular_entry_occupying(destination, source_name, profile_name, provider)
+        if entry is None:
+            continue
+        if entry != destination.name:
+            owner_stem, record = _context_record_owner(
+                _artifact_stem(entry, _artifact_suffix(artifact_provider))
+            )
+            if owner_stem is not None or record is not None:
+                continue
+        orphan = destination if entry == destination.name else destination.parent / entry
+        raise _collision_error_class(provider)(
+            f"Installing '{source_name}.md' (name '{profile_name}') for {provider} would "
+            f"create the ownership record for '{profile_name}' while the {artifact_provider} "
+            f"agent file '{orphan}' belongs to no installed profile CAO knows of. The install "
+            "was refused rather than let a new record claim that file for a later "
+            f"{artifact_provider} install. If '{orphan}' is a leftover from an uninstalled or "
+            "hand-deleted profile, delete it and reinstall."
+        )
 
 
 def _artifact_suffix(provider: str) -> str:
@@ -1197,6 +1269,11 @@ def _guard_installed_copy_ownership(source_name: str, profile_name: str, provide
     _guard_provider_artifact_ownership(
         source_name, profile_name, provider, target_id, self_owned=self_owned
     )
+    if not self_owned:
+        # No record exists for this name, so this install writes the first one.
+        # It must not be created over a file some other provider's install left
+        # behind, or it would vouch for that file at the next install.
+        _guard_no_orphaned_artifact_is_adopted(source_name, profile_name, provider)
 
 
 def _materialize_opencode_mcp(

@@ -798,3 +798,113 @@ class TestUnenumerableProviderDirectory:
         assert "Fix the file's permissions" in r2.output
         assert "delete it and reinstall" not in r2.output
         assert "V1" in (workspace["agents_dir"] / "shared.md").read_text()
+
+
+class TestRecreatedContextRecordDoesNotAdoptOrphans:
+    """Round 6 (haofeif P2): ``self_owned`` proved ownership of the CURRENT
+    context record, not of the provider file. Install ``alpha`` (``name:
+    shared``), delete only its context copy, install a distinct ``beta`` with the
+    same name through a provider that writes no file there (``claude_code``, or
+    any other artifact-writing provider): that install recreated the record with
+    beta's marker without looking at alpha's surviving file, and beta's next
+    install for alpha's provider then overwrote it on the strength of that
+    record. A new record must not be created while any provider's file for the
+    name is orphaned."""
+
+    ARTIFACT_PROVIDERS = ["opencode_cli", "kiro_cli", "copilot_cli"]
+
+    @staticmethod
+    def _artifact(workspace: Dict[str, Any], provider: str) -> Path:
+        return install_service._provider_artifact_path(provider, "shared")  # type: ignore[return-value]
+
+    @pytest.mark.parametrize("provider", ARTIFACT_PROVIDERS)
+    def test_intervening_claude_code_install_is_refused_naming_the_orphan(
+        self, runner: CliRunner, workspace: Dict[str, Any], provider: str
+    ) -> None:
+        store = workspace["local_store"]
+        _write_profile(store / "alpha.md", name="shared", body="ALPHA-BODY")
+        _ok(_install_for(runner, "alpha", provider))
+        artifact = self._artifact(workspace, provider)
+        before = artifact.read_bytes()
+        (workspace["context_dir"] / "shared.md").unlink()
+
+        _write_profile(store / "beta.md", name="shared", body="BETA-BODY")
+        r2 = _install_for(runner, "beta", "claude_code")
+
+        _refused(r2)
+        assert str(artifact) in r2.output, r2.output
+        assert "no installed profile CAO knows of" in r2.output
+        assert "delete it and reinstall" in r2.output
+        # No record was created for beta, so nothing can later vouch for it.
+        assert not (workspace["context_dir"] / "shared.md").exists()
+
+        # The sequence's payoff step is still refused and alpha's file intact.
+        r3 = _install_for(runner, "beta", provider)
+        _refused(r3)
+        assert artifact.read_bytes() == before
+
+    def test_intervening_install_through_another_artifact_provider_is_refused(
+        self, runner: CliRunner, workspace: Dict[str, Any]
+    ) -> None:
+        store = workspace["local_store"]
+        _write_profile(store / "alpha.md", name="shared", body="ALPHA-BODY")
+        _ok(_install(runner, "alpha"))
+        (workspace["context_dir"] / "shared.md").unlink()
+
+        _write_profile(store / "beta.md", name="shared", body="BETA-BODY")
+        r2 = _install_for(runner, "beta", "kiro_cli")
+
+        _refused(r2)
+        assert str(workspace["agents_dir"] / "shared.md") in r2.output, r2.output
+        assert not (workspace["kiro_agents_dir"] / "shared.json").exists()
+        assert not (workspace["context_dir"] / "shared.md").exists()
+
+        r3 = _install(runner, "beta")
+        _refused(r3)
+        assert "ALPHA-BODY" in (workspace["agents_dir"] / "shared.md").read_text()
+
+    def test_own_record_still_covers_own_files_for_every_provider(
+        self, runner: CliRunner, workspace: Dict[str, Any]
+    ) -> None:
+        """Control: the same profile installed for several providers owns all of
+        its files through its one record, and reinstalls for any of them -- or
+        for a provider without a file -- go through."""
+        store = workspace["local_store"]
+        _write_profile(store / "alpha.md", name="shared", body="V1")
+        _ok(_install(runner, "alpha"))
+        _ok(_install_for(runner, "alpha", "kiro_cli"))
+        _ok(_install_for(runner, "alpha", "copilot_cli"))
+
+        _write_profile(store / "alpha.md", name="shared", body="V2")
+        _ok(_install_for(runner, "alpha", "claude_code"))
+        _ok(_install(runner, "alpha"))
+        assert "V2" in (workspace["agents_dir"] / "shared.md").read_text()
+
+    def test_removing_the_orphan_lets_the_sequence_through(
+        self, runner: CliRunner, workspace: Dict[str, Any]
+    ) -> None:
+        """Control: the remedy named in the refusal is sufficient."""
+        store = workspace["local_store"]
+        _write_profile(store / "alpha.md", name="shared", body="ALPHA-BODY")
+        _ok(_install(runner, "alpha"))
+        (workspace["context_dir"] / "shared.md").unlink()
+        _write_profile(store / "beta.md", name="shared", body="BETA-BODY")
+        _refused(_install_for(runner, "beta", "claude_code"))
+
+        (workspace["agents_dir"] / "shared.md").unlink()
+        _ok(_install_for(runner, "beta", "claude_code"))
+        _ok(_install(runner, "beta"))
+        assert "BETA-BODY" in (workspace["agents_dir"] / "shared.md").read_text()
+
+    def test_unrelated_name_is_not_blocked_by_someone_elses_orphan(
+        self, runner: CliRunner, workspace: Dict[str, Any]
+    ) -> None:
+        """Control: only files for THIS name are consulted."""
+        store = workspace["local_store"]
+        _write_profile(store / "alpha.md", name="shared", body="ALPHA-BODY")
+        _ok(_install(runner, "alpha"))
+        (workspace["context_dir"] / "shared.md").unlink()
+
+        _write_profile(store / "gamma.md", name="other", body="GAMMA")
+        _ok(_install_for(runner, "gamma", "claude_code"))
+        _ok(_install(runner, "gamma"))
