@@ -49,12 +49,23 @@ PORT="${CAO_API_PORT:-9889}"
 
 # The runtime-channel token (#745) belongs only to the process this script
 # finally execs: cao-bridge, or cao-server checking the runtimes that dial it.
-# Given as CAO_RUNTIME_TOKEN, it leaves the environment here, before anything
-# below starts a subprocess (cao init, cao install, the provider warm-up), and
-# is handed back on the final exec only. CAO_RUNTIME_TOKEN_FILE, a path, needs
-# none of this.
+# Both forms leave the environment here, before anything below starts a
+# subprocess (cao init, cao install, the provider warm-up): CAO_RUNTIME_TOKEN,
+# and CAO_RUNTIME_TOKEN_FILE, which names a readable Secret and so is as good as
+# the token. Both are handed back on the final exec only.
 runtime_token="${CAO_RUNTIME_TOKEN-}"
-unset CAO_RUNTIME_TOKEN
+runtime_token_file="${CAO_RUNTIME_TOKEN_FILE-}"
+unset CAO_RUNTIME_TOKEN CAO_RUNTIME_TOKEN_FILE
+
+exec_with_runtime_token() {
+  if [ -n "${runtime_token}" ]; then
+    export CAO_RUNTIME_TOKEN="${runtime_token}"
+  fi
+  if [ -n "${runtime_token_file}" ]; then
+    export CAO_RUNTIME_TOKEN_FILE="${runtime_token_file}"
+  fi
+  exec "$@"
+}
 
 # A bridge's readiness file on a volume that outlives the container (the
 # example's emptyDir) says nothing about this start: a killed cao-bridge could
@@ -63,13 +74,6 @@ unset CAO_RUNTIME_TOKEN
 if [ "${CAO_NODE_MODE:-server}" = "bridge" ]; then
   rm -f "${CAO_BRIDGE_READY_FILE:-${CAO_HOME_DIR:-${HOME}/.aws/cli-agent-orchestrator}/bridge-ready}"
 fi
-
-exec_with_runtime_token() {
-  if [ -n "${runtime_token}" ]; then
-    CAO_RUNTIME_TOKEN="${runtime_token}" exec "$@"
-  fi
-  exec "$@"
-}
 
 # State seed — replace `cao init` + `cao install` with a tar extract.
 #
