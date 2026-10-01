@@ -70,6 +70,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The marker now accepts a word between `Credits:` and the number; fixtures cut
   from live 2.25.0 frames pin idle, working and finished (#837)
 
+- **The `cao` CLI and the bundled Web UI can now talk to an auth-enabled
+  server.** Neither presented a bearer, so with an IdP or a standalone
+  `CAO_AUTH_LOCAL_TOKEN` configured every `cao launch`/`session`/`terminal`/
+  `workflow`/`info`/`shutdown` call and every Web UI request got a bare `401`.
+  The CLI's HTTP calls (36 sites across the six commands and the polling
+  helpers in `utils/terminal`) now go through `utils/api_http`, which attaches
+  `CAO_AUTH_LOCAL_TOKEN` from the CLI's environment to requests aimed at this
+  node's API and to nothing else, and turns a `401` with no token configured
+  into an error naming the variable. The Web UI takes a token from the URL
+  fragment (`/#token=…`, moved into `sessionStorage` and stripped from the
+  address bar before anything renders) or from a new **Server Access Token**
+  field in Settings, and sends it as `Authorization: Bearer` on every request,
+  `?token=` on the terminal WebSocket and `?access_token=` on the workflow event
+  stream. With no token set every client sends exactly what it did before
+  (#838, closes #807)
+
 - **OpenCode agents whose display name contains spaces never reported COMPLETED.**
   The completion marker read the agent name as one `\S+` token, so a marker such
   as `▣  Sisyphus - Ultraworker · Big Pickle · 3.1s` never matched and every

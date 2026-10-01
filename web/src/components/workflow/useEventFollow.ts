@@ -18,6 +18,7 @@
 //     would send as `Last-Event-ID` — we pass it explicitly.
 
 import { useEffect, useRef } from 'react'
+import { withAuth } from '../../auth'
 import { eventStreamUrl } from '../../api'
 import type { WorkflowEvent, GapMarker } from '../../api'
 
@@ -130,7 +131,7 @@ export function useEventFollow(
       const url = eventStreamUrl(runId, lastSeq)
       try {
         const res = await fetch(url, {
-          headers: { Accept: 'text/event-stream' },
+          headers: withAuth({ Accept: 'text/event-stream' }),
           signal: controller.signal,
         })
         if (!res.ok || !res.body) throw new Error(`SSE ${res.status}`)
