@@ -1065,6 +1065,34 @@ class TestSiblings:
 
 class TestLaunchCancellation:
     @pytest.mark.asyncio
+    async def test_a_launch_cancelled_before_it_is_sent_never_starts(self):
+        from types import SimpleNamespace
+
+        registry = server_mod.runtime_registry
+        written, release = [], asyncio.Event()
+
+        async def send_text(text):
+            written.append(decode(text))
+            await release.wait()  # the first send holds the channel
+
+        conn = registry.register("rt-1", send_text)
+        registry.activate(conn)
+        holder = asyncio.ensure_future(conn.call(CommandType.KEY, {"key": "x"}, "t1", timeout=5))
+        await asyncio.sleep(0.05)
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(plugin_registry=None)))
+        body = server_mod.LaunchRequest(agent_profile="developer")
+        task = asyncio.ensure_future(server_mod.launch_on_runtime("rt-1", body, request))
+        await asyncio.sleep(0.05)  # queued behind the held channel
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        await asyncio.sleep(0.2)
+        holder.cancel()
+        assert [c.type for c in written] == [CommandType.KEY], "the launch must never be sent"
+        assert not server_mod._settlements, "nothing is left running for it"
+
+    @pytest.mark.asyncio
     async def test_a_cancel_landing_with_the_launch_result_still_settles_it(self):
         from types import SimpleNamespace
 
