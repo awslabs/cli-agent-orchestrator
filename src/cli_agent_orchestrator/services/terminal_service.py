@@ -27,7 +27,7 @@ import re
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -1830,7 +1830,7 @@ async def create_terminal(
             deferred_init_failure=None,
             session_incarnation_id=session_incarnation_id,
             status=initial_status,
-            last_active=datetime.now(),
+            last_active=datetime.now(timezone.utc),
         )
 
         logger.info(
