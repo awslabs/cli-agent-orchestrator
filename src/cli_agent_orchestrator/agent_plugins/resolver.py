@@ -162,6 +162,11 @@ def _resolve_git(source: PluginSource, dest: Path) -> tuple[Path, Optional[str]]
         "--no-tags",
     ]
     if source.ref:
+        # ``--branch`` consumes its value, so a ref beginning with ``-`` could
+        # not become an option; refuse it anyway so the argv never carries one
+        # and the error names the cause instead of git's "invalid branch name".
+        if source.ref.startswith("-") or any(ch.isspace() for ch in source.ref):
+            raise ResolverError(f"Plugin source ref {source.ref!r} is not a valid ref name")
         args += ["--branch", source.ref]
     # `--` so a location beginning with `-` is never read as an option.
     args += ["--", location, str(staged)]
@@ -266,6 +271,13 @@ def _git_env() -> dict:
     host to whatever URL the plugin source named.
     """
     env = dict(os.environ)
+    # The transport policy is CAO's, not the host's. ``git_clone_target`` already
+    # refuses anything but https/ssh, but a caller that reaches git some other
+    # way, or a future rewrite, must meet the same wall inside git itself:
+    # ``GIT_ALLOW_PROTOCOL`` overrides every ``protocol.*.allow`` in any gitconfig
+    # and refuses ``file``, ``git`` and ``ext`` (arbitrary command execution
+    # where the host's policy permitted it) with "transport not allowed".
+    env["GIT_ALLOW_PROTOCOL"] = "https:ssh"
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_ASKPASS"] = ""
     env["SSH_ASKPASS"] = ""
@@ -287,8 +299,23 @@ def _run_git(args: List[str], *, what: str, cwd: Optional[Path] = None) -> str:
     * ``credential.helper=`` — empties the helper *chain* for this invocation, so
       no configured helper is consulted at all. ``_git_env`` stops a helper from
       blocking; this stops one from answering.
+    * ``http.followRedirects=false`` — the allowlisted host is the only host git
+      may talk to; a redirect would be a hop the allowlist never saw.
     """
-    command = ["git", "-c", "submodule.recurse=false", "-c", "credential.helper=", *args]
+    command = [
+        "git",
+        "-c",
+        "submodule.recurse=false",
+        "-c",
+        "credential.helper=",
+        # An allowed host could answer with a redirect to somewhere the allowlist
+        # never saw (the profile downloader refuses redirects for the same
+        # reason). A renamed repository therefore fails with git's own message
+        # instead of being followed; retype the new location.
+        "-c",
+        "http.followRedirects=false",
+        *args,
+    ]
 
     try:
         result = subprocess.run(

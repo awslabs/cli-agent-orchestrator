@@ -38,6 +38,7 @@ from wcwidth import wcswidth
 from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
@@ -223,6 +224,15 @@ class GrokCliProvider(BaseProvider):
     # accepted. Using it as deferred-init pickup evidence would suppress the
     # redelivery that a genuinely dropped paste needs.
     supports_stale_processing_capture = True
+
+    @classmethod
+    def honors_model(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+        requested_model: Optional[str],
+    ) -> bool:
+        return True
 
     def __init__(
         self,

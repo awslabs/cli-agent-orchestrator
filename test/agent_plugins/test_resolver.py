@@ -95,6 +95,7 @@ class TestPathSource:
         assert (resolved.root / "plugin.json").is_file()
 
 
+@pytest.mark.usefixtures("allow_local_git_sources")
 class TestUnreachableSources:
     def test_missing_local_path_reports_the_cause(self, tmp_path):
         with pytest.raises(ResolverError, match="does not exist"):
@@ -154,6 +155,7 @@ class TestSubdir:
 
 
 @requires_git
+@pytest.mark.usefixtures("allow_local_git_sources")
 class TestGitSource:
     def test_clone_records_the_resolved_commit(self, tmp_path, git_repo):
         resolved = resolve(
@@ -343,6 +345,7 @@ class TestGitInvocationHardening:
 
 
 @requires_git
+@pytest.mark.usefixtures("allow_local_git_sources")
 class TestVcsMetadataIsStripped:
     """``.git`` is not package bytes, and `--depth` does not apply to local clones."""
 
@@ -378,6 +381,7 @@ class TestVcsMetadataIsStripped:
 
 
 @requires_git
+@pytest.mark.usefixtures("allow_local_git_sources")
 class TestFullCommitPin:
     """`clone --branch` cannot take a commit, so a pinned commit needs a fetch."""
 

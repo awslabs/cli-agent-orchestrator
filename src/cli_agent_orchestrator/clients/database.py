@@ -57,6 +57,8 @@ class TerminalModel(Base):
     tmux_window = Column(String, nullable=False)  # a window name, or a pane mark
     provider = Column(String, nullable=False)  # "kiro_cli", "claude_code"
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
+    model = Column(String, nullable=True)  # resolved per-launch model; NULL = provider default
+    model_honored = Column(Boolean, nullable=True)  # NULL = unknown for pre-migration rows
     working_directory = Column(String, nullable=True)  # launch-time cwd (optional)
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
@@ -1857,6 +1859,14 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN session_incarnation_id TEXT")
             conn.commit()
             logger.info("Migration: added session_incarnation_id column to terminals table")
+        if "model" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN model TEXT")
+            conn.commit()
+            logger.info("Migration: added model column to terminals table")
+        if "model_honored" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN model_honored BOOLEAN")
+            conn.commit()
+            logger.info("Migration: added model_honored column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -1881,6 +1891,8 @@ def create_terminal(
     idempotency_key: Optional[str] = None,
     request_fingerprint: Optional[str] = None,
     new_session_incarnation: bool = False,
+    model: Optional[str] = None,
+    model_honored: Optional[bool] = None,
     initial_delivery: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
@@ -1923,6 +1935,8 @@ def create_terminal(
             tmux_window=tmux_window,
             provider=provider,
             agent_profile=agent_profile,
+            model=model,
+            model_honored=model_honored,
             working_directory=working_directory,
             # ``[]`` is an explicit deny-all and must round-trip as ``[]``: a
             # falsiness test stores it as SQL NULL, and every reader treats
@@ -1960,6 +1974,8 @@ def create_terminal(
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "model": terminal.model,
+            "model_honored": terminal.model_honored,
             "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
@@ -2077,6 +2093,8 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "model": terminal.model,
+            "model_honored": terminal.model_honored,
             "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
@@ -2488,6 +2506,8 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "model": t.model,
+                "model_honored": t.model_honored,
                 "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                 "deferred_init_failure": (
@@ -2589,6 +2609,8 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "model": t.model,
+                "model_honored": t.model_honored,
                 "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                 "deferred_init_failure": (
@@ -2617,6 +2639,8 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "model": t.model,
+                "model_honored": t.model_honored,
                 "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                 "deferred_init_failure": (

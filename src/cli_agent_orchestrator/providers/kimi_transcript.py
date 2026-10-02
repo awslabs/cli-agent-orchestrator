@@ -228,14 +228,14 @@ WELCOME_BANNER_RE = re.compile(r"^\s*Welcome to Kimi Code(?: CLI)?!\s*$")
 # reaches IDLE.
 BOOT_MESSAGE_ROW_RE = re.compile(
     r"^\s*(?:[\u2800-\u28ff]\s*)?(?:"
-    r"Loading configuration|Loading agent|Resolving dependencies|Restoring conversation"
+    r"(?:Loading configuration|Loading agent|Resolving dependencies|Restoring conversation"
     r"|Send /help for help information"
-    r"|No session yet(?:\s*[—–-].*)?"
-    r"|Run /web to continue your session in the browser"
-    r"|✦\s*Try Kimi Code Web UI.*"
-    r"|MCP server \"[^\"]*\" connected(?:\s*·.*)?"
-    r"|tmux extended-keys is off.*"
-    r")\s*[.…\s]*$",
+    r"|Run /web to continue your session in the browser)[.…\s]*"
+    # A newline separates arbitrary detail text (.*) from any remaining suffix.
+    r"|No session yet(?:[.…\s]*|\s*[—–-].*(?:\n[.…\s]*)?)"
+    r"|MCP server \"[^\"]*\" connected(?:[.…\s]*|\s*·.*(?:\n[.…\s]*)?)"
+    r"|(?:✦\s*Try Kimi Code Web UI|tmux extended-keys is off).*(?:\n[.…\s]*)?"
+    r")$",
     re.IGNORECASE,
 )
 
@@ -251,10 +251,11 @@ BOOT_MESSAGE_ROW_RE = re.compile(
 # punctuation / counts — so "... is only a phrase" stays content.
 MCP_BOOT_ROW_RE = re.compile(
     r"^\s*(?:"
-    r"[\u2800-\u28ff]\s*MCP Servers:\s*\d+/\d+.*"
+    # One digit establishes the second count; the suffix accepts any remaining digits.
+    r"[\u2800-\u28ff]\s*MCP Servers:\s*\d+/\d.*(?:\n\s*)?"
     r"|[\u2800-\u28ff]\s*\S.*\(connecting\)\s*"
     r"|connecting to mcp servers[\s.…·()0-9/]*"
-    r")\s*$",
+    r")$",
     re.IGNORECASE,
 )
 
@@ -368,7 +369,7 @@ LEGACY_IDLE_PROMPT_RE = re.compile(r"^\s*[✨💫]\s*$")
 # it — reproduced: `• The UI shows … (3 more lines, ctrl+o to expand) when output
 # is collapsed.` — was classified as execution plumbing and dropped from the
 # answer, even with a colour-253 answer bullet.
-COLLAPSED_TOOL_OUTPUT_RE = re.compile(r"^\s*[•●]?\s*…\s*\(\d+ more lines")
+COLLAPSED_TOOL_OUTPUT_RE = re.compile(r"^\s*(?:[•●]\s*)?…\s*\(\d+ more lines")
 
 # Kimi Code's inline key hints that sit under a running tool call. Matched as
 # the exact observed strings, not as a loose `^Press ` prefix: an assistant

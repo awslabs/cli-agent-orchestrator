@@ -102,7 +102,7 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     probe_kiro_capabilities,
     requested_kiro_capabilities,
 )
-from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.providers.manager import ProviderManager, provider_manager
 from cli_agent_orchestrator.services import worktree_service
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
     elastic_worker_gateway_headers,
@@ -203,6 +203,12 @@ TERMINAL_RANGE_MAX_LENGTH = 1024 * 1024
 # delays this one notification — but still bounded so a black-holed node can't
 # pin the thread.
 CROSS_NODE_NOTIFY_TIMEOUT = 10.0
+
+
+def resolve_launch_model(model: Optional[str], profile: Optional[AgentProfile]) -> Optional[str]:
+    """Resolve the model CAO passes to a provider for this launch."""
+    return model or (profile.model if profile else None)
+
 
 # Track terminals that have already received memory injection (first message only).
 _memory_injected_terminals: set = set()
@@ -1408,6 +1414,12 @@ async def create_terminal(
         # accepting arbitrary attributes as configuration.
         if profile is not None and not isinstance(profile, AgentProfile):
             profile = None
+        launch_model = resolve_launch_model(model, profile)
+        model_honored = ProviderManager.provider_class(provider).honors_model(
+            agent_profile=agent_profile,
+            profile=profile,
+            requested_model=launch_model,
+        )
 
         if provider == ProviderType.KIRO_CLI.value:
             resolved_engine = resolve_kiro_engine(
@@ -1430,7 +1442,7 @@ async def create_terminal(
             # explicit override launch --model on a wrapper never probed for it.
             requested = requested_kiro_capabilities(
                 resolved_engine,
-                model=model or (profile.model if profile else None),
+                model=launch_model,
                 yolo=True,
             )
             probe = kiro_capability_probe or probe_kiro_capabilities
@@ -1714,6 +1726,8 @@ async def create_terminal(
                         provider,
                         agent_profile,
                         allowed_tools,
+                        model=launch_model,
+                        model_honored=model_honored,
                         caller_id=caller_id,
                         engine=resolved_engine.value if resolved_engine is not None else None,
                         group=group,
@@ -1827,7 +1841,7 @@ async def create_terminal(
             agent_profile,
             allowed_tools,
             skill_prompt=skill_prompt,
-            model=model or (profile.model if profile else None),
+            model=launch_model,
             engine=resolved_engine,
             resume_session_id=resume_session_id,
         )
@@ -1888,6 +1902,8 @@ async def create_terminal(
             provider=ProviderType(provider),
             session_name=session_name,
             agent_profile=agent_profile,
+            model=launch_model,
+            model_honored=model_honored,
             caller_id=caller_id,
             allowed_tools=allowed_tools,
             engine=resolved_engine,
@@ -3520,6 +3536,8 @@ def get_terminal(terminal_id: str) -> Dict:
             "provider": metadata["provider"],
             "session_name": metadata["tmux_session"],
             "agent_profile": metadata["agent_profile"],
+            "model": metadata.get("model"),
+            "model_honored": metadata.get("model_honored"),
             "caller_id": metadata.get("caller_id"),
             "allowed_tools": metadata.get("allowed_tools"),
             "engine": metadata.get("engine"),

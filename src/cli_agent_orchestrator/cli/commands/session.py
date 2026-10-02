@@ -56,6 +56,14 @@ def _resolve_conductor(session_name):
     return terminals[0], terminals
 
 
+def _format_launch_model(terminal):
+    """Return operator text for the stored launch-model state."""
+    honored = terminal.get("model_honored")
+    if honored is None:
+        return "unknown", "unknown"
+    return terminal.get("model") or "provider default", "yes" if honored else "no"
+
+
 @click.group()
 def session():
     """Manage CAO sessions."""
@@ -152,6 +160,8 @@ def status(session_name, terminal_id, workers, as_json):
                 "id": target["id"],
                 "agent_profile": target.get("agent_profile"),
                 "provider": target.get("provider"),
+                "model": target.get("model"),
+                "model_honored": target.get("model_honored"),
                 "status": target.get("status"),
                 "last_output": last_output,
             },
@@ -162,6 +172,8 @@ def status(session_name, terminal_id, workers, as_json):
                     "id": t["id"],
                     "agent_profile": t.get("agent_profile"),
                     "provider": t.get("provider"),
+                    "model": t.get("model"),
+                    "model_honored": t.get("model_honored"),
                     "status": t.get("status"),
                 }
                 for t in all_terminals[1:]
@@ -173,6 +185,9 @@ def status(session_name, terminal_id, workers, as_json):
     click.echo(f"Terminal: {target['id']}")
     click.echo(f"Agent:    {target.get('agent_profile', 'N/A')}")
     click.echo(f"Provider: {target.get('provider', 'N/A')}")
+    target_model, target_honored = _format_launch_model(target)
+    click.echo(f"Model:    {target_model}")
+    click.echo(f"Honored:  {target_honored}")
     click.echo(f"Status:   {target.get('status', 'N/A')}")
 
     if last_output:
@@ -188,12 +203,18 @@ def status(session_name, terminal_id, workers, as_json):
     if workers and not terminal_id:
         worker_terminals = all_terminals[1:]
         if worker_terminals:
-            click.echo(f"\n{'ID':<12} {'AGENT':<20} {'PROVIDER':<15} {'STATUS':<15}")
-            click.echo("-" * 65)
+            click.echo(
+                f"\n{'ID':<12} {'AGENT':<20} {'PROVIDER':<15} "
+                f"{'MODEL':<20} {'HONORED':<8} {'STATUS':<15}"
+            )
+            click.echo("-" * 95)
             for t in worker_terminals:
+                worker_model, worker_honored = _format_launch_model(t)
                 click.echo(
                     f"{t['id']:<12} {t.get('agent_profile', 'N/A'):<20} "
-                    f"{t.get('provider', 'N/A'):<15} {t.get('status', 'N/A'):<15}"
+                    f"{t.get('provider', 'N/A'):<15} "
+                    f"{worker_model:<20} "
+                    f"{worker_honored:<8} {t.get('status', 'N/A'):<15}"
                 )
         else:
             click.echo("\nNo worker terminals")
