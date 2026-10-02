@@ -91,6 +91,8 @@ def test_collapsed_output_mentions_are_not_tool_chrome(row):
         ("MCP_BOOT_ROW_RE", "\u2827 MCP Servers: 0/1", "\t", "\n", "\n!"),
         ("MCP_BOOT_ROW_RE", "\u2827 MCP Servers: 0/", "1", "\n", "\n!"),
         ("MCP_BOOT_ROW_RE", "\u2826 example (connecting)", "\t", "\n", "\n!"),
+        ("MCP_BOOT_ROW_RE", "\u2826", "\u00a0", "example (connecting)", "\n!"),
+        ("MCP_BOOT_ROW_RE", "\u2826", "xa0", "(connecting)", "\n!"),
     ],
 )
 def test_long_matching_and_nonmatching_whitespace_remains_bounded(
