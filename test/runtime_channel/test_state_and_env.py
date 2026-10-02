@@ -142,6 +142,19 @@ def test_a_runtime_home_cao_bridge_initialised_can_record_a_launch(db, monkeypat
     assert set(database.Base.metadata.tables) <= set(inspect(engine).get_table_names())
 
 
+def test_runtime_lookups_on_terminals_are_indexed(db):
+    # A runtime's terminal list (every hello) and session_is_remote (session
+    # create and teardown) would otherwise scan the whole table.
+    path, _ = db
+    database.init_db()
+    database.init_db()  # idempotent
+    with sqlite3.connect(str(path)) as conn:
+        names = [row[1] for row in conn.execute("PRAGMA index_list('terminals')")]
+        columns = [[c[2] for c in conn.execute(f"PRAGMA index_info('{n}')")] for n in names]
+    assert ["runtime_id"] in columns
+    assert ["tmux_session", "runtime_id"] in columns
+
+
 def test_the_runtime_token_never_reaches_a_pane():
     assert TmuxClient._is_blocked_env_key(TOKEN_ENV) is True
     env = {}
