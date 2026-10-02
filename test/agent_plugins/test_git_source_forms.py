@@ -26,6 +26,7 @@ from typing import Dict, List
 import pytest
 
 from cli_agent_orchestrator.agent_plugins import resolver
+from cli_agent_orchestrator.agent_plugins.git_source import UnsupportedGitSourceError
 from cli_agent_orchestrator.agent_plugins.models import PluginSource
 from cli_agent_orchestrator.cli.commands.agent_plugin import _make_source
 
@@ -58,11 +59,12 @@ PROBE_GIT_PLUS_PREFIXES: List[str] = [
 
 #: Non-``git+`` locations the classifier already treats as git. These must keep
 #: reaching ``git clone`` byte-identically: normalization is scoped to ``git+``.
+#: (``git://`` used to be in this list; it is now refused by the scheme allowlist,
+#: see test_git_source_allowlist.py.)
 UNTOUCHED_GIT_LOCATIONS: List[str] = [
     "https://github.com/agentplugins/agent-plugins-example",
     "https://github.com/o/r.git",
     "ssh://git@example.test/x",
-    "git://example.test/x.git",
     "git@github.com:owner/repo.git",
 ]
 
@@ -216,10 +218,34 @@ class TestGitPlusFileIsRefusedNotAttempted:
 
         assert calls == []
 
-    def test_the_bare_repo_control_still_clones_over_plain_file(self, bare_repo, tmp_path):
-        """The control: the same repository via plain ``file://`` must still work."""
+    def test_plain_file_is_refused_too_now(self, bare_repo, tmp_path, monkeypatch):
+        """Formerly the control ("the same repository via plain ``file://`` must
+        still work"). ``file://`` reads any repository the server user can, so
+        the scheme allowlist refuses it before git runs, ``git+`` prefix or not;
+        the refusal points at a plain directory path for a local repository."""
+        calls = []
+
+        def fake_run(*args, **kwargs):
+            calls.append(args)
+            raise AssertionError("git ran for a refused file:// source")
+
+        monkeypatch.setattr(resolver.subprocess, "run", fake_run)
+        with pytest.raises(UnsupportedGitSourceError) as exc:
+            resolver.resolve(
+                PluginSource(kind="git", location=f"file://{bare_repo}"), tmp_path / "dest"
+            )
+        assert "'file' transport is not allowed" in str(exc.value)
+        assert "plain directory path" in str(exc.value)
+        assert calls == []
+
+    def test_the_bare_repo_control_still_clones_with_the_test_only_local_door(
+        self, bare_repo, tmp_path, allow_local_git_sources
+    ):
+        """The control the refusal tests rely on: the repository IS clonable when
+        the test-only local transport fixture opens the door, so a refusal above
+        is the allowlist's verdict, not a broken fixture."""
         resolved = resolver.resolve(
-            PluginSource(kind="git", location=f"file://{bare_repo}"), tmp_path / "dest"
+            PluginSource(kind="git", location=str(bare_repo)), tmp_path / "dest"
         )
 
         assert (resolved.root / "plugin.json").is_file()
