@@ -89,11 +89,14 @@ def test_child_may_delegate_lifts_denial(registry, monkeypatch, tool):
 
 
 @pytest.mark.parametrize("tool", TOOLS)
-def test_registry_lookup_failure_denies(registry, monkeypatch, tool):
-    monkeypatch.setattr(
-        database, "is_ephemeral_terminal", Mock(side_effect=RuntimeError("registry unavailable"))
-    )
+def test_registry_lookup_failure_denies(registry, tool):
+    from cli_agent_orchestrator.api.main import app
+
+    database.EphemeralAgentModel.__table__.drop(registry.kw["bind"])
     assert server._tool_denied_reason(tool) is not None
+    response = TestClient(app, base_url="http://localhost").get("/terminals/abcd1234")
+    assert response.status_code == 500
+    assert "ephemeral" not in response.json()
 
 
 @pytest.mark.parametrize("bound, forged", [(False, True), (True, False)])
@@ -268,3 +271,97 @@ def test_registry_membership_is_batched_for_terminal_lists(registry, reader):
         event.remove(engine, "before_cursor_execute", count_selects)
     assert len(selects) <= 2
     assert {row["id"] for row in rows if row["ephemeral"]} == {"abcd1234"}
+
+
+def test_registry_has_future_binding_columns(registry):
+    from sqlalchemy import inspect
+
+    columns = {
+        column["name"]: column
+        for column in inspect(registry.kw["bind"]).get_columns("ephemeral_agents")
+    }
+    assert {"bound_at", "idempotency_key"} <= columns.keys()
+    assert columns["bound_at"]["nullable"] is True
+    assert columns["idempotency_key"]["nullable"] is True
+
+
+@pytest.mark.parametrize("handler", ["_create_terminal", "_resolve_handoff_provider"])
+def test_installed_handler_guard_does_not_read_source(stores, monkeypatch, handler):
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    source = Mock(side_effect=AssertionError("installed guard must not read a profile"))
+    monkeypatch.setattr(agent_profiles, "resolve_agent_profile_source", source)
+    monkeypatch.setattr(orchestration, "_current_terminal_id", lambda: None)
+    monkeypatch.setattr(orchestration, "resolve_provider", lambda *a, **k: "claude_code")
+    monkeypatch.setattr(
+        orchestration.requests,
+        "post",
+        Mock(
+            return_value=Mock(
+                json=lambda: {
+                    "id": "abcd1234",
+                    "session_name": "session",
+                    "provider": "claude_code",
+                }
+            )
+        ),
+    )
+    getattr(orchestration, handler)("ordinary")
+    source.assert_not_called()
+
+
+@pytest.mark.parametrize("tool", ["workflow_run", "workflow_resume", "workflow_start"])
+@pytest.mark.parametrize("caller", ["installed", "unbound"])
+@pytest.mark.asyncio
+async def test_workflows_allow_installed_and_unbound_callers(registry, monkeypatch, tool, caller):
+    import json
+
+    with registry() as db:
+        row = db.get(database.TerminalModel, "abcd1234")
+        row.allowed_tools = json.dumps(["fs_read"])
+        db.commit()
+    if caller == "unbound":
+        monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)
+        monkeypatch.setattr(
+            server.mcp_utils,
+            "get_json",
+            Mock(side_effect=AssertionError("operator has no terminal lookup")),
+        )
+    post = Mock(
+        return_value=Mock(
+            status_code=202 if tool == "workflow_start" else 200,
+            json=lambda: {"run_id": "run", "state": "completed"},
+        )
+    )
+    monkeypatch.setattr(server.requests, "post", post)
+    result = await getattr(server, tool)("run")
+    assert result["ok"] is True
+    post.assert_called_once()
+
+
+@pytest.mark.parametrize("tool", ["workflow_run", "workflow_resume", "workflow_start"])
+@pytest.mark.parametrize("status_code", [404, 500])
+@pytest.mark.asyncio
+async def test_workflows_refuse_unresolved_callers(registry, monkeypatch, tool, status_code):
+    import requests
+
+    response = requests.Response()
+    response.status_code = status_code
+    monkeypatch.setattr(
+        server.mcp_utils, "get_json", Mock(side_effect=requests.HTTPError(response=response))
+    )
+    post = Mock(side_effect=AssertionError("must not dispatch"))
+    monkeypatch.setattr(server.requests, "post", post)
+    result = await getattr(server, tool)("run")
+    assert result["ok"] is False
+    assert "cannot authorize" in result["error"]
+    post.assert_not_called()
+
+
+@pytest.mark.parametrize("tool", TOOLS)
+def test_old_server_without_marker_keeps_installed_caller_compatible(registry, monkeypatch, tool):
+    metadata = terminal_service.get_terminal("abcd1234")
+    metadata.pop("ephemeral")
+    monkeypatch.setattr(server.mcp_utils, "get_json", lambda *a, **k: metadata)
+    assert server._get_terminal_context_from_env()["ephemeral"] is False
+    assert server._tool_denied_reason(tool) is None

@@ -48,7 +48,7 @@ class SessionIncarnationModel(Base):
 
 
 class EphemeralAgentModel(Base):
-    """Read-only groundwork for the server-owned ephemeral registry (#801 E1a)."""
+    """Read-only access to the server-owned ephemeral registry."""
 
     __tablename__ = "ephemeral_agents"
 
@@ -58,8 +58,10 @@ class EphemeralAgentModel(Base):
     session_name = Column(String, nullable=False)
     state = Column(String, nullable=False)
     claim_id = Column(String, nullable=True)
+    idempotency_key = Column(String, nullable=True)
     claim_expires_at = Column(DateTime, nullable=True)
     launched_terminal_id = Column(String, nullable=True, index=True)
+    bound_at = Column(DateTime, nullable=True)
     model_tier = Column(String, nullable=True)
     effort = Column(String, nullable=True)
     provider = Column(String, nullable=False)

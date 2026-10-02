@@ -46,7 +46,7 @@ def load_launch_profile(name: str) -> tuple[AgentProfile, ProfileSource]:
         path = _safe_join(EPHEMERAL_LIVE_DIR, f"{name}.md")
         if path is None:
             raise ValueError("live profile path escapes its store")
-        profile = parse_agent_profile_text(resolve_env_vars(path.read_text(encoding="utf-8")), name)
+        profile = parse_agent_profile_text(path.read_text(encoding="utf-8"), name)
     except Exception as exc:
         raise EphemeralProfileUnavailable(f"Ephemeral profile unavailable: {name}") from exc
     return profile, ProfileSource.EPHEMERAL
@@ -59,12 +59,15 @@ def resolve_agent_profile_source(name: str) -> ProfileSource:
 
 def warn_reserved_installed_profiles() -> None:
     """Warn once at startup about installed profiles shadowed by the namespace."""
-    for profile in _list_installed_profiles():
-        if routes_to_ephemeral_store(profile["name"]):
-            logger.warning(
-                "Installed profile '%s' matches the reserved ephemeral namespace and cannot be used",
-                profile["name"],
-            )
+    try:
+        for profile in _list_installed_profiles():
+            if routes_to_ephemeral_store(profile["name"]):
+                logger.warning(
+                    "Installed profile '%s' matches the reserved ephemeral namespace and cannot be used",
+                    profile["name"],
+                )
+    except Exception:
+        logger.warning("reserved-name startup scan failed", exc_info=True)
 
 
 def _validate_agent_name(agent_name: str) -> None:

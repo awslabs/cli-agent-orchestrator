@@ -421,6 +421,15 @@ def _resolve_child_allowed_tools(
     return ",".join(child_allowed)
 
 
+def _refuse_ephemeral_target_without_claim(name: str) -> None:
+    """Refuse reserved launch targets until the claim protocol is available."""
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    if agent_profiles.routes_to_ephemeral_store(name):
+        agent_profiles.resolve_agent_profile_source(name)
+        raise ValueError("Ephemeral targets cannot be launched until claims are supported.")
+
+
 def _create_terminal(
     agent_profile: str,
     working_directory: Optional[str] = None,
@@ -488,14 +497,7 @@ def _create_terminal(
     Raises:
         Exception: If terminal creation fails
     """
-    from cli_agent_orchestrator.utils import agent_profiles
-
-    try:
-        source = agent_profiles.resolve_agent_profile_source(agent_profile)
-    except (FileNotFoundError, RuntimeError):
-        source = agent_profiles.ProfileSource.INSTALLED
-    if source == agent_profiles.ProfileSource.EPHEMERAL:
-        raise ValueError("Ephemeral target requires a claim result; unavailable in E1a")
+    _refuse_ephemeral_target_without_claim(agent_profile)
 
     provider = DEFAULT_PROVIDER
     parent_allowed_tools = None
@@ -756,14 +758,7 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
     the single combined run-step call, while preserving the same-session /
     caller_id / allowed_tools behavior the old six-call path had.
     """
-    from cli_agent_orchestrator.utils import agent_profiles
-
-    try:
-        source = agent_profiles.resolve_agent_profile_source(agent_profile)
-    except (FileNotFoundError, RuntimeError):
-        source = agent_profiles.ProfileSource.INSTALLED
-    if source == agent_profiles.ProfileSource.EPHEMERAL:
-        raise ValueError("Ephemeral target requires a claim result; unavailable in E1a")
+    _refuse_ephemeral_target_without_claim(agent_profile)
 
     current_terminal_id = _current_terminal_id()
     if not current_terminal_id:
