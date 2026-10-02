@@ -6553,8 +6553,8 @@ def _resolve_error_kind(row: Any, steps: List[Any]) -> Optional[str]:
 
     # FAILED only: the run-level terminal kind is authoritative when present.
     run_kind = getattr(row, "kind", None)
-    if isinstance(run_kind, str):
-        return run_kind
+    if run_kind:
+        return str(run_kind)
 
     # Legacy rows only: fall back to the durable step kind.
     durable = _durable_error_kind(steps)

@@ -1284,6 +1284,30 @@ class TestInBandProviderError:
         assert result.status == TerminalStatus.COMPLETED
         assert result.last_message == refusal
 
+    def test_missing_raw_context_degrades_to_completed(self):
+        """Best-effort capture failures must not turn a would-match answer into a failure."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output=self.ERROR
+        )
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(
+                f"{_MODULE}.terminal_service.get_output_context",
+                return_value=None,
+                create=True,
+            ),
+        ):
+            result = asyncio.run(run_agent_step("codex", "dev", "x"))
+
+        assert result.status == TerminalStatus.COMPLETED
+        assert result.last_message == self.ERROR
+
     def test_provider_error_raises_and_leaves_the_terminal_alive(self):
         """The step FAILS, the raw text stays retrievable, and — mirroring the
         ``kind="error"`` crash contract — the pane is NOT reclaimed, so an operator

@@ -3513,7 +3513,7 @@ def get_output_context(terminal_id: str) -> Optional[str]:
             return output
         return get_backend().get_history(metadata["tmux_session"], metadata["tmux_window"])
     except Exception as exc:  # noqa: BLE001 — classifier context is best-effort
-        logger.debug("get_output_context: %s unavailable for %s: %s", terminal_id, exc)
+        logger.debug("get_output_context: %s unavailable: %s", terminal_id, exc)
         return None
 
 

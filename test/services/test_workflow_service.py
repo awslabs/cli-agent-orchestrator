@@ -173,6 +173,8 @@ async def test_trace_b_worker_crashes_twice_then_succeeds(monkeypatch):
     assert res.state == RunState.COMPLETED
     assert res.steps[0].state == StepState.COMPLETED
     assert res.steps[0].attempts == 3
+    # The attempt-1 failure kind is cleared when a retry settles successfully.
+    assert res.steps[0].error_kind is None
 
 
 @pytest.mark.asyncio
@@ -522,6 +524,34 @@ async def test_cancel_interrupts_in_flight_wait_converges_cancelled(monkeypatch)
     assert states["s1"] == StepState.SKIPPED
     assert states["s2"] == StepState.SKIPPED
     assert res.steps[0].attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_clears_a_prior_retry_error_kind(monkeypatch):
+    """Cancellation settles SKIPPED and must not retain the failed attempt's kind."""
+    from cli_agent_orchestrator.services.agent_step import StepCancelledError
+
+    calls = {"n": 0}
+
+    async def _side(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise StepExecutionError("provider refused", kind="provider_error", terminal_id="tp")
+        ws.cancel_run(kwargs["env_vars"]["CAO_WORKFLOW_RUN_ID"])
+        await kwargs["cancel_event"].wait()
+        raise StepCancelledError(terminal_id="tc")
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    res = await ws.start_run(
+        _spec(steps=[WorkflowStep(id="s1", provider="p", agent="g", prompt="a")]),
+        {},
+        "runCancelKind",
+    )
+
+    assert res.state == RunState.CANCELLED
+    assert res.steps[0].state == StepState.SKIPPED
+    assert res.steps[0].attempts == 2
+    assert res.steps[0].error_kind is None
 
 
 @pytest.mark.asyncio

@@ -1775,6 +1775,16 @@ def test_resolve_error_kind_error_branch():
     assert _resolve_error_kind(_FakeRow(RunState.FAILED.value), steps) == "error"
 
 
+def test_resolve_error_kind_ignores_empty_run_kind():
+    """Legacy/empty run kinds fall through to the step kind instead of winning."""
+    from cli_agent_orchestrator.api.main import _resolve_error_kind
+
+    row = _FakeRow(RunState.FAILED.value)
+    row.kind = ""
+    steps = [_FakeStep(state="failed", error_kind="provider_error")]
+    assert _resolve_error_kind(row, steps) == "provider_error"
+
+
 def test_resolve_error_kind_completed_is_none():
     """U9-T1 (RP-3): a COMPLETED run resolves to None (no kind)."""
     from cli_agent_orchestrator.api.main import _resolve_error_kind

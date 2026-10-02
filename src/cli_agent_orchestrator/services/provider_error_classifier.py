@@ -9,12 +9,14 @@ from "the model refused to load", so the RUNTIME classifies it: CAO launched the
 CLI and knows its error signatures.
 
 DELIBERATELY NARROW (issue #638, criterion 4). A MISSED classification degrades to
-today's behaviour; a false one would fail a step that really answered. So four
+today's behaviour; a false one would fail a step that really answered. So five
 independent guards: only the FIRST non-empty line is tested; any output longer than
 :data:`PROVIDER_ERROR_MAX_CHARS` is out of scope; each row applies only to the
-provider adapters that emit that chrome; and the pattern must consume the WHOLE line.
-Common words, status-code values, or error vocabulary in another adapter's ordinary
-prose are therefore answers, not refusals. The runtime-side companion of
+provider adapters that emit that chrome; the pattern must consume the WHOLE line;
+and raw adapter context, when available, must show provider chrome rather than an
+assistant-marker-owned rendering. Common words, status-code values, or error
+vocabulary in another adapter's ordinary prose are therefore answers, not refusals.
+The runtime-side companion of
 :meth:`BaseProvider.get_error_message`, which asks the same question of a provider
 *instance* holding a live terminal buffer.
 """
@@ -24,6 +26,10 @@ from __future__ import annotations
 import re
 from typing import Any, NamedTuple, Optional, Tuple
 
+from cli_agent_orchestrator.providers.claude_code import EXTRACTION_RESPONSE_PATTERN
+from cli_agent_orchestrator.providers.codex import ASSISTANT_PREFIX_PATTERN
+from cli_agent_orchestrator.providers.kimi_cli import KIMI_RESPONSE_MARKER_RE
+from cli_agent_orchestrator.providers.minimax_code import ASSISTANT_MARKER_PATTERN
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 # Only outputs at most this long are candidates: two orders of magnitude above a
@@ -116,13 +122,15 @@ _SIGNATURES: Tuple[ProviderErrorSignature, ...] = tuple(
     for slug, pattern, providers in _ROWS
 )
 
-# A rendered assistant message owns its text.  These markers are structural
-# evidence from the provider's terminal UI, not another answer-shaped pattern:
+# A rendered assistant message owns its text. These are the same adapter-owned
+# patterns used to extract that message, not a second private copy that can drift:
 # the same first line is a provider refusal when it appears as bare chrome and is
 # an ordinary answer when it follows the adapter's response marker.
 _ASSISTANT_MARKERS = {
-    "claude_code": re.compile(r"^[ \t]*[⏺●][ \t]*"),
-    "codex": re.compile(r"^[ \t]*(?:(?:assistant|codex|agent)\s*:|•)[ \t]*", re.I),
+    "claude_code": EXTRACTION_RESPONSE_PATTERN,
+    "codex": re.compile(ASSISTANT_PREFIX_PATTERN, re.I),
+    "kimi_cli": KIMI_RESPONSE_MARKER_RE,
+    "mcode": ASSISTANT_MARKER_PATTERN,
 }
 _CONTEXT_UNSET: Any = object()
 
@@ -148,20 +156,24 @@ def _provider_owns_error_line(provider: str, error_line: str, script_output: str
     caller must not classify it.
     """
     marker = _ASSISTANT_MARKERS.get(provider)
+    if marker is None:
+        # No marker vocabulary means no positive ownership evidence. The caller
+        # must degrade to the pre-#638 behaviour rather than trust the text alone.
+        return False
+
     found = False
     assistant_owned = False
     for raw_line in strip_terminal_escapes(script_output).splitlines():
         line = raw_line.strip()
+        match = marker.match(line)
+        if match is not None:
+            if line[match.end() :].strip() == error_line:
+                found = True
+                assistant_owned = True
+            continue
         if line == error_line:
             found = True
             assistant_owned = False
-            continue
-        if marker is None:
-            continue
-        match = marker.match(line)
-        if match and line[match.end() :].strip() == error_line:
-            found = True
-            assistant_owned = True
     return found and not assistant_owned
 
 

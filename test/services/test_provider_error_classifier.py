@@ -63,6 +63,8 @@ _NON_REFUSALS = (
     ("codex", "Model gpt-5 is not supported because this sentence is fictional."),
     ("claude_code", "Unknown model 'gpt-4o-mini'"),
     ("codex", "The function returns None when the request fails."),
+    ("kiro_cli", "API Error: 401 invalid_api_key"),
+    ("q_cli", "API Error: 401 invalid_api_key"),
     (None, ""),
     (None, None),
 )
@@ -107,6 +109,57 @@ def test_a_provider_scoped_row_is_only_eligible_for_its_provider():
     scoped = ProviderErrorSignature("scoped", re.compile(r"NOPE"), ("one",))
     assert scoped.applies_to("one") is True
     assert scoped.applies_to("two") is False
+
+
+def test_provider_scope_is_enforced_through_classifier():
+    """The production entry point, not only ``applies_to``, enforces the scope."""
+    output = "API Error: 401 invalid_api_key"
+    assert classify_provider_error("codex", output) is not None
+    assert classify_provider_error("kiro_cli", output) is None
+    assert classify_provider_error("q_cli", output) is None
+
+
+def test_markerless_provider_context_is_conservative():
+    """A provider whose answers are unmarked cannot establish provider ownership.
+
+    The two-argument API still classifies a trusted signature; the production
+    three-argument path must degrade to the pre-fix behaviour because an answer
+    and provider chrome can be textually identical for grok_cli.
+    """
+    model_error = "Unknown model: a model type absent from the serializer registry."
+    auth_error = "Authentication failed: no credentials configured"
+
+    assert classify_provider_error("grok_cli", model_error) is not None
+    assert (
+        classify_provider_error("grok_cli", model_error, script_output=f"{model_error}\n>") is None
+    )
+    assert classify_provider_error("grok_cli", auth_error, script_output=f"{auth_error}\n>") is None
+
+
+def test_marker_aware_three_arg_path_distinguishes_provider_chrome():
+    """mcode and kimi now contribute their real response markers to ownership."""
+    mcode_error = "Authentication failed: no credentials configured"
+    assert (
+        classify_provider_error(
+            "mcode", mcode_error, script_output=f"› task\n{mcode_error}\n└ Completed in 1s"
+        )
+        is not None
+    )
+    assert (
+        classify_provider_error(
+            "mcode", mcode_error, script_output=f"› task\n● {mcode_error}\n└ Completed in 1s"
+        )
+        is None
+    )
+
+    kimi_error = "ConnectionError: upstream refused the connection"
+    assert (
+        classify_provider_error("kimi_cli", kimi_error, script_output=f"{kimi_error}\n💫")
+        is not None
+    )
+    assert (
+        classify_provider_error("kimi_cli", kimi_error, script_output=f"• {kimi_error}\n💫") is None
+    )
 
 
 def test_context_distinguishes_provider_error_from_assistant_prose():
