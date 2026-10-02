@@ -27,7 +27,9 @@ the shared token in the `x-cao-runtime-token` header. Its runtime id (for
 it is letters, digits, `.`, `_` and `-`; a Kubernetes pod name fits. Both sides exchange a
 hello carrying the protocol version. The runtime's hello also lists every
 terminal it runs, with its current status, so a reconnect restores status
-without replaying anything. A newer connection from the same runtime replaces
+without replaying anything. That covers a dropped connection; a restarted
+`cao-bridge` process is different (see [Known limits](#known-limits-of-this-slice)).
+A newer connection from the same runtime replaces
 the older one, which the server then closes and no longer listens to.
 
 ## Commands
@@ -136,6 +138,11 @@ retried until the runtime confirms it (see [Commands](#commands)).
   remote terminal, and the PTY WebSocket refuses one (close code `4004`).
 - The memory context added to a remote terminal's first input is resolved
   in the runtime, not from the server's memory store.
+- A restarted `cao-bridge` process does not re-attach to tmux panes that
+  outlived it, as a restarted `cao-server` does not for its local terminals:
+  their status stays `unknown`, while input, output and delete still work.
+  In the EKS example a restart of `cao-bridge` restarts its container, which
+  takes tmux and those terminals with it, and the bridge drops their rows.
 
 ## Deploy
 
