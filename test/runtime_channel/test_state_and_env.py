@@ -1,5 +1,6 @@
 """State the runtime channel keeps in SQLite, and what a pane may inherit (#745)."""
 
+import asyncio
 import sqlite3
 
 import pytest
@@ -95,10 +96,50 @@ def test_the_retention_sweep_leaves_remote_rows_alone(db, monkeypatch):
     assert database.get_terminal_metadata("aaaa0002") is not None
 
 
-def test_a_runtime_creates_only_the_pane_tables(db):
+def test_a_runtime_home_cao_bridge_initialised_can_record_a_launch(db, monkeypatch, tmp_path):
+    # A launch on a new session records its incarnation (#823). A hand-kept
+    # subset of tables missed that one, so every launch on a runtime home only
+    # cao-bridge had initialised failed with 502.
+    from cli_agent_orchestrator.runtime_channel import bridge as bridge_mod
+    from cli_agent_orchestrator.runtime_channel import token as token_mod
+    from cli_agent_orchestrator.services.event_bus import bus
+    from cli_agent_orchestrator.services.log_writer import log_writer
+    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
     _, engine = db
-    database.init_runtime_db()
-    assert set(inspect(engine).get_table_names()) == set(database.RUNTIME_TABLES)
+
+    async def idle():
+        return None
+
+    async def launch(self):
+        # What create_terminal(new_session=True) writes, once the server asks.
+        database.create_terminal(
+            "aaaa0001",
+            "cao-a",
+            "dev-a",
+            "mock_cli",
+            "developer",
+            session_incarnation_id="inc-1",
+            new_session_incarnation=True,
+        )
+
+    monkeypatch.setattr(status_monitor, "run", idle)
+    monkeypatch.setattr(log_writer, "run", idle)
+    monkeypatch.setattr(bridge_mod.Bridge, "run", launch)
+    monkeypatch.setattr(bus, "_loop", bus._loop)  # _amain points the bus at its own loop
+    monkeypatch.setenv("CAO_BRIDGE_SERVER_URL", "ws://server/runtime/channel")
+    monkeypatch.setenv("CAO_BRIDGE_RUNTIME_ID", "rt-1")
+    monkeypatch.setenv("CAO_BRIDGE_READY_FILE", str(tmp_path / "ready"))
+    monkeypatch.setenv(TOKEN_ENV, "token")
+    token_mod._reset_for_tests()
+    try:
+        asyncio.run(bridge_mod._amain())
+    finally:
+        token_mod._reset_for_tests()
+
+    assert database.get_terminal_metadata("aaaa0001") is not None
+    # The whole schema, so a table added later cannot be missed either.
+    assert set(database.Base.metadata.tables) <= set(inspect(engine).get_table_names())
 
 
 def test_the_runtime_token_never_reaches_a_pane():
@@ -120,7 +161,7 @@ def test_rows_whose_pane_died_with_the_last_container_are_dropped(db, monkeypatc
     from cli_agent_orchestrator.runtime_channel import bridge as bridge_mod
 
     _, engine = db
-    database.init_runtime_db()
+    database.init_db()
     database.create_terminal("aaaa0001", "cao-live", "dev-a", "mock_cli", "developer")
     database.create_terminal("aaaa0002", "cao-gone", "dev-b", "mock_cli", "developer")
 
@@ -137,7 +178,7 @@ def test_rows_are_kept_when_tmux_cannot_be_asked(db, monkeypatch):
     from cli_agent_orchestrator.backends import registry as backend_registry
     from cli_agent_orchestrator.runtime_channel import bridge as bridge_mod
 
-    database.init_runtime_db()
+    database.init_db()
     database.create_terminal("aaaa0001", "cao-a", "dev-a", "mock_cli", "developer")
 
     class Broken:

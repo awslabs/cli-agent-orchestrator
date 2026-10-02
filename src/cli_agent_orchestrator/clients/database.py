@@ -765,18 +765,6 @@ def init_db() -> None:
     _migrate_add_handoff_results()
 
 
-#: The tables the terminal service writes for panes on this host. An execution
-#: runtime (``cao-bridge``) needs only these; orchestration state stays central.
-RUNTIME_TABLES = ("terminals", "inbox", "idempotency_keys")
-
-
-def init_runtime_db() -> None:
-    """Initialize only the pane tables, for an execution runtime (#745)."""
-    Base.metadata.create_all(bind=engine, tables=[Base.metadata.tables[t] for t in RUNTIME_TABLES])
-    _restrict_db_file_permissions()
-    _migrate_terminals_schema()
-
-
 def _restrict_db_file_permissions() -> None:
     """Chmod the SQLite file (+ -wal/-shm siblings if present) to 0o600.
 
