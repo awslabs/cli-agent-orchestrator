@@ -36,7 +36,7 @@ class TestCreateTerminalCleanup:
         "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
         return_value="tid1",
     )
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_cleanup_on_provider_init_failure(
         self,
         mock_load_profile,
@@ -101,7 +101,7 @@ class TestCreateTerminalCleanup:
         "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
         return_value="tid1",
     )
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_cleanup_on_failure_does_not_kill_session_if_not_new(
         self,
         mock_load_profile,
@@ -169,7 +169,7 @@ class TestCreateTerminalCleanup:
         "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
         return_value="tid1",
     )
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_cleanup_does_not_kill_window_if_it_was_never_created(
         self,
         mock_load_profile,
@@ -224,7 +224,7 @@ class TestCreateTerminalCleanup:
         "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
         return_value="tid1",
     )
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_cleanup_swallows_kill_window_errors(
         self,
         mock_load_profile,
@@ -285,7 +285,7 @@ class TestCreateTerminalCleanup:
         "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
         return_value="tid1",
     )
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_cleanup_ignores_cleanup_errors(
         self,
         mock_load_profile,
@@ -344,7 +344,7 @@ class TestCreateTerminalCleanup:
         "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
         return_value="tid1",
     )
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_session_prefix_added_for_new_session(
         self,
         mock_load_profile,
@@ -405,7 +405,7 @@ class TestCreateTerminalSessionCleanupGuard:
         "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
         return_value="tid1",
     )
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_no_kill_session_when_session_already_exists(
         self,
         mock_load_profile,
@@ -455,7 +455,7 @@ class TestCreateTerminalSessionCleanupGuard:
         "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
         return_value="tid1",
     )
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_kill_session_when_we_created_it_and_later_step_fails(
         self,
         mock_load_profile,

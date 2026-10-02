@@ -67,7 +67,7 @@ def create_mocks():
             generate_terminal_id=p("generate_terminal_id"),
             generate_session_name=p("generate_session_name"),
             generate_window_name=p("generate_window_name"),
-            load_agent_profile=p("load_agent_profile"),
+            load_agent_profile=p("agent_profiles.load_agent_profile"),
             build_skill_catalog=p("build_skill_catalog"),
             dispatch_plugin_event=p("dispatch_plugin_event"),
             update_terminal_shell_command=p("update_terminal_shell_command"),

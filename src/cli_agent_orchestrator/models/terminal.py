@@ -86,6 +86,9 @@ class Terminal(BaseModel):
     model_honored: Optional[bool] = Field(
         None, description="Whether the provider applies the requested launch model"
     )
+    ephemeral: bool = Field(
+        default=False, description="Server-computed ephemeral registry membership"
+    )
     caller_id: Optional[str] = Field(
         None, description="Terminal that created this one via handoff/assign (callback target)"
     )

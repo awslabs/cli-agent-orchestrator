@@ -47,6 +47,73 @@ class SessionIncarnationModel(Base):
     incarnation_id = Column(String, nullable=False)
 
 
+class EphemeralAgentModel(Base):
+    """Read-only groundwork for the server-owned ephemeral registry (#801 E1a)."""
+
+    __tablename__ = "ephemeral_agents"
+
+    name = Column(String, primary_key=True)
+    owner_kind = Column(String, nullable=False)
+    owner_id = Column(String, nullable=False)
+    session_name = Column(String, nullable=False)
+    state = Column(String, nullable=False)
+    claim_id = Column(String, nullable=True)
+    claim_expires_at = Column(DateTime, nullable=True)
+    launched_terminal_id = Column(String, nullable=True, index=True)
+    model_tier = Column(String, nullable=True)
+    effort = Column(String, nullable=True)
+    provider = Column(String, nullable=False)
+    effective_tools = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    gc_reason = Column(String, nullable=True)
+    spec_sha256 = Column(String, nullable=False)
+    profile_sha256 = Column(String, nullable=False)
+    audit_path = Column(String, nullable=False)
+
+
+def get_ephemeral_agent(name: str) -> Optional[Dict[str, Any]]:
+    """Read registry facts without creating, claiming or modifying a row."""
+    with SessionLocal() as db:
+        row = db.query(EphemeralAgentModel).filter(EphemeralAgentModel.name == name).first()
+        if row is None:
+            return None
+        result = {
+            column.name: getattr(row, column.name)
+            for column in EphemeralAgentModel.__table__.columns
+        }
+        result["effective_tools"] = _json.loads(result["effective_tools"])
+        return result
+
+
+def is_ephemeral_terminal(terminal_id: str) -> bool:
+    """Registry membership in ANY state, including gc; lookup errors propagate."""
+    with SessionLocal() as db:
+        return (
+            db.query(
+                db.query(EphemeralAgentModel)
+                .filter(EphemeralAgentModel.launched_terminal_id == terminal_id)
+                .exists()
+            ).scalar()
+            is True
+        )
+
+
+def _ephemeral_terminal_ids(db: Any, terminal_query: Any) -> set[str]:
+    """Batch membership for a terminal selection, without one lookup per row.
+
+    The subquery also avoids SQLite's parameter limit for large terminal lists.
+    State is deliberately unrestricted: a gc row still marks a surviving terminal.
+    """
+    selected_ids = terminal_query.with_entities(TerminalModel.id).order_by(None)
+    return {
+        row[0]
+        for row in db.query(EphemeralAgentModel.launched_terminal_id)
+        .filter(EphemeralAgentModel.launched_terminal_id.in_(selected_ids))
+        .all()
+    }
+
+
 class TerminalModel(Base):
     """SQLAlchemy model for terminal metadata only."""
 
@@ -1964,6 +2031,7 @@ def create_terminal(
             "agent_profile": terminal.agent_profile,
             "model": terminal.model,
             "model_honored": terminal.model_honored,
+            "ephemeral": is_ephemeral_terminal(str(terminal.id)),
             "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
@@ -2078,6 +2146,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "agent_profile": terminal.agent_profile,
             "model": terminal.model,
             "model_honored": terminal.model_honored,
+            "ephemeral": is_ephemeral_terminal(str(terminal.id)),
             "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
@@ -2418,12 +2487,13 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
     cannot quietly change which terminal is the conductor.
     """
     with SessionLocal() as db:
-        terminals = (
+        terminal_query = (
             db.query(TerminalModel)
             .filter(TerminalModel.tmux_session == tmux_session)
             .order_by(literal_column("terminals.rowid"))
-            .all()
         )
+        terminals = terminal_query.all()
+        ephemeral_ids = _ephemeral_terminal_ids(db, terminal_query)
         return [
             {
                 "id": t.id,
@@ -2433,6 +2503,7 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "agent_profile": t.agent_profile,
                 "model": t.model,
                 "model_honored": t.model_honored,
+                "ephemeral": str(t.id) in ephemeral_ids,
                 "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                 "deferred_init_failure": (
@@ -2521,12 +2592,13 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
     if not tmux_sessions:
         return []
     with SessionLocal() as db:
-        terminals = (
+        terminal_query = (
             db.query(TerminalModel)
             .filter(TerminalModel.tmux_session.in_(tmux_sessions))
             .order_by(literal_column("terminals.rowid"))
-            .all()
         )
+        terminals = terminal_query.all()
+        ephemeral_ids = _ephemeral_terminal_ids(db, terminal_query)
         return [
             {
                 "id": t.id,
@@ -2536,6 +2608,7 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
                 "agent_profile": t.agent_profile,
                 "model": t.model,
                 "model_honored": t.model_honored,
+                "ephemeral": str(t.id) in ephemeral_ids,
                 "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                 "deferred_init_failure": (
@@ -2556,7 +2629,9 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
 def list_all_terminals() -> List[Dict[str, Any]]:
     """List all terminals."""
     with SessionLocal() as db:
-        terminals = db.query(TerminalModel).all()
+        terminal_query = db.query(TerminalModel)
+        terminals = terminal_query.all()
+        ephemeral_ids = _ephemeral_terminal_ids(db, terminal_query)
         return [
             {
                 "id": t.id,
@@ -2566,6 +2641,7 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "agent_profile": t.agent_profile,
                 "model": t.model,
                 "model_honored": t.model_honored,
+                "ephemeral": str(t.id) in ephemeral_ids,
                 "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                 "deferred_init_failure": (

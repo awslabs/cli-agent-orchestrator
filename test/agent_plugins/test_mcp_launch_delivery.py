@@ -381,7 +381,9 @@ class TestTheLaunchCommandCarriesThePluginServer:
         mod = importlib.import_module(f"cli_agent_orchestrator.providers.{case.module}")
         provider_cls = getattr(mod, case.cls)
 
-        monkeypatch.setattr(mod, "load_agent_profile", lambda _name: _profile_stub())
+        monkeypatch.setattr(
+            getattr(mod, "agent_profiles", mod), "load_agent_profile", lambda _name: _profile_stub()
+        )
         # A synthetic environment rather than a skip. The old blanket
         # `except Exception: pytest.skip(...)` meant a provider whose build raised
         # for ANY reason — including a genuine delivery defect — reported green,
@@ -429,7 +431,9 @@ class TestTheLaunchCommandCarriesThePluginServer:
         """Copilot's runtime config is the only MCP config it reads."""
         from cli_agent_orchestrator.providers import copilot_cli as mod
 
-        monkeypatch.setattr(mod, "load_agent_profile", lambda _name: _profile_stub())
+        monkeypatch.setattr(
+            getattr(mod, "agent_profiles", mod), "load_agent_profile", lambda _name: _profile_stub()
+        )
         provider = mod.CopilotCliProvider("tid-2", "sess", "win", "worker")
 
         raw = provider._build_runtime_mcp_config()
@@ -448,7 +452,9 @@ class TestTheLaunchCommandCarriesThePluginServer:
         from cli_agent_orchestrator.providers import antigravity_cli as mod
 
         config_path = tmp_path / "gemini" / "config" / "mcp_config.json"
-        monkeypatch.setattr(mod, "load_agent_profile", lambda _name: _profile_stub())
+        monkeypatch.setattr(
+            getattr(mod, "agent_profiles", mod), "load_agent_profile", lambda _name: _profile_stub()
+        )
         monkeypatch.setattr(
             mod.AntigravityCliProvider, "_mcp_config_path", lambda self: config_path
         )
@@ -515,7 +521,9 @@ class TestGrokCarriesAnHttpPluginServer:
         from cli_agent_orchestrator.providers import grok_cli as mod
 
         monkeypatch.setattr(mod, "CAO_HOME_DIR", tmp_path / "cao-home")
-        monkeypatch.setattr(mod, "load_agent_profile", lambda _name: _profile_stub())
+        monkeypatch.setattr(
+            getattr(mod, "agent_profiles", mod), "load_agent_profile", lambda _name: _profile_stub()
+        )
         monkeypatch.setattr(mod.shutil, "which", lambda _name: "/usr/bin/grok")
 
         provider = mod.GrokCliProvider("tid-grok", "sess", "win", "worker")
@@ -575,7 +583,9 @@ class TestKimiCarriesTheDeclaredTransport:
 
         from cli_agent_orchestrator.providers import kimi_cli as mod
 
-        monkeypatch.setattr(mod, "load_agent_profile", lambda _name: _profile_stub())
+        monkeypatch.setattr(
+            getattr(mod, "agent_profiles", mod), "load_agent_profile", lambda _name: _profile_stub()
+        )
         provider = mod.KimiCliProvider("tid-kimi", "sess", "win", "worker")
         monkeypatch.setattr(mod.Path, "home", classmethod(lambda cls: tmp_path / "kimi-home"))
         if True:
@@ -672,7 +682,9 @@ class TestCopilotCarriesAnHttpPluginServer:
 
         from cli_agent_orchestrator.providers import copilot_cli as mod
 
-        monkeypatch.setattr(mod, "load_agent_profile", lambda _name: _profile_stub())
+        monkeypatch.setattr(
+            getattr(mod, "agent_profiles", mod), "load_agent_profile", lambda _name: _profile_stub()
+        )
         provider = mod.CopilotCliProvider("tid-copilot-http", "sess", "win", "worker")
 
         servers = json.loads(provider._build_runtime_mcp_config())["mcpServers"]
@@ -700,7 +712,9 @@ class TestCopilotCarriesAnHttpPluginServer:
         """
         from cli_agent_orchestrator.providers import copilot_cli as mod
 
-        monkeypatch.setattr(mod, "load_agent_profile", lambda _name: _profile_stub())
+        monkeypatch.setattr(
+            getattr(mod, "agent_profiles", mod), "load_agent_profile", lambda _name: _profile_stub()
+        )
         provider = mod.CopilotCliProvider("tid-copilot-stdio", "sess", "win", "worker")
 
         servers = json.loads(provider._build_runtime_mcp_config())["mcpServers"]
@@ -720,7 +734,9 @@ class TestCopilotCarriesAnHttpPluginServer:
         """
         from cli_agent_orchestrator.providers import copilot_cli as mod
 
-        monkeypatch.setattr(mod, "load_agent_profile", lambda _name: _profile_stub())
+        monkeypatch.setattr(
+            getattr(mod, "agent_profiles", mod), "load_agent_profile", lambda _name: _profile_stub()
+        )
         provider = mod.CopilotCliProvider("tid-copilot-own", "sess", "win", "worker")
 
         servers = json.loads(provider._build_runtime_mcp_config())["mcpServers"]

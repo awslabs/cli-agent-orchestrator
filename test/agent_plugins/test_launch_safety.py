@@ -95,7 +95,7 @@ class TestCreateTerminalUnderConcurrentSweep:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_terminal_still_launches_while_a_projection_breaks(
         self,
         mock_load_profile,
@@ -158,7 +158,7 @@ class TestCreateTerminalUnderConcurrentSweep:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_terminal_launches_with_an_already_dangling_link(
         self,
         mock_load_profile,
