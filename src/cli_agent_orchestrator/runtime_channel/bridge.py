@@ -499,7 +499,7 @@ async def _amain() -> None:
 def main() -> None:
     from cli_agent_orchestrator.utils.logging import setup_logging
 
-    setup_logging()
+    setup_logging(command="cao-bridge", label="cao-bridge")
     try:
         asyncio.run(_amain())
     except ChannelRefused as exc:
