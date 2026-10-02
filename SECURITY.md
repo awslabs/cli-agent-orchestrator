@@ -57,7 +57,10 @@ Security scans run:
 
 ### CodeQL Static Analysis
 
-CodeQL runs via GitHub's default setup on every push to `main` and every pull request, covering both Python and JavaScript/TypeScript. Findings appear as PR review comments and in the repo's [Security tab](https://github.com/awslabs/cli-agent-orchestrator/security/code-scanning). Default setup catches `py/full-ssrf`, `py/path-injection`, `py/request-without-timeout`, and the rest of the `security-extended` query suite.
+CodeQL currently uses GitHub's default setup, with its configured languages and
+query suite. Findings appear in the repo's [Security tab](https://github.com/awslabs/cli-agent-orchestrator/security/code-scanning).
+Default setup does not cover fork pull requests; see GitHub's
+[setup types](https://docs.github.com/en/code-security/concepts/code-scanning/setup-types).
 
 Default setup is configured in repo settings, not in a workflow file — adding a workflow-based CodeQL job alongside it causes upload conflicts. If the team later needs the wider `security-and-quality` suite or custom queries, toggle default setup off first and then add an advanced workflow.
 
@@ -125,6 +128,54 @@ scripts/security-scan.sh trivy     # just Trivy
 scripts/security-scan.sh codeql    # just CodeQL (requires the CodeQL CLI)
 scripts/security-scan.sh gitleaks  # just gitleaks (requires the gitleaks CLI)
 ```
+
+### Preparing an advanced CodeQL workflow
+
+GitHub rejects advanced CodeQL SARIF uploads while its hosted default setup is
+enabled. Merging a workflow or prerequisite PR does **not** change that setting.
+Maintainers own this configuration; workflow and setup changes require a
+maintainer's security review, not merely green checks from the PR's own workflow.
+
+[`scripts/prepare_codeql_advanced.py`](scripts/prepare_codeql_advanced.py) makes
+the prerequisite explicit and verifiable. It requires a target repository and
+the full reviewed commit SHA containing `.github/workflows/codeql.yml`. By
+default it only reads GitHub and exits nonzero if default setup blocks uploads.
+It checks file presence, not the workflow's safety or scan completeness.
+
+```bash
+REPO=awslabs/cli-agent-orchestrator
+PR=123 # Replace with the advanced-workflow PR number.
+REF=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid)
+uv run python scripts/prepare_codeql_advanced.py --repo "$REPO" --ref "$REF"
+```
+
+Only during a coordinated migration, with merges paused, the replacement
+workflow reviewed, and the current setup recorded for rollback, may an
+administrator apply the switch:
+
+```bash
+uv run python scripts/prepare_codeql_advanced.py \
+  --repo "$REPO" --ref "$REF" --disable-default-setup
+```
+
+The command uses the existing `gh` authentication, changes only the default-setup
+state, and verifies the result. GitHub requires repository administration write
+permission for a fine-grained token. Keep credentials in the approved credential
+store; never put an administrator token in a PR workflow. Authentication, API,
+missing-workflow, and unconfirmed-update errors fail explicitly. If a write cannot
+be confirmed, inspect the setting before proceeding; no automatic rollback or
+retry is attempted.
+
+This command neither merges PRs nor changes branch protections. After the switch,
+rerun all four advanced language checks at the reviewed head and require accepted
+uploads before merging the workflow PR. Establish its `main` baseline, configure
+the required CodeQL scan/status rules, and complete fork-PR and merge-blocking
+acceptance before ending the migration. A successful prerequisite check alone is
+not evidence that scanning or merge protection works. If the migration must be
+abandoned, restore default setup before resuming ordinary merges.
+
+See GitHub's [advanced setup procedure](https://docs.github.com/en/code-security/how-tos/find-and-fix-code-vulnerabilities/configure-code-scanning/configuring-advanced-setup-for-code-scanning)
+and [default-setup API](https://docs.github.com/en/rest/code-scanning/code-scanning#update-a-code-scanning-default-setup-configuration).
 
 ## Tool Restrictions (allowedTools)
 

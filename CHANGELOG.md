@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- An explicit administrator command to check and prepare the hosted CodeQL setup
+  before enabling advanced workflow uploads. It is read-only by default, requires
+  a reviewed replacement workflow, and verifies any opt-in setting change.
+  Merging the prerequisite code does not change repository settings (#857).
+
 - terminal records keep the model each terminal was launched with (`model`)
   and whether its provider applies a launch model (`model_honored`). Each
   provider declares the second through `honors_model`; the base default is
@@ -1408,5 +1413,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump to v0.51.0, update method name (#31)
 
 - accept optional U+03BB (λ) after % in kiro and q CLIs (#44)
-
 
