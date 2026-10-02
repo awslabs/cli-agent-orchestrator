@@ -443,7 +443,7 @@ def _drop_stale_rows() -> int:
 
 
 async def _amain() -> None:
-    from cli_agent_orchestrator.clients.database import init_runtime_db
+    from cli_agent_orchestrator.clients.database import init_db
     from cli_agent_orchestrator.services.log_writer import log_writer
     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
@@ -464,7 +464,9 @@ async def _amain() -> None:
     ready = os.environ.get("CAO_BRIDGE_READY_FILE", "").strip()
     ready_file = Path(ready) if ready else CAO_HOME_DIR / "bridge-ready"
 
-    init_runtime_db()
+    # The full schema: the terminal service a launch runs writes more than the
+    # terminals table (e.g. session incarnations), and a subset would drift.
+    init_db()
     # Before the first hello, which lists every row as a running terminal.
     await asyncio.to_thread(_drop_stale_rows)
     loop = asyncio.get_running_loop()
