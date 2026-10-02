@@ -103,6 +103,8 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     requested_kiro_capabilities,
 )
 from cli_agent_orchestrator.providers.manager import ProviderManager, provider_manager
+from cli_agent_orchestrator.runtime_channel.protocol import CommandType
+from cli_agent_orchestrator.runtime_channel.registry import COMMAND_TIMEOUT
 from cli_agent_orchestrator.services import worktree_service
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
     elastic_worker_gateway_headers,
@@ -3116,20 +3118,30 @@ def _schedule_deferred_init(
     return task
 
 
-def _call_runtime(metadata: Dict, command_type: str, payload: Dict, timeout: float = 60.0) -> Dict:
+#: A remote delete's deadline: the runtime's teardown can include the provider's
+#: own cleanup, so it gets longer than an ordinary command.
+REMOTE_DELETE_TIMEOUT = 2 * COMMAND_TIMEOUT
+
+
+def _call_runtime(
+    metadata: Dict,
+    command_type: CommandType,
+    payload: Dict,
+    timeout: float = COMMAND_TIMEOUT,
+) -> Dict:
     """Run one operation for a terminal that lives in an execution runtime (#745).
 
     Anything that touches the terminal's tmux runs in that runtime, beside its
     pane; the server never falls back to its own tmux for a remote terminal.
-    Raises a ``RemoteRuntimeError`` subclass when the runtime is not connected,
-    does not answer, or reports a failure.
+    Raises a ``RemoteRuntimeError`` subclass when the runtime is not connected
+    (503), does not answer within ``timeout`` (504 once the command was sent,
+    503 if it never was), or reports a failure (502).
     """
-    from cli_agent_orchestrator.runtime_channel.protocol import CommandType
     from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
 
     return runtime_registry.call_blocking(
         metadata["runtime_id"],
-        CommandType(command_type),
+        command_type,
         payload,
         terminal_id=metadata["id"],
         timeout=timeout,
@@ -3310,7 +3322,7 @@ def get_working_directory(terminal_id: str) -> Optional[str]:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
         if metadata.get("runtime_id"):
-            result = _call_runtime(metadata, "working_directory", {})
+            result = _call_runtime(metadata, CommandType.WORKING_DIRECTORY, {})
             return result.get("working_directory")
 
         working_dir = get_backend().get_pane_working_directory(
@@ -3375,7 +3387,7 @@ def send_input(
             # provider guards and memory injection it needs.
             result = _call_runtime(
                 metadata,
-                "input",
+                CommandType.INPUT,
                 {
                     "message": message,
                     "sender_id": sender_id,
@@ -3565,7 +3577,7 @@ def send_special_key(terminal_id: str, key: str) -> bool:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
         if metadata.get("runtime_id"):
-            result = _call_runtime(metadata, "key", {"key": key})
+            result = _call_runtime(metadata, CommandType.KEY, {"key": key})
             if not result.get("success"):
                 return False
             update_last_active(terminal_id)
@@ -3603,7 +3615,7 @@ def exit_terminal_cli(terminal_id: str) -> None:
     metadata = get_terminal_metadata(terminal_id)
     if metadata and metadata.get("runtime_id"):
         # The provider object that knows its exit command lives in the runtime.
-        _call_runtime(metadata, "exit", {})
+        _call_runtime(metadata, CommandType.EXIT, {})
         return
     provider = provider_manager.get_provider(terminal_id)
     if provider is None:
@@ -3656,8 +3668,8 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
 
         if metadata.get("runtime_id"):
             # Extraction reads the pane, so it runs in the runtime.
-            result = _call_runtime(metadata, "output", {"mode": OutputMode(mode).value})
-            return str(result.get("output", ""))
+            remote = _call_runtime(metadata, CommandType.OUTPUT, {"mode": OutputMode(mode).value})
+            return str(remote.get("output", ""))
 
         # Get output from StatusMonitor buffer (instant, no tmux call)
         full_output = status_monitor.get_buffer(terminal_id)
@@ -4221,7 +4233,7 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
         row = get_terminal_metadata(terminal_id)
         if row and row.get("runtime_id"):
             # Tear down in the runtime; drop the central row only once it confirms.
-            result = _call_runtime(row, "delete", {}, timeout=120.0)
+            result = _call_runtime(row, CommandType.DELETE, {}, timeout=REMOTE_DELETE_TIMEOUT)
             if not result.get("deleted"):
                 logger.warning("Runtime deferred cleanup of terminal %s", terminal_id)
                 return False
