@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Security groundwork for ephemeral agents (#801): installed-profile APIs and
+  CLI lookups refuse reserved names, and matching installed profiles trigger a
+  startup warning. Terminal responses include a registry-derived `ephemeral`
+  boolean. Ephemeral callers cannot delegate or start workflows unless the
+  operator sets `ephemeral.child_may_delegate` to `true` in `settings.json`.
+  Ephemeral agent creation is not yet available.
 - Advanced CodeQL analysis for same-repository and fork pull requests, with
   Python, JavaScript/TypeScript, GitHub Actions, and Rust coverage, plus `main`,
   weekly, and manual scans. CI workflow definitions and their `CODEOWNERS`
