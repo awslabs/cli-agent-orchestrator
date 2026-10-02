@@ -4490,6 +4490,15 @@ def read_output_range(terminal_id: str, offset: int, length: int) -> str:
     if offset < 0:
         raise ValueError(f"offset must be >= 0, got {offset}")
 
+    metadata = get_terminal_metadata(terminal_id)
+    if metadata and metadata.get("runtime_id"):
+        # Its log is written beside its pane, in the runtime (#745): an empty
+        # range from this server would read as "nothing logged yet".
+        raise LocalExecutionDisabledError(
+            f"terminal {terminal_id} runs in an execution runtime; output ranges "
+            "are read from logs on this server only"
+        )
+
     # Clamp the read window (BR-2). A non-positive length reads nothing rather
     # than raising — the route enforces length >= 1, so this is defense in depth.
     capped_length = max(0, min(length, TERMINAL_RANGE_MAX_LENGTH))

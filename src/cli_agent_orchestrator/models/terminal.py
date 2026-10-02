@@ -76,8 +76,11 @@ class LocalExecutionDisabledError(Exception):
     """Raised when a terminal would start beside a server set to run no agents.
 
     A central ``cao-server`` whose agents all run in execution runtimes (#745)
-    sets ``CAO_LOCAL_EXECUTION=0``. Not a ``ValueError`` subclass, for the reason
-    ``TerminalLimitError`` gives: the API maps it to its own status (409).
+    sets ``CAO_LOCAL_EXECUTION=0``. Also raised when an operation that only
+    works on this server's own panes or logs (run-step reuse, inbox delivery,
+    output ranges) targets a terminal that runs in an execution runtime. Not a
+    ``ValueError`` subclass, for the reason ``TerminalLimitError`` gives: the
+    API maps it to its own status (409).
     """
 
 

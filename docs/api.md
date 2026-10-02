@@ -232,6 +232,10 @@ strings. See [Control Planes](control-planes.md) for operator-facing choices.
   return `503` when the runtime is not connected, `504` when the outcome is
   unknown, and `502` when the runtime reports a failure. See
   [Execution runtimes](execution-runtimes.md).
+- Routes that work only on the server's own panes and logs return `409` for a
+  remote terminal: `POST /terminals/run-step` reusing one,
+  `POST /terminals/{terminal_id}/inbox/messages` to one, and
+  `GET /terminals/{terminal_id}/output/range`.
 
 ### Durable handoff results
 

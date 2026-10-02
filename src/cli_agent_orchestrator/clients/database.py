@@ -28,6 +28,7 @@ from sqlalchemy.types import TypeDecorator
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
+from cli_agent_orchestrator.models.terminal import LocalExecutionDisabledError
 
 logger = logging.getLogger(__name__)
 
@@ -2912,10 +2913,19 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
 
     Raises:
         ValueError: If the receiver terminal does not exist.
+        LocalExecutionDisabledError: If the receiver runs in an execution
+            runtime (#745): inbox delivery watches this server's own panes, so
+            the message would stay pending for good.
     """
     with SessionLocal() as db:
-        if not db.query(TerminalModel).filter(TerminalModel.id == receiver_id).first():
+        receiver = db.query(TerminalModel).filter(TerminalModel.id == receiver_id).first()
+        if not receiver:
             raise ValueError(f"Terminal '{receiver_id}' not found")
+        if receiver.runtime_id is not None:
+            raise LocalExecutionDisabledError(
+                f"terminal {receiver_id} runs in an execution runtime; inbox messages "
+                "are delivered to terminals on this server only"
+            )
         inbox_msg = InboxModel(
             sender_id=sender_id,
             receiver_id=receiver_id,
