@@ -52,6 +52,7 @@ class ProviderManager:
             ProviderType.ANTIGRAVITY_CLI.value: AntigravityCliProvider,
             ProviderType.GROK_CLI.value: GrokCliProvider,
             ProviderType.MINIMAX_CODE.value: MiniMaxCodeProvider,
+            ProviderType.DEVIN_CLI.value: DevinCliProvider,
             ProviderType.MOCK_CLI.value: MockCliProvider,
         }
         try:
@@ -215,6 +216,7 @@ class ProviderManager:
                     agent_profile,
                     allowed_tools,
                     skill_prompt=skill_prompt,
+                    model=model,
                 )
             # --- Credentials-free mock provider (test/CI infrastructure) ---
             elif provider_type == ProviderType.MOCK_CLI.value:

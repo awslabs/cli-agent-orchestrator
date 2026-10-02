@@ -74,6 +74,15 @@ ERROR_PATTERNS = [
 class DevinCliProvider(BaseProvider):
     """Provider for Devin CLI (https://cli.devin.ai/)."""
 
+    @classmethod
+    def honors_model(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+        requested_model: Optional[str],
+    ) -> bool:
+        return True
+
     def __init__(
         self,
         terminal_id: str,
@@ -82,11 +91,14 @@ class DevinCliProvider(BaseProvider):
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
+        model: Optional[str] = None,
     ):
         """Initialize provider with terminal context."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        # Explicit per-call override for profile.model, see _build_command.
+        self._model = model
         self._temp_prompt_file: Optional[str] = None
         self._mcp_config_path: Optional[Path] = None
         # name -> (entry we wrote, entry that was there before — _PRIOR_ABSENT
@@ -273,9 +285,13 @@ class DevinCliProvider(BaseProvider):
             logger.debug("Could not list terminals for %s: %s", self.terminal_id, exc)
             return False
         target = str(workdir)
+        # Rows are keyed by ``id`` (the TerminalModel primary key), not
+        # ``terminal_id`` — list_all_terminals() has no ``terminal_id`` key, so
+        # reading it would make every row a non-self match, including this
+        # terminal's own still-present row during cleanup_provider().
         return any(
             isinstance(t, dict)
-            and t.get("terminal_id") != self.terminal_id
+            and t.get("id") != self.terminal_id
             and t.get("working_directory") == target
             for t in terminals
         )
@@ -405,6 +421,12 @@ class DevinCliProvider(BaseProvider):
                     "false",
                 ]
             )
+
+        # self._model is an explicit per-call override (handoff/assign's own
+        # selection); otherwise the profile's model applies.
+        resolved_model = self._model or (profile.model if profile else None)
+        if resolved_model:
+            command_parts.extend(["--model", resolved_model])
 
         # Handle allowed_tools restrictions
         if self._allowed_tools is not None and "*" not in self._allowed_tools:
