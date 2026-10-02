@@ -209,12 +209,12 @@ Hazards:
 **Decision.**
 - **Registry:** a DB table `ephemeral_agents` with:
   - `name` (key), `owner_kind` (terminal | workflow_step), `owner_id`, `session_name`;
-  - `state` (pending | claimed | launched | gc), `claim_id`, `claim_expires_at`, `launched_terminal_id`, the declared `model_tier`/`effort`;
+  - `state` (pending | claimed | launched | gc), `claim_id`, `claim_expires_at`, `idempotency_key` (set by the claim, ADR-2), `launched_terminal_id`, `bound_at` (set by the bind, read by the sweep, ADR-4), the declared `model_tier`/`effort`;
   - `provider`, resolved at create, which the bind matches (ADR-2), and `effective_tools`, the ceiling computed at create (ADR-5), which the claim returns;
   - `created_at`, `expires_at`, `gc_reason`;
   - `spec_sha256`, `profile_sha256`, `audit_path`.
 - **Live copy:** `CAO_HOME/ephemeral/live/<name>.md` (file 0600, dir 0700), written only by cao-server. It is written at create with the explicit or fallback values. `finalize` rewrites it from the stored spec after every successful claim, through a temp file and a rename in the same dir. The rewrite always happens before `create_terminal` loads the profile (`terminal_service.py:1326-1332`), so a name returned to `pending` keeps no earlier decision.
-- **Resolution: a launch-only loader.** A new `load_launch_profile(name) -> (AgentProfile, ProfileSource)` in `utils/agent_profiles.py` is the only loader that serves ephemerals. Its first branch looks up a name matching the reserved pattern (ADR-8) only in `ephemeral/live/`, and raises `EphemeralProfileUnavailable(ValueError)` if the file is missing. Other names go to `load_agent_profile`, unchanged.
+- **Resolution: a launch-only loader.** A new `load_launch_profile(name) -> (AgentProfile, ProfileSource)` in `utils/agent_profiles.py` is the only loader that serves ephemerals. Its first branch looks up a name matching the reserved pattern (ADR-8) only in `ephemeral/live/`, and raises `EphemeralProfileUnavailable(ValueError)` if the file is missing. It parses that file verbatim, never through `resolve_env_vars`, so a `${VAR}` in a brief cannot pull a value from `CAO_HOME/.env` into the prompt. Other names go to `load_agent_profile`, unchanged.
   - Only the launch path calls it: `create_terminal` (`terminal_service.py:1330`), Claude's profile load (`claude_code.py:343`), Codex's command build (`codex.py:1022`), `resolve_provider` (`utils/agent_profiles.py:376`) and `resolve_agent_profile_source`.
   - The error is a `ValueError`, which `load_agent_profile`'s re-raise passes unwrapped (`:370`) and `resolve_provider`'s fallback does not catch (`:392-397`; E1a pins this with a test). `create_terminal` catches only `FileNotFoundError` (`:1331`), and Claude and Codex wrap it as `ProviderError` (`claude_code.py:346-347`, `codex.py:1023-1024`).
   - So a missing or expired ephemeral fails closed. It never reaches another store, another provider or `claude --agent`.
