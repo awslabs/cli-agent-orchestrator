@@ -164,7 +164,7 @@ The provider detects terminal state from the tmux capture buffer (ANSI-stripped)
   whose command or arguments are relative to its own directory starts in the right
   place rather than in OpenCode's workspace directory
 
-The agent ID is the slash-sanitized form of the profile name (`/` → `__`) — the same identifier used for the installed `.md` filename and the runtime `opencode --agent <id>` argument. This keeps the filename, the `--agent` arg, and the `opencode.json` key aligned for any profile name.
+The agent ID is the profile's resolved `name:` — the same identifier used for the installed `.md` filename and the runtime `opencode --agent <id>` argument. This keeps the filename, the `--agent` arg, and the `opencode.json` key aligned for any profile name. (Install rejects a `name:` containing a path separator outright; `to_opencode_agent_id` still flattens `/` to `__` as defence in depth for any other caller.)
 
 Because the ID comes from the resolved `name:` rather than the file name, two
 different profile files can resolve to the same ID. `cao install` refuses the

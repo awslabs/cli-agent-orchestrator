@@ -1023,13 +1023,12 @@ class TestRefusedImportPreservesTheStoredProfile:
         self, runner: CliRunner, workspace: Dict[str, Any], tmp_path: Path, monkeypatch
     ) -> None:
         """The preflight must see the incoming profile with ``--env`` applied, as
-        the install itself does, or a ``${VAR}``-named profile could slip past."""
+        the install itself does, or a ``${VAR}``-named profile could slip past.
+        And a refused install persists nothing to the managed .env file."""
+        persisted: list = []
         monkeypatch.setattr(
-            "cli_agent_orchestrator.services.install_service.set_env_var", lambda k, v: None
-        )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.install_service.resolve_env_vars",
-            lambda text: text.replace("${ALIAS}", "shared"),
+            "cli_agent_orchestrator.services.install_service.set_env_var",
+            lambda k, v: persisted.append((k, v)),
         )
         before = self._seed(runner, workspace, "opencode_cli")
         incoming = tmp_path / "incoming" / "beta.md"
@@ -1037,8 +1036,188 @@ class TestRefusedImportPreservesTheStoredProfile:
         _write_profile(incoming, name="${ALIAS}", body="UPDATED-BETA")
 
         r = runner.invoke(
-            install, [str(incoming), "--provider", "opencode_cli", "--env", "ALIAS=x"]
+            install, [str(incoming), "--provider", "opencode_cli", "--env", "ALIAS=shared"]
         )
 
         _refused(r)
         assert (workspace["local_store"] / "beta.md").read_bytes() == before
+        assert persisted == []
+
+
+class TestRefusedImportPreservesTheStoreForWriterRefusals:
+    """Round 7 (gutosantos82): the byte-identical invariant held only for
+    ownership-guard refusals. Every refusal the context writer raises itself --
+    a symlink or directory at the context target, the provenance read-back
+    refusal, an unwritable context directory -- fired after ``write_profile``
+    had already replaced the store with the rejected input. Those checks now run
+    as a preflight ahead of the store write."""
+
+    def _seed(self, runner: CliRunner, workspace: Dict[str, Any]) -> bytes:
+        store = workspace["local_store"]
+        _write_profile(store / "kappa.md", name="kappa_old", body="KAPPA-OLD")
+        _ok(_install(runner, "kappa"))
+        return (store / "kappa.md").read_bytes()
+
+    @staticmethod
+    def _incoming(tmp_path: Path, text: str) -> Path:
+        incoming = tmp_path / "incoming" / "kappa.md"
+        incoming.parent.mkdir(exist_ok=True)
+        incoming.write_text(text, encoding="utf-8")
+        return incoming
+
+    def test_symlink_at_the_context_target(
+        self, runner: CliRunner, workspace: Dict[str, Any], tmp_path: Path
+    ) -> None:
+        before = self._seed(runner, workspace)
+        elsewhere = tmp_path / "elsewhere.md"
+        elsewhere.write_text("DO NOT TOUCH", encoding="utf-8")
+        os.symlink(elsewhere, workspace["context_dir"] / "kappa_new.md")
+        incoming = self._incoming(
+            tmp_path, "---\nname: kappa_new\ndescription: D\n---\nKAPPA-NEW\n"
+        )
+
+        r = runner.invoke(install, [str(incoming), "--provider", "opencode_cli"])
+
+        _refused(r)
+        assert "non-regular filesystem entry" in r.output, r.output
+        assert (workspace["local_store"] / "kappa.md").read_bytes() == before
+        assert elsewhere.read_text() == "DO NOT TOUCH"
+
+    def test_directory_at_the_context_target(
+        self, runner: CliRunner, workspace: Dict[str, Any], tmp_path: Path
+    ) -> None:
+        before = self._seed(runner, workspace)
+        (workspace["context_dir"] / "kappa_new.md").mkdir()
+        incoming = self._incoming(
+            tmp_path, "---\nname: kappa_new\ndescription: D\n---\nKAPPA-NEW\n"
+        )
+
+        r = runner.invoke(install, [str(incoming), "--provider", "opencode_cli"])
+
+        _refused(r)
+        assert "non-regular filesystem entry" in r.output, r.output
+        assert (workspace["local_store"] / "kappa.md").read_bytes() == before
+
+    def test_provenance_readback_refusal(
+        self, runner: CliRunner, workspace: Dict[str, Any], tmp_path: Path
+    ) -> None:
+        before = self._seed(runner, workspace)
+        incoming = self._incoming(
+            tmp_path,
+            f"---\nname: kappa_new\ndescription: D\n\"{_CONTEXT_SOURCE_STEM_KEY}\": 'bbb'\n---\nX\n",
+        )
+
+        r = runner.invoke(install, [str(incoming), "--provider", "opencode_cli"])
+
+        _refused(r)
+        assert "could not stamp a trustworthy" in r.output, r.output
+        assert (workspace["local_store"] / "kappa.md").read_bytes() == before
+        assert not (workspace["context_dir"] / "kappa_new.md").exists()
+
+    def test_unwritable_context_directory(
+        self, runner: CliRunner, workspace: Dict[str, Any], tmp_path: Path
+    ) -> None:
+        if os.geteuid() == 0:
+            pytest.skip("root ignores directory modes")
+        before = self._seed(runner, workspace)
+        incoming = self._incoming(
+            tmp_path, "---\nname: kappa_new\ndescription: D\n---\nKAPPA-NEW\n"
+        )
+        context_dir = workspace["context_dir"]
+        os.chmod(context_dir, 0o500)
+        try:
+            r = runner.invoke(install, [str(incoming), "--provider", "opencode_cli"])
+        finally:
+            os.chmod(context_dir, 0o700)
+
+        _refused(r)
+        assert str(context_dir / "kappa_new.md") in r.output, r.output
+        assert (workspace["local_store"] / "kappa.md").read_bytes() == before
+
+    def test_url_import_with_a_symlinked_context_target(
+        self, runner: CliRunner, workspace: Dict[str, Any], tmp_path: Path
+    ) -> None:
+        """The URL import path shares the preflight."""
+        before = self._seed(runner, workspace)
+        elsewhere = tmp_path / "elsewhere.md"
+        elsewhere.write_text("DO NOT TOUCH", encoding="utf-8")
+        os.symlink(elsewhere, workspace["context_dir"] / "kappa_new.md")
+        response = MagicMock()
+        response.text = "---\nname: kappa_new\ndescription: D\n---\nKAPPA-NEW\n"
+        response.is_redirect = False
+        response.raise_for_status.return_value = None
+
+        with patch(
+            "cli_agent_orchestrator.services.install_service.requests.get",
+            return_value=response,
+        ):
+            r = runner.invoke(
+                install,
+                [
+                    "https://raw.githubusercontent.com/org/repo/main/kappa.md",
+                    "--provider",
+                    "kiro_cli",
+                ],
+            )
+
+        _refused(r)
+        assert (workspace["local_store"] / "kappa.md").read_bytes() == before
+        assert elsewhere.read_text() == "DO NOT TOUCH"
+
+
+class TestPluginRefreshFollowsTheConfiguredContextDirectory:
+    """Round 7 (gutosantos82): ``refresh_installed_agents_for_plugin_mcp`` still
+    enumerated the hard-coded ``AGENT_CONTEXT_DIR``, so with an active
+    ``agents.dirs.cao_installed`` override a plugin install or uninstall
+    refreshed the default directory and found nothing."""
+
+    def _install_then_override(
+        self,
+        runner: CliRunner,
+        workspace: Dict[str, Any],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> Path:
+        store = workspace["local_store"]
+        _write_profile(store / "alpha.md", name="shared", body="ALPHA")
+        _ok(_install_for(runner, "alpha", "kiro_cli"))
+        override_dir = tmp_path / "configured-elsewhere"
+        override_dir.mkdir()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+            lambda: {"cao_installed": str(override_dir)},
+        )
+        _ok(_install_for(runner, "alpha", "kiro_cli"))
+        assert (override_dir / "shared.md").exists()
+        return override_dir
+
+    def test_copies_recorded_only_in_the_override_are_refreshed(
+        self,
+        runner: CliRunner,
+        workspace: Dict[str, Any],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._install_then_override(runner, workspace, tmp_path, monkeypatch)
+        (workspace["context_dir"] / "shared.md").unlink()
+
+        assert install_service.refresh_installed_agents_for_plugin_mcp() == ["shared"]
+
+    def test_a_copy_in_both_directories_is_refreshed_once(
+        self,
+        runner: CliRunner,
+        workspace: Dict[str, Any],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._install_then_override(runner, workspace, tmp_path, monkeypatch)
+
+        assert install_service.refresh_installed_agents_for_plugin_mcp() == ["shared"]
+
+    def test_default_directory_alone_still_works(
+        self, runner: CliRunner, workspace: Dict[str, Any]
+    ) -> None:
+        _write_profile(workspace["local_store"] / "alpha.md", name="shared", body="ALPHA")
+        _ok(_install_for(runner, "alpha", "kiro_cli"))
+
+        assert install_service.refresh_installed_agents_for_plugin_mcp() == ["shared"]

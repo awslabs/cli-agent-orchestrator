@@ -8,6 +8,7 @@ import re
 import secrets
 import stat
 from pathlib import Path
+from string import Template
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -46,7 +47,7 @@ from cli_agent_orchestrator.utils.agent_profiles import (
     _read_agent_profile_source,
     parse_agent_profile_text,
 )
-from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
+from cli_agent_orchestrator.utils.env import load_env_vars, resolve_env_vars, set_env_var
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.opencode_config import (
     OpenCodeAgentIdCollisionError,
@@ -381,9 +382,9 @@ def _flow_mapping_span(lines: List[str], opening_idx: int, closing_idx: int) -> 
     ``None`` for block-style frontmatter. A flow-style block is one whose first
     content line (blank lines and comments skipped) opens with ``{`` and whose
     last content line ends with ``}``; the block already parsed as a mapping in
-    :func:`_find_frontmatter_block`, so that is what those braces delimit. A
-    flow mapping followed by a trailing comment line is not recognised and
-    falls through to the readback refusal, as before.
+    :func:`_find_frontmatter_block`, so that is what those braces delimit.
+    Blank and comment lines before or after the mapping are skipped, so a
+    trailing comment line does not stop the mapping from being recognised.
     """
     first = last = None
     for idx in range(opening_idx + 1, closing_idx):
@@ -747,8 +748,64 @@ def _create_context_temp_file(context_file: Path) -> Tuple[int, Path]:
     ) from last_exc
 
 
-def _write_context_file(agent_name: str, raw_content: str, source_name: str) -> Path:
+def _preflight_context_file(agent_name: str, raw_content: str, source_name: str) -> str:
+    """Raise every refusal :func:`_write_context_file` would raise, without writing.
+
+    Returns the stamped content so the writer need not assemble it twice.
+    ``install_agent`` calls this BEFORE it writes the local store, so an import
+    the writer would refuse -- a symlink or directory at the context target, a
+    provenance marker that does not read back, a context directory that is not
+    absolute or not writable -- leaves the previously stored profile of that
+    stem byte-identical, the same as an ownership-guard refusal (round-7 review
+    of #493). The writer repeats the cheap checks at its own sink because they
+    are its barrier, not because this preflight is optional.
+
+    The writability check is advisory (``os.access`` on an existing directory);
+    an I/O fault during the write itself is a failure, not a refusal, and is
+    reported by the writer.
+    """
+    context_dir = _context_dir()
+    if not context_dir.is_absolute():
+        raise _relative_context_dir_error(context_dir)
+    safe_name = validate_path_component(agent_name, description="profile name")
+    base = os.path.realpath(context_dir)
+    candidate = os.path.join(base, f"{safe_name}.md")
+    if candidate != base and not candidate.startswith(base + os.sep):
+        raise _escaping_context_target_error(agent_name, candidate)
+    context_file = Path(candidate)
+    try:
+        st = os.lstat(context_file)
+    except FileNotFoundError:
+        st = None
+    if st is not None and not stat.S_ISREG(st.st_mode):
+        raise _non_regular_target_error(context_file)
+    if context_dir.is_dir() and not os.access(context_dir, os.W_OK):
+        raise OSError(f"Failed to write context file '{context_file}': Permission denied")
+    return _context_content_with_provenance(raw_content, source_name)
+
+
+def _relative_context_dir_error(context_dir: Path) -> ValueError:
+    return ValueError(
+        f"Refusing to write context copy: the installed-profile directory "
+        f"{str(context_dir)!r} is not an absolute path. Set agents.dirs.cao_installed "
+        "to an absolute directory or remove it to use the default."
+    )
+
+
+def _escaping_context_target_error(agent_name: str, candidate: str) -> ValueError:
+    return ValueError(
+        f"Refusing to write context copy: profile name {agent_name!r} resolves "
+        f"to a path outside the agent context directory ({candidate!r})."
+    )
+
+
+def _write_context_file(
+    agent_name: str, raw_content: str, source_name: str, *, content: Optional[str] = None
+) -> Path:
     """Write the unresolved profile source to the shared context directory.
+
+    ``content`` is the stamped text :func:`_preflight_context_file` returned, when
+    the caller ran it; otherwise it is assembled here.
 
     ``agent_name`` is the *resolved* profile name (frontmatter ``name:``) and
     determines the filename — the context copy lives at
@@ -800,11 +857,7 @@ def _write_context_file(agent_name: str, raw_content: str, source_name: str) -> 
         # settings; this is the sink's own refusal to ever treat the server's
         # working directory as the trusted write root (a profile named README or
         # AGENTS would otherwise land on a repository file).
-        raise ValueError(
-            f"Refusing to write context copy: the installed-profile directory "
-            f"{str(context_dir)!r} is not an absolute path. Set agents.dirs.cao_installed "
-            "to an absolute directory or remove it to use the default."
-        )
+        raise _relative_context_dir_error(context_dir)
     context_dir.mkdir(parents=True, exist_ok=True)
     # BARRIER PLACEMENT: the validation and the containment check are inlined
     # here, in the same function as the write sink, rather than factored into a
@@ -824,10 +877,7 @@ def _write_context_file(agent_name: str, raw_content: str, source_name: str) -> 
     base = os.path.realpath(context_dir)
     candidate = os.path.join(base, f"{safe_name}.md")
     if candidate != base and not candidate.startswith(base + os.sep):
-        raise ValueError(
-            f"Refusing to write context copy: profile name {agent_name!r} resolves "
-            f"to a path outside the agent context directory ({candidate!r})."
-        )
+        raise _escaping_context_target_error(agent_name, candidate)
     context_file = Path(candidate)
     # HOW THE SYMLINK REFUSAL IS ENFORCED HERE, having replaced O_NOFOLLOW.
     # The pre-atomic writer opened the target directly, so it needed O_NOFOLLOW to
@@ -854,7 +904,8 @@ def _write_context_file(agent_name: str, raw_content: str, source_name: str) -> 
     # is preserved rather than reasserted.
     existing_mode = stat.S_IMODE(st.st_mode) if st is not None else None
 
-    content = _context_content_with_provenance(raw_content, source_name)
+    if content is None:
+        content = _context_content_with_provenance(raw_content, source_name)
     temp_path: Optional[Path] = None
     try:
         fd, temp_path = _create_context_temp_file(context_file)
@@ -1465,7 +1516,12 @@ def install_agent(
     install reads, and it is written to the local store as ``<source>.md``
     only after the ownership guard has accepted it. A URL source is an import
     in the same sense. Either way a refused import leaves the previously
-    stored profile of that stem byte-identical (round-6 review of #493).
+    stored profile of that stem byte-identical, whether the refusal comes
+    from the ownership guard or from the context writer's own checks, which
+    run as a preflight ahead of the store write (rounds 6 and 7 of #493); an
+    I/O failure during the write itself is reported, not a refusal, and
+    may follow the store write. ``--env`` values are persisted only after the
+    same point.
     """
     try:
         valid_providers = [provider_type.value for provider_type in ProviderType]
@@ -1505,12 +1561,16 @@ def install_agent(
             source_kind = "name"
             incoming = profile_content
 
-        if env_vars:
-            for key, value in env_vars.items():
-                set_env_var(key, value)
-
         raw_content = incoming if incoming is not None else _read_agent_profile_source(agent_name)
-        resolved_content = resolve_env_vars(raw_content)
+        # ``--env`` values take part in resolution now but are persisted to the
+        # managed .env file only after the ownership guard has accepted the
+        # install (below), so a refused install leaves no env side effect
+        # behind either (round-7 review of #493).
+        resolved_content = (
+            Template(raw_content).safe_substitute({**load_env_vars(), **env_vars})
+            if env_vars
+            else resolve_env_vars(raw_content)
+        )
         profile = parse_agent_profile_text(resolved_content, agent_name)
 
         # No explicit provider — honour the profile's frontmatter ``provider:``
@@ -1604,6 +1664,14 @@ def install_agent(
         # the artifact every provider's agent reads -- and, for OpenCode, the
         # agent file and config section it also shares.
         _guard_installed_copy_ownership(agent_name, profile.name, provider)
+        # The context writer's own refusals (non-regular target, provenance that
+        # does not read back, unwritable directory) are raised here, before the
+        # store write, for the same reason; the stamped content is reused below.
+        context_content = _preflight_context_file(profile.name, raw_content, agent_name)
+
+        if env_vars:
+            for key, value in env_vars.items():
+                set_env_var(key, value)
 
         record_provider = profile.provider != provider and not preserve_recorded_provider
         if incoming is not None or record_provider:
@@ -1640,7 +1708,9 @@ def install_agent(
 
         # Ownership was established above, before the local-store rewrite; the
         # shared context copy is the next thing this install writes.
-        context_file = _write_context_file(profile.name, raw_content, agent_name)
+        context_file = _write_context_file(
+            profile.name, raw_content, agent_name, content=context_content
+        )
 
         if provider == ProviderType.KIRO_CLI.value:
             if profile.engine == KiroEngine.KAS:
@@ -1832,14 +1902,38 @@ def refresh_installed_agents_for_plugin_mcp() -> List[str]:
     """
     refreshed: List[str] = []
 
-    if not AGENT_CONTEXT_DIR.is_dir():
-        return refreshed
-
-    # ``AGENT_CONTEXT_DIR/<name>.md`` is CAO's existing marker for "this agent is
+    # ``<context dir>/<name>.md`` is CAO's existing marker for "this agent is
     # CAO-managed" — ``skill_injection._is_cao_managed_copilot_agent`` already
-    # uses exactly this test, so reusing it keeps one definition of managed.
-    for context_file in sorted(AGENT_CONTEXT_DIR.glob("*.md")):
-        agent_name = context_file.stem
+    # uses exactly this test, so reusing it keeps one definition of managed. The
+    # directory is the configured one first and then the default, like every
+    # other consumer: with an ``agents.dirs.cao_installed`` override active the
+    # writer deposits copies in the override, and a refresh that only read the
+    # default found nothing to refresh (round-7 review of #493). A name recorded
+    # in both is refreshed once, from the copy the guard would consult first.
+    copies: Dict[str, Path] = {}
+    for context_dir in _context_lookup_dirs():
+        try:
+            if not context_dir.is_dir():
+                continue
+            for context_file in sorted(context_dir.glob("*.md")):
+                copies.setdefault(context_file.stem, context_file)
+        except OSError:  # pragma: no cover - unreadable context dir
+            continue
+
+    for agent_name, context_file in sorted(copies.items()):
+        # Replay with the stem the copy was installed FROM, which its provenance
+        # marker records, not with the resolved name the copy is filed under.
+        # The two differ whenever ``name:`` differs from the filename, and the
+        # ownership guard rightly refuses an install of ``<name>.md`` over a
+        # record that names another stem; the pre-guard refresh got away with
+        # replaying the resolved name only because nothing checked. A copy with
+        # no marker falls back to the resolved name and is refused by the guard
+        # like any other markerless copy (logged below, best effort).
+        try:
+            recorded_stem = _context_source_stem(context_file.read_text(encoding="utf-8"))
+        except Exception:
+            recorded_stem = None
+        install_source = recorded_stem or agent_name
         safe_filename = agent_name.replace("/", "__")
 
         for provider, artifact in (
@@ -1868,7 +1962,7 @@ def refresh_installed_agents_for_plugin_mcp() -> List[str]:
                 # overwrite the operator's own ``--provider`` decision on every
                 # unrelated plugin add and remove (R9). This is the only call site
                 # that passes the keyword.
-                result = install_agent(agent_name, provider, preserve_recorded_provider=True)
+                result = install_agent(install_source, provider, preserve_recorded_provider=True)
             except Exception as exc:  # pragma: no cover - install_agent is total
                 logger.warning(
                     "Could not refresh agent '%s' for provider '%s' after an agent-plugin "

@@ -79,8 +79,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file on the strength of the new record). A provider directory whose listing
   cannot be read is refused as an I/O fault rather than treated as confirming
   the requested spelling. And an import — a local `.md` file or a URL — is
-  written to the local store only after this check accepts it, so a refused
-  import leaves the previously stored profile of that stem byte-identical.
+  written to the local store only after this check and the context writer's
+  own checks (a symlink or directory at the context target, a provenance marker
+  that does not read back, an unwritable context directory) accept it, so a
+  refused import leaves the previously stored profile of that stem
+  byte-identical; `--env` values are likewise persisted only after that point.
+  Plugin install and uninstall, which replay `cao install` for every installed
+  agent to re-materialise MCP servers, now enumerate the configured
+  `agents.dirs.cao_installed` directory (and the default) instead of only the
+  default, and replay each agent from the stem its provenance marker records
+  rather than from its resolved name, so agents whose `name:` differs from
+  their filename are refreshed instead of refused by the new check.
 
 - the shared context copy is written to the configured installed-profile
   directory (`agents.dirs.cao_installed`), the directory profile discovery, the
