@@ -790,37 +790,5 @@ jobs:
           fail-on-severity: high
           deny-licenses: GPL-3.0, AGPL-3.0
 
-# NOTE: CodeQL runs via GitHub's "default setup" (visible as the `Analyze (...)`
-# checks on every PR). Adding a workflow-based CodeQL job here would conflict
-# with default setup ("CodeQL analyses from advanced configurations cannot be
-# processed when the default setup is enabled") and fail uploads. To widen the
-# query suite beyond the default, toggle default setup off in
-# Settings → Code security → CodeQL default setup and re-add a workflow job.
-#
-# ---------------------------------------------------------------------------------------
-# RUST SAST IS AN ACCEPTED, NAMED GAP — considered and declined, not forgotten (SR-6,
-# interview Q6; issue #321).
-#
-# There is deliberately NO Rust static-analysis/scanning job in this file. The reason is the
-# constraint recorded immediately above: CodeQL here runs via default setup, and a
-# workflow-based scanning job that uploads SARIF conflicts with it and fails the upload. So
-# adding one would not buy Rust SAST — it would break the analysis that already runs.
-#
-# What covers the Rust code instead, and it is genuinely less than SAST:
-#   - `cargo clippy --locked --all-targets -- -D warnings` (the `rust` job) — a hard gate,
-#     linting TEST targets as well as the binary. The per-site escape hatch is
-#     `#[allow(lint_name)]` plus an issue-number comment (SR-3), never a global relaxation.
-#   - `#![forbid(unsafe_code)]` at tui/src/main.rs line 1 — memory-safety classes that SAST
-#     would hunt for cannot be expressed in this crate at all. It is a compile-time refusal,
-#     not a warning.
-#   - `cargo-deny` (.github/workflows/cargo-deny.yml) — RustSec advisories over the whole
-#     resolved graph, weekly as well as per-PR. That is dependency CVE coverage, which is a
-#     different axis from first-party static analysis.
-#
-# WHAT REMAINS UNCOVERED: first-party Rust logic flaws — taint flow into a subprocess argv,
-# an injection path through a constructed command, a TOCTOU on a file the TUI writes. clippy
-# is a lint pass, not a dataflow analysis, and will not find those. Unit `rust-ci` treats this
-# as an accepted gap rather than papering over it; to close it, toggle CodeQL default setup off
-# (Rust is supported by CodeQL) and add a single advanced-configuration job covering Python and
-# Rust together.
-# ---------------------------------------------------------------------------------------
+# CodeQL analysis runs separately in codeql.yml, including fork PRs and weekly scans.
+# SECURITY.md documents the required default-setup migration and merge-protection rules.
