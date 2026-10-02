@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- terminal records keep the model each terminal was launched with (`model`)
+  and whether its provider applies a launch model (`model_honored`). Each
+  provider declares the second through `honors_model`; the base default is
+  `False`, so a provider that has not declared it is never reported as having
+  run a model. Both columns are nullable and added by migration, and rows from
+  before it read as unknown. Terminal and session responses,
+  `cao session status`, and the ops MCP `get_terminal_status` and
+  `get_session_info` return both fields; `list_siblings` and the delegation
+  tool results are unchanged (#810)
 - pane-mode windows caption each pane with the terminal running in it.
   `pane_window` gets `pane-border-status` and a border format reading the
   `@cao_terminal` mark, so the caption survives an agent whose TUI sets its own
