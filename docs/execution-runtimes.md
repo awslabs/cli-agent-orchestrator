@@ -100,6 +100,10 @@ retried until the runtime confirms it (see [Commands](#commands)).
   exits on either rather than retrying.
 - The token is read once from `CAO_RUNTIME_TOKEN_FILE`, or from
   `CAO_RUNTIME_TOKEN`; both are then removed from the process environment.
+  When `CAO_RUNTIME_TOKEN_FILE` is set, only the file counts: if it is
+  unreadable (logged as an error) or empty, the process has no token even
+  with `CAO_RUNTIME_TOKEN` set, so the server refuses every runtime and
+  `cao-bridge` exits.
   `cao-server` reads it first thing at startup, before any event plugin loads.
   tmux never passes either variable to a pane. The EKS image's entrypoint
   removes both forms before its setup steps (`cao init`, `cao install`, the
@@ -110,6 +114,12 @@ retried until the runtime confirms it (see [Commands](#commands)).
 - The token authenticates a runtime, not an agent. Agents in a runtime run as
   the same user as `cao-bridge`, so treat everything in a runtime as trusted
   with that token.
+- Nor does the token tie a runtime to its id: the id is whatever its hello
+  says. Anyone holding the token can connect as another runtime's id. That
+  replaces and closes the other runtime's connection, and the impostor then
+  receives the commands for that runtime's terminals and reports their status.
+  Until per-runtime credentials arrive in a later slice, give the token only
+  to runtimes that may act for one another.
 - The runtime token does not protect the HTTP API. Turn on API authentication
   on the server (`CAO_AUTH_LOCAL_TOKEN`, or an IdP; see
   [Configuration](configuration.md)), as the EKS example does, and give a

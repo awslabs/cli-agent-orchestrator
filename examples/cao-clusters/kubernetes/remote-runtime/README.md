@@ -7,6 +7,11 @@ EKS: a central `cao-server` that runs no agents, and an execution runtime
 driven through the server's HTTP API. See
 [Execution runtimes](../../../../docs/execution-runtimes.md) for the design.
 
+Which example to use: [`../eks/`](../eks/README.md) runs a supervisor pod that
+runs agents itself, plus one disposable worker pod per `assign_elastic` call.
+This one keeps every agent out of the server: long-lived runtimes run them,
+and the server's API drives them.
+
 | Object | Role |
 |---|---|
 | `StatefulSet/cao-server`, `Service/cao-server` | the API and central state, on a gp3 volume; `CAO_LOCAL_EXECUTION=0`, so it refuses to start agents itself |
