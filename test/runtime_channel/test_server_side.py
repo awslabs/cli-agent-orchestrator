@@ -29,7 +29,7 @@ import cli_agent_orchestrator.runtime_channel.server as server_mod
 from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.backends import registry as backend_registry
 from cli_agent_orchestrator.models.inbox import OrchestrationType
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import LocalExecutionDisabledError, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.runtime_channel import token as token_mod
 from cli_agent_orchestrator.runtime_channel.bridge import Bridge
@@ -1530,6 +1530,44 @@ class TestRunStepOnARemoteTerminal:
                 "timeout": 5,
             },
         )
+        assert response.status_code == 409, response.text
+        assert "execution runtime" in response.json()["detail"]
+        assert runtime.received == [], "nothing is sent to the runtime"
+
+
+class TestLocalOnlyRoutes:
+    """Routes served from this server's own panes or logs refuse a remote terminal."""
+
+    def test_an_inbox_message_to_a_remote_terminal_is_refused(self, http, start_runtime):
+        _remote_row("abcd1234", "rt-1")
+        runtime = start_runtime(script=_answer)
+        response = http.post(
+            "/terminals/abcd1234/inbox/messages",
+            params={"sender_id": "abcd9999", "message": "hello"},
+        )
+        assert response.status_code == 409, response.text
+        assert "execution runtime" in response.json()["detail"]
+        assert database.get_inbox_messages("abcd1234") == [], "nothing is queued"
+        assert runtime.received == [], "nothing is sent to the runtime"
+
+    def test_no_caller_can_queue_a_message_for_a_remote_terminal(self):
+        # The deferred-init failure notice queues straight into the database.
+        _remote_row("abcd1234", "rt-1")
+        with pytest.raises(LocalExecutionDisabledError):
+            database.create_inbox_message("abcd9999", "abcd1234", "worker failed")
+        assert database.get_inbox_messages("abcd1234") == []
+
+    def test_a_local_terminal_still_gets_its_messages(self):
+        database.create_terminal(
+            "abcd5678", "cao-local1", "developer-abcd", "mock_cli", "developer"
+        )
+        queued = database.create_inbox_message("abcd9999", "abcd5678", "hello")
+        assert (queued.receiver_id, queued.status.value) == ("abcd5678", "pending")
+
+    def test_an_output_range_of_a_remote_terminal_is_refused(self, http, start_runtime):
+        _remote_row("abcd1234", "rt-1")
+        runtime = start_runtime(script=_answer)
+        response = http.get("/terminals/abcd1234/output/range", params={"offset": 0, "length": 64})
         assert response.status_code == 409, response.text
         assert "execution runtime" in response.json()["detail"]
         assert runtime.received == [], "nothing is sent to the runtime"

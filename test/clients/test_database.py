@@ -1681,8 +1681,10 @@ class TestFlowOperations:
         mock_session.__exit__ = MagicMock(return_value=False)
         mock_session_class.return_value = mock_session
 
-        # Receiver terminal exists
-        mock_session.query.return_value.filter.return_value.first.return_value = MagicMock()
+        # Receiver terminal exists, and runs on this server (no runtime_id)
+        mock_session.query.return_value.filter.return_value.first.return_value = MagicMock(
+            runtime_id=None
+        )
 
         # Setup mock to update message attributes on refresh
         def mock_refresh(msg):

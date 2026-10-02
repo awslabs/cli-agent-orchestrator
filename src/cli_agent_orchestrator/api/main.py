@@ -4084,6 +4084,9 @@ async def get_terminal_output_range(
     except ValueError as e:
         # Malformed id / negative offset — a caller error, not a missing log.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except LocalExecutionDisabledError as e:
+        # A remote terminal (#745): its log is in its runtime, not here.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except Exception as e:
         # A genuine file I/O failure surfaced by read_output_range (BR-4): report
         # it rather than masking a real fault as empty output.
@@ -7218,6 +7221,10 @@ async def create_inbox_message_endpoint(
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except LocalExecutionDisabledError as e:
+        # The receiver runs in an execution runtime (#745): refused, not
+        # acknowledged and left pending.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

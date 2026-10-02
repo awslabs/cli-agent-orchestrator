@@ -51,6 +51,12 @@ order; different terminals run concurrently.
 `GET /terminals/{id}` answers from the status the runtime last pushed. While
 the runtime is disconnected, the status is `unknown`.
 
+Operations that work only on the server's own panes and logs refuse a remote
+terminal with `409` rather than act on nothing: reusing it in
+`POST /terminals/run-step`, `POST /terminals/{id}/inbox/messages` to it (a
+queued message would never be delivered), and
+`GET /terminals/{id}/output/range` (its log is in the runtime).
+
 A launch may take up to `CAO_RUNTIME_LAUNCH_TIMEOUT` seconds (a server
 setting; 240 by default) before it is reported as `504`. Set it above the
 longest provider start-up the runtime's profiles allow.
@@ -131,11 +137,13 @@ retried until the runtime confirms it (see [Commands](#commands)).
 ## Known limits of this slice
 
 - Inbox delivery, supervisor delegation through the MCP server, flows and
-  workflows target local terminals only.
+  workflows target local terminals only. A message to a remote terminal is
+  refused (`409`), so `send_message` reports the failure.
 - `GET /sessions` and the CLI's shared-server commands do not list remote
   terminals; `GET /runtimes` does.
 - Output is read on request. There is no output streaming or replay for a
-  remote terminal, and the PTY WebSocket refuses one (close code `4004`).
+  remote terminal: `GET /terminals/{id}/output/range` answers `409`, and the
+  PTY WebSocket refuses one (close code `4004`).
 - The memory context added to a remote terminal's first input is resolved
   in the runtime, not from the server's memory store.
 - A restarted `cao-bridge` process does not re-attach to tmux panes that
