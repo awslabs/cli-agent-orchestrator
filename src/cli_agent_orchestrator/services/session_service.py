@@ -561,6 +561,10 @@ def _delete_remote_session(session_name: str, registry: PluginRegistry | None) -
                         ],
                     }
                 return {"deleted": [session_name], "errors": []}
+            # Serial, under the lock, each bounded by REMOTE_DELETE_TIMEOUT. A
+            # remote session holds one terminal in this slice: a runtime launches
+            # each in a new session, and neither a launch's record step nor a
+            # local create adds one to it. Fan these out if that changes.
             for terminal in list_terminals_by_session(session_name):
                 if terminal_service.delete_terminal(terminal["id"]):
                     torn_down.append(terminal)

@@ -1282,6 +1282,70 @@ class TestLaunchIdRace:
         assert registry.is_known("beef0001", "rt-1")
         assert not registry.is_known("beef0001", "rt-2")
 
+    def test_a_launch_losing_a_row_race_on_its_runtime_keeps_the_winners_placement(
+        self, monkeypatch
+    ):
+        # Two launches on rt-1 reported beef0001 in different sessions, so under
+        # different locks: the other wrote its row after this one's checks.
+        registry = registry_mod.runtime_registry
+        real_create = server_mod.db_create_terminal
+
+        def create_after_the_winner(terminal_id, *args, **kwargs):
+            real_create(terminal_id, "cao-winner", "developer-beef", "mock_cli", runtime_id="rt-1")
+            return real_create(terminal_id, *args, **kwargs)  # its primary key is taken
+
+        monkeypatch.setattr(server_mod, "db_create_terminal", create_after_the_winner)
+        launched = server_mod._Launched.model_validate(LAUNCHED)
+        with pytest.raises(Exception):
+            server_mod._record_launch("rt-1", launched, None)
+        assert database.get_terminal_metadata("beef0001")["tmux_session"] == "cao-winner"
+        assert registry.is_placed("beef0001", "rt-1"), "the winner's row still places it"
+
+    def test_a_launch_whose_row_write_fails_is_unplaced(self, monkeypatch):
+        def refuse(*args, **kwargs):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(server_mod, "db_create_terminal", refuse)
+        launched = server_mod._Launched.model_validate(LAUNCHED)
+        with pytest.raises(RuntimeError):
+            server_mod._record_launch("rt-1", launched, None)
+        assert not registry_mod.runtime_registry.is_placed("beef0001", "rt-1")
+
+
+class TestUnrecordedCleanupPerId:
+    @pytest.mark.asyncio
+    async def test_a_repeated_unrecorded_id_gets_one_cleanup(self, monkeypatch):
+        registry = registry_mod.runtime_registry
+        deletes = []
+
+        async def send_text(text):
+            command = decode(text)
+            deletes.append(command.terminal_id)
+            reply = Result(op_id=command.op_id, ok=True, payload={"deleted": False})
+            asyncio.get_running_loop().call_soon(conn.resolve, reply)
+
+        conn = registry.register("rt-1", send_text)
+        registry.activate(conn)
+        # Deferred by the runtime: each cleanup then waits this long to retry.
+        monkeypatch.setattr(server_mod, "UNRECORDED_RETRY_DELAY", 60.0)
+        try:
+            for _ in range(3):  # a runtime repeating an id, in results it made up
+                server_mod._delete_unrecorded(conn, "beef0009")
+            server_mod._delete_unrecorded(conn, "beef0010")  # another id gets its own
+            for _ in range(100):
+                if len(deletes) >= 2:
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
+            assert sorted(deletes) == ["beef0009", "beef0010"]
+            assert len(server_mod._teardowns) == 2
+        finally:
+            tasks = list(server_mod._teardowns)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        assert not server_mod._unrecorded, "finished cleanups are forgotten"
+
 
 class TestUnrecordedCleanupRetry:
     @pytest.mark.asyncio
