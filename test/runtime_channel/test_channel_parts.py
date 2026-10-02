@@ -81,6 +81,19 @@ class TestToken:
         monkeypatch.setenv(token_mod.TOKEN_FILE_ENV, str(tmp_path / "missing"))
         assert token_mod.runtime_token() is None
 
+    @pytest.mark.parametrize("content", [None, "\n"])
+    def test_a_configured_file_that_gives_no_token_does_not_fall_back(
+        self, monkeypatch, tmp_path, content
+    ):
+        # Fail closed, as docs/execution-runtimes.md states: the env value is
+        # not a fallback for a token file that is missing or empty.
+        path = tmp_path / "token"
+        if content is not None:
+            path.write_text(content)
+        monkeypatch.setenv(token_mod.TOKEN_FILE_ENV, str(path))
+        monkeypatch.setenv(token_mod.TOKEN_ENV, "from-env")
+        assert token_mod.runtime_token() is None
+
 
 class _FakeRuntime:
     """Answers every command it is sent, the way a bridge would."""

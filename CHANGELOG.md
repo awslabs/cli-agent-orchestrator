@@ -24,6 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cao session status`, and the ops MCP `get_terminal_status` and
   `get_session_info` return both fields; `list_siblings` and the delegation
   tool results are unchanged (#810)
+- execution runtimes, first slice: agents run in separate runtime processes or
+  pods behind one `cao-server` that runs none itself. A runtime runs the new
+  `cao-bridge` console script, which dials `WS /runtime/channel` with a shared
+  token (`CAO_RUNTIME_TOKEN_FILE` or `CAO_RUNTIME_TOKEN`). New routes:
+  `GET /runtimes` and `POST /runtimes/{runtime_id}/terminals`. The terminal
+  routes and `DELETE /sessions/{session_name}` pass a remote terminal's
+  operations to its runtime, answering `503`, `504` or `502` when the runtime
+  cannot. Terminal rows gain a nullable `runtime_id` column, added
+  idempotently. `CAO_LOCAL_EXECUTION=0` stops the server starting agents
+  itself, and `CAO_RUNTIME_LAUNCH_TIMEOUT` bounds a launch. An EKS example is
+  in `examples/cao-clusters/kubernetes/remote-runtime/`. See
+  [Execution runtimes](docs/execution-runtimes.md) for the limits of this
+  slice (#745)
 - pane-mode windows caption each pane with the terminal running in it.
   `pane_window` gets `pane-border-status` and a border format reading the
   `@cao_terminal` mark, so the caption survives an agent whose TUI sets its own
