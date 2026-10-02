@@ -77,6 +77,12 @@ class _NoLocalTmux:
         raise AssertionError(f"cao-server used its local tmux ({name}) for a remote terminal")
 
 
+def _no_installed_profile(name):
+    # The host's profile stores must not decide a test: an installed or an
+    # unreadable profile there turned local launches here into 500s.
+    raise FileNotFoundError(name)
+
+
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch, tmp_path):
     engine = create_engine(
@@ -84,6 +90,7 @@ def isolated(monkeypatch, tmp_path):
     )
     database.Base.metadata.create_all(engine)
     monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
+    monkeypatch.setattr(terminal_service, "load_agent_profile", _no_installed_profile)
     registry = RuntimeRegistry()
     monkeypatch.setattr(registry_mod, "runtime_registry", registry)
     monkeypatch.setattr(server_mod, "runtime_registry", registry)
