@@ -909,7 +909,9 @@ class TestListSiblingsByGroupPrefix:
         assert by_id["sib-1"]["group"] == ["tenant_1", "project_5", "folder_1"]
         assert by_id["sib-1"]["metadata"] == {"task": "reviewing"}
         assert by_id["sib-2"]["metadata"] is None
-        assert all(set(sibling) == {"id", "group", "metadata"} for sibling in result)
+        # runtime_id is internal: list_siblings reads status through it and
+        # drops it from the reported shape (#745).
+        assert all(set(sibling) == {"id", "group", "metadata", "runtime_id"} for sibling in result)
 
     def test_caller_excluded_from_its_own_results(self, test_db):
         self._seed(
