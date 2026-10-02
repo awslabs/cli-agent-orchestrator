@@ -86,6 +86,21 @@ class BaseProvider(ABC):
         _allowed_tools: CAO-vocabulary tool names this agent is allowed to use
     """
 
+    @classmethod
+    def honors_model(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+        requested_model: Optional[str],
+    ) -> bool:
+        """Return whether this provider applies a per-launch model request.
+
+        Providers must override this declaration explicitly. The conservative
+        default prevents an undeclared provider from being reported as having
+        honored a model it may ignore.
+        """
+        return False
+
     def __init__(
         self,
         terminal_id: str,

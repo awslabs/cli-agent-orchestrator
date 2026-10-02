@@ -18,6 +18,7 @@ from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import OutputExtractionError
+from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.terminal_service import (
     IdempotencyKeyConflict,
     OutputMode,
@@ -148,7 +149,11 @@ class TestCreateTerminal:
         )
 
         assert result.status == TerminalStatus.UNKNOWN
+        assert result.model == "gpt-5.1-codex"
+        assert result.model_honored is True
         assert mock_provider_manager.create_provider.call_args.kwargs["model"] == ("gpt-5.1-codex")
+        assert mock_db_create.call_args.kwargs["model"] == "gpt-5.1-codex"
+        assert mock_db_create.call_args.kwargs["model_honored"] is True
         mock_provider.initialize.assert_not_awaited()
         mock_schedule_deferred_init.assert_called_once_with(
             mock_provider,
@@ -224,6 +229,77 @@ class TestCreateTerminal:
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.terminal_service._schedule_deferred_init")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_create_terminal_records_ignored_model_for_mock_provider(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+        mock_schedule_deferred_init,
+        mock_delete_terminals_by_session,
+    ):
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.return_value = AgentProfile(
+            name="developer",
+            description="Developer",
+            model="profile-default-model",
+        )
+        mock_provider_manager.create_provider.return_value = AsyncMock()
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        result = await create_terminal(
+            "mock_cli",
+            "developer",
+            new_session=True,
+            defer_init=True,
+        )
+
+        assert result.model == "profile-default-model"
+        assert result.model_honored is False
+        assert mock_db_create.call_args.kwargs["model"] == "profile-default-model"
+        assert mock_db_create.call_args.kwargs["model_honored"] is False
+
+    @pytest.mark.parametrize(
+        ("explicit_model", "profile_model", "expected"),
+        [
+            ("explicit", "profile", "explicit"),
+            (None, "profile", "profile"),
+            (None, None, None),
+        ],
+    )
+    def test_resolve_launch_model_uses_explicit_then_profile(
+        self, explicit_model, profile_model, expected
+    ):
+        profile = (
+            AgentProfile(name="developer", description="Developer", model=profile_model)
+            if profile_model
+            else None
+        )
+
+        assert terminal_service.resolve_launch_model(explicit_model, profile) == expected
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.utils.tool_mapping.resolve_allowed_tools")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
@@ -276,6 +352,8 @@ class TestCreateTerminal:
             "kiro_cli",
             "developer",
             ["fs_read"],
+            model=None,
+            model_honored=True,
             caller_id=None,
             engine="v2",
             group=None,

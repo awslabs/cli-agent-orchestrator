@@ -82,6 +82,10 @@ class Terminal(BaseModel):
     provider: ProviderType = Field(..., description="CLI tool provider")
     session_name: str = Field(..., description="Session name")
     agent_profile: Optional[str] = Field(None, description="Agent profile")
+    model: Optional[str] = Field(None, description="Model requested at launch")
+    model_honored: Optional[bool] = Field(
+        None, description="Whether the provider applies the requested launch model"
+    )
     caller_id: Optional[str] = Field(
         None, description="Terminal that created this one via handoff/assign (callback target)"
     )

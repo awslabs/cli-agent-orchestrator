@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Advanced CodeQL analysis for same-repository and fork pull requests, with
+  Python, JavaScript/TypeScript, GitHub Actions, and Rust coverage, plus `main`,
+  weekly, and manual scans. CI workflow definitions and their `CODEOWNERS`
+  policy are assigned to repository maintainers; the security guidance covers
+  required owner review, stale-approval dismissal, merge gates, and the
+  administrator-managed cutover (#857, #858).
+- terminal records keep the model each terminal was launched with (`model`)
+  and whether its provider applies a launch model (`model_honored`). Each
+  provider declares the second through `honors_model`; the base default is
+  `False`, so a provider that has not declared it is never reported as having
+  run a model. Both columns are nullable and added by migration, and rows from
+  before it read as unknown. Terminal and session responses,
+  `cao session status`, and the ops MCP `get_terminal_status` and
+  `get_session_info` return both fields; `list_siblings` and the delegation
+  tool results are unchanged (#810)
 - pane-mode windows caption each pane with the terminal running in it.
   `pane_window` gets `pane-border-status` and a border format reading the
   `@cao_terminal` mark, so the caption survives an agent whose TUI sets its own
@@ -200,6 +215,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previously got `read`/`grep`/`glob` (and the write and bash tools) on
   OpenCode and now gets none of them: add `fs_read`, `fs_list` and the rest
   explicitly, as the shipped roles already do (#824)
+
+- **Codex startup handling could stall a launch, or press keys into the wrong
+  dialog.** `startup_prompt_handler_timeout` is now the idle gap between
+  startup prompts, with `provider_init_timeout` as the hard cap, so lowering
+  the gap for another provider no longer truncates Codex's handler; the
+  first-run sign-in menu is recognised as a settled state instead of running
+  the handler to its cap; the handler now decides once per frame which startup
+  block is actually live at the bottom of the pane and sends a key only to
+  that block, so stale trust text left in scrollback can no longer answer a
+  live update dialog or sign-in menu; a frame in which a further dialog is
+  still being drawn is held rather than keyed, whether or not a complete
+  dialog is on screen above it; the idle gap is judged on a freshly read frame
+  with no dialog on it, not on the clock alone; the idle composer takes part in
+  that same positional decision and status detection uses the same resolver, so
+  trust wording a dismissed dialog leaves above the live composer no longer
+  reports `WAITING_USER_ANSWER` and a modal arriving below a stale composer no
+  longer reads as ready; initialisation fails, instead of succeeding through
+  the login menu's `WAITING_USER_ANSWER` path, when a trust or update dialog is
+  still on screen at the handler's cap or after the readiness wait; a
+  profile's own `provider_init_timeout` now governs every Codex initialisation
+  wait; the resolver's mid-redraw ("transitional") reading is honoured only
+  until initialisation is over, so assistant prose quoting a startup phrase
+  mid-turn no longer flips a processing terminal to `WAITING_USER_ANSWER` on
+  the runtime status path; and the post-readiness check re-reads a mid-redraw
+  frame a few times instead of failing an otherwise-valid login start on a
+  single capture (#731)
 
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
   The `/internal/memory/store` and `/forget` routes validated the wire `key` as
@@ -452,6 +493,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the server warn when they find one and keep treating that terminal as
   unrestricted. The Kiro e2e restricted case asserts bash is refused again
   (#836, follow-up to #824)
+
+- **Agent plugin git sources are allowlisted by scheme and host.** The plugin
+  resolver handed the source string to `git clone` unchanged, and for git the
+  text before `://` is a transport: `file://` read any repository the server
+  user could, `git://` opened a TCP connection from the server to any host and
+  port it could reach, and the `ext::` helper runs a command wherever git's
+  protocol policy allows it; `--` on the argv guards against option injection
+  only. The surface is default-off (`CAO_AGENT_PLUGINS_ENABLED`) and, with auth
+  on, needs `cao:write`, but with auth off any local caller of `POST /plugins`
+  could reach it, and `"kind": "git"` skipped the CLI's shape check. A plugin is
+  now cloned only over `https://` or `ssh://` (URL or scp-style) from an allowed
+  host (`github.com` by default; `CAO_PLUGIN_ALLOWED_HOSTS` replaces the list),
+  with no query, fragment or embedded credential, the clone target is rebuilt
+  from the validated parts, and every `git` CAO runs is pinned with
+  `GIT_ALLOW_PROTOCOL=https:ssh` and `http.followRedirects=false` so the rule
+  holds inside git as well. Same posture as the profile downloader's
+  `CAO_PROFILE_ALLOWED_HOSTS` guard. Reported through the AWS Vulnerability
+  Reporting Program (#847)
 
 - **an unknown `role` no longer falls open to unrestricted `["*"]`.** Omitting
   `role` still uses developer defaults. A typo or a role that is not defined

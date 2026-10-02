@@ -183,6 +183,7 @@ class TestDeletionRaceBranches:
         _rmtree_reporting(target, what="a file")  # absence is success
 
 
+@pytest.mark.usefixtures("allow_local_git_sources")
 class TestResolverRemainingPaths:
     def test_a_clone_with_no_resolvable_head_still_resolves(self, tmp_path, monkeypatch):
         """Odd but not fatal: the tree is usable, the commit is simply unknown."""

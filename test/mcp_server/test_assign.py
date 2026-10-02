@@ -807,19 +807,48 @@ class TestAssignSenderIdInjection:
 
     @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", True)
-    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
-    def test_assign_returns_fast_success_message(self, mock_create, _nudge):
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration._resolve_child_allowed_tools",
+        return_value=None,
+    )
+    @patch(
+        "cli_agent_orchestrator.utils.orchestration.resolve_provider",
+        return_value="kiro_cli",
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration.requests")
+    def test_assign_returns_fast_success_message(
+        self, mock_requests, _mock_resolve_provider, _mock_allowed_tools, _nudge
+    ):
         """Regression: assign() should tell the LLM the worker is initializing
         in the background, not claim the message has been delivered."""
         from cli_agent_orchestrator.utils.orchestration import _assign_impl
 
-        mock_create.return_value = ("worker-fast", "kiro_cli")
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "kiro_cli",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+        create_response = MagicMock()
+        create_response.json.return_value = {
+            "id": "worker-fast",
+            "provider": "kiro_cli",
+            "model": "model-x",
+            "model_honored": True,
+        }
+        create_response.raise_for_status.return_value = None
+        mock_requests.get.return_value = metadata_response
+        mock_requests.post.return_value = create_response
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
             result = _assign_impl("developer", "Do work")
 
+        assert set(result) == {"success", "terminal_id", "message"}
         assert result["success"] is True
         assert result["terminal_id"] == "worker-fast"
+        assert "model" not in result
+        assert "model_honored" not in result
         # The message must reflect deferred delivery so the LLM does not
         # falsely conclude the worker has already received the task.
         assert "initializing" in result["message"].lower()

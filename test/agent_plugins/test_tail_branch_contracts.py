@@ -56,6 +56,7 @@ class TestPerSkillFailureIsolationAtTheFileLevel:
         assert report.skill_names == ("alpha",)
 
 
+@pytest.mark.usefixtures("allow_local_git_sources")
 class TestCommitPinnedCloneClearsStaging:
     def test_a_pinned_fetch_starts_from_an_empty_staging_tree(self, tmp_path, monkeypatch):
         """`init` + `fetch` cannot run over a partial tree from a failed attempt.
