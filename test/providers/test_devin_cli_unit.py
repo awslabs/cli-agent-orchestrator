@@ -274,12 +274,21 @@ class TestDevinCliToolRestrictions:
         assert provider._temp_prompt_file is None
         provider.cleanup()
 
+    def test_model_override_passed_as_flag(self):
+        """A per-launch model becomes ``--model`` on the devin command."""
+        provider = DevinCliProvider("test1234", "test-session", "window-0", model="opus")
+        command = provider._build_command()
+
+        assert "--model opus" in command
+        provider.cleanup()
+
     def test_tool_restriction_with_agent_profile(self):
         """Security constraint is prepended before the profile system prompt."""
         mock_profile = MagicMock()
         mock_profile.system_prompt = "You are a helpful assistant."
         mock_profile.mcpServers = None
         mock_profile.container = None
+        mock_profile.model = None
 
         with patch(
             "cli_agent_orchestrator.providers.devin_cli.load_agent_profile",
@@ -501,6 +510,7 @@ class TestDevinCliMcpDelivery:
         mock_profile.system_prompt = ""
         mock_profile.mcpServers = {"tools": {"type": "stdio", "command": "demo"}}
         mock_profile.container = None
+        mock_profile.model = None
 
         with patch(
             "cli_agent_orchestrator.providers.devin_cli.load_agent_profile",
@@ -518,3 +528,88 @@ class TestDevinCliMcpDelivery:
 
         assert not (workdir / ".devin" / "mcp_config.local.json").exists()
         provider.cleanup()
+
+
+class TestDevinCliMcpSiblingRegistry:
+    """``_has_live_siblings`` against real ``list_all_terminals()`` row shape.
+
+    Rows are keyed by ``id`` (the TerminalModel primary key) — there is no
+    ``terminal_id`` key. ``cleanup_provider`` also runs while the terminal's
+    OWN row is still present (``delete_terminal_row`` comes after), so that
+    row must not count as a live sibling.
+    """
+
+    def _provider_in(self, tmp_path, monkeypatch, rows):
+        workdir = tmp_path / "repo"
+        workdir.mkdir()
+        monkeypatch.setattr(DevinCliProvider, "_terminal_workdir", lambda self: workdir)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.list_all_terminals",
+            lambda: rows,
+        )
+        return DevinCliProvider("term-a", "test-session", "window-0"), workdir
+
+    def test_own_still_present_row_is_not_a_sibling(self, tmp_path, monkeypatch):
+        """Service order: cleanup_provider runs before the row is deleted."""
+        provider, workdir = self._provider_in(
+            tmp_path,
+            monkeypatch,
+            [{"id": "term-a", "working_directory": str(tmp_path / "repo")}],
+        )
+        config_path = workdir / ".devin" / "mcp_config.local.json"
+
+        provider._deliver_mcp_servers({"tools": {"type": "stdio", "command": "demo"}})
+        provider.cleanup()
+
+        assert not config_path.exists()
+
+    def test_own_row_still_present_restores_operator_entry(self, tmp_path, monkeypatch):
+        """The pre-delivery entry comes back even though our row still exists."""
+        provider, workdir = self._provider_in(
+            tmp_path,
+            monkeypatch,
+            [{"id": "term-a", "working_directory": str(tmp_path / "repo")}],
+        )
+        config_path = workdir / ".devin" / "mcp_config.local.json"
+        config_path.parent.mkdir(parents=True)
+        operator_entry = {"command": "operator-version"}
+        config_path.write_text(json.dumps({"mcpServers": {"tools": operator_entry}}))
+
+        provider._deliver_mcp_servers({"tools": {"type": "stdio", "command": "demo"}})
+        provider.cleanup()
+
+        servers = json.loads(config_path.read_text())["mcpServers"]
+        assert servers == {"tools": operator_entry}
+
+    def test_a_real_sibling_row_keeps_the_file(self, tmp_path, monkeypatch):
+        """Another terminal's row in the same workdir leaves the file alone."""
+        workdir = tmp_path / "repo"
+        provider, _ = self._provider_in(
+            tmp_path,
+            monkeypatch,
+            [
+                {"id": "term-a", "working_directory": str(workdir)},
+                {"id": "term-b", "working_directory": str(workdir)},
+            ],
+        )
+        config_path = workdir / ".devin" / "mcp_config.local.json"
+
+        provider._deliver_mcp_servers({"tools": {"type": "stdio", "command": "demo"}})
+        provider.cleanup()
+
+        servers = json.loads(config_path.read_text())["mcpServers"]
+        assert "tools" in servers
+
+    def test_a_row_in_another_workdir_is_not_a_sibling(self, tmp_path, monkeypatch):
+        """Same shape, different directory: cleanup still runs."""
+        provider, workdir = self._provider_in(
+            tmp_path,
+            monkeypatch,
+            [{"id": "term-b", "working_directory": str(tmp_path / "elsewhere")}],
+        )
+        config_path = workdir / ".devin" / "mcp_config.local.json"
+
+        provider._deliver_mcp_servers({"tools": {"type": "stdio", "command": "demo"}})
+        provider.cleanup()
+
+        assert not config_path.exists()
