@@ -55,6 +55,7 @@ from typing import List, Optional
 from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import SECURITY_PROMPT
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -182,6 +183,15 @@ class AntigravityCliProvider(BaseProvider):
         _agent_profile: Optional CAO agent profile name to load.
         _model: Optional model override forwarded as ``--model``.
     """
+
+    @classmethod
+    def honors_model(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+        requested_model: Optional[str],
+    ) -> bool:
+        return profile is None or not profile.model or profile.model == requested_model
 
     def __init__(
         self,

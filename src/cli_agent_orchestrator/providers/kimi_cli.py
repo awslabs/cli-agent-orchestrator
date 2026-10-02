@@ -76,6 +76,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers import kimi_transcript as kt
 from cli_agent_orchestrator.providers.base import (
@@ -763,6 +764,15 @@ class KimiCliProvider(BaseProvider):
     and cleanup. Kimi CLI agent profiles are optional — if not provided,
     Kimi uses its built-in default agent.
     """
+
+    @classmethod
+    def honors_model(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+        requested_model: Optional[str],
+    ) -> bool:
+        return True
 
     # Class-level flag: ensures ~/.kimi/config.toml MCP timeout is set only once,
     # even when multiple KimiCliProvider instances are created in parallel (e.g.,

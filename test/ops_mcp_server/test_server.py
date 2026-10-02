@@ -693,7 +693,10 @@ class TestSessionLifecycleTools:
 
     async def test_get_session_info_returns_payload(self) -> None:
         """Session details should be returned unchanged."""
-        payload = {"name": "cao-123", "terminals": [{"id": "term-1"}]}
+        payload = {
+            "name": "cao-123",
+            "terminals": [{"id": "term-1", "model": "model-x", "model_honored": True}],
+        }
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
             return_value=_response(json_data=payload),
@@ -970,6 +973,8 @@ class TestTerminalMonitoringTools:
             "provider": "claude_code",
             "session_name": "cao-abc",
             "agent_profile": "dev-sonnet",
+            "model": "model-x",
+            "model_honored": True,
             "status": "processing",
             "last_active": "2026-06-11T00:00:00",
         }
