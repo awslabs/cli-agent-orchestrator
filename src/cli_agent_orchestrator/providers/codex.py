@@ -13,6 +13,7 @@ from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as
 from cli_agent_orchestrator.agent_plugins.mcp_mapping import CODEX_BARE_KEY
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -944,6 +945,15 @@ class ProviderError(Exception):
 
 class CodexProvider(BaseProvider):
     """Provider for Codex CLI tool integration."""
+
+    @classmethod
+    def honors_model(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+        requested_model: Optional[str],
+    ) -> bool:
+        return True
 
     # Codex redraws its inline TUI in place. The append-only pipe-pane stream
     # therefore retains transient progress frames (notably MCP startup) after
