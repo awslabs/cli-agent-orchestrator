@@ -57,6 +57,24 @@ class TerminalInputBlockedError(Exception):
     """
 
 
+class TerminalCaptureUnavailableError(Exception):
+    """Raised when a provider cannot read the terminal pane at dispatch time.
+
+    The pre-send transcript capture that establishes per-dispatch ownership
+    (see CodexProvider.mark_input_received) reads the pane before any key is
+    typed. A pane read that keeps failing is transient infrastructure, not a
+    dead terminal: nothing has been sent, so the dispatch can be retried
+    wholesale. Defined here for the same reason as
+    TerminalInputBlockedError above — providers raise it from
+    mark_input_received() while services (inbox delivery, deferred init)
+    import the concrete provider modules, so a provider importing back from
+    terminal_service would be a circular import. Consumers must treat it as
+    retryable: inbox delivery resets the message to PENDING for the
+    reconcile sweep, and deferred initialization retries the delivery and
+    leaves the initialized worker alive instead of tearing it down.
+    """
+
+
 class TerminalLimitError(Exception):
     """Raised when creating a terminal would exceed this node's tracked-terminal cap.
 

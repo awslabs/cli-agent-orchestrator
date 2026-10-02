@@ -22,7 +22,7 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import TerminalCaptureUnavailableError, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import terminal_service
@@ -168,6 +168,18 @@ class InboxService:
                 logger.warning(
                     f"Pane not resolvable for terminal {terminal_id}; leaving "
                     f"{len(batch)} message(s) pending for retry: {e}"
+                )
+            except TerminalCaptureUnavailableError as e:
+                # The provider refused the dispatch before typing anything —
+                # its pre-send transcript capture failed after a bounded retry
+                # (issue #739 review). Nothing was sent, so the message is as
+                # retryable as an unresolvable pane: reset to PENDING for the
+                # reconcile sweep instead of terminally failing it.
+                for message in batch:
+                    update_message_status(message.id, MessageStatus.PENDING)
+                logger.warning(
+                    f"Pre-send capture unavailable for terminal {terminal_id}; "
+                    f"leaving {len(batch)} message(s) pending for retry: {e}"
                 )
             except Exception as e:
                 for message in batch:
