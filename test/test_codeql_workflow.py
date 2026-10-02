@@ -72,3 +72,10 @@ def test_queries_run_and_upload_against_the_default_pr_merge_revision(workflow):
         "category": "/language:${{ matrix.language }}",
         "wait-for-processing": True,
     }
+
+
+@pytest.mark.parametrize("pattern", ["/.github/workflows/", "/.github/CODEOWNERS"])
+def test_ci_definitions_have_repository_maintainer_ownership(pattern):
+    codeowners = (WORKFLOW.parent.parent / "CODEOWNERS").read_text(encoding="utf-8")
+    entries = [line.split("#", 1)[0].split() for line in codeowners.splitlines()]
+    assert [pattern, "@awslabs/multiq"] in entries

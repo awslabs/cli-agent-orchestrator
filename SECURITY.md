@@ -71,6 +71,15 @@ Checkout does not retain credentials. Fork PRs use the restricted built-in
 `pull_request_target` workaround to run untrusted code. Trivy, dependency
 review, and secret scanning remain independent checks.
 
+The [CODEOWNERS policy](.github/CODEOWNERS) assigns `.github/workflows/` and
+the ownership file itself to the repository-maintainer team `@awslabs/multiq`.
+Protecting the whole workflow directory also covers a new workflow that
+tries to emit the same required check names. GitHub uses the base branch's
+ownership policy, so request this team's review explicitly for the initial
+workflow/ownership PR; automatic owner enforcement starts once `main`
+contains the file. A CODEOWNERS file alone does not require approval: the
+administrator must enable the review settings below.
+
 #### Administrator migration and merge protection
 
 The workflow file does **not** change hosted CodeQL settings or branch rules.
@@ -95,7 +104,13 @@ treat merging the file alone as completion of issue #857.
    `CodeQL (python)`, and `CodeQL (rust)`. Require every matrix job, not just
    one successful analysis or a successful SARIF upload. Document any
    explicitly authorized bypass; do not add one as a migration shortcut.
-5. Verify a clean same-repository PR and a disposable fork PR, then use a
+5. In the pull-request rule, enable **Require review from Code Owners** and
+   **Dismiss stale pull request approvals when new commits are pushed**.
+   Workflow or ownership changes must receive owner approval, and later
+   changes to the reviewed diff must invalidate the earlier approval.
+6. Verify that changes to a workflow or the ownership policy require owner
+   review and that a later push dismisses its approval. Verify a clean
+   same-repository PR and a disposable fork PR, then use a
    harmless controlled finding above the threshold to verify merge blocking.
    Missing, pending, or failed jobs must also block. Push a new revision and
    confirm old results cannot satisfy its checks; compare each analysis to
