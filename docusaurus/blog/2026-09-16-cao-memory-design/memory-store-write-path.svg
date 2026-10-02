@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="900" viewBox="0 0 1200 900" role="img" aria-labelledby="title desc">
+  <title id="title">CAO memory store write path</title>
+  <desc id="desc">An agent calls memory_store. CAO validates scope and policy, acquires a per-topic lock, writes the Markdown topic atomically, updates the Markdown index, and upserts SQLite metadata. Eligible updates may also schedule optional LLM compilation after the observation is safely written.</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="7" flood-color="#0f172a" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#7c3aed"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .eyebrow { font-size: 13px; font-weight: 700; letter-spacing: 1.5px; fill: #64748b; }
+      .title { font-size: 30px; font-weight: 750; fill: #0f172a; }
+      .subtitle { font-size: 16px; font-weight: 450; fill: #475569; }
+      .card-title { font-size: 18px; font-weight: 700; fill: #0f172a; }
+      .card-copy { font-size: 14px; font-weight: 450; fill: #475569; }
+      .label { font-size: 12px; font-weight: 700; letter-spacing: 0.8px; fill: #475569; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 15px; font-weight: 650; }
+      .step { font-size: 13px; font-weight: 750; fill: #ffffff; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="900" fill="#ffffff"/>
+  <text class="eyebrow" x="60" y="54">DETERMINISTIC MEMORY WRITE</text>
+  <text class="title" x="60" y="94">Save the observation first. Organize it later.</text>
+  <text class="subtitle" x="60" y="124">The durable path uses fixed code; optional LLM work branches off only after the content is safe.</text>
+
+  <text class="eyebrow" x="76" y="164">DURABLE WRITE PATH</text>
+  <text class="eyebrow" x="842" y="164">OPTIONAL ASYNC WORK</text>
+
+  <g filter="url(#shadow)">
+    <rect x="76" y="184" width="654" height="72" rx="18" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+    <circle cx="112" cy="220" r="13" fill="#2563eb"/>
+    <path d="M105 220H119M112 213V227" fill="none" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round"/>
+    <text class="card-title" x="142" y="215">Agent calls</text>
+    <text class="mono" x="242" y="215" fill="#1d4ed8">memory_store</text>
+    <text class="card-copy" x="142" y="239">One provider-neutral entry point for every supported CAO agent.</text>
+  </g>
+
+  <path d="M403 256V282" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="76" y="290" width="654" height="76" rx="18" fill="#f8fafc" stroke="#64748b" stroke-width="2"/>
+    <circle cx="112" cy="328" r="17" fill="#64748b"/>
+    <text class="step" x="112" y="333" text-anchor="middle">1</text>
+    <text class="card-title" x="146" y="321">Validate the request</text>
+    <text class="card-copy" x="146" y="347">scope · identity · caller write policy</text>
+  </g>
+
+  <path d="M403 366V392" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="76" y="400" width="654" height="76" rx="18" fill="#f8fafc" stroke="#64748b" stroke-width="2"/>
+    <circle cx="112" cy="438" r="17" fill="#64748b"/>
+    <text class="step" x="112" y="443" text-anchor="middle">2</text>
+    <text class="card-title" x="146" y="431">Acquire the per-topic lock</text>
+    <text class="card-copy" x="146" y="457">serializes updates to the same memory topic</text>
+  </g>
+
+  <path d="M403 476V502" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="76" y="510" width="654" height="96" rx="20" fill="#f0fdf4" stroke="#16a34a" stroke-width="2.5"/>
+    <circle cx="112" cy="558" r="17" fill="#16a34a"/>
+    <text class="step" x="112" y="563" text-anchor="middle">3</text>
+    <text class="card-title" x="146" y="548">Write the Markdown topic atomically</text>
+    <text class="card-copy" x="146" y="576">append-form content is published with an atomic file replacement</text>
+    <rect x="568" y="536" width="132" height="38" rx="19" fill="#dcfce7"/>
+    <text class="label" x="634" y="560" text-anchor="middle" fill="#166534">CONTENT SAFE</text>
+  </g>
+
+  <path d="M730 558H814" fill="none" stroke="#7c3aed" stroke-width="2.5" stroke-dasharray="7 7" marker-end="url(#arrow-purple)"/>
+  <text class="label" x="772" y="540" text-anchor="middle" fill="#6d28d9">ELIGIBLE ONLY</text>
+
+  <g filter="url(#shadow)">
+    <rect x="822" y="492" width="318" height="132" rx="20" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2"/>
+    <rect x="848" y="516" width="92" height="30" rx="15" fill="#ede9fe"/>
+    <text class="label" x="894" y="536" text-anchor="middle" fill="#6d28d9">OPTIONAL</text>
+    <text class="card-title" x="848" y="578">Schedule LLM compilation</text>
+    <text class="card-copy" x="848" y="603">merge repetition and propose related topics</text>
+  </g>
+
+  <rect x="846" y="648" width="290" height="76" rx="16" fill="#faf5ff" stroke="#c4b5fd" stroke-width="1.5"/>
+  <text class="label" x="870" y="677" fill="#6d28d9">THE INITIAL SAVE DOES NOT WAIT</text>
+  <text class="card-copy" x="870" y="703">Slow or failed compilation cannot erase it.</text>
+  <path d="M981 624V640" fill="none" stroke="#7c3aed" stroke-width="2" stroke-dasharray="7 7" marker-end="url(#arrow-purple)"/>
+
+  <path d="M403 606V642" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="76" y="650" width="654" height="76" rx="18" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+    <circle cx="112" cy="688" r="17" fill="#2563eb"/>
+    <text class="step" x="112" y="693" text-anchor="middle">4</text>
+    <text class="card-title" x="146" y="681">Update the Markdown index</text>
+    <text class="card-copy" x="146" y="707">the shared index uses its own lock</text>
+  </g>
+
+  <path d="M403 726V762" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="76" y="770" width="654" height="84" rx="18" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+    <circle cx="112" cy="812" r="17" fill="#d97706"/>
+    <text class="step" x="112" y="817" text-anchor="middle">5</text>
+    <text class="card-title" x="146" y="805">Upsert SQLite metadata</text>
+    <text class="card-copy" x="146" y="831">scope, timestamps, provenance, usage, compilation, and relationship state</text>
+  </g>
+
+  <path d="M730 812H804" fill="none" stroke="#d97706" stroke-width="2"/>
+  <rect x="812" y="779" width="328" height="66" rx="16" fill="#fffbeb" stroke="#fbbf24" stroke-width="1.5"/>
+  <text class="label" x="836" y="806" fill="#92400e">FILESYSTEM AND SQLITE ARE SEPARATE</text>
+  <text class="card-copy" x="836" y="829">A partial metadata write is visible and repairable.</text>
+</svg>
