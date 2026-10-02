@@ -360,7 +360,7 @@ def _recorded_on(terminal_id: str, runtime_id: str) -> bool:
         row = get_terminal_metadata(terminal_id)
     except Exception:  # noqa: BLE001 - unreadable: the write that just failed decides
         return False
-    return bool(row) and row.get("runtime_id") == runtime_id
+    return row is not None and row.get("runtime_id") == runtime_id
 
 
 async def _finish_launch(
