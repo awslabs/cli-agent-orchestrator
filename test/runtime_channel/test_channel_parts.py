@@ -386,3 +386,21 @@ def test_cao_bridge_refuses_a_server_url_it_could_never_dial(monkeypatch, url):
         assert "ws://" in str(exc.value)
     finally:
         token_mod._reset_for_tests()
+
+
+def test_cao_bridge_names_itself_in_its_startup_banner(monkeypatch, capsys):
+    import logging
+
+    import cli_agent_orchestrator.utils.logging as log_mod
+    from cli_agent_orchestrator.runtime_channel import bridge as bridge_mod
+
+    async def done():
+        return None
+
+    monkeypatch.setattr(log_mod.logging, "basicConfig", lambda **kwargs: None)
+    monkeypatch.setattr(log_mod.logging, "FileHandler", lambda path: logging.NullHandler())
+    monkeypatch.setattr(bridge_mod, "_amain", done)
+    bridge_mod.main()
+    banner = capsys.readouterr().out
+    assert "cao-bridge" in banner
+    assert "cao-server" not in banner and "Server logs" not in banner
