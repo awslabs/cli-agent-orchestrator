@@ -265,6 +265,10 @@ class _Launched(BaseModel):
     status: Optional[TerminalStatus] = None
     # The Kiro engine the runtime resolved for the launch (v2 or kas).
     engine: Optional[KiroEngine] = None
+    # The launch model the runtime resolved, and whether its provider applies
+    # it (#856). A cao-bridge from before #856 sends neither: unknown.
+    model: Optional[str] = None
+    model_honored: Optional[bool] = None
 
 
 async def _undo_launch(runtime_id: str, terminal_id: str) -> bool:
@@ -319,6 +323,8 @@ def _record_launch(
                 working_directory=working_directory,
                 runtime_id=runtime_id,
                 engine=launched.engine.value if launched.engine else None,
+                model=launched.model,
+                model_honored=launched.model_honored,
             )
         except Exception:
             runtime_registry.unplace(launched.id, runtime_id)
@@ -412,6 +418,8 @@ async def _finish_launch(
             provider=launched.provider,
             session_name=launched.session_name,
             agent_profile=launched.agent_profile,
+            model=launched.model,
+            model_honored=launched.model_honored,
             caller_id=None,
             allowed_tools=launched.allowed_tools,
             engine=launched.engine,

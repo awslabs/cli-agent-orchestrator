@@ -1316,6 +1316,23 @@ class TestLaunchMetadata:
         assert response.status_code == 201, response.text
         assert database.get_terminal_metadata("beef0001")["engine"] == "kas"
 
+    def test_a_remote_launch_keeps_the_model_its_runtime_launched_with(self, http, start_runtime):
+        claude = {**LAUNCHED, "provider": "claude_code", "model": "model-x", "model_honored": True}
+        start_runtime(script=lambda command: {"terminal": dict(claude)})
+        response = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
+        assert response.status_code == 201, response.text
+        row = database.get_terminal_metadata("beef0001")
+        assert (row["model"], row["model_honored"]) == ("model-x", True)
+        assert (response.json()["model"], response.json()["model_honored"]) == ("model-x", True)
+
+    def test_a_runtime_that_reports_no_model_leaves_it_unknown(self, http, start_runtime):
+        # A cao-bridge from before #856 sends neither field.
+        start_runtime(script=lambda command: {"terminal": dict(LAUNCHED)})
+        response = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
+        assert response.status_code == 201, response.text
+        row = database.get_terminal_metadata("beef0001")
+        assert (row["model"], row["model_honored"]) == (None, None)
+
     def test_the_bridge_reports_the_engine_it_launched_with(self):
         from cli_agent_orchestrator.models.kiro_engine import KiroEngine
         from cli_agent_orchestrator.runtime_channel.bridge import _jsonable
@@ -1485,6 +1502,18 @@ class TestLaunchReadBack:
             "mock_cli",
         )
         assert database.get_terminal_metadata("beef0001") is not None
+
+    def test_the_fallback_answer_keeps_the_launch_model(self, http, start_runtime, monkeypatch):
+        reported = {**LAUNCHED, "model": "model-x", "model_honored": False}
+        start_runtime(script=lambda command: {"terminal": dict(reported)})
+
+        def flaky(terminal_id):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(terminal_service, "get_terminal", flaky)
+        response = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
+        assert response.status_code == 201, response.text
+        assert (response.json()["model"], response.json()["model_honored"]) == ("model-x", False)
 
 
 class TestRunStepOnARemoteTerminal:
