@@ -1977,6 +1977,15 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN runtime_id TEXT")
             conn.commit()
             logger.info("Migration: added runtime_id column to terminals table")
+        # For a runtime's terminal list and session_is_remote (#745).
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_terminals_runtime_id ON terminals (runtime_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_terminals_session_runtime "
+            "ON terminals (tmux_session, runtime_id)"
+        )
+        conn.commit()
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
