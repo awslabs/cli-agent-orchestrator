@@ -15,11 +15,15 @@ exactly as before.
 | Central SQLite state | yes, one row per terminal, naming its runtime | pane bookkeeping only |
 | tmux, provider CLIs, agents | no, for remote terminals; none at all with `CAO_LOCAL_EXECUTION=0` | yes |
 | Status detection | receives it | derives it beside the pane and pushes it |
+| Flow pre-scripts, Python workflow scripts | yes, even with `CAO_LOCAL_EXECUTION=0` | no |
 
 Set `CAO_LOCAL_EXECUTION=0` on a central server that must run no agents
 itself. Every local terminal creation is then refused; the routes that would
 start one (`POST /sessions`, `POST /sessions/{name}/terminals`,
-`POST /terminals/run-step`) return `409`.
+`POST /terminals/run-step`) return `409`. The setting covers agents only: a
+flow's pre-script and a Python workflow script still run on the server host,
+as the server's user. The flow's session launch, or the workflow's agent
+steps, are then refused.
 
 The runtime opens one WebSocket to `WS /runtime/channel`, outbound only, with
 the shared token in the `x-cao-runtime-token` header. Its runtime id (for
@@ -133,6 +137,12 @@ retried until the runtime confirms it (see [Commands](#commands)).
   [Configuration](configuration.md)), as the EKS example does, and give a
   runtime no API credential: agents there then cannot drive the API.
   `WS /runtime/channel` and `/health` need no bearer.
+- The channel adds no encryption of its own. Over `ws://`, as in the EKS
+  example, the token and every frame (agent input, captured output, status)
+  cross the network between runtime and server in cleartext, so the example
+  relies on that network being trusted: its NetworkPolicy limits who can
+  connect, not who can read the traffic. Where the network is not trusted,
+  terminate TLS in front of `cao-server` and give `cao-bridge` a `wss://` URL.
 
 ## Known limits of this slice
 
