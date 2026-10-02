@@ -359,6 +359,31 @@ class TestRemoteTerminal:
             "frozen_memory": None,
         }
 
+    def test_a_delivered_orchestrated_message_emits_the_callers_text(
+        self, http, start_runtime, monkeypatch
+    ):
+        # The runtime injects memory beside the pane; the server's event carries
+        # what the caller sent, as the local path's original_message does.
+        _remote_row("abcd1234", "rt-1")
+        plugins = _RecordingPlugins()
+        monkeypatch.setattr(app.state, "plugin_registry", plugins)
+        start_runtime(script=lambda command: {"success": True})
+        response = http.post(
+            "/terminals/abcd1234/input",
+            params={"message": "hi", "sender_id": "abcd9999", "orchestration_type": "send_message"},
+        )
+        assert response.status_code == 200 and response.json()["success"] is True
+        _wait_for(lambda: plugins.events, "the post_send_message event")
+        [(event_type, event)] = plugins.events
+        assert event_type == "post_send_message"
+        assert (event.session_id, event.sender, event.receiver, event.message) == (
+            "cao-remote1",
+            "abcd9999",
+            "abcd1234",
+            "hi",
+        )
+        assert event.orchestration_type == OrchestrationType.SEND_MESSAGE
+
     def test_the_status_the_runtime_pushes_is_the_terminals_status(self, http, start_runtime):
         _remote_row("abcd1234", "rt-1")
         runtime = start_runtime(statuses={"abcd1234": TerminalStatus.IDLE})
