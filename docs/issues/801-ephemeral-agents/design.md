@@ -1087,7 +1087,7 @@ E1-E4 can land before #810 slice 1 (S1). Only E5 depends on it.
 
 **Purpose.** Dynamic (ephemeral) agents from #801 Phase 2 consume the #810 decision platform and add no decider interface of their own. This page stands on its own.
 
-#810 slice 1 lands as three PRs: S1a records the launch model (PR #856), S1b adds the decision-platform core, and S1c routes delegation launches through it. As of 2026-10-02, S1a is in review as #856; S1b and S1c are not yet open as PRs.
+#810 slice 1 lands as three PRs: S1a records the launch model (PR #856), S1b adds the decision-platform core, and S1c routes delegation launches through it. As of 2026-10-02, S1a is merged (#856); S1b and S1c are not yet open as PRs.
 
 **Agreed with #810 (2026-09-30):**
 1. **Option sets.** `model.route` uses `small < medium < large` plus `unsure`, and asks "what model size does this task need?". `effort.route` uses `low < medium < high` plus `unsure`. The spec uses the same sets, plus the literal `auto`.
