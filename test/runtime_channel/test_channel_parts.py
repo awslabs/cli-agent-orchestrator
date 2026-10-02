@@ -349,3 +349,27 @@ def test_cao_bridge_refuses_an_unaddressable_runtime_id(monkeypatch):
         assert "CAO_BRIDGE_RUNTIME_ID" in str(exc.value)
     finally:
         token_mod._reset_for_tests()
+
+
+@pytest.mark.parametrize("url", ["http://cao-server:9889/runtime/channel", "cao-server:9889"])
+def test_cao_bridge_refuses_a_server_url_it_could_never_dial(monkeypatch, url):
+    # Retrying could not help, as with a refused token: exit at once, not loop.
+    import cli_agent_orchestrator.clients.database as database
+    from cli_agent_orchestrator.runtime_channel import bridge as bridge_mod
+
+    def must_not_start(*args, **kwargs):
+        raise AssertionError("cao-bridge started with a URL it can never dial")
+
+    monkeypatch.setattr(database, "init_db", must_not_start)
+    monkeypatch.setattr(bridge_mod.Bridge, "run", must_not_start)
+    monkeypatch.setenv("CAO_BRIDGE_SERVER_URL", url)
+    monkeypatch.setenv("CAO_BRIDGE_RUNTIME_ID", "rt-1")
+    monkeypatch.setenv(token_mod.TOKEN_ENV, "token")
+    token_mod._reset_for_tests()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            asyncio.run(bridge_mod._amain())
+        assert "CAO_BRIDGE_SERVER_URL" in str(exc.value)
+        assert "ws://" in str(exc.value)
+    finally:
+        token_mod._reset_for_tests()
