@@ -4,6 +4,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from sqlalchemy import and_
+
 from cli_agent_orchestrator.clients.database import (
     IdempotencyKeyModel,
     InboxModel,
@@ -46,8 +48,12 @@ def cleanup_old_data():
         with SessionLocal() as db:
             old_terminals = list(
                 db.query(TerminalModel)
-                .filter(TerminalModel.last_active < cutoff_date)
-                .filter(TerminalModel.runtime_id.is_(None))
+                .filter(
+                    and_(
+                        TerminalModel.last_active < cutoff_date,
+                        TerminalModel.runtime_id.is_(None),
+                    )
+                )
                 .all()
             )
 

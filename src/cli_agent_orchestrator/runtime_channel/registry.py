@@ -330,7 +330,12 @@ class RuntimeRegistry:
             )
 
     def claim(self, terminal_id: str, runtime_id: str) -> bool:
-        """Place a newly launched terminal, unless another runtime holds its id."""
+        """Place a newly launched terminal, unless another runtime holds its id.
+
+        Re-claiming an id already placed on the same runtime succeeds: the
+        runtime generated both, so they are one terminal or a collision the
+        launch's record step refuses (session lock, metadata check, primary key).
+        """
         with self._lock:
             if self._placement.get(terminal_id) not in (None, runtime_id):
                 return False
