@@ -25,6 +25,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 
 import websockets
 from websockets.asyncio.client import ClientConnection, connect
+from websockets.uri import parse_uri
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -460,6 +461,14 @@ async def _amain() -> None:
         raise SystemExit(
             "cao-bridge requires CAO_BRIDGE_SERVER_URL, CAO_BRIDGE_RUNTIME_ID and "
             "CAO_RUNTIME_TOKEN_FILE (or CAO_RUNTIME_TOKEN)"
+        )
+    try:
+        parse_uri(server_url)
+    except websockets.exceptions.InvalidURI as exc:
+        # A configuration error, like a refused token: retrying cannot help.
+        raise SystemExit(
+            f"CAO_BRIDGE_SERVER_URL={server_url!r} is not a WebSocket URL ({exc}); "
+            "use ws:// or wss://, e.g. ws://cao-server:9889/runtime/channel"
         )
     ready = os.environ.get("CAO_BRIDGE_READY_FILE", "").strip()
     ready_file = Path(ready) if ready else CAO_HOME_DIR / "bridge-ready"
