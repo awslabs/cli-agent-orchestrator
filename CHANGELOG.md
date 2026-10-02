@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Advanced CodeQL analysis for same-repository and fork pull requests, with
+  Python, JavaScript/TypeScript, GitHub Actions, and Rust coverage, plus `main`,
+  weekly, and manual scans. CI workflow definitions and their `CODEOWNERS`
+  policy are assigned to repository maintainers; the security guidance covers
+  required owner review, stale-approval dismissal, merge gates, and the
+  administrator-managed cutover (#857, #858).
 - terminal records keep the model each terminal was launched with (`model`)
   and whether its provider applies a launch model (`model_honored`). Each
   provider declares the second through `honors_model`; the base default is
