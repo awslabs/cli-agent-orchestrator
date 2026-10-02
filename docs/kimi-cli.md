@@ -596,11 +596,13 @@ connecting to mcp servers is only a phrase   <- must survive
 Final line                                   <- must survive
 ```
 
-Boot-message suffixes and optional collapsed-output bullets avoid overlapping
-whitespace repetitions, so long whitespace runs do not cause repeated
-backtracking at those boundaries. Existing punctuation, Unicode whitespace,
-and both bullet glyphs remain accepted; this does not add a transcript-length
-limit or change the distinction between answer content and chrome.
+Boot-message suffixes start at the beginning of their punctuation/whitespace
+run, rather than trying every split with an arbitrary detail field. MCP count
+digits and optional collapsed-output bullets likewise avoid overlapping
+repetitions. Existing punctuation, Unicode whitespace, trailing-newline
+behavior, and both bullet glyphs remain accepted; this does not add a
+transcript-length limit or change the distinction between answer content and
+chrome.
 
 ### Terminal Output Format (v1.20.0+, legacy)
 

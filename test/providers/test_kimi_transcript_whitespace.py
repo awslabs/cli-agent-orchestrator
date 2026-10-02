@@ -70,14 +70,32 @@ def test_collapsed_output_mentions_are_not_tool_chrome(row):
 
 
 @pytest.mark.parametrize(
-    "pattern_name,prefix,suffix",
+    "pattern_name,prefix,repeated,accepted_tail,rejected_tail",
     [
-        ("BOOT_MESSAGE_ROW_RE", "Restoring conversation", "\u2026"),
-        ("MCP_BOOT_ROW_RE", "CONNECTING TO MCP SERVERS", " (2/5)"),
-        ("COLLAPSED_TOOL_OUTPUT_RE", "", "\u2026 (23 more lines"),
+        ("BOOT_MESSAGE_ROW_RE", "Restoring conversation", "\t", "\u2026", "!"),
+        ("BOOT_MESSAGE_ROW_RE", "Loading agent", " \u2003", "...", "!"),
+        ("MCP_BOOT_ROW_RE", "CONNECTING TO MCP SERVERS", "\t", " (2/5)", "!"),
+        ("MCP_BOOT_ROW_RE", "connecting to mcp servers", " \u2003", "...", "!"),
+        ("COLLAPSED_TOOL_OUTPUT_RE", "", "\t", "\u2026 (23 more lines", "!"),
+        ("COLLAPSED_TOOL_OUTPUT_RE", "", " \u2003", "\u2026 (2 more lines", "!"),
+        ("BOOT_MESSAGE_ROW_RE", "No session yet \u2014 detail", "\t", "\n...", "\n!"),
+        (
+            "BOOT_MESSAGE_ROW_RE",
+            'MCP server "example" connected \u00b7 detail',
+            " \u2003",
+            "\n...",
+            "\n!",
+        ),
+        ("BOOT_MESSAGE_ROW_RE", "tmux extended-keys is off", "\t", "\n", "\n!"),
+        ("BOOT_MESSAGE_ROW_RE", "\u2726 Try Kimi Code Web UI", "\t", "\n", "\n!"),
+        ("MCP_BOOT_ROW_RE", "\u2827 MCP Servers: 0/1", "\t", "\n", "\n!"),
+        ("MCP_BOOT_ROW_RE", "\u2827 MCP Servers: 0/", "1", "\n", "\n!"),
+        ("MCP_BOOT_ROW_RE", "\u2826 example (connecting)", "\t", "\n", "\n!"),
     ],
 )
-def test_long_matching_and_nonmatching_whitespace_remains_bounded(pattern_name, prefix, suffix):
+def test_long_matching_and_nonmatching_whitespace_remains_bounded(
+    pattern_name, prefix, repeated, accepted_tail, rejected_tail
+):
     # A child timeout bounds regressions without leaving a stuck regex in pytest.
     result = subprocess.run(
         [
@@ -89,14 +107,15 @@ from cli_agent_orchestrator.providers import kimi_transcript as kt
 
 pattern = getattr(kt, sys.argv[1])
 for length in (32768, 131072):
-    for whitespace in ("\\t", " \\u2003"):
-        row = sys.argv[2] + whitespace * length
-        assert not pattern.search(row + "!")
-        assert pattern.search(row + sys.argv[3])
+    row = sys.argv[2] + sys.argv[3] * length
+    assert not pattern.search(row + sys.argv[5])
+    assert pattern.search(row + sys.argv[4])
 """,
             pattern_name,
             prefix,
-            suffix,
+            repeated,
+            accepted_tail,
+            rejected_tail,
         ],
         capture_output=True,
         text=True,

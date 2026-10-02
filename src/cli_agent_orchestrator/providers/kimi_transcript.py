@@ -235,7 +235,8 @@ BOOT_MESSAGE_ROW_RE = re.compile(
     r"|✦\s*Try Kimi Code Web UI.*"
     r"|MCP server \"[^\"]*\" connected(?:\s*·.*)?"
     r"|tmux extended-keys is off.*"
-    r")[.…\s]*$",
+    # Start the suffix only at the beginning of its punctuation/whitespace run.
+    r")(?<![.…\s])[.…\s]*$",
     re.IGNORECASE,
 )
 
@@ -251,10 +252,11 @@ BOOT_MESSAGE_ROW_RE = re.compile(
 # punctuation / counts — so "... is only a phrase" stays content.
 MCP_BOOT_ROW_RE = re.compile(
     r"^\s*(?:"
-    r"[\u2800-\u28ff]\s*MCP Servers:\s*\d+/\d+.*\s*"
-    r"|[\u2800-\u28ff]\s*\S.*\(connecting\)\s*"
+    # One digit establishes the second count; the suffix accepts any remaining digits.
+    r"[\u2800-\u28ff]\s*MCP Servers:\s*\d+/\d.*"
+    r"|[\u2800-\u28ff]\s*\S.*\(connecting\)"
     r"|connecting to mcp servers[\s.…·()0-9/]*"
-    r")$",
+    r")(?<!\s)\s*$",
     re.IGNORECASE,
 )
 
