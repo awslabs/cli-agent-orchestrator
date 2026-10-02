@@ -439,8 +439,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the validated parts, and every `git` CAO runs is pinned with
   `GIT_ALLOW_PROTOCOL=https:ssh` and `http.followRedirects=false` so the rule
   holds inside git as well. Same posture as the profile downloader's
-  `CAO_PROFILE_ALLOWED_HOSTS` guard. Reported through the AWS Vulnerability
-  Reporting Program (#847)
+  `CAO_PROFILE_ALLOWED_HOSTS` guard. Reported by Chowdhury Faizal Ahammed
+  through the AWS Vulnerability Reporting Program; thank you. (#847)
 
 - **an unknown `role` no longer falls open to unrestricted `["*"]`.** Omitting
   `role` still uses developer defaults. A typo or a role that is not defined
