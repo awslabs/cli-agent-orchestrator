@@ -5274,11 +5274,10 @@ class TestDispatchBoundaryIsSampledBeforeKeys:
     @pytest.mark.asyncio
     async def test_fast_completion_during_send_confirms_with_the_inner_boundary(self):
         """The reviewer's schedule, end to end through the confirmation gate."""
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
         from cli_agent_orchestrator.services.terminal_service import (
             _wait_for_post_dispatch_start,
         )
-
-        from cli_agent_orchestrator.services.status_monitor import StatusObservation
 
         fake_monitor = MagicMock()
         # After the send: the worker emitted once (3 -> 4) and completed; nothing

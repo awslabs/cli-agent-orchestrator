@@ -123,7 +123,7 @@ class TestRedeliverDroppedMessageHelper:
             patch.object(ts, "provider_manager") as mgr,
             patch.object(ts, "_worker_is_started_direct", return_value=True) as probe,
             patch.object(ts, "send_special_key") as key,
-            patch.object(ts, "send_input") as send,
+            patch.object(ts, "dispatch_input") as send,
         ):
             mgr.get_provider.return_value = provider
             started = ts.redeliver_dropped_message("t1", "Analyze the logs", 1)
@@ -139,7 +139,7 @@ class TestRedeliverDroppedMessageHelper:
             patch.object(ts, "provider_manager") as mgr,
             patch.object(ts, "_message_visible_in_box", return_value=True) as box,
             patch.object(ts, "send_special_key") as key,
-            patch.object(ts, "send_input") as send,
+            patch.object(ts, "dispatch_input") as send,
         ):
             mgr.get_provider.side_effect = ValueError("Terminal t1 not found")
             started = ts.redeliver_dropped_message("t1", "Analyze the logs", 1)
@@ -156,7 +156,7 @@ class TestRedeliverDroppedMessageHelper:
             patch.object(ts, "_worker_is_started_direct", return_value=False),
             patch.object(ts, "_message_visible_in_box", return_value=False),
             patch.object(ts, "send_special_key") as key,
-            patch.object(ts, "send_input") as send,
+            patch.object(ts, "dispatch_input") as send,
         ):
             started = ts.redeliver_dropped_message(
                 "t1", "Analyze the logs", 1, provider, full_resend_requires_probe=True
@@ -174,7 +174,7 @@ class TestRedeliverDroppedMessageHelper:
             patch.object(ts, "_worker_is_started_direct") as probe,
             patch.object(ts, "_message_visible_in_box", return_value=False),
             patch.object(ts, "send_special_key") as key,
-            patch.object(ts, "send_input") as send,
+            patch.object(ts, "dispatch_input") as send,
         ):
             started = ts.redeliver_dropped_message(
                 "t1", "Analyze the logs", 1, provider, full_resend_requires_probe=True
@@ -192,7 +192,7 @@ class TestRedeliverDroppedMessageHelper:
         with (
             patch.object(ts, "_message_visible_in_box", return_value=True),
             patch.object(ts, "send_special_key") as key,
-            patch.object(ts, "send_input") as send,
+            patch.object(ts, "dispatch_input") as send,
         ):
             started = ts.redeliver_dropped_message(
                 "t1", "Analyze the logs", 1, provider, full_resend_requires_probe=True
@@ -208,7 +208,7 @@ class TestRedeliverDroppedMessageHelper:
         with (
             patch.object(ts, "_message_visible_in_box", return_value=False),
             patch.object(ts, "send_special_key") as key,
-            patch.object(ts, "send_input") as send,
+            patch.object(ts, "dispatch_input") as send,
         ):
             started = ts.redeliver_dropped_message("t1", "Analyze the logs", 1, provider)
         assert started is False
@@ -222,7 +222,7 @@ class TestConfirmWorkerStartedOrResubmit:
         with (
             patch.object(ts, "_wait_for_post_dispatch_start", new=AsyncMock(return_value=True)),
             patch.object(ts, "send_special_key") as key,
-            patch.object(ts, "send_input") as send,
+            patch.object(ts, "dispatch_input") as send,
         ):
             ok = await ts._confirm_worker_started_or_resubmit(
                 "t1", "Analyze the logs", None, "sup", None
@@ -240,7 +240,7 @@ class TestConfirmWorkerStartedOrResubmit:
             ),
             patch.object(ts, "_message_visible_in_box", return_value=True),
             patch.object(ts, "send_special_key") as key,
-            patch.object(ts, "send_input") as send,
+            patch.object(ts, "dispatch_input") as send,
         ):
             ok = await ts._confirm_worker_started_or_resubmit(
                 "t1", "Analyze the logs", None, "sup", None
@@ -257,7 +257,7 @@ class TestConfirmWorkerStartedOrResubmit:
             ),
             patch.object(ts, "_message_visible_in_box", return_value=False),
             patch.object(ts, "send_special_key") as key,
-            patch.object(ts, "send_input") as send,
+            patch.object(ts, "dispatch_input") as send,
         ):
             ok = await ts._confirm_worker_started_or_resubmit(
                 "t1", "Analyze the logs", "reg", "sup", None
@@ -274,7 +274,7 @@ class TestConfirmWorkerStartedOrResubmit:
             patch.object(ts, "_wait_for_post_dispatch_start", new=AsyncMock(return_value=False)),
             patch.object(ts, "_message_visible_in_box", return_value=True),
             patch.object(ts, "send_special_key"),
-            patch.object(ts, "send_input"),
+            patch.object(ts, "dispatch_input"),
         ):
             ok = await ts._confirm_worker_started_or_resubmit(
                 "t1", "Analyze the logs", None, "sup", None
@@ -289,7 +289,7 @@ class TestConfirmWorkerStartedOrResubmit:
             patch.object(ts, "_wait_for_post_dispatch_start", new=AsyncMock(return_value=False)),
             patch.object(ts, "_worker_is_started_direct", return_value=True),
             patch.object(ts, "send_special_key") as key,
-            patch.object(ts, "send_input") as send,
+            patch.object(ts, "dispatch_input") as send,
         ):
             ok = await ts._confirm_worker_started_or_resubmit(
                 "t1",
@@ -313,7 +313,7 @@ class TestConfirmWorkerStartedOrResubmit:
             patch.object(ts, "_worker_is_started_direct", return_value=False),
             patch.object(ts, "_message_visible_in_box", return_value=True),
             patch.object(ts, "send_special_key") as key,
-            patch.object(ts, "send_input") as send,
+            patch.object(ts, "dispatch_input") as send,
         ):
             ok = await ts._confirm_worker_started_or_resubmit(
                 "t1",
@@ -338,7 +338,7 @@ class TestConfirmWorkerStartedOrResubmit:
             patch.object(ts, "_worker_is_started_direct") as probe,
             patch.object(ts, "_message_visible_in_box", return_value=True),
             patch.object(ts, "send_special_key"),
-            patch.object(ts, "send_input"),
+            patch.object(ts, "dispatch_input"),
         ):
             ok = await ts._confirm_worker_started_or_resubmit(
                 "t1",
@@ -360,7 +360,7 @@ class TestConfirmWorkerStartedOrResubmit:
             patch.object(ts, "_worker_is_started_direct") as probe,
             patch.object(ts, "_message_visible_in_box", return_value=True),
             patch.object(ts, "send_special_key"),
-            patch.object(ts, "send_input"),
+            patch.object(ts, "dispatch_input"),
         ):
             ok = await ts._confirm_worker_started_or_resubmit(
                 "t1",
@@ -372,6 +372,227 @@ class TestConfirmWorkerStartedOrResubmit:
             )
         assert ok is True
         probe.assert_not_called()
+
+
+@pytest.mark.asyncio
+class TestConfirmBranchSelectionAndResubmitBoundary:
+    """Pin the seam the main merge reconciled, and the per-attempt recency bar.
+
+    ``_confirm_worker_started_or_resubmit`` has two ways to wait for a start:
+    strict execution-evidence providers (Kimi) poll ``_worker_is_started_direct``
+    and ignore the dispatch boundary; everyone else goes through the real
+    generation gate ``_wait_for_post_dispatch_start``. Each branch had its own
+    tests, but nothing drove the real confirm with a plain provider, a real
+    integer boundary and the real gate (PR #566 review, gutosantos82). The
+    second half pins that a resubmit's own boundary, not the original dispatch's,
+    is what the next wait is measured against.
+    """
+
+    @staticmethod
+    def _observations(*pairs):
+        """A fake monitor whose status_observation replays ``pairs`` then holds the last."""
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+        seq = [StatusObservation(status, gen) for status, gen in pairs]
+        monitor = MagicMock()
+        monitor.status_observation.side_effect = lambda _tid: seq.pop(0) if len(seq) > 1 else seq[0]
+        monitor.get_status.side_effect = lambda _tid: seq[0].status
+        return monitor
+
+    async def test_plain_provider_confirms_through_the_real_gate_on_a_stamped_status(self):
+        # COMPLETED stamped at the boundary (pre-dispatch) is refused by the real
+        # gate; PROCESSING stamped past it confirms. The direct probe is never
+        # consulted for a provider that does not require execution evidence.
+        provider = MagicMock(requires_execution_evidence=False, supports_direct_status_probe=False)
+        monitor = self._observations(
+            (TerminalStatus.COMPLETED, 7),
+            (TerminalStatus.PROCESSING, 8),
+        )
+        with (
+            patch.object(ts, "status_monitor", monitor),
+            patch.object(ts, "_DEFERRED_SUBMIT_CONFIRM_TIMEOUT", 5.0),
+            patch.object(ts, "_worker_is_started_direct") as probe,
+            patch.object(ts, "redeliver_dropped_message_with_boundary") as redeliver,
+        ):
+            ok = await ts._confirm_worker_started_or_resubmit(
+                "t1",
+                "Analyze the logs",
+                None,
+                "sup",
+                None,
+                provider=provider,
+                dispatch_generation=7,
+            )
+        assert ok is True
+        probe.assert_not_called()
+        redeliver.assert_not_called()
+        # The first observation (COMPLETED earned AT the boundary) was not enough:
+        # the gate had to poll again and see the stamped PROCESSING.
+        assert monitor.status_observation.call_count >= 2
+
+    async def test_plain_provider_is_not_confirmed_by_a_pre_dispatch_completed(self):
+        # The same real gate, never offered anything newer than the boundary: the
+        # confirm loop must fall through to redelivery rather than accept it.
+        provider = MagicMock(requires_execution_evidence=False, supports_direct_status_probe=False)
+        monitor = self._observations((TerminalStatus.COMPLETED, 7))
+        with (
+            patch.object(ts, "status_monitor", monitor),
+            patch.object(ts, "_DEFERRED_SUBMIT_CONFIRM_TIMEOUT", 0.05),
+            patch.object(ts, "_DEFERRED_SUBMIT_MAX_RESUBMITS", 1),
+            patch.object(ts, "_worker_is_started_direct") as probe,
+            patch.object(
+                ts, "redeliver_dropped_message_with_boundary", return_value=(False, None)
+            ) as redeliver,
+        ):
+            ok = await ts._confirm_worker_started_or_resubmit(
+                "t1",
+                "Analyze the logs",
+                None,
+                "sup",
+                None,
+                provider=provider,
+                dispatch_generation=7,
+            )
+        assert ok is False
+        probe.assert_not_called()
+        redeliver.assert_called_once()
+
+    async def test_execution_evidence_provider_uses_the_direct_probe_not_the_gate(self):
+        # Kimi: a stale stamped COMPLETED would fail the gate, but the gate is not
+        # consulted; the direct probe decides, and the boundary is irrelevant.
+        provider = MagicMock(requires_execution_evidence=True, supports_direct_status_probe=True)
+        monitor = self._observations((TerminalStatus.COMPLETED, 7))
+        with (
+            patch.object(ts, "status_monitor", monitor),
+            patch.object(ts, "_worker_is_started_direct", return_value=True) as probe,
+            patch.object(ts, "_wait_for_post_dispatch_start") as gate,
+        ):
+            ok = await ts._confirm_worker_started_or_resubmit(
+                "t1",
+                "Analyze the logs",
+                None,
+                "sup",
+                None,
+                provider=provider,
+                dispatch_generation=7,
+            )
+        assert ok is True
+        probe.assert_called_once_with("t1", provider)
+        gate.assert_not_called()
+
+    async def test_full_resubmit_moves_the_recency_bar_to_its_own_boundary(self):
+        # First wait fails against boundary 7; the full re-send samples 12 inside
+        # dispatch_input; the second wait must be measured against 12, so that a
+        # status earned between 7 and 12 (or the resubmit's own paste echo) is
+        # not accepted as this attempt's evidence.
+        provider = MagicMock(requires_execution_evidence=False, supports_direct_status_probe=False)
+        with (
+            patch.object(
+                ts, "_wait_for_post_dispatch_start", new=AsyncMock(side_effect=[False, True])
+            ) as gate,
+            patch.object(ts, "_message_visible_in_box", return_value=False),
+            patch.object(ts, "dispatch_input", return_value=12) as dispatch,
+            patch.object(ts, "send_special_key") as key,
+        ):
+            ok = await ts._confirm_worker_started_or_resubmit(
+                "t1",
+                "Analyze the logs",
+                None,
+                "sup",
+                None,
+                provider=provider,
+                dispatch_generation=7,
+            )
+        assert ok is True
+        key.assert_not_called()
+        dispatch.assert_called_once()
+        assert dispatch.call_args.kwargs["redelivery"] is True
+        assert [c.args[1] for c in gate.call_args_list] == [7, 12]
+
+    async def test_bare_enter_resubmit_samples_a_fresh_boundary_before_the_key(self):
+        # Enter-only redelivery has no dispatch_input to sample inside, so it
+        # reads the current output generation itself, before the key is sent.
+        provider = MagicMock(requires_execution_evidence=False, supports_direct_status_probe=False)
+        monitor = MagicMock()
+        order = []
+        monitor.output_generation.side_effect = lambda _tid: order.append("sample") or 9
+        with (
+            patch.object(ts, "status_monitor", monitor),
+            patch.object(
+                ts, "_wait_for_post_dispatch_start", new=AsyncMock(side_effect=[False, True])
+            ) as gate,
+            patch.object(ts, "_message_visible_in_box", return_value=True),
+            patch.object(ts, "dispatch_input") as dispatch,
+            patch.object(ts, "send_special_key", side_effect=lambda *_a: order.append("enter")),
+        ):
+            ok = await ts._confirm_worker_started_or_resubmit(
+                "t1",
+                "Analyze the logs",
+                None,
+                "sup",
+                None,
+                provider=provider,
+                dispatch_generation=7,
+            )
+        assert ok is True
+        dispatch.assert_not_called()
+        assert order == ["sample", "enter"]
+        assert [c.args[1] for c in gate.call_args_list] == [7, 9]
+
+    async def test_skipped_resubmit_keeps_the_current_boundary(self):
+        # Nothing was sent (ambiguous execution evidence), so there is no new
+        # attempt to measure from; the wait keeps the boundary it had.
+        provider = MagicMock(
+            requires_execution_evidence=False,
+            supports_direct_status_probe=False,
+            execution_evidence_ambiguous=True,
+        )
+        with (
+            patch.object(
+                ts, "_wait_for_post_dispatch_start", new=AsyncMock(side_effect=[False, True])
+            ) as gate,
+            patch.object(ts, "_message_visible_in_box", return_value=False),
+            patch.object(ts, "dispatch_input") as dispatch,
+        ):
+            ok = await ts._confirm_worker_started_or_resubmit(
+                "t1",
+                "Analyze the logs",
+                None,
+                "sup",
+                None,
+                provider=provider,
+                dispatch_generation=7,
+            )
+        assert ok is True
+        dispatch.assert_not_called()
+        assert [c.args[1] for c in gate.call_args_list] == [7, 7]
+
+    async def test_event_inbox_backend_stays_on_the_transition_check_after_resubmit(self):
+        # herdr passes dispatch_generation=None; a resubmit's boundary must not
+        # switch it onto a generation gate it can never satisfy.
+        provider = MagicMock(requires_execution_evidence=False, supports_direct_status_probe=False)
+        with (
+            patch.object(
+                ts, "_wait_for_post_dispatch_start", new=AsyncMock(side_effect=[False, True])
+            ) as gate,
+            patch.object(ts, "_message_visible_in_box", return_value=False),
+            patch.object(ts, "dispatch_input", return_value=3),
+        ):
+            ok = await ts._confirm_worker_started_or_resubmit(
+                "t1",
+                "Analyze the logs",
+                None,
+                "sup",
+                None,
+                provider=provider,
+                dispatch_generation=None,
+                pre_dispatch_status=TerminalStatus.COMPLETED,
+            )
+        assert ok is True
+        assert [c.args[1] for c in gate.call_args_list] == [None, None]
+        assert all(
+            c.kwargs["pre_dispatch_status"] == TerminalStatus.COMPLETED for c in gate.call_args_list
+        )
 
 
 class TestWorkerIsStartedDirect:
@@ -547,11 +768,10 @@ async def test_kimi_confirmation_requires_execution_even_when_cached_status_says
         ),
         patch.object(ts, "get_backend", return_value=backend),
         patch.object(ts.status_monitor, "probe_execution_evidence", execution_probe),
-        patch.object(ts, "wait_until_status", new=AsyncMock(return_value=True)),
         patch.object(ts, "_DEFERRED_SUBMIT_CONFIRM_TIMEOUT", 8.0 if accepted else 0.0),
         patch.object(ts.asyncio, "sleep", new=AsyncMock()) as sleep,
         patch.object(ts, "_message_visible_in_box", return_value=False),
-        patch.object(ts, "send_input") as send,
+        patch.object(ts, "dispatch_input", return_value=0) as send,
     ):
         assert (
             await ts._confirm_worker_started_or_resubmit(

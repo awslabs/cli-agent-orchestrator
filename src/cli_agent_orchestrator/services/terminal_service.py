@@ -140,7 +140,6 @@ from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
     generate_window_name,
-    wait_until_status,
 )
 
 logger = logging.getLogger(__name__)
@@ -2907,6 +2906,37 @@ def redeliver_dropped_message(
 ) -> bool:
     """Re-deliver a message the TUI never accepted (blocking; to_thread it).
 
+    Thin wrapper over :func:`redeliver_dropped_message_with_boundary` that keeps
+    the ``bool`` contract the synchronous step path (#562) relies on. The
+    deferred-init confirm loop calls the underlying function directly because it
+    also needs the dispatch boundary the redelivery sampled.
+    """
+    started, _boundary = redeliver_dropped_message_with_boundary(
+        terminal_id,
+        message,
+        attempt,
+        provider,
+        full_resend_requires_probe=full_resend_requires_probe,
+        registry=registry,
+        sender_id=sender_id,
+        orchestration_type=orchestration_type,
+    )
+    return started
+
+
+def redeliver_dropped_message_with_boundary(
+    terminal_id: str,
+    message: str,
+    attempt: int,
+    provider=None,
+    *,
+    full_resend_requires_probe: bool = False,
+    registry: "PluginRegistry | None" = None,
+    sender_id: Optional[str] = None,
+    orchestration_type: Optional[OrchestrationType] = None,
+) -> tuple[bool, Optional[int]]:
+    """Re-deliver a message the TUI never accepted and report the new dispatch boundary.
+
     One attempt of the confirm-and-redeliver loop shared by the deferred-init
     path (#479) and the synchronous step path (#562). First, when the provider
     opts in via ``supports_direct_status_probe``, a live capture-pane check
@@ -2933,17 +2963,28 @@ def redeliver_dropped_message(
     bare-Enter branch (which cannot duplicate a task) is still taken
     whenever the text is visible; otherwise nothing is sent and False is
     returned, leaving the caller's own timeout to classify the outcome. The
-    deferred-init path keeps the default (off) because it loops on
-    ``wait_until_status`` for the PROCESSING edge before ever reaching here,
-    and that pre-existing behavior is unchanged by this helper's extraction.
+    deferred-init path keeps the default (off) because it waits on
+    ``_wait_for_post_dispatch_start`` for post-dispatch evidence before ever
+    reaching here, and that pre-existing behavior is unchanged by this helper's
+    extraction.
 
-    The full re-send is forwarded to ``send_input`` as ``redelivery=True``: it
+    The full re-send goes through ``dispatch_input`` with ``redelivery=True``: it
     repeats the dispatch CAO is already waiting on, so the provider must treat
     it as another delivery attempt of the same logical turn rather than as a
     newly dispatched turn.
 
-    Returns True when the worker was found already started and nothing was
-    sent; False when a redelivery was attempted (or deliberately skipped).
+    Returns ``(started, boundary)``. ``started`` is True when the worker was
+    found already running and nothing was sent; False when a redelivery was
+    attempted (or deliberately skipped). ``boundary`` is the output generation
+    sampled before the redelivery's keys reached the pane -- the fresh baseline
+    the next confirmation wait must use, so that evidence has to be earned
+    after THIS attempt rather than after the original dispatch (PR #566 review,
+    gutosantos82: the recency bar has to advance per attempt). It is ``None``
+    when nothing was sent, in which case the caller keeps its current baseline.
+    A bare Enter samples the current generation directly: it submits the paste
+    that is already in the composer, so there is no monitor arm or buffer clear
+    to repeat, but output that follows it is still the only output that can
+    prove this attempt was accepted.
     """
     if provider is None:
         try:
@@ -2955,15 +2996,16 @@ def redeliver_dropped_message(
     )
     if probe_capable:
         if _worker_is_started_direct(terminal_id, provider):
-            return True
+            return True, None
     if _message_visible_in_box(terminal_id, message):
         logger.warning(
             "Delivery to %s unsubmitted (Enter swallowed); " "re-submitting via Enter (attempt %d)",
             terminal_id,
             attempt,
         )
+        boundary = status_monitor.output_generation(terminal_id)
         send_special_key(terminal_id, "Enter")
-        return False
+        return False, boundary
     if getattr(provider, "execution_evidence_ambiguous", False) is True:
         logger.warning(
             "Delivery to %s is unconfirmed after execution context was evicted; "
@@ -2971,7 +3013,7 @@ def redeliver_dropped_message(
             terminal_id,
             attempt,
         )
-        return False
+        return False, None
     if full_resend_requires_probe and not probe_capable:
         # No probe → cannot rule out a working worker whose prompt left the
         # pane; a full re-send could silently duplicate the task. Skip the
@@ -2982,13 +3024,13 @@ def redeliver_dropped_message(
             terminal_id,
             attempt,
         )
-        return False
+        return False, None
     logger.warning(
         "Delivery to %s not accepted (paste dropped); " "re-delivering message (attempt %d)",
         terminal_id,
         attempt,
     )
-    send_input(
+    boundary = dispatch_input(
         terminal_id,
         message,
         registry=registry,
@@ -2996,7 +3038,7 @@ def redeliver_dropped_message(
         orchestration_type=orchestration_type,
         redelivery=True,
     )
-    return False
+    return False, boundary
 
 
 async def _wait_for_post_dispatch_start(
@@ -3095,7 +3137,7 @@ async def _confirm_worker_started_or_resubmit(
         except Exception:
             provider = None
 
-    async def wait_for_start() -> bool:
+    async def wait_for_start(boundary: Optional[int]) -> bool:
         if getattr(provider, "requires_execution_evidence", False) is True:
             # Cached PROCESSING/COMPLETED may be dispatch-derived too. Poll
             # independent evidence for the full grace period before resending.
@@ -3108,20 +3150,20 @@ async def _confirm_worker_started_or_resubmit(
                 await asyncio.sleep(0.5)
         return await _wait_for_post_dispatch_start(
             terminal_id,
-            dispatch_generation,
+            boundary,
             timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
             pre_dispatch_status=pre_dispatch_status,
         )
 
-    if await wait_for_start():
+    if await wait_for_start(dispatch_generation):
         return True
 
     for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
         # The redelivery decision (box check + #496's direct-probe guard for
-        # providers that opt in) lives in ``redeliver_dropped_message`` —
-        # shared with the synchronous step path (#562).
-        already_started = await asyncio.to_thread(
-            redeliver_dropped_message,
+        # providers that opt in) lives in ``redeliver_dropped_message_with_boundary``
+        # — shared, via its bool wrapper, with the synchronous step path (#562).
+        already_started, redelivery_boundary = await asyncio.to_thread(
+            redeliver_dropped_message_with_boundary,
             terminal_id,
             message,
             attempt,
@@ -3132,9 +3174,17 @@ async def _confirm_worker_started_or_resubmit(
         )
         if already_started:
             return True
-        # Same recency requirement as the first wait: a resubmit that lands on a
-        # still-cached pre-dispatch COMPLETED must not read as success either.
-        if await wait_for_start():
+        # Same recency requirement as the first wait, measured from THIS attempt:
+        # a resubmit that lands on a still-cached pre-dispatch COMPLETED must not
+        # read as success, and neither may a status earned between the original
+        # dispatch and this redelivery -- the previous wait already judged that
+        # window and found nothing. The redelivery's own paste echo is inside the
+        # new baseline, so it cannot pass for evidence either. Event-inbox
+        # backends stay on the transition check (``None``); a skipped redelivery
+        # returns no boundary and the current one is kept.
+        if redelivery_boundary is not None and dispatch_generation is not None:
+            dispatch_generation = redelivery_boundary
+        if await wait_for_start(dispatch_generation):
             return True
 
     return False
@@ -3151,7 +3201,7 @@ def _schedule_deferred_init(
     delete_on_failure: bool | None = None,
 ) -> asyncio.Task | None:
     """Kick off provider.initialize() in the background and, on success,
-    deliver the initial message via send_input.
+    deliver the initial message via dispatch_input.
 
     Runs as an asyncio task on the running event loop so it doesn't block
     the caller. Because assign() has already returned success=True by the
@@ -3199,7 +3249,7 @@ def _schedule_deferred_init(
                 # _schedule_deferred_init), so defaulting an unstated orchestration_type
                 # to ASSIGN here is always correct and cannot affect answer_user_prompt.
                 effective_orchestration_type = orchestration_type or OrchestrationType.ASSIGN
-                # send_input is blocking tmux I/O — off the loop so it can't
+                # dispatch_input is blocking tmux I/O — off the loop so it can't
                 # freeze the server for concurrent requests.
                 # Event-inbox backends (herdr) derive status on demand and have no
                 # output generation, so their recency check is a TRANSITION from
@@ -3226,7 +3276,7 @@ def _schedule_deferred_init(
                 # Round-4 review (haofeif), P1. An earlier revision cleared it at
                 # this dispatch boundary, reasoning that a keystroke had been
                 # issued so a poller's evidence was now downstream of the send. It
-                # isn't. send_input only calls status_monitor.notify_input_sent(),
+                # isn't. dispatch_input only calls status_monitor.notify_input_sent(),
                 # which ARMS the next transition without changing the cached
                 # status, and no current provider enables
                 # assume_processing_on_dispatch. The status a poller reads right
@@ -3280,7 +3330,7 @@ def _schedule_deferred_init(
                     initial_message,
                     registry,
                     caller_id,
-                    # Same guard-eligible default as the initial send_input above --
+                    # Same guard-eligible default as the initial dispatch_input above --
                     # a resubmit is still an unattended initial-task delivery, so it
                     # must not silently drop back to the unguarded original type.
                     effective_orchestration_type,
