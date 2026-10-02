@@ -148,6 +148,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   OpenCode and now gets none of them: add `fs_read`, `fs_list` and the rest
   explicitly, as the shipped roles already do (#824)
 
+- **Codex startup handling could stall a launch, or press keys into the wrong
+  dialog.** `startup_prompt_handler_timeout` is now the idle gap between
+  startup prompts, with `provider_init_timeout` as the hard cap, so lowering
+  the gap for another provider no longer truncates Codex's handler; the
+  first-run sign-in menu is recognised as a settled state instead of running
+  the handler to its cap; the handler now decides once per frame which startup
+  block is actually live at the bottom of the pane and sends a key only to
+  that block, so stale trust text left in scrollback can no longer answer a
+  live update dialog or sign-in menu; a frame in which a further dialog is
+  still being drawn is held rather than keyed, whether or not a complete
+  dialog is on screen above it; the idle gap is judged on a freshly read frame
+  with no dialog on it, not on the clock alone; the idle composer takes part in
+  that same positional decision and status detection uses the same resolver, so
+  trust wording a dismissed dialog leaves above the live composer no longer
+  reports `WAITING_USER_ANSWER` and a modal arriving below a stale composer no
+  longer reads as ready; initialisation fails, instead of succeeding through
+  the login menu's `WAITING_USER_ANSWER` path, when a trust or update dialog is
+  still on screen at the handler's cap or after the readiness wait; a
+  profile's own `provider_init_timeout` now governs every Codex initialisation
+  wait; the resolver's mid-redraw ("transitional") reading is honoured only
+  until initialisation is over, so assistant prose quoting a startup phrase
+  mid-turn no longer flips a processing terminal to `WAITING_USER_ANSWER` on
+  the runtime status path; and the post-readiness check re-reads a mid-redraw
+  frame a few times instead of failing an otherwise-valid login start on a
+  single capture (#731)
+
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
   The `/internal/memory/store` and `/forget` routes validated the wire `key` as
   the strict `MemoryKey` (`^[a-z0-9-]{1,60}$`), while the MCP tools have always
