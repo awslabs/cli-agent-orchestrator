@@ -60,6 +60,13 @@ _STICKY_READY_STATUSES = frozenset(
     }
 )
 
+# The two statuses a repaint flaps between once a turn is over: the completion
+# box and the empty composer are both "finished" renderings of the SAME turn, so
+# moving from one to the other does not re-earn the status for stamping purposes
+# (see _apply_detection_locked). WAITING_USER_ANSWER and ERROR are deliberately
+# not here: a prompt or an error appearing after a ready state is new content.
+_COMPLETABLE_FLAP_STATUSES = frozenset({TerminalStatus.IDLE, TerminalStatus.COMPLETED})
+
 # Stale-PROCESSING self-heal (#558). get_status()'s cheap re-check re-derives from the SAME
 # rolling buffer the FIFO pipeline feeds — and the moment a process goes genuinely idle it also
 # stops emitting output, so that buffer stops changing. If its final content never happened to
@@ -417,7 +424,18 @@ class StatusMonitor:
         # (notify_input_sent(assume_processing=True)); they are stamped with
         # the pre-send generation, which is by construction not newer than the
         # dispatch boundary sampled right after, so they never confirm a send.
-        self._status_generation[terminal_id] = self._output_generation.get(terminal_id, 0)
+        #
+        # A completable status reached from the other completable status keeps
+        # its stamp. Once notify_input_sent has armed the latch, COMPLETED -> IDLE
+        # is let through, and IDLE -> COMPLETED is a change too, so a swallowed
+        # Enter whose echo frame parses IDLE and whose next repaint composites the
+        # previous turn's completion box would otherwise re-stamp that old
+        # COMPLETED past the dispatch boundary and confirm a send that never
+        # happened. That flap is the same reading seen twice, not a status the
+        # worker earned; a completion reached from PROCESSING (or from nothing)
+        # is, and is stamped.
+        if not (last in _COMPLETABLE_FLAP_STATUSES and detected in _COMPLETABLE_FLAP_STATUSES):
+            self._status_generation[terminal_id] = self._output_generation.get(terminal_id, 0)
         if detected == TerminalStatus.PROCESSING:
             self._allow_processing_revert[terminal_id] = False
         elif detected in _STICKY_READY_STATUSES and last not in _STICKY_READY_STATUSES:

@@ -5002,6 +5002,81 @@ class TestConfirmationIsCausalOnTheRealMonitor:
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_completable_flap_after_dispatch_does_not_restamp_the_completed(
+        self, mock_pm, mock_settings, mock_backend
+    ):
+        """Round-10 (pre-push review): a ready-to-ready flap is not new evidence.
+
+        The arm set by ``notify_input_sent`` lets COMPLETED -> IDLE through (the
+        latch only blocks that downgrade when unarmed), and IDLE -> COMPLETED is a
+        change too. So with the Enter swallowed: the paste's echo frame parses
+        IDLE (composer holding the text, completion box scrolled), then a repaint
+        composites the previous turn's completion box and parses COMPLETED again.
+        Both are changes of the applied status; if either re-stamps, the old
+        COMPLETED carries a post-boundary stamp and confirms a send that never
+        happened. A completable status reached from another completable status
+        is the same reading flapping, not a status the worker earned.
+        """
+        mock_backend.return_value = self._tmux_backend()
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        mock_pm.get_provider.return_value = provider
+        sm, boundary = self._monitor_with_sticky_startup_completed(provider)
+
+        # Echo frame: the pasted text sits in the composer, no completion box.
+        provider.get_status.return_value = TerminalStatus.IDLE
+        sm._process_chunk("t1", "> do the task")
+        assert sm.get_status("t1") == TerminalStatus.IDLE
+        # Repaint: the previous turn's completion box is back on screen.
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        sm._process_chunk("t1", "\x1b[2J\x1b[H(previous answer) ✓ Done\n> do the task")
+        assert sm.output_generation("t1") == boundary + 2
+
+        observation = sm.status_observation("t1")
+        assert observation.status == TerminalStatus.COMPLETED
+        assert observation.output_generation == 1, (
+            "the IDLE->COMPLETED flap re-stamped the previous turn's COMPLETED past the "
+            "dispatch boundary; a swallowed Enter would now be confirmed as delivered"
+        )
+
+        from cli_agent_orchestrator.services.terminal_service import (
+            _wait_for_post_dispatch_start,
+        )
+
+        with patch("cli_agent_orchestrator.services.terminal_service.status_monitor", sm):
+            confirmed = asyncio.run(
+                _wait_for_post_dispatch_start("t1", boundary, timeout=0.2, polling_interval=0.05)
+            )
+        assert confirmed is False
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_completable_status_reached_from_processing_is_still_earned(
+        self, mock_pm, mock_settings, mock_backend
+    ):
+        """The flap rule must not swallow a real turn: PROCESSING then COMPLETED
+        after the boundary is this task's completion and carries a fresh stamp."""
+        mock_backend.return_value = self._tmux_backend()
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        mock_pm.get_provider.return_value = provider
+        sm, boundary = self._monitor_with_sticky_startup_completed(provider)
+
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        sm._process_chunk("t1", "⠋ Thinking…")
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        sm._process_chunk("t1", "(new answer) ✓ Done\n> ")
+
+        observation = sm.status_observation("t1")
+        assert observation.status == TerminalStatus.COMPLETED
+        assert observation.output_generation == boundary + 2
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     def test_status_earned_from_post_boundary_output_is_confirmed(
         self, mock_pm, mock_settings, mock_backend
     ):
