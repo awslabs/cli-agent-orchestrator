@@ -126,7 +126,9 @@ def test_a_runtime_home_cao_bridge_initialised_can_record_a_launch(db, monkeypat
     monkeypatch.setattr(status_monitor, "run", idle)
     monkeypatch.setattr(log_writer, "run", idle)
     monkeypatch.setattr(bridge_mod.Bridge, "run", launch)
-    monkeypatch.setattr(bus, "_loop", bus._loop)  # _amain points the bus at its own loop
+    # Not a no-op: monkeypatch restores this value after the test, undoing
+    # _amain's bus.set_loop(), which would leave the bus on a closed loop.
+    monkeypatch.setattr(bus, "_loop", bus._loop)
     monkeypatch.setenv("CAO_BRIDGE_SERVER_URL", "ws://server/runtime/channel")
     monkeypatch.setenv("CAO_BRIDGE_RUNTIME_ID", "rt-1")
     monkeypatch.setenv("CAO_BRIDGE_READY_FILE", str(tmp_path / "ready"))

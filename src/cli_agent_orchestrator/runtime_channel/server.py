@@ -74,6 +74,8 @@ _teardowns: Set["asyncio.Task[None]"] = set()
 # the delete is retried here, with the delay doubling from this up to that.
 UNRECORDED_RETRY_DELAY = 5.0
 UNRECORDED_RETRY_MAX_DELAY = 60.0
+# The ids each connection's unrecorded cleanups are deleting: one per id.
+_unrecorded: Dict[RuntimeConnection, Set[str]] = {}
 # Likewise for launch settlements that outlive a cancelled request.
 _settlements: Set["asyncio.Task[Dict[str, Any]]"] = set()
 
@@ -109,7 +111,16 @@ def _delete_unrecorded(conn: RuntimeConnection, terminal_id: str) -> None:
 
     That is a launch whose result was lost (or arrived after the server gave
     up), so nothing else would ever stop it.
+
+    One cleanup per id and connection: a runtime repeating an id cannot start
+    more. Distinct ids are not capped: the server cannot tell an id a runtime
+    made up from an agent it must stop, and a token holder is trusted anyway
+    (see docs/execution-runtimes.md, Security).
     """
+    deleting = _unrecorded.setdefault(conn, set())
+    if terminal_id in deleting:
+        return
+    deleting.add(terminal_id)
 
     async def run() -> None:
         logger.warning(
@@ -152,7 +163,14 @@ def _delete_unrecorded(conn: RuntimeConnection, terminal_id: str) -> None:
 
     task = asyncio.create_task(run())
     _teardowns.add(task)
-    task.add_done_callback(_teardowns.discard)
+
+    def finished(done: "asyncio.Task[None]") -> None:
+        _teardowns.discard(done)
+        deleting.discard(terminal_id)
+        if not deleting and _unrecorded.get(conn) is deleting:
+            del _unrecorded[conn]
+
+    task.add_done_callback(finished)
 
 
 @router.websocket("/runtime/channel")
@@ -327,9 +345,22 @@ def _record_launch(
                 model_honored=launched.model_honored,
             )
         except Exception:
-            runtime_registry.unplace(launched.id, runtime_id)
+            # The placement follows the row. Keep it if a row places this id on
+            # this runtime anyway: a concurrent launch of the same id there, in
+            # another session (so under another lock), wrote it first.
+            if not _recorded_on(launched.id, runtime_id):
+                runtime_registry.unplace(launched.id, runtime_id)
             raise
     return None
+
+
+def _recorded_on(terminal_id: str, runtime_id: str) -> bool:
+    """Whether the central row of ``terminal_id`` places it on ``runtime_id``."""
+    try:
+        row = get_terminal_metadata(terminal_id)
+    except Exception:  # noqa: BLE001 - unreadable: the write that just failed decides
+        return False
+    return bool(row) and row.get("runtime_id") == runtime_id
 
 
 async def _finish_launch(
