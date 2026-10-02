@@ -5,17 +5,19 @@ tags: [deep-dive]
 description: How CAO gives agents one shared memory layer across sessions, models, and CLI providers.
 ---
 
-Agents often repeat work that another agent already finished. A new session may need the same
-project context. Another provider may reread the same documents. A proven workflow may be
-discovered again from scratch.
+With Agentic Coding practice, how an agent uses memory is critical in many aspects. It helps you
+increase code quality, be more token efficient, and keep consistency across a long-running session or
+session handoff.
 
+Memory is not just giving the next session the conclusion or summary of the previous one.
 CAO memory saves conclusions that make the next task faster. It is more than conversation
 history. It can hold project decisions, user preferences, reusable instructions, document
 findings, and workflow lessons.
 
-The result is closer to a scoped project wiki than a transcript archive. Markdown keeps the
-knowledge readable. Search and typed relationships connect related topics. Obsidian can
-project those relationships into a browsable graph.
+The result is closer to a scoped project wiki than a transcript archive. The identity of CAO
+memory is Markdown — that is what keeps the knowledge readable. Search runs over an index backed
+by a SQLite database, and a knowledge graph projects the relationships between memory nodes, both
+in the CAO UI and in Obsidian.
 
 CAO gives every supported agent the same memory tools. An agent can remember a fact with one
 CLI provider and recall it later with another. The memory belongs to CAO, not to a specific
@@ -26,7 +28,11 @@ This post explains how that shared layer works. For commands and configuration, 
 
 {/* truncate */}
 
-## One MCP memory layer for every agent
+## Why CAO owns memory
+
+CAO keeps one memory layer for every agent (agnostic to the harness / CLI provider) and sets out what that layer has to guarantee.
+
+### One MCP memory layer for every agent
 
 CAO exposes three core MCP operations:
 
@@ -35,18 +41,18 @@ CAO exposes three core MCP operations:
 - `memory_forget` removes a fact.
 
 These operations stay the same across Kiro CLI, Claude Code, Codex, and other CAO agents.
-The provider may change. The model may change. The memory API and scope rules do not.
+The provider may change. The model may change. The memory API and scope rules stay the same.
 
 CAO resolves scope before it calls the provider. This gives every agent a consistent view
-of project, session, global, agent, and federated memory. Access still follows the scope and
+across scopes: project, session, global, agent, and federated memory. Access still follows the scope and
 caller policy.
 
-This is the main reason CAO owns the memory layer. A provider-specific memory feature would
-split knowledge into separate stores. CAO keeps one store and one API.
+This is why CAO owns the memory layer at all. Lean on a provider-specific memory feature and
+your knowledge fragments into separate stores; CAO keeps one store behind one API.
 
 ![One CAO memory layer across agents and sessions](./shared-memory-layer.svg)
 
-## What the design must do
+### What the design must do
 
 The shared layer has five goals:
 
@@ -59,24 +65,30 @@ The shared layer has five goals:
 The prompt also has a hard size limit. CAO must choose a small set of useful memories. It
 cannot inject the whole store.
 
-## Local by default
+## How CAO stores a memory
+
+CAO keeps memory local, splits content from metadata, and makes every write recoverable.
+These sections cover where memory is stored, what triggers a save, the order CAO writes in,
+and how it recovers when a write only partly succeeds.
+
+### Local by default
 
 CAO keeps memory on the machine by default. Markdown files hold the content under the CAO
 home directory. The CAO SQLite database holds metadata and lifecycle state. BM25 search
-runs in the CAO process and reads the local Markdown files.
+runs inside the CAO process and reads the local Markdown files.
 
-This local design has clear benefits. Memory works without a cloud service. The files stay
-under the operator's control. Reads are fast. A person can open the files and check what an
-agent may recall.
+You get real benefits from keeping this local: memory works with no cloud service in the
+loop, the files stay under your control, and reads are fast. You can open the files yourself
+and see exactly what an agent may recall.
 
 An LLM is not required for the first write or for BM25 search. CAO can use an LLM later to
-organize an existing topic. That step is optional.
+organize an existing topic (optional).
 
 A distributed CAO deployment can use remote memory. Setting `CAO_MEMORY_API_URL` routes the
 same store, recall, forget, and context operations to a memory-owning CAO server. The MCP
 contract does not change. Only the location of the store changes.
 
-## Markdown stores content; SQLite tracks metadata
+### Markdown stores content; SQLite tracks metadata
 
 CAO uses two local stores:
 
@@ -111,7 +123,7 @@ SQLite relationship state, not a second source of truth.
 Some SQLite data can be rebuilt from Markdown. Some cannot. For example, a rejected
 relationship is a human decision. That decision must remain in SQLite.
 
-## What causes CAO to save a memory
+### What causes CAO to save a memory
 
 CAO does not save every conversation by default. A memory is saved when an agent calls
 `memory_store`. A user can trigger that call with a direct request such as, "Remember that
@@ -124,30 +136,11 @@ outcome and starts retrospection. It does not run automatically at session end.
 CAO has no general automatic conversation-capture step today. This avoids turning every
 message, guess, or secret into long-lived memory.
 
-## Save first, organize later
+### Save first, organize later
 
 A CAO agent calls `memory_store`. The memory service then follows a fixed write path:
 
-```text
-agent calls memory_store
-       │
-       ▼
-validate scope, identity, and write policy
-       │
-       ▼
-acquire a per-topic lock
-       │
-       ▼
-write an append-form Markdown topic atomically
-       │
-       ├──────────▶ on eligible updates, schedule LLM compilation
-       │
-       ▼
-update the Markdown index
-       │
-       ▼
-upsert SQLite metadata
-```
+![CAO memory store write path](./memory-store-write-path.svg)
 
 This first path is deterministic because it uses fixed code, not model output. CAO locks
 the topic, writes a known append format, and publishes it with an atomic file replacement.
@@ -156,23 +149,36 @@ The same rules run for every write.
 The shared Markdown index has its own lock. This prevents two topics from losing each
 other's index updates.
 
-When creating a new topic in memory, CAO does not use an LLM. An existing topic may use an
-LLM when compile mode is `llm`. The LLM can merge repeated entries and find related topics.
-This work runs after the initial save.
+**Compile mode** controls that optional second step. It has two settings. In `append`
+mode, CAO only ever appends the new timestamped section — no LLM is involved at any point,
+which reproduces the original Phase 1/2 behavior. In `llm` mode (the default), CAO still
+writes the append-form section first, then schedules a background compilation that calls an
+LLM to merge repeated entries and find related topics. Compilation only runs when it updates
+an existing topic — a brand-new topic is never compiled.
+
+So the write path itself never calls an LLM, regardless of compile mode. The agent that
+*calls* `memory_store` may of course be an LLM — but recording the observation is fixed
+code, not a model deciding what to persist. An LLM only re-enters afterward, and only in
+`llm` mode, to reorganize an existing topic. That compilation runs after the initial save.
 
 The compiler checks for newer writes before it publishes a result. If the topic changed,
 CAO drops the stale result. A slow or failed LLM never removes the saved observation.
 
-The rule we follow is simple: save the observation first. Improve the structure later. CAO
-uses an LLM for that second step only when the operator enables it.
+The rule is simple, and it is deliberate: save the observation first, improve the structure
+later. An LLM only touches that second step, and only when you turn it on.
 
-## Partial writes are visible
+### Partial writes are visible
 
-The filesystem and SQLite cannot share one transaction. CAO handles that limit directly.
+CAO does not run the filesystem write and the SQLite commit in one transaction. They are two
+independent durability domains: SQLite commits through its own write-ahead log, while a
+Markdown file is made durable by a separate `write-temp-then-rename` plus `fsync`. There is no
+common commit or rollback that spans both — if the SQLite commit fails after the files are
+already renamed into place, nothing automatically un-writes those files. CAO owns that gap
+directly rather than pretending it does not exist.
 
 The topic file and Markdown index are written before SQLite metadata. If the SQLite write
-fails, CAO raises `MemoryPartialWriteError`. The error lists the key, scope, file path, and
-completed phases.
+fails, CAO raises `MemoryPartialWriteError`. The error lists the key, scope, scope ID, file
+path, and completed phases, and names the repair command (`cao memory repair --apply`) to run.
 
 This tells the caller what is already safe. Retrying the same write could add a duplicate
 entry.
@@ -180,7 +186,7 @@ entry.
 CAO can repair the missing metadata. Reconciliation scans the topic files, validates them,
 and rebuilds missing rows or index entries. It never rebuilds topic text from SQLite.
 
-## Scope tells CAO where memory applies
+### Scope tells CAO where memory applies
 
 We define a memory with:
 
@@ -202,10 +208,7 @@ specific project, session, or agent when needed.
 The retention periods match the expected lifetime of each scope. Session memory is temporary,
 so it expires first. Project memory lasts longer because project decisions often stay useful
 across many sessions. Global, agent, and federated memory are designed to cross project or
-session boundaries, so they do not expire.
-
-Memories of type `user` or `feedback` also never expire. User preferences and explicit
-corrections should not silently disappear. Cleanup runs when `cao-server` starts. It is not
+session boundaries, so they do not expire. Cleanup runs when `cao-server` starts. It is not
 a continuous sweep.
 
 Project, session, and agent scopes need an identity. CAO rejects the write if it cannot
@@ -223,7 +226,13 @@ older stores. It does not save raw remote URLs because they may contain credenti
 Scope and type are separate. Scope says where a fact applies. Type says whether the fact is
 a project note, user preference, correction, or reference.
 
-## Put only useful memory in the prompt
+## How agents use memory
+
+Storing a memory is only half the story. These sections cover how CAO selects what to put in
+the prompt, keeps workflow replays reproducible, governs the relationship graph, and turns
+validated work into reusable lessons.
+
+### Put only useful memory in the prompt
 
 CAO has two retrieval paths.
 
@@ -232,7 +241,21 @@ and global memory in that order. Each scope gets at most ten entries and its own
 limit. Empty space from one scope is not given to another.
 
 Every provider receives the same `<cao-memory>` content block on the first user message.
-Built-in provider plugins also write the block into the file that provider reads:
+The block wraps a short, scope-ordered list of selected memories:
+
+```text
+<cao-memory>
+## Context from CAO Memory
+- [project] python-version: This project targets Python 3.12.
+- [project] test-runner: Run the suite with `pytest -q`; CI blocks on it.
+- [project] api-auth [related]: Endpoints under /v1 require a bearer token.
+- [global] commit-style: Use Conventional Commits; keep subjects under 72 chars.
+</cao-memory>
+```
+
+Each line is `- [scope] key: content`, and a `[related]` tag marks an entry pulled in by a
+typed relationship rather than selected directly. Built-in provider plugins also write the
+block into the file that provider reads:
 
 - Claude Code: `.claude/CLAUDE.md`
 - Codex: `AGENTS.md`
@@ -248,9 +271,10 @@ Results can be sorted by recency, usage, or a combined score.
 A successful recall may increase `access_count`. A failed counter update never blocks the
 read.
 
-## Keep CAO workflow replays consistent
+### Keep CAO workflow replays consistent
 
-CAO workflows are a separate feature. They run repeatable, multi-step jobs. Memory matters
+[CAO workflows](https://github.com/awslabs/cli-agent-orchestrator/issues/583)
+are a separate feature. They run repeatable, multi-step jobs. Memory matters
 to workflows because a recalled fact can change the result.
 
 Suppose a workflow reads a project rule today. The rule changes tomorrow. A replay should
@@ -265,7 +289,7 @@ must not fall back to the live store.
 CAO saves the block before the terminal uses it. If that save fails, the run continues
 without memory. This is safer than using context that cannot be reproduced.
 
-## Keep relationships as governed data
+### Keep relationships as governed data
 
 CAO stores relationships as typed edges. It does not ask a model to rebuild the graph on
 every read.
@@ -282,30 +306,12 @@ Reading it does not change it.
 CAO has two promotion actions. Relationship promotion accepts a proposed edge. Instruction
 promotion copies a lesson into an agent profile.
 
-## How the opt-in learning loop works
+### How the opt-in learning loop works
 
 CAO does not learn from every conversation. Learning is opt-in. A supervisor starts each
 step of the loop.
 
-```text
-validated work
-     │
-     ▼
-report_outcome ──▶ workflow_outcomes (SQLite)
-                          │
-                          ▼
-supervisor hands off to the retrospector prompt
-                          │
-               list_outcomes + memory_recall
-                          │
-                          ▼
-store_lesson ──▶ worker's agent-scope feedback memory
-                          │
-                   explicit recall
-                          │
-                          ▼
-optional reviewed promotion ──▶ profile ## Learned Patterns
-```
+![CAO's opt-in learning loop](./learning-loop.svg)
 
 The flow has five steps:
 
@@ -328,10 +334,15 @@ Promotion copies the lesson into the profile's `## Learned Patterns` block. It d
 delete the original memory. The operator should review the change like any system prompt
 update.
 
-## Costs and savings
+## Operating CAO memory
 
-A good memory can replace repeated work. The agent may avoid another code search, document
-read, web search, or user question. This can save tool calls, tokens, and time.
+The memory layer has running costs and portability options worth weighing before you lean on
+it. These sections cover the tradeoffs and the ways to move or inspect memory outside CAO.
+
+### Costs and savings
+
+A good memory pays for itself by replacing repeated work: the agent skips another code search,
+document read, web search, or round-trip to you — saving tool calls, tokens, and time.
 
 Memory also has costs:
 
@@ -344,9 +355,10 @@ Memory also has costs:
 The useful question is simple: is storing and checking the conclusion cheaper than finding
 it again on every run?
 
-## Move and view memory outside CAO
+### Move and view memory outside CAO
 
-CAO supports two different use cases: moving topic content and viewing relationships.
+CAO supports three ways to look at memory from outside the write path: moving topic content,
+viewing relationships in an external vault, and browsing them live in the CAO UI.
 
 **OKF export and import** move portable topic content. Export checks content for credential
 patterns. Import requires the operator to choose the target scope. OKF does not preserve
@@ -356,6 +368,11 @@ format, not a full backup.
 **Obsidian graph export** creates a vault for browsing. It writes one Markdown note per
 node, with YAML metadata, an H1 title, and `[[wikilinks]]` for relationships. This export is
 one-way. CAO does not read edits back.
+
+**The CAO UI knowledge graph** renders the same relationships live, with no export step. It
+reads the current graph through `GET /graph/{provider}` and shows the memory nodes and their
+typed edges in the browser, so you can inspect the graph without leaving CAO or opening
+another tool.
 
 ![Current Obsidian export and PR #674 canonical vault architecture](./obsidian-memory-architecture.svg)
 
