@@ -1300,6 +1300,9 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("OTel telemetry init failed; continuing", exc_info=True)
     init_db()
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    agent_profiles.warn_reserved_installed_profiles()
     # Deferred-init tasks are process-local.  Recover any external-owner rows
     # left pending by a prior cao-server crash/restart into durable ERROR before
     # background cleanup can mistake them for ordinary ghosts.
@@ -2575,6 +2578,11 @@ def _validate_profile_for_write(name: str, content: str) -> List[ProfileValidati
 
     def _reject(message: str, findings: Sequence[Any] = ()) -> None:
         raise _profile_write_rejection(message, findings)
+
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    if agent_profiles.routes_to_ephemeral_store(name):
+        _reject(f"Reserved ephemeral profile name: {name}")
 
     # Parsed once here, then handed to validate_frontmatter as metadata.
     # validate_profile_text would parse it again: its docstring exists precisely

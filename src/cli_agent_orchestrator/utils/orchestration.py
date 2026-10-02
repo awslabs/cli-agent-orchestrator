@@ -488,6 +488,15 @@ def _create_terminal(
     Raises:
         Exception: If terminal creation fails
     """
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    try:
+        source = agent_profiles.resolve_agent_profile_source(agent_profile)
+    except (FileNotFoundError, RuntimeError):
+        source = agent_profiles.ProfileSource.INSTALLED
+    if source == agent_profiles.ProfileSource.EPHEMERAL:
+        raise ValueError("Ephemeral target requires a claim result; unavailable in E1a")
+
     provider = DEFAULT_PROVIDER
     parent_allowed_tools = None
 
@@ -747,6 +756,15 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
     the single combined run-step call, while preserving the same-session /
     caller_id / allowed_tools behavior the old six-call path had.
     """
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    try:
+        source = agent_profiles.resolve_agent_profile_source(agent_profile)
+    except (FileNotFoundError, RuntimeError):
+        source = agent_profiles.ProfileSource.INSTALLED
+    if source == agent_profiles.ProfileSource.EPHEMERAL:
+        raise ValueError("Ephemeral target requires a claim result; unavailable in E1a")
+
     current_terminal_id = _current_terminal_id()
     if not current_terminal_id:
         return HandoffContext(

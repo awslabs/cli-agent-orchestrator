@@ -81,6 +81,12 @@ def _load_or_raise() -> Dict[str, Any]:
     return data
 
 
+def child_may_delegate() -> bool:
+    """Operator-only ephemeral.child_may_delegate; no environment overrides."""
+    block = _load_or_raise().get("ephemeral", {})
+    return isinstance(block, dict) and block.get("child_may_delegate") is True
+
+
 def _load() -> Dict[str, Any]:
     """Load settings from disk, tolerating an unreadable file.
 
