@@ -808,15 +808,30 @@ async def run_agent_step(
     # launching a terminal. Classify BEFORE the result is built so the step is
     # NEVER journaled as a replayable completed outcome.
     #
-    # The terminal is deliberately left ALIVE (no teardown), exactly like the
-    # ``kind="error"`` crash path, so the calling engine can keep the live pane
-    # available to an operator. Teardown remains the caller's decision:
-    # ``replay_single_step`` reclaims it, while the drive loop retains it on the
-    # step for inspection. The RAW text travels on the exception so it stays
-    # retrievable after the step fails.
-    script_output = await asyncio.to_thread(terminal_service.get_output_context, terminal_id)
-    provider_error = classify_provider_error(provider, last_message, script_output=script_output)
+    # Cheap first (P3): the two-argument call only runs the signature table, and it
+    # returns ``None`` for the overwhelming majority of steps -- ordinary answers,
+    # outputs past the length cap, providers with no scoped rows -- so the
+    # raw-context fetch (a terminal-metadata DB read plus a possible ``capture-pane``
+    # when the rolling buffer is empty) is deferred until a row actually matches.
+    # Only a candidate match pays for the capture, and only then is it re-read to
+    # confirm the line is provider chrome rather than a marker-owned answer.
+    provider_error = classify_provider_error(provider, last_message)
     if provider_error is not None:
+        script_output = await asyncio.to_thread(terminal_service.get_output_context, terminal_id)
+        provider_error = classify_provider_error(
+            provider, last_message, script_output=script_output
+        )
+    if provider_error is not None:
+        # Unlike the crash/timeout paths above, the CLI here is HEALTHY and idle: it
+        # settled cleanly after printing a refusal, and the refusal text already
+        # travels on the exception (#638 criterion 2), so there is nothing left for
+        # an operator to inspect in the pane. Tear down a terminal THIS call created,
+        # or each retry of a YAML step leaks one idle CLI: the drive loop creates a
+        # fresh terminal every attempt (``teardown=True``) and only the LAST one stays
+        # referenced, and capped nodes (``max_terminals``) would block on the orphans.
+        # ``terminal_id`` still rides on the exception for reporting.
+        if teardown and created_here:
+            await _best_effort_teardown(terminal_id, registry)
         raise StepExecutionError(
             f"provider error ({provider_error.slug}) from {provider}: {provider_error.detail}",
             kind=provider_error.kind,

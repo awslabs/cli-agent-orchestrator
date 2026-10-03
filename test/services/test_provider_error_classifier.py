@@ -325,18 +325,47 @@ def test_real_cli_captures_are_classified_through_the_adapters(
 @pytest.mark.parametrize(
     "answer",
     (
+        # Do not match any row at all.
         "API Error handling should preserve context.",
         "API Error: none found - all 42 endpoints return 2xx.",
         "API Error: 200 endpoints were audited; none failed.",
         "Unknown model types use the fallback serializer.",
         "Rate limiting protects APIs from burst traffic.",
+        # fanhongy P2-1: these DO match a row BY TEXT, but none is provider-native
+        # for Claude Code, so a marked (⏺/●) occurrence must still be an answer.
+        # (Verbatim from the review's table.)
+        "429 Too Many Requests",
+        "Unknown model: `Invoice` isn't registered in admin.py, so I added it.",
+        "Rate limit exceeded, retry after 60 seconds.",
     ),
 )
 def test_marked_ordinary_answers_are_not_refusals(answer):
     """Claude Code marks answers and errors the same way, so the marker never proves a
-    refusal: an ordinary answer on the response bullet must stay an answer."""
+    refusal: an ordinary answer on the response bullet must stay an answer.
+
+    Only the narrow ``API Error: <4xx/5xx>`` family is provider-native for Claude
+    (see ``test_context_distinguishes_provider_error_from_assistant_prose``); every
+    other claude-scoped row has no upstream evidence and is scoped to the adapters
+    that actually emit it, so it cannot fire here."""
     raw = f"⏺ {answer}\n❯ "
     assert classify_provider_error("claude_code", answer, script_output=raw) is None
+
+
+@pytest.mark.parametrize(
+    "answer",
+    (
+        "429 Too Many Requests",
+        "Unknown model: `Invoice` isn't registered in admin.py, so I added it.",
+        "Rate limit exceeded, retry after 60 seconds.",
+    ),
+)
+def test_dropped_claude_rows_do_not_apply_to_claude_code(answer):
+    """Those shapes are still refusals for Codex (its own chrome backs them); for
+    Claude Code they are gone from the table entirely, so even a bare (unmarked)
+    occurrence is an answer."""
+    assert classify_provider_error("codex", answer) is not None
+    assert classify_provider_error("claude_code", answer) is None
+    assert classify_provider_error("claude_code", answer, script_output=answer + "\n❯ ") is None
 
 
 def test_codex_stream_error_retry_that_succeeds_is_not_a_refusal():

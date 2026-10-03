@@ -15,10 +15,13 @@ independent guards: only the FIRST non-empty line is tested; any output longer t
 provider adapters that emit that chrome; the pattern must consume the WHOLE line;
 and raw adapter context, when available, must show a provider-NATIVE error signal
 rather than an ordinary marker-owned answer. That signal is the CLI's own error
-chrome where it has one (Codex's ``■`` / ``⚠️ stream error``), and the error text
-itself for an adapter that renders errors on its response bullet (Claude Code's
-``⏺ API Error: 400 …``). Common words, status-code values, or error
-vocabulary in another adapter's ordinary prose are therefore answers, not refusals.
+chrome where it has one (Codex's ``■`` / ``⚠️ stream error``), and — for the ONE
+family with upstream evidence that it renders on the response bullet — the narrow
+``API Error: <4xx/5xx>`` text Claude Code prints. Common words, status-code values,
+or error vocabulary in another adapter's ordinary prose are therefore answers, not
+refusals. Every other claude-scoped row keeps the marker veto (or is scoped to the
+adapters that actually emit it), so a short answer that merely USES the ``⏺``/``●``
+bullet stays an answer.
 The runtime-side companion of
 :meth:`BaseProvider.get_error_message`, which asks the same question of a provider
 *instance* holding a live terminal buffer.
@@ -96,7 +99,7 @@ _ROWS = (
     (
         "model_not_available",
         r"(?:Unknown|Unsupported|Invalid|Undefined)\s+model\s*[:=]\s*\S.*",
-        ("claude_code", "codex", "grok_cli"),
+        ("codex", "grok_cli"),
     ),
     (
         "model_not_available",
@@ -123,7 +126,7 @@ _ROWS = (
         r"rate_limit(?:_error)?\s*[:=]\s*(?:rate limit|too many|exceeded|retry|try)\b.*|"
         r"429\s*:\s*rate limit(?:ing|ed)?(?:\s+exceeded)?(?:\s*[,.:].*)?|"
         r"429\s+Too Many Requests)",
-        ("claude_code", "codex"),
+        ("codex",),
     ),
     # Kimi reports transport failures as column-zero terminal chrome.
     ("connection_error", r"(?:ConnectionError|APIConnectionError):\s*\S.*", ("kimi_cli",)),
@@ -146,13 +149,15 @@ _ASSISTANT_MARKERS = {
     "mcode": ASSISTANT_MARKER_PATTERN,
 }
 
-# Adapters whose CLI renders its OWN in-band errors on the same response bullet it
-# uses for assistant text. Claude Code prints ``⏺ API Error: 400 …`` /
-# ``● API Error: 400 …`` (anthropics/claude-code#91345, #92316), so a response-marker
-# occurrence there is provider chrome, not proof of an answer: the provider-native
-# signal is the ``API Error: <status>`` text itself. Every other adapter keeps the
-# opposite reading, where a marker-owned occurrence is an ordinary answer.
-_ERRORS_RENDERED_ON_ASSISTANT_MARKER = frozenset({"claude_code"})
+# The (provider, slug) pairs whose CLI renders its OWN in-band error on the same
+# response bullet it uses for assistant text. Keyed on the PAIR, not the provider:
+# only Claude Code's ``api_error`` (``⏺ API Error: 400 …`` / ``● API Error: 400 …``,
+# anthropics/claude-code#91345, #92316) carries upstream evidence that the chrome sits
+# on the response bullet itself. The other claude-scoped rows (throttling, the
+# ``Unknown model:`` colon form) have no such evidence, so they keep the marker veto
+# and a marked occurrence stays an ordinary answer. Every non-Claude adapter also keeps
+# the marker veto, where a marker-owned occurrence is an ordinary answer.
+_ERRORS_RENDERED_ON_ASSISTANT_MARKER = frozenset({("claude_code", "api_error")})
 _CONTEXT_UNSET: Any = object()
 
 
@@ -166,17 +171,20 @@ class ProviderErrorMatch(NamedTuple):
     kind: str = KIND_PROVIDER_ERROR
 
 
-def _provider_owns_error_line(provider: str, error_line: str, script_output: str) -> bool:
+def _provider_owns_error_line(
+    provider: str, slug: str, error_line: str, script_output: str
+) -> bool:
     """Whether the last matching rendered line is provider chrome, not assistant text.
 
     The final-message extractor intentionally removes the provider's response marker,
     so the extracted text alone cannot establish ownership.  Walk the raw script
     capture and let the LAST occurrence decide: an unmarked occurrence is provider
     chrome, and an occurrence owned by the adapter's assistant marker is normally an
-    answer.  For the adapters in :data:`_ERRORS_RENDERED_ON_ASSISTANT_MARKER`, however,
-    the CLI renders its own errors on that marker, so it counts as provider chrome
-    too.  No marker vocabulary for a provider means no positive ownership evidence,
-    so the caller must not classify it.
+    answer.  For the ``(provider, slug)`` pairs in
+    :data:`_ERRORS_RENDERED_ON_ASSISTANT_MARKER`, however, the CLI renders that one
+    error family on the marker itself, so it counts as provider chrome too.  No
+    marker vocabulary for a provider means no positive ownership evidence, so the
+    caller must not classify it.
     """
     marker = _ASSISTANT_MARKERS.get(provider)
     if marker is None:
@@ -184,7 +192,7 @@ def _provider_owns_error_line(provider: str, error_line: str, script_output: str
         # must degrade to the pre-#638 behaviour rather than trust the text alone.
         return False
 
-    errors_on_marker = provider in _ERRORS_RENDERED_ON_ASSISTANT_MARKER
+    errors_on_marker = (provider, slug) in _ERRORS_RENDERED_ON_ASSISTANT_MARKER
     found = False
     assistant_owned = False
     for raw_line in strip_terminal_escapes(script_output).splitlines():
@@ -193,8 +201,9 @@ def _provider_owns_error_line(provider: str, error_line: str, script_output: str
         if match is not None:
             if line[match.end() :].strip() == error_line:
                 found = True
-                # On an adapter that renders errors on the response bullet the marker
-                # is provider chrome, not proof that the model authored the line.
+                # On an adapter that renders THIS error family on the response
+                # bullet the marker is provider chrome, not proof that the model
+                # authored the line.
                 assistant_owned = not errors_on_marker
             continue
         if line == error_line:
@@ -232,7 +241,7 @@ def classify_provider_error(
         if not signature.applies_to(provider) or not signature.pattern.fullmatch(first_line):
             continue
         if script_output is not _CONTEXT_UNSET and not _provider_owns_error_line(
-            provider, first_line, script_output or ""
+            provider, signature.slug, first_line, script_output or ""
         ):
             return None
         return ProviderErrorMatch(

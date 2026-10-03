@@ -1355,10 +1355,16 @@ class TestInBandProviderError:
         assert result.status == TerminalStatus.COMPLETED
         assert result.last_message == self.ERROR
 
-    def test_provider_error_raises_and_leaves_the_terminal_alive(self):
-        """The step FAILS, the raw text stays retrievable, and — mirroring the
-        ``kind="error"`` crash contract — the pane is NOT reclaimed, so an operator
-        (and ``replay_single_step``) can still read the real refusal."""
+    def test_provider_error_raises_and_tears_the_terminal_down(self):
+        """The step FAILS, the raw text stays retrievable on the exception, and the
+        terminal this call created is reclaimed.
+
+        The CLI here is HEALTHY and idle (it settled cleanly after printing the
+        refusal) and the text already travels on the exception (#638 criterion 2), so
+        — unlike the crash/timeout paths — no live pane is kept for inspection.
+        Leaving it alive leaks one idle terminal per retried YAML attempt (fanhongy
+        P2-2): the drive loop creates a fresh terminal every attempt and only the last
+        one stays referenced."""
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
             output=self.ERROR
         )
@@ -1377,8 +1383,91 @@ class TestInBandProviderError:
 
         assert excinfo.value.kind == "provider_error"
         assert self.ERROR in str(excinfo.value)  # criterion 2: text retrievable
+        assert excinfo.value.terminal_id == "abc12345"  # still reported
+        m_exit.assert_called_once_with("abc12345")
+        m_delete.assert_called_once_with("abc12345", registry=None)
+
+    def test_provider_error_on_a_reused_terminal_is_not_torn_down(self):
+        """Teardown stays scoped to a terminal THIS call created: a reused terminal
+        belongs to the caller, so a provider refusal must not reclaim it."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output=self.ERROR
+        )
+        metadata = {"id": "reuse99", "provider": "codex", "engine": None}
+        with (
+            create,
+            send,
+            delete as m_delete,
+            get_output,
+            exit_cli as m_exit,
+            wait,
+            status,
+            self._context_patch("codex", self.ERROR, provider_owned=True),
+            patch(
+                f"{_MODULE}.terminal_service.get_terminal_metadata",
+                return_value=metadata,
+            ),
+        ):
+            with pytest.raises(StepExecutionError) as excinfo:
+                asyncio.run(run_agent_step("codex", "dev", "x", reuse_terminal_id="reuse99"))
+
+        assert excinfo.value.kind == "provider_error"
+        assert excinfo.value.terminal_id == "reuse99"
         m_delete.assert_not_called()
         m_exit.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "answer",
+        (
+            "429 Too Many Requests",
+            "Unknown model: `Invoice` isn't registered in admin.py, so I added it.",
+            "Rate limit exceeded, retry after 60 seconds.",
+        ),
+    )
+    def test_short_bulleted_claude_answers_are_not_refusals(self, answer):
+        """fanhongy P2-1 regression: Claude Code renders answers on the ``⏺``/``●``
+        response bullet, so a short answer that merely uses that bullet must complete
+        — only the narrow ``API Error: <4xx/5xx>`` chrome is provider-native for
+        Claude (see the classifier tests)."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output=answer
+        )
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            self._context_patch("claude_code", answer),
+        ):
+            result = asyncio.run(run_agent_step("claude_code", "dev", "x"))
+
+        assert result.status == TerminalStatus.COMPLETED
+        assert result.last_message == answer
+
+    def test_raw_context_is_not_fetched_for_a_non_candidate_answer(self):
+        """P3: the raw-context fetch is deferred until a signature actually matches, so
+        an ordinary answer never pays for the metadata read / capture-pane."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output="The answer is 42."
+        )
+        context = MagicMock(side_effect=AssertionError("get_output_context must not be called"))
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            patch(f"{_MODULE}.terminal_service.get_output_context", context, create=True),
+        ):
+            result = asyncio.run(run_agent_step("codex", "dev", "x"))
+
+        assert result.status == TerminalStatus.COMPLETED
+        context.assert_not_called()
 
     def test_long_answer_quoting_a_provider_error_and_normal_answers_complete(self):
         """Regression (criterion 4): quoting an error is not an error, and the
