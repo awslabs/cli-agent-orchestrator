@@ -57,9 +57,110 @@ Security scans run:
 
 ### CodeQL Static Analysis
 
-CodeQL runs via GitHub's default setup on every push to `main` and every pull request, covering both Python and JavaScript/TypeScript. Findings appear as PR review comments and in the repo's [Security tab](https://github.com/awslabs/cli-agent-orchestrator/security/code-scanning). Default setup catches `py/full-ssrf`, `py/path-injection`, `py/request-without-timeout`, and the rest of the `security-extended` query suite.
+The advanced [CodeQL workflow](.github/workflows/codeql.yml) analyzes Python,
+JavaScript/TypeScript, GitHub Actions, and Rust with CodeQL's default query
+suite. It runs on pushes to `main`, pull requests targeting `main` (including
+forks), Mondays at 08:00 UTC, and manual dispatch. Fork runs remain subject to
+the repository's contributor-workflow approval policy. Unlike this workflow,
+[GitHub's default setup excludes fork PRs](https://docs.github.com/en/code-security/concepts/code-scanning/setup-types#about-default-setup).
 
-Default setup is configured in repo settings, not in a workflow file — adding a workflow-based CodeQL job alongside it causes upload conflicts. If the team later needs the wider `security-and-quality` suite or custom queries, toggle default setup off first and then add an advanced workflow.
+Each language uses a separate job, without a project build or dependency
+installation, and uploads results for the checked-out PR merge revision.
+Checkout does not retain credentials. Fork PRs use the restricted built-in
+`GITHUB_TOKEN`; do not introduce secrets, personal access tokens, or a
+`pull_request_target` workaround to run untrusted code. Trivy, dependency
+review, and secret scanning remain independent checks.
+
+#### Scan scope and merge policy
+
+For a PR targeting `main`, the CodeQL workflow checks out GitHub's test merge
+revision, `refs/pull/<number>/merge`: the base revision plus the PR's changes
+for that run. CodeQL applies its query suite to supported code from that
+checkout with codebase context, rather than treating a patch as a standalone
+program. This merge SHA can differ from both the PR head and the eventual
+commit merged into `main`. Other CI jobs run their configured tests, linters,
+and builds; this policy does not limit those jobs to changed lines.
+
+| Check | What it evaluates | What success means |
+| --- | --- | --- |
+| Four CodeQL analysis jobs | Analysis, upload, and result processing for each configured language | The scan completed successfully, not that it found no issues |
+| Required CodeQL status checks | Completion of all four language jobs for the current PR revision, with the branch up to date | Missing, pending, or failed required checks cannot satisfy the gate |
+| Code-scanning merge rule | Required CodeQL analysis and applicable open alerts in the PR diff | Analysis is available and complete, and no applicable alert reaches **High or higher** security severity or the general **Errors** threshold |
+| `main` push and weekly scans | Supported repository code at the default-branch revision, including baseline findings | Analysis completed; existing alerts can remain open |
+
+**The current policy is to prevent qualifying findings in PR changes, not
+to require zero open alerts across the repository before every PR can merge.**
+Baseline findings remain a separate triage/fix track so they do not
+automatically block unrelated PRs. This is a merge-policy choice, not an
+exclusion of those findings from default-branch scanning. A whole-repository
+alert gate for every PR would be a different policy and is not configured.
+
+For example, an applicable new High-security finding can leave the analysis
+job green while the code-scanning rule blocks merging. An unchanged baseline
+alert outside an unrelated PR's diff does not automatically block that PR.
+A failed upload still blocks the required check even if no new alert was
+reported. Passing CodeQL checks also does not replace other required CI or
+review approvals.
+
+GitHub requires all source lines identified by an alert to be in the PR
+diff for its code-scanning merge rule to apply. See
+[Code scanning merge protection](https://docs.github.com/en/code-security/concepts/code-scanning/merge-protection)
+for this scope and additional limitations, including merge queues. Neither a
+green job nor this merge rule proves that the repository is vulnerability-free
+or that every reported alert is exploitable.
+
+The [CODEOWNERS policy](.github/CODEOWNERS) assigns `.github/workflows/` and
+the ownership file itself to the repository-maintainer team `@awslabs/multiq`.
+Protecting the whole workflow directory also covers a new workflow that
+tries to emit the same required check names. GitHub uses the base branch's
+ownership policy, so request this team's review explicitly for the initial
+workflow/ownership PR; automatic owner enforcement starts once `main`
+contains the file. A CODEOWNERS file alone does not require approval: the
+administrator must enable the review settings below.
+
+#### Administrator migration and merge protection
+
+The workflow file does **not** change hosted CodeQL settings or branch rules.
+A repository administrator must coordinate the following cutover; do not
+treat merging the file alone as completion of issue #857.
+
+1. Pause merges while switching the reviewed workflow from default to
+   advanced setup in **Settings > Advanced Security > CodeQL analysis**.
+   Disable default setup before running the advanced workflow: simultaneous
+   configurations cause rejected uploads, not a clean result. Re-run the
+   migration PR at its latest revision and require all four analysis jobs
+   to succeed before merging it.
+2. After merging, require the push analysis on `main` to finish, establishing
+   the advanced workflow's default-branch baseline. Keep merges paused until
+   the rules and acceptance checks below are verified.
+3. Extend an active ruleset targeting `main`, without removing existing
+   protections. Enable **Require code scanning results** for **CodeQL**,
+   with **Security alerts: High or higher** and **Alerts: Errors**. A rule's
+   `warning` classification is distinct from its security severity.
+4. Also require these GitHub Actions status checks, with the branch up to
+   date before merging: `CodeQL (actions)`, `CodeQL (javascript-typescript)`,
+   `CodeQL (python)`, and `CodeQL (rust)`. Require every matrix job, not just
+   one successful analysis or a successful SARIF upload. Document any
+   explicitly authorized bypass; do not add one as a migration shortcut.
+5. In the pull-request rule, enable **Require review from Code Owners** and
+   **Dismiss stale pull request approvals when new commits are pushed**.
+   Workflow or ownership changes must receive owner approval, and later
+   changes to the reviewed diff must invalidate the earlier approval.
+6. Verify that changes to a workflow or the ownership policy require owner
+   review and that a later push dismisses its approval. Verify a clean
+   same-repository PR and a disposable fork PR, then use a
+   harmless controlled finding above the threshold to verify merge blocking.
+   Missing, pending, or failed jobs must also block. Push a new revision and
+   confirm old results cannot satisfy its checks; compare each analysis to
+   that run's PR merge SHA, not an older head. Remove the disposable cases.
+
+If the cutover fails, keep merges paused, disable the advanced workflow,
+restore default setup and the previous rule configuration, and verify scans
+resume. This rollback restores the old fork-coverage gap; do not resume fork
+PR merges as if the new protection were active.
+
+See GitHub's [advanced setup instructions](https://docs.github.com/en/code-security/how-tos/find-and-fix-code-vulnerabilities/configure-code-scanning/configuring-advanced-setup-for-code-scanning)
+and [merge-protection configuration](https://docs.github.com/en/code-security/how-tos/find-and-fix-code-vulnerabilities/manage-your-configuration/set-merge-protection).
 
 ### Dependency Review
 

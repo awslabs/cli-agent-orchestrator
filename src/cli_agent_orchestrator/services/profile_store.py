@@ -7,7 +7,7 @@ one. Every public function takes a name, never a caller-supplied path.
 Why names and not paths: the store is a fixed root joined with a single
 validated segment, which is safe to centralise. Filesystem handling of
 caller-supplied *paths* deliberately stays in the CLI (see
-``cli/commands/install.py::_copy_local_profile_to_store``) so that
+``cli/commands/install.py::_read_local_profile``) so that
 ``Path(user_input)`` never reaches the HTTP-reachable service layer -- the
 property that closed the recurring ``py/path-injection`` alerts. Callers keep
 their own input validation; this module validates the segment it is handed.

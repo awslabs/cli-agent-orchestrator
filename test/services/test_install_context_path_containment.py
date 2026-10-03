@@ -11,7 +11,7 @@ Two layers of coverage:
 - `TestContextPathContainment` exercises `_write_context_file` directly against
   each escape class: relative traversal, absolute paths, backslash separators,
   NUL, and three symlink shapes (including one resolving *inside* the base, which
-  isolates the `O_NOFOLLOW` guard from the containment check).
+  isolates the symlink guard from the containment check).
 - `TestInstallAgentRefusesHostileResolvedName` drives the public `install_agent`
   entry point, pinning the actual attack path end to end.
 """
@@ -51,7 +51,9 @@ class TestContextPathContainment:
     )
     def test_hostile_resolved_name_is_refused(self, context_dir, hostile_name):
         with pytest.raises(ValueError):
-            install_service._write_context_file(hostile_name, "---\nname: x\n---\nbody\n")
+            install_service._write_context_file(
+                hostile_name, "---\nname: x\n---\nbody\n", "trusted-handle"
+            )
         # the context dir stayed empty (see the install_agent tests below for the
         # broader "nothing written anywhere" assertion)
         assert list(context_dir.iterdir()) == []
@@ -62,19 +64,24 @@ class TestContextPathContainment:
         (decoy / "CLAUDE.md").write_text("ORIGINAL trusted instructions\n")
         with pytest.raises(ValueError):
             install_service._write_context_file(
-                str(decoy / "CLAUDE"), "---\nname: x\n---\nINJECTED\n"
+                str(decoy / "CLAUDE"), "---\nname: x\n---\nINJECTED\n", "trusted-handle"
             )
         assert (decoy / "CLAUDE.md").read_text() == "ORIGINAL trusted instructions\n"
 
     def test_symlink_at_target_pointing_outside_is_not_followed(self, context_dir, tmp_path):
         # A symlink planted at the target, pointing outside, must not be written
         # through. The final component is left unresolved by the path guard, so
-        # this is caught by O_NOFOLLOW at the open, not by containment.
+        # this is caught by the writer's lstat type check, not by containment.
+        # (It was O_NOFOLLOW at the open before the writer became atomic; the
+        # refusal is the same, the mechanism is the lstat plus os.replace, which
+        # replaces a symlink rather than following it.)
         outside = tmp_path / "outside"
         outside.mkdir()
         (context_dir / "evil.md").symlink_to(outside / "pwned.md")
         with pytest.raises(ValueError):
-            install_service._write_context_file("evil", "---\nname: x\n---\nINJECTED\n")
+            install_service._write_context_file(
+                "evil", "---\nname: x\n---\nINJECTED\n", "trusted-handle"
+            )
         assert not (outside / "pwned.md").exists()
 
     def test_symlinked_target_regular_file_outside_is_refused(self, context_dir, tmp_path):
@@ -82,29 +89,38 @@ class TestContextPathContainment:
         outside_file.write_text("original\n")
         (context_dir / "evil.md").symlink_to(outside_file)
         with pytest.raises(ValueError):
-            install_service._write_context_file("evil", "---\nname: x\n---\nINJECTED\n")
+            install_service._write_context_file(
+                "evil", "---\nname: x\n---\nINJECTED\n", "trusted-handle"
+            )
         assert outside_file.read_text() == "original\n"
 
     def test_symlink_at_target_pointing_INSIDE_base_is_still_refused(self, context_dir):
-        # Isolates the O_NOFOLLOW guard: this symlink resolves to a path INSIDE
-        # the context dir, so the realpath-containment check would ALLOW it — only
-        # the no-follow open refuses it. Guards against a future refactor silently
-        # dropping O_NOFOLLOW (the containment test would still pass without it).
+        # Isolates the symlink guard from the containment guard: this symlink
+        # resolves to a path INSIDE the context dir, so the realpath-containment
+        # check would ALLOW it — only the type check on the target refuses it.
+        # Guards against a future refactor silently dropping that check (the
+        # containment test would still pass without it). This test did its job:
+        # the writer later became atomic and traded O_NOFOLLOW for an lstat plus
+        # os.replace, and this case is what proved the replacement still refuses.
         (context_dir / "real.md").write_text("real target\n")
         (context_dir / "evil.md").symlink_to(context_dir / "real.md")
         with pytest.raises(ValueError):
-            install_service._write_context_file("evil", "---\nname: x\n---\nINJECTED\n")
+            install_service._write_context_file(
+                "evil", "---\nname: x\n---\nINJECTED\n", "trusted-handle"
+            )
         # the symlink's in-base target was not written through
         assert (context_dir / "real.md").read_text() == "real target\n"
 
     def test_nul_byte_in_name_is_refused(self, context_dir):
         with pytest.raises(ValueError):
-            install_service._write_context_file("a\x00b", "---\nname: x\n---\nbody\n")
+            install_service._write_context_file(
+                "a\x00b", "---\nname: x\n---\nbody\n", "trusted-handle"
+            )
         assert list(context_dir.iterdir()) == []
 
     def test_normal_name_writes_inside(self, context_dir):
         written = install_service._write_context_file(
-            "developer", "---\nname: developer\n---\nBe helpful.\n"
+            "developer", "---\nname: developer\n---\nBe helpful.\n", "developer"
         )
         assert written == context_dir / "developer.md"
         assert written.is_file()
@@ -112,10 +128,12 @@ class TestContextPathContainment:
         assert os.path.realpath(written).startswith(os.path.realpath(context_dir) + os.sep)
 
     def test_reinstall_over_own_regular_copy_is_allowed(self, context_dir):
-        install_service._write_context_file("developer", "---\nname: developer\n---\nv1\n")
+        install_service._write_context_file(
+            "developer", "---\nname: developer\n---\nv1\n", "developer"
+        )
         # a normal reinstall overwrites the profile's own prior regular-file copy
         written = install_service._write_context_file(
-            "developer", "---\nname: developer\n---\nv2\n"
+            "developer", "---\nname: developer\n---\nv2\n", "developer"
         )
         assert "v2" in written.read_text()
         assert stat.S_ISREG(os.lstat(written).st_mode)

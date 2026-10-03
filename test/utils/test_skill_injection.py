@@ -283,6 +283,27 @@ class TestIsCaoManagedCopilotAgent:
 
         assert skill_injection._is_cao_managed_copilot_agent(hostile) is False
 
+    def test_configured_installed_dir_is_where_the_probe_looks(self, tmp_path, monkeypatch):
+        """The probe follows ``agents.dirs.cao_installed`` like the install writer.
+
+        PR #493 moved the writer onto the configured directory; a probe still
+        reading the constant would skip every agent installed under an override,
+        and ``cao skills refresh`` would silently leave them untouched.
+        """
+        constant_dir = tmp_path / "context"
+        constant_dir.mkdir()
+        override_dir = tmp_path / "configured-elsewhere"
+        override_dir.mkdir()
+        (override_dir / "developer.md").write_text("x", encoding="utf-8")
+        monkeypatch.setattr(skill_injection, "AGENT_CONTEXT_DIR", constant_dir)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+            lambda: {"cao_installed": str(override_dir)},
+        )
+
+        assert skill_injection._is_cao_managed_copilot_agent("developer") is True
+        assert skill_injection._is_cao_managed_copilot_agent("nobody") is False
+
     def test_traversal_to_an_existing_file_outside_is_refused(self, tmp_path, monkeypatch):
         """The case that isolates the segment guard from the existence check.
 
