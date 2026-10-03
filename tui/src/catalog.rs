@@ -1883,7 +1883,7 @@ mod tests {
         counts
     }
 
-    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 61 HIDE, totalling 107.**
+    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 65 HIDE, totalling 107.**
     ///
     /// Every number here is a **hard-coded literal**, and that is the entire design of the test.
     /// Deriving any of them from the table — `assert_eq!(in_app, TABLE.iter().filter(..).count())`
