@@ -235,3 +235,19 @@ def test_unreadable_or_dangling_halt_fails_closed(egress, monkeypatch, tmp_path)
     monkeypatch.setattr(Path, "lstat", lstat)
     assert egress.is_halted()
     assert {p.state.value for p in settings.load_settings().points.values()} == {"off"}
+
+
+@pytest.mark.asyncio
+async def test_halt_published_after_shared_lock_refuses_permit(egress, monkeypatch):
+    settings.set_point("model.route", "on", "external")
+    actual_flock = egress.fcntl.flock
+
+    def flock(fd, operation):
+        actual_flock(fd, operation)
+        if operation == fcntl.LOCK_SH | fcntl.LOCK_NB:
+            egress.HALT_FILE.touch()
+
+    monkeypatch.setattr(egress.fcntl, "flock", flock)
+    async with egress.egress_permit("model.route", "external") as allowed:
+        assert allowed is False
+    assert egress.is_halted()

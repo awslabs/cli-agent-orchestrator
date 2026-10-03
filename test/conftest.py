@@ -41,6 +41,42 @@ pytest_plugins = (
 )
 
 
+_DECISION_HOME_SNAPSHOT = pytest.StashKey[dict[pathlib.Path, tuple[int, int, int] | None]]()
+
+
+def _decision_home_file_state(path: pathlib.Path) -> tuple[int, int, int] | None:
+    try:
+        stat = path.lstat()
+    except FileNotFoundError:
+        return None
+    return stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def pytest_sessionstart(session):
+    # Resolve the startup home before any per-test redirects; inspect metadata only.
+    from cli_agent_orchestrator.constants import CAO_HOME_DIR
+
+    session.stash[_DECISION_HOME_SNAPSHOT] = {
+        CAO_HOME_DIR / name: _decision_home_file_state(CAO_HOME_DIR / name)
+        for name in ("decisions.halt", "decisions-egress.lock")
+    }
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session, exitstatus):
+    before = session.stash[_DECISION_HOME_SNAPSHOT]
+    changed = [
+        path.name for path, state in before.items() if _decision_home_file_state(path) != state
+    ]
+    if changed:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+        if reporter is not None:
+            reporter.write_sep(
+                "=", "Decision state changed under startup CAO home: " + ", ".join(changed)
+            )
+
+
 _AUTH_TEST_DOMAIN = "test.local"
 _AUTH_TEST_AUDIENCE = "cao://test"
 
