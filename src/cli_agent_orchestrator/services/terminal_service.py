@@ -1725,11 +1725,23 @@ async def create_terminal(
             def _probe_pane(s=session_name, w=window_name) -> str:
                 return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
 
+            def _fifo_buffer_tail(t=terminal_id) -> str:
+                return status_monitor.get_buffer(t)
+
+            def _fifo_screen_display(t=terminal_id) -> Optional[str]:
+                return status_monitor.get_screen_display(t)
+
             def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
                 get_backend().stop_pipe_pane(s, w)
                 get_backend().pipe_pane(s, w, p)
 
-            fifo_manager.create_reader(terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe)
+            fifo_manager.create_reader(
+                terminal_id,
+                pane_probe=_probe_pane,
+                rearm=_rearm_pipe,
+                fifo_buffer_probe=_fifo_buffer_tail,
+                fifo_screen_probe=_fifo_screen_display,
+            )
 
             # Configure pipe-pane to stream output to the FIFO. This enables
             # real-time event-driven processing via StatusMonitor and LogWriter
