@@ -7,6 +7,9 @@ handler bodies rather than a re-implementation of them.
 
 from __future__ import annotations
 
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -128,6 +131,30 @@ class TestInstall:
 
         source = _plugin_source(PluginInstallRequest(source="/tmp/x", kind="git"))
         assert source.kind == "git"
+
+    @pytest.mark.parametrize(
+        "endpoint,target", [("/plugins", "install"), ("/plugins/validate", "validate_source")]
+    )
+    @pytest.mark.parametrize(
+        "source,expected_kind",
+        [("git@github.com:owner/repo", "git"), ("./local@host:plugin", "path")],
+    )
+    def test_source_inference_does_not_probe_before_the_resolver(
+        self, client, monkeypatch, endpoint, target, source, expected_kind
+    ):
+        from cli_agent_orchestrator.agent_plugins.installer import PluginInstallError
+
+        resolver = MagicMock(side_effect=PluginInstallError("resolver boundary"))
+        monkeypatch.setattr(f"cli_agent_orchestrator.agent_plugins.installer.{target}", resolver)
+        with patch.object(
+            Path, "exists", side_effect=AssertionError("unexpected filesystem probe")
+        ):
+            response = client.post(endpoint, json={"source": source})
+
+        assert response.status_code == 400, response.text
+        assert response.json()["detail"] == "resolver boundary"
+        resolver.assert_called_once()
+        assert resolver.call_args.args[0].kind == expected_kind
 
 
 class TestValidate:

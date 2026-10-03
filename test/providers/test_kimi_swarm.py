@@ -80,6 +80,43 @@ def swarm_panel(state="Working…", prefix="🌑 "):
     )
 
 
+@pytest.mark.parametrize(
+    "row,expected",
+    [
+        ("Working…", kt.KimiLineKind.LIVE_SWARM_PROGRESS),
+        ("\t⠙\u2003Orchestrating…\treading files", kt.KimiLineKind.LIVE_SWARM_PROGRESS),
+        ("🌕 Prompting…\u2003waiting for input", kt.KimiLineKind.LIVE_SWARM_PROGRESS),
+        ("\u2003Rate limited…\t", kt.KimiLineKind.LIVE_SWARM_PROGRESS),
+        ("✓ Completed.", kt.KimiLineKind.SWARM_PROGRESS),
+        ("✗ Failed.", kt.KimiLineKind.SWARM_PROGRESS),
+        ("⊘ Aborted.", kt.KimiLineKind.SWARM_PROGRESS),
+    ],
+)
+def test_swarm_status_preserves_glyphs_whitespace_and_details(row, expected):
+    kinds = [
+        kind
+        for _, _, kind in kt.classify_lines(
+            SWARM_ECHO + swarm_panel(row, prefix=""), kt.SpinnerSemantics.CODE
+        )
+    ]
+    assert expected in kinds
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "Working…not a state",
+        "Working… arbitrary detail",
+        "Completed. still ordinary prose",
+        "Working…\n",
+        "Orchestrating… detail\n ",
+    ],
+)
+def test_invalid_or_multiline_swarm_status_does_not_establish_a_panel(row):
+    raws = [SWARM_HEADING, SWARM_MEMBER, f"\x1b[38;5;111m{row}\x1b[39m"]
+    assert kt._swarm_progress_rows(raws, [kt.strip_sgr(raw) for raw in raws], set()) == {}
+
+
 @pytest.mark.parametrize("prefix", ["", "🌑 ", "⠙ "])
 @pytest.mark.parametrize("state", ["Working…", "Orchestrating…", "Rate limited…"])
 def test_native_panel_establishes_current_execution_without_thinking_spinner(

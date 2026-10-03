@@ -9,6 +9,7 @@ exercising the real command bodies rather than a re-implementation of them.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
@@ -196,6 +197,39 @@ class TestSourceKindDetection:
     @pytest.mark.parametrize("location", ["./local", "/abs/path", "relative/dir", "."])
     def test_path_shaped_sources(self, location):
         assert not _looks_like_git(location)
+
+    @pytest.mark.parametrize(
+        "location,expected",
+        [
+            ("git@github.com:owner/repo", True),
+            ("operator@example.test:team/repo", True),
+            ("./local@host:plugin", False),
+            ("../local@host:plugin", False),
+            ("/tmp/local@host:plugin", False),
+            ("~/local@host:plugin", False),
+            ("relative/local@host:plugin", False),
+            (r".\local@host:plugin", False),
+            ("github.com", False),
+            ("./local.git", False),
+            ("repo.git", True),
+        ],
+    )
+    def test_source_inference_never_probes_the_filesystem(self, location, expected, monkeypatch):
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                Path, "exists", lambda _: pytest.fail("source inference probed the filesystem")
+            )
+            assert _looks_like_git(location) is expected
+
+    def test_scp_inference_does_not_depend_on_a_matching_local_directory(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        location = "git@github.com:owner/repo"
+        (tmp_path / location).mkdir(parents=True)
+
+        assert _looks_like_git(location)
+        assert not _looks_like_git(f"./{location}")
 
     def test_an_unsupported_git_plus_form_is_refused_at_the_cli(self, cli_env, tmp_path):
         """The operator-visible artifact: a message naming the forms that work.

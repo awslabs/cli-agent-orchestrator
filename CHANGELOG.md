@@ -68,6 +68,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Address five baseline CodeQL alerts without suppressions: remove filesystem
+  probes from plugin source-kind inference, confine Kiro policy-file inspection
+  to its canonical agent directory, replace the flagged Kimi footer and swarm
+  status regex constructs, and check canonical schema-source metadata rather
+  than a hostname substring in policy prose. Explicit local plugin paths,
+  legacy Kiro filename mapping, and Kimi's content/chrome boundaries remain
+  covered by regression cases.
 - Run all four required CodeQL language jobs inside the main CI workflow,
   including full CI reruns, instead of relying on a separate PR trigger.
   Weekly and manual scans share the same maintainer-owned scan steps, with

@@ -1449,10 +1449,17 @@ def installed_kiro_tools(profile_name: str) -> Optional[List[str]]:
     list-valued ``tools``. The launch gate and the server use this to notice a
     profile installed before CAO wrote the policy into ``tools`` (it carries
     ``["*"]``) and say so, since on Kiro the installed file is the policy.
+
+    Raises ``ValueError`` when the file resolves outside the Kiro agent directory.
     """
-    agent_file = KIRO_AGENTS_DIR / f"{flatten_path_separators(profile_name)}.json"
+    base = os.path.realpath(KIRO_AGENTS_DIR)
+    agent_path = os.path.realpath(
+        os.path.join(base, f"{flatten_path_separators(profile_name)}.json")
+    )
+    if agent_path != base and not agent_path.startswith(base + os.sep):
+        raise ValueError("Refusing to inspect a Kiro agent file outside the agent directory")
     try:
-        data = json.loads(agent_file.read_text(encoding="utf-8"))
+        data = json.loads(Path(agent_path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     tools = data.get("tools") if isinstance(data, dict) else None
