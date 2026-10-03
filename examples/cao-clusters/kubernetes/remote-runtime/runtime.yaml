@@ -8,6 +8,10 @@ metadata:
   # For Claude Code on Bedrock, give the runtime an IAM role, e.g. with IRSA:
   # annotations:
   #   eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/ROLE_NAME
+# Agents here run commands, and nothing in the pod calls the Kubernetes API, so
+# no API token is mounted. IRSA's web-identity token is a projected volume of
+# its own, which this does not affect.
+automountServiceAccountToken: false
 ---
 # Required by the StatefulSet; it exposes no ports.
 apiVersion: v1
