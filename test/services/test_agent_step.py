@@ -1153,10 +1153,16 @@ class TestInBandProviderError:
 
     @staticmethod
     def _context(provider, output, *, provider_owned=False):
-        """Return a minimal rendered capture with the provider's ownership marker."""
+        """Return a minimal rendered capture in the adapter's real shape.
+
+        Codex renders an answer on the ``•`` assistant marker and provider chrome
+        unmarked.  Claude Code renders BOTH answers and its own API errors on the
+        ``⏺``/``●`` response bullet (anthropics/claude-code#91345 / #92316), so
+        ``provider_owned`` does not change its rendering — the ``API Error:`` text is
+        the provider-native signal, and the marker must not veto it.
+        """
         if provider == "claude_code":
-            prefix = "" if provider_owned else "⏺ "
-            return f"{prefix}{output}\n❯"
+            return f"⏺ {output}\n❯"
         prefix = "" if provider_owned else "• "
         return f"› user\n{prefix}{output}\n›"
 
@@ -1234,12 +1240,14 @@ class TestInBandProviderError:
         ("provider", "output"),
         (
             ("codex", "API Error: 404 is the response for an unknown route."),
-            ("claude_code", "API Error: 404 is the response for an unknown route."),
             ("codex", "Unknown model: a model type absent from the serializer registry."),
         ),
     )
     def test_provider_shaped_assistant_text_completes(self, provider, output):
-        """The same words are an answer when the adapter renders them as assistant output."""
+        """Provider-shaped words are an answer only when the adapter renders them as
+        assistant output.  Codex renders an answer on ``•``, so this text is a reply;
+        Claude Code marks its API errors on the SAME bullet, so the Claude case is a
+        refusal instead (covered by ``test_real_cli_error_chrome_fails_the_step``)."""
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
             output=output
         )
@@ -1257,6 +1265,45 @@ class TestInBandProviderError:
 
         assert result.status == TerminalStatus.COMPLETED
         assert result.last_message == output
+
+    @pytest.mark.parametrize(
+        ("provider", "output"),
+        (
+            (
+                "claude_code",
+                "API Error: 400 invalid params, messages.4.content.1.tool_use.input: "
+                "Input should be a valid dictionary (2013)",
+            ),
+            ("codex", '■ unexpected status 400 Bad Request: {"code":20015}'),
+            (
+                "codex",
+                '⚠️ stream error: unexpected status 400 Bad Request: {"code":20015}; '
+                "retrying 1/5 in 196ms…",
+            ),
+        ),
+    )
+    def test_real_cli_error_chrome_fails_the_step(self, provider, output):
+        """The reviewed regression, at the ``run_agent_step`` seam: Claude Code marks
+        the API error on its ``⏺``/``●`` response bullet and Codex uses its own
+        ``■`` / ``⚠️ stream error`` chrome, so both must FAIL the step rather than
+        return the refusal as the answer."""
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+            output=output
+        )
+        with (
+            create,
+            send,
+            delete,
+            get_output,
+            exit_cli,
+            wait,
+            status,
+            self._context_patch(provider, output, provider_owned=True),
+        ):
+            with pytest.raises(StepExecutionError) as excinfo:
+                asyncio.run(run_agent_step(provider, "dev", "x"))
+
+        assert excinfo.value.kind == "provider_error"
 
     def test_a_stale_provider_error_does_not_taint_a_later_assistant_answer(self):
         """Multi-turn stability: ownership is resolved against the latest matching turn."""

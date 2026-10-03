@@ -13,8 +13,11 @@ today's behaviour; a false one would fail a step that really answered. So five
 independent guards: only the FIRST non-empty line is tested; any output longer than
 :data:`PROVIDER_ERROR_MAX_CHARS` is out of scope; each row applies only to the
 provider adapters that emit that chrome; the pattern must consume the WHOLE line;
-and raw adapter context, when available, must show provider chrome rather than an
-assistant-marker-owned rendering. Common words, status-code values, or error
+and raw adapter context, when available, must show a provider-NATIVE error signal
+rather than an ordinary marker-owned answer. That signal is the CLI's own error
+chrome where it has one (Codex's ``■`` / ``⚠️ stream error``), and the error text
+itself for an adapter that renders errors on its response bullet (Claude Code's
+``⏺ API Error: 400 …``). Common words, status-code values, or error
 vocabulary in another adapter's ordinary prose are therefore answers, not refusals.
 The runtime-side companion of
 :meth:`BaseProvider.get_error_message`, which asks the same question of a provider
@@ -72,6 +75,15 @@ _ROWS = (
         r"API ?Error(?:\s*\([^)\n]{1,80}\))?\s*:\s*[45]\d{2}\b.*",
         ("claude_code", "codex"),
     ),
+    # Codex transport chrome. An upstream refusal is rendered on Codex's OWN error
+    # bullet -- ``■`` (openai/codex#6933) or the ``⚠️ stream error:`` retry banner
+    # (openai/codex#4270) -- never on the ``•`` assistant marker. Require a
+    # structured 4xx/5xx status after the chrome.
+    (
+        "unexpected_status",
+        r"(?:\u25a0|\u26a0\ufe0f?)\s*(?:stream error\s*:\s*)?unexpected status\s+[45]\d{2}\b.*",
+        ("codex",),
+    ),
     # Model rejection, with or without the leading HTTP status code.
     (
         "model_not_available",
@@ -124,14 +136,23 @@ _SIGNATURES: Tuple[ProviderErrorSignature, ...] = tuple(
 
 # A rendered assistant message owns its text. These are the same adapter-owned
 # patterns used to extract that message, not a second private copy that can drift:
-# the same first line is a provider refusal when it appears as bare chrome and is
-# an ordinary answer when it follows the adapter's response marker.
+# for most adapters the same first line is a provider refusal when it appears as bare
+# chrome and is an ordinary answer when it follows the adapter's response marker. See
+# ``_ERRORS_RENDERED_ON_ASSISTANT_MARKER`` for the exceptions.
 _ASSISTANT_MARKERS = {
     "claude_code": EXTRACTION_RESPONSE_PATTERN,
     "codex": re.compile(ASSISTANT_PREFIX_PATTERN, re.I),
     "kimi_cli": KIMI_RESPONSE_MARKER_RE,
     "mcode": ASSISTANT_MARKER_PATTERN,
 }
+
+# Adapters whose CLI renders its OWN in-band errors on the same response bullet it
+# uses for assistant text. Claude Code prints ``⏺ API Error: 400 …`` /
+# ``● API Error: 400 …`` (anthropics/claude-code#91345, #92316), so a response-marker
+# occurrence there is provider chrome, not proof of an answer: the provider-native
+# signal is the ``API Error: <status>`` text itself. Every other adapter keeps the
+# opposite reading, where a marker-owned occurrence is an ordinary answer.
+_ERRORS_RENDERED_ON_ASSISTANT_MARKER = frozenset({"claude_code"})
 _CONTEXT_UNSET: Any = object()
 
 
@@ -151,9 +172,11 @@ def _provider_owns_error_line(provider: str, error_line: str, script_output: str
     The final-message extractor intentionally removes the provider's response marker,
     so the extracted text alone cannot establish ownership.  Walk the raw script
     capture and let the LAST occurrence decide: an unmarked occurrence is provider
-    chrome, while one owned by the adapter's assistant marker is an answer.  No
-    marker vocabulary for a provider means no positive ownership evidence, so the
-    caller must not classify it.
+    chrome, and an occurrence owned by the adapter's assistant marker is normally an
+    answer.  For the adapters in :data:`_ERRORS_RENDERED_ON_ASSISTANT_MARKER`, however,
+    the CLI renders its own errors on that marker, so it counts as provider chrome
+    too.  No marker vocabulary for a provider means no positive ownership evidence,
+    so the caller must not classify it.
     """
     marker = _ASSISTANT_MARKERS.get(provider)
     if marker is None:
@@ -161,6 +184,7 @@ def _provider_owns_error_line(provider: str, error_line: str, script_output: str
         # must degrade to the pre-#638 behaviour rather than trust the text alone.
         return False
 
+    errors_on_marker = provider in _ERRORS_RENDERED_ON_ASSISTANT_MARKER
     found = False
     assistant_owned = False
     for raw_line in strip_terminal_escapes(script_output).splitlines():
@@ -169,7 +193,9 @@ def _provider_owns_error_line(provider: str, error_line: str, script_output: str
         if match is not None:
             if line[match.end() :].strip() == error_line:
                 found = True
-                assistant_owned = True
+                # On an adapter that renders errors on the response bullet the marker
+                # is provider chrome, not proof that the model authored the line.
+                assistant_owned = not errors_on_marker
             continue
         if line == error_line:
             found = True
@@ -191,7 +217,7 @@ def classify_provider_error(
     eligible signature. Each signature consumes the whole first non-empty line.
 
     ``script_output`` is the raw adapter capture when production has it.  Supplying
-    it activates the ownership check above; omitting it preserves the historical
+    it activates the provider-native ownership check above; omitting it preserves the historical
     two-argument API for callers that already hold independently-trusted chrome.
     The RAW text is never rewritten or truncated here.
     """

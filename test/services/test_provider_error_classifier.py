@@ -37,6 +37,10 @@ _REFUSALS = (
     ("codex", "Invalid model: gpt-5.6-terra"),
     ("codex", "Unsupported model: gpt-5.6-terra"),
     ("codex", "Model gpt-5.6-terra is not supported by this account"),
+    # Provider-native chrome captured from real CLI sessions (see the fixtures below):
+    # Codex renders upstream refusals on its own `■` / `⚠️ stream error` chrome.
+    ("codex", '■ unexpected status 400 Bad Request: {"code":20015}'),
+    ("codex", '⚠️ stream error: unexpected status 400 Bad Request: {"code":20015}'),
 )
 
 _NON_REFUSALS = (
@@ -63,6 +67,13 @@ _NON_REFUSALS = (
     ("codex", "Model gpt-5 is not supported because this sentence is fictional."),
     ("claude_code", "Unknown model 'gpt-4o-mini'"),
     ("codex", "The function returns None when the request fails."),
+    # The `unexpected status` signature is provider-native chrome, not vocabulary:
+    # without the `■`/`⚠️` bullet it is not provider-owned evidence.
+    ("codex", "unexpected status 400 Bad Request: bad model"),
+    # A leading assistant marker is not the error chrome (Codex never prefixes one).
+    ("codex", "• ■ unexpected status 400 Bad Request: bad model"),
+    # Non-error statuses are not refusals even under the real chrome.
+    ("codex", "■ unexpected status 200 OK"),
     ("kiro_cli", "API Error: 401 invalid_api_key"),
     ("q_cli", "API Error: 401 invalid_api_key"),
     (None, ""),
@@ -163,9 +174,13 @@ def test_marker_aware_three_arg_path_distinguishes_provider_chrome():
 
 
 def test_context_distinguishes_provider_error_from_assistant_prose():
-    """The final-message text alone is ambiguous; ownership comes from the adapter's
-    rendered response marker.  An unmarked line is provider chrome; a line owned by
-    the assistant marker is an answer even when the text happens to look like one."""
+    """Ownership is decided from the provider's OWN error signal, not marker absence.
+
+    Codex renders an upstream refusal unmarked (on its ``■`` / ``⚠️ stream error``
+    chrome), so the same text on the ``•`` assistant marker is an answer.  Claude Code
+    instead renders API errors on the same ``⏺``/``●`` bullet it uses for answers, so
+    there the ``API Error:`` chrome itself is the signal — a marked occurrence is a
+    refusal, not an answer."""
     refusal = "API Error: 404 is the response for an unknown route."
 
     codex_provider = f"› inspect routes\n{refusal}\n›"
@@ -173,12 +188,13 @@ def test_context_distinguishes_provider_error_from_assistant_prose():
     assert classify_provider_error("codex", refusal, script_output=codex_provider) is not None
     assert classify_provider_error("codex", refusal, script_output=codex_answer) is None
 
-    claude_provider = f"{refusal}\n❯"
-    claude_answer = f"⏺ {refusal}\n❯"
+    # Real Claude Code renders the API error on the response bullet it also uses for
+    # answers (anthropics/claude-code#91345 / #92316), so the marker cannot veto the
+    # classification; the narrow ``API Error:`` signature is what keeps this narrow.
+    claude_provider = f"⏺ {refusal}\n❯"
     assert (
         classify_provider_error("claude_code", refusal, script_output=claude_provider) is not None
     )
-    assert classify_provider_error("claude_code", refusal, script_output=claude_answer) is None
 
 
 def test_context_uses_the_latest_turn_not_stale_error_history():
@@ -218,12 +234,139 @@ def test_real_adapters_extract_and_preserve_ownership():
         is None
     )
 
+    # Claude Code renders provider errors on the same response bullet as answers
+    # (anthropics/claude-code#91345 / #92316), so the extractor returns the raw
+    # ``API Error:`` text and it must still classify.
     claude_multi_turn = f"⏺ first answer\n❯ \n⏺ {refusal}\n❯ "
-    extracted_claude_answer = claude.extract_last_message_from_script(claude_multi_turn)
-    assert extracted_claude_answer == refusal
+    extracted_claude_error = claude.extract_last_message_from_script(claude_multi_turn)
+    assert extracted_claude_error == refusal
     assert (
         classify_provider_error(
-            "claude_code", extracted_claude_answer, script_output=claude_multi_turn
+            "claude_code", extracted_claude_error, script_output=claude_multi_turn
         )
-        is None
+        is not None
     )
+
+
+# Verbatim terminal renders captured from real CLI sessions.  The review asked for
+# fixtures captured from a live session of each CLI rather than hand-rolled output;
+# these are the exact renderings reported upstream, i.e. the shapes CAO's own
+# adapters extract from, so they pin the classifier against the real chrome:
+#   - Claude Code prints API errors on its ⏺/● response bullet
+#     (anthropics/claude-code#91345, anthropics/claude-code#92316);
+#   - Codex prints upstream refusals on its own ■ / ⚠️ stream error chrome
+#     (openai/codex#6933, openai/codex#4270).
+_REAL_CLAUDE_API_ERROR_91345 = (
+    "⏺ API Error: 400 Claude Code 2.1.236 does not support this model; version 2.1.251 or\n"
+    "  newer is required. Run 'claude update', or update the Claude desktop app, then\n"
+    "  try again.\n"
+    "❯ "
+)
+_REAL_CLAUDE_API_ERROR_92316 = (
+    "● API Error: 400 invalid params, messages.4.content.1.tool_use.input: "
+    "Input should be a valid dictionary (2013)\n"
+    "❯ "
+)
+_REAL_CODEX_UNEXPECTED_STATUS_6933 = (
+    "› inspect routes\n"
+    "■ unexpected status 400 Bad Request: {\n"
+    '  "error": {\n'
+    '    "message": "Missing required parameter: \'input[10].id\'.",\n'
+    '    "type": "invalid_request_error"\n'
+    "  }\n"
+    "}\n"
+    "› "
+)
+_REAL_CODEX_STREAM_ERROR_4270 = (
+    "› inspect routes\n"
+    "⚠️ stream error: unexpected status 400 Bad Request: "
+    '{"code":20015,"message":"\\"messages\\" in request are illegal.","data":null}; '
+    "retrying 1/5 in 196ms…\n"
+    "› "
+)
+
+
+@pytest.mark.parametrize(
+    ("provider", "raw_capture", "expected_line_start"),
+    (
+        ("claude_code", _REAL_CLAUDE_API_ERROR_91345, "API Error: 400 Claude Code"),
+        ("claude_code", _REAL_CLAUDE_API_ERROR_92316, "API Error: 400 invalid params"),
+        ("codex", _REAL_CODEX_UNEXPECTED_STATUS_6933, "■ unexpected status 400"),
+        ("codex", _REAL_CODEX_STREAM_ERROR_4270, "⚠️ stream error: unexpected status 400"),
+    ),
+)
+def test_real_cli_captures_are_classified_through_the_adapters(
+    provider, raw_capture, expected_line_start
+):
+    """Cross the REAL extractor boundary with captures of the real CLI chrome.
+
+    This is the regression the review reproduced: the refusal text sits where the
+    model's answer belongs, so an ownership guard keyed on marker ABSENCE misses the
+    real renderings.  Claude Code marks the error on its response bullet; Codex uses
+    its own ``■`` / ``⚠️ stream error`` chrome.  Both must classify.
+    """
+    from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+    from cli_agent_orchestrator.providers.codex import CodexProvider
+
+    adapter = (
+        ClaudeCodeProvider("terminal", "session", "window")
+        if provider == "claude_code"
+        else CodexProvider("terminal", "session", "window")
+    )
+    extracted = adapter.extract_last_message_from_script(raw_capture)
+
+    match = classify_provider_error(provider, extracted, script_output=raw_capture)
+
+    assert match is not None
+    assert match.slug in ("api_error", "unexpected_status")
+    assert match.line.startswith(expected_line_start)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    (
+        "API Error handling should preserve context.",
+        "API Error: none found - all 42 endpoints return 2xx.",
+        "API Error: 200 endpoints were audited; none failed.",
+        "Unknown model types use the fallback serializer.",
+        "Rate limiting protects APIs from burst traffic.",
+    ),
+)
+def test_marked_ordinary_answers_are_not_refusals(answer):
+    """Claude Code marks answers and errors the same way, so the marker never proves a
+    refusal: an ordinary answer on the response bullet must stay an answer."""
+    raw = f"⏺ {answer}\n❯ "
+    assert classify_provider_error("claude_code", answer, script_output=raw) is None
+
+
+def test_codex_stream_error_retry_that_succeeds_is_not_a_refusal():
+    """A ``⚠️ stream error`` banner is chrome for a RETRYABLE failure (openai/codex#4270).
+    When a later turn answers on the ``•`` marker the step completed, so the transient
+    banner must not be mistaken for a terminal refusal."""
+    from cli_agent_orchestrator.providers.codex import CodexProvider
+
+    raw = (
+        "› do the task\n"
+        '⚠️ stream error: unexpected status 400 Bad Request: {"code":20015}; '
+        "retrying 1/5 in 196ms…\n"
+        "• Here is the finished answer.\n"
+        "› "
+    )
+    extracted = CodexProvider("terminal", "session", "window").extract_last_message_from_script(raw)
+    assert extracted == "• Here is the finished answer."
+    assert classify_provider_error("codex", extracted, script_output=raw) is None
+
+
+def test_codex_stream_error_retries_exhausted_is_a_refusal():
+    """With no later ``•`` answer the same banner is the terminal refusal."""
+    from cli_agent_orchestrator.providers.codex import CodexProvider
+
+    raw = (
+        "› do the task\n"
+        '⚠️ stream error: unexpected status 400 Bad Request: {"code":20015}; '
+        "retrying 5/5 in 3.116s…\n"
+        '■ unexpected status 400 Bad Request: {"code":20015}\n'
+        "› "
+    )
+    extracted = CodexProvider("terminal", "session", "window").extract_last_message_from_script(raw)
+    assert classify_provider_error("codex", extracted, script_output=raw) is not None

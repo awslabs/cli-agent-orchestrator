@@ -4153,10 +4153,13 @@ async def _record_job_state(job_id: Optional[str], state: str, **fields: Any) ->
         "Failure contract: a non-2xx body is a structured object "
         "`{message, kind, terminal_id}`. **`kind` is authoritative** — "
         '`kind="error"` means the worker CRASHED (terminal reached ERROR), '
-        '`kind="timeout"` means it RAN LONG. The HTTP status mirrors `kind` '
-        "(502 = crashed, 504 = ran long) for transport-layer consumers, but a "
-        "caller MUST branch on `kind`, not the status code. `terminal_id` names "
-        "the live terminal (read it as a field; never regex-scrape `message`)."
+        '`kind="timeout"` means it RAN LONG, and `kind="provider_error"` means '
+        "the provider refused in band (the CLI exited cleanly with an error "
+        "payload sitting where the answer belongs). The HTTP status mirrors "
+        "`kind` (502 = crashed or provider refusal, 504 = ran long) for "
+        "transport-layer consumers, but a caller MUST branch on `kind`, not the "
+        "status code. `terminal_id` names the live terminal (read it as a field; "
+        "never regex-scrape `message`)."
     ),
 )
 async def run_step(
@@ -4180,13 +4183,17 @@ async def run_step(
     out, not just inferable from the handler):
 
     - A failed step returns a STRUCTURED detail object
-      ``{"message": str, "kind": "timeout"|"error", "terminal_id": str|None}``.
+      ``{"message": str, "kind": "timeout"|"error"|"provider_error",
+      "terminal_id": str|None}``.
     - ``kind`` is the AUTHORITATIVE discriminator. ``kind="error"`` => the worker
       CRASHED (the terminal reached ``TerminalStatus.ERROR``); ``kind="timeout"``
-      => the worker RAN LONG (readiness/completion wait elapsed). The HTTP status
-      is derived FROM ``kind`` (``error`` -> 502 Bad Gateway, ``timeout`` -> 504
-      Gateway Timeout) as a convenience for transport-layer consumers — a client
-      that can read the body MUST branch on ``kind``, not the status code.
+      => the worker RAN LONG (readiness/completion wait elapsed);
+      ``kind="provider_error"`` => the provider refused in band (issue #638: a
+      model/API error printed where the model's answer belongs). The HTTP status
+      is derived FROM ``kind`` (``error``/``provider_error`` -> 502 Bad Gateway,
+      ``timeout`` -> 504 Gateway Timeout) as a convenience for transport-layer
+      consumers — a client that can read the body MUST branch on ``kind``, not the
+      status code.
     - ``terminal_id`` names the live terminal the step ran on (when known) so a
       caller can report/clean it up without regex-scraping ``message``.
     - A bad terminal reference -> 404; any other failure -> 500 (plain-string
