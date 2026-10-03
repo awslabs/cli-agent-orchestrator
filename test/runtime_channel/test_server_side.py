@@ -1381,8 +1381,18 @@ class TestLaunchMetadata:
         assert database.get_terminal_metadata("beef0001")["engine"] == "kas"
 
     def test_a_remote_launch_keeps_the_model_its_runtime_launched_with(self, http, start_runtime):
-        claude = {**LAUNCHED, "provider": "claude_code", "model": "model-x", "model_honored": True}
-        start_runtime(script=lambda command: {"terminal": dict(claude)})
+        from cli_agent_orchestrator.runtime_channel.bridge import _jsonable
+
+        # What the runtime's get_terminal returns, through cao-bridge's own
+        # serializer: a scripted result alone would bypass what it drops.
+        local = {
+            **LAUNCHED,
+            "provider": "claude_code",
+            "status": TerminalStatus.IDLE,
+            "model": "model-x",
+            "model_honored": True,
+        }
+        start_runtime(script=lambda command: {"terminal": _jsonable(local)})
         response = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
         assert response.status_code == 201, response.text
         row = database.get_terminal_metadata("beef0001")

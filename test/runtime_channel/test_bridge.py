@@ -85,6 +85,8 @@ class TestExecute:
                 "agent_profile": "developer",
                 "allowed_tools": ["@builtin"],
                 "status": TerminalStatus.IDLE,
+                "model": "model-x",
+                "model_honored": True,
                 "last_active": "not sent",
             },
         )
@@ -107,6 +109,9 @@ class TestExecute:
                 "allowed_tools": ["@builtin"],
                 "status": "idle",
                 "engine": None,  # set for kiro_cli launches (v2 or kas)
+                # The launch model and whether the provider applies it (#856).
+                "model": "model-x",
+                "model_honored": True,
             }
         }
 
