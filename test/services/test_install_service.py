@@ -197,7 +197,7 @@ class TestInstallAgent:
     ) -> None:
         """Bare names resolved from the local store should be converted for Copilot.
 
-        File-path handling moved to the CLI (``_copy_local_profile_to_store``)
+        File-path handling moved to the CLI (``_read_local_profile``)
         so the service only ever sees the bare stem. That's the shape under
         test here.
         """
@@ -294,20 +294,25 @@ class TestInstallAgent:
         assert "Cedar" in result.message
         assert not (install_paths["kiro_dir"] / "kas-agent.json").exists()
 
-    def test_install_sets_env_vars_before_profile_loading(
+    def test_install_resolves_env_vars_before_parsing_and_persists_them_after_the_guard(
         self, install_paths: dict[str, Path]
     ) -> None:
-        """Env vars should be persisted before profile parsing begins."""
+        """``--env`` values take part in resolution (so a ``${VAR}`` in the profile,
+        including its ``name:``, is seen resolved) but are persisted to the managed
+        .env file only once the ownership guard has accepted the install, so a
+        refused install leaves no env side effect (round-7 review of #493)."""
         local_profile = install_paths["local_store_dir"] / "developer.md"
         local_profile.write_text(_profile_text(name="developer"), encoding="utf-8")
 
         call_order: list[str] = []
+        parsed_texts: list[str] = []
 
         def track_set_env_var(key: str, value: str) -> None:
             call_order.append(f"set:{key}")
 
         def track_parse_agent_profile_text(resolved_text: str, profile_name: str):
             call_order.append(f"parse:{profile_name}")
+            parsed_texts.append(resolved_text)
             from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
 
             return parse_agent_profile_text(resolved_text, profile_name)
@@ -325,7 +330,9 @@ class TestInstallAgent:
             result = install_agent("developer", "claude_code", {"API_TOKEN": "secret-token"})
 
         assert result.success is True
-        assert call_order == ["set:API_TOKEN", "parse:developer"]
+        assert call_order == ["parse:developer", "set:API_TOKEN"]
+        assert "secret-token" in parsed_texts[0]
+        assert "${API_TOKEN}" not in parsed_texts[0]
 
     def test_install_returns_failure_for_invalid_source(
         self, install_paths: dict[str, Path]

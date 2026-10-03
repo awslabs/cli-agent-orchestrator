@@ -68,6 +68,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- refuse an install that would silently overwrite another profile's installed
+  artifacts, instead of letting the second install clobber the first (#493).
+  Two profile files can carry the same `name:`; the second used to replace the
+  first's shared context copy — which the installed agent reads at runtime —
+  and, for OpenCode, its agent file and `opencode.json` section. The check now
+  runs for **every provider** and reads ownership from the context copy at its
+  destination path rather than from profile discovery, so it holds when the
+  installed copy is shadowed by a same-named file elsewhere, when its `name:`
+  holds a `${VAR}` placeholder, when the directory is disabled, or when
+  discovery fails. A profile that merely *could* produce the same id — a
+  packaged built-in, or a local-store profile that has not been installed —
+  does not block the install, since it owns no file yet; installing a profile
+  whose `name:` matches one of the built-ins therefore still works, and the
+  same profile still installs for any number of providers. The provider's own
+  agent file (OpenCode `<id>.md`, Kiro `<name>.json`, Copilot `<name>.agent.md`)
+  is probed as well, under that directory's case rules, so a context directory
+  on case-sensitive storage can no longer let `Agent` silently replace an
+  installed `agent` in a case-folding provider directory, and a provider file
+  left behind by a hand-deleted context copy is refused rather than overwritten.
+  That last rule holds for every provider's file, not only the one being
+  installed for: while any provider's agent file for a name has no context
+  record vouching for it, no install may create a new record for that name
+  (which would otherwise let a later install for that provider replace the
+  file on the strength of the new record). A provider directory whose listing
+  cannot be read is refused as an I/O fault rather than treated as confirming
+  the requested spelling. And an import — a local `.md` file or a URL — is
+  written to the local store only after this check and the context writer's
+  own checks (a symlink or directory at the context target, a provenance marker
+  that does not read back, an unwritable context directory) accept it, so a
+  refused import leaves the previously stored profile of that stem
+  byte-identical; `--env` values are likewise persisted only after that point.
+  Plugin install and uninstall, which replay `cao install` for every installed
+  agent to re-materialise MCP servers, now enumerate the configured
+  `agents.dirs.cao_installed` directory (and the default) instead of only the
+  default, and replay each agent from the stem its provenance marker records
+  rather than from its resolved name, so agents whose `name:` differs from
+  their filename are refreshed instead of refused by the new check.
+
+- the shared context copy is written to the configured installed-profile
+  directory (`agents.dirs.cao_installed`), the directory profile discovery, the
+  collision guard and the Copilot skill-injection probe read, instead of always
+  the default path; a `~`, trailing-slash or symlinked spelling of the default
+  still counts as the default, and with the default setting nothing moves. A
+  blank or relative value under `agents.dirs` — for `cao_installed` or any
+  other key — is ignored with a warning wherever CAO opens directories (profile
+  discovery, the lookup behind `cao install <name>`, memory promotion's profile
+  lookup, the context-copy writer),
+  rather than making the server's working directory a profile source or the
+  write root; the Settings API still reports the value as saved. With an
+  override configured, the guard and the probe also consult the default
+  directory, so ownership records written there by earlier releases stay in
+  force (#493).
+
 - **Workflow script run-step refusals now retain their typed reason in run
   records.** When a structured HTTP error includes a string `detail.kind`,
   `ShimHTTPError` includes that kind and its optional message in the exception
@@ -396,6 +449,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of spinning on a cancelled task and never exiting (#823)
 
 ### Changed
+
+- record the originating install handle in each shared context copy's frontmatter
+  (`x-cao-source-stem`), so a reinstall can tell its own prior copy apart from a
+  different profile that resolves to the same OpenCode agent id. The key is
+  CAO-written: a source profile that declares it at the top level of its
+  frontmatter has that line replaced by CAO's own at install, and the install is
+  refused when the result does not read back as the marker CAO wrote. Only the
+  top-level entry is touched — a literal scalar whose text mentions the key, or
+  a nested mapping key spelled the same way, is left as written — and
+  frontmatter written as a single flow mapping (`{name: x, ...}`) receives the
+  marker as an entry inside the braces, so valid flow-style profiles install
+  (#493).
+
+- write the shared context copy atomically, via a same-directory temporary file
+  and `os.replace`, so an interrupted install cannot leave a truncated copy; a new
+  copy is created `0o600` regardless of umask, and a reinstall preserves the
+  existing file's mode (#493).
 
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped
   silently, so `limit=500` keeps working rather than becoming a 422.
