@@ -315,6 +315,65 @@ class TestTerminalCreationWithWorkingDirectory:
 
         assert response.status_code == 400
 
+    @pytest.mark.parametrize(
+        "endpoint,target",
+        [
+            ("/sessions", "session_service.create_session"),
+            ("/sessions/test-session/terminals", "terminal_service.create_terminal"),
+        ],
+    )
+    def test_kiro_policy_path_refusal_is_a_bad_request(
+        self, client, tmp_path, monkeypatch, endpoint, target
+    ):
+        from cli_agent_orchestrator.services.install_service import installed_kiro_tools
+
+        directory = tmp_path / "agents"
+        directory.mkdir()
+        outside = tmp_path / "outside.json"
+        outside.write_text('{"tools": ["*"]}')
+        (directory / "analyst.json").symlink_to(outside)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.install_service.KIRO_AGENTS_DIR", directory
+        )
+
+        def check_policy(**kwargs):
+            return installed_kiro_tools(kwargs["agent_profile"])
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch(
+                f"cli_agent_orchestrator.api.main.{target}", new=AsyncMock(side_effect=check_policy)
+            ),
+        ):
+            response = client.post(
+                endpoint, params={"provider": "kiro_cli", "agent_profile": "analyst"}
+            )
+
+        assert response.status_code == 400, response.text
+        assert "beneath the agent directory" in response.json()["detail"]
+
+    def test_create_terminal_missing_session_remains_404(self, client):
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.terminal_service.create_terminal",
+                new=AsyncMock(side_effect=ValueError("Session not found")),
+            ),
+        ):
+            response = client.post(
+                "/sessions/missing/terminals",
+                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+            )
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Session not found"
+
     def test_create_terminal_rejects_malformed_caller_id(self, client):
         """caller_id is validated against the TerminalId pattern — IDs arrive
         from agent input and must not be persisted unvalidated."""

@@ -18,6 +18,7 @@ from cli_agent_orchestrator.models.terminal import (
 from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.services.agent_step import StepExecutionError
+from cli_agent_orchestrator.services.install_service import KiroAgentPathError
 from cli_agent_orchestrator.services.worktree_service import WorktreeError
 
 _RUN_STEP = "cli_agent_orchestrator.api.main.run_agent_step"
@@ -158,10 +159,21 @@ class TestRunStepDurabilityErrorBranches:
         [
             (OutputExtractionError("no response marker in scrollback"), 500, "response marker"),
             (KiroPhase0KASError(False), 400, "not available in Phase 0"),
+            (
+                KiroAgentPathError("Kiro agent file must resolve beneath the agent directory"),
+                400,
+                "beneath the agent directory",
+            ),
             (TerminalLimitError("node is at CAO_MAX_TERMINALS"), 429, "CAO_MAX_TERMINALS"),
             (WorktreeError("not a git repository"), 400, "not a git repository"),
         ],
-        ids=["output_extraction", "kiro_phase0_kas", "terminal_limit", "worktree"],
+        ids=[
+            "output_extraction",
+            "kiro_phase0_kas",
+            "kiro_agent_path",
+            "terminal_limit",
+            "worktree",
+        ],
     )
     def test_settled_failure_arms_persist_error_state(self, client, exc, expected_status, fragment):
         calls = []

@@ -113,6 +113,15 @@ Kiro CLI shows `Allow this action? [y/n/t]:` prompts for sensitive operations (f
 
 Enforcement is install-time: changing a profile's policy takes effect at the next `cao install`, and `--allowed-tools` or a role override at launch does not change the installed agent. A profile installed before CAO wrote `tools` still carries `["*"]`; `cao launch` and the server warn when they find one, and treat that terminal as unrestricted until it is reinstalled. See [Tool Restrictions](tool-restrictions.md).
 
+Legacy-policy inspection preserves the `/` and `\` to `__` filename mapping
+and resolves both the agent directory and the target before reading. The target
+must be beneath that directory: an escaping symlink or a link to the directory
+itself raises an error rather than being treated as a missing policy. Symlinks
+to files within the agent directory and a symlinked agent directory remain
+supported. These policy-path refusals return HTTP 400 from session creation,
+terminal creation, and run-step requests; missing sessions or terminals retain
+their HTTP 404 responses.
+
 ## Configuration
 
 ### Agent Profile (Required)
