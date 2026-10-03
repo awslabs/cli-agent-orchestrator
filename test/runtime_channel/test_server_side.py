@@ -935,8 +935,8 @@ class TestRemoteSessionTeardown:
         deleted = []
         monkeypatch.setattr(
             terminal_service,
-            "delete_terminal",
-            lambda terminal_id, registry=None: deleted.append(terminal_id) or True,
+            "delete_remote_terminal",
+            lambda terminal_id: deleted.append(terminal_id) or (True, True),
         )
         result = session_service.delete_session("cao-swap1")
         assert deleted == [], "the replacement local terminal is not this delete's"
@@ -963,11 +963,12 @@ class TestRemoteSessionTeardown:
         monkeypatch.setattr(session_service, "session_is_remote", racing)
         deleted = []
 
-        def delete(terminal_id, registry=None):
+        def delete(terminal_id):
             deleted.append(terminal_id)
-            return database.delete_terminal(terminal_id)
+            dropped = database.delete_terminal(terminal_id)
+            return dropped, dropped
 
-        monkeypatch.setattr(terminal_service, "delete_terminal", delete)
+        monkeypatch.setattr(terminal_service, "delete_remote_terminal", delete)
         result = session_service.delete_session("cao-race1")
         assert deleted == ["abcd0001"], "its terminal must be deleted in its runtime"
         assert result["deleted"] == ["cao-race1"]
@@ -979,13 +980,14 @@ class TestRemoteSessionTeardown:
         started, release = threading.Event(), threading.Event()
         calls = []
 
-        def delete(terminal_id, registry=None):
+        def delete(terminal_id):
             calls.append(terminal_id)
             started.set()
             release.wait(5)
-            return database.delete_terminal(terminal_id)
+            dropped = database.delete_terminal(terminal_id)
+            return dropped, dropped
 
-        monkeypatch.setattr(terminal_service, "delete_terminal", delete)
+        monkeypatch.setattr(terminal_service, "delete_remote_terminal", delete)
         results = []
 
         def run():
@@ -1018,12 +1020,13 @@ class TestRemoteSessionTeardown:
         _remote_row("abcd0001", "rt-1", session="cao-remote1")
         _remote_row("abcd0002", "rt-1", session="cao-remote1")
 
-        def delete(terminal_id, registry=None):
+        def delete(terminal_id):
             if terminal_id == "abcd0002":
-                return False  # its runtime deferred the cleanup
-            return database.delete_terminal(terminal_id)
+                return False, False  # its runtime deferred the cleanup
+            dropped = database.delete_terminal(terminal_id)
+            return dropped, dropped
 
-        monkeypatch.setattr(terminal_service, "delete_terminal", delete)
+        monkeypatch.setattr(terminal_service, "delete_remote_terminal", delete)
         registry = MagicMock()
         registry.dispatch = AsyncMock()
         result = session_service.delete_session("cao-remote1", registry=registry)
@@ -1032,6 +1035,30 @@ class TestRemoteSessionTeardown:
         events = [c.args[0] for c in registry.dispatch.await_args_list]
         assert events == ["post_kill_terminal"]
         assert registry.dispatch.await_args_list[0].args[1].terminal_id == "abcd0001"
+
+    def test_a_terminal_a_concurrent_delete_removed_counts_as_deleted_once(
+        self, http, start_runtime, monkeypatch
+    ):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from cli_agent_orchestrator.services import session_service
+
+        # A DELETE /terminals of the session's terminal drops its row (and
+        # dispatches its event) while this session delete waits on the runtime.
+        _remote_row("abcd0001", "rt-1", session="cao-remote1")
+        start_runtime(script=_answer)
+        real_delete_row = terminal_service.delete_terminal_row
+
+        def the_other_request_won(terminal_id, *args, **kwargs):
+            assert real_delete_row(terminal_id, *args, **kwargs)
+            return False
+
+        monkeypatch.setattr(terminal_service, "delete_terminal_row", the_other_request_won)
+        registry = MagicMock()
+        registry.dispatch = AsyncMock()
+        result = session_service.delete_session("cao-remote1", registry=registry)
+        assert result == {"deleted": ["cao-remote1"], "errors": []}
+        assert registry.dispatch.await_args_list == [], "the other delete owns its event"
 
 
 class TestRemoteSession:
@@ -1412,6 +1439,25 @@ class TestFailedRowDelete:
         # The row survives for a retry, and so does its routing.
         assert database.get_terminal_metadata("abcd1234") is not None
         assert runtimes_of(http)["rt-1"]["terminals"] == ["abcd1234"]
+
+    def test_a_delete_whose_row_a_concurrent_delete_dropped_succeeds(
+        self, http, start_runtime, monkeypatch
+    ):
+        # Two DELETEs of one terminal: the runtime confirms both (the second as
+        # absent), and the other request drops the central row first.
+        _remote_row("abcd1234", "rt-1")
+        start_runtime(script=_answer, statuses={"abcd1234": TerminalStatus.IDLE})
+        real_delete_row = terminal_service.delete_terminal_row
+
+        def the_other_request_won(terminal_id, *args, **kwargs):
+            assert real_delete_row(terminal_id, *args, **kwargs)
+            return False  # this request's own drop then finds no row
+
+        monkeypatch.setattr(terminal_service, "delete_terminal_row", the_other_request_won)
+        response = http.delete("/terminals/abcd1234")
+        assert response.status_code == 200, response.text
+        assert database.get_terminal_metadata("abcd1234") is None
+        assert runtimes_of(http)["rt-1"]["terminals"] == []
 
 
 class TestLaunchIdRace:
