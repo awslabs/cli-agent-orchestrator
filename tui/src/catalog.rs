@@ -1022,7 +1022,7 @@ fn entry(id: CommandId) -> Command {
             id: CommandId::DecisionsOff,
             parent: Some("decisions"),
             leaf_name: "off",
-            summary: "Halt all points and drain external requests.",
+            summary: "Halt all points and wait for external requests to finish.",
             policy: Policy::Hidden, // Local operator controls have no HTTP route.
             params: &[],
             handoff_reason: None,
@@ -1031,7 +1031,7 @@ fn entry(id: CommandId) -> Command {
             id: CommandId::DecisionsEnable,
             parent: Some("decisions"),
             leaf_name: "enable",
-            summary: "Run an installed decider's interactive consent command.",
+            summary: "Run an installed decider's consent command in an interactive terminal.",
             policy: Policy::Hidden, // Local operator controls have no HTTP route.
             params: &[],
             handoff_reason: None,
