@@ -640,6 +640,7 @@ class TestInstallSkillCatalogBaking:
     @pytest.fixture
     def install_workspace(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
         """Patch install and skills paths into a temp workspace."""
+        monkeypatch.setattr("cli_agent_orchestrator.utils.env.load_env_vars", lambda: {})
         local_store_dir = tmp_path / "agent-store"
         context_dir = tmp_path / "agent-context"
         kiro_dir = tmp_path / "kiro"

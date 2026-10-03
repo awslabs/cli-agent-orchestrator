@@ -15,6 +15,7 @@ from cli_agent_orchestrator.constants import (
     COPILOT_AGENTS_DIR,
 )
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.utils import agent_profiles
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
 from cli_agent_orchestrator.utils.path_validation import (
@@ -69,6 +70,10 @@ def refresh_agent_md_prompt(md_path: Path, profile: AgentProfile) -> bool:
     interleave temp files or publish a half-written file — the same failure
     mode fixed for the memory plugins in ``plugins/builtin/*_memory.py``.
     """
+    for name in (profile.name, md_path.name.removesuffix(".agent.md")):
+        if agent_profiles.routes_to_ephemeral_store(name):
+            raise FileNotFoundError(f"Reserved ephemeral profile name: {name}")
+
     if not md_path.exists():
         return False
 

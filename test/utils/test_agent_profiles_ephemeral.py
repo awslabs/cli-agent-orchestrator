@@ -55,7 +55,8 @@ def test_missing_never_falls_back(stores):
         profiles.load_agent_profile(NAME)
 
 
-def test_served_store_determines_source(stores):
+def test_served_store_determines_source(stores, monkeypatch):
+    monkeypatch.setattr(profiles, "resolve_env_vars", lambda content: content)
     local, live = stores
     (live / f"{NAME}.md").write_text(DOCUMENT)
     profile, source = profiles.load_launch_profile(NAME)
@@ -72,6 +73,7 @@ def test_served_store_determines_source(stores):
     "consumer", ["launch", "source", "raw", "warning", "list", "post", "put", "create", "handoff"]
 )
 def test_all_consumers_use_module_predicate(stores, monkeypatch, caplog, consumer):
+    monkeypatch.setattr(profiles, "resolve_env_vars", lambda content: content)
     from cli_agent_orchestrator.api.main import app
     from cli_agent_orchestrator.services import profile_store
     from cli_agent_orchestrator.utils import orchestration

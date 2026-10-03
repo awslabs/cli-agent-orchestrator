@@ -43,6 +43,7 @@ from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.opencode_agent import OpenCodeAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.services.profile_store import write_profile
+from cli_agent_orchestrator.utils import agent_profiles
 from cli_agent_orchestrator.utils.agent_profiles import (
     _read_agent_profile_source,
     parse_agent_profile_text,
@@ -1561,6 +1562,9 @@ def install_agent(
             source_kind = "name"
             incoming = profile_content
 
+        if agent_profiles.routes_to_ephemeral_store(agent_name):
+            raise FileNotFoundError(f"Reserved ephemeral profile name: {agent_name}")
+
         raw_content = incoming if incoming is not None else _read_agent_profile_source(agent_name)
         # ``--env`` values take part in resolution now but are persisted to the
         # managed .env file only after the ownership guard has accepted the
@@ -1572,6 +1576,9 @@ def install_agent(
             else resolve_env_vars(raw_content)
         )
         profile = parse_agent_profile_text(resolved_content, agent_name)
+        # The source stem and frontmatter name can differ; both reach installed sinks.
+        if agent_profiles.routes_to_ephemeral_store(profile.name):
+            raise FileNotFoundError(f"Reserved ephemeral profile name: {profile.name}")
 
         # No explicit provider — honour the profile's frontmatter ``provider:``
         # key, mirroring resolve_provider() on the launch/handoff paths. Bogus
