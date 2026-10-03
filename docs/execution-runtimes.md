@@ -73,7 +73,11 @@ remote terminal, since its working directory is in the runtime.
 
 If the server cannot record a launched terminal, it sends `delete` to the
 runtime. The `500` it then returns says whether the agent may still be
-running. The server also deletes any terminal a runtime runs that it has no
+running. That delete goes only to the runtime instance that ran the launch:
+if another instance has connected under the same runtime id meanwhile, the
+outcome is reported as unconfirmed, and the terminal is deleted when the
+original instance reconnects and lists it. The server also deletes any
+terminal a runtime runs that it has no
 record of: one listed in the runtime's hello, or one in a launch result that
 arrives after the launch timed out or its connection dropped. It retries that
 delete until the runtime confirms it, or the connection ends (the runtime's

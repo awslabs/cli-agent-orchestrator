@@ -98,6 +98,9 @@ class RuntimeConnection:
         self.closed = False
         # Set once the hello exchange is over; commands are refused until then.
         self.active = False
+        # The terminals this connection's hello listed: the ones the instance
+        # behind it runs. Another instance could claim the same runtime id.
+        self.listed: Set[str] = set()
 
     async def call(
         self,
