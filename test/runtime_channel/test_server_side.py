@@ -1167,6 +1167,11 @@ class TestInvalidLaunchResults:
             {"id": "beef0001"},  # fields missing
             {**LAUNCHED, "provider": "not-a-provider"},
             {**LAUNCHED, "session_name": 7},
+            # Names local creation refuses: the session APIs could not address them.
+            {**LAUNCHED, "session_name": "cao:bad"},
+            {**LAUNCHED, "session_name": "-cao-beef"},
+            {**LAUNCHED, "name": "developer.beef"},
+            {**LAUNCHED, "name": "-developer"},
         ],
     )
     def test_an_invalid_result_naming_a_terminal_is_undone(self, http, start_runtime, terminal):
