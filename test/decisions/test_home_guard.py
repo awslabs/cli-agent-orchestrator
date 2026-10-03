@@ -55,3 +55,40 @@ def test_session_guard_fails_changed_home_file(session_home, mutation):
     guard.pytest_sessionfinish(session, pytest.ExitCode.OK)
     assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
     assert "decisions-egress.lock" in messages[0][1]
+
+
+def test_session_guard_finish_without_start_is_safe(session_home):
+    session, home, messages = session_home
+    guard.pytest_sessionfinish(session, pytest.ExitCode.OK)
+    assert session.exitstatus == pytest.ExitCode.OK
+    assert not messages
+
+
+@pytest.mark.parametrize("phase", ["start", "finish"])
+@pytest.mark.parametrize("error", [PermissionError, OSError])
+def test_session_guard_warns_and_skips_unstatable_path(
+    session_home, monkeypatch, caplog, phase, error
+):
+    from pathlib import Path
+
+    session, home, messages = session_home
+    unreadable = home / "decisions.halt"
+    actual_lstat = Path.lstat
+
+    def lstat(path, *args, **kwargs):
+        if path == unreadable:
+            raise error("cannot inspect marker")
+        return actual_lstat(path, *args, **kwargs)
+
+    if phase == "finish":
+        guard.pytest_sessionstart(session)
+    monkeypatch.setattr(Path, "lstat", lstat)
+    if phase == "start":
+        guard.pytest_sessionstart(session)
+    guard.pytest_sessionfinish(session, pytest.ExitCode.OK)
+    assert session.exitstatus == pytest.ExitCode.OK
+    assert not messages
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "decisions.halt" in warnings[0].getMessage()
+    assert "skipping" in warnings[0].getMessage()

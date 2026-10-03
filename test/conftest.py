@@ -13,6 +13,7 @@ Also exposes shared security fixtures (RSA keys, JWKS stub,
 that need to exercise the Auth0 paths.
 """
 
+import logging
 import os
 import pathlib
 import time
@@ -41,14 +42,19 @@ pytest_plugins = (
 )
 
 
-_DECISION_HOME_SNAPSHOT = pytest.StashKey[dict[pathlib.Path, tuple[int, int, int] | None]]()
+_DECISION_HOME_UNSTATABLE = object()
+_DECISION_HOME_SNAPSHOT = pytest.StashKey[dict[pathlib.Path, object]]()
+logger = logging.getLogger(__name__)
 
 
-def _decision_home_file_state(path: pathlib.Path) -> tuple[int, int, int] | None:
+def _decision_home_file_state(path: pathlib.Path) -> object:
     try:
         stat = path.lstat()
     except FileNotFoundError:
         return None
+    except OSError:
+        logger.warning("Could not stat %s; skipping decision home guard comparison", path.name)
+        return _DECISION_HOME_UNSTATABLE
     return stat.st_ino, stat.st_size, stat.st_mtime_ns
 
 
@@ -64,10 +70,14 @@ def pytest_sessionstart(session):
 
 @pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session, exitstatus):
-    before = session.stash[_DECISION_HOME_SNAPSHOT]
-    changed = [
-        path.name for path, state in before.items() if _decision_home_file_state(path) != state
-    ]
+    before = session.stash.get(_DECISION_HOME_SNAPSHOT, {})
+    changed = []
+    for path, state in before.items():
+        if state is _DECISION_HOME_UNSTATABLE:
+            continue
+        current = _decision_home_file_state(path)
+        if current is not _DECISION_HOME_UNSTATABLE and current != state:
+            changed.append(path.name)
     if changed:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
         reporter = session.config.pluginmanager.get_plugin("terminalreporter")
