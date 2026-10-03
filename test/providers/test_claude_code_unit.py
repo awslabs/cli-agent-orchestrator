@@ -2778,3 +2778,215 @@ class TestBlocksOrchestratedInputWhileWaitingUserAnswer:
     def test_blocks_orchestrated_input_while_waiting_user_answer(self):
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.blocks_orchestrated_input_while_waiting_user_answer is True
+
+
+class TestClaudeCodeTurnEndGate:
+    """GH #865: a dispatched turn is finished only when the end-of-turn summary is
+    the newest line above the input box.
+
+    The newest TUI draws no spinner while response text streams. A settled
+    mid-answer frame is therefore "boxed ❯ + response text above it", which the
+    detectors read as COMPLETED (a ⏺/● still on screen) or IDLE (every marker
+    scrolled off). Both verdicts end ``run_step``/``handoff`` and tear the worker
+    down mid-answer. The ``claude_code_865_*`` fixtures are real
+    ``tmux capture-pane -p`` frames (180x50) from Claude Code 2.1.288, scrubbed.
+    """
+
+    FIXTURES = Path(__file__).parent / "fixtures"
+
+    @classmethod
+    def _frame(cls, name: str) -> list:
+        return (
+            (cls.FIXTURES / f"claude_code_865_{name}.txt").read_text(encoding="utf-8").split("\n")
+        )
+
+    @staticmethod
+    def _dispatched(mock_backend) -> ClaudeCodeProvider:
+        """A provider that has had one task sent to it (what every run-step/handoff
+        worker looks like after ``send_input``). The snapshot history is empty so the
+        #407 tail-hash guard cannot be the reason a frame reads PROCESSING."""
+        mock_backend.get_native_status.return_value = None
+        mock_backend.supports_event_inbox.return_value = False
+        mock_backend.get_history.return_value = ""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider.mark_input_received()
+        return provider
+
+    @staticmethod
+    def _both(provider: ClaudeCodeProvider, lines: list) -> tuple:
+        """(rendered-screen verdict, raw-stream verdict) for one frame. The
+        run-step wait polls the RAW detector while the cached status is PROCESSING,
+        even with the pyte path on, so both must agree."""
+        return (
+            provider.get_status_from_screen(lines),
+            provider.get_status("\n".join(lines)),
+        )
+
+    # --- real frames -------------------------------------------------------
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_streaming_with_markers_on_screen_is_processing(self, mock_backend):
+        """Mid-answer, ⏺ BEGIN and the PREVIOUS turn's summary still on screen,
+        no spinner. Read COMPLETED before the fix. The old summary sits above the
+        new prompt echo, not directly above the box, so it does not count."""
+        provider = self._dispatched(mock_backend)
+        frame = self._frame("streaming_markers_visible")
+        assert self._both(provider, frame) == (TerminalStatus.PROCESSING, TerminalStatus.PROCESSING)
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_streaming_with_markers_scrolled_off_is_processing(self, mock_backend):
+        """Mid-answer, every ⏺ scrolled off the top: only list text above the box.
+        Read IDLE before the fix, which ``_wait_for_completion`` accepts as done
+        after three polls once it has seen PROCESSING."""
+        provider = self._dispatched(mock_backend)
+        frame = self._frame("streaming_markers_scrolled_off")
+        assert self._both(provider, frame) == (TerminalStatus.PROCESSING, TerminalStatus.PROCESSING)
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_stop_hooks_spinner_is_processing(self, mock_backend):
+        """The spinner returns for the Stop hooks at the end of the answer."""
+        provider = self._dispatched(mock_backend)
+        frame = self._frame("stop_hooks_spinner")
+        assert self._both(provider, frame) == (TerminalStatus.PROCESSING, TerminalStatus.PROCESSING)
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_turn_ended_summary_above_box_is_completed(self, mock_backend):
+        """'✻ Baked for 12s · done 12:27 PM' painted directly above the box."""
+        provider = self._dispatched(mock_backend)
+        frame = self._frame("turn_ended")
+        assert self._both(provider, frame) == (TerminalStatus.COMPLETED, TerminalStatus.COMPLETED)
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_short_turn_summary_above_blank_rows_is_completed(self, mock_backend):
+        """A one-word reply: the TUI pins the box to the bottom and leaves ~30
+        empty rows between the summary and the box. The walk must skip them."""
+        provider = self._dispatched(mock_backend)
+        frame = self._frame("short_turn_ended")
+        assert self._both(provider, frame) == (TerminalStatus.COMPLETED, TerminalStatus.COMPLETED)
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_api_retry_notice_above_box_is_processing(self, mock_backend):
+        """'✻ Connection refused … · Retrying in 14s · attempt 6/10' above the box,
+        no spinner, no summary: the turn is still running. Read IDLE before the fix."""
+        provider = self._dispatched(mock_backend)
+        frame = self._frame("api_retry")
+        assert self._both(provider, frame) == (TerminalStatus.PROCESSING, TerminalStatus.PROCESSING)
+
+    def test_startup_frame_before_any_dispatch_is_idle(self):
+        """Pre-dispatch the gate is inert: the settled startup frame still reads
+        IDLE so ``initialize()`` and the readiness wait are unchanged."""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        frame = self._frame("startup_idle")
+        assert provider.get_status_from_screen(frame) == TerminalStatus.IDLE
+
+    def test_streaming_frame_before_any_dispatch_keeps_legacy_verdict(self):
+        """Documents the boundary: with no dispatch recorded, the mid-answer frame
+        keeps its pre-fix COMPLETED reading. The gate keys off ``_task_dispatched``."""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        frame = self._frame("streaming_markers_visible")
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+
+    # --- shape of the summary line ----------------------------------------
+
+    @staticmethod
+    def _boxed(*above: str) -> str:
+        rail = "─" * 40
+        return "\n".join(above) + "\n" + rail + "\n❯ \n" + rail + "\n"
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_interim_summary_followed_by_new_marker_is_processing(self, mock_backend):
+        """Claude prints interim summaries mid-turn ('✻ Pondered for 8s') and keeps
+        working; the newer ● line below it means the turn has not ended."""
+        provider = self._dispatched(mock_backend)
+        output = self._boxed("● Looking into it", "✻ Pondered for 8s", "● Calling cao-mcp-server")
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_markdown_bullet_with_for_is_not_a_summary(self, mock_backend):
+        """A streamed '* … for …' bullet directly above the box must not count:
+        the · and * glyphs only qualify with a full 'for Ns' duration."""
+        provider = self._dispatched(mock_backend)
+        output = self._boxed("● Options:", "* Use Redis for caching")
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_summary_on_dot_glyph_with_duration_is_completed(self, mock_backend):
+        """The TUI cycles the glyph; a summary that lands on · still ends the turn."""
+        provider = self._dispatched(mock_backend)
+        output = self._boxed("● def greet(name):", "· Worked for 3s")
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_summary_above_tip_and_effort_footer_is_completed(self, mock_backend):
+        """Chrome between the summary and the box (⎿ tip, own-line effort footer,
+        tmux hint) is skipped by the walk."""
+        provider = self._dispatched(mock_backend)
+        output = self._boxed(
+            "● done",
+            "✻ Worked for 4s · done 12:26 PM",
+            "  ⎿  Tip: Use git worktrees to run multiple Claude sessions in parallel.",
+            "● high · /effort",
+            "            tmux detected · scroll with PgUp/PgDn · or add 'set -g mouse on' to ~/.tmux.conf",
+        )
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    # --- grace valve --------------------------------------------------------
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_unchanged_frame_without_summary_falls_back_after_grace(self, mock_backend):
+        """An end state the gate does not know (here an operator's '/compact', which
+        paints no summary) is PROCESSING while the frame keeps changing and for
+        TURN_END_GRACE_S after it stops, then falls back to the legacy verdict."""
+        from cli_agent_orchestrator.providers.claude_code import TURN_END_GRACE_S
+
+        provider = self._dispatched(mock_backend)
+        clock = {"now": 1000.0}
+        provider._turn_gate_clock = lambda: clock["now"]
+        frame = self._boxed(
+            "● PONG",
+            "✻ Brewed for 4s · done 12:32 PM",
+            "❯ /compact",
+            "  ⎿  Compacted (ctrl+o to see full summary)",
+        ).split("\n")
+
+        assert self._both(provider, frame) == (TerminalStatus.PROCESSING, TerminalStatus.PROCESSING)
+        clock["now"] += TURN_END_GRACE_S - 0.1
+        assert self._both(provider, frame) == (TerminalStatus.PROCESSING, TerminalStatus.PROCESSING)
+        clock["now"] += 0.2
+        assert self._both(provider, frame) == (TerminalStatus.COMPLETED, TerminalStatus.COMPLETED)
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_frame_change_restarts_grace(self, mock_backend):
+        """A streaming answer repaints sub-second; each change restarts the clock,
+        so the valve never fires while output is still arriving."""
+        from cli_agent_orchestrator.providers.claude_code import TURN_END_GRACE_S
+
+        provider = self._dispatched(mock_backend)
+        clock = {"now": 1000.0}
+        provider._turn_gate_clock = lambda: clock["now"]
+        for i in range(5):
+            frame = self._boxed("⏺ BEGIN", *[f"  {n} element" for n in range(1, i + 2)]).split("\n")
+            assert provider.get_status_from_screen(frame) == TerminalStatus.PROCESSING
+            clock["now"] += TURN_END_GRACE_S - 1.0
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_new_dispatch_resets_grace(self, mock_backend):
+        """A new send starts a new turn: the previous gated frame's clock is dropped."""
+        from cli_agent_orchestrator.providers.claude_code import TURN_END_GRACE_S
+
+        provider = self._dispatched(mock_backend)
+        clock = {"now": 1000.0}
+        provider._turn_gate_clock = lambda: clock["now"]
+        frame = self._boxed("⏺ partial answer").split("\n")
+        assert provider.get_status_from_screen(frame) == TerminalStatus.PROCESSING
+        clock["now"] += TURN_END_GRACE_S - 1.0
+        provider.mark_input_received()
+        clock["now"] += 2.0
+        assert provider.get_status_from_screen(frame) == TerminalStatus.PROCESSING
+
+    def test_claude_opts_into_screen_status_poll(self):
+        """The poll re-check must read Claude from the composite: the raw rolling
+        window never holds this TUI's input box mid-turn."""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.supports_screen_detection is True
+        assert provider.supports_screen_status_poll is True
