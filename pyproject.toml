@@ -44,7 +44,8 @@ dependencies = [
     "apscheduler>=3.10.4",
     "sqlalchemy>=2.0.0",
     "uvicorn[standard]>=0.24.0",
-    "websockets>=12.0",
+    # >=14.0: cao-bridge uses the asyncio client (websockets.asyncio.client).
+    "websockets>=14.0",
     # Upper bound: libtmux 0.53.1 rewrote `neo.parse_output` to zip a fixed
     # 125-name format list against each row's values with `strict=True`, so any
     # row short of 125 values (a pane/session vanishing mid-listing, or a
@@ -130,6 +131,7 @@ otel = [
 "cao-server" = "cli_agent_orchestrator.api.main:main"
 "cao-mcp-server" = "cli_agent_orchestrator.mcp_server.server:main"
 "cao-ops-mcp-server" = "cli_agent_orchestrator.ops_mcp_server.server:main"
+"cao-bridge" = "cli_agent_orchestrator.runtime_channel.bridge:main"
 
 [project.entry-points."cao.plugins"]
 claude_code_memory = "cli_agent_orchestrator.plugins.builtin.claude_code_memory:ClaudeCodeMemoryPlugin"

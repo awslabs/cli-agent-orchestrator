@@ -356,7 +356,8 @@ class TestTerminalOperations:
         mock_session.__exit__ = MagicMock(return_value=False)
 
         mock_query = MagicMock()
-        mock_query.filter.return_value.delete.return_value = 2
+        # Session name, then local rows only: a remote row is never swept (#745).
+        mock_query.filter.return_value.filter.return_value.delete.return_value = 2
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 
@@ -908,7 +909,9 @@ class TestListSiblingsByGroupPrefix:
         assert by_id["sib-1"]["group"] == ["tenant_1", "project_5", "folder_1"]
         assert by_id["sib-1"]["metadata"] == {"task": "reviewing"}
         assert by_id["sib-2"]["metadata"] is None
-        assert all(set(sibling) == {"id", "group", "metadata"} for sibling in result)
+        # runtime_id is internal: list_siblings reads status through it and
+        # drops it from the reported shape (#745).
+        assert all(set(sibling) == {"id", "group", "metadata", "runtime_id"} for sibling in result)
 
     def test_caller_excluded_from_its_own_results(self, test_db):
         self._seed(
@@ -1678,8 +1681,10 @@ class TestFlowOperations:
         mock_session.__exit__ = MagicMock(return_value=False)
         mock_session_class.return_value = mock_session
 
-        # Receiver terminal exists
-        mock_session.query.return_value.filter.return_value.first.return_value = MagicMock()
+        # Receiver terminal exists, and runs on this server (no runtime_id)
+        mock_session.query.return_value.filter.return_value.first.return_value = MagicMock(
+            runtime_id=None
+        )
 
         # Setup mock to update message attributes on refresh
         def mock_refresh(msg):

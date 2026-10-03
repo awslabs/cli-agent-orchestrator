@@ -27,6 +27,7 @@ from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
+from cli_agent_orchestrator.models.terminal import LocalExecutionDisabledError
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,14 @@ class TerminalModel(Base):
     # distinguish the old rows from failures that belong to the CURRENT live
     # session. NULL is reserved for rows created before this column existed.
     session_incarnation_id = Column(String, nullable=True)
+    # The execution runtime this terminal runs in (#745); NULL for a terminal on
+    # this host. Its own column rather than a ``metadata`` key, because an agent
+    # can rewrite its metadata but must not be able to move its own placement.
+    # Local sweeps (the retention sweep in cleanup_service, the stale-row
+    # cleanup in delete_terminals_by_session) skip rows that have one: they
+    # cannot stop the agent in its runtime, and the row is the only handle on
+    # it. Such a row goes only through delete_terminal, which routes there.
+    runtime_id = Column(String, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
 
     # ORDERING CONTRACT: the two session-scoped reads -- ``list_terminals_by_session``
@@ -1857,6 +1866,19 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN model_honored BOOLEAN")
             conn.commit()
             logger.info("Migration: added model_honored column to terminals table")
+        if "runtime_id" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN runtime_id TEXT")
+            conn.commit()
+            logger.info("Migration: added runtime_id column to terminals table")
+        # For a runtime's terminal list and session_is_remote (#745).
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_terminals_runtime_id ON terminals (runtime_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_terminals_session_runtime "
+            "ON terminals (tmux_session, runtime_id)"
+        )
+        conn.commit()
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -1883,6 +1905,7 @@ def create_terminal(
     new_session_incarnation: bool = False,
     model: Optional[str] = None,
     model_honored: Optional[bool] = None,
+    runtime_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
 
@@ -1939,6 +1962,7 @@ def create_terminal(
             metadata_json=_json.dumps(metadata) if metadata else None,
             deferred_init_external_owner=bool(deferred_init_external_owner),
             session_incarnation_id=session_incarnation_id,
+            runtime_id=runtime_id,
         )
         db.add(terminal)
         if idempotency_key:
@@ -1981,6 +2005,7 @@ def create_terminal(
             "deferred_init_external_owner": bool(deferred_init_external_owner),
             "deferred_init_runtime_reclaimed": False,
             "session_incarnation_id": session_incarnation_id,
+            "runtime_id": terminal.runtime_id,
         }
 
 
@@ -2094,6 +2119,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
                 getattr(terminal, "deferred_init_runtime_reclaimed", False)
             ),
             "session_incarnation_id": getattr(terminal, "session_incarnation_id", None),
+            "runtime_id": terminal.runtime_id,
             "last_active": terminal.last_active,
         }
 
@@ -2242,12 +2268,14 @@ def list_pending_deferred_init_external_owner_terminal_ids() -> List[str]:
 
 
 def count_runtime_allocated_terminals() -> int:
-    """Count terminal rows that still represent live/allocated provider runtime."""
+    """Count terminal rows that still represent live/allocated provider runtime
+    on this host. A terminal in an execution runtime (#745) uses none of it."""
 
     with SessionLocal() as db:
         return int(
             db.query(TerminalModel)
             .filter(TerminalModel.deferred_init_runtime_reclaimed.is_(False))
+            .filter(TerminalModel.runtime_id.is_(None))
             .count()
         )
 
@@ -2368,6 +2396,9 @@ def list_siblings_by_group_prefix(
                         "id": row.id,
                         "group": sibling_group,
                         "metadata": metadata,
+                        # Where its status comes from (#745); list_siblings
+                        # drops it from the reported shape.
+                        "runtime_id": row.runtime_id,
                     }
                 )
         return siblings
@@ -2578,9 +2609,30 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
                 "session_incarnation_id": t.session_incarnation_id,
                 "last_active": t.last_active,
+                # Set for a terminal that runs in an execution runtime (#745).
+                "runtime_id": t.runtime_id,
             }
             for t in terminals
         ]
+
+
+def list_terminal_ids_on_runtime(runtime_id: str) -> List[str]:
+    """Ids of the terminals whose central row places them on ``runtime_id``."""
+    with SessionLocal() as db:
+        rows = db.query(TerminalModel.id).filter(TerminalModel.runtime_id == runtime_id).all()
+        return [row[0] for row in rows]
+
+
+def session_is_remote(tmux_session: str) -> bool:
+    """True when a terminal of ``tmux_session`` runs in an execution runtime (#745)."""
+    with SessionLocal() as db:
+        row = (
+            db.query(TerminalModel.id)
+            .filter(TerminalModel.tmux_session == tmux_session)
+            .filter(TerminalModel.runtime_id.isnot(None))
+            .first()
+        )
+        return row is not None
 
 
 def list_pending_receiver_ids_by_provider(provider: str) -> List[str]:
@@ -2637,11 +2689,38 @@ def delete_terminal(terminal_id: str) -> bool:
         return deleted > 0
 
 
-def delete_terminals_by_session(tmux_session: str) -> int:
-    """Delete all terminals in a session."""
+def delete_terminal_routed_by(terminal_id: str, runtime_id: str, tmux_session: str) -> bool:
+    """Delete the row of ``terminal_id`` only while it names ``runtime_id`` and ``tmux_session``.
+
+    A remote delete waits on its runtime (#745). Meanwhile another delete may
+    drop the row and a new launch reuse the 8-hex id; only the row the delete
+    was routed by may go, never its replacement.
+    """
     with SessionLocal() as db:
         deleted = (
-            db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).delete()
+            db.query(TerminalModel)
+            .filter(TerminalModel.id == terminal_id)
+            .filter(TerminalModel.runtime_id == runtime_id)
+            .filter(TerminalModel.tmux_session == tmux_session)
+            .delete()
+        )
+        db.commit()
+        return deleted > 0
+
+
+def delete_terminals_by_session(tmux_session: str) -> int:
+    """Delete all local terminals in a session.
+
+    Its callers sweep rows a dead local tmux session left behind. A row whose
+    terminal runs in an execution runtime (#745) is never such a row, so it is
+    kept even when the names match.
+    """
+    with SessionLocal() as db:
+        deleted = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.tmux_session == tmux_session)
+            .filter(TerminalModel.runtime_id.is_(None))
+            .delete()
         )
         db.commit()
         return deleted
@@ -2673,10 +2752,19 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
 
     Raises:
         ValueError: If the receiver terminal does not exist.
+        LocalExecutionDisabledError: If the receiver runs in an execution
+            runtime (#745): inbox delivery watches this server's own panes, so
+            the message would stay pending for good.
     """
     with SessionLocal() as db:
-        if not db.query(TerminalModel).filter(TerminalModel.id == receiver_id).first():
+        receiver = db.query(TerminalModel).filter(TerminalModel.id == receiver_id).first()
+        if not receiver:
             raise ValueError(f"Terminal '{receiver_id}' not found")
+        if receiver.runtime_id is not None:
+            raise LocalExecutionDisabledError(
+                f"terminal {receiver_id} runs in an execution runtime; inbox messages "
+                "are delivered to terminals on this server only"
+            )
         inbox_msg = InboxModel(
             sender_id=sender_id,
             receiver_id=receiver_id,

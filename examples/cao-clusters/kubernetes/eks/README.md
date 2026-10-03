@@ -15,6 +15,10 @@ authenticated memory and callback requests through the broker's narrow gateway;
 the broker forwards only those five routes to the supervisor, so project memory
 has one durable owner without exposing the supervisor control API.
 
+To keep every agent out of the server instead, with long-lived execution
+runtimes that one `cao-server` drives, see
+[`../remote-runtime/`](../remote-runtime/README.md).
+
 Three properties are worth understanding before changing anything here.
 
 **The broker is a security boundary, not a convenience.** It is the only pod in

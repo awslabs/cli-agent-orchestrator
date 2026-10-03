@@ -106,7 +106,12 @@ from cli_agent_orchestrator.models.memory import (
     MemoryScopeId,
     MemoryType,
 )
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalId, TerminalLimitError
+from cli_agent_orchestrator.models.terminal import (
+    LocalExecutionDisabledError,
+    Terminal,
+    TerminalId,
+    TerminalLimitError,
+)
 from cli_agent_orchestrator.models.workflow import RecoveryPolicy
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
@@ -114,6 +119,9 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilityError,
     KiroPhase0KASError,
 )
+from cli_agent_orchestrator.runtime_channel.registry import RemoteRuntimeError
+from cli_agent_orchestrator.runtime_channel.server import router as runtime_channel_router
+from cli_agent_orchestrator.runtime_channel.token import runtime_token
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
     SCOPE_READ,
@@ -1286,6 +1294,10 @@ def _sweep_workflow_runs_at_startup() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
+    # Read the runtime-channel token (#745) first, so it leaves this process's
+    # environment before anything below can start a child process: plugin
+    # setup, a tmux server, and so any agent pane.
+    runtime_token()
     logger.info("Starting CLI Agent Orchestrator server...")
     setup_logging()
     # Scrub credential query params (``?access_token=`` / ``?ticket=``) from
@@ -1501,6 +1513,8 @@ app = FastAPI(
     version=SERVER_VERSION,
     lifespan=lifespan,
 )
+# Execution runtimes (#745): WS /runtime/channel and the /runtimes routes.
+app.include_router(runtime_channel_router)
 
 # Methods whose request could change server state. The Origin check only
 # guards these — GET/HEAD/OPTIONS stay open (reads leak nothing stateful, and
@@ -3408,6 +3422,8 @@ async def create_session(
         # Exception and NOT ValueError precisely so this arm cannot be
         # shadowed by the 400 arm below -- which, note, sits FIRST here.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except LocalExecutionDisabledError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except TerminalLimitError as e:
         # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
         # rejection, not a bad request: the caller should retry on another node.
@@ -3510,6 +3526,8 @@ async def delete_session(
         return {"success": True, **result}
     except HTTPException:
         raise
+    except RemoteRuntimeError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -3669,6 +3687,8 @@ async def create_terminal_in_session(
         # a rejected engine is a bad request, not a missing resource. Matches
         # POST /sessions, which already returns 400 for the identical failure.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except LocalExecutionDisabledError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except TerminalLimitError as e:
         # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
         # rejection, not a bad request or a missing session: the caller should
@@ -3916,8 +3936,12 @@ async def get_terminal_working_directory(
 ) -> WorkingDirectoryResponse:
     """Get the current working directory of a terminal's pane."""
     try:
-        working_directory = terminal_service.get_working_directory(terminal_id)
+        working_directory = await asyncio.to_thread(
+            terminal_service.get_working_directory, terminal_id
+        )
         return WorkingDirectoryResponse(working_directory=working_directory)
+    except RemoteRuntimeError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -3950,6 +3974,8 @@ async def send_terminal_input(
             orchestration_type=orchestration_type,
         )
         return {"success": success}
+    except RemoteRuntimeError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except TerminalInputBlockedError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
@@ -3981,6 +4007,8 @@ async def send_terminal_key(
         # Blocking tmux send-keys — off the loop.
         success = await asyncio.to_thread(terminal_service.send_special_key, terminal_id, key)
         return {"success": success}
+    except RemoteRuntimeError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -4002,6 +4030,8 @@ async def get_terminal_output(
         # transcript can't stall the whole server.
         output = await asyncio.to_thread(terminal_service.get_output, terminal_id, mode)
         return TerminalOutputResponse(output=output, mode=mode)
+    except RemoteRuntimeError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except OutputExtractionError as e:
         # Ordered before the ValueError arm it subclasses, same as run_step: the
         # terminal and the route both resolved -- only the response marker was
@@ -4054,6 +4084,9 @@ async def get_terminal_output_range(
     except ValueError as e:
         # Malformed id / negative offset — a caller error, not a missing log.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except LocalExecutionDisabledError as e:
+        # A remote terminal (#745): its log is in its runtime, not here.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except Exception as e:
         # A genuine file I/O failure surfaced by read_output_range (BR-4): report
         # it rather than masking a real fault as empty output.
@@ -4073,6 +4106,8 @@ async def exit_terminal(
         # Blocking tmux I/O — off the loop.
         await asyncio.to_thread(terminal_service.exit_terminal_cli, terminal_id)
         return {"success": True}
+    except RemoteRuntimeError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -4601,6 +4636,10 @@ async def run_step(
         _settle_step(None, str(e))
         await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    except LocalExecutionDisabledError as e:
+        _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except TerminalLimitError as e:
         # The node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — surfaced
         # as 429 so a step scheduler can retry on a different node instead of
@@ -7154,6 +7193,8 @@ async def delete_terminal(
         return {"success": True}
     except HTTPException:
         raise
+    except RemoteRuntimeError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -7180,6 +7221,10 @@ async def create_inbox_message_endpoint(
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except LocalExecutionDisabledError as e:
+        # The receiver runs in an execution runtime (#745): refused, not
+        # acknowledged and left pending.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -7393,6 +7438,10 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     metadata = get_terminal_metadata(terminal_id)
     if not metadata:
         await websocket.close(code=4004, reason="Terminal not found")
+        return
+    if metadata.get("runtime_id"):
+        # Its pane lives in an execution runtime; attach is not relayed yet (#745).
+        await websocket.close(code=4004, reason="Terminal runs in an execution runtime")
         return
 
     # Defence-in-depth: re-validate the names from the DB before they

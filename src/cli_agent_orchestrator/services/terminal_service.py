@@ -47,6 +47,7 @@ from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam
 )
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam: creation no longer bulk-deletes with this helper,; but older integrations/tests patch the imported symbol while exercising; create_terminal. Keep the name exported from this module until that seam; can be retired separately.
+    delete_terminal_routed_by,
     delete_terminals_by_session,
     get_idempotency_record,
     get_session_incarnation,
@@ -55,6 +56,7 @@ from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam
     list_pending_deferred_init_external_owner_terminal_ids,
     list_siblings_by_group_prefix,
     list_terminals_by_session,
+    session_is_remote,
     update_last_active,
     update_terminal_deferred_init_external_owner,
     update_terminal_deferred_init_failure,
@@ -78,6 +80,7 @@ from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
+    LocalExecutionDisabledError,
     Terminal,
     TerminalInputBlockedError,
     TerminalLimitError,
@@ -101,6 +104,8 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     requested_kiro_capabilities,
 )
 from cli_agent_orchestrator.providers.manager import ProviderManager, provider_manager
+from cli_agent_orchestrator.runtime_channel.protocol import CommandType
+from cli_agent_orchestrator.runtime_channel.registry import COMMAND_TIMEOUT
 from cli_agent_orchestrator.services import worktree_service
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
     elastic_worker_gateway_headers,
@@ -939,6 +944,17 @@ def _request_fingerprint(
     ).hexdigest()
 
 
+#: Set to 0 on a central cao-server whose agents all run in execution runtimes
+#: (#745): every local terminal creation is then refused.
+LOCAL_EXECUTION_ENV = "CAO_LOCAL_EXECUTION"
+
+
+def local_execution_enabled() -> bool:
+    """False when this process is set to run no agents itself."""
+    value = os.environ.get(LOCAL_EXECUTION_ENV, "")
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -1297,8 +1313,17 @@ async def create_terminal(
     # cleanly with nothing to roll back. Best-effort under concurrency: two
     # simultaneous creates can both pass the check (no cross-request lock),
     # which is acceptable for the cap's placement-guard purpose.
+    # After the idempotency HIT above (a retry recovers a terminal made before
+    # local execution was switched off), before anything is allocated.
+    if not local_execution_enabled():
+        raise LocalExecutionDisabledError(
+            f"this cao-server runs no agents ({LOCAL_EXECUTION_ENV}=0); launch in an "
+            "execution runtime with POST /runtimes/{runtime_id}/terminals"
+        )
     max_terminals = get_max_terminals()
     if max_terminals is not None:
+        # Terminals on this host only: one running in an execution runtime
+        # (#745) uses none of this node's capacity (see the count).
         tracked_count = count_runtime_allocated_terminals()
         if tracked_count >= max_terminals:
             raise TerminalLimitError(
@@ -1557,6 +1582,13 @@ async def create_terminal(
             nonlocal deferred_delete_on_failure, session_incarnation_id
             assert session_name is not None  # narrowed by the caller
             with session_lifecycle_lock(session_name):
+                # A session whose terminals run in an execution runtime (#745)
+                # is not this server's to create or extend. Checked under the
+                # lock a remote launch records its session under.
+                if session_is_remote(session_name):
+                    raise ValueError(
+                        f"Session '{session_name}' already exists in an execution runtime"
+                    )
                 if new_session:
                     # Prevent duplicate sessions
                     if get_backend().session_exists(session_name):
@@ -3087,6 +3119,47 @@ def _schedule_deferred_init(
     return task
 
 
+#: A remote delete's deadline: the runtime's teardown can include the provider's
+#: own cleanup, so it gets longer than an ordinary command.
+REMOTE_DELETE_TIMEOUT = 2 * COMMAND_TIMEOUT
+
+
+def _call_runtime(
+    metadata: Dict,
+    command_type: CommandType,
+    payload: Dict,
+    timeout: float = COMMAND_TIMEOUT,
+) -> Dict:
+    """Run one operation for a terminal that lives in an execution runtime (#745).
+
+    Anything that touches the terminal's tmux runs in that runtime, beside its
+    pane; the server never falls back to its own tmux for a remote terminal.
+    Raises a ``RemoteRuntimeError`` subclass when the runtime is not connected
+    (503), does not answer within ``timeout`` (504 once the command was sent,
+    503 if it never was), or reports a failure (502).
+    """
+    from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+    return runtime_registry.call_blocking(
+        metadata["runtime_id"],
+        command_type,
+        payload,
+        terminal_id=metadata["id"],
+        timeout=timeout,
+    )
+
+
+def _current_status(terminal_id: str, runtime_id: Optional[str]) -> TerminalStatus:
+    """A terminal's status, given its row's ``runtime_id``: the one its runtime
+    pushed if it runs in one (#745; unknown while that runtime is away), else
+    the local status monitor's."""
+    if runtime_id:
+        from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+        return runtime_registry.get_status(terminal_id, runtime_id)
+    return status_monitor.get_status(terminal_id)
+
+
 def get_terminal(terminal_id: str) -> Dict:
     """Get terminal data."""
     try:
@@ -3102,7 +3175,10 @@ def get_terminal(terminal_id: str) -> Dict:
         # Deferred init can fail before provider status becomes meaningful. The
         # DB-backed failure marker is authoritative and survives server restart,
         # unlike StatusMonitor's in-memory latch.
-        if deferred_failure is not None:
+        if metadata.get("runtime_id"):
+            # Derived beside the pane by its runtime, and pushed over the channel.
+            status = _current_status(terminal_id, metadata["runtime_id"]).value
+        elif deferred_failure is not None:
             status = TerminalStatus.ERROR.value
         else:
             observed_status = status_monitor.get_status(terminal_id)
@@ -3222,7 +3298,10 @@ def list_siblings(
         caller_id, prefix, caller_session=caller_session, cross_session=cross_session
     )
     for sibling in siblings:
-        sibling["status"] = status_monitor.get_status(sibling["id"]).value
+        # The row's runtime (#745) decides where the status comes from; it is
+        # not part of the sibling's reported shape.
+        runtime_id = sibling.pop("runtime_id", None)
+        sibling["status"] = _current_status(sibling["id"], runtime_id).value
     return siblings
 
 
@@ -3243,6 +3322,9 @@ def get_working_directory(terminal_id: str) -> Optional[str]:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
+        if metadata.get("runtime_id"):
+            result = _call_runtime(metadata, CommandType.WORKING_DIRECTORY, {})
+            return result.get("working_directory")
 
         working_dir = get_backend().get_pane_working_directory(
             metadata["tmux_session"], metadata["tmux_window"]
@@ -3295,12 +3377,39 @@ def send_input(
         ):
             raise KiroPhase0KASError(profile_has_v2_policy=False)
 
-        provider = provider_manager.get_provider(terminal_id)
         orchestration_value = (
             orchestration_type.value
             if isinstance(orchestration_type, OrchestrationType)
             else str(orchestration_type or "")
         )
+        # Kept for the post_send_message event: plugins/webhooks see what the
+        # caller sent, not the internal <cao-memory> block pasted into the TUI.
+        original_message = message
+
+        if metadata.get("runtime_id"):
+            # The runtime runs this same function beside the pane, with the
+            # provider guards and memory injection it needs.
+            result = _call_runtime(
+                metadata,
+                CommandType.INPUT,
+                {
+                    "message": message,
+                    "sender_id": sender_id,
+                    "orchestration_type": orchestration_value or None,
+                    "frozen_memory": frozen_memory,
+                },
+            )
+            if not result.get("success"):
+                # Not delivered: the terminal was not used, and no message went.
+                return False
+            update_last_active(terminal_id)
+            # Memory is injected in the runtime, so nothing here changed it.
+            _emit_post_send_message(
+                registry, metadata, terminal_id, sender_id, orchestration_type, original_message
+            )
+            return True
+
+        provider = provider_manager.get_provider(terminal_id)
 
         if provider:
             current_status = status_monitor.get_status(terminal_id)
@@ -3394,39 +3503,59 @@ def send_input(
 
         update_last_active(terminal_id)
         logger.info(f"Sent input to terminal: {terminal_id}")
-        if registry is not None and sender_id is not None and orchestration_type is not None:
-            # Telemetry (opt-in; no-ops without the [otel] extra or when the SDK
-            # is disabled): record a GenAI ``execute_tool`` span for the dispatch,
-            # count it, and propagate the active trace context into the plugin
-            # event so downstream consumers can continue the trace.
-            from cli_agent_orchestrator.telemetry import (
-                execute_tool_span,
-                inject_traceparent,
-                record_orchestration_dispatch,
-            )
-
-            with execute_tool_span(
-                f"send_message:{orchestration_value}",
-                conversation_id=metadata["tmux_session"],
-            ):
-                record_orchestration_dispatch(orchestration_value)
-                dispatch_plugin_event(
-                    registry,
-                    "post_send_message",
-                    PostSendMessageEvent(
-                        session_id=metadata["tmux_session"],
-                        sender=sender_id,
-                        receiver=terminal_id,
-                        message=original_message,
-                        orchestration_type=orchestration_type,
-                        traceparent=inject_traceparent(),
-                    ),
-                )
+        _emit_post_send_message(
+            registry, metadata, terminal_id, sender_id, orchestration_type, original_message
+        )
         return True
 
     except Exception as e:
         logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
         raise
+
+
+def _emit_post_send_message(
+    registry: PluginRegistry | None,
+    metadata: Dict,
+    terminal_id: str,
+    sender_id: str | None,
+    orchestration_type: OrchestrationType | None,
+    original_message: str,
+) -> None:
+    """Emit ``post_send_message`` for an orchestrated delivery, if one applies."""
+    if registry is None or sender_id is None or orchestration_type is None:
+        return
+    orchestration_value = (
+        orchestration_type.value
+        if isinstance(orchestration_type, OrchestrationType)
+        else str(orchestration_type)
+    )
+    # Telemetry (opt-in; no-ops without the [otel] extra or when the SDK
+    # is disabled): record a GenAI ``execute_tool`` span for the dispatch,
+    # count it, and propagate the active trace context into the plugin
+    # event so downstream consumers can continue the trace.
+    from cli_agent_orchestrator.telemetry import (
+        execute_tool_span,
+        inject_traceparent,
+        record_orchestration_dispatch,
+    )
+
+    with execute_tool_span(
+        f"send_message:{orchestration_value}",
+        conversation_id=metadata["tmux_session"],
+    ):
+        record_orchestration_dispatch(orchestration_value)
+        dispatch_plugin_event(
+            registry,
+            "post_send_message",
+            PostSendMessageEvent(
+                session_id=metadata["tmux_session"],
+                sender=sender_id,
+                receiver=terminal_id,
+                message=original_message,
+                orchestration_type=orchestration_type,
+                traceparent=inject_traceparent(),
+            ),
+        )
 
 
 def send_special_key(terminal_id: str, key: str) -> bool:
@@ -3449,6 +3578,13 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
+
+        if metadata.get("runtime_id"):
+            result = _call_runtime(metadata, CommandType.KEY, {"key": key})
+            if not result.get("success"):
+                return False
+            update_last_active(terminal_id)
+            return True
 
         # Arm StatusMonitor stickiness: special keys (Enter on a permission
         # prompt, C-c interrupting work, C-d sending EOF) all initiate a new
@@ -3479,6 +3615,11 @@ def exit_terminal_cli(terminal_id: str) -> None:
     Raises:
         ValueError: if no provider is registered for ``terminal_id``.
     """
+    metadata = get_terminal_metadata(terminal_id)
+    if metadata and metadata.get("runtime_id"):
+        # The provider object that knows its exit command lives in the runtime.
+        _call_runtime(metadata, CommandType.EXIT, {})
+        return
     provider = provider_manager.get_provider(terminal_id)
     if provider is None:
         raise ValueError(f"Provider not found for terminal {terminal_id}")
@@ -3527,6 +3668,11 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
+
+        if metadata.get("runtime_id"):
+            # Extraction reads the pane, so it runs in the runtime.
+            remote = _call_runtime(metadata, CommandType.OUTPUT, {"mode": OutputMode(mode).value})
+            return str(remote.get("output", ""))
 
         # Get output from StatusMonitor buffer (instant, no tmux call)
         full_output = status_monitor.get_buffer(terminal_id)
@@ -3729,6 +3875,15 @@ def read_output_range(terminal_id: str, offset: int, length: int) -> str:
 
     if offset < 0:
         raise ValueError(f"offset must be >= 0, got {offset}")
+
+    metadata = get_terminal_metadata(terminal_id)
+    if metadata and metadata.get("runtime_id"):
+        # Its log is written beside its pane, in the runtime (#745): an empty
+        # range from this server would read as "nothing logged yet".
+        raise LocalExecutionDisabledError(
+            f"terminal {terminal_id} runs in an execution runtime; output ranges "
+            "are read from logs on this server only"
+        )
 
     # Clamp the read window (BR-2). A non-positive length reads nothing rather
     # than raising — the route enforces length >= 1, so this is defense in depth.
@@ -4036,6 +4191,8 @@ def delete_terminal_row(
     terminal_id: str,
     metadata: Optional[Dict],
     registry: PluginRegistry | None = None,
+    *,
+    routed: bool = False,
 ) -> bool:
     """Drop a terminal's registry row and emit ``post_kill_terminal``.
 
@@ -4045,6 +4202,10 @@ def delete_terminal_row(
     tmux diverge. ``metadata`` is what ``capture_terminal_snapshot`` returned;
     it is needed for the event payload because the row is gone by the time the
     event is built.
+
+    ``routed=True`` (a remote terminal, #745) drops the row only while it
+    still names the runtime and session in ``metadata``: the row the delete
+    was routed by, never a replacement under a reused id.
 
     ``registry=None`` drops the row WITHOUT emitting. Session teardown passes
     None and emits the events itself once it has released the lifecycle lock, so
@@ -4057,7 +4218,12 @@ def delete_terminal_row(
     # and existing sidecars, and then the background task can publish a new
     # orphan sidecar after DELETE has already returned.
     with _DEFERRED_INIT_SIDECAR_LOCK:
-        deleted = db_delete_terminal(terminal_id)
+        if routed and metadata:
+            deleted = delete_terminal_routed_by(
+                terminal_id, metadata["runtime_id"], metadata["tmux_session"]
+            )
+        else:
+            deleted = db_delete_terminal(terminal_id)
         # Sidecars are keyed by terminal id and are safe to remove even when the
         # DB row was already deleted by another lifecycle owner.
         _delete_deferred_failure_fallback(terminal_id)
@@ -4076,6 +4242,56 @@ def delete_terminal_row(
     return deleted
 
 
+def delete_remote_terminal(terminal_id: str) -> Tuple[bool, bool]:
+    """Tear down a terminal that runs in an execution runtime (#745); see ``_delete_remote``.
+
+    For session teardown, which dispatches its plugin events itself, after
+    releasing the session lock: only for the terminals whose row it dropped.
+    """
+    row = get_terminal_metadata(terminal_id)
+    if row is None:
+        return True, False  # a concurrent delete already took it
+    if not row.get("runtime_id"):
+        # Not expected in a remote session (a runtime's terminal is alone in
+        # its session); torn down as delete_terminal would, with no event.
+        deleted = delete_terminal(terminal_id)
+        return deleted, deleted
+    return _delete_remote(terminal_id, row, None)
+
+
+def _delete_remote(
+    terminal_id: str, row: Dict[str, Any], registry: PluginRegistry | None
+) -> Tuple[bool, bool]:
+    """Tear down in the runtime; drop the central row only once it confirms.
+
+    Returns ``(gone, dropped)``. ``gone``: the runtime confirmed the teardown
+    and the row this delete was routed by is gone, whichever request dropped
+    it: a concurrent delete may have dropped it first, and a new launch may
+    since hold the id (that terminal is not this delete's, and is kept).
+    ``dropped``: this call dropped the row, and so dispatched
+    ``post_kill_terminal`` to ``registry``. ``(False, False)`` when the runtime
+    deferred the cleanup: the row stays, for a retry.
+    """
+    result = _call_runtime(row, CommandType.DELETE, {}, timeout=REMOTE_DELETE_TIMEOUT)
+    if not result.get("deleted"):
+        logger.warning("Runtime deferred cleanup of terminal %s", terminal_id)
+        return False, False
+    from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+    # The row first, then the placement, so a reconnect in between cannot
+    # restore the placement of a deleted terminal. A row that could not be
+    # dropped keeps its placement: it still routes a retry.
+    dropped = delete_terminal_row(terminal_id, row, registry=registry, routed=True)
+    current = get_terminal_metadata(terminal_id)
+    replaced = current is not None and (current.get("runtime_id"), current["tmux_session"]) != (
+        row["runtime_id"],
+        row["tmux_session"],
+    )
+    if current is None:
+        runtime_registry.forget_unless_launching(terminal_id)
+    return dropped or current is None or replaced, dropped
+
+
 def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
     """Delete terminal and kill its tmux window.
 
@@ -4087,6 +4303,10 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
     ``dismantle_terminal_runtime``), leaving the row in place for a retry.
     """
     try:
+        row = get_terminal_metadata(terminal_id)
+        if row and row.get("runtime_id"):
+            gone, _ = _delete_remote(terminal_id, row, registry)
+            return gone
         metadata = capture_terminal_snapshot(terminal_id)
         if not dismantle_terminal_runtime(terminal_id, metadata):
             logger.warning(
