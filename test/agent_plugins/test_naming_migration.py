@@ -103,6 +103,9 @@ _UNSCOPED_DOCS = [
     "kiro-cli.md",
     "claude-code.md",
     "copilot-cli.md",
+    # Gained an agent-plugin MCP-delivery section on #465 — CAO's own noun
+    # throughout, no vendor "Plugin", so the strict rule applies.
+    "devin-cli.md",
 ]
 
 #: Docs whose H1 scopes the noun ("# Event Plugins", "# Agent Plugins"), so bare

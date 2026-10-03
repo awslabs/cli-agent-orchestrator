@@ -1,0 +1,18 @@
+Welcome to Devin CLI
+
+> explain this codebase
+
+This is a CLI agent orchestrator that provides a unified interface
+for multiple AI coding assistants. It supports:
+
+1. Multiple providers (Claude, Codex, Copilot, Q, Kiro, Gemini, Kimi, Devin)
+2. Session management via tmux
+3. Agent profiles with customizable system prompts
+4. MCP server integration
+
+The main entry point is the FastAPI server in src/cli_agent_orchestrator/api/main.py.
+
+────────────────────────────────────────
+#
+────────────────────────────────────────
+Mode: chat  Model: devin-v1

@@ -147,6 +147,7 @@ CAO 驱动的是已有 CLI Agent 工具，它并不会替代这些工具。使�
 | **Oh My Pi** | [Provider docs](docs/omp-cli.md) · [Installation](https://github.com/can1357/oh-my-pi) | OMP authenticated model account |
 | **Cursor CLI** | [Provider docs](docs/cursor-cli.md) · [Installation](https://cursor.com/cli) | Cursor subscription / API key |
 | **Antigravity CLI** | [Provider docs](docs/antigravity-cli.md) · [Installation](https://antigravity.google) | Google account（与 Antigravity IDE 登录共用） |
+| **Devin CLI** | [Provider docs](docs/devin-cli.md) · [Installation](https://docs.devin.ai/cli) | Devin CLI auth |
 
 ## 快速开始
 

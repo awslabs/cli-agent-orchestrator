@@ -53,8 +53,9 @@ Install:
   [MiniMax Code](docs/minimax-code.md),
   [GitHub Copilot CLI](docs/copilot-cli.md),
   [OpenCode CLI](docs/opencode-cli.md), [Oh My Pi(OMP) CLI](docs/omp-cli.md),
-  [Cursor CLI](docs/cursor-cli.md), or
-  [Grok Build CLI](docs/grok-cli.md)
+  [Cursor CLI](docs/cursor-cli.md),
+  [Grok Build CLI](docs/grok-cli.md), or
+  [Devin CLI](docs/devin-cli.md)
 
 The focused provider guides contain installation, authentication, and
 provider-specific behavior.
@@ -162,8 +163,9 @@ provider override while keeping the same sequence.
   [MiniMax Code](docs/minimax-code.md),
   [GitHub Copilot CLI](docs/copilot-cli.md),
   [OpenCode CLI](docs/opencode-cli.md), [Oh My Pi(OMP) CLI](docs/omp-cli.md),
-  [Cursor CLI](docs/cursor-cli.md), and
-  [Grok Build CLI](docs/grok-cli.md).
+  [Cursor CLI](docs/cursor-cli.md),
+  [Grok Build CLI](docs/grok-cli.md), and
+  [Devin CLI](docs/devin-cli.md).
 - [Security policy](SECURITY.md): vulnerability reporting and deployment
   guidance.
 

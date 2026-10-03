@@ -1,0 +1,15 @@
+Welcome to Devin CLI
+
+> list files in the current directory
+
+Here are the files in the current directory:
+
+- README.md
+- src/
+- test/
+- pyproject.toml
+
+────────────────────────────────────────
+#
+────────────────────────────────────────
+Mode: chat  Model: devin-v1
