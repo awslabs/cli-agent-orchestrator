@@ -8,6 +8,7 @@ from typing import Annotated, Any, Dict, List, Optional, Tuple, Union
 
 import requests
 from fastmcp import FastMCP
+from fastmcp.tools import Tool, ToolResult
 from pydantic import Field, WithJsonSchema
 
 from cli_agent_orchestrator.constants import (
@@ -1599,6 +1600,21 @@ async def create_ephemeral_agent(
     Codex tools are advisory when the operator enables Codex. The feature
     defaults off; see docs/ephemeral-agents.md for the full honesty statement.
     """
+    return await _create_ephemeral_from_arguments(
+        {
+            "purpose": purpose,
+            "brief": brief,
+            "description": description,
+            "provider": provider,
+            "tools": tools,
+            "model_tier": model_tier,
+            "effort": effort,
+        }
+    )
+
+
+async def _create_ephemeral_from_arguments(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Gate before forwarding raw arguments to the sole, server-side validator."""
     from cli_agent_orchestrator.services.ephemeral_service import log_refusal
 
     caller_id = os.environ.get("CAO_TERMINAL_ID")
@@ -1624,16 +1640,7 @@ async def create_ephemeral_agent(
                 )
             )
         else:
-            payload = {
-                "spec_version": 1,
-                "purpose": purpose,
-                "brief": brief,
-                "description": description,
-                "provider": provider,
-                "tools": tools,
-                "model_tier": model_tier,
-                "effort": effort,
-            }
+            payload = {"spec_version": 1, **arguments}
             try:
                 response = await asyncio.to_thread(
                     requests.post,
@@ -1660,6 +1667,9 @@ async def create_ephemeral_agent(
                     "rule": error.get("rule", "unexpected_failure"),
                     "message": error.get("message", "ephemeral policy: unexpected_failure"),
                 }
+            except requests.exceptions.JSONDecodeError:
+                # requests' JSON error is also a RequestException; it is not a network failure.
+                rule, detail = "unexpected_failure", ""
             except requests.RequestException:
                 rule, detail = "creator_unresolved", "cao-server could not be reached"
             except ValueError:
@@ -1672,10 +1682,26 @@ async def create_ephemeral_agent(
     }
 
 
+class _EphemeralCreateTool(Tool):
+    """Use normal tool resolution, but never bind untrusted creation arguments."""
+
+    async def run(self, arguments: Dict[str, Any]) -> ToolResult:
+        return ToolResult(structured_content=await _create_ephemeral_from_arguments(arguments))
+
+
 def _register_ephemeral_tool(target: FastMCP, enabled: Any) -> None:
     """Register only on literal operator opt-in; agent terminals must restart to see it."""
     if enabled is True:
-        target.tool()(create_ephemeral_agent)
+        # The function supplies documentation/schema only, not the execution binder.
+        advertised = Tool.from_function(create_ephemeral_agent)
+        target.add_tool(
+            _EphemeralCreateTool(
+                name=advertised.name,
+                description=advertised.description,
+                parameters=advertised.parameters,
+                output_schema=advertised.output_schema,
+            )
+        )
 
 
 def _ephemeral_enabled_at_startup() -> bool:

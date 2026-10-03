@@ -378,11 +378,18 @@ async def test_real_fastmcp_invalid_values_are_server_redacted(create_store, mon
     post.assert_called_once()
 
 
+@pytest.mark.parametrize("status", [500, 502])
 @pytest.mark.asyncio
-async def test_non_json_server_reply_is_unexpected_and_redacted(create_store, monkeypatch, caplog):
+async def test_non_json_server_reply_is_unexpected_and_redacted(
+    create_store, monkeypatch, caplog, status
+):
     monkeypatch.setenv("CAO_TERMINAL_ID", CALLER)
     monkeypatch.setattr(server, "_tool_denied_reason", lambda _: None)
-    response = Mock(status_code=500, json=Mock(side_effect=ValueError("private response body")))
+    response = server.requests.models.Response()
+    response.status_code = status
+    response._content = b"<html>private response body</html>"
+    with pytest.raises(server.requests.exceptions.JSONDecodeError):
+        response.json()
     monkeypatch.setattr(server.requests, "post", Mock(return_value=response))
     result = await server.create_ephemeral_agent("log_triage", "private-brief")
     assert result == {
@@ -413,3 +420,129 @@ async def test_remote_refusal_uses_shared_redacted_logger(create_store, monkeypa
     records = [r for r in caplog.records if "remote_placement_not_allowed" in r.getMessage()]
     assert len(records) == 1
     assert "caller=-" in records[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    "case", ["model", "secret_key", "allowed_tools", "prompt", "missing_brief", "empty"]
+)
+@pytest.mark.asyncio
+async def test_real_fastmcp_arity_is_server_redacted(create_store, monkeypatch, case):
+    from fastmcp import FastMCP
+
+    private = "AKIAIOSFODNN7EXAMPLE"
+    cases = {
+        "model": ({"purpose": "log_triage", "brief": private, "model": private}, ["model"]),
+        "secret_key": ({"purpose": "log_triage", "brief": private, private: private}, [private]),
+        "allowed_tools": (
+            {"purpose": "log_triage", "brief": "Inspect logs.", "allowed_tools": [private]},
+            ["allowed_tools"],
+        ),
+        "prompt": (
+            {"purpose": "log_triage", "prompt": private, "description": private},
+            ["prompt"],
+        ),
+        "missing_brief": ({"purpose": private}, []),
+        "empty": ({}, []),
+    }
+    args, unknown_keys = cases[case]
+    records = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append(self.format(record))
+
+    capture = Capture()
+    roots = [logging.getLogger("fastmcp"), logging.getLogger()]
+    for logger in roots:
+        logger.addHandler(capture)
+    monkeypatch.setenv("CAO_TERMINAL_ID", CALLER)
+    monkeypatch.setattr(server, "_tool_denied_reason", lambda _: None)
+    post = Mock(
+        side_effect=lambda url, **kw: client().post(
+            "/ephemeral-agents", params=kw["params"], json=kw["json"]
+        )
+    )
+    monkeypatch.setattr(server.requests, "post", post)
+    target = FastMCP("raw arity boundary")
+    server._register_ephemeral_tool(target, True)
+    try:
+        try:
+            result = await target.call_tool("create_ephemeral_agent", args)
+            returned = str(result)
+        except Exception as exc:
+            result = None
+            returned = str(exc)
+    finally:
+        for logger in roots:
+            logger.removeHandler(capture)
+    assert private not in returned
+    assert all(private not in record for record in records)
+    for key in unknown_keys:
+        assert key not in returned
+        assert all(key not in record for record in records)
+    assert result is not None
+    assert result.structured_content["success"] is False
+    assert result.structured_content["rule"] == "invalid_spec"
+    if unknown_keys:
+        assert "unknown field" in result.structured_content["message"]
+    post.assert_called_once()
+    assert post.call_args.kwargs["json"] == {"spec_version": 1, **args}
+    assert post.call_args.kwargs["params"] == {"caller_id": CALLER}
+
+
+@pytest.mark.asyncio
+async def test_other_tool_keeps_argument_binding(create_store):
+    from fastmcp import FastMCP
+
+    target = FastMCP("ordinary binding")
+    server._register_ephemeral_tool(target, True)
+    invoked = Mock()
+
+    @target.tool()
+    def ordinary(value: str) -> str:
+        invoked()
+        return value
+
+    with pytest.raises(Exception):
+        await target.call_tool("ordinary", {"value": "valid", "unexpected": "extra"})
+    invoked.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "denial,rule",
+    [
+        (None, "creator_unresolved"),
+        ("@cao-mcp-server is denied", "tool_exceeds_creator"),
+        ("max_depth_exceeded", "max_depth_exceeded"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_real_raw_tool_gate_precedes_body_validation(create_store, monkeypatch, denial, rule):
+    from fastmcp import FastMCP
+
+    if denial is None:
+        monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)
+    else:
+        monkeypatch.setenv("CAO_TERMINAL_ID", CALLER)
+        monkeypatch.setattr(server, "_tool_denied_reason", lambda _: denial)
+    post = Mock(side_effect=AssertionError("gate must not forward"))
+    monkeypatch.setattr(server.requests, "post", post)
+    target = FastMCP("gate before shape")
+    server._register_ephemeral_tool(target, True)
+    result = await target.call_tool("create_ephemeral_agent", {"prompt": "private text"})
+    assert result.structured_content["rule"] == rule
+    post.assert_not_called()
+
+
+@pytest.mark.parametrize("enabled", [False, "true", None])
+@pytest.mark.asyncio
+async def test_unregistered_raw_tool_is_inert(create_store, enabled, monkeypatch):
+    from fastmcp import FastMCP
+
+    target = FastMCP("disabled raw tool")
+    server._register_ephemeral_tool(target, enabled)
+    post = Mock(side_effect=AssertionError("unregistered must not forward"))
+    monkeypatch.setattr(server.requests, "post", post)
+    with pytest.raises(Exception):
+        await target.call_tool("create_ephemeral_agent", {"prompt": "private text"})
+    post.assert_not_called()
