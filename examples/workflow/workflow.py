@@ -124,7 +124,11 @@ def main() -> None:
     # Conservative concurrency: never exceed the declared default, even when a
     # run asks for more (measured guidance for claude_code fan-out — see the
     # authoring guide's fan-out section and the cao-workflow skill's R1).
-    max_workers = min(inputs.get("concurrency", 2), INPUTS["concurrency"]["default"])
+    # The max(1, ...) floor is not redundant: `concurrency` is declared as a
+    # bare int with no minimum, so `--input concurrency=0` (or a negative)
+    # clears the pre-run validation gate and would otherwise reach
+    # ThreadPoolExecutor as max_workers=0, which raises ValueError mid-run.
+    max_workers = max(1, min(inputs.get("concurrency", 2), INPUTS["concurrency"]["default"]))
 
     plan = _plan(target, tone)
 
