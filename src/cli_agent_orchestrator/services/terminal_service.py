@@ -4228,6 +4228,50 @@ def delete_terminal_row(
     return deleted
 
 
+def delete_remote_terminal(terminal_id: str) -> Tuple[bool, bool]:
+    """Tear down a terminal that runs in an execution runtime (#745); see ``_delete_remote``.
+
+    For session teardown, which dispatches its plugin events itself, after
+    releasing the session lock: only for the terminals whose row it dropped.
+    """
+    row = get_terminal_metadata(terminal_id)
+    if row is None:
+        return True, False  # a concurrent delete already took it
+    if not row.get("runtime_id"):
+        # Not expected in a remote session (a runtime's terminal is alone in
+        # its session); torn down as delete_terminal would, with no event.
+        deleted = delete_terminal(terminal_id)
+        return deleted, deleted
+    return _delete_remote(terminal_id, row, None)
+
+
+def _delete_remote(
+    terminal_id: str, row: Dict[str, Any], registry: PluginRegistry | None
+) -> Tuple[bool, bool]:
+    """Tear down in the runtime; drop the central row only once it confirms.
+
+    Returns ``(gone, dropped)``. ``gone``: the runtime confirmed the teardown
+    and the row is gone, whichever request dropped it; a concurrent delete may
+    have dropped it first. ``dropped``: this call dropped the row, and so
+    dispatched ``post_kill_terminal`` to ``registry``. ``(False, False)`` when
+    the runtime deferred the cleanup: the row stays, for a retry.
+    """
+    result = _call_runtime(row, CommandType.DELETE, {}, timeout=REMOTE_DELETE_TIMEOUT)
+    if not result.get("deleted"):
+        logger.warning("Runtime deferred cleanup of terminal %s", terminal_id)
+        return False, False
+    from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
+
+    # The row first, then the placement, so a reconnect in between cannot
+    # restore the placement of a deleted terminal. A row that could not be
+    # dropped keeps its placement: it still routes a retry.
+    dropped = delete_terminal_row(terminal_id, row, registry=registry)
+    gone = dropped or get_terminal_metadata(terminal_id) is None
+    if gone:
+        runtime_registry.forget(terminal_id)
+    return gone, dropped
+
+
 def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
     """Delete terminal and kill its tmux window.
 
@@ -4241,20 +4285,8 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
     try:
         row = get_terminal_metadata(terminal_id)
         if row and row.get("runtime_id"):
-            # Tear down in the runtime; drop the central row only once it confirms.
-            result = _call_runtime(row, CommandType.DELETE, {}, timeout=REMOTE_DELETE_TIMEOUT)
-            if not result.get("deleted"):
-                logger.warning("Runtime deferred cleanup of terminal %s", terminal_id)
-                return False
-            from cli_agent_orchestrator.runtime_channel.registry import runtime_registry
-
-            # The row first, then the placement, so a reconnect in between
-            # cannot restore the placement of a deleted terminal. A row that
-            # could not be dropped keeps its placement: it still routes a retry.
-            deleted = delete_terminal_row(terminal_id, row, registry=registry)
-            if deleted or get_terminal_metadata(terminal_id) is None:
-                runtime_registry.forget(terminal_id)
-            return deleted
+            gone, _ = _delete_remote(terminal_id, row, registry)
+            return gone
         metadata = capture_terminal_snapshot(terminal_id)
         if not dismantle_terminal_runtime(terminal_id, metadata):
             logger.warning(

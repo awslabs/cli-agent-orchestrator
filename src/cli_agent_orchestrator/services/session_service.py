@@ -524,12 +524,13 @@ def _delete_remote_session(session_name: str, registry: PluginRegistry | None) -
     """Tear down a session whose terminals run in an execution runtime (#745).
 
     Returns None for a local session. Each terminal is deleted in its runtime
-    (``terminal_service.delete_terminal`` routes it); the local tmux is never
+    (``terminal_service.delete_remote_terminal``); the local tmux is never
     consulted. As for a local session, the lifecycle lock is held across the
     teardown and plugin events are dispatched after it is released:
-    ``post_kill_terminal`` for each confirmed deletion, ``post_kill_session``
-    only once every terminal is gone. A ``RemoteRuntimeError`` (runtime not
-    connected, no answer) propagates to the caller.
+    ``post_kill_terminal`` for each terminal whose row this call dropped,
+    ``post_kill_session`` only once every terminal is gone. A
+    ``RemoteRuntimeError`` (runtime not connected, no answer) propagates to the
+    caller.
     """
     if not session_is_remote(session_name):
         return None
@@ -559,15 +560,18 @@ def _delete_remote_session(session_name: str, registry: PluginRegistry | None) -
             # each in a new session, and neither a launch's record step nor a
             # local create adds one to it. Fan these out if that changes.
             for terminal in list_terminals_by_session(session_name):
-                if terminal_service.delete_terminal(terminal["id"]):
+                gone, dropped = terminal_service.delete_remote_terminal(terminal["id"])
+                if dropped:
                     torn_down.append(terminal)
-                else:
+                elif not gone:
                     result["errors"].append(
                         {
                             "terminal_id": terminal["id"],
                             "error": "cleanup deferred; retry delete_session",
                         }
                     )
+                # Gone but not dropped here: a concurrent delete of the
+                # terminal dropped its row, and dispatched its event.
     finally:
         # Also when a runtime could not be reached: these are already gone.
         for terminal in torn_down:
