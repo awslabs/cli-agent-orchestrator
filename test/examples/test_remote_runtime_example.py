@@ -9,6 +9,7 @@ pass it.
 import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "examples/cao-clusters/kubernetes/remote-runtime"
@@ -47,3 +48,27 @@ def test_every_api_call_in_the_readme_passes_the_token():
     assert calls, "the README drives the API with curl"
     assert all('-H "$AUTH"' in line for line in calls), calls
     assert "secret generic cao-api-token" in readme
+
+
+def _documents(manifest: str) -> list:
+    return [doc for doc in yaml.safe_load_all((EXAMPLE / manifest).read_text()) if doc]
+
+
+@pytest.mark.parametrize(
+    "manifest,name", [("server.yaml", "cao-server"), ("runtime.yaml", "cao-runtime")]
+)
+def test_no_pod_mounts_a_kubernetes_api_token(manifest, name):
+    # Neither pod calls the Kubernetes API, and both run user code: agents in
+    # the runtime, flow and workflow scripts on the server. A projected
+    # web-identity token (IRSA) is a volume of its own and is unaffected.
+    docs = _documents(manifest)
+    (statefulset,) = [
+        d for d in docs if d["kind"] == "StatefulSet" and d["metadata"]["name"] == name
+    ]
+    pod = statefulset["spec"]["template"]["spec"]
+    accounts = {d["metadata"]["name"]: d for d in docs if d["kind"] == "ServiceAccount"}
+    account = accounts.get(pod.get("serviceAccountName", "default"), {})
+    mounted = pod.get(
+        "automountServiceAccountToken", account.get("automountServiceAccountToken", True)
+    )
+    assert mounted is False, f"{name} mounts the Kubernetes API token"

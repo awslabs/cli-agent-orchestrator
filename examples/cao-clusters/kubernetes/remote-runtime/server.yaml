@@ -31,6 +31,9 @@ spec:
       labels:
         app.kubernetes.io/name: cao-server
     spec:
+      # Flow and workflow scripts run here, and nothing calls the Kubernetes
+      # API: no API token is mounted.
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: 30
       securityContext:
         fsGroup: 1000
