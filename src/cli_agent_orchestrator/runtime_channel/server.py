@@ -24,7 +24,7 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, ValidationInfo, field_validator
 
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import (
@@ -62,6 +62,7 @@ from cli_agent_orchestrator.security.auth import (
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
+from cli_agent_orchestrator.utils.terminal import validate_tmux_name
 
 logger = logging.getLogger(__name__)
 
@@ -288,6 +289,13 @@ class _Launched(BaseModel):
     # it (#856). A cao-bridge from before #856 sends neither: unknown.
     model: Optional[str] = None
     model_honored: Optional[bool] = None
+
+    @field_validator("name", "session_name")
+    @classmethod
+    def _addressable(cls, value: str, info: ValidationInfo) -> str:
+        # The allowlist local creation uses: the session APIs refuse any other
+        # name, so a row under one could not be addressed through them.
+        return validate_tmux_name(value, info.field_name or "name")
 
 
 async def _undo_launch(
