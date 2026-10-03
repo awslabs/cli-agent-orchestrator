@@ -407,6 +407,9 @@ def _jsonable(terminal: Dict[str, Any]) -> Dict[str, Any]:
         "allowed_tools",
         "status",
         "engine",
+        # The launch model and whether its provider applies it (#856).
+        "model",
+        "model_honored",
     )
     out = {key: terminal.get(key) for key in keys}
     for key in ("provider", "status", "engine"):
