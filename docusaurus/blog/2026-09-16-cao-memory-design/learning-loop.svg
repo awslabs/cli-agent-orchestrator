@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="900" viewBox="0 0 1200 900" role="img" aria-labelledby="title desc">
+  <title id="title">CAO's opt-in learning loop</title>
+  <desc id="desc">After work is validated, a supervisor records an outcome and hands it to a retrospector. The retrospector reads outcomes and existing memory, then stores a lesson in the worker's agent-scoped feedback memory. A future worker explicitly recalls the lesson. Promotion into the agent profile is optional and requires operator review.</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="7" flood-color="#0f172a" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#047857"/>
+    </marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#7c3aed"/>
+    </marker>
+    <marker id="arrow-slate" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#64748b"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .eyebrow { font-size: 13px; font-weight: 700; letter-spacing: 1.5px; fill: #64748b; }
+      .title { font-size: 30px; font-weight: 750; fill: #0f172a; }
+      .subtitle { font-size: 16px; font-weight: 450; fill: #475569; }
+      .card-title { font-size: 18px; font-weight: 700; fill: #0f172a; }
+      .card-copy { font-size: 14px; font-weight: 450; fill: #475569; }
+      .label { font-size: 12px; font-weight: 700; letter-spacing: 0.8px; fill: #475569; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 14px; font-weight: 650; }
+      .step { font-size: 13px; font-weight: 750; fill: #ffffff; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="900" fill="#ffffff"/>
+  <text class="eyebrow" x="60" y="54">GOVERNED AGENT LEARNING</text>
+  <text class="title" x="60" y="94">Learning happens only when a supervisor starts the loop</text>
+  <text class="subtitle" x="60" y="124">Outcomes become reusable lessons; profile changes remain optional and reviewed.</text>
+
+  <text class="eyebrow" x="76" y="158">CONTROL FLOW</text>
+  <text class="eyebrow" x="842" y="158">DURABLE STATE</text>
+
+  <g filter="url(#shadow)">
+    <rect x="76" y="176" width="654" height="64" rx="18" fill="#f0fdf4" stroke="#16a34a" stroke-width="2"/>
+    <circle cx="112" cy="208" r="12" fill="#16a34a"/>
+    <path d="M106 208L110 212L118 203" fill="none" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <text class="card-title" x="140" y="205">Validated work</text>
+    <text class="card-copy" x="140" y="226">The supervisor records an outcome only after validation.</text>
+  </g>
+
+  <path d="M403 240V266" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="76" y="274" width="654" height="80" rx="18" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+    <circle cx="112" cy="314" r="17" fill="#2563eb"/>
+    <text class="step" x="112" y="319" text-anchor="middle">1</text>
+    <text class="mono" x="146" y="307" fill="#1d4ed8">report_outcome</text>
+    <text class="card-copy" x="146" y="333">success, optional score, and short friction notes—not a transcript</text>
+  </g>
+
+  <path d="M730 314H834" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="842" y="266" width="298" height="96" rx="18" fill="#f8fafc" stroke="#64748b" stroke-width="2"/>
+    <rect x="866" y="286" width="86" height="28" rx="14" fill="#e2e8f0"/>
+    <text class="label" x="909" y="305" text-anchor="middle">SQLITE</text>
+    <text class="card-title" x="866" y="340">workflow_outcomes</text>
+  </g>
+
+  <path d="M403 354V380" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="76" y="388" width="654" height="78" rx="18" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+    <circle cx="112" cy="427" r="17" fill="#d97706"/>
+    <text class="step" x="112" y="432" text-anchor="middle">2</text>
+    <text class="card-title" x="146" y="420">Supervisor handoff</text>
+    <text class="card-copy" x="146" y="445">Explicitly starts the retrospector prompt; nothing runs at session end.</text>
+  </g>
+
+  <path d="M403 466V492" fill="none" stroke="#7c3aed" stroke-width="2.5" marker-end="url(#arrow-purple)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="76" y="500" width="654" height="96" rx="18" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2"/>
+    <circle cx="112" cy="548" r="17" fill="#7c3aed"/>
+    <text class="step" x="112" y="553" text-anchor="middle">3</text>
+    <text class="card-title" x="146" y="535">Retrospector checks the evidence</text>
+    <text class="mono" x="146" y="564" fill="#6d28d9">list_outcomes + memory_recall</text>
+    <text class="card-copy" x="430" y="564">checks existing lessons before proposing one</text>
+  </g>
+
+  <path d="M991 362V548H738" fill="none" stroke="#64748b" stroke-width="2" stroke-dasharray="7 7" marker-end="url(#arrow-slate)"/>
+  <text class="label" x="880" y="530">READ OUTCOMES</text>
+
+  <path d="M403 596V622" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="76" y="630" width="654" height="82" rx="18" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+    <circle cx="112" cy="671" r="17" fill="#2563eb"/>
+    <text class="step" x="112" y="676" text-anchor="middle">4</text>
+    <text class="mono" x="146" y="664" fill="#1d4ed8">store_lesson</text>
+    <text class="card-copy" x="146" y="690">writes feedback to the worker’s agent scope</text>
+  </g>
+
+  <path d="M730 671H834" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="842" y="616" width="298" height="112" rx="18" fill="#f0fdfa" stroke="#0f766e" stroke-width="2"/>
+    <rect x="866" y="638" width="118" height="28" rx="14" fill="#ccfbf1"/>
+    <text class="label" x="925" y="657" text-anchor="middle" fill="#115e59">AGENT SCOPE</text>
+    <text class="card-title" x="866" y="690">Feedback memory</text>
+    <text class="card-copy" x="866" y="714">lesson remains separate from the profile</text>
+  </g>
+
+  <path d="M403 712V742" fill="none" stroke="#047857" stroke-width="2.5" marker-end="url(#arrow-green)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="76" y="750" width="654" height="84" rx="18" fill="#f0fdf4" stroke="#047857" stroke-width="2"/>
+    <circle cx="112" cy="792" r="17" fill="#047857"/>
+    <text class="step" x="112" y="797" text-anchor="middle">5</text>
+    <text class="card-title" x="146" y="785">A future worker explicitly recalls the lesson</text>
+    <text class="card-copy" x="146" y="811">Recall can increase access_count; unpromoted lessons are not auto-injected.</text>
+  </g>
+
+  <path d="M842 686H794V792H738" fill="none" stroke="#047857" stroke-width="2.5" marker-end="url(#arrow-green)"/>
+  <text class="label" x="768" y="774" text-anchor="middle" fill="#065f46">EXPLICIT RECALL</text>
+
+  <path d="M991 728V752" fill="none" stroke="#d97706" stroke-width="2" stroke-dasharray="6 6" marker-end="url(#arrow-slate)"/>
+  <rect x="866" y="760" width="250" height="34" rx="17" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+  <text class="label" x="991" y="782" text-anchor="middle" fill="#92400e">OPTIONAL OPERATOR REVIEW</text>
+  <path d="M991 794V808" fill="none" stroke="#d97706" stroke-width="2" stroke-dasharray="6 6" marker-end="url(#arrow-slate)"/>
+  <rect x="842" y="816" width="298" height="60" rx="16" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <text class="mono" x="991" y="852" text-anchor="middle" fill="#92400e">profile ## Learned Patterns</text>
+
+  <path d="M76 792H42V208H68" fill="none" stroke="#94a3b8" stroke-width="2" stroke-dasharray="7 7" marker-end="url(#arrow-slate)"/>
+  <text class="label" x="30" y="500" text-anchor="middle" transform="rotate(-90 30 500)">FUTURE VALIDATED WORK CONTINUES THE LOOP</text>
+</svg>
