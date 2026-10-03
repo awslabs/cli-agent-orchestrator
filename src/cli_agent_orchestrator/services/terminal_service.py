@@ -48,6 +48,7 @@ from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam
 )
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam: creation no longer bulk-deletes with this helper,; but older integrations/tests patch the imported symbol while exercising; create_terminal. Keep the name exported from this module until that seam; can be retired separately.
+    delete_terminal_routed_by,
     delete_terminals_by_session,
     get_idempotency_record,
     get_session_incarnation,
@@ -4806,6 +4807,8 @@ def delete_terminal_row(
     terminal_id: str,
     metadata: Optional[Dict],
     registry: PluginRegistry | None = None,
+    *,
+    routed: bool = False,
 ) -> bool:
     """Drop a terminal's registry row and emit ``post_kill_terminal``.
 
@@ -4815,6 +4818,10 @@ def delete_terminal_row(
     tmux diverge. ``metadata`` is what ``capture_terminal_snapshot`` returned;
     it is needed for the event payload because the row is gone by the time the
     event is built.
+
+    ``routed=True`` (a remote terminal, #745) drops the row only while it
+    still names the runtime and session in ``metadata``: the row the delete
+    was routed by, never a replacement under a reused id.
 
     ``registry=None`` drops the row WITHOUT emitting. Session teardown passes
     None and emits the events itself once it has released the lifecycle lock, so
@@ -4827,7 +4834,12 @@ def delete_terminal_row(
     # and existing sidecars, and then the background task can publish a new
     # orphan sidecar after DELETE has already returned.
     with _DEFERRED_INIT_SIDECAR_LOCK:
-        deleted = db_delete_terminal(terminal_id)
+        if routed and metadata:
+            deleted = delete_terminal_routed_by(
+                terminal_id, metadata["runtime_id"], metadata["tmux_session"]
+            )
+        else:
+            deleted = db_delete_terminal(terminal_id)
         # Sidecars are keyed by terminal id and are safe to remove even when the
         # DB row was already deleted by another lifecycle owner.
         _delete_deferred_failure_fallback(terminal_id)
@@ -4871,10 +4883,12 @@ def _delete_remote(
     """Tear down in the runtime; drop the central row only once it confirms.
 
     Returns ``(gone, dropped)``. ``gone``: the runtime confirmed the teardown
-    and the row is gone, whichever request dropped it; a concurrent delete may
-    have dropped it first. ``dropped``: this call dropped the row, and so
-    dispatched ``post_kill_terminal`` to ``registry``. ``(False, False)`` when
-    the runtime deferred the cleanup: the row stays, for a retry.
+    and the row this delete was routed by is gone, whichever request dropped
+    it: a concurrent delete may have dropped it first, and a new launch may
+    since hold the id (that terminal is not this delete's, and is kept).
+    ``dropped``: this call dropped the row, and so dispatched
+    ``post_kill_terminal`` to ``registry``. ``(False, False)`` when the runtime
+    deferred the cleanup: the row stays, for a retry.
     """
     result = _call_runtime(row, CommandType.DELETE, {}, timeout=REMOTE_DELETE_TIMEOUT)
     if not result.get("deleted"):
@@ -4885,11 +4899,15 @@ def _delete_remote(
     # The row first, then the placement, so a reconnect in between cannot
     # restore the placement of a deleted terminal. A row that could not be
     # dropped keeps its placement: it still routes a retry.
-    dropped = delete_terminal_row(terminal_id, row, registry=registry)
-    gone = dropped or get_terminal_metadata(terminal_id) is None
-    if gone:
-        runtime_registry.forget(terminal_id)
-    return gone, dropped
+    dropped = delete_terminal_row(terminal_id, row, registry=registry, routed=True)
+    current = get_terminal_metadata(terminal_id)
+    replaced = current is not None and (current.get("runtime_id"), current["tmux_session"]) != (
+        row["runtime_id"],
+        row["tmux_session"],
+    )
+    if current is None:
+        runtime_registry.forget_unless_launching(terminal_id)
+    return dropped or current is None or replaced, dropped
 
 
 def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:

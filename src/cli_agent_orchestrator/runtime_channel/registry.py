@@ -300,6 +300,17 @@ class RuntimeRegistry:
             if runtime_id is not None:
                 self._status.pop((terminal_id, runtime_id), None)
 
+    def forget_unless_launching(self, terminal_id: str) -> None:
+        """``forget``, unless the placed runtime's launch of this id is being
+        recorded (see ``reserve``): then the placement is that launch's claim,
+        not a deleted terminal's."""
+        with self._lock:
+            runtime_id = self._placement.get(terminal_id)
+            if runtime_id is None or (terminal_id, runtime_id) in self._reserved:
+                return
+            del self._placement[terminal_id]
+            self._status.pop((terminal_id, runtime_id), None)
+
     def unplace(self, terminal_id: str, runtime_id: str) -> None:
         """Forget a placement, but only if it is still ``runtime_id``'s."""
         with self._lock:

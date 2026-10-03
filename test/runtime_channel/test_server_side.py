@@ -336,10 +336,10 @@ class TestRemoteTerminal:
         start_runtime(script=_answer)
         real = terminal_service.delete_terminal_row
 
-        def reconnect_meanwhile(terminal_id, metadata, registry=None):
+        def reconnect_meanwhile(terminal_id, metadata, registry=None, **kwargs):
             # A reconnect's hello still finds the row, and places the terminal.
             registry_mod.runtime_registry.place(terminal_id, "rt-1")
-            return real(terminal_id, metadata, registry=registry)
+            return real(terminal_id, metadata, registry=registry, **kwargs)
 
         monkeypatch.setattr(terminal_service, "delete_terminal_row", reconnect_meanwhile)
         assert http.delete("/terminals/abcd1234").status_code == 200
@@ -1464,6 +1464,30 @@ class TestFailedRowDelete:
         assert database.get_terminal_metadata("abcd1234") is None
         assert runtimes_of(http)["rt-1"]["terminals"] == []
 
+    def test_a_delete_leaves_a_terminal_launched_since_under_the_same_id(
+        self, http, start_runtime, monkeypatch
+    ):
+        # While this delete waits on the runtime, another drops the row, and a
+        # new launch reuses the 8-hex id (another session) before this one
+        # drops "its" row.
+        _remote_row("abcd1234", "rt-1", session="cao-old1")
+        start_runtime(script=_answer, statuses={"abcd1234": TerminalStatus.IDLE})
+        real_call = terminal_service._call_runtime
+
+        def replaced_meanwhile(row, command_type, payload, **kwargs):
+            answer = real_call(row, command_type, payload, **kwargs)
+            if command_type == CommandType.DELETE:
+                database.delete_terminal("abcd1234")
+                _remote_row("abcd1234", "rt-1", session="cao-new1")
+            return answer
+
+        monkeypatch.setattr(terminal_service, "_call_runtime", replaced_meanwhile)
+        response = http.delete("/terminals/abcd1234")
+        assert response.status_code == 200, response.text  # the terminal it meant is gone
+        row = database.get_terminal_metadata("abcd1234")
+        assert row is not None and row["tmux_session"] == "cao-new1", "the new terminal is kept"
+        assert runtimes_of(http)["rt-1"]["terminals"] == ["abcd1234"], "and so is its routing"
+
 
 class TestLaunchIdRace:
     def test_a_launch_losing_an_id_race_leaves_the_winner_alone(self):
@@ -1483,6 +1507,23 @@ class TestLaunchIdRace:
         registry.release("beef0001", "rt-2")
         assert registry.is_known("beef0001", "rt-1")
         assert not registry.is_known("beef0001", "rt-2")
+
+    def test_a_deleted_terminals_placement_is_kept_for_a_launch_of_its_id(self):
+        # Between a launch's claim and its row write, a delete of the old
+        # terminal with that id finds no row: the claim is the launch's.
+        registry = registry_mod.runtime_registry
+        registry.reserve("beef0001", "rt-1")
+        registry.claim("beef0001", "rt-1")
+        registry.forget_unless_launching("beef0001")
+        assert registry.is_placed("beef0001", "rt-1")
+
+    def test_a_stale_placement_does_not_block_another_runtimes_launch_of_its_id(self):
+        registry = registry_mod.runtime_registry
+        registry.place("beef0001", "rt-1")
+        registry.reserve("beef0001", "rt-2")
+        registry.forget_unless_launching("beef0001")
+        assert not registry.is_placed("beef0001", "rt-1")
+        assert registry.claim("beef0001", "rt-2")
 
     def test_a_launch_losing_a_row_race_on_its_runtime_keeps_the_winners_placement(
         self, monkeypatch
