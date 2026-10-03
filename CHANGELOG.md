@@ -68,6 +68,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Run all four required CodeQL language jobs inside the main CI workflow,
+  including full CI reruns, instead of relying on a separate PR trigger.
+  Weekly and manual scans share the same maintainer-owned scan steps, with
+  unchanged check names and fork permissions. Document how existing PR
+  branches adopt the updated workflow (#857).
 - refuse an install that would silently overwrite another profile's installed
   artifacts, instead of letting the second install clobber the first (#493).
   Two profile files can carry the same `name:`; the second used to replace the
@@ -1490,5 +1495,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump to v0.51.0, update method name (#31)
 
 - accept optional U+03BB (λ) after % in kiro and q CLIs (#44)
-
 
