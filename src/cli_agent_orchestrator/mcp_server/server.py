@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import Annotated, Any, Dict, List, Optional, Tuple, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 
 import requests
 from fastmcp import FastMCP
@@ -722,6 +722,19 @@ async def assign_elastic(
     denied = await asyncio.to_thread(_tool_denied_reason, "assign_elastic")
     if denied:
         return {"success": False, "terminal_id": None, "elastic": True, "message": denied}
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    if agent_profiles.routes_to_ephemeral_store(agent_profile):
+        from cli_agent_orchestrator.services.ephemeral_service import log_refusal
+
+        text = f"remote_placement_not_allowed: ephemeral agent '{agent_profile}' can only launch on the node that created it; use assign or handoff"
+        log_refusal(
+            "remote_placement_not_allowed",
+            os.environ.get("CAO_TERMINAL_ID"),
+            agent_profile,
+            "use assign or handoff",
+        )
+        return {"success": False, "terminal_id": None, "elastic": True, "message": text}
     try:
         callback_terminal_id = _current_terminal_id()
         if not callback_terminal_id:
@@ -1483,6 +1496,9 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
             "terminal could not be resolved"
         )
 
+    if tool_name == "create_ephemeral_agent" and context.get("ephemeral"):
+        return "max_depth_exceeded: ephemeral agents cannot create ephemeral agents (ephemeral.max_depth=1)"
+
     if tool_name in {
         "assign",
         "handoff",
@@ -1522,6 +1538,112 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
         f"'{tool_name}' is not permitted: the calling terminal's allowed tools do not "
         f"include '{CAO_MCP_SERVER_SELECTOR}'"
     )
+
+
+async def create_ephemeral_agent(
+    purpose: str,
+    brief: str,
+    tools: Optional[
+        List[Literal["fs_read", "fs_list", "fs_write", "execute_bash", "web_fetch"]]
+    ] = None,
+    provider: Optional[Literal["claude_code", "codex"]] = None,
+    model_tier: Optional[Literal["small", "medium", "large", "auto"]] = None,
+    effort: Optional[Literal["low", "medium", "high", "auto"]] = None,
+    description: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create and store a bounded agent profile; these names cannot launch yet.
+
+    The CAO-recorded tool list is bounded by the creator's effective list.
+    This is not an OS privilege boundary or a per-tool MCP restriction.
+    Codex tools are advisory when the operator enables Codex. The feature
+    defaults off; see docs/ephemeral-agents.md for the full honesty statement.
+    """
+    from cli_agent_orchestrator.services.ephemeral_service import log_refusal
+
+    caller_id = os.environ.get("CAO_TERMINAL_ID")
+    if not caller_id:
+        rule, detail = "creator_unresolved", "a registered calling terminal is required"
+    else:
+        denied = await asyncio.to_thread(_tool_denied_reason, "create_ephemeral_agent")
+        if denied:
+            rule = (
+                "max_depth_exceeded"
+                if "max_depth_exceeded" in denied
+                else (
+                    "creator_unresolved" if "cannot authorize" in denied else "tool_exceeds_creator"
+                )
+            )
+            detail = (
+                "ephemeral agents cannot create ephemeral agents"
+                if rule == "max_depth_exceeded"
+                else (
+                    "@cao-mcp-server"
+                    if rule == "tool_exceeds_creator"
+                    else "calling terminal could not be resolved"
+                )
+            )
+        else:
+            payload = {
+                "spec_version": 1,
+                "purpose": purpose,
+                "brief": brief,
+                "description": description,
+                "provider": provider,
+                "tools": tools,
+                "model_tier": model_tier,
+                "effort": effort,
+            }
+            try:
+                response = await asyncio.to_thread(
+                    requests.post,
+                    f"{API_BASE_URL}/ephemeral-agents",
+                    params={"caller_id": caller_id},
+                    json=payload,
+                    headers=mcp_utils._auth_headers() or None,
+                    timeout=_mcp_timeout(),
+                )
+                data = response.json()
+                if response.status_code == 201:
+                    return data
+                error = data.get("detail", {}) if isinstance(data, dict) else None
+                if not isinstance(error, dict):
+                    # Auth refusals use string details, outside the policy error contract.
+                    log_refusal("unexpected_failure", caller_id, None, "")
+                    return {
+                        "success": False,
+                        "rule": "unexpected_failure",
+                        "message": "ephemeral policy: unexpected_failure",
+                    }
+                return {
+                    "success": False,
+                    "rule": error.get("rule", "unexpected_failure"),
+                    "message": error.get("message", "ephemeral policy: unexpected_failure"),
+                }
+            except (requests.RequestException, ValueError):
+                rule, detail = "creator_unresolved", "cao-server could not be reached"
+    log_refusal(rule, caller_id, None, detail)
+    return {"success": False, "rule": rule, "message": f"ephemeral policy: {rule} {detail}"}
+
+
+def _register_ephemeral_tool(target: FastMCP, enabled: Any) -> None:
+    """Register only on literal operator opt-in; agent terminals must restart to see it."""
+    if enabled is True:
+        target.tool()(create_ephemeral_agent)
+
+
+def _ephemeral_enabled_at_startup() -> bool:
+    from cli_agent_orchestrator.services.settings_service import (
+        SettingsUnreadableError,
+        get_ephemeral_settings,
+    )
+
+    try:
+        return get_ephemeral_settings()["enabled"] is True
+    except SettingsUnreadableError:
+        return False
+
+
+_register_ephemeral_tool(mcp, _ephemeral_enabled_at_startup())
 
 
 @mcp.tool()

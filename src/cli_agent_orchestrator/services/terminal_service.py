@@ -1334,7 +1334,16 @@ async def create_terminal(
         # resource. A KAS request must probe then fail closed with no window,
         # database row, FIFO, Herdr registration, or provider process.
         try:
-            profile, _source = agent_profiles.load_launch_profile(agent_profile)
+            profile, source = agent_profiles.load_launch_profile(agent_profile)
+            if source is agent_profiles.ProfileSource.EPHEMERAL:
+                from cli_agent_orchestrator.services.ephemeral_service import log_refusal
+
+                log_refusal(
+                    "launch_not_supported", caller_id, agent_profile, "claims are not supported"
+                )
+                raise agent_profiles.EphemeralLaunchRefused(
+                    f"Ephemeral target '{agent_profile}' cannot be launched until claims are supported."
+                )
         except FileNotFoundError:
             profile = None
         # Production loaders return AgentProfile. Treat a test double or an
