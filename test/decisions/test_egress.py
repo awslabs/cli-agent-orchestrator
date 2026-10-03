@@ -213,3 +213,25 @@ async def test_server_and_permit_share_startup_loader(egress, monkeypatch):
             )
             async with egress.egress_permit("model.route", "external") as allowed:
                 assert not allowed
+
+
+@pytest.mark.parametrize("timeout", [-1, float("nan"), float("inf")])
+def test_invalid_drain_timeout_refused(egress, timeout):
+    assert not egress.drain(timeout)
+
+
+def test_unreadable_or_dangling_halt_fails_closed(egress, monkeypatch, tmp_path):
+    from pathlib import Path
+
+    egress.HALT_FILE.symlink_to(tmp_path / "missing")
+    assert egress.is_halted()
+    original = Path.lstat
+
+    def lstat(path, *args, **kwargs):
+        if path == egress.HALT_FILE:
+            raise PermissionError("marker unavailable")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+    assert egress.is_halted()
+    assert {p.state.value for p in settings.load_settings().points.values()} == {"off"}
