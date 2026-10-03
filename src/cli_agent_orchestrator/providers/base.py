@@ -249,6 +249,16 @@ class BaseProvider(ABC):
     # never probed: the terminal keeps the status the edges give it.
     supports_midburst_processing_probe: bool = False
 
+    # Opt-in for StatusMonitor's per-poll PROCESSING re-check to read this
+    # provider from its composited pyte screen instead of the raw rolling
+    # window. Set True only alongside ``supports_screen_detection`` and only
+    # when the raw detector cannot anchor on that window: an Ink TUI repaints
+    # changed cells only, so the window holds glyph fragments and, once a long
+    # answer has pushed the input box past the size cap, no box at all
+    # (claude_code, GH #865). Providers that leave this False keep the raw
+    # re-check, which their detectors and turn bookkeeping were built around.
+    supports_screen_status_poll: bool = False
+
     def probe_processing_from_screen(self, screen_lines: List[str]) -> bool:
         """Report whether this half-drawn frame shows the agent actively working.
 

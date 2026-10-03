@@ -889,7 +889,20 @@ class StatusMonitor:
             )
 
         if cached == TerminalStatus.PROCESSING and buffer:
-            fresh = self._detect_status(terminal_id, buffer)
+            # A provider that opts into ``supports_screen_status_poll`` is re-read
+            # from its composited screen: its raw detector cannot anchor on the
+            # rolling window (see the flag on BaseProvider, GH #865). Everyone
+            # else keeps the raw re-check.
+            poll_provider = provider_manager.get_provider(terminal_id)
+            if (
+                CAO_PYTE_STATUS
+                and poll_provider is not None
+                and getattr(poll_provider, "supports_screen_detection", False)
+                and getattr(poll_provider, "supports_screen_status_poll", False)
+            ):
+                fresh = self._detect_screen(terminal_id, poll_provider)
+            else:
+                fresh = self._detect_status(terminal_id, buffer)
             logger.debug(
                 f"get_status [{terminal_id}]: cached=PROCESSING, "
                 f"fresh={fresh.value}, buffer_len={len(buffer)}"

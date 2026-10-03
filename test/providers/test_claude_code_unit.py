@@ -2983,3 +2983,10 @@ class TestClaudeCodeTurnEndGate:
         provider.mark_input_received()
         clock["now"] += 2.0
         assert provider.get_status_from_screen(frame) == TerminalStatus.PROCESSING
+
+    def test_claude_opts_into_screen_status_poll(self):
+        """The poll re-check must read Claude from the composite: the raw rolling
+        window never holds this TUI's input box mid-turn."""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.supports_screen_detection is True
+        assert provider.supports_screen_status_poll is True
