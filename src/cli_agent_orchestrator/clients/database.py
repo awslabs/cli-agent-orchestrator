@@ -174,6 +174,48 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class DecisionRecordModel(Base):
+    """Content-free decision records retained independently of terminals."""
+
+    __tablename__ = "decision_records"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
+    contract_version = Column(Integer, default=1, nullable=False)
+    point = Column(String, nullable=False)
+    state = Column(String, nullable=False)
+    decider = Column(String, nullable=True)
+    decider_version = Column(String, nullable=True)
+    kind = Column(String, nullable=False)
+    provider = Column(String, nullable=False)
+    agent_profile = Column(String, nullable=True)
+    fallback_value = Column(String, nullable=True)
+    fallback_source = Column(String, nullable=False)
+    answer = Column(String, nullable=True)
+    probabilities = Column(Text, nullable=True)
+    confidence = Column(Float, nullable=True)
+    candidate_value = Column(String, nullable=True)
+    candidate_model = Column(String, nullable=True)
+    applied_value = Column(String, nullable=True)
+    outcome = Column(String, nullable=False)
+    reason = Column(String, nullable=True)
+    launched_model = Column(String, nullable=True)
+    model_honored = Column(Boolean, nullable=True)
+    latency_ms = Column(Float, nullable=True)
+    decision_status = Column(String, default="done", nullable=False)
+    launch_status = Column(String, default="pending", nullable=False)
+    terminal_id = Column(String, nullable=True)
+    message_hash = Column(String, nullable=True)
+    hash_key_id = Column(String, nullable=True)
+    message_bytes = Column(Integer, nullable=True)
+    __table_args__ = (
+        Index("ix_decision_records_created_at", "created_at"),
+        Index("ix_decision_records_terminal_id", "terminal_id"),
+        Index("ix_decision_records_point_created_at", "point", "created_at"),
+        {"sqlite_autoincrement": True},
+    )
+
+
 class MemoryMetadataModel(Base):
     """SQLAlchemy model for memory metadata (Phase 2 U1).
 
@@ -651,6 +693,8 @@ def init_db() -> None:
     # Appended LAST (issue #447, ``handoff_results``). Its own new table, no shared
     # columns with anything above, so registry order is immaterial here too.
     _migrate_add_handoff_results()
+    # Appended LAST: its independent table and indexes do not alter other migrations.
+    _migrate_decision_records()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -3037,3 +3081,12 @@ def get_flows_to_run() -> List[Flow]:
             )
             for f in flows
         ]
+
+
+def _migrate_decision_records(bind: Any = None) -> None:
+    """Add the independent decision table and indexes without changing old rows."""
+    try:
+        DecisionRecordModel.__table__.create(bind=engine if bind is None else bind, checkfirst=True)
+    except Exception:
+        logger.warning("Decision record migration failed")
+        raise

@@ -918,12 +918,17 @@ async def shutdown_session(
     return {"success": False, "message": "Shutdown session failed: invalid response payload"}
 
 
+from cli_agent_orchestrator.ops_mcp_server.decision_tools import (  # noqa: E402
+    register_decision_tools,
+)
+
 # Plugins may add operator-facing tools here too (the cao_quota plugin's
 # provider_availability / record_provider_refusal, for example): an external
 # coordinator that only speaks to cao-ops otherwise has no way to reach them.
 # Same best-effort entry-point registration the in-session server performs.
 from cli_agent_orchestrator.plugins.registry import register_mcp_server_surfaces  # noqa: E402
 
+register_decision_tools(mcp)
 register_mcp_server_surfaces(mcp)
 
 
