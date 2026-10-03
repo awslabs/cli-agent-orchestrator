@@ -163,8 +163,13 @@ def _hermetic_cao_env(monkeypatch, tmp_path):
     stripping ``CAO_TERMINAL_ID`` is load-bearing for vault-recall exclusion
     tests as well as sender-id defaults.
     """
+    from cli_agent_orchestrator.decisions import egress
+    from cli_agent_orchestrator.decisions.settings import load_settings
     from cli_agent_orchestrator.services import settings_service
 
+    monkeypatch.setattr(egress, "HALT_FILE", tmp_path / "decisions.halt")
+    monkeypatch.setattr(egress, "EGRESS_LOCK_FILE", tmp_path / "decisions-egress.lock")
+    monkeypatch.setattr(egress, "_settings_loader", load_settings)
     monkeypatch.setattr(settings_service, "SETTINGS_FILE", tmp_path / "settings.json")
     monkeypatch.setattr(settings_service, "_server_settings_cache", None)
     monkeypatch.setattr(settings_service, "_server_settings_mtime_ns", -1)
