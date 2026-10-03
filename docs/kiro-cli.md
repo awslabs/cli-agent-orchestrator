@@ -118,7 +118,9 @@ and resolves both the agent directory and the target before reading. The target
 must be beneath that directory: an escaping symlink or a link to the directory
 itself raises an error rather than being treated as a missing policy. Symlinks
 to files within the agent directory and a symlinked agent directory remain
-supported.
+supported. These policy-path refusals return HTTP 400 from session creation,
+terminal creation, and run-step requests; missing sessions or terminals retain
+their HTTP 404 responses.
 
 ## Configuration
 

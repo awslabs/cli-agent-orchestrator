@@ -77,6 +77,10 @@ from cli_agent_orchestrator.utils.tool_mapping import (
 logger = logging.getLogger(__name__)
 
 
+class KiroAgentPathError(ValueError):
+    """The Kiro policy file does not resolve beneath its agent directory."""
+
+
 class InstallResult(BaseModel):
     """Structured result for agent profile installation."""
 
@@ -1450,14 +1454,14 @@ def installed_kiro_tools(profile_name: str) -> Optional[List[str]]:
     profile installed before CAO wrote the policy into ``tools`` (it carries
     ``["*"]``) and say so, since on Kiro the installed file is the policy.
 
-    Raises ``ValueError`` when the file does not resolve beneath the Kiro agent directory.
+    Raises ``KiroAgentPathError`` when the file is not beneath the Kiro agent directory.
     """
     base = os.path.realpath(KIRO_AGENTS_DIR)
     agent_path = os.path.realpath(
         os.path.join(base, f"{flatten_path_separators(profile_name)}.json")
     )
     if not agent_path.startswith(base + os.sep):
-        raise ValueError("Kiro agent file must resolve beneath the agent directory")
+        raise KiroAgentPathError("Kiro agent file must resolve beneath the agent directory")
     try:
         data = json.loads(Path(agent_path).read_text(encoding="utf-8"))
     except (OSError, ValueError):

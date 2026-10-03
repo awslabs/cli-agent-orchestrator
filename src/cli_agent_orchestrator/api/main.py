@@ -154,7 +154,11 @@ from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import set_herdr_inbox_service
 from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
 from cli_agent_orchestrator.services.inbox_service import inbox_service
-from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
+from cli_agent_orchestrator.services.install_service import (
+    InstallResult,
+    KiroAgentPathError,
+    install_agent,
+)
 from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.profile_search import (
     DEFAULT_LIMIT as PROFILE_SEARCH_DEFAULT_LIMIT,
@@ -3664,9 +3668,9 @@ async def create_terminal_in_session(
         # that arm: IdempotencyKeyConflict is not a ValueError, so no reorder
         # of the ValueError family can shadow it.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except (KiroPhase0KASError, KiroCapabilityError) as e:
-        # Both subclass ValueError, so they must precede the generic arm below —
-        # a rejected engine is a bad request, not a missing resource. Matches
+    except (KiroPhase0KASError, KiroCapabilityError, KiroAgentPathError) as e:
+        # These subclass ValueError, so they must precede the generic arm below —
+        # a rejected configuration is a bad request, not a missing resource. Matches
         # POST /sessions, which already returns 400 for the identical failure.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except TerminalLimitError as e:
@@ -4586,8 +4590,8 @@ async def run_step(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail={"message": str(e), "kind": "timeout", "terminal_id": None},
         )
-    except (KiroPhase0KASError, KiroCapabilityError) as e:
-        # Ordered before the ValueError arm they subclass: an engine rejection is
+    except (KiroPhase0KASError, KiroCapabilityError, KiroAgentPathError) as e:
+        # Ordered before the ValueError arm they subclass: a configuration rejection is
         # a bad request, not an unknown terminal.
         _settle_step(None, str(e))
         await _record_job_state(job_id, "error", error_message=str(e))
