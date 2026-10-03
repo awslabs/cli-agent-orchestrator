@@ -178,7 +178,7 @@ class TestCodexBuildCommand:
             " -c check_for_update_on_startup=false"
         )
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_build_command_with_skill_prompt(self, mock_load_profile, tmp_path):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -203,7 +203,7 @@ class TestCodexBuildCommand:
         assert "## Available Skills" in instructions
         assert "python-testing" in instructions
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_build_command_with_agent_profile(self, mock_load_profile, tmp_path):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -222,7 +222,7 @@ class TestCodexBuildCommand:
         assert "developer_instructions=$(cat " in command
         assert "You are a code supervisor agent." in read_developer_instructions_file(command)
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_build_command_escapes_quotes(self, mock_load_profile, tmp_path):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -237,7 +237,7 @@ class TestCodexBuildCommand:
 
         assert '\\"double quotes\\"' in read_developer_instructions_file(command)
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_build_command_escapes_newlines(self, mock_load_profile, tmp_path):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -263,7 +263,7 @@ class TestCodexBuildCommand:
         assert "\\n" in instructions
         assert "Line one.\\nLine two.\\n\\n## Section\\n- Item" in instructions
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_build_command_with_mcp_servers(self, mock_load_profile):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -297,7 +297,7 @@ class TestCodexBuildCommand:
         assert "mcp_servers.cao-mcp-server.tool_timeout_sec=600.0" in command
 
     @patch("cli_agent_orchestrator.providers.codex.resolve_mcp_server_config")
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_bundled_mcp_command_is_resolved(self, mock_load_profile, mock_resolve):
         """The bundled bare cao-mcp-server command is run through the resolver
         before being emitted as a -c override."""
@@ -325,7 +325,7 @@ class TestCodexBuildCommand:
         assert 'mcp_servers.cao-mcp-server.command="/home/u/.local/bin/cao-mcp-server"' in command
 
     @patch("cli_agent_orchestrator.providers.codex.resolve_mcp_server_config")
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_mcp_server_command_field_is_toml_escaped(self, mock_load_profile, mock_resolve):
         """A resolved command containing TOML-special chars is escaped so the
         -c override stays a valid TOML basic string."""
@@ -353,7 +353,7 @@ class TestCodexBuildCommand:
         # The raw (unescaped) form must NOT appear -- that would break TOML.
         assert '"/tmp/we"ird' not in command
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_mcp_server_args_and_env_are_toml_escaped(self, mock_load_profile):
         """Args and env values containing TOML-special chars are escaped."""
         mock_profile = MagicMock()
@@ -381,7 +381,7 @@ class TestCodexBuildCommand:
         assert r'--flag="C:\data"' not in command
         assert 'se"cret' not in command
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_mcp_env_vars_non_string_entry_fails_fast(self, mock_load_profile):
         """A non-string env_vars entry raises TypeError (intentional fail-fast).
 
@@ -407,7 +407,7 @@ class TestCodexBuildCommand:
         with pytest.raises(TypeError, match="scalars"):
             provider._build_codex_command()
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_build_command_with_mcp_servers_env(self, mock_load_profile):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -434,7 +434,7 @@ class TestCodexBuildCommand:
         assert "mcp_servers.test-server.env_vars=" in command
         assert "CAO_TERMINAL_ID" in command
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_build_command_mcp_preserves_existing_env_vars(self, mock_load_profile):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -457,7 +457,7 @@ class TestCodexBuildCommand:
         assert "PATH" in command
         assert "CAO_TERMINAL_ID" in command
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_build_command_empty_system_prompt(self, mock_load_profile):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -475,7 +475,7 @@ class TestCodexBuildCommand:
         )
         assert "developer_instructions" not in command
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_build_command_none_system_prompt(self, mock_load_profile):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -492,7 +492,7 @@ class TestCodexBuildCommand:
             " -c check_for_update_on_startup=false"
         )
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_build_command_profile_load_failure(self, mock_load_profile):
         mock_load_profile.side_effect = RuntimeError("Profile not found")
 
@@ -505,7 +505,7 @@ class TestCodexBuildCommand:
     @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_initialize_with_agent_profile(
         self, mock_tmux, mock_load_profile, mock_wait_shell, mock_wait_status, mock_sleep, tmp_path
@@ -538,7 +538,7 @@ class TestCodexBuildCommand:
 class TestCodexProviderModelFlag:
     """Tests that profile.model is forwarded to Codex via --model."""
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_build_command_appends_model_when_set(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = "gpt-5"
@@ -552,7 +552,7 @@ class TestCodexProviderModelFlag:
 
         assert "--model gpt-5" in command
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_build_command_omits_model_when_unset(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -566,7 +566,7 @@ class TestCodexProviderModelFlag:
 
         assert "--model" not in command
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_explicit_model_override_wins_over_profile_model(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = "gpt-5"
@@ -592,7 +592,7 @@ class TestCodexBuildCommandExtra:
     """Coverage for branches inside ``_build_codex_command`` that the
     pre-existing fixtures didn't exercise."""
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_security_prompt_prepended_when_tools_restricted(self, mock_load, tmp_path):
         # When ``allowed_tools`` is a restricted set (no "*"), the provider
         # prepends SECURITY_PROMPT plus a "You only have access to these
@@ -617,7 +617,7 @@ class TestCodexBuildCommandExtra:
         # rather than importing the constant into the test fixture.
         assert "NEVER" in instructions  # "NEVER read/output: ~/.aws/credentials..."
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_long_system_prompt_keeps_launch_line_short(self, mock_load, tmp_path):
         """Regression test for the real, live-reproduced failure: a large system_prompt
         (harness-control's own injected operating instructions + skill list commonly produce
@@ -660,7 +660,7 @@ class TestCodexBuildCommandExtra:
         assert "developer_instructions=$(cat " in command
         assert long_prompt in read_developer_instructions_file(command)
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_developer_instructions_file_written_with_owner_only_permissions(
         self, mock_load, tmp_path
     ):
@@ -680,7 +680,7 @@ class TestCodexBuildCommandExtra:
         file_path = Path(match.group(1))
         assert oct(file_path.stat().st_mode)[-3:] == "600"
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_cleanup_removes_developer_instructions_file(self, mock_load, tmp_path):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -700,7 +700,7 @@ class TestCodexBuildCommandExtra:
             provider.cleanup()
             assert not file_path.exists()
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_mcp_server_accepts_model_instance(self, mock_load):
         # mcpServers values may arrive as McpServer model instances (not
         # dicts) when loaded via Pydantic; the provider falls back to
@@ -728,7 +728,7 @@ class TestCodexBuildCommandExtra:
 class TestCodexProviderCodexProfile:
     """Tests that profile.codexProfile swaps --yolo for codex's --profile <name>."""
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_codex_profile_replaces_yolo(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -746,7 +746,7 @@ class TestCodexProviderCodexProfile:
         assert "--no-alt-screen" in command
         assert "--disable shell_snapshot" in command
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_codex_profile_composes_with_mcp_overrides(self, mock_load):
         # Regression guard: --profile <name> must still be followed by the
         # -c mcp_servers... overrides CAO injects, so handoff/assign keep
@@ -773,7 +773,7 @@ class TestCodexProviderCodexProfile:
         assert "mcp_servers.cao-mcp-server.tool_timeout_sec=600.0" in command
         assert "CAO_TERMINAL_ID" in command
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_yolo_overrides_codex_profile(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -788,7 +788,7 @@ class TestCodexProviderCodexProfile:
         assert "--yolo" in command
         assert "--profile" not in command
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_discarded_codex_profile_is_warned_not_silent(self, mock_load, caplog):
         """#707: dropping an explicit containment setting must not be silent.
 
@@ -816,7 +816,7 @@ class TestCodexProviderCodexProfile:
         assert "cao_reviewer" in text, "the discarded profile is not named"
         assert "allowed_tools" in text and "*" in text, "the cause is not named"
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_no_warning_when_codex_profile_is_honored(self, mock_load, caplog):
         """The warning must be specific to the discard, not to codexProfile itself."""
         mock_profile = MagicMock()
@@ -929,7 +929,7 @@ class TestMcpKeyValidation:
     @pytest.mark.parametrize(
         "name", ['srv"x', "srv\ninjected", "srv\n", "bad name", "a=b", "", "srv.dotted"]
     )
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_rejects_unsafe_server_name(self, mock_load, name):
         mock_load.return_value = self._profile_with({name: {"command": "cmd", "args": []}})
         provider = CodexProvider("tid", "sess", "win", "agent")
@@ -937,7 +937,7 @@ class TestMcpKeyValidation:
             provider._build_codex_command()
 
     @pytest.mark.parametrize("env_key", ['K"X', "K\nY", "K\n", "BAD KEY", "a=b", "K.DOTTED"])
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_an_env_key_is_no_longer_rejected_but_escaped(self, mock_load, env_key):
         """CONTRACT INVERTED by review 5222539218 on #584 (item 6).
 
@@ -965,7 +965,7 @@ class TestMcpKeyValidation:
         assert match, command
         assert tomllib.loads(f"x = {match.group(1)}")["x"] == {env_key: "value"}
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_an_empty_env_key_is_still_expressible(self, mock_load):
         """TOML permits a quoted empty key; nothing about it corrupts the document."""
         import re as _re
@@ -984,7 +984,7 @@ class TestMcpKeyValidation:
         assert match, command
         assert tomllib.loads(f"x = {match.group(1)}")["x"] == {"": "value"}
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_accepts_normal_names_and_env_keys(self, mock_load):
         mock_load.return_value = self._profile_with(
             {"cao-mcp-server": {"command": "cmd", "args": [], "env": {"API_KEY": "v"}}}
@@ -998,7 +998,7 @@ class TestMcpKeyValidation:
 class TestCodexProviderCodexConfig:
     """Tests that profile.codexConfig emits inline ``-c key=value`` overrides."""
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_codex_config_emits_c_overrides_in_yolo_path(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -1023,7 +1023,7 @@ class TestCodexProviderCodexConfig:
         assert 'service_tier="fast"' in command
         assert "features.fast_mode=true" in command
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_codex_config_composes_with_codex_profile(self, mock_load):
         # codexConfig must apply in the --profile path too, so effort/fast-mode
         # knobs work whether or not a named profile governs sandbox/approvals.
@@ -1042,7 +1042,7 @@ class TestCodexProviderCodexConfig:
         assert "--yolo" not in command
         assert 'model_reasoning_effort="high"' in command
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_codex_config_none_emits_no_overrides(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -1060,7 +1060,7 @@ class TestCodexProviderCodexConfig:
             " -c check_for_update_on_startup=false"
         )
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_codex_config_empty_dict_emits_no_overrides(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -1078,7 +1078,7 @@ class TestCodexProviderCodexConfig:
             " -c check_for_update_on_startup=false"
         )
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_codex_config_composes_with_mcp_and_model(self, mock_load):
         # Regression guard: codexConfig overrides sit alongside the model flag
         # and the -c mcp_servers... wiring without clobbering either.
@@ -3708,7 +3708,7 @@ class TestCodexProviderUpdateDialog:
             "test-session", "window-0", "3", enter_count=0
         )
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_update_check_suppression_is_last_override(self, mock_load):
         """CAO's update suppression must win even if a profile sets the key."""
         mock_profile = MagicMock()
@@ -5151,7 +5151,8 @@ class TestCodexEnvIsOneInlineTable:
         profile.codexConfig = None
         profile.mcpServers = {"s": {"command": "srv", "env": env}}
         with patch(
-            "cli_agent_orchestrator.providers.codex.load_agent_profile", return_value=profile
+            "cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile",
+            return_value=profile,
         ):
             provider = CodexProvider("test1234", "sess", "win-0", "agent")
             return provider._build_codex_command()
@@ -5183,7 +5184,8 @@ class TestCodexEnvIsOneInlineTable:
         profile.codexConfig = None
         profile.mcpServers = {"acme.tools": {"command": "srv"}}
         with patch(
-            "cli_agent_orchestrator.providers.codex.load_agent_profile", return_value=profile
+            "cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile",
+            return_value=profile,
         ):
             provider = CodexProvider("test1234", "sess", "win-0", "agent")
             with pytest.raises(ValueError, match="mcpServers name"):
@@ -5199,7 +5201,7 @@ class TestCodexNativeCwd:
     field need.
     """
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_cwd_is_emitted_as_a_config_override(self, mock_load):
         profile = MagicMock()
         profile.model = None
@@ -5212,7 +5214,7 @@ class TestCodexNativeCwd:
         command = provider._build_codex_command()
         assert 'mcp_servers.s.cwd="/p"' in command, command
 
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     def test_no_cwd_override_when_the_entry_has_none(self, mock_load):
         profile = MagicMock()
         profile.model = None
@@ -5528,7 +5530,7 @@ class TestCodexInitHonoursProfileTimeout:
     @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.services.settings_service.get_server_settings")
     @patch("cli_agent_orchestrator.providers.codex.get_server_settings")
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
@@ -5569,7 +5571,7 @@ class TestCodexInitHonoursProfileTimeout:
     @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.services.settings_service.get_server_settings")
     @patch("cli_agent_orchestrator.providers.codex.get_server_settings")
-    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.get_backend")

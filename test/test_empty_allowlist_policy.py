@@ -118,7 +118,8 @@ class TestSoftProvidersKeepAZeroToolInstruction:
         provider = CodexProvider("tid", "sess", "win", "agent", allowed_tools=[])
         with (
             patch(
-                "cli_agent_orchestrator.providers.codex.load_agent_profile", return_value=profile
+                "cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile",
+                return_value=profile,
             ),
             patch("cli_agent_orchestrator.providers.codex.CAO_HOME_DIR", tmp_path),
         ):

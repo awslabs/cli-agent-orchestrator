@@ -2493,6 +2493,7 @@ class TestListTerminalsInSessions:
             "agent_profile",
             "model",
             "model_honored",
+            "ephemeral",
             "working_directory",
             "engine",
             "deferred_init_failure",
