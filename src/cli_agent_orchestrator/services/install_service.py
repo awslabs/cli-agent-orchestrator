@@ -1566,7 +1566,11 @@ def install_agent(
             raise FileNotFoundError(f"Reserved ephemeral profile name: {agent_name}")
 
         raw_content = incoming if incoming is not None else _read_agent_profile_source(agent_name)
-        raw_name = frontmatter.loads(raw_content).get("name", agent_name)
+        try:
+            raw_name = frontmatter.loads(raw_content).get("name", agent_name)
+        except yaml.YAMLError:
+            # Unresolved flow placeholders may become valid YAML only after resolution.
+            raw_name = None
         if isinstance(raw_name, str) and agent_profiles.routes_to_ephemeral_store(raw_name):
             raise FileNotFoundError(f"Reserved ephemeral profile name: {raw_name}")
         # A ${VAR}-built reserved name is refused only after resolution below.

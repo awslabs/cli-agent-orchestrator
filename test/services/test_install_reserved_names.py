@@ -243,3 +243,79 @@ def test_variable_built_reserved_name_is_refused_after_resolution(has_env, paths
         loader.assert_not_called()
         resolver.assert_called_once_with(content)
     assert all(list(path.iterdir()) == [] for path in stores.values())
+
+
+def flow_document(name, shape, provider="kiro_cli"):
+    field = "env: {TOKEN: ${TOKEN}}" if shape == "mapping" else "args: [--token, ${TOKEN}]"
+    return (
+        f"---\nname: {name}\ndescription: Flow placeholders\nprovider: {provider}\n"
+        f"mcpServers:\n  helper:\n    command: fake-server\n    {field}\n---\nTask.\n"
+    )
+
+
+@pytest.mark.parametrize("surface", ["cli-file", "api-url"])
+@pytest.mark.parametrize("shape", ["mapping", "sequence"])
+@pytest.mark.parametrize("reserved", [False, True])
+def test_flow_placeholders_resolve_before_parsed_name_refusal(
+    paths, tmp_path, monkeypatch, surface, shape, reserved
+):
+    from cli_agent_orchestrator.api.main import app
+    from cli_agent_orchestrator.cli.commands.install import install
+
+    stores, seam, _ = paths
+    content = flow_document(RESERVED if reserved else "ordinary", shape)
+    loader = Mock(return_value={})
+    persist = Mock()
+    guard = Mock(wraps=install_service._guard_installed_copy_ownership)
+    monkeypatch.setattr(install_service, "load_env_vars", loader)
+    monkeypatch.setattr(install_service, "set_env_var", persist)
+    monkeypatch.setattr(install_service, "_guard_installed_copy_ownership", guard)
+    if surface == "cli-file":
+        source = tmp_path / "ordinary.md"
+        source.write_text(content)
+        result = CliRunner().invoke(
+            install, [str(source), "--provider", "kiro_cli", "--env", "TOKEN=abc"]
+        )
+        success, message = "installed successfully" in result.output, result.output
+    else:
+        monkeypatch.setattr(install_service, "_download_agent", lambda url: ("ordinary", content))
+        result = TestClient(app, base_url="http://localhost").post(
+            "/agents/profiles/install",
+            json={
+                "source": "https://raw.githubusercontent.com/example/repo/main/ordinary.md",
+                "provider": "kiro_cli",
+                "env_vars": {"TOKEN": "abc"},
+            },
+        )
+        success, message = result.status_code == 200, result.text
+    assert success is not reserved, message
+    loader.assert_called_once()
+    seam.assert_not_called()
+    if reserved:
+        assert f"Reserved ephemeral profile name: {RESERVED}" in message
+        guard.assert_not_called()
+        persist.assert_not_called()
+        assert all(list(path.iterdir()) == [] for path in stores.values())
+    else:
+        guard.assert_called_once()
+        persist.assert_called_once_with("TOKEN", "abc")
+        assert (stores["store"] / "ordinary.md").is_file()
+        assert (stores["context"] / "ordinary.md").is_file()
+        assert (stores["kiro"] / "ordinary.json").is_file()
+
+
+def test_raw_name_precheck_does_not_swallow_non_yaml_errors(paths, monkeypatch):
+    stores, seam, resolver = paths
+    monkeypatch.setattr(
+        install_service.frontmatter,
+        "loads",
+        Mock(side_effect=RuntimeError("unexpected parser error")),
+    )
+    result = install_service.install_agent(
+        "ordinary", provider="kiro_cli", profile_content=document("ordinary")
+    )
+    assert not result.success
+    assert "unexpected parser error" in result.message
+    resolver.assert_not_called()
+    seam.assert_not_called()
+    assert all(list(path.iterdir()) == [] for path in stores.values())

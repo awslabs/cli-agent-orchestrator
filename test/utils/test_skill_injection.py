@@ -490,3 +490,32 @@ def test_batch_skips_reserved_file_and_refreshes_next_agent(
     assert "reserved" in skips[0].message.lower()
     if reserved_at != "loaded":
         loader.assert_called_once_with("zeta")
+
+
+@pytest.mark.parametrize("reserved_at", ["filename", "frontmatter"])
+def test_unmanaged_reserved_agent_is_skipped_silently(tmp_path, monkeypatch, caplog, reserved_at):
+    from unittest.mock import Mock
+
+    reserved = "Bunmanaged-log_triage-0000"
+    stem = reserved if reserved_at == "filename" else "userown"
+    name = reserved if reserved_at == "frontmatter" else "userown"
+    copilot = tmp_path / "copilot"
+    context = tmp_path / "context"
+    context.mkdir()
+    target = copilot / f"{stem}.agent.md"
+    _write_agent_md(target, name, "User owned", "Preserve this prompt")
+    before = target.read_bytes()
+    monkeypatch.setattr(skill_injection, "COPILOT_AGENTS_DIR", copilot)
+    monkeypatch.setattr(skill_injection, "AGENT_CONTEXT_DIR", context)
+    loader = Mock()
+    monkeypatch.setattr(skill_injection, "load_agent_profile", loader)
+    with caplog.at_level(logging.WARNING, logger=skill_injection.__name__):
+        result = skill_injection.refresh_all_cao_managed_agents()
+    assert result == []
+    assert target.read_bytes() == before
+    loader.assert_not_called()
+    assert not [
+        r
+        for r in caplog.records
+        if r.name == skill_injection.__name__ and "CAO-managed" in r.message
+    ]
