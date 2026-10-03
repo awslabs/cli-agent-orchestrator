@@ -416,6 +416,33 @@ def test_cao_bridge_clears_a_stale_readiness_file_before_its_startup_work(monkey
     assert seen == [False], "the stale readiness file was still there during startup"
 
 
+def test_cao_bridge_will_not_start_beside_a_readiness_file_it_cannot_remove(monkeypatch, tmp_path):
+    # Kept, it would report this runtime ready while starting and while
+    # disconnected: readiness fails closed instead.
+    import cli_agent_orchestrator.clients.database as database
+    from cli_agent_orchestrator.runtime_channel import bridge as bridge_mod
+
+    ready = tmp_path / "bridge-ready"
+    ready.mkdir()  # cannot be unlinked as a file
+    (ready / "keep").write_text("")
+
+    def must_not_start(*args, **kwargs):
+        raise AssertionError("cao-bridge started beside a readiness file it cannot clear")
+
+    monkeypatch.setattr(database, "init_db", must_not_start)
+    monkeypatch.setenv("CAO_BRIDGE_SERVER_URL", "ws://server/runtime/channel")
+    monkeypatch.setenv("CAO_BRIDGE_RUNTIME_ID", "rt-1")
+    monkeypatch.setenv("CAO_BRIDGE_READY_FILE", str(ready))
+    monkeypatch.setenv(token_mod.TOKEN_ENV, "token")
+    token_mod._reset_for_tests()
+    try:
+        with pytest.raises(SystemExit) as exc:
+            asyncio.run(bridge_mod._amain())
+    finally:
+        token_mod._reset_for_tests()
+    assert "CAO_BRIDGE_READY_FILE" in str(exc.value)
+
+
 def test_cao_bridge_names_itself_in_its_startup_banner(monkeypatch, capsys):
     import logging
 

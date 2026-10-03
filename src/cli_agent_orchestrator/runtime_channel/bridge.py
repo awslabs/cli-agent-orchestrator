@@ -56,6 +56,18 @@ class ChannelRefused(Exception):
     """The server refused this runtime (token or protocol version). Retrying cannot help."""
 
 
+class UnreportedLaunch(RuntimeError):
+    """A launch whose agent runs, but which could be neither reported nor stopped.
+
+    Its failed result names ``terminal_id``: the server learns of a terminal
+    only from successful results, so without the name nothing would stop it.
+    """
+
+    def __init__(self, message: str, terminal_id: str):
+        super().__init__(message)
+        self.terminal_id = terminal_id
+
+
 class Bridge:
     def __init__(
         self, server_url: str, runtime_id: str, token: str, ready_file: Optional[Path] = None
@@ -199,7 +211,11 @@ class Bridge:
             result = Result(op_id=command.op_id, ok=True, payload=payload)
         except Exception as exc:  # noqa: BLE001 - reported to the server as a failed result
             logger.warning("command %s (%s) failed: %s", command.op_id, command.type.value, exc)
-            result = Result(op_id=command.op_id, ok=False, error=str(exc) or type(exc).__name__)
+            # A failed launch whose agent still runs names it, for the server to delete.
+            named = {"terminal_id": exc.terminal_id} if isinstance(exc, UnreportedLaunch) else {}
+            result = Result(
+                op_id=command.op_id, ok=False, error=str(exc) or type(exc).__name__, payload=named
+            )
         await self._send(result)
         launched = result.payload.get("terminal") if result.ok else None
         if command.type == CommandType.LAUNCH and isinstance(launched, dict):
@@ -239,7 +255,8 @@ class Bridge:
                     logger.exception("could not stop unreported terminal %s", terminal.id)
                 detail = f"launched terminal {terminal.id} but could not report it ({exc})"
                 if not stopped:
-                    detail += "; it may still be running"
+                    # Named, so the server deletes it as an unrecorded terminal.
+                    raise UnreportedLaunch(detail + "; it may still be running", terminal.id)
                 raise RuntimeError(detail) from exc
 
         terminal_id = command.terminal_id
@@ -476,11 +493,15 @@ async def _amain() -> None:
     ready = os.environ.get("CAO_BRIDGE_READY_FILE", "").strip()
     ready_file = Path(ready) if ready else CAO_HOME_DIR / "bridge-ready"
     # One a run that died left behind would report this one ready through its
-    # startup work; the channel recreates it once the hello is done.
+    # startup work; the channel recreates it once the hello is done. Fail
+    # closed: kept, it would report this runtime ready while disconnected too.
     try:
         ready_file.unlink(missing_ok=True)
     except OSError as exc:
-        logger.warning("could not clear readiness file %s: %s", ready_file, exc)
+        raise SystemExit(
+            f"CAO_BRIDGE_READY_FILE {str(ready_file)!r} cannot be removed ({exc}); "
+            "a readiness file left in place would report this runtime ready"
+        )
 
     # The full schema: the terminal service a launch runs writes more than the
     # terminals table (e.g. session incarnations), and a subset would drift.

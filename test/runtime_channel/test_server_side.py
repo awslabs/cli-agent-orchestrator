@@ -32,7 +32,7 @@ from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import LocalExecutionDisabledError, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.runtime_channel import token as token_mod
-from cli_agent_orchestrator.runtime_channel.bridge import Bridge
+from cli_agent_orchestrator.runtime_channel.bridge import Bridge, UnreportedLaunch
 from cli_agent_orchestrator.runtime_channel.protocol import (
     PROTOCOL_VERSION,
     Command,
@@ -1547,6 +1547,68 @@ class TestUnrecordedCleanupPerId:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
         assert not server_mod._unrecorded, "finished cleanups are forgotten"
+
+
+class TestUnreportedLaunch:
+    @staticmethod
+    def _fail_launches_naming(runtime, terminal_id):
+        # What cao-bridge does for an agent it could neither report nor stop.
+        async def execute(command):
+            runtime.received.append(command)
+            if command.type == CommandType.LAUNCH:
+                raise UnreportedLaunch(
+                    f"launched terminal {terminal_id} but could not report it", terminal_id
+                )
+            return {"deleted": True}
+
+        runtime.execute = execute
+
+    def test_a_failed_launch_naming_its_terminal_gets_it_deleted(self, http, start_runtime):
+        runtime = start_runtime()
+        self._fail_launches_naming(runtime, "beef0009")
+        response = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
+        assert response.status_code == 502, response.text
+        _wait_for(
+            lambda: (CommandType.DELETE, "beef0009")
+            in [(c.type, c.terminal_id) for c in runtime.received],
+            "the server to delete the unreported terminal",
+        )
+
+    def test_a_failed_launch_cannot_get_a_recorded_terminal_deleted(self, http, start_runtime):
+        _remote_row("abcd1234", "rt-1")
+        runtime = start_runtime(script=_answer)
+        self._fail_launches_naming(runtime, "abcd1234")
+        response = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
+        assert response.status_code == 502, response.text
+        time.sleep(0.3)
+        assert [c.type for c in runtime.received] == [CommandType.LAUNCH]
+        assert database.get_terminal_metadata("abcd1234") is not None
+
+
+class TestStatusOnReconnect:
+    def test_a_reconnected_runtime_republishes_its_statuses(self, start_runtime, monkeypatch):
+        # Status consumers (approval prompts, inbox delivery) react to status
+        # events only. After a hello, cao-bridge sends each terminal's status
+        # as a status frame, which the server publishes: a terminal already
+        # waiting for its user when the server restarted gets its prompt back.
+        from cli_agent_orchestrator.services.event_bus import bus
+
+        _remote_row("abcd1234", "rt-1")
+        events, loop = [], asyncio.new_event_loop()
+        monkeypatch.setattr(bus, "_loop", loop)
+        queue = loop.run_until_complete(_subscribe(bus))
+        try:
+            start_runtime(statuses={"abcd1234": TerminalStatus.WAITING_USER_ANSWER})
+            event = loop.run_until_complete(asyncio.wait_for(queue.get(), 5))
+            events.append((event["topic"], event["data"]))
+        finally:
+            bus.unsubscribe("terminal.*.status", queue)
+            loop.close()
+        assert events == [("terminal.abcd1234.status", {"status": "waiting_user_answer"})]
+
+
+async def _subscribe(bus):
+    return bus.subscribe("terminal.*.status")
 
 
 class TestUnrecordedCleanupRetry:

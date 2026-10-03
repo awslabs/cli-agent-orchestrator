@@ -24,7 +24,14 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from pydantic import BaseModel, Field, ValidationError, ValidationInfo, field_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+)
 
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import (
@@ -98,6 +105,19 @@ def _launch_timeout() -> float:
             pass
         logger.warning("ignoring %s=%r: not a positive number of seconds", LAUNCH_TIMEOUT_ENV, raw)
     return LAUNCH_TIMEOUT
+
+
+_TERMINAL_ID = TypeAdapter(TerminalId)
+
+
+def _unreported_terminal(frame: Result) -> Optional[str]:
+    """The terminal a failed result names as still running, if any: a launch
+    whose agent cao-bridge could neither report nor stop."""
+    named = frame.payload.get("terminal_id") if not frame.ok else None
+    try:
+        return _TERMINAL_ID.validate_python(named) if named is not None else None
+    except ValidationError:
+        return None
 
 
 def _token_matches(presented: str) -> bool:
@@ -246,6 +266,10 @@ async def runtime_channel(ws: WebSocket) -> None:
                 ):
                     # A launch that finished after the server gave up on it.
                     _delete_unrecorded(conn, launched_id)
+                unreported = _unreported_terminal(frame)
+                if unreported and not runtime_registry.is_known(unreported, runtime_id):
+                    # A failed launch whose agent the runtime could not stop.
+                    _delete_unrecorded(conn, unreported)
             elif isinstance(frame, Status):
                 if runtime_registry.set_status(
                     frame.terminal_id, runtime_id, frame.status, conn=conn
