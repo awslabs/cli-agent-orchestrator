@@ -475,6 +475,12 @@ async def _amain() -> None:
         )
     ready = os.environ.get("CAO_BRIDGE_READY_FILE", "").strip()
     ready_file = Path(ready) if ready else CAO_HOME_DIR / "bridge-ready"
+    # One a run that died left behind would report this one ready through its
+    # startup work; the channel recreates it once the hello is done.
+    try:
+        ready_file.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("could not clear readiness file %s: %s", ready_file, exc)
 
     # The full schema: the terminal service a launch runs writes more than the
     # terminals table (e.g. session incarnations), and a subset would drift.
