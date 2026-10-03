@@ -15,6 +15,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from cli_agent_orchestrator.clients import database
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.services import settings_service
 from cli_agent_orchestrator.utils import agent_profiles
 
@@ -717,7 +718,10 @@ def test_additional_shape_refusals(create_store, field, value):
     service = create_store[0]
     with pytest.raises(service.EphemeralPolicyError) as err:
         create(create_store, {**SPEC, field: value})
-    assert err.value.rule == "invalid_spec" and err.value.status_code == 422
+    assert err.value.rule == (
+        "provider_unsupported" if field == "provider" and value == "kiro_cli" else "invalid_spec"
+    )
+    assert err.value.status_code == (400 if field == "provider" and value == "kiro_cli" else 422)
     assert not (create_store[2] / "ephemeral").exists()
 
 
@@ -764,3 +768,110 @@ def test_leaf_symlink_never_overwritten(create_store):
         create(create_store)
     assert outside.read_bytes() == b"outside"
     assert not list(live.glob("*.spec.json"))
+
+
+def test_note_build_failure_precedes_all_writes(create_store, monkeypatch):
+    service, factory, home, _, _ = create_store
+    monkeypatch.setattr(
+        service, "_policy_notes", Mock(side_effect=RuntimeError("note builder failed"))
+    )
+    with pytest.raises(service.EphemeralPolicyError) as err:
+        create(create_store)
+    assert err.value.rule == "unexpected_failure"
+    with factory() as db:
+        assert db.query(database.EphemeralAgentModel).count() == 0
+    assert not (home / "ephemeral").exists()
+
+
+def test_success_warning_failure_cannot_fail_committed_create(create_store, monkeypatch):
+    service = create_store[0]
+    create_store[4]["ephemeral"]["max_tier"] = "small"
+    monkeypatch.setattr(service.logger, "warning", Mock(side_effect=RuntimeError("warning failed")))
+    result = create(create_store)
+    assert database.get_ephemeral_agent(result["name"])["state"] == "pending"
+
+
+@pytest.mark.parametrize(
+    "block,top,model_note,effort_note,notice",
+    [
+        (
+            {"max_tier": "private-tier"},
+            {},
+            "model: provider default (tier omitted; ephemeral.max_tier is not applied yet)",
+            "effort: provider default (effort omitted, no default_effort)",
+            "ephemeral.max_tier is not applied yet; the provider default is used",
+        ),
+        (
+            {"max_effort": "private-effort"},
+            {},
+            "model: provider default (tier omitted, no default_tier)",
+            "effort: provider default (effort omitted; ephemeral.max_effort is not applied yet)",
+            "ephemeral.max_effort is not applied yet; the provider default is used",
+        ),
+        (
+            {
+                "max_tier": "private-tier",
+                "default_tier": "private-tier",
+                "max_effort": "private-effort",
+                "default_effort": "private-effort",
+            },
+            {"model_tiers": {"claude_code": {"small": "private-model-id"}}},
+            "model: provider default (tier omitted; ephemeral.max_tier, ephemeral.default_tier, model_tiers are not applied yet)",
+            "effort: provider default (effort omitted; ephemeral.max_effort, ephemeral.default_effort are not applied yet)",
+            "ephemeral.max_tier, ephemeral.default_tier, ephemeral.max_effort, ephemeral.default_effort, model_tiers are not applied yet; the provider default is used",
+        ),
+    ],
+)
+def test_ignored_notes_split_keys_without_values(
+    create_store, caplog, block, top, model_note, effort_note, notice
+):
+    config = create_store[4]
+    config["ephemeral"].update(block)
+    config.update(top)
+    result = create(create_store)
+    assert result["notes"] == [
+        model_note,
+        effort_note,
+        "launch: not supported by this server version",
+    ]
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings == ["ephemeral create " + result["name"] + ": " + notice]
+    assert "private-tier" not in str(result) + caplog.text
+    assert "private-effort" not in str(result) + caplog.text
+    assert "private-model-id" not in str(result) + caplog.text
+
+
+@pytest.mark.parametrize("declared", [True, False])
+@pytest.mark.parametrize(
+    "provider", [p.value for p in ProviderType if p.value not in {"claude_code", "codex"}]
+)
+def test_known_non_v1_provider_is_policy_refusal(create_store, declared, provider):
+    service, factory, home, _, config = create_store
+    config["ephemeral"]["allowed_providers"] = ["codex"]
+    with factory() as db:
+        db.get(database.TerminalModel, CALLER).provider = provider
+        db.commit()
+    spec = {**SPEC, "provider": provider} if declared else SPEC
+    with pytest.raises(service.EphemeralPolicyError) as err:
+        create(create_store, spec)
+    assert err.value.rule == "provider_unsupported" and err.value.status_code == 400
+    expected = provider + (
+        "; supported providers: claude_code, codex" if declared else "; set provider explicitly"
+    )
+    assert err.value.detail == expected
+    assert not (home / "ephemeral").exists()
+
+
+def test_declared_non_v1_provider_obeys_fixed_check_order(create_store):
+    service, factory, _, _, config = create_store
+    spec = {**SPEC, "provider": "kiro_cli", "model_tier": "small"}
+    with pytest.raises(service.EphemeralPolicyError) as err:
+        create(create_store, spec)
+    assert err.value.rule == "tier_not_supported"
+    config["ephemeral"]["max_depth"] = 2
+    with pytest.raises(service.EphemeralPolicyError) as err:
+        create(create_store, spec)
+    assert err.value.rule == "policy_config_error:max_depth"
+    with pytest.raises(service.EphemeralPolicyError) as err:
+        create(create_store, {**SPEC, "provider": "not-a-provider"})
+    assert err.value.rule == "invalid_spec" and err.value.status_code == 422

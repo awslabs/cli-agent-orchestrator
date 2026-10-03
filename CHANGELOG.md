@@ -17,12 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unless the operator sets `ephemeral.child_may_delegate` to `true` in
   `settings.json`. Workflow `run`/`resume`/`start` now refuse when
   `CAO_TERMINAL_ID` is set but the calling terminal cannot be resolved.
-  That security groundwork introduced no creation API.
 - Create-only ephemeral agents (#801): `create_ephemeral_agent` and
   `POST /ephemeral-agents` are available behind `ephemeral.enabled`, off by
   default. Creation stores a pending row, two live files and an archive; these
   persist without garbage collection, so keep the feature disabled outside
-  testing. Created names cannot launch until claim and launch support lands.
+  testing. cao-server refuses to launch created names
+  until claim and launch support lands.
   The live files and archive can be deleted by exact path while no ephemeral
   terminal exists. Reserved names also refuse remote placement with
   `remote_placement_not_allowed`. Explicit tiers and efforts temporarily refuse

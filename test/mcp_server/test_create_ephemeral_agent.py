@@ -1,6 +1,7 @@
 """The HTTP create boundary, opt-in MCP surface and remote placement refusal."""
 
 import json
+import logging
 from test.services.test_ephemeral_service import CALLER, SPEC, create_store  # noqa: F401
 from unittest.mock import Mock
 
@@ -312,3 +313,103 @@ async def test_mcp_unstructured_server_error_fails_redacted(
         "message": "ephemeral policy: unexpected_failure",
     }
     assert "private-brief" not in caplog.text and "private-description" not in caplog.text
+
+
+# Canonical advertised schema of the original FastMCP function registration,
+# pinned so the raw-argument tool keeps it byte-identical.
+PINNED_CREATE_TOOL_SCHEMA = '{"additionalProperties":false,"properties":{"brief":{"type":"string"},"description":{"anyOf":[{"type":"string"},{"type":"null"}],"default":null},"effort":{"anyOf":[{"enum":["low","medium","high","auto"],"type":"string"},{"type":"null"}],"default":null},"model_tier":{"anyOf":[{"enum":["small","medium","large","auto"],"type":"string"},{"type":"null"}],"default":null},"provider":{"anyOf":[{"enum":["claude_code","codex"],"type":"string"},{"type":"null"}],"default":null},"purpose":{"type":"string"},"tools":{"anyOf":[{"items":{"enum":["fs_read","fs_list","fs_write","execute_bash","web_fetch"],"type":"string"},"type":"array"},{"type":"null"}],"default":null}},"required":["purpose","brief"],"type":"object"}'
+
+
+@pytest.mark.asyncio
+async def test_real_fastmcp_schema_matches_review_base(create_store):
+    from fastmcp import FastMCP
+
+    target = FastMCP("schema compatibility")
+    server._register_ephemeral_tool(target, True)
+    tool = (await target.list_tools())[0]
+    assert (
+        json.dumps(tool.parameters, sort_keys=True, separators=(",", ":"))
+        == PINNED_CREATE_TOOL_SCHEMA
+    )
+
+
+@pytest.mark.parametrize("field", ["brief", "description", "tools"])
+@pytest.mark.asyncio
+async def test_real_fastmcp_invalid_values_are_server_redacted(create_store, monkeypatch, field):
+    from fastmcp import FastMCP
+
+    private = "AKIAIOSFODNN7EXAMPLE"
+    records = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append(self.format(record))
+
+    capture = Capture()
+    roots = [logging.getLogger("fastmcp"), logging.getLogger()]
+    for logger in roots:
+        logger.addHandler(capture)
+    monkeypatch.setenv("CAO_TERMINAL_ID", CALLER)
+    monkeypatch.setattr(server, "_tool_denied_reason", lambda _: None)
+    post = Mock(
+        side_effect=lambda url, **kw: client().post(
+            "/ephemeral-agents", params=kw["params"], json=kw["json"]
+        )
+    )
+    monkeypatch.setattr(server.requests, "post", post)
+    target = FastMCP("real validation boundary")
+    server._register_ephemeral_tool(target, True)
+    args = {"purpose": "log_triage", "brief": "Inspect logs.", field: [private]}
+    try:
+        try:
+            result = await target.call_tool("create_ephemeral_agent", args)
+            returned = str(result)
+        except Exception as exc:
+            result = None
+            returned = str(exc)
+    finally:
+        for logger in roots:
+            logger.removeHandler(capture)
+    assert private not in returned
+    assert all(private not in record for record in records)
+    assert result is not None
+    assert result.structured_content["success"] is False
+    assert result.structured_content["rule"] == "invalid_spec"
+    post.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_non_json_server_reply_is_unexpected_and_redacted(create_store, monkeypatch, caplog):
+    monkeypatch.setenv("CAO_TERMINAL_ID", CALLER)
+    monkeypatch.setattr(server, "_tool_denied_reason", lambda _: None)
+    response = Mock(status_code=500, json=Mock(side_effect=ValueError("private response body")))
+    monkeypatch.setattr(server.requests, "post", Mock(return_value=response))
+    result = await server.create_ephemeral_agent("log_triage", "private-brief")
+    assert result == {
+        "success": False,
+        "rule": "unexpected_failure",
+        "message": "ephemeral policy: unexpected_failure",
+    }
+    assert "private response body" not in str(result) + caplog.text
+    assert "private-brief" not in str(result) + caplog.text
+
+
+@pytest.mark.parametrize("path", ["assign", "handoff"])
+@pytest.mark.asyncio
+async def test_remote_refusal_uses_shared_redacted_logger(create_store, monkeypatch, caplog, path):
+    caller = "private-caller\nforged-warning"
+    monkeypatch.setenv("CAO_TERMINAL_ID", caller)
+    if path == "assign":
+        result = orchestration._assign_impl(
+            "Ramones-log_triage-3f9a", "Inspect logs.", target_host="remote"
+        )
+        assert result["success"] is False
+    else:
+        result = await orchestration._handoff_impl(
+            "Ramones-log_triage-3f9a", "Inspect logs.", target_host="remote"
+        )
+        assert result.success is False
+    assert "private-caller" not in caplog.text and "forged-warning" not in caplog.text
+    records = [r for r in caplog.records if "remote_placement_not_allowed" in r.getMessage()]
+    assert len(records) == 1
+    assert "caller=-" in records[0].getMessage()

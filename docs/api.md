@@ -38,6 +38,7 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
 
 ### Profiles, providers, and settings
 
+- `POST /ephemeral-agents` creates and stores an opt-in, [create-only ephemeral agent](ephemeral-agents.md).
 - `GET /agents/profiles` and `GET /agents/profiles/{name}` list and inspect
   installed profiles.
 - `GET /agents/profiles/search` ranks installed, loadable profiles by capability

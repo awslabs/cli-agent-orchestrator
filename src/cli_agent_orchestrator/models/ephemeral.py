@@ -5,6 +5,8 @@ from typing import Any, Literal, Optional, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from cli_agent_orchestrator.models.provider import ProviderType
+
 ToolAtom = Literal["fs_read", "fs_list", "fs_write", "execute_bash", "web_fetch"]
 ModelTier = Literal["small", "medium", "large", "auto"]
 Effort = Literal["low", "medium", "high", "auto"]
@@ -20,10 +22,19 @@ class EphemeralSpec(BaseModel):
     purpose: str = Field(pattern=r"^[a-z][a-z0-9_]{2,31}$")
     brief: str
     description: Optional[str] = Field(default=None, max_length=280)
-    provider: Optional[Literal["claude_code", "codex"]] = None
+    provider: Optional[ProviderType] = None
     tools: Optional[list[ToolAtom]] = None
     model_tier: Optional[ModelTier] = None
     effort: Optional[Effort] = None
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def provider_is_known(cls, value: Any) -> Optional[ProviderType]:
+        if value is None or isinstance(value, ProviderType):
+            return value
+        if isinstance(value, str):
+            return ProviderType(value)
+        raise ValueError("provider must be a known provider id")
 
     @field_validator("spec_version", mode="before")
     @classmethod

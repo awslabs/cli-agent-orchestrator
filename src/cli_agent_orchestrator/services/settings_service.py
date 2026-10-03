@@ -98,13 +98,13 @@ def get_ephemeral_settings() -> Dict[str, Any]:
     if not isinstance(block, dict):
         block = {}
     result = {**EPHEMERAL_DEFAULTS, **block}
-    result["_ignored_policy"] = {
-        "ephemeral." + key: block[key]
+    result["_ignored_policy"] = [
+        "ephemeral." + key
         for key in ("max_tier", "default_tier", "max_effort", "default_effort")
         if block.get(key) is not None
-    }
+    ]
     if settings.get("model_tiers") is not None:
-        result["_ignored_policy"]["model_tiers"] = settings["model_tiers"]
+        result["_ignored_policy"].append("model_tiers")
     return result
 
 

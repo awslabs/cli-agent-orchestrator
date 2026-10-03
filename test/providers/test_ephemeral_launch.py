@@ -172,6 +172,7 @@ def test_launch_routes_preserve_valueerror_mapping(stores, monkeypatch, route, s
 
 @pytest.mark.asyncio
 async def test_installed_profile_passes_launch_refusal(stores, monkeypatch):
+    monkeypatch.setattr(profiles, "resolve_env_vars", lambda text: text)
     from cli_agent_orchestrator.services import terminal_service as service
 
     (stores[0] / "ordinary.md").write_text(DOCUMENT.replace(NAME, "ordinary"))

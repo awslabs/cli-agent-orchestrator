@@ -426,10 +426,13 @@ def _remote_ephemeral_refusal(name: str, target_host: Optional[str]) -> Optional
     from cli_agent_orchestrator.utils import agent_profiles
 
     if target_host and agent_profiles.routes_to_ephemeral_store(name):
-        logger.warning(
-            "ephemeral refusal rule=remote_placement_not_allowed caller=%s name=%s detail=omit target_host",
-            os.environ.get("CAO_TERMINAL_ID") or "-",
+        from cli_agent_orchestrator.services.ephemeral_service import log_refusal
+
+        log_refusal(
+            "remote_placement_not_allowed",
+            os.environ.get("CAO_TERMINAL_ID"),
             name,
+            "omit target_host",
         )
         return f"remote_placement_not_allowed: ephemeral agent '{name}' can only launch on the node that created it; omit target_host"
     return None

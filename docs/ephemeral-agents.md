@@ -80,8 +80,8 @@ boundary. Marker strings inside the brief remain unchanged. The fence sentence i
 > An ephemeral child's CAO-recorded allowlist is a subset of its creator's effective allowlist at creation time. Its profile cannot declare MCP servers, hooks, skills or native agents; installed agent plugins' MCP servers are not added at launch; and CAO will not launch it with a wider list. An ephemeral child cannot delegate, create ephemerals or start workflows through CAO's MCP tools unless the operator sets `child_may_delegate`. That is all this guarantees. It does not guarantee:
 > 1. **Enforcement on every provider.** On Claude Code the native-tool ceiling is Hard. On Codex, an operator opt-in, `tools` is advisory: the child runs `--yolo` with a shell, and the MCP servers in the user's `~/.codex/config.toml` load. Kiro is unsupported until the deferred Kiro slice lands.
 > 2. **Per-tool MCP limits.** `@cao-mcp-server` is a server-level grant. A child can still message, answer or delete other terminals, and use every CAO tool that is not a delegation (#671).
-> 3. **A privilege boundary.** A child with `execute_bash` or `fs_write` runs as the same OS user. It can call the local HTTP API directly with a `caller_id` it supplies itself [A5], edit `settings.json`, or read `ephemeral/live/`.
-> 4. **Intersection for installed profiles** (`orchestration.py:414-421`).
+> 3. **A privilege boundary.** A child with `execute_bash` or `fs_write` runs as the same OS user. It can call the local HTTP API directly with a `caller_id` it supplies itself, edit `settings.json`, or read `ephemeral/live/`.
+> 4. **Intersection for installed profiles** (#671).
 
 These describe the intended launch guarantees. This create-only slice refuses every
 ephemeral launch and always refuses ephemeral creation by an ephemeral caller.

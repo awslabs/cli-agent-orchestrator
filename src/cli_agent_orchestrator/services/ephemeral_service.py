@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.ephemeral import TOOL_ATOMS, EphemeralSpec
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.services.secret_gate import scan_for_secrets
 from cli_agent_orchestrator.services.settings_service import (
     SettingsUnreadableError,
@@ -194,7 +195,7 @@ def normalize_brief(brief: str) -> str:
 
 
 def canonical_spec_bytes(spec: EphemeralSpec) -> bytes:
-    declared = spec.model_dump()
+    declared = spec.model_dump(mode="json")
     declared["brief"] = normalize_brief(spec.brief)
     if spec.tools is not None:
         declared["tools"] = sorted(set(spec.tools), key=TOOL_ATOMS.index)
@@ -298,21 +299,45 @@ def _cleanup(owned: list[tuple[Path, int, int]]) -> None:
             pass
 
 
-def _policy_notes(settings: dict[str, Any], name: str) -> list[str]:
+def _ignored_policy_notice(keys: list[str]) -> Optional[str]:
+    if not keys:
+        return None
+    verb = "is" if len(keys) == 1 else "are"
+    return ", ".join(keys) + " " + verb + " not applied yet"
+
+
+def _policy_notes(settings: dict[str, Any]) -> list[str]:
     ignored = settings["_ignored_policy"]
-    if ignored:
-        description = ", ".join(f"{key}={value}" for key, value in ignored.items())
-        logger.warning(
-            "ephemeral create %s: %s are not applied yet; the provider default is used",
-            name,
-            description,
-        )
-        model = "model: provider default (tier omitted; " + description + " is not applied yet)"
-        effort = "effort: provider default (effort omitted; " + description + " is not applied yet)"
-    else:
-        model = "model: provider default (tier omitted, no default_tier)"
-        effort = "effort: provider default (effort omitted, no default_effort)"
+    tier_keys = [
+        key
+        for key in ignored
+        if key in ("ephemeral.max_tier", "ephemeral.default_tier", "model_tiers")
+    ]
+    effort_keys = [
+        key for key in ignored if key in ("ephemeral.max_effort", "ephemeral.default_effort")
+    ]
+    model_notice = _ignored_policy_notice(tier_keys)
+    effort_notice = _ignored_policy_notice(effort_keys)
+    model = (
+        "model: provider default (tier omitted; " + model_notice + ")"
+        if model_notice
+        else "model: provider default (tier omitted, no default_tier)"
+    )
+    effort = (
+        "effort: provider default (effort omitted; " + effort_notice + ")"
+        if effort_notice
+        else "effort: provider default (effort omitted, no default_effort)"
+    )
     return [model, effort, "launch: not supported by this server version"]
+
+
+def _warn_ignored_policy(name: str, notice: Optional[str]) -> None:
+    # A diagnostic failure cannot turn a committed create into a 500 refusal.
+    if notice:
+        try:
+            logger.warning("ephemeral create %s: %s; the provider default is used", name, notice)
+        except Exception:
+            pass
 
 
 def create_ephemeral_agent(
@@ -362,9 +387,16 @@ def create_ephemeral_agent(
                     rule,
                     f"{field}={value} is not supported yet; omit {field} to use the provider default",
                 )
-        provider = spec.provider if spec.provider is not None else creator["provider"]
+        provider = spec.provider.value if spec.provider is not None else creator["provider"]
+        if provider not in {item.value for item in ProviderType}:
+            raise EphemeralPolicyError("creator_unresolved")
         if provider not in ("claude_code", "codex"):
-            raise EphemeralPolicyError("provider_unsupported", "set provider explicitly")
+            detail = provider + (
+                "; supported providers: claude_code, codex"
+                if spec.provider is not None
+                else "; set provider explicitly"
+            )
+            raise EphemeralPolicyError("provider_unsupported", detail)
         if provider not in config["allowed_providers"]:
             raise EphemeralPolicyError("provider_not_allowed", provider)
         grants = set(atom for atom in TOOL_ATOMS if atom in creator_tools)
@@ -395,12 +427,25 @@ def create_ephemeral_agent(
         digest = hashlib.sha256(canonical).hexdigest()
         created = datetime.now(timezone.utc)
         expires = created + timedelta(seconds=config["pending_ttl_seconds"])
+        expires_at = expires.isoformat()
+        notes = _policy_notes(config)
+        notice = _ignored_policy_notice(config["_ignored_policy"])
         for _ in range(5):
             name = f"{secrets.choice(BAND_NAMES)}-{spec.purpose}-{secrets.token_hex(2)}"
             if database.get_ephemeral_agent(
                 name
             ) is not None or agent_profiles.installed_profile_exists(name):
                 continue
+            result = {
+                "name": name,
+                "provider": provider,
+                "effective_tools": tools,
+                "model_tier": None,
+                "effort": None,
+                "expires_at": expires_at,
+                "spec_sha256": digest,
+                "notes": notes,
+            }
             owned: list[tuple[Path, int, int]] = []
             try:
                 for directory in (
@@ -427,7 +472,7 @@ def create_ephemeral_agent(
                     },
                     "session_name": session,
                     "created_at": created.isoformat(),
-                    "expires_at": expires.isoformat(),
+                    "expires_at": expires_at,
                     "events": [{"at": created.isoformat(), "event": "created"}],
                 }
                 audit_path = EPHEMERAL_DIR / "audit" / session / (name + ".json")
@@ -470,17 +515,8 @@ def create_ephemeral_agent(
             except BaseException:
                 _cleanup(owned)
                 raise
-            notes = _policy_notes(config, name)
-            return {
-                "name": name,
-                "provider": provider,
-                "effective_tools": tools,
-                "model_tier": None,
-                "effort": None,
-                "expires_at": expires.isoformat(),
-                "spec_sha256": digest,
-                "notes": notes,
-            }
+            _warn_ignored_policy(name, notice)
+            return result
         raise EphemeralPolicyError("name_space_exhausted", status_code=409)
     except EphemeralPolicyError as exc:
         log_refusal(exc.rule, caller_id, None, exc.detail)

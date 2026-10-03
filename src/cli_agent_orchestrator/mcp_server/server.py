@@ -4,11 +4,11 @@ import asyncio
 import logging
 import os
 import time
-from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Annotated, Any, Dict, List, Optional, Tuple, Union
 
 import requests
 from fastmcp import FastMCP
-from pydantic import Field
+from pydantic import Field, WithJsonSchema
 
 from cli_agent_orchestrator.constants import (
     ADVERTISED_URL_ENV,
@@ -1541,15 +1541,56 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
 
 
 async def create_ephemeral_agent(
-    purpose: str,
-    brief: str,
-    tools: Optional[
-        List[Literal["fs_read", "fs_list", "fs_write", "execute_bash", "web_fetch"]]
+    purpose: Annotated[Any, WithJsonSchema({"type": "string"})],
+    brief: Annotated[Any, WithJsonSchema({"type": "string"})],
+    tools: Annotated[
+        Any,
+        WithJsonSchema(
+            {
+                "anyOf": [
+                    {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["fs_read", "fs_list", "fs_write", "execute_bash", "web_fetch"],
+                        },
+                    },
+                    {"type": "null"},
+                ]
+            }
+        ),
     ] = None,
-    provider: Optional[Literal["claude_code", "codex"]] = None,
-    model_tier: Optional[Literal["small", "medium", "large", "auto"]] = None,
-    effort: Optional[Literal["low", "medium", "high", "auto"]] = None,
-    description: Optional[str] = None,
+    provider: Annotated[
+        Any,
+        WithJsonSchema(
+            {"anyOf": [{"type": "string", "enum": ["claude_code", "codex"]}, {"type": "null"}]}
+        ),
+    ] = None,
+    model_tier: Annotated[
+        Any,
+        WithJsonSchema(
+            {
+                "anyOf": [
+                    {"type": "string", "enum": ["small", "medium", "large", "auto"]},
+                    {"type": "null"},
+                ]
+            }
+        ),
+    ] = None,
+    effort: Annotated[
+        Any,
+        WithJsonSchema(
+            {
+                "anyOf": [
+                    {"type": "string", "enum": ["low", "medium", "high", "auto"]},
+                    {"type": "null"},
+                ]
+            }
+        ),
+    ] = None,
+    description: Annotated[
+        Any, WithJsonSchema({"anyOf": [{"type": "string"}, {"type": "null"}]})
+    ] = None,
 ) -> Dict[str, Any]:
     """Create and store a bounded agent profile; these names cannot launch yet.
 
@@ -1619,10 +1660,16 @@ async def create_ephemeral_agent(
                     "rule": error.get("rule", "unexpected_failure"),
                     "message": error.get("message", "ephemeral policy: unexpected_failure"),
                 }
-            except (requests.RequestException, ValueError):
+            except requests.RequestException:
                 rule, detail = "creator_unresolved", "cao-server could not be reached"
+            except ValueError:
+                rule, detail = "unexpected_failure", ""
     log_refusal(rule, caller_id, None, detail)
-    return {"success": False, "rule": rule, "message": f"ephemeral policy: {rule} {detail}"}
+    return {
+        "success": False,
+        "rule": rule,
+        "message": f"ephemeral policy: {rule}" + (f" {detail}" if detail else ""),
+    }
 
 
 def _register_ephemeral_tool(target: FastMCP, enabled: Any) -> None:
