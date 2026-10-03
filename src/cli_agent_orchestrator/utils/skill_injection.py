@@ -121,6 +121,17 @@ def refresh_all_cao_managed_agents() -> List[Path]:
             logger.warning("Skipping Copilot agent with missing name: %s", md_path)
             continue
 
+        if any(
+            agent_profiles.routes_to_ephemeral_store(name)
+            for name in (md_path.name.removesuffix(".agent.md"), profile_name)
+        ):
+            logger.warning(
+                "Skipping CAO-managed Copilot agent '%s' at %s: reserved ephemeral profile name",
+                profile_name,
+                md_path,
+            )
+            continue
+
         if not _is_cao_managed_copilot_agent(profile_name):
             continue
 
@@ -133,6 +144,14 @@ def refresh_all_cao_managed_agents() -> List[Path]:
                 profile_name,
                 md_path,
                 exc,
+            )
+            continue
+
+        if agent_profiles.routes_to_ephemeral_store(profile.name):
+            logger.warning(
+                "Skipping CAO-managed Copilot agent '%s' at %s: reserved ephemeral profile name",
+                profile.name,
+                md_path,
             )
             continue
 

@@ -175,8 +175,11 @@ def test_copilot_refresh_refuses_reserved_profiles(reserved, paths):
         assert "Updated." in target.read_text()
 
 
-@pytest.mark.parametrize("source_kind", ["name", "content", "url"])
-def test_reserved_install_never_resolves_or_persists_supplied_env(source_kind, paths, monkeypatch):
+@pytest.mark.parametrize("source_kind", ["name", "content", "url", "frontmatter"])
+@pytest.mark.parametrize("has_env", [False, True])
+def test_reserved_install_never_resolves_or_persists_supplied_env(
+    source_kind, has_env, paths, monkeypatch
+):
     stores, seam, resolver = paths
     download = Mock(return_value=(RESERVED, document(RESERVED)))
     monkeypatch.setattr(install_service, "_download_agent", download)
@@ -185,12 +188,19 @@ def test_reserved_install_never_resolves_or_persists_supplied_env(source_kind, p
         if source_kind == "url"
         else RESERVED
     )
-    kwargs = {"profile_content": document(RESERVED)} if source_kind == "content" else {}
+    kwargs = (
+        {"profile_content": document(RESERVED)} if source_kind in {"content", "frontmatter"} else {}
+    )
+    if source_kind == "frontmatter":
+        source = "ordinary"
+    guard = Mock(wraps=install_service._guard_installed_copy_ownership)
+    monkeypatch.setattr(install_service, "_guard_installed_copy_ownership", guard)
     result = install_service.install_agent(
-        source, provider="kiro_cli", env_vars={"ALIAS": "ordinary"}, **kwargs
+        source, provider="kiro_cli", env_vars={"ALIAS": "ordinary"} if has_env else None, **kwargs
     )
     assert not result.success
     assert result.message == f"Reserved ephemeral profile name: {RESERVED}"
+    guard.assert_not_called()
     seam.assert_not_called()
     resolver.assert_not_called()
     assert all(list(path.iterdir()) == [] for path in stores.values())
@@ -205,3 +215,31 @@ def test_copilot_refresh_refuses_reserved_filename_with_ordinary_profile(paths):
         skill_injection.refresh_agent_md_prompt(target, profile)
     assert target.read_text() == document("ordinary")
     assert list(stores["copilot"].iterdir()) == [target]
+
+
+@pytest.mark.parametrize("has_env", [False, True])
+def test_variable_built_reserved_name_is_refused_after_resolution(has_env, paths, monkeypatch):
+    stores, seam, resolver = paths
+    content = document("${ALIAS}")
+    loader = Mock(return_value={})
+    monkeypatch.setattr(install_service, "load_env_vars", loader)
+    resolver.side_effect = lambda text: text.replace("${ALIAS}", RESERVED)
+    guard = Mock(wraps=install_service._guard_installed_copy_ownership)
+    monkeypatch.setattr(install_service, "_guard_installed_copy_ownership", guard)
+    result = install_service.install_agent(
+        "ordinary",
+        provider="kiro_cli",
+        profile_content=content,
+        env_vars={"ALIAS": RESERVED} if has_env else None,
+    )
+    assert not result.success
+    assert result.message == f"Reserved ephemeral profile name: {RESERVED}"
+    guard.assert_not_called()
+    seam.assert_not_called()
+    if has_env:
+        loader.assert_called_once()
+        resolver.assert_not_called()
+    else:
+        loader.assert_not_called()
+        resolver.assert_called_once_with(content)
+    assert all(list(path.iterdir()) == [] for path in stores.values())

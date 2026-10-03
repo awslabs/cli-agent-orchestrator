@@ -1566,6 +1566,10 @@ def install_agent(
             raise FileNotFoundError(f"Reserved ephemeral profile name: {agent_name}")
 
         raw_content = incoming if incoming is not None else _read_agent_profile_source(agent_name)
+        raw_name = frontmatter.loads(raw_content).get("name", agent_name)
+        if isinstance(raw_name, str) and agent_profiles.routes_to_ephemeral_store(raw_name):
+            raise FileNotFoundError(f"Reserved ephemeral profile name: {raw_name}")
+        # A ${VAR}-built reserved name is refused only after resolution below.
         # ``--env`` values take part in resolution now but are persisted to the
         # managed .env file only after the ownership guard has accepted the
         # install (below), so a refused install leaves no env side effect

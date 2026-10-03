@@ -443,3 +443,50 @@ class TestRefreshAllCaoManagedAgents:
             _read_agent_md_body(managed_copilot) == "managed-copilot prompt\n\n## Available Skills"
         )
         assert unmanaged_copilot.read_bytes() == unmanaged_original
+
+
+@pytest.mark.parametrize("reserved_at", ["filename", "frontmatter", "loaded"])
+def test_batch_skips_reserved_file_and_refreshes_next_agent(
+    tmp_path, monkeypatch, caplog, reserved_at
+):
+    from unittest.mock import Mock
+
+    from cli_agent_orchestrator.services import settings_service
+
+    reserved = "ACDC-log_triage-3f9a"
+    copilot = tmp_path / "copilot"
+    context = tmp_path / "context"
+    context.mkdir()
+    filename = reserved if reserved_at == "filename" else "alpha"
+    name = reserved if reserved_at == "frontmatter" else "ordinary"
+    rejected = copilot / f"{filename}.agent.md"
+    normal = copilot / "zeta.agent.md"
+    _write_agent_md(rejected, name, "Legacy copy", "Keep these bytes")
+    _write_agent_md(normal, "zeta", "Normal", "Old prompt")
+    for profile_name in (name, "zeta"):
+        (context / f"{profile_name}.md").write_text("Context")
+    before = rejected.read_bytes()
+    monkeypatch.setattr(skill_injection, "COPILOT_AGENTS_DIR", copilot)
+    monkeypatch.setattr(skill_injection, "AGENT_CONTEXT_DIR", context)
+    monkeypatch.setattr(settings_service, "get_agent_dirs", lambda: {"cao_installed": str(context)})
+    loader = Mock(
+        side_effect=lambda value: AgentProfile(
+            name=reserved if reserved_at == "loaded" and value == "ordinary" else value,
+            description="Profile",
+            system_prompt="Refreshed prompt",
+        )
+    )
+    monkeypatch.setattr(skill_injection, "load_agent_profile", loader)
+    monkeypatch.setattr(skill_injection, "build_skill_catalog", lambda: "")
+    with caplog.at_level(logging.WARNING, logger=skill_injection.__name__):
+        result = skill_injection.refresh_all_cao_managed_agents()
+    assert result == [normal]
+    assert rejected.read_bytes() == before
+    assert "Refreshed prompt" in normal.read_text()
+    skips = [
+        r for r in caplog.records if r.name == skill_injection.__name__ and "Skipping" in r.message
+    ]
+    assert len(skips) == 1
+    assert "reserved" in skips[0].message.lower()
+    if reserved_at != "loaded":
+        loader.assert_called_once_with("zeta")
