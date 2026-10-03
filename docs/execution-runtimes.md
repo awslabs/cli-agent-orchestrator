@@ -83,7 +83,9 @@ arrives after the launch timed out or its connection dropped. It retries that
 delete until the runtime confirms it, or the connection ends (the runtime's
 next hello lists the terminal again). A runtime that
 starts an agent but cannot report it stops it, and the launch fails with `502`
-naming the terminal. So a lost launch result cannot leave an agent running
+naming the terminal. If it cannot stop it either, its failed result names the
+terminal, and the server deletes it as one it has no record of. So a lost
+launch result cannot leave an agent running
 unseen. Nor can a cancelled request: once the agent runs, recording it (or
 undoing it) completes even if the caller goes away.
 

@@ -225,6 +225,34 @@ class TestExecute:
 
 class TestHandle:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("stopped", [True, False])
+    async def test_a_launch_it_could_not_stop_is_named_in_its_failed_result(
+        self, monkeypatch, stopped
+    ):
+        # The server learns of a terminal only from successful results: a
+        # failure must name the one still running, or nothing would stop it.
+        bridge = _bridge()
+        server = FakeServer()
+        bridge._ws = server
+
+        async def create_terminal(**kwargs):
+            return SimpleNamespace(id="beef0001")
+
+        def get_terminal(tid):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(terminal_service, "create_terminal", create_terminal)
+        monkeypatch.setattr(terminal_service, "get_terminal", get_terminal)
+        monkeypatch.setattr(terminal_service, "delete_terminal", lambda tid: stopped)
+        bridge._existing_terminal_ids = lambda: set()
+        await bridge.handle(
+            _command(CommandType.LAUNCH, None, agent_profile="developer", provider="mock_cli")
+        )
+        (result,) = server.sent
+        assert result.ok is False and "beef0001" in result.error
+        assert result.payload == ({} if stopped else {"terminal_id": "beef0001"})
+
+    @pytest.mark.asyncio
     async def test_a_failure_is_reported_as_a_failed_result(self):
         bridge = _bridge()
         server = FakeServer()
