@@ -30,7 +30,11 @@ def installed_deciders() -> list[dict[str, Any]]:
         item = {
             "name": entry.name,
             "distribution": distribution,
-            "version": dist.version if dist is not None else None,
+            "version": (
+                dist.metadata["Version"]
+                if dist is not None and "Version" in dist.metadata
+                else None
+            ),
             "kind": "builtin" if builtin else "external",
         }
         if not builtin:
@@ -68,4 +72,4 @@ def dispatch(name: str, action: str, extra: Sequence[str] = ()) -> int:
         raise RuntimeError(f"operator command failed for {name}") from None
     if not isinstance(code, int) or isinstance(code, bool):
         raise RuntimeError(f"operator command returned no integer exit code for {name}")
-    return code
+    return code if 0 <= code <= 255 else 1

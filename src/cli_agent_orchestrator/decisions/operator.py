@@ -14,6 +14,9 @@ from cli_agent_orchestrator.decisions.types import POINTS
 from cli_agent_orchestrator.services import settings_service
 
 logger = logging.getLogger(__name__)
+OFF_REENABLED_MESSAGE = (
+    "A concurrent change re-enabled decisions during off; re-run cao decisions off."
+)
 
 
 def status() -> dict[str, Any]:
@@ -43,11 +46,21 @@ def off() -> dict[str, Any]:
     except (OSError, ValueError, settings_service.SettingsUnreadableError):
         logger.warning("Could not persist decision states; halt remains active")
     drained = egress.drain(snapshot.shadow_timeout_ms / 1000 + 5)
+    points = asdict(load_settings())["points"]
+    halted = egress.is_halted()
+    all_off = all(points[point]["state"] == "off" for point in POINTS)
+    message = None
+    if not halted or not all_off:
+        message = OFF_REENABLED_MESSAGE
+    elif not drained:
+        message = "External decision requests did not drain before the timeout"
     return {
-        "halted": egress.is_halted(),
+        "halted": halted,
         "drained": drained,
         "settings_saved": saved,
-        "points": asdict(load_settings())["points"],
+        "points": points,
+        "success": drained and halted and all_off,
+        "message": message,
     }
 
 

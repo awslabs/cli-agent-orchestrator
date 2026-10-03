@@ -258,9 +258,14 @@ requests may be running.
 
 `cao decisions off` creates `decisions.halt`, writes every point off, then waits
 for in-flight permit holders to finish. The wait is the configured shadow timeout
-plus five seconds. A successful return means every external decider that follows
-the permit rule has drained and cannot start another request. A timeout produces
-a non-zero CLI exit code, and the halt remains active. If settings cannot be read
+plus five seconds. A successful return requires the drain to finish, the halt
+marker to remain present, and every returned point to be off. Every external
+decider that follows the permit rule has then drained and cannot start another
+request while the halt remains active. If a concurrent explicit change re-enables
+decisions during off, the CLI exits 1 and operations MCP reports failure, asking
+the operator to re-run `cao decisions off`. The command does not recreate the
+marker over that newer action. A timeout produces a non-zero CLI exit code,
+and the halt remains active. If settings cannot be read
 or saved, the marker still switches every point off and the result reports
 `settings_saved: false`. Fix the settings before re-enabling decisions.
 
