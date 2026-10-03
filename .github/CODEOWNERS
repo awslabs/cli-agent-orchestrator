@@ -1,2 +1,3 @@
 /.github/workflows/ @awslabs/multiq
+/.github/actions/ @awslabs/multiq
 /.github/CODEOWNERS @awslabs/multiq
