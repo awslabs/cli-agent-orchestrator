@@ -31,10 +31,19 @@ def set_point(point: str, state: str, decider: str | None = None) -> dict[str, A
     return status()
 
 
+def _halt_marker_identity() -> tuple[int, int] | None:
+    try:
+        stat = egress.HALT_FILE.lstat()
+    except OSError:
+        return None
+    return stat.st_dev, stat.st_ino
+
+
 def off() -> dict[str, Any]:
     """Publish the halt before saving states and waiting for outstanding egress."""
     egress.HALT_FILE.parent.mkdir(parents=True, exist_ok=True)
     egress.HALT_FILE.touch(mode=0o600)
+    marker_identity = _halt_marker_identity()
     snapshot = load_settings()
     saved = False
     try:
@@ -48,9 +57,10 @@ def off() -> dict[str, Any]:
     drained = egress.drain(snapshot.shadow_timeout_ms / 1000 + 5)
     points = asdict(load_settings())["points"]
     halted = egress.is_halted()
+    same_halt = marker_identity is not None and _halt_marker_identity() == marker_identity
     all_off = all(points[point]["state"] == "off" for point in POINTS)
     message = None
-    if not halted or not all_off:
+    if not halted or not same_halt or not all_off:
         message = OFF_REENABLED_MESSAGE
     elif not drained:
         message = "External decision requests did not drain before the timeout"
@@ -59,7 +69,7 @@ def off() -> dict[str, Any]:
         "drained": drained,
         "settings_saved": saved,
         "points": points,
-        "success": drained and halted and all_off,
+        "success": drained and halted and same_halt and all_off,
         "message": message,
     }
 

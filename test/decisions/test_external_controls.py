@@ -375,3 +375,40 @@ def test_status_tolerates_missing_distribution_version(monkeypatch):
     )
     monkeypatch.setattr(packages, "entry_points", lambda **kwargs: [entry])
     assert packages.installed_deciders()[0]["version"] is None
+
+
+def test_off_rejects_replaced_halt_on_cli_and_ops(monkeypatch, tmp_path):
+    from cli_agent_orchestrator.ops_mcp_server.decision_tools import register_decision_tools
+
+    replacement_identity = []
+
+    def drain(timeout):
+        replacement = tmp_path / "new-halt"
+        replacement.touch()
+        stat = replacement.lstat()
+        replacement_identity.append((stat.st_dev, stat.st_ino))
+        replacement.replace(egress.HALT_FILE)
+        return True
+
+    monkeypatch.setattr(egress, "drain", drain)
+    result = CliRunner().invoke(decisions, ["off"])
+    assert result.exit_code == 1
+    assert result.stderr.strip() == operator.OFF_REENABLED_MESSAGE
+    data = json.loads(result.stdout)
+    assert data["halted"] and data["drained"] and not data["success"]
+    tools = {}
+    register_decision_tools(SimpleNamespace(tool=lambda fn: tools.setdefault(fn.__name__, fn)))
+    result = tools["decisions_off"]()
+    assert not result["success"] and result["message"] == operator.OFF_REENABLED_MESSAGE
+    assert result["data"]["halted"] and result["data"]["drained"]
+    stat = egress.HALT_FILE.lstat()
+    assert (stat.st_dev, stat.st_ino) == replacement_identity[-1]
+
+
+def test_off_accepts_unchanged_preexisting_halt():
+    egress.HALT_FILE.touch()
+    before = egress.HALT_FILE.lstat()
+    result = operator.off()
+    after = egress.HALT_FILE.lstat()
+    assert result["success"]
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
