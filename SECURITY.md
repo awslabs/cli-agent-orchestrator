@@ -57,23 +57,48 @@ Security scans run:
 
 ### CodeQL Static Analysis
 
-The advanced [CodeQL workflow](.github/workflows/codeql.yml) analyzes Python,
-JavaScript/TypeScript, GitHub Actions, and Rust with CodeQL's default query
-suite. It runs on pushes to `main`, pull requests targeting `main` (including
-forks), Mondays at 08:00 UTC, and manual dispatch. Fork runs remain subject to
-the repository's contributor-workflow approval policy. Unlike this workflow,
+The [CI workflow](.github/workflows/ci.yml) includes four CodeQL jobs that
+analyze Python, JavaScript/TypeScript, GitHub Actions, and Rust with CodeQL's
+default query suite. They run alongside the other CI jobs on pushes to `main`
+and pull requests targeting `main` (including forks), without path filters,
+fork exclusions, or dependencies on other jobs. Re-running all jobs in that
+CI run includes CodeQL; it does not rely on a separate PR workflow trigger.
+Fork runs remain subject to the repository's contributor-workflow approval
+policy. Unlike these CI jobs,
 [GitHub's default setup excludes fork PRs](https://docs.github.com/en/code-security/concepts/code-scanning/setup-types#about-default-setup).
 
+The [standalone CodeQL workflow](.github/workflows/codeql.yml) retains the
+Monday 08:00 UTC schedule and manual dispatch, but does not also run on PRs or
+pushes. Both workflows use the same [scan action](.github/actions/codeql/action.yml),
+so the weekly/manual scans and CI use the same analysis and upload steps.
+
 Each language uses a separate job, without a project build or dependency
-installation, and uploads results for the checked-out PR merge revision.
+installation, and uploads results for the checked-out revision: the PR test
+merge revision for pull requests, or the selected branch revision otherwise.
 Checkout does not retain credentials. Fork PRs use the restricted built-in
 `GITHUB_TOKEN`; do not introduce secrets, personal access tokens, or a
 `pull_request_target` workaround to run untrusted code. Trivy, dependency
 review, and secret scanning remain independent checks.
 
+#### Existing pull requests and reruns
+
+Required check names are merge conditions, not workflow triggers. Adding a
+requirement does not create a run for an already-open PR. Update existing PR
+branches against `main` so they include the current CI workflow and shared
+scan action; resolve merge conflicts first, since GitHub does not start
+`pull_request` workflows for conflicting PRs. The resulting branch update
+triggers a new CI run, subject to any required fork-workflow approval.
+
+Re-running an older CI run uses that run's original revision, not the updated
+workflow on `main`. On the new run, verify all four `CodeQL (...)` jobs appear
+under `CI` for the latest PR revision. An **Expected** required check without
+a job is not a running scan. GitHub's **Re-run all jobs** includes all four;
+re-running only failed or individually selected jobs does not rerun unrelated
+successful jobs. See [GitHub's rerun semantics](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs).
+
 #### Scan scope and merge policy
 
-For a PR targeting `main`, the CodeQL workflow checks out GitHub's test merge
+For a PR targeting `main`, the CodeQL job checks out GitHub's test merge
 revision, `refs/pull/<number>/merge`: the base revision plus the PR's changes
 for that run. CodeQL applies its query suite to supported code from that
 checkout with codebase context, rather than treating a patch as a standalone
@@ -109,8 +134,9 @@ for this scope and additional limitations, including merge queues. Neither a
 green job nor this merge rule proves that the repository is vulnerability-free
 or that every reported alert is exploitable.
 
-The [CODEOWNERS policy](.github/CODEOWNERS) assigns `.github/workflows/` and
-the ownership file itself to the repository-maintainer team `@awslabs/multiq`.
+The [CODEOWNERS policy](.github/CODEOWNERS) assigns `.github/workflows/`,
+the shared actions in `.github/actions/`, and the ownership file itself to
+the repository-maintainer team `@awslabs/multiq`.
 Protecting the whole workflow directory also covers a new workflow that
 tries to emit the same required check names. GitHub uses the base branch's
 ownership policy, so request this team's review explicitly for the initial
@@ -120,7 +146,7 @@ administrator must enable the review settings below.
 
 #### Administrator migration and merge protection
 
-The workflow file does **not** change hosted CodeQL settings or branch rules.
+The workflow files do **not** change hosted CodeQL settings or branch rules.
 A repository administrator must coordinate the following cutover; do not
 treat merging the file alone as completion of issue #857.
 
@@ -154,10 +180,12 @@ treat merging the file alone as completion of issue #857.
    confirm old results cannot satisfy its checks; compare each analysis to
    that run's PR merge SHA, not an older head. Remove the disposable cases.
 
-If the cutover fails, keep merges paused, disable the advanced workflow,
-restore default setup and the previous rule configuration, and verify scans
-resume. This rollback restores the old fork-coverage gap; do not resume fork
-PR merges as if the new protection were active.
+If the cutover fails, keep merges paused and stop advanced CodeQL scanning
+in both `ci.yml` and `codeql.yml` before restoring default setup and the
+previous rule configuration. Disabling only the standalone workflow does
+not stop CI's CodeQL jobs. Verify scans resume after the rollback. This
+restores the old fork-coverage gap; do not resume fork PR merges as if the
+new protection were active.
 
 See GitHub's [advanced setup instructions](https://docs.github.com/en/code-security/how-tos/find-and-fix-code-vulnerabilities/configure-code-scanning/configuring-advanced-setup-for-code-scanning)
 and [merge-protection configuration](https://docs.github.com/en/code-security/how-tos/find-and-fix-code-vulnerabilities/manage-your-configuration/set-merge-protection).

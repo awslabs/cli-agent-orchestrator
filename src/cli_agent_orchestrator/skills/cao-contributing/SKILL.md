@@ -81,7 +81,16 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 | **Web UI Build** | frontend build | **Yes** |
 | **AI-DLC Portfolio Example** | example project builds | **Yes** |
 | **Security Scan** | Trivy | **Yes** |
+| **CodeQL** | GitHub Actions, JavaScript/TypeScript, Python, and Rust analysis and upload in the same CI run, including forks after required workflow approval | **Yes** — no project build; the hosted scan/status rules remain as documented in `SECURITY.md` |
 | **Dependency Review** | `actions/dependency-review-action` over the PR's dependency delta: `fail-on-severity: high` plus denied licences `GPL-3.0`/`AGPL-3.0` | **Yes** — CI-only; there is nothing to run locally, and it is skipped on forks (`if: github.repository == 'awslabs/cli-agent-orchestrator'`), so a green run on your fork has not exercised it |
+
+CodeQL's four language jobs are part of `ci.yml`, so **Re-run all jobs** includes
+them. The standalone `codeql.yml` is only for weekly and manual scans; both use
+the same maintainer-owned scan action. Existing PR branches must pick up the
+current `main` workflow before their new CI runs use this wiring. Resolve merge
+conflicts, update the branch, and approve fork workflows when required rather
+than merely rerunning a CI run created before the change. An **Expected**
+required check without an actual job is not a running scan.
 
 > **The `-m "not e2e"` on the CI command replaces your local `addopts` — it does not
 > compose with it.** So a local run that *also* deselects `integration` is a strict subset
@@ -117,7 +126,6 @@ pins this table to the workflow files.
 |----------|------------------|---------|-----------|
 | **Secret Scan** (`secret-scan.yml`) | `gitleaks`, `gitleaks config tests` | every PR to `main` | **Yes** — the config tests run locally as `uv run pytest test/test_gitleaks_config.py`; the scan itself is `gitleaks detect --config .gitleaks.toml` over the PR's commits |
 | **cargo-deny** (`cargo-deny.yml`) | `cargo-deny (advisories, licenses, bans, sources)` | every PR to `main` | **Yes** — locally, `cargo deny --manifest-path tui/Cargo.toml --locked check` (global flags before the subcommand, as the action passes them) |
-| **CodeQL** (`codeql.yml`) | `CodeQL` (actions, JavaScript/TypeScript, Python, and Rust matrix) | every PR to `main`, including forks after required workflow approval | **Yes** — requires the default-to-advanced cutover and hosted scan/status rules documented in `SECURITY.md`; default setup must not remain enabled |
 | **Test Antigravity CLI Provider** (`test-antigravity-cli-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test or fixtures, `pyproject.toml`, or the workflow | **Yes** |
 | **Test Claude Code Provider** (`test-claude-code-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test, `pyproject.toml`, or the workflow | **Yes** |
 | **Test Codex CLI Provider** (`test-codex-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test or fixtures, `pyproject.toml`, or the workflow | **Yes** |
