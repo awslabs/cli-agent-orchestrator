@@ -1175,7 +1175,7 @@ def test_launch_reports_an_escaping_kiro_policy_path(tmp_path, monkeypatch):
     result = _restricted_launch("kiro_cli")
 
     assert result.exit_code != 0
-    assert "outside the agent directory" in result.output
+    assert "beneath the agent directory" in result.output
     assert "launched successfully" not in result.output
 
 

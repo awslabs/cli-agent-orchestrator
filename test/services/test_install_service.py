@@ -1215,9 +1215,16 @@ class TestKiroInstallPredatesNativeEnforcement:
         (install_paths["kiro_dir"] / "linked.json").symlink_to(outside)
 
         with patch.object(Path, "read_text") as read:
-            with pytest.raises(ValueError, match="outside"):
+            with pytest.raises(ValueError, match="beneath the agent directory"):
                 installed_kiro_tools("linked")
         read.assert_not_called()
+
+    def test_link_to_agent_directory_itself_is_refused(self, install_paths):
+        directory = install_paths["kiro_dir"]
+        (directory / "linked.json").symlink_to(directory, target_is_directory=True)
+
+        with pytest.raises(ValueError, match="beneath the agent directory"):
+            installed_kiro_tools("linked")
 
     def test_symlink_within_agent_directory_remains_readable(self, install_paths):
         target = install_paths["kiro_dir"] / "real.json"
