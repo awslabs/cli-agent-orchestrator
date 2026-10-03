@@ -26,7 +26,9 @@ def package(name="external", distribution="external-decider", script=True, code=
         name="cao-decider-" + name, group="console_scripts", load=lambda: main
     )
     dist = SimpleNamespace(
-        metadata={"Name": distribution}, version="1.2.3", entry_points=[command] if script else []
+        metadata={"Name": distribution, "Version": "1.2.3"},
+        version="1.2.3",
+        entry_points=[command] if script else [],
     )
     entry = EntryPoint(name=name, value="unused:Decider", group="cao.deciders")
     entry = entry._for(dist)
@@ -145,7 +147,7 @@ def test_off_uses_shadow_timeout_and_cli_reports_drain_failure(monkeypatch):
     monkeypatch.setattr(egress, "drain", drain)
     result = CliRunner().invoke(decisions, ["off"])
     assert result.exit_code != 0
-    assert json.loads(result.output)["drained"] is False
+    assert json.loads(result.stdout)["drained"] is False
     assert timeouts == [5.25]
     assert egress.is_halted()
 
@@ -191,7 +193,15 @@ def test_ops_off_shares_control_and_cannot_grant_consent(monkeypatch):
     settings.set_point("model.route", "on")
     assert tools["decisions_off"]()["success"]
     assert egress.is_halted()
-    assert not {"decisions_enable", "decisions_disable", "decisions_show"} & tools.keys()
+    assert set(tools) == {
+        "decisions_status",
+        "decisions_off",
+        "decisions_set_point",
+        "decisions_set_tier",
+        "decisions_set_exclusions",
+        "decisions_list",
+        "decisions_purge",
+    }
     monkeypatch.setattr(egress, "drain", lambda timeout: False)
     result = tools["decisions_off"]()
     assert not result["success"] and result["data"]["halted"]
@@ -276,3 +286,92 @@ def test_off_never_opens_unredirected_home_files(monkeypatch, tmp_path):
     assert result["drained"]
     assert egress.HALT_FILE == tmp_path / "decisions.halt"
     assert egress.EGRESS_LOCK_FILE == tmp_path / "decisions-egress.lock"
+
+
+@pytest.mark.parametrize("reenable", [False, True])
+def test_off_reports_concurrent_reenable_on_cli_and_ops(monkeypatch, reenable):
+    from cli_agent_orchestrator.ops_mcp_server.decision_tools import register_decision_tools
+
+    def drain(timeout):
+        egress.HALT_FILE.unlink()
+        if reenable:
+            settings.set_point("effort.route", "shadow")
+        return True
+
+    monkeypatch.setattr(egress, "drain", drain)
+    message = "A concurrent change re-enabled decisions during off; re-run cao decisions off."
+    result = CliRunner().invoke(decisions, ["off"])
+    assert result.exit_code == 1
+    assert result.stderr.strip() == message
+    data = json.loads(result.stdout)
+    assert data["drained"] and not data["halted"]
+    assert not egress.HALT_FILE.exists()
+    if reenable:
+        assert data["points"]["effort.route"]["state"] == "shadow"
+    tools = {}
+    register_decision_tools(SimpleNamespace(tool=lambda fn: tools.setdefault(fn.__name__, fn)))
+    result = tools["decisions_off"]()
+    assert not result["success"]
+    assert result["message"] == message
+    assert result["data"]["drained"] and not result["data"]["halted"]
+    assert not egress.HALT_FILE.exists()
+
+
+def test_off_checks_returned_point_states_even_if_halted(monkeypatch):
+    from dataclasses import replace
+
+    from cli_agent_orchestrator.decisions.settings import PointSettings
+    from cli_agent_orchestrator.decisions.types import PointState
+
+    actual = operator.load_settings
+
+    def load():
+        snapshot = actual()
+        return replace(
+            snapshot, points={**snapshot.points, "effort.route": PointSettings(PointState.SHADOW)}
+        )
+
+    monkeypatch.setattr(operator, "load_settings", load)
+    result = CliRunner().invoke(decisions, ["off"])
+    assert result.exit_code == 1
+    assert "concurrent change re-enabled decisions" in result.stderr
+    assert json.loads(result.stdout)["halted"]
+
+
+def test_off_publishes_halt_before_saving(monkeypatch):
+    actual_save = settings_service._save
+
+    def save(data):
+        assert egress.HALT_FILE.exists(), "settings saved before halt was published"
+        actual_save(data)
+
+    monkeypatch.setattr(settings_service, "_save", save)
+    result = operator.off()
+    assert result["drained"] and result["halted"] and result["settings_saved"]
+
+
+@pytest.mark.parametrize("code,expected", [(256, 1), (-1, 1), (255, 255)])
+def test_dispatch_normalizes_out_of_range_exit_codes(monkeypatch, code, expected):
+    from cli_agent_orchestrator.decisions import packages
+
+    entry, main = package(code=code)
+    monkeypatch.setattr(packages, "entry_points", lambda **kwargs: [entry])
+    assert packages.dispatch("external", "status") == expected
+    assert CliRunner().invoke(decisions, ["show", "external"]).exit_code == expected
+
+
+def test_status_tolerates_missing_distribution_version(monkeypatch):
+    from cli_agent_orchestrator.decisions import packages
+
+    class Distribution:
+        metadata = {"Name": "external-decider"}
+
+        @property
+        def version(self):
+            pytest.fail("missing Version accessed through distribution.version")
+
+    entry = EntryPoint(name="external", value="unused:Decider", group="cao.deciders")._for(
+        Distribution()
+    )
+    monkeypatch.setattr(packages, "entry_points", lambda **kwargs: [entry])
+    assert packages.installed_deciders()[0]["version"] is None

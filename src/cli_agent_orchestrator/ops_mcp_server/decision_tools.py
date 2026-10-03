@@ -27,9 +27,9 @@ def register_decision_tools(mcp: Any) -> None:
     def decisions_off() -> dict[str, Any]:
         """Halt all decision points and drain external requests."""
         result = _result(operator.off)
-        if result["success"] and not result["data"]["drained"]:
+        if result["success"] and not result["data"]["success"]:
             result["success"] = False
-            result["message"] = "External decision requests did not drain before the timeout"
+            result["message"] = result["data"]["message"]
         return result
 
     @mcp.tool

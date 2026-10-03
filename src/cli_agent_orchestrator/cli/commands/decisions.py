@@ -115,7 +115,8 @@ def purge(before: str | None, all_records: bool, rotate_key: bool) -> None:
 def off() -> None:
     """Halt all points and wait for external requests to finish."""
     result = _run(operator.off)
-    if not result["drained"]:
+    if not result["success"]:
+        click.echo(result["message"], err=True)
         raise click.exceptions.Exit(1)
 
 
