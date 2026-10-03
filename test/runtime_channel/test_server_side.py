@@ -733,6 +733,157 @@ class TestLaunchAcrossAReconnect:
         assert response.status_code == 201, response.text
         assert status_now == "unknown", "the old connection's launch status must not stand"
 
+    def test_an_undo_is_not_confirmed_by_another_instance_of_the_runtime(
+        self, http, server, monkeypatch
+    ):
+        # The new connection's hello does not list the terminal: another
+        # instance took over rt-1. A real cao-bridge answers a delete of a
+        # terminal it never ran with deleted/absent, which proves nothing.
+        response, received = _undo_across_a_reconnect(
+            http, server, monkeypatch, {}, {"deleted": True, "absent": True}
+        )
+        assert response.status_code == 409, response.text
+        assert "may still be running there" in response.json()["detail"]
+        assert received == [], "no delete goes to an instance that never ran the terminal"
+
+        # The instance that runs it lists it when it reconnects: deleted then.
+        async def original_reconnects():
+            async with _dial(server) as again:
+                await again.send(_hello(statuses={"beef0001": "idle"}))
+                await again.recv()
+                return await _next_command(again)
+
+        command = asyncio.run(original_reconnects())
+        assert (command.type, command.terminal_id) == (CommandType.DELETE, "beef0001")
+
+    def test_an_undo_reaches_the_runtime_through_its_new_connection(
+        self, http, server, monkeypatch
+    ):
+        # The new connection's hello lists the terminal: the same runtime,
+        # reconnected while the launch was being recorded (so that hello did
+        # not delete it). The undo is sent there, and its answer counts.
+        response, received = _undo_across_a_reconnect(
+            http, server, monkeypatch, {"beef0001": "idle"}, {"deleted": True}
+        )
+        assert response.status_code == 409, response.text
+        assert "it was deleted" in response.json()["detail"]
+        assert received == [(CommandType.DELETE, "beef0001")]
+
+    def test_a_reconnect_during_an_undo_still_gets_the_terminal_deleted(
+        self, http, server, monkeypatch
+    ):
+        monkeypatch.setattr(
+            server_mod, "_record_launch", lambda *a, **k: "session cao-beef already exists"
+        )
+
+        async def scenario():
+            async with _dial(server) as old:
+                await old.send(_hello())
+                await old.recv()
+                loop = asyncio.get_running_loop()
+                request = loop.run_in_executor(
+                    None,
+                    lambda: http.post(
+                        "/runtimes/rt-1/terminals", json={"agent_profile": "developer"}
+                    ),
+                )
+                launch = await _next_command(old)
+                await old.send(
+                    encode(
+                        Result(op_id=launch.op_id, ok=True, payload={"terminal": dict(LAUNCHED)})
+                    )
+                )
+                undo = await _next_command(old)  # left unanswered: the connection drops
+                # The same runtime reconnects mid-undo; its hello lists the terminal.
+                async with _dial(server) as new:
+                    await new.send(_hello(statuses={"beef0001": "idle"}))
+                    await new.recv()
+                    retry = await _next_command(new)
+                    await new.send(
+                        encode(Result(op_id=retry.op_id, ok=True, payload={"deleted": True}))
+                    )
+                    return undo, retry, await asyncio.wait_for(request, 10)
+
+        undo, retry, response = asyncio.run(scenario())
+        assert (undo.type, undo.terminal_id) == (CommandType.DELETE, "beef0001")
+        assert (retry.type, retry.terminal_id) == (CommandType.DELETE, "beef0001")
+        assert response.status_code == 409, response.text
+
+    def test_an_undo_releases_the_launch_before_it_deletes(self, http, start_runtime, monkeypatch):
+        # Still reserved, the terminal would be skipped by a hello that arrives
+        # during the undo, as a launch being recorded: never deleted.
+        monkeypatch.setattr(
+            server_mod, "_record_launch", lambda *a, **k: "session cao-beef already exists"
+        )
+        registry = registry_mod.runtime_registry
+        known_during_delete = []
+
+        def script(command):
+            if command.type == CommandType.DELETE:
+                known_during_delete.append(registry.is_known("beef0001", "rt-1"))
+                return {"deleted": True}
+            return {"terminal": dict(LAUNCHED)}
+
+        start_runtime(script=script)
+        response = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
+        assert response.status_code == 409, response.text
+        assert known_during_delete == [False]
+
+
+def _undo_across_a_reconnect(http, server, monkeypatch, hello_statuses, answer):
+    """Launch over one connection. While the launch is being recorded, rt-1
+    reconnects with ``hello_statuses``; then the record step refuses the launch.
+
+    Returns the response, and the (type, terminal id) of each command the new
+    connection received, each answered with ``answer``.
+    """
+    recording, release = threading.Event(), threading.Event()
+
+    def refusing_record(*args, **kwargs):
+        recording.set()
+        release.wait(5)
+        return "session cao-beef already exists"
+
+    monkeypatch.setattr(server_mod, "_record_launch", refusing_record)
+    received = []
+
+    async def answer_commands(ws):
+        try:
+            while True:
+                frame = decode(await ws.recv())
+                if isinstance(frame, Command):
+                    received.append((frame.type, frame.terminal_id))
+                    await ws.send(encode(Result(op_id=frame.op_id, ok=True, payload=answer)))
+        except websockets.exceptions.ConnectionClosed:
+            return
+
+    async def scenario():
+        async with _dial(server) as old:
+            await old.send(_hello())
+            await old.recv()
+            loop = asyncio.get_running_loop()
+            request = loop.run_in_executor(
+                None,
+                lambda: http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"}),
+            )
+            launch = await _next_command(old)
+            await old.send(
+                encode(Result(op_id=launch.op_id, ok=True, payload={"terminal": dict(LAUNCHED)}))
+            )
+            await asyncio.to_thread(recording.wait, 5)
+            async with _dial(server) as new:
+                await new.send(_hello(statuses=hello_statuses))
+                await new.recv()
+                responder = asyncio.create_task(answer_commands(new))
+                release.set()
+                response = await asyncio.wait_for(request, 10)
+                await asyncio.sleep(0.3)  # room for a background retry, if any
+                responder.cancel()
+                await asyncio.gather(responder, return_exceptions=True)
+                return response
+
+    return asyncio.run(scenario()), received
+
 
 class TestServerThatRunsNoAgents:
     @pytest.mark.parametrize(

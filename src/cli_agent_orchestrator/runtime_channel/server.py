@@ -215,6 +215,7 @@ async def runtime_channel(ws: WebSocket) -> None:
                 runtime_registry.unplace(terminal_id, runtime_id)
         for terminal_id, reported in hello.statuses.items():
             runtime_registry.set_status(terminal_id, runtime_id, reported, conn=conn)
+        conn.listed = set(hello.statuses)
         await ws.send_text(server_hello)
         runtime_registry.activate(conn)
         # The hello lists every terminal the runtime runs.
@@ -289,27 +290,57 @@ class _Launched(BaseModel):
     model_honored: Optional[bool] = None
 
 
-async def _undo_launch(runtime_id: str, terminal_id: str) -> bool:
+async def _undo_launch(
+    runtime_id: str, terminal_id: str, origin: Optional[RuntimeConnection]
+) -> bool:
     """Delete a launched terminal the server will not record. True if it is gone.
+
+    Only the instance that ran the launch can confirm that: ``origin``, the
+    connection its result came over, or a newer connection whose hello listed
+    the terminal (the same runtime, reconnected). Another instance under the
+    same runtime id would answer that the terminal is absent while the
+    original may still run it; then the outcome is reported unconfirmed, and
+    the original's next hello lists the terminal and gets it deleted.
 
     If the runtime defers or fails it, the delete is retried in the background
     (see ``_delete_unrecorded``): with no central row, nothing else would.
     """
-    try:
-        deleted = await runtime_registry.call(
-            runtime_id, CommandType.DELETE, {}, terminal_id=terminal_id
+    # Not recorded after all: from here on, a hello that lists the terminal
+    # gets it deleted, instead of skipping it as a launch being recorded.
+    runtime_registry.release(terminal_id, runtime_id)
+    conn = _instance_running(runtime_id, terminal_id, origin)
+    if conn is None:
+        logger.warning(
+            "terminal %s was launched over a connection of runtime %s that has since "
+            "been replaced; it is deleted when that instance reconnects",
+            terminal_id,
+            runtime_id,
         )
+        return False
+    try:
+        deleted = await conn.call(CommandType.DELETE, {}, terminal_id=terminal_id)
         if deleted.get("deleted"):
             return True
     except RemoteRuntimeError as exc:
         logger.warning(
             "could not delete terminal %s on runtime %s: %s", terminal_id, runtime_id, exc
         )
-    conn = runtime_registry.connection(runtime_id)
-    if conn is not None:
+    if not conn.closed:
         _delete_unrecorded(conn, terminal_id)
-    # Otherwise the runtime's next hello lists the terminal, and it is deleted then.
+    # Otherwise the instance's next hello lists the terminal, and it is deleted then.
     return False
+
+
+def _instance_running(
+    runtime_id: str, terminal_id: str, origin: Optional[RuntimeConnection]
+) -> Optional[RuntimeConnection]:
+    """The open connection to the instance that ran a launch, if there is one."""
+    if origin is not None and not origin.closed:
+        return origin
+    current = runtime_registry.connection(runtime_id)
+    if current is not None and (origin is None or terminal_id in current.listed):
+        return current
+    return None
 
 
 def _record_launch(
@@ -381,7 +412,7 @@ async def _finish_launch(
         named = raw.get("id") if isinstance(raw, dict) else None
         detail = f"runtime {runtime_id} returned an invalid launch result"
         if isinstance(named, str) and named:
-            cleaned = await _undo_launch(runtime_id, named)
+            cleaned = await _undo_launch(runtime_id, named, conn)
             detail += f" for terminal {named}; " + (
                 "it was deleted" if cleaned else "it may still be running there"
             )
@@ -403,7 +434,7 @@ async def _finish_launch(
         # The agent is running with no central row: tear it down so nothing is
         # left running that the server cannot see.
         logger.exception("could not record terminal %s from runtime %s", terminal_id, runtime_id)
-        cleaned = await _undo_launch(runtime_id, terminal_id)
+        cleaned = await _undo_launch(runtime_id, terminal_id, conn)
         detail = f"launched terminal {terminal_id} on runtime {runtime_id} but could not record it"
         if not cleaned:
             detail += "; it may still be running there"
@@ -411,7 +442,7 @@ async def _finish_launch(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=detail
         ) from exc
     if conflict:
-        cleaned = await _undo_launch(runtime_id, terminal_id)
+        cleaned = await _undo_launch(runtime_id, terminal_id, conn)
         detail = f"runtime {runtime_id} launched terminal {terminal_id}, but {conflict}; " + (
             "it was deleted" if cleaned else "it may still be running there"
         )
