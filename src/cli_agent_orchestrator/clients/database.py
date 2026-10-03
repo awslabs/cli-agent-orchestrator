@@ -2689,6 +2689,25 @@ def delete_terminal(terminal_id: str) -> bool:
         return deleted > 0
 
 
+def delete_terminal_routed_by(terminal_id: str, runtime_id: str, tmux_session: str) -> bool:
+    """Delete the row of ``terminal_id`` only while it names ``runtime_id`` and ``tmux_session``.
+
+    A remote delete waits on its runtime (#745). Meanwhile another delete may
+    drop the row and a new launch reuse the 8-hex id; only the row the delete
+    was routed by may go, never its replacement.
+    """
+    with SessionLocal() as db:
+        deleted = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.id == terminal_id)
+            .filter(TerminalModel.runtime_id == runtime_id)
+            .filter(TerminalModel.tmux_session == tmux_session)
+            .delete()
+        )
+        db.commit()
+        return deleted > 0
+
+
 def delete_terminals_by_session(tmux_session: str) -> int:
     """Delete all local terminals in a session.
 
