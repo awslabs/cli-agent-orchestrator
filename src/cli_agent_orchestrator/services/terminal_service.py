@@ -3382,6 +3382,9 @@ def send_input(
             if isinstance(orchestration_type, OrchestrationType)
             else str(orchestration_type or "")
         )
+        # Kept for the post_send_message event: plugins/webhooks see what the
+        # caller sent, not the internal <cao-memory> block pasted into the TUI.
+        original_message = message
 
         if metadata.get("runtime_id"):
             # The runtime runs this same function beside the pane, with the
@@ -3400,10 +3403,9 @@ def send_input(
                 # Not delivered: the terminal was not used, and no message went.
                 return False
             update_last_active(terminal_id)
-            # ``message`` is still the caller's text here (memory is injected in
-            # the runtime), which is what the local path emits as original_message.
+            # Memory is injected in the runtime, so nothing here changed it.
             _emit_post_send_message(
-                registry, metadata, terminal_id, sender_id, orchestration_type, message
+                registry, metadata, terminal_id, sender_id, orchestration_type, original_message
             )
             return True
 
