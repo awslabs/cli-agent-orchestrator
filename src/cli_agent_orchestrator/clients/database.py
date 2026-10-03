@@ -88,17 +88,22 @@ def get_ephemeral_agent(name: str) -> Optional[Dict[str, Any]]:
         return result
 
 
+def _is_ephemeral_terminal(db: Any, terminal_id: str) -> bool:
+    """Check registry membership using the caller's existing session."""
+    return (
+        db.query(
+            db.query(EphemeralAgentModel)
+            .filter(EphemeralAgentModel.launched_terminal_id == terminal_id)
+            .exists()
+        ).scalar()
+        is True
+    )
+
+
 def is_ephemeral_terminal(terminal_id: str) -> bool:
     """Registry membership in ANY state, including gc; lookup errors propagate."""
     with SessionLocal() as db:
-        return (
-            db.query(
-                db.query(EphemeralAgentModel)
-                .filter(EphemeralAgentModel.launched_terminal_id == terminal_id)
-                .exists()
-            ).scalar()
-            is True
-        )
+        return _is_ephemeral_terminal(db, terminal_id)
 
 
 def _ephemeral_terminal_ids(db: Any, terminal_query: Any) -> set[str]:
@@ -2033,7 +2038,7 @@ def create_terminal(
             "agent_profile": terminal.agent_profile,
             "model": terminal.model,
             "model_honored": terminal.model_honored,
-            "ephemeral": is_ephemeral_terminal(str(terminal.id)),
+            "ephemeral": _is_ephemeral_terminal(db, str(terminal.id)),
             "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
@@ -2148,7 +2153,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "agent_profile": terminal.agent_profile,
             "model": terminal.model,
             "model_honored": terminal.model_honored,
-            "ephemeral": is_ephemeral_terminal(str(terminal.id)),
+            "ephemeral": _is_ephemeral_terminal(db, str(terminal.id)),
             "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,

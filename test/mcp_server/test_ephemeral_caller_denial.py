@@ -22,6 +22,7 @@ TOOLS = ["assign", "handoff", "assign_elastic", "workflow_run", "workflow_resume
 
 @pytest.fixture
 def registry(monkeypatch):
+    # QueuePool exhaustion is covered in test/clients/test_database_ephemeral_pool.py.
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
