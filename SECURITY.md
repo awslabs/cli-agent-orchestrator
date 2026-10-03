@@ -71,6 +71,44 @@ Checkout does not retain credentials. Fork PRs use the restricted built-in
 `pull_request_target` workaround to run untrusted code. Trivy, dependency
 review, and secret scanning remain independent checks.
 
+#### Scan scope and merge policy
+
+For a PR targeting `main`, the CodeQL workflow checks out GitHub's test merge
+revision, `refs/pull/<number>/merge`: the base revision plus the PR's changes
+for that run. CodeQL applies its query suite to supported code from that
+checkout with codebase context, rather than treating a patch as a standalone
+program. This merge SHA can differ from both the PR head and the eventual
+commit merged into `main`. Other CI jobs run their configured tests, linters,
+and builds; this policy does not limit those jobs to changed lines.
+
+| Check | What it evaluates | What success means |
+| --- | --- | --- |
+| Four CodeQL analysis jobs | Analysis, upload, and result processing for each configured language | The scan completed successfully, not that it found no issues |
+| Required CodeQL status checks | Completion of all four language jobs for the current PR revision, with the branch up to date | Missing, pending, or failed required checks cannot satisfy the gate |
+| Code-scanning merge rule | Required CodeQL analysis and applicable open alerts in the PR diff | Analysis is available and complete, and no applicable alert reaches **High or higher** security severity or the general **Errors** threshold |
+| `main` push and weekly scans | Supported repository code at the default-branch revision, including baseline findings | Analysis completed; existing alerts can remain open |
+
+**The current policy is to prevent qualifying findings in PR changes, not
+to require zero open alerts across the repository before every PR can merge.**
+Baseline findings remain a separate triage/fix track so they do not
+automatically block unrelated PRs. This is a merge-policy choice, not an
+exclusion of those findings from default-branch scanning. A whole-repository
+alert gate for every PR would be a different policy and is not configured.
+
+For example, an applicable new High-security finding can leave the analysis
+job green while the code-scanning rule blocks merging. An unchanged baseline
+alert outside an unrelated PR's diff does not automatically block that PR.
+A failed upload still blocks the required check even if no new alert was
+reported. Passing CodeQL checks also does not replace other required CI or
+review approvals.
+
+GitHub requires all source lines identified by an alert to be in the PR
+diff for its code-scanning merge rule to apply. See
+[Code scanning merge protection](https://docs.github.com/en/code-security/concepts/code-scanning/merge-protection)
+for this scope and additional limitations, including merge queues. Neither a
+green job nor this merge rule proves that the repository is vulnerability-free
+or that every reported alert is exploitable.
+
 The [CODEOWNERS policy](.github/CODEOWNERS) assigns `.github/workflows/` and
 the ownership file itself to the repository-maintainer team `@awslabs/multiq`.
 Protecting the whole workflow directory also covers a new workflow that
@@ -115,12 +153,6 @@ treat merging the file alone as completion of issue #857.
    Missing, pending, or failed jobs must also block. Push a new revision and
    confirm old results cannot satisfy its checks; compare each analysis to
    that run's PR merge SHA, not an older head. Remove the disposable cases.
-
-Code-scanning merge protection evaluates applicable findings in the PR diff;
-it does not prove that existing alerts are resolved or that every alert is
-exploitable. GitHub documents additional limitations, including merge queues,
-in [Code scanning merge protection](https://docs.github.com/en/code-security/concepts/code-scanning/merge-protection).
-Keep unresolved baseline alerts on their own triage/fix track.
 
 If the cutover fails, keep merges paused, disable the advanced workflow,
 restore default setup and the previous rule configuration, and verify scans
