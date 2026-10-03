@@ -11,7 +11,7 @@ import stat
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
@@ -222,6 +222,23 @@ BACKGROUND_WAIT_PATTERN = re.compile(
     r"(?m)^[ \t\xa0]*[✶✢✽✻✳·*][ \t\xa0]+Waiting for\b"
     r"(?=[^\n]*\b(?:workflows?|tasks?|to finish|background)\b)"
 )
+# End-of-turn summary as the newest line above the input box (GH #865):
+# "✻ Worked for 4s · done 12:26 PM", or "✻ Crunched for " when the redraw clips
+# the duration. The newest TUI draws no spinner while response text streams, so
+# after a dispatch this line is the only evidence a turn ended; a box with
+# anything else above it is a turn still in flight. · and * are also markdown
+# bullets, so they count only with a full "for Ns" duration.
+NEW_TUI_BOX_SUMMARY_PATTERN = re.compile(
+    r"^[ \t]*(?:[✶✢✽✻✳][ \t]+(?!Waiting\b)\w+[ \t]+for\b"
+    r"|[·*][ \t]+\w+[ \t]+for[ \t]+\d+(?:\.\d+)?[ \t]*s\b)"
+)
+# Chrome the TUI paints between the newest conversation line and the box.
+NEW_TUI_BOX_CHROME_PATTERN = re.compile(r"^[ \t]*(?:⎿|tmux (?:detected|focus-events)\b)")
+# A gated frame unchanged for this long falls back to the legacy verdict, so an
+# end state that paints no summary (an operator's slash command, an exhausted
+# retry loop) costs one grace period rather than the step timeout. A streaming
+# answer repaints sub-second and a retry countdown every second.
+TURN_END_GRACE_S = 15.0
 # The newest Claude Code TUI renders the ❯ input prompt BOXED between two
 # horizontal separator lines (the older TUI used a single separator ABOVE ❯).
 # Detecting this box GATES the new-TUI status logic so legacy output is
@@ -296,6 +313,9 @@ class ClaudeCodeProvider(BaseProvider):
         # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
         # lives on BaseProvider and is consumed by _resolve_native_status().
         self._input_generation: int = 0
+        # Turn-end gate: last gated frame per detector path and when it was first seen.
+        self._turn_gate_frames: Dict[str, Tuple[str, float]] = {}
+        self._turn_gate_clock: Callable[[], float] = time.monotonic
         self._snapshot_tail_hash: Optional[str] = None
         self._snapshot_last_response: Optional[str] = None
         self._snapshot_response_count: int = 0
@@ -1161,6 +1181,9 @@ class ClaudeCodeProvider(BaseProvider):
                 if NEW_TUI_BOX_SPINNER_PATTERN.search(line):
                     return TerminalStatus.PROCESSING
                 break
+            # No spinner is drawn while text streams; see NEW_TUI_BOX_SUMMARY_PATTERN.
+            if self._turn_still_in_flight("raw", above_lines):
+                return TerminalStatus.PROCESSING
 
         # COMPLETED: the finished turn left output behind — a "✻ <Verb>ed for Ns"
         # completion summary OR a start-of-line response marker (legacy ⏺ or the
@@ -1227,6 +1250,47 @@ class ClaudeCodeProvider(BaseProvider):
             return TerminalStatus.IDLE
 
         return TerminalStatus.UNKNOWN
+
+    @staticmethod
+    def _turn_ended_above_box(above_lines: List[str]) -> bool:
+        """True when the newest conversation line above the input box is the
+        end-of-turn summary. Blank rows and box chrome are skipped on the way up.
+        """
+        for line in reversed(above_lines):
+            if (
+                not line.strip()
+                or NEW_TUI_BOX_CHROME_PATTERN.match(line)
+                or EFFORT_FOOTER_LINE_PATTERN.match(line)
+            ):
+                continue
+            return NEW_TUI_BOX_SUMMARY_PATTERN.match(line) is not None
+        return False
+
+    def _turn_still_in_flight(self, path: str, above_lines: List[str]) -> bool:
+        """After a dispatch, a box without the summary as its newest line above is
+        a running turn, until the same frame has sat unchanged for
+        TURN_END_GRACE_S. ``path`` keeps the two detectors' frame clocks apart.
+        """
+        if not self._task_dispatched:
+            return False
+        if self._turn_ended_above_box(above_lines):
+            self._turn_gate_frames.pop(path, None)
+            return False
+        frame = "\n".join(ln.strip() for ln in above_lines[-40:] if ln.strip())
+        now = self._turn_gate_clock()
+        seen = self._turn_gate_frames.get(path)
+        if seen is None or seen[0] != frame:
+            self._turn_gate_frames[path] = (frame, now)
+            return True
+        if now - seen[1] < TURN_END_GRACE_S:
+            return True
+        logger.info(
+            "claude_code %s: no end-of-turn summary above the input box on a frame "
+            "unchanged for %.0fs; falling back to the legacy ready verdict",
+            self.terminal_id,
+            now - seen[1],
+        )
+        return False
 
     # Opt in to pyte rendered-screen detection (gated by CAO_PYTE_STATUS). The
     # detector below is tuned for a COMPOSITED viewport, not the raw stream.
@@ -1310,11 +1374,16 @@ class ClaudeCodeProvider(BaseProvider):
         # early-painted ──── rule, which a one-sided adjacency misread as a ready
         # prompt (premature IDLE on init — the first task then hits a not-ready
         # agent). The real box always has a rail above AND below the prompt.
-        boxed_prompt = any(
-            any(0 < pi - si <= 2 for si in sep_idx) and any(0 < si - pi <= 2 for si in sep_idx)
+        boxed_rows = [
+            pi
             for pi in prompt_idx
-        )
-        if boxed_prompt:
+            if any(0 < pi - si <= 2 for si in sep_idx) and any(0 < si - pi <= 2 for si in sep_idx)
+        ]
+        if boxed_rows:
+            # No spinner is drawn while text streams; see NEW_TUI_BOX_SUMMARY_PATTERN.
+            box_top = max(si for si in sep_idx if 0 < boxed_rows[-1] - si <= 2)
+            if self._turn_still_in_flight("screen", rows[:box_top]):
+                return TerminalStatus.PROCESSING
             if re.search(
                 GET_STATUS_COMPLETION_PATTERN, joined
             ) or EXTRACTION_RESPONSE_PATTERN.search(joined):
@@ -1375,6 +1444,7 @@ class ClaudeCodeProvider(BaseProvider):
         clean = self._strip_effort_footer_lines(re.sub(ANSI_CODE_PATTERN, "", output))
         self._snapshot_response_count = len(list(re.finditer(r"[⏺●]\s+", clean)))
         self._input_generation += 1
+        self._turn_gate_frames.clear()
         super().mark_input_received()
 
     def get_idle_pattern_for_log(self) -> str:

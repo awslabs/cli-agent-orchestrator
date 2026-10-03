@@ -1,0 +1,50 @@
+
+ ▐▛███▛█   Claude Code v2.1.288
+▝▜██████▀  Sonnet 5.5
+ ▝▝   ▝▝   /home/user/project
+
+
+❯ Reply with exactly the single word PONG and nothing else.
+
+⏺ PONG
+
+✻ Worked for 4s · done 12:26 PM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                 tmux detected · scroll with PgUp/PgDn · or add 'set -g mouse on' to ~/.tmux.conf for wheel scroll
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Model: Sonnet 5.5 | Thinking: medium | Context: [█░░░░░░░░░░░░░░░] 57k/1.0M (6%) | Session: <1m
+  ⎇ no git | cwd: /home/user/project
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
