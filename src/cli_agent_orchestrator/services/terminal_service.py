@@ -3492,6 +3492,31 @@ def exit_terminal_cli(terminal_id: str) -> None:
         send_input(terminal_id, exit_command)
 
 
+def get_output_context(terminal_id: str) -> Optional[str]:
+    """Return raw terminal output for provider-owned error classification.
+
+    This is deliberately separate from :func:`get_output`: that function returns
+    extracted assistant text, where a legitimate answer and provider chrome can be
+    byte-identical.  The raw capture carries the adapter's response-marker context,
+    so the classifier can distinguish ownership instead of guessing from words.
+
+    Best-effort by design.  A missing terminal, backend, or buffer means there is
+    no positive ownership evidence; callers must treat ``None`` as "do not classify"
+    rather than as a step failure.
+    """
+    try:
+        metadata = get_terminal_metadata(terminal_id)
+        if not metadata:
+            return None
+        output = status_monitor.get_buffer(terminal_id)
+        if output:
+            return output
+        return get_backend().get_history(metadata["tmux_session"], metadata["tmux_window"])
+    except Exception as exc:  # noqa: BLE001 — classifier context is best-effort
+        logger.debug("get_output_context: %s unavailable: %s", terminal_id, exc)
+        return None
+
+
 def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     """Get terminal output.
 
