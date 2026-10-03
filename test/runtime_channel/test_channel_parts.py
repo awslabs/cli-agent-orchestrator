@@ -388,6 +388,34 @@ def test_cao_bridge_refuses_a_server_url_it_could_never_dial(monkeypatch, url):
         token_mod._reset_for_tests()
 
 
+def test_cao_bridge_clears_a_stale_readiness_file_before_its_startup_work(monkeypatch, tmp_path):
+    # Left by a run that died without cleaning up: kept until Bridge.run(), it
+    # reports a starting bridge ready through init_db and the stale-row sweep.
+    import cli_agent_orchestrator.clients.database as database
+    from cli_agent_orchestrator.runtime_channel import bridge as bridge_mod
+
+    ready = tmp_path / "bridge-ready"
+    ready.write_text("12345\n")
+    seen = []
+
+    def stop_at_init_db():
+        seen.append(ready.exists())
+        raise RuntimeError("stop after the readiness check")
+
+    monkeypatch.setattr(database, "init_db", stop_at_init_db)
+    monkeypatch.setenv("CAO_BRIDGE_SERVER_URL", "ws://server/runtime/channel")
+    monkeypatch.setenv("CAO_BRIDGE_RUNTIME_ID", "rt-1")
+    monkeypatch.setenv("CAO_BRIDGE_READY_FILE", str(ready))
+    monkeypatch.setenv(token_mod.TOKEN_ENV, "token")
+    token_mod._reset_for_tests()
+    try:
+        with pytest.raises(RuntimeError, match="stop after the readiness check"):
+            asyncio.run(bridge_mod._amain())
+    finally:
+        token_mod._reset_for_tests()
+    assert seen == [False], "the stale readiness file was still there during startup"
+
+
 def test_cao_bridge_names_itself_in_its_startup_banner(monkeypatch, capsys):
     import logging
 
