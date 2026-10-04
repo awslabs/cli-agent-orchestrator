@@ -83,7 +83,7 @@ COPILOT_STATUS_BAR_PATTERN = r"^\s*(?:autopilot|plan|interactive)\s*[·•]"
 # Path can be tilde-prefixed (home) or absolute (e.g. /tmp/...), so allow both.
 COPILOT_CWD_BREADCRUMB_PATTERN = r"^\s+(?:~|/)[^\[]*\["
 COPILOT_HINT_BAR_PATTERN = r"^←.*[·•]\s*/ commands\b"
-COPILOT_AGENT_MODEL_BAR_PATTERN = r"^[\w.-]+\s*[·•]\s*github copilot\s*[·•]"
+COPILOT_AGENT_MODEL_BAR_PATTERN = r"^(?:[\w.-]+\s*[·•]\s*)?github copilot\s*[·•]"
 PROCESSING_LINE_PATTERN = r"^(?:[●◐◑◒◓◉◎∙]\s*)?.*\besc to cancel\b.*$"
 
 
@@ -435,6 +435,12 @@ class CopilotCliProvider(BaseProvider):
                 self.window_name,
                 unrecognized[0],
             )
+        else:
+            logger.warning(
+                "Copilot idle prompt recognized for %s:%s but status did not settle to idle",
+                self.session_name,
+                self.window_name,
+            )
         screen_tail = [line for line in lines if line.strip()][-12:]
         logger.debug(
             "Copilot screen tail for %s:%s:\n%s",
@@ -536,21 +542,15 @@ class CopilotCliProvider(BaseProvider):
         remaining: list[str] = []
         idx = 0
         while idx < len(rows):
+            if rows[idx].strip().startswith("←"):
+                break
             if cls._is_footer_line(rows[idx]) or cls._is_idle_chrome_row(rows[idx]):
                 idx += 1
                 continue
-            span = next(
-                (
-                    size
-                    for size in (2, 3, 4)
-                    if idx + size <= len(rows)
-                    and cls._is_wrapped_idle_chrome(rows[idx : idx + size])
-                ),
-                0,
-            )
-            if span:
-                idx += span
-                continue
+            if any(
+                cls._is_wrapped_idle_chrome(rows[idx:end]) for end in range(idx + 2, len(rows) + 1)
+            ):
+                break
             remaining.append(rows[idx])
             idx += 1
         return remaining

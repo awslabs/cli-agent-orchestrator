@@ -389,6 +389,39 @@ class TestCopilotCliProviderInitialization:
             "Copilot idle prompt not found for %s:%s", "test-session", "window-0"
         )
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.copilot_cli.logger")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.time.time")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.asyncio.sleep")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    @patch.object(CopilotCliProvider, "_accept_trust_prompts")
+    async def test_initialize_timeout_logs_recognized_prompt_that_did_not_settle(
+        self,
+        _mock_accept,
+        _mock_tmux,
+        mock_wait_shell,
+        _mock_async_sleep,
+        mock_status_monitor,
+        mock_time,
+        mock_logger,
+    ):
+        mock_wait_shell.return_value = True
+        mock_status_monitor.get_status.return_value = TerminalStatus.PROCESSING
+        mock_time.side_effect = [0.0, 61.0]
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+
+        with patch.object(provider, "_history", return_value="● Ready\n❯\n"):
+            with pytest.raises(TimeoutError, match="Copilot initialization timed out"):
+                await provider.initialize()
+
+        mock_logger.warning.assert_called_once_with(
+            "Copilot idle prompt recognized for %s:%s but status did not settle to idle",
+            "test-session",
+            "window-0",
+        )
+
 
 class TestCopilotCliProviderTrustPrompts:
     @pytest.mark.asyncio
@@ -791,6 +824,30 @@ class TestCopilotCliProviderMisc:
         assert provider.extract_last_message_from_script(output) == (
             "vscode · GitHub Copilot · AI assistant"
         )
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    def test_get_status_idle_when_footer_wraps_across_many_rows(self, mock_tmux):
+        rule = "─" * 12
+        output = (
+            f"{rule}\n❯\n{rule}\n"
+            "← open sid\nebar · Auto\npilot · All\now All · / c\nommands · t\n"
+            "ab next tab\ndata_analyst\n · GitHub Co\npilot • Claude\n Sonnet 5\n"
+        )
+        mock_tmux.return_value.get_native_status.return_value = None
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    def test_get_status_idle_with_model_row_lacking_agent_prefix(self, mock_tmux):
+        rule = "─" * 120
+        output = (
+            f"{rule}\n❯\n{rule}\n"
+            " ← open sidebar · Autopilot · Allow All · / commands · tab next tab"
+            "            GitHub Copilot • Claude Sonnet 5\n"
+        )
+        mock_tmux.return_value.get_native_status.return_value = None
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.IDLE
 
     @pytest.mark.parametrize("separator", ["", " "])
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
