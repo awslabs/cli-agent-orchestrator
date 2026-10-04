@@ -17,7 +17,7 @@ from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
-from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils import agent_profiles
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -1029,7 +1029,9 @@ class CodexProvider(BaseProvider):
         profile = None
         if self._agent_profile is not None:
             try:
-                profile = _with_plugin_mcp(load_agent_profile(self._agent_profile), "codex")
+                profile, source = agent_profiles.load_launch_profile(self._agent_profile)
+                if source == agent_profiles.ProfileSource.INSTALLED:
+                    profile = _with_plugin_mcp(profile, "codex")
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
@@ -1507,7 +1509,10 @@ class CodexProvider(BaseProvider):
         if self._agent_profile is None:
             return None
         try:
-            return _with_plugin_mcp(load_agent_profile(self._agent_profile), "codex")
+            profile, source = agent_profiles.load_launch_profile(self._agent_profile)
+            if source == agent_profiles.ProfileSource.EPHEMERAL:
+                return profile
+            return _with_plugin_mcp(profile, "codex")
         except Exception:
             return None
 

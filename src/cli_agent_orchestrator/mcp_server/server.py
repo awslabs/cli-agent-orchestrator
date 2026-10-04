@@ -41,6 +41,9 @@ from cli_agent_orchestrator.services.outcome_service import (
     LEARNING_DISABLED_MESSAGE,
 )
 from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT
+from cli_agent_orchestrator.utils.caller_tools import (
+    caller_effective_allowed_tools as _caller_effective_allowed_tools,
+)
 from cli_agent_orchestrator.utils.orchestration import (
     ENABLE_SENDER_ID_INJECTION,
     REMOTE_CONNECT_TIMEOUT,
@@ -1384,6 +1387,7 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
             "provider": meta["provider"],
             "agent_profile": meta.get("agent_profile"),
             "allowed_tools": meta.get("allowed_tools"),
+            "ephemeral": meta.get("ephemeral", False),
         }
         # Try to get working directory for project scope resolution. Same header
         # reasoning as above — best-effort, so a failure degrades project scope
@@ -1433,31 +1437,6 @@ def _caller_has_store_lesson_capability(caller_profile: Optional[str]) -> bool:
 CAO_MCP_SERVER_SELECTOR = "@cao-mcp-server"
 
 
-def _caller_effective_allowed_tools(context: Dict[str, Any]) -> Optional[List[str]]:
-    """Effective CAO allowlist for the calling terminal, or None if unresolvable.
-
-    Mirrors ``create_terminal``: a recorded ``allowed_tools`` IS the effective
-    list, while ``None`` means "resolve from the agent profile" rather than
-    "unrestricted", so the profile goes through the same
-    ``resolve_allowed_tools`` the launch path uses.
-    """
-    recorded = context.get("allowed_tools")
-    if recorded is not None:
-        return list(recorded)
-
-    profile_name = context.get("agent_profile")
-    if not profile_name:
-        return None
-
-    from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
-    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-    from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
-
-    profile = load_agent_profile(profile_name)
-    mcp_server_names = grantable_server_names(profile)
-    return resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
-
-
 def _tool_denied_reason(tool_name: str) -> Optional[str]:
     """Reason the calling terminal's allowlist bars ``tool_name``, or None to allow.
 
@@ -1503,6 +1482,26 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
             f"cannot authorize '{tool_name}': CAO_TERMINAL_ID is set but the calling "
             "terminal could not be resolved"
         )
+
+    if tool_name in {
+        "assign",
+        "handoff",
+        "assign_elastic",
+        "workflow_run",
+        "workflow_resume",
+        "workflow_start",
+    }:
+        try:
+            from cli_agent_orchestrator.services.settings_service import child_may_delegate
+
+            if context.get("ephemeral") and not child_may_delegate():
+                return f"'{tool_name}' is not permitted: ephemeral child delegation requires ephemeral.child_may_delegate"
+        except Exception as exc:
+            return f"cannot authorize '{tool_name}': ephemeral delegation policy could not be resolved ({exc})"
+
+    # Workflow calls keep the installed-caller contract; only ephemerals get this gate.
+    if tool_name in {"workflow_run", "workflow_resume", "workflow_start"}:
+        return None
 
     try:
         allowed = _caller_effective_allowed_tools(context)
@@ -2166,6 +2165,10 @@ async def workflow_run(
     (``_check_run_id_available``, 409 on collision), surfaced through the envelope.
     The tool stays blocking (FR-5.2); the async ``:submit`` spine is a separate seam.
     """
+    denied = await asyncio.to_thread(_tool_denied_reason, "workflow_run")
+    if denied:
+        return {"ok": False, "error": denied}
+
     payload: Dict[str, Any] = {"name_or_path": name_or_path, "inputs": inputs or {}}
     # Forward the id ONLY when a real value was supplied. ``isinstance(..., str)``
     # (not ``is not None``) so the omitted case is byte-identical to today whether
@@ -2246,6 +2249,10 @@ async def workflow_resume(
     values. The tool's contract is otherwise unchanged: a 400 from the route is still
     just another ``ok=False`` detail.
     """
+    denied = await asyncio.to_thread(_tool_denied_reason, "workflow_resume")
+    if denied:
+        return {"ok": False, "error": denied}
+
     # ``decisions`` arrives as a real dict from an MCP client (fastmcp resolves the
     # declared default through the generated model) and as the ``FieldInfo`` SENTINEL
     # when a Python caller omits the argument entirely — this module's tools are
@@ -2354,6 +2361,10 @@ async def workflow_start(
     blocking tool); admission (uniqueness) is the server's and a collision surfaces
     as ``ok=False``.
     """
+    denied = await asyncio.to_thread(_tool_denied_reason, "workflow_start")
+    if denied:
+        return {"ok": False, "error": denied}
+
     payload: Dict[str, Any] = {"name_or_path": name_or_path, "inputs": inputs or {}}
     # Forward the id ONLY when a real value was supplied — ``isinstance(..., str)``
     # (not ``is not None``) so the omitted case is byte-identical whether invoked

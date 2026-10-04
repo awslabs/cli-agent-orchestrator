@@ -2,18 +2,72 @@
 
 import logging
 import re
+from enum import Enum
 from importlib import resources
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 import frontmatter
 
-from cli_agent_orchestrator.constants import LOCAL_AGENT_STORE_DIR, PROVIDERS
+from cli_agent_orchestrator.constants import CAO_HOME_DIR, LOCAL_AGENT_STORE_DIR, PROVIDERS
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.utils.env import resolve_env_vars
 from cli_agent_orchestrator.utils.paths import normalized_path
 
 logger = logging.getLogger(__name__)
+
+EPHEMERAL_LIVE_DIR = CAO_HOME_DIR / "ephemeral" / "live"
+_RESERVED_EPHEMERAL_PATTERN = re.compile(
+    r"^[A-Z][A-Za-z0-9]{1,23}-[a-z][a-z0-9_]{2,31}-[0-9a-f]{4}$"
+)
+
+
+class ProfileSource(str, Enum):
+    """The store that served a launch profile."""
+
+    INSTALLED = "installed"
+    EPHEMERAL = "ephemeral"
+
+
+class EphemeralProfileUnavailable(ValueError):
+    """A reserved name cannot be served by the ephemeral live store."""
+
+
+def routes_to_ephemeral_store(name: str) -> bool:
+    """Route reserved names exclusively to the server-owned live store."""
+    return _RESERVED_EPHEMERAL_PATTERN.fullmatch(name) is not None
+
+
+def load_launch_profile(name: str) -> tuple[AgentProfile, ProfileSource]:
+    """Load a launch profile; reserved names never fall back to installed stores."""
+    if not routes_to_ephemeral_store(name):
+        return load_agent_profile(name), ProfileSource.INSTALLED
+    try:
+        path = _safe_join(EPHEMERAL_LIVE_DIR, f"{name}.md")
+        if path is None:
+            raise ValueError("live profile path escapes its store")
+        profile = parse_agent_profile_text(path.read_text(encoding="utf-8"), name)
+    except Exception as exc:
+        raise EphemeralProfileUnavailable(f"Ephemeral profile unavailable: {name}") from exc
+    return profile, ProfileSource.EPHEMERAL
+
+
+def resolve_agent_profile_source(name: str) -> ProfileSource:
+    """Report the store that actually served the file, refusing unavailable names."""
+    return load_launch_profile(name)[1]
+
+
+def warn_reserved_installed_profiles() -> None:
+    """Warn once at startup about installed profiles shadowed by the namespace."""
+    try:
+        for profile in _list_installed_profiles():
+            if routes_to_ephemeral_store(profile["name"]):
+                logger.warning(
+                    "Installed profile '%s' matches the reserved ephemeral namespace and cannot be used",
+                    profile["name"],
+                )
+    except Exception:
+        logger.warning("reserved-name startup scan failed", exc_info=True)
 
 
 def _validate_agent_name(agent_name: str) -> None:
@@ -186,7 +240,7 @@ def _scan_directory(
                 }
 
 
-def list_agent_profiles() -> List[Dict]:
+def _list_installed_profiles() -> List[Dict]:
     """Discover all available agent profiles from all configured directories.
 
     Scans built-in store, local store, and all provider agent directories
@@ -277,6 +331,11 @@ def list_agent_profiles() -> List[Dict]:
     return sorted(profiles.values(), key=lambda p: p["name"])
 
 
+def list_agent_profiles() -> List[Dict]:
+    """List installed profiles, excluding the reserved launch-only namespace."""
+    return [p for p in _list_installed_profiles() if not routes_to_ephemeral_store(p["name"])]
+
+
 def parse_agent_profile_text(resolved_text: str, profile_name: str) -> AgentProfile:
     """Parse an AgentProfile from already-resolved markdown text."""
     profile_data = frontmatter.loads(resolved_text)
@@ -305,6 +364,8 @@ def _read_agent_profile_source(agent_name: str) -> str:
     the context file). Centralising the lookup keeps the two callers in sync.
     """
     _validate_agent_name(agent_name)
+    if routes_to_ephemeral_store(agent_name):
+        raise FileNotFoundError(f"Reserved ephemeral profile name: {agent_name}")
 
     from cli_agent_orchestrator.services.settings_service import (
         get_disabled_agent_dirs,
@@ -391,7 +452,7 @@ def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
         Resolved provider type string.
     """
     try:
-        profile = load_agent_profile(agent_profile_name)
+        profile, _source = load_launch_profile(agent_profile_name)
     except (FileNotFoundError, RuntimeError):
         # Profile not found or failed to load — provider.initialize()
         # will surface a clear error later.  Fall back for now.

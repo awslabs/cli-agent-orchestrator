@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Security groundwork for ephemeral agents (#801): installed profiles whose
+  names match the reserved pattern can no longer be launched or listed;
+  installed-profile APIs and CLI lookups refuse those names, and cao-server
+  warns about them at startup. Terminal responses include a registry-derived
+  `ephemeral` boolean. Ephemeral callers cannot delegate or start workflows
+  unless the operator sets `ephemeral.child_may_delegate` to `true` in
+  `settings.json`. Workflow `run`/`resume`/`start` now refuse when
+  `CAO_TERMINAL_ID` is set but the calling terminal cannot be resolved.
+  Ephemeral agent creation is not yet available.
 - Advanced CodeQL analysis for same-repository and fork pull requests, with
   Python, JavaScript/TypeScript, GitHub Actions, and Rust coverage, plus `main`,
   weekly, and manual scans. CI workflow definitions and their `CODEOWNERS`
