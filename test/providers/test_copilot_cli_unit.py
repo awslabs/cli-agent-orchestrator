@@ -768,8 +768,44 @@ class TestCopilotCliProviderMessageExtraction:
 
 
 class TestCopilotCliProviderMisc:
-    def test_supports_direct_status_probe_is_true(self):
-        assert CopilotCliProvider.supports_direct_status_probe is True
+    def test_opts_into_stale_capture_but_not_direct_status_probe(self):
+        assert CopilotCliProvider.supports_stale_processing_capture is True
+        assert CopilotCliProvider.supports_direct_status_probe is False
+
+    def test_stale_capture_probe_classifies_without_side_effects(self):
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        output = "❯\n← open sidebar · Autopilot · / commands · tab next tab\n"
+        assert provider.probe_stale_processing_capture(output) == TerminalStatus.IDLE
+        assert provider.commit_stale_processing_capture(output, TerminalStatus.IDLE) is True
+
+    def test_extract_last_message_keeps_sole_reply_resembling_agent_model_bar(self):
+        output = (
+            "❯ who are you\n"
+            "vscode · GitHub Copilot · AI assistant\n"
+            "\n"
+            "❯\n"
+            "← open sidebar · Autopilot · / commands · tab next tab\n"
+            "data_analyst · GitHub Copilot • GPT-5.6 Terra\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.extract_last_message_from_script(output) == (
+            "vscode · GitHub Copilot · AI assistant"
+        )
+
+    @pytest.mark.parametrize("separator", ["", " "])
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    def test_get_status_idle_when_footer_rows_wrap_in_narrow_pane(self, mock_tmux, separator):
+        hint = "← open sidebar · Autopilot · Allow All · / commands · tab next tab"
+        model = "data_analyst · GitHub Copilot • Claude Sonnet 5"
+        rule = "─" * 40
+        output = (
+            f"{rule}\n❯\n{rule}\n"
+            f"{hint[:30]}{separator}\n{hint[30:]}\n"
+            f"{model[:20]}{separator}\n{model[20:]}\n"
+        )
+        mock_tmux.return_value.get_native_status.return_value = None
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_idle_on_v1091_capture_pane_with_shared_footer_row(self, mock_tmux):

@@ -90,7 +90,7 @@ PROCESSING_LINE_PATTERN = r"^(?:[●◐◑◒◓◉◎∙]\s*)?.*\besc to cancel
 class CopilotCliProvider(BaseProvider):
     """Provider for GitHub Copilot CLI."""
 
-    supports_direct_status_probe = True
+    supports_stale_processing_capture = True
 
     @classmethod
     def honors_model(
@@ -479,10 +479,6 @@ class CopilotCliProvider(BaseProvider):
         # Copilot v1.0.31+ status bar: " autopilot · / commands    Claude Sonnet 4.6 · (0%)"
         if re.match(COPILOT_STATUS_BAR_PATTERN, stripped):
             return True
-        if re.search(COPILOT_HINT_BAR_PATTERN, stripped):
-            return True
-        if re.search(COPILOT_AGENT_MODEL_BAR_PATTERN, stripped):
-            return True
         # Copilot v1.0.31+ cwd breadcrumb: " ~/path [⎇ branch*%]"
         # (pre-v1.0.31 form included "(0x)" and was caught by the \(\d+x\) check above)
         if re.match(
@@ -490,6 +486,21 @@ class CopilotCliProvider(BaseProvider):
         ):  # intentionally use raw line (preserves leading spaces)
             return True
         return False
+
+    @staticmethod
+    def _is_idle_chrome_row(text: str) -> bool:
+        stripped = text.strip().lower()
+        return bool(
+            re.search(COPILOT_HINT_BAR_PATTERN, stripped)
+            or re.search(COPILOT_AGENT_MODEL_BAR_PATTERN, stripped)
+        )
+
+    @classmethod
+    def _is_wrapped_idle_chrome(cls, rows: list[str]) -> bool:
+        stripped_rows = [row.strip() for row in rows]
+        return any(
+            cls._is_idle_chrome_row(separator.join(stripped_rows)) for separator in ("", " ")
+        )
 
     @staticmethod
     def _is_processing_line(line: str) -> bool:
@@ -517,21 +528,52 @@ class CopilotCliProvider(BaseProvider):
         if last_prompt_idx < 0:
             return None
 
-        return [
-            line
-            for line in tail[last_prompt_idx + 1 :]
-            if line.strip() and not cls._is_footer_line(line)
-        ]
+        return cls._rows_outside_idle_chrome(tail[last_prompt_idx + 1 :])
+
+    @classmethod
+    def _rows_outside_idle_chrome(cls, rows: list[str]) -> list[str]:
+        rows = [row for row in rows if row.strip()]
+        remaining: list[str] = []
+        idx = 0
+        while idx < len(rows):
+            if cls._is_footer_line(rows[idx]) or cls._is_idle_chrome_row(rows[idx]):
+                idx += 1
+                continue
+            span = next(
+                (
+                    size
+                    for size in (2, 3, 4)
+                    if idx + size <= len(rows)
+                    and cls._is_wrapped_idle_chrome(rows[idx : idx + size])
+                ),
+                0,
+            )
+            if span:
+                idx += span
+                continue
+            remaining.append(rows[idx])
+            idx += 1
+        return remaining
 
     @classmethod
     def _normalize_post_user_lines(cls, lines: list[str]) -> list[str]:
-        normalized = [
+        last_prompt = max(
+            (idx for idx, line in enumerate(lines) if re.match(IDLE_PROMPT_LINE_PATTERN, line)),
+            default=-1,
+        )
+        body = [
             line
-            for line in lines
+            for line in lines[: last_prompt + 1 if last_prompt >= 0 else len(lines)]
             if line.strip()
             and not cls._is_footer_line(line)
             and not re.match(IDLE_PROMPT_LINE_PATTERN, line)
         ]
+        trailing = [
+            line
+            for line in cls._rows_outside_idle_chrome(lines[last_prompt + 1 :])
+            if not cls._is_footer_line(line)
+        ]
+        normalized = body + trailing
 
         while (
             normalized
@@ -626,6 +668,12 @@ class CopilotCliProvider(BaseProvider):
             return TerminalStatus.ERROR
 
         return TerminalStatus.COMPLETED
+
+    def probe_stale_processing_capture(self, output: str) -> TerminalStatus:
+        return self.get_status(output)
+
+    def commit_stale_processing_capture(self, output: str, expected: TerminalStatus) -> bool:
+        return True
 
     def get_idle_pattern_for_log(self) -> str:
         return IDLE_PROMPT_PATTERN_LOG
