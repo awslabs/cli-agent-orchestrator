@@ -76,7 +76,7 @@ class SessionIncarnationModel(Base):
 
 
 class EphemeralAgentModel(Base):
-    """Read-only access to the server-owned ephemeral registry."""
+    """Server-owned ephemeral registry with guarded lifecycle transitions."""
 
     __tablename__ = "ephemeral_agents"
 
@@ -87,15 +87,15 @@ class EphemeralAgentModel(Base):
     state = Column(String, nullable=False)
     claim_id = Column(String, nullable=True)
     idempotency_key = Column(String, nullable=True)
-    claim_expires_at = Column(DateTime, nullable=True)
+    claim_expires_at = Column(UTCDateTime, nullable=True)
     launched_terminal_id = Column(String, nullable=True, index=True)
-    bound_at = Column(DateTime, nullable=True)
+    bound_at = Column(UTCDateTime, nullable=True)
     model_tier = Column(String, nullable=True)
     effort = Column(String, nullable=True)
     provider = Column(String, nullable=False)
     effective_tools = Column(Text, nullable=False)
-    created_at = Column(DateTime, nullable=False)
-    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(UTCDateTime, nullable=False)
+    expires_at = Column(UTCDateTime, nullable=False)
     gc_reason = Column(String, nullable=True)
     spec_sha256 = Column(String, nullable=False)
     profile_sha256 = Column(String, nullable=False)

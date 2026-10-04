@@ -1,4 +1,4 @@
-"""Create and persist bounded ephemeral profiles; launch claims are a separate contract."""
+"""Persist bounded ephemeral profiles and guard their claim lifecycle."""
 
 import hashlib
 import json
@@ -7,13 +7,16 @@ import os
 import re
 import secrets
 import stat
+import threading
 import unicodedata
-from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Iterator, Optional, cast
 
 import yaml
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 
 from cli_agent_orchestrator.clients import database
@@ -22,6 +25,7 @@ from cli_agent_orchestrator.models.ephemeral import TOOL_ATOMS, EphemeralSpec
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.services.secret_gate import scan_for_secrets
 from cli_agent_orchestrator.services.settings_service import (
+    EPHEMERAL_DEFAULTS,
     SettingsUnreadableError,
     get_ephemeral_settings,
 )
@@ -168,6 +172,10 @@ def require_enabled(settings: dict[str, Any]) -> None:
         raise EphemeralPolicyError("ephemeral_disabled", status_code=404)
 
 
+def _positive_integer(value: Any) -> bool:
+    return type(value) is int and value > 0
+
+
 def validate_block(settings: dict[str, Any]) -> None:
     providers = settings["allowed_providers"]
     if (
@@ -181,7 +189,7 @@ def validate_block(settings: dict[str, Any]) -> None:
         )
     for key in ("max_brief_bytes", "pending_ttl_seconds", "claim_lease_seconds"):
         value = settings[key]
-        if type(value) is not int or value <= 0:
+        if not _positive_integer(value):
             raise EphemeralPolicyError(
                 "policy_config_error:" + key, "ephemeral." + key + " must be a positive integer"
             )
@@ -425,7 +433,7 @@ def create_ephemeral_agent(
                 raise EphemeralPolicyError("secret_detected", hit)
         canonical = canonical_spec_bytes(spec)
         digest = hashlib.sha256(canonical).hexdigest()
-        created = datetime.now(timezone.utc)
+        created = database._utcnow()
         expires = created + timedelta(seconds=config["pending_ttl_seconds"])
         expires_at = expires.isoformat()
         notes = _policy_notes(config)
@@ -524,4 +532,364 @@ def create_ephemeral_agent(
     except Exception:
         error = EphemeralPolicyError("unexpected_failure", status_code=500)
         log_refusal(error.rule, caller_id, None, "")
+        raise error from None
+
+
+class _ClaimRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    idempotency_key: Optional[str] = None
+    claim_id: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    model: Optional[str] = None
+
+
+@contextmanager
+def _transaction() -> Iterator[Any]:
+    """Serialize lapse and compare-and-update on SQLite, without nested sessions."""
+    with database.SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            yield db
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+
+
+def _row(db: Any, name: str) -> Optional[dict[str, Any]]:
+    row = db.get(database.EphemeralAgentModel, name)
+    if row is None:
+        return None
+    result = {c.name: getattr(row, c.name) for c in database.EphemeralAgentModel.__table__.columns}
+    result["effective_tools"] = json.loads(result["effective_tools"])
+    return result
+
+
+def _change(
+    db: Any, name: str, state: str, values: dict[str, Any], claim_id: Optional[str] = None
+) -> int:
+    table = database.EphemeralAgentModel
+    statement = update(table).where(table.name == name, table.state == state)
+    if claim_id is not None:
+        statement = statement.where(table.claim_id == claim_id)
+    return cast(int, db.execute(statement.values(**values)).rowcount)
+
+
+def _expired(value: Any, now: Any) -> bool:
+    left, right = database.as_utc(value), database.as_utc(now)
+    return left is not None and right is not None and left <= right
+
+
+def _lapse(db: Any, row: dict[str, Any], now: Any) -> dict[str, Any]:
+    if row["state"] == "pending" or (
+        row["state"] == "claimed" and _expired(row["claim_expires_at"], now)
+    ):
+        if _expired(row["expires_at"], now):
+            _change(
+                db,
+                row["name"],
+                row["state"],
+                dict(state="gc", gc_reason="ephemeral_expired"),
+                row["claim_id"],
+            )
+        elif row["state"] == "claimed":
+            _change(
+                db,
+                row["name"],
+                "claimed",
+                dict(state="pending", claim_id=None, claim_expires_at=None, idempotency_key=None),
+                row["claim_id"],
+            )
+        db.expire_all()
+        return cast(dict[str, Any], _row(db, row["name"]))
+    return row
+
+
+def _read_regular(path: Path) -> bytes:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("ephemeral store file is unsafe")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            return stream.read()
+    finally:
+        os.close(fd)
+
+
+_audit_lock = threading.Lock()
+
+
+def _audit_update(
+    row: dict[str, Any], event: Optional[str] = None, refusal: Optional[str] = None, **facts: Any
+) -> None:
+    """Best-effort atomic archive replacement; only policy facts enter events."""
+    owned: list[tuple[Path, int, int]] = []
+    try:
+        with _audit_lock:
+            path = Path(row["audit_path"])
+            archive = json.loads(_read_regular(path))
+            now = database._utcnow().isoformat()
+            if refusal:
+                entry = archive.setdefault("refusals", {}).setdefault(
+                    refusal, dict(count=0, first_at=now)
+                )
+                entry.update(count=entry["count"] + 1, last_at=now)
+            if event:
+                if event == "released" and any(e["event"] == "released" for e in archive["events"]):
+                    return
+                archive["events"].append(dict(at=now, event=event, **facts))
+                if event == "finalized":
+                    archive["profile_sha256"] = facts["profile_sha256"]
+                elif event == "released":
+                    archive["gc_reason"] = row["gc_reason"]
+            temp = path.with_name("." + path.name + "." + secrets.token_hex(4) + ".tmp")
+            _write_exclusive(
+                temp,
+                json.dumps(archive, ensure_ascii=False, allow_nan=False).encode("utf-8"),
+                owned,
+            )
+            os.replace(temp, path)
+    except Exception:
+        pass
+    finally:
+        try:
+            _cleanup(owned)
+        except Exception:
+            pass  # Archive maintenance never controls the registry transition.
+
+
+def _finish_gc(row: dict[str, Any]) -> None:
+    """Remove only the two exact regular live files, leaving the archive."""
+    if not agent_profiles.routes_to_ephemeral_store(row["name"]):
+        return
+    for suffix in (".md", ".spec.json"):
+        path = EPHEMERAL_DIR / "live" / (row["name"] + suffix)
+        try:
+            if stat.S_ISREG(path.lstat().st_mode):
+                path.unlink()
+        except OSError:
+            pass
+    _audit_update(row, "released", gc_reason=row["gc_reason"])
+
+
+def end_claim(name: Optional[str], claim_id: str) -> None:
+    """Only this unbound claim is ended; a stale claim changes nothing."""
+    if not name:
+        return
+    try:
+        with _transaction() as db:
+            row = _row(db, name)
+            if row is None or row["state"] != "claimed" or row["claim_id"] != claim_id:
+                return
+            values = (
+                dict(state="pending", claim_id=None, claim_expires_at=None, idempotency_key=None)
+                if row["owner_kind"] == "terminal"
+                else dict(state="gc", gc_reason="launch_failed")
+            )
+            _change(db, name, "claimed", values, claim_id)
+            row.update(values)
+        if row["state"] == "gc":
+            _finish_gc(row)
+    except Exception:
+        pass  # Cleanup must not replace the original launch failure.
+
+
+def _recheck_policy(row: dict[str, Any], settings: dict[str, Any], claim_id: Optional[str]) -> None:
+    """Block errors revert this claim; a removed provider collects it."""
+    state = "claimed" if claim_id is not None else "pending"
+    try:
+        validate_block(settings)
+    except EphemeralPolicyError as exc:
+        if claim_id is not None:
+            with _transaction() as db:
+                _change(
+                    db,
+                    row["name"],
+                    "claimed",
+                    dict(
+                        state="pending", claim_id=None, claim_expires_at=None, idempotency_key=None
+                    ),
+                    claim_id,
+                )
+        key = exc.rule.partition(":")[2]
+        raise EphemeralPolicyError(
+            exc.rule,
+            "("
+            + exc.detail
+            + "); the operator must fix ephemeral."
+            + key
+            + " in settings before any launch can succeed",
+        ) from None
+    if row["provider"] not in settings["allowed_providers"]:
+        with _transaction() as db:
+            changed = _change(
+                db, row["name"], state, dict(state="gc", gc_reason="policy_changed"), claim_id
+            )
+        if changed:
+            row.update(state="gc", gc_reason="policy_changed")
+            _finish_gc(row)
+        raise EphemeralPolicyError(
+            "policy_changed_since_create:provider_not_allowed",
+            "(" + row["provider"] + "); re-create the ephemeral agent",
+        )
+
+
+def finalize(name: str, claim_id: str) -> None:
+    """Re-render verified stored spec before returning the claim to its caller."""
+    row = database.get_ephemeral_agent(name)
+    if row is None:
+        raise EphemeralPolicyError("unknown_ephemeral", status_code=404)
+    owned: list[tuple[Path, int, int]] = []
+    try:
+        try:
+            payload = _read_regular(EPHEMERAL_DIR / "live" / (name + ".spec.json"))
+        except FileNotFoundError:
+            payload = None
+        if payload is None or hashlib.sha256(payload).hexdigest() != row["spec_sha256"]:
+            with _transaction() as db:
+                changed = _change(
+                    db, name, "claimed", dict(state="gc", gc_reason="launch_failed"), claim_id
+                )
+            if changed:
+                row.update(state="gc", gc_reason="launch_failed")
+                _finish_gc(row)
+            raise EphemeralPolicyError(
+                "spec_unavailable", "stored spec unavailable; re-create the ephemeral agent", 409
+            )
+        spec = EphemeralSpec.model_validate(json.loads(payload))
+        profile = render_profile(
+            name, spec, row["provider"], row["effective_tools"], row["owner_id"]
+        )
+        temp = EPHEMERAL_DIR / "live" / ("." + name + ".md." + secrets.token_hex(4) + ".tmp")
+        _write_exclusive(temp, profile, owned)
+        os.replace(temp, EPHEMERAL_DIR / "live" / (name + ".md"))
+        digest = hashlib.sha256(profile).hexdigest()
+        with _transaction() as db:
+            changed = _change(db, name, "claimed", dict(profile_sha256=digest), claim_id)
+        if not changed:
+            raise EphemeralPolicyError("claim_expired", status_code=409)
+        _audit_update(row, "finalized", profile_sha256=digest)
+    finally:
+        _cleanup(owned)
+
+
+def claim_ephemeral_agent(
+    name: str, raw: Any, caller_id: Optional[str], settings: Optional[dict[str, Any]] = None
+) -> dict[str, Any]:
+    """Claim once under a lease, then re-check and finalize before responding."""
+    row = None
+    won_claim = None
+    try:
+        config = read_settings() if settings is None else settings
+        require_enabled(config)
+        try:
+            request = _ClaimRequest.model_validate(raw)
+        except ValidationError as exc:
+            fields = [
+                (
+                    "unknown field: extra_forbidden"
+                    if e["type"] == "extra_forbidden"
+                    else (str(e["loc"][0]) if e["loc"] else "body") + ": " + e["type"]
+                )
+                for e in exc.errors(include_input=False, include_url=False)
+            ]
+            raise EphemeralPolicyError("invalid_request", "; ".join(fields), 422) from None
+        try:
+            if (
+                not caller_id
+                or not re.fullmatch(r"[0-9a-f]{8}", caller_id)
+                or database.get_terminal_metadata(caller_id) is None
+            ):
+                raise ValueError()
+        except Exception:
+            raise EphemeralPolicyError("creator_unresolved") from None
+        row = database.get_ephemeral_agent(name)
+        if row is None:
+            raise EphemeralPolicyError("unknown_ephemeral", status_code=404)
+        if row["owner_id"] != caller_id:
+            raise EphemeralPolicyError("not_owner")
+        if row["state"] == "launched":
+            if (
+                request.idempotency_key is not None
+                and request.idempotency_key == row["idempotency_key"]
+            ) or (request.claim_id is not None and request.claim_id == row["claim_id"]):
+                return dict(terminal_id=row["launched_terminal_id"], replayed=True)
+            raise EphemeralPolicyError("already_claimed", status_code=409)
+        if request.model is not None:
+            raise EphemeralPolicyError("model_override_not_allowed", "set model_tier in the spec")
+        now = database._utcnow()
+        lease = config["claim_lease_seconds"]
+        if not _positive_integer(lease):
+            lease = EPHEMERAL_DEFAULTS["claim_lease_seconds"]
+        try:
+            deadline = now + timedelta(seconds=lease)
+        except OverflowError:
+            raise EphemeralPolicyError(
+                "policy_config_error:claim_lease_seconds",
+                "ephemeral.claim_lease_seconds is too large",
+            ) from None
+        token = secrets.token_hex(16)
+        with _transaction() as db:
+            current = _row(db, name)
+            if current is not None:
+                current = _lapse(db, current, now)
+            table = database.EphemeralAgentModel
+            changed = db.execute(
+                update(table)
+                .where(
+                    table.name == name,
+                    table.state == "pending",
+                    table.owner_id == caller_id,
+                    table.expires_at > now,
+                )
+                .values(
+                    state="claimed",
+                    claim_id=token,
+                    claim_expires_at=deadline,
+                    idempotency_key=request.idempotency_key,
+                )
+            ).rowcount
+            db.expire_all()
+            row = _row(db, name)
+        if not changed:
+            if row is not None and row["state"] == "gc":
+                _finish_gc(row)
+            rule = (
+                "unknown_ephemeral"
+                if row is None
+                else "ephemeral_expired" if row["state"] == "gc" else "already_claimed"
+            )
+            raise EphemeralPolicyError(rule, status_code=404 if row is None else 409)
+        assert row is not None
+        won_claim = token
+        _audit_update(row, "claimed")
+        _recheck_policy(row, config, token)
+        finalize(name, token)
+        return dict(
+            claim_id=token,
+            provider=row["provider"],
+            effective_tools=row["effective_tools"],
+            replayed=False,
+        )
+    except EphemeralPolicyError as exc:
+        log_refusal(
+            exc.rule,
+            caller_id,
+            name if agent_profiles.routes_to_ephemeral_store(name) else None,
+            exc.detail,
+        )
+        if row is not None:
+            _audit_update(row, refusal=exc.rule)
+        raise
+    except BaseException as exc:
+        if won_claim is not None:
+            end_claim(name, won_claim)
+        if not isinstance(exc, Exception):
+            raise
+        error = EphemeralPolicyError("unexpected_failure", status_code=500)
+        log_refusal(
+            error.rule,
+            caller_id,
+            name if agent_profiles.routes_to_ephemeral_store(name) else None,
+            "",
+        )
         raise error from None

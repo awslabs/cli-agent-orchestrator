@@ -2365,6 +2365,33 @@ async def create_ephemeral_agent_endpoint(
         raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from None
 
 
+@app.post("/ephemeral-agents/{name}/claim", dependencies=[Depends(_require_ephemeral_enabled)])
+async def claim_ephemeral_agent_endpoint(
+    name: str,
+    request: Request,
+    caller_id: Optional[str] = None,
+    settings: Dict[str, Any] = Depends(_require_ephemeral_enabled),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Claim with a single settings snapshot and redacted body validation."""
+    from cli_agent_orchestrator.services import ephemeral_service
+
+    try:
+        try:
+            raw = await request.json()
+        except (ValueError, UnicodeError):
+            error = ephemeral_service.EphemeralPolicyError(
+                "invalid_request", "body: json_invalid", 422
+            )
+            ephemeral_service.log_refusal(error.rule, caller_id, None, error.detail)
+            raise HTTPException(status_code=422, detail=error.as_detail()) from None
+        return await asyncio.to_thread(
+            ephemeral_service.claim_ephemeral_agent, name, raw, caller_id, settings
+        )
+    except ephemeral_service.EphemeralPolicyError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from None
+
+
 @app.get("/agents/profiles")
 async def list_agent_profiles_endpoint(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
