@@ -216,6 +216,13 @@ async def execute_flow(name: str) -> bool:
         logger.info(f"Executing flow: {name}")
         flow = get_flow(name)
 
+        # Advance the schedule before anything below can raise. A failed run
+        # then waits for its next cron slot, as an execute=false run does,
+        # instead of staying due and re-running on every flow_daemon poll.
+        now = datetime.now()
+        next_run = _get_next_run_time(flow.schedule)
+        db_update_flow_run_times(name, last_run=now, next_run=next_run)
+
         # Read flow file
         file_path = Path(flow.file_path)
         metadata, prompt_template = _parse_flow_file(file_path)
@@ -257,11 +264,6 @@ async def execute_flow(name: str) -> bool:
 
             if "output" not in output:
                 raise ValueError("Script output missing 'output' field")
-
-        # Update last_run and calculate next_run
-        now = datetime.now()
-        next_run = _get_next_run_time(flow.schedule)
-        db_update_flow_run_times(name, last_run=now, next_run=next_run)
 
         # Check if we should execute
         if not output["execute"]:
