@@ -70,6 +70,88 @@ def test_collapsed_output_mentions_are_not_tool_chrome(row):
 
 
 @pytest.mark.parametrize(
+    "tip",
+    ["ctrl-o to hide or reveal tool output", "shift-tab to Plan mode", "/goal for multi-step"],
+)
+@pytest.mark.parametrize(
+    "template,expected",
+    [
+        ("\x1b[38;5;242mhint: {tip}\x1b[39m", True),
+        ("hint: \x1b[38;5;242m{tip}\x1b[39m", True),
+        ("\x1b[38;5;242mprefix \x1b[38;5;253m{tip}\x1b[39m", False),
+        ("\x1b[38;5;242mprefix \x1b[0m{tip}", False),
+        ("\x1b[38;5;253mprefix {tip}\x1b[38;5;242m", False),
+        ("[38;5;242mprefix {tip}\x1b[39m", False),
+    ],
+)
+def test_footer_tip_must_belong_to_its_own_color_segment(tip, template, expected):
+    raw = template.format(tip=tip)
+    assert kt.is_status_footer_line(kt.strip_sgr(raw), raw) is expected
+
+
+def test_footer_tip_cannot_span_escape_segments():
+    raw = "\x1b[38;5;242mprefix ctrl-o to \x1b[38;5;242mhide or reveal tool output"
+    assert not kt.is_status_footer_line(kt.strip_sgr(raw), raw)
+
+
+def test_long_footer_color_segments_remain_bounded():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            r"""
+from cli_agent_orchestrator.providers import kimi_transcript as kt
+
+tip = "ctrl-o to hide or reveal tool output"
+color = "\x1b[38;5;242m"
+for length in (32768, 131072):
+    for prefix in (color * length, color + "x" * length):
+        matching = prefix + "hint: " + tip
+        nonmatching = prefix + "\x1b[38;5;253mhint: " + tip
+        assert kt.is_status_footer_line(kt.strip_sgr(matching), matching)
+        assert not kt.is_status_footer_line(kt.strip_sgr(nonmatching), nonmatching)
+    printable = r"\x1b[38;5;242m" * length + "hint: " + tip
+    assert not kt.is_status_footer_line(printable, printable)
+""",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "state,repeated", [("Working\u2026", "\t"), ("Orchestrating\u2026", " \u2003")]
+)
+def test_long_swarm_progress_details_remain_bounded(state, repeated):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            r"""
+import sys
+from cli_agent_orchestrator.providers import kimi_transcript as kt
+
+header = "\x1b[38;5;111m\u2500 Agent Swarm \u2500\x1b[39m"
+for length in (32768, 131072):
+    for suffix, expected in (("\u2501", True), ("x\n!", False)):
+        row = sys.argv[1] + sys.argv[2] * length + suffix
+        raws = [header, "\x1b[38;5;111m" + row + "\x1b[39m"]
+        kinds = kt._swarm_progress_rows(raws, [kt.strip_sgr(raw) for raw in raws], set())
+        assert bool(kinds) is expected
+""",
+            state,
+            repeated,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
     "pattern_name,prefix,repeated,accepted_tail,rejected_tail",
     [
         ("BOOT_MESSAGE_ROW_RE", "Restoring conversation", "\t", "\u2026", "!"),

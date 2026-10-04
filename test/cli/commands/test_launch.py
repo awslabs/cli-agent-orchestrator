@@ -1709,6 +1709,21 @@ def test_launch_gate_warns_when_the_installed_kiro_agent_predates_native_enforce
     assert "cao install test-agent --provider kiro_cli" in result.output
 
 
+def test_launch_reports_an_escaping_kiro_policy_path(tmp_path, monkeypatch):
+    kiro_dir = tmp_path / "agents"
+    kiro_dir.mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"tools": ["*"]}')
+    (kiro_dir / "test-agent.json").symlink_to(outside)
+    monkeypatch.setattr("cli_agent_orchestrator.services.install_service.KIRO_AGENTS_DIR", kiro_dir)
+
+    result = _restricted_launch("kiro_cli")
+
+    assert result.exit_code != 0
+    assert "beneath the agent directory" in result.output
+    assert "launched successfully" not in result.output
+
+
 def test_launch_yolo_on_kiro_says_it_does_not_widen_the_tool_set():
     runner = CliRunner()
     with (

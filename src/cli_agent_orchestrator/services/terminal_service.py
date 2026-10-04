@@ -27,7 +27,7 @@ import re
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -127,7 +127,7 @@ from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
 from cli_agent_orchestrator.services.settings_service import get_max_terminals
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
-from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils import agent_profiles
 from cli_agent_orchestrator.utils.enforcement import NATIVE as NATIVE_ENFORCEMENT
 from cli_agent_orchestrator.utils.enforcement import (
     PROVIDER_ENFORCEMENT,
@@ -1380,6 +1380,7 @@ async def create_terminal(
             )
 
     terminal_id: Optional[str] = None
+    created_terminal_facts: Optional[Dict[str, Any]] = None
     # The window name the failure handler rolls back. ``window_name`` itself is
     # first bound inside the try, so a failure before that point (capability
     # probe, worktree) would leave it unassigned; this mirror is set from the
@@ -1405,7 +1406,7 @@ async def create_terminal(
         # resource. A KAS request must probe then fail closed with no window,
         # database row, FIFO, Herdr registration, or provider process.
         try:
-            profile = load_agent_profile(agent_profile)
+            profile, _source = agent_profiles.load_launch_profile(agent_profile)
         except FileNotFoundError:
             profile = None
         # Production loaders return AgentProfile. Treat a test double or an
@@ -1626,7 +1627,7 @@ async def create_terminal(
             not own, leaving ITS row pointing at nothing. Under the lock the
             name goes free -> free with no observable intermediate state.
             """
-            nonlocal deferred_delete_on_failure, session_incarnation_id
+            nonlocal deferred_delete_on_failure, session_incarnation_id, created_terminal_facts
             assert session_name is not None  # narrowed by the caller
             with session_lifecycle_lock(session_name):
                 if new_session:
@@ -1718,7 +1719,7 @@ async def create_terminal(
                     # the launch policy already resolved above (allowed_tools,
                     # engine), so API reads and snapshots report what was actually
                     # launched.
-                    db_create_terminal(
+                    created_terminal_facts = db_create_terminal(
                         terminal_id,
                         session_name,
                         created_window_name,
@@ -1903,6 +1904,10 @@ async def create_terminal(
             agent_profile=agent_profile,
             model=launch_model,
             model_honored=model_honored,
+            ephemeral=(
+                isinstance(created_terminal_facts, dict)
+                and created_terminal_facts.get("ephemeral") is True
+            ),
             caller_id=caller_id,
             allowed_tools=allowed_tools,
             engine=resolved_engine,
@@ -1912,7 +1917,7 @@ async def create_terminal(
             deferred_init_failure=None,
             session_incarnation_id=session_incarnation_id,
             status=initial_status,
-            last_active=datetime.now(),
+            last_active=datetime.now(timezone.utc),
         )
 
         logger.info(
@@ -3588,6 +3593,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "agent_profile": metadata["agent_profile"],
             "model": metadata.get("model"),
             "model_honored": metadata.get("model_honored"),
+            "ephemeral": metadata.get("ephemeral", False),
             "caller_id": metadata.get("caller_id"),
             "allowed_tools": metadata.get("allowed_tools"),
             "engine": metadata.get("engine"),

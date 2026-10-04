@@ -23,6 +23,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
+from sqlalchemy.types import TypeDecorator
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.flow import Flow
@@ -31,6 +32,33 @@ from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 logger = logging.getLogger(__name__)
 
 Base: Any = declarative_base()
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def as_utc(value: Optional[datetime]) -> Optional[datetime]:
+    """Normalize a datetime to UTC, treating naive values as UTC."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+class UTCDateTime(TypeDecorator):
+    """Store naive UTC in SQLite and return aware UTC datetimes."""
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value: Optional[datetime], dialect: Any) -> Optional[datetime]:
+        utc = as_utc(value)
+        return None if utc is None else utc.replace(tzinfo=None)
+
+    def process_result_value(self, value: Optional[datetime], dialect: Any) -> Optional[datetime]:
+        return as_utc(value)
 
 
 class SessionIncarnationModel(Base):
@@ -45,6 +73,80 @@ class SessionIncarnationModel(Base):
 
     session_name = Column(String, primary_key=True)
     incarnation_id = Column(String, nullable=False)
+
+
+class EphemeralAgentModel(Base):
+    """Read-only access to the server-owned ephemeral registry."""
+
+    __tablename__ = "ephemeral_agents"
+
+    name = Column(String, primary_key=True)
+    owner_kind = Column(String, nullable=False)
+    owner_id = Column(String, nullable=False)
+    session_name = Column(String, nullable=False)
+    state = Column(String, nullable=False)
+    claim_id = Column(String, nullable=True)
+    idempotency_key = Column(String, nullable=True)
+    claim_expires_at = Column(DateTime, nullable=True)
+    launched_terminal_id = Column(String, nullable=True, index=True)
+    bound_at = Column(DateTime, nullable=True)
+    model_tier = Column(String, nullable=True)
+    effort = Column(String, nullable=True)
+    provider = Column(String, nullable=False)
+    effective_tools = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    gc_reason = Column(String, nullable=True)
+    spec_sha256 = Column(String, nullable=False)
+    profile_sha256 = Column(String, nullable=False)
+    audit_path = Column(String, nullable=False)
+
+
+def get_ephemeral_agent(name: str) -> Optional[Dict[str, Any]]:
+    """Read registry facts without creating, claiming or modifying a row."""
+    with SessionLocal() as db:
+        row = db.query(EphemeralAgentModel).filter(EphemeralAgentModel.name == name).first()
+        if row is None:
+            return None
+        result = {
+            column.name: getattr(row, column.name)
+            for column in EphemeralAgentModel.__table__.columns
+        }
+        result["effective_tools"] = _json.loads(result["effective_tools"])
+        return result
+
+
+def _is_ephemeral_terminal(db: Any, terminal_id: str) -> bool:
+    """Check registry membership using the caller's existing session."""
+    return (
+        db.query(
+            db.query(EphemeralAgentModel)
+            .filter(EphemeralAgentModel.launched_terminal_id == terminal_id)
+            .exists()
+        ).scalar()
+        is True
+    )
+
+
+def is_ephemeral_terminal(terminal_id: str) -> bool:
+    """Registry membership in ANY state, including gc; lookup errors propagate."""
+    with SessionLocal() as db:
+        return _is_ephemeral_terminal(db, terminal_id)
+
+
+def _ephemeral_terminal_ids(db: Any, terminal_query: Any) -> set[str]:
+    """Batch membership for a terminal selection, without one lookup per row.
+
+    The subquery also avoids SQLite's parameter limit for large terminal lists.
+    State is deliberately unrestricted: a gc row still marks a surviving terminal.
+    """
+    selected_ids = terminal_query.with_entities(TerminalModel.id).order_by(None)
+    return {
+        row[0]
+        for row in db.query(EphemeralAgentModel.launched_terminal_id)
+        .filter(EphemeralAgentModel.launched_terminal_id.in_(selected_ids))
+        .all()
+    }
 
 
 class TerminalModel(Base):
@@ -107,7 +209,7 @@ class TerminalModel(Base):
     # distinguish the old rows from failures that belong to the CURRENT live
     # session. NULL is reserved for rows created before this column existed.
     session_incarnation_id = Column(String, nullable=True)
-    last_active = Column(DateTime, default=datetime.now)
+    last_active = Column(UTCDateTime, default=_utcnow)
 
     # ORDERING CONTRACT: the two session-scoped reads -- ``list_terminals_by_session``
     # and ``list_terminals_in_sessions`` -- order by SQLite's implicit ``rowid``,
@@ -173,11 +275,7 @@ class InboxModel(Base):
     receiver_id = Column(String, nullable=False)
     message = Column(String, nullable=False)
     status = Column(String, nullable=False)  # MessageStatus enum value
-    created_at = Column(DateTime, default=datetime.now)
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    created_at = Column(UTCDateTime, default=_utcnow)
 
 
 class MemoryMetadataModel(Base):
@@ -591,7 +689,7 @@ class IdempotencyKeyModel(Base):
     # from an earlier revision of this branch, whose fix is deleting the file.
     # It is compared like any other value and simply mismatches, loudly.
     request_fingerprint = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(UTCDateTime, default=_utcnow)
 
 
 def _ensure_db_dir() -> None:
@@ -1976,6 +2074,7 @@ def create_terminal(
             "agent_profile": terminal.agent_profile,
             "model": terminal.model,
             "model_honored": terminal.model_honored,
+            "ephemeral": _is_ephemeral_terminal(db, str(terminal.id)),
             "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
@@ -2095,6 +2194,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "agent_profile": terminal.agent_profile,
             "model": terminal.model,
             "model_honored": terminal.model_honored,
+            "ephemeral": _is_ephemeral_terminal(db, str(terminal.id)),
             "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
@@ -2493,12 +2593,13 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
     cannot quietly change which terminal is the conductor.
     """
     with SessionLocal() as db:
-        terminals = (
+        terminal_query = (
             db.query(TerminalModel)
             .filter(TerminalModel.tmux_session == tmux_session)
             .order_by(literal_column("terminals.rowid"))
-            .all()
         )
+        terminals = terminal_query.all()
+        ephemeral_ids = _ephemeral_terminal_ids(db, terminal_query)
         return [
             {
                 "id": t.id,
@@ -2508,6 +2609,7 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "agent_profile": t.agent_profile,
                 "model": t.model,
                 "model_honored": t.model_honored,
+                "ephemeral": str(t.id) in ephemeral_ids,
                 "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                 "deferred_init_failure": (
@@ -2530,7 +2632,7 @@ def update_last_active(terminal_id: str) -> bool:
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal:
-            terminal.last_active = datetime.now()
+            terminal.last_active = _utcnow()
             db.commit()
             return True
         return False
@@ -2596,12 +2698,13 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
     if not tmux_sessions:
         return []
     with SessionLocal() as db:
-        terminals = (
+        terminal_query = (
             db.query(TerminalModel)
             .filter(TerminalModel.tmux_session.in_(tmux_sessions))
             .order_by(literal_column("terminals.rowid"))
-            .all()
         )
+        terminals = terminal_query.all()
+        ephemeral_ids = _ephemeral_terminal_ids(db, terminal_query)
         return [
             {
                 "id": t.id,
@@ -2611,6 +2714,7 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
                 "agent_profile": t.agent_profile,
                 "model": t.model,
                 "model_honored": t.model_honored,
+                "ephemeral": str(t.id) in ephemeral_ids,
                 "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                 "deferred_init_failure": (
@@ -2631,7 +2735,9 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
 def list_all_terminals() -> List[Dict[str, Any]]:
     """List all terminals."""
     with SessionLocal() as db:
-        terminals = db.query(TerminalModel).all()
+        terminal_query = db.query(TerminalModel)
+        terminals = terminal_query.all()
+        ephemeral_ids = _ephemeral_terminal_ids(db, terminal_query)
         return [
             {
                 "id": t.id,
@@ -2641,6 +2747,7 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "agent_profile": t.agent_profile,
                 "model": t.model,
                 "model_honored": t.model_honored,
+                "ephemeral": str(t.id) in ephemeral_ids,
                 "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                 "deferred_init_failure": (
@@ -2685,11 +2792,9 @@ def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
     The join on ``terminals`` drops messages whose receiver terminal no longer
     exists, so the sweep does not keep retrying deliveries to deleted agents.
 
-    ``created_at`` is stored local-naive (``InboxModel.created_at`` defaults to
-    ``datetime.now``), so the cutoff uses ``datetime.now()`` to match — the same
-    convention as the retention query in ``cleanup_service.cleanup_old_data``.
+    ``created_at`` is stored in UTC, so the cutoff uses the same clock.
     """
-    cutoff = datetime.now() - timedelta(seconds=min_age_seconds)
+    cutoff = _utcnow() - timedelta(seconds=min_age_seconds)
     with SessionLocal() as db:
         rows = (
             db.query(InboxModel.receiver_id)

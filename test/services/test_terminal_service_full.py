@@ -40,6 +40,7 @@ pytestmark = pytest.mark.usefixtures("isolated_memory_db")
 class TestCreateTerminal:
     """Tests for create_terminal function."""
 
+    @pytest.mark.parametrize("registry_bound", [False, True])
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
@@ -51,7 +52,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_create_terminal_new_session(
         self,
         mock_load_profile,
@@ -65,6 +66,7 @@ class TestCreateTerminal:
         mock_fifo_manager,
         mock_status_monitor,
         mock_delete_terminals_by_session,
+        registry_bound,
     ):
         """Test creating terminal with new session."""
         mock_gen_id.return_value = "test1234"
@@ -77,7 +79,11 @@ class TestCreateTerminal:
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
 
-        result = await create_terminal("kiro_cli", "developer", new_session=True)
+        mock_db_create.return_value = {"ephemeral": registry_bound}
+        result = await create_terminal(
+            "kiro_cli", "developer", new_session=True, metadata={"ephemeral": not registry_bound}
+        )
+        assert result.ephemeral is registry_bound
 
         assert result.id == "test1234"
         assert result.session_incarnation_id
@@ -100,7 +106,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_create_terminal_forwards_deferred_launch_payload(
         self,
         mock_load_profile,
@@ -180,7 +186,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.get_session_env")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_deferred_existing_session_inherits_callback_ownership(
         self,
         mock_load_profile,
@@ -240,7 +246,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_create_terminal_records_ignored_model_for_mock_provider(
         self,
         mock_load_profile,
@@ -311,7 +317,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_create_terminal_persists_resolved_allowed_tools(
         self,
         mock_load_profile,
@@ -380,7 +386,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_create_terminal_explicit_model_overrides_profile_model(
         self,
         mock_load_profile,
@@ -436,7 +442,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_create_terminal_falls_back_to_profile_model_when_no_override(
         self,
         mock_load_profile,
@@ -484,7 +490,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_create_terminal_persists_caller_id(
         self,
         mock_load_profile,
@@ -527,7 +533,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_create_terminal_existing_session(
         self,
         mock_load_profile,
@@ -680,7 +686,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_existing_session_incarnation_conflict_prevents_window_creation(
         self,
         mock_load_profile,
@@ -725,7 +731,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_create_terminal_session_not_found(
         self,
         mock_load_profile,
@@ -751,7 +757,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_create_terminal_session_already_exists(
         self,
         mock_load_profile,
@@ -786,7 +792,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_create_terminal_appends_skill_catalog(
         self,
         mock_load_profile,
@@ -855,7 +861,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_create_terminal_without_skills_is_unchanged(
         self,
         mock_load_profile,
@@ -911,7 +917,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_create_terminal_does_not_pass_skill_prompt_to_non_runtime_provider(
         self,
         mock_load_profile,
@@ -971,7 +977,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_build_skill_catalog_called_for_runtime_prompt_provider(
         self,
         mock_load_profile,
@@ -1024,7 +1030,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_build_skill_catalog_called_with_empty_filter_for_deny_all(
         self,
         mock_load_profile,
@@ -1079,7 +1085,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_build_skill_catalog_called_with_none_for_missing_profile_runtime_provider(
         self,
         mock_load_profile,
@@ -1130,7 +1136,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_build_skill_catalog_not_called_for_native_or_baked_provider(
         self,
         mock_load_profile,
@@ -1179,7 +1185,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_create_terminal_profile_not_found(
         self,
         mock_load_profile,
@@ -1274,7 +1280,7 @@ class TestCreateTerminalIdempotencyKey:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
     async def test_unseen_key_creates_normally_and_forwards_to_db(
         self,
@@ -1320,7 +1326,7 @@ class TestCreateTerminalIdempotencyKey:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
@@ -1372,7 +1378,7 @@ class TestCreateTerminalIdempotencyKey:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_stale_mapping_fresh_create_survives_the_real_insert(
         self,
         mock_load_profile,
@@ -1763,7 +1769,7 @@ class TestIdempotencyKeyRequestFingerprint:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_stale_key_with_a_different_request_does_not_conflict(
         self,
         mock_load_profile,
@@ -1849,7 +1855,7 @@ class TestCreateTerminalWorktree:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.services.terminal_service.worktree_service")
     async def test_use_worktree_overrides_working_directory_for_the_new_window(
         self,
@@ -1920,7 +1926,7 @@ class TestCreateTerminalWorktree:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.services.terminal_service.worktree_service")
     async def test_use_worktree_false_never_touches_worktree_service(
         self,
@@ -1989,7 +1995,7 @@ class TestCreateTerminalWorktree:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.services.terminal_service.worktree_service")
     async def test_use_worktree_rolls_back_the_worktree_on_a_later_failure(
         self,
@@ -2079,7 +2085,7 @@ class TestCreateTerminalEnvVars:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_env_vars_reach_window_in_existing_session(
         self,
         mock_load_profile,
@@ -2135,7 +2141,7 @@ class TestCreateTerminalEnvVars:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_per_step_env_var_wins_over_persisted_session_var(
         self,
         mock_load_profile,
@@ -2187,7 +2193,7 @@ class TestCreateTerminalEnvVars:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_no_env_vars_existing_session_uses_session_env_only(
         self,
         mock_load_profile,
@@ -2235,7 +2241,7 @@ class TestCreateTerminalEnvVars:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_new_session_true_path_unchanged(
         self,
         mock_load_profile,

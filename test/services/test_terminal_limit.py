@@ -91,7 +91,7 @@ class TestCreateTerminalCap:
         with (
             patch(f"{_TS}.get_max_terminals", return_value=2),
             patch(f"{_TS}.count_runtime_allocated_terminals", return_value=1),
-            patch(f"{_TS}.load_agent_profile", side_effect=_StopBeforeAllocation()),
+            patch(f"{_TS}.agent_profiles.load_agent_profile", side_effect=_StopBeforeAllocation()),
         ):
             with pytest.raises(_StopBeforeAllocation):
                 asyncio.run(
@@ -102,7 +102,7 @@ class TestCreateTerminalCap:
         with (
             patch(f"{_TS}.get_max_terminals", return_value=None),
             patch(f"{_TS}.count_runtime_allocated_terminals") as mock_count,
-            patch(f"{_TS}.load_agent_profile", side_effect=_StopBeforeAllocation()),
+            patch(f"{_TS}.agent_profiles.load_agent_profile", side_effect=_StopBeforeAllocation()),
         ):
             with pytest.raises(_StopBeforeAllocation):
                 asyncio.run(

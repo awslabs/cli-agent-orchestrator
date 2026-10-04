@@ -1010,12 +1010,20 @@ def _resolve_profile_path(agent_name: str) -> Path:
     installed-package contents are not a writable store — copy the profile
     into an agent dir first.
     """
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    if agent_profiles.routes_to_ephemeral_store(agent_name):
+        raise click.ClickException(f"Reserved ephemeral profile name: {agent_name}")
+
     from cli_agent_orchestrator.services.settings_service import (
-        get_agent_dirs,
         get_extra_agent_dirs,
+        usable_agent_dirs,
     )
 
-    search_dirs = list(dict.fromkeys(get_agent_dirs().values())) + list(get_extra_agent_dirs())
+    # usable_agent_dirs, not get_agent_dirs: promotion writes to the file it
+    # finds, and a blank or relative setting would make the working directory a
+    # search root (see settings_service.usable_agent_dirs).
+    search_dirs = list(dict.fromkeys(usable_agent_dirs().values())) + list(get_extra_agent_dirs())
     for dir_path in search_dirs:
         base = Path(dir_path)
         for candidate in (base / f"{agent_name}.md", base / agent_name / "agent.md"):

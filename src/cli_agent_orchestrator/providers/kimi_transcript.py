@@ -297,12 +297,6 @@ FOOTER_SEGMENT_RES: Tuple[re.Pattern, ...] = (
 FOOTER_TIP_RE = re.compile(
     r"ctrl-o to hide or reveal tool output|shift-tab to Plan mode|/goal for multi-step"
 )
-#: The same tips carrying the footer's own foreground colour.
-FOOTER_TIP_STYLE_RE = re.compile(
-    r"\x1b\[38;5;242m[^\x1b]*(?:ctrl-o to hide or reveal tool output"
-    r"|shift-tab to Plan mode|/goal for multi-step)"
-)
-
 # Segments that constitute a footer row on their own.
 LEGACY_STATUS_ROW_RE = re.compile(r"^\s*\d+:\d+\s.*(?:agent|shell)\s*\(")
 
@@ -1102,7 +1096,11 @@ def is_status_footer_line(clean_line: str, raw_line: str = "") -> bool:
     if not FOOTER_TIP_RE.search(clean_line):
         return False
     if _SGR_RE.search(raw_line or ""):
-        return bool(FOOTER_TIP_STYLE_RE.search(raw_line))
+        # A tip must occur before the next escape, not under a later colour.
+        return any(
+            segment.startswith("[38;5;242m") and FOOTER_TIP_RE.search(segment)
+            for segment in raw_line.split("\x1b")[1:]
+        )
     return segments >= 1
 
 
@@ -1745,10 +1743,10 @@ def classify_line(
 
 _SWARM_HEADER_RE = re.compile(r"^\s*─ Agent Swarm(?:\s+─|\s*$)")
 _SWARM_MEMBER_RE = re.compile(r"^\s*\d{3,}\s+\S")
-_SWARM_STATUS_RE = re.compile(
+_SWARM_STATUS_PREFIX_RE = re.compile(
     r"^\s*(?:[🌑🌒🌓🌔🌕🌖🌗🌘⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✓✗⊘]\s+)?"
     r"(?P<state>Working…|Orchestrating…|Prompting…|Rate limited…|Completed\.|Failed\.|Aborted\.)"
-    r"(?:\s+(?P<detail>.*))?\s*$"
+    r"(?=\s|$)"
 )
 
 
@@ -1774,10 +1772,12 @@ def _swarm_progress_rows(
             if end in quoted:
                 break
             row = cleans[end]
-            status = _SWARM_STATUS_RE.match(row)
+            if "\n" in row:
+                break
+            status = _SWARM_STATUS_PREFIX_RE.match(row)
             if status:
                 state = status.group("state")
-                detail = (status.group("detail") or "").strip()
+                detail = row[status.end() :].strip()
                 if state not in {"Prompting…", "Orchestrating…"} and detail.strip("━"):
                     break
                 if not _FOREGROUND_COLOR_RE.search(raws[end]):

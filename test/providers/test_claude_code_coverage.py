@@ -25,7 +25,7 @@ def provider():
 class TestBuildCommandMcpServerModelDump:
     """Test the model_dump branch in _build_claude_command (line 93)."""
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_mcp_server_with_model_dump(self, mock_load, provider):
         """When mcpServers contains a Pydantic model (not dict), model_dump is called."""
         mock_mcp = MagicMock()

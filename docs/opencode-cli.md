@@ -164,7 +164,24 @@ The provider detects terminal state from the tmux capture buffer (ANSI-stripped)
   whose command or arguments are relative to its own directory starts in the right
   place rather than in OpenCode's workspace directory
 
-The agent ID is the slash-sanitized form of the profile name (`/` → `__`) — the same identifier used for the installed `.md` filename and the runtime `opencode --agent <id>` argument. This keeps the filename, the `--agent` arg, and the `opencode.json` key aligned for any profile name.
+The agent ID is the profile's resolved `name:` — the same identifier used for the installed `.md` filename and the runtime `opencode --agent <id>` argument. This keeps the filename, the `--agent` arg, and the `opencode.json` key aligned for any profile name. (Install rejects a `name:` containing a path separator outright; `to_opencode_agent_id` still flattens `/` to `__` as defence in depth for any other caller.)
+
+Because the ID comes from the resolved `name:` rather than the file name, two
+different profile files can resolve to the same ID. `cao install` refuses the
+second install rather than overwriting the first, naming both profiles so one
+can be renamed. Only an installed profile owns an ID: a packaged built-in or an
+uninstalled local profile with the same `name:` does not block. Ownership is
+read from the installed context copy at its destination path (the configured
+`agents.dirs.cao_installed` directory, and the default directory as well when an
+override is configured), not from profile discovery, and the same check guards
+installs for every provider, since they all write that copy. The agent file in
+`OPENCODE_AGENTS_DIR` is probed too, under that directory's own case rules, so a
+name that differs from an installed one only in case is refused where that
+directory folds case even when the context directory does not. A context copy
+written by a CAO version before the `x-cao-source-stem` marker existed cannot
+prove which profile it belongs to; the error tells you to delete that copy and
+reinstall, and an agent file left behind by a deleted context copy is refused
+the same way.
 
 ### Your `agent.<id>` entry is yours to edit
 
