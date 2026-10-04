@@ -60,13 +60,6 @@ _STICKY_READY_STATUSES = frozenset(
     }
 )
 
-# The two statuses a repaint flaps between once a turn is over: the completion
-# box and the empty composer are both "finished" renderings of the SAME turn, so
-# moving from one to the other does not re-earn the status for stamping purposes
-# (see _apply_detection_locked). WAITING_USER_ANSWER and ERROR are deliberately
-# not here: a prompt or an error appearing after a ready state is new content.
-_COMPLETABLE_FLAP_STATUSES = frozenset({TerminalStatus.IDLE, TerminalStatus.COMPLETED})
-
 # Stale-PROCESSING self-heal (#558). get_status()'s cheap re-check re-derives from the SAME
 # rolling buffer the FIFO pipeline feeds — and the moment a process goes genuinely idle it also
 # stops emitting output, so that buffer stops changing. If its final content never happened to
@@ -198,6 +191,15 @@ class StatusMonitor:
         # sticky pre-dispatch COMPLETED keeps its old stamp no matter how many
         # unrelated frames bump ``_output_generation`` afterwards.
         self._status_generation: Dict[str, int] = {}
+        # Per-terminal marker: the current IDLE was reached from COMPLETED (the
+        # completion box was evicted or scrolled while the latch was armed). The
+        # return trip IDLE -> COMPLETED is then the same finished turn's box being
+        # re-read, not a completion the worker earned, and must not re-stamp
+        # ``_status_generation`` (PR #566, round 10). Set on COMPLETED -> IDLE,
+        # consumed by the return trip, cleared by any other transition and by
+        # ``notify_input_sent`` (a new dispatch makes the pre-dispatch IDLE the
+        # baseline, so the first change away from it after the boundary counts).
+        self._idle_from_completed: Dict[str, bool] = {}
         # --- pyte rendered-screen detection state (only used when CAO_PYTE_STATUS
         # is on AND the provider opts in via supports_screen_detection) ---
         # Per-terminal pyte Screen+Stream that composites the raw byte stream
@@ -425,17 +427,31 @@ class StatusMonitor:
         # the pre-send generation, which is by construction not newer than the
         # dispatch boundary sampled right after, so they never confirm a send.
         #
-        # A completable status reached from the other completable status keeps
-        # its stamp. Once notify_input_sent has armed the latch, COMPLETED -> IDLE
-        # is let through, and IDLE -> COMPLETED is a change too, so a swallowed
-        # Enter whose echo frame parses IDLE and whose next repaint composites the
-        # previous turn's completion box would otherwise re-stamp that old
-        # COMPLETED past the dispatch boundary and confirm a send that never
-        # happened. That flap is the same reading seen twice, not a status the
-        # worker earned; a completion reached from PROCESSING (or from nothing)
-        # is, and is stamped.
-        if not (last in _COMPLETABLE_FLAP_STATUSES and detected in _COMPLETABLE_FLAP_STATUSES):
-            self._status_generation[terminal_id] = self._output_generation.get(terminal_id, 0)
+        # Two transitions do NOT re-stamp: COMPLETED -> IDLE, and the IDLE ->
+        # COMPLETED that returns from it. Once notify_input_sent has armed the
+        # latch, COMPLETED -> IDLE is let through, so a swallowed Enter whose echo
+        # frame parses IDLE and whose next repaint composites the previous turn's
+        # completion box would otherwise re-stamp that old COMPLETED past the
+        # dispatch boundary and confirm a send that never happened. That round
+        # trip is the same finished turn read twice. Every other way of reaching
+        # COMPLETED is stamped, in particular IDLE -> COMPLETED when the IDLE was
+        # the pre-dispatch baseline (a fresh worker sits at IDLE after init, and a
+        # fast turn can land spinner and answer in one chunk with no PROCESSING
+        # detected in between): that IS this task's completion, and refusing it
+        # would resubmit the task to a worker that has already done it (round-10
+        # review, P2).
+        completed_to_idle = last == TerminalStatus.COMPLETED and detected == TerminalStatus.IDLE
+        returning_to_completed = (
+            last == TerminalStatus.IDLE
+            and detected == TerminalStatus.COMPLETED
+            and self._idle_from_completed.get(terminal_id, False)
+        )
+        if completed_to_idle:
+            self._idle_from_completed[terminal_id] = True
+        else:
+            self._idle_from_completed.pop(terminal_id, None)
+            if not returning_to_completed:
+                self._status_generation[terminal_id] = self._output_generation.get(terminal_id, 0)
         if detected == TerminalStatus.PROCESSING:
             self._allow_processing_revert[terminal_id] = False
         elif detected in _STICKY_READY_STATUSES and last not in _STICKY_READY_STATUSES:
@@ -884,6 +900,11 @@ class StatusMonitor:
             self._pending_stale_capture.pop(terminal_id, None)
             self._confirmed_stale_capture_commit.pop(terminal_id, None)
             self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
+            # Whatever the cached ready status is now, it is the pre-dispatch
+            # baseline for the turn this input starts; the first change away from
+            # it after the boundary is that turn's evidence, even if the status
+            # got here by a previous turn's COMPLETED -> IDLE eviction.
+            self._idle_from_completed.pop(terminal_id, None)
         if assume_processing:
             # Optimistic dispatch latch only; this is not provider evidence and
             # must not authorize stale-pane recovery for the new generation.
@@ -947,6 +968,7 @@ class StatusMonitor:
             self._capture_generation.pop(terminal_id, None)
             self._output_generation.pop(terminal_id, None)
             self._status_generation.pop(terminal_id, None)
+            self._idle_from_completed.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
@@ -976,6 +998,7 @@ class StatusMonitor:
             self._capture_generation.pop(terminal_id, None)
             self._output_generation.pop(terminal_id, None)
             self._status_generation.pop(terminal_id, None)
+            self._idle_from_completed.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 

@@ -5050,6 +5050,95 @@ class TestConfirmationIsCausalOnTheRealMonitor:
             )
         assert confirmed is False
 
+    def _monitor_with_post_init_idle(self, provider):
+        """A fresh worker: init output parses IDLE and that is the pre-dispatch status."""
+        from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+        sm = StatusMonitor()
+        provider.get_status.return_value = TerminalStatus.IDLE
+        sm._process_chunk("t1", "Welcome.\n> ")
+        assert sm.get_status("t1") == TerminalStatus.IDLE
+        assert sm.status_observation("t1").output_generation == 1
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1")
+        boundary = sm.output_generation("t1")
+        assert boundary == 1
+        return sm, boundary
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_first_completion_from_post_init_idle_is_earned(
+        self, mock_pm, mock_settings, mock_backend
+    ):
+        """Round-10 review (haofeif), P2: a fresh worker sits at IDLE after init, no
+        provider enables ``assume_processing_on_dispatch``, and a fast turn can land
+        spinner and answer in one chunk (or the rising-edge frame is composited
+        before the spinner draws). The first status detected after dispatch is then
+        COMPLETED with no PROCESSING in between. That IDLE -> COMPLETED is this task's
+        completion and must carry a stamp past the boundary, or the worker is re-sent
+        the task three times and failed as task_not_started."""
+        mock_backend.return_value = self._tmux_backend()
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        mock_pm.get_provider.return_value = provider
+        sm, boundary = self._monitor_with_post_init_idle(provider)
+
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        sm._process_chunk("t1", "⠋ Thinking… (answer) ✓ Done\n> ")
+
+        observation = sm.status_observation("t1")
+        assert observation.status == TerminalStatus.COMPLETED
+        assert observation.output_generation == boundary + 1, (
+            "a genuine first completion reached from post-init IDLE kept the pre-dispatch "
+            "stamp; the fast worker would be resubmitted to and failed"
+        )
+
+        from cli_agent_orchestrator.services.terminal_service import (
+            _wait_for_post_dispatch_start,
+        )
+
+        with patch("cli_agent_orchestrator.services.terminal_service.status_monitor", sm):
+            confirmed = asyncio.run(
+                _wait_for_post_dispatch_start("t1", boundary, timeout=0.2, polling_interval=0.05)
+            )
+        assert confirmed is True
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_pre_dispatch_eviction_to_idle_does_not_poison_the_next_turn(
+        self, mock_pm, mock_settings, mock_backend
+    ):
+        """The "IDLE reached from COMPLETED" marker belongs to the turn that set it.
+        A previous turn whose completion box was evicted (COMPLETED -> IDLE while
+        armed) must not make the NEXT dispatch's first completion look like a
+        repaint: the arm resets the marker, so IDLE -> COMPLETED after the new
+        boundary is stamped."""
+        mock_backend.return_value = self._tmux_backend()
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        mock_pm.get_provider.return_value = provider
+        sm, _ = self._monitor_with_sticky_startup_completed(provider)
+
+        # Previous turn: armed eviction of the completion box.
+        provider.get_status.return_value = TerminalStatus.IDLE
+        sm._process_chunk("t1", "> ")
+        assert sm.get_status("t1") == TerminalStatus.IDLE
+
+        # New dispatch from that IDLE, then a fast completion.
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1")
+        boundary = sm.output_generation("t1")
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        sm._process_chunk("t1", "(answer) ✓ Done\n> ")
+
+        observation = sm.status_observation("t1")
+        assert observation.status == TerminalStatus.COMPLETED
+        assert observation.output_generation == boundary + 1
+
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
