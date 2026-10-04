@@ -82,11 +82,15 @@ COPILOT_STATUS_BAR_PATTERN = r"^\s*(?:autopilot|plan|interactive)\s*[·•]"
 # token/model info moved to the status bar in v1.0.31, leaving only the path.
 # Path can be tilde-prefixed (home) or absolute (e.g. /tmp/...), so allow both.
 COPILOT_CWD_BREADCRUMB_PATTERN = r"^\s+(?:~|/)[^\[]*\["
+COPILOT_HINT_BAR_PATTERN = r"^←.*[·•]\s*/ commands\b"
+COPILOT_AGENT_MODEL_BAR_PATTERN = r"^[\w.-]+\s*[·•]\s*github copilot\s*[·•]"
 PROCESSING_LINE_PATTERN = r"^(?:[●◐◑◒◓◉◎∙]\s*)?.*\besc to cancel\b.*$"
 
 
 class CopilotCliProvider(BaseProvider):
     """Provider for GitHub Copilot CLI."""
+
+    supports_direct_status_probe = True
 
     @classmethod
     def honors_model(
@@ -414,7 +418,30 @@ class CopilotCliProvider(BaseProvider):
                 return True
             await asyncio.sleep(1.0)
 
+        await asyncio.to_thread(self._log_unready_screen)
         raise TimeoutError("Copilot initialization timed out after 60 seconds")
+
+    def _log_unready_screen(self) -> None:
+        lines = self._history(tail_lines=60).splitlines()
+        unrecognized = self._unrecognized_rows_after_prompt(lines)
+        if unrecognized is None:
+            logger.warning(
+                "Copilot idle prompt not found for %s:%s", self.session_name, self.window_name
+            )
+        elif unrecognized:
+            logger.warning(
+                "Copilot idle prompt for %s:%s is followed by unrecognized row %r",
+                self.session_name,
+                self.window_name,
+                unrecognized[0],
+            )
+        screen_tail = [line for line in lines if line.strip()][-12:]
+        logger.debug(
+            "Copilot screen tail for %s:%s:\n%s",
+            self.session_name,
+            self.window_name,
+            "\n".join(screen_tail),
+        )
 
     @staticmethod
     def _find_last_user_line(lines: list[str]) -> int:
@@ -452,6 +479,10 @@ class CopilotCliProvider(BaseProvider):
         # Copilot v1.0.31+ status bar: " autopilot · / commands    Claude Sonnet 4.6 · (0%)"
         if re.match(COPILOT_STATUS_BAR_PATTERN, stripped):
             return True
+        if re.search(COPILOT_HINT_BAR_PATTERN, stripped):
+            return True
+        if re.search(COPILOT_AGENT_MODEL_BAR_PATTERN, stripped):
+            return True
         # Copilot v1.0.31+ cwd breadcrumb: " ~/path [⎇ branch*%]"
         # (pre-v1.0.31 form included "(0x)" and was caught by the \(\d+x\) check above)
         if re.match(
@@ -466,16 +497,17 @@ class CopilotCliProvider(BaseProvider):
 
     @classmethod
     def _has_idle_prompt_near_end(cls, lines: list[str]) -> bool:
-        if not lines:
-            return False
+        return cls._unrecognized_rows_after_prompt(lines) == []
 
+    @classmethod
+    def _unrecognized_rows_after_prompt(cls, lines: list[str]) -> Optional[list[str]]:
         # Strip trailing empty lines — TUI providers (like Copilot) render in
         # a fixed viewport at the top of the pane, leaving the bottom blank.
         stripped = list(lines)
         while stripped and not stripped[-1].strip():
             stripped.pop()
         if not stripped:
-            return False
+            return None
 
         tail = stripped[-25:]
         last_prompt_idx = -1
@@ -483,15 +515,13 @@ class CopilotCliProvider(BaseProvider):
             if re.match(IDLE_PROMPT_LINE_PATTERN, line):
                 last_prompt_idx = idx
         if last_prompt_idx < 0:
-            return False
+            return None
 
-        for line in tail[last_prompt_idx + 1 :]:
-            if cls._is_footer_line(line):
-                continue
-            if line.strip():
-                return False
-
-        return True
+        return [
+            line
+            for line in tail[last_prompt_idx + 1 :]
+            if line.strip() and not cls._is_footer_line(line)
+        ]
 
     @classmethod
     def _normalize_post_user_lines(cls, lines: list[str]) -> list[str]:

@@ -324,6 +324,71 @@ class TestCopilotCliProviderInitialization:
         assert get_status_calls, "status_monitor.get_status was never dispatched via to_thread"
         assert all(c.args[1] == "test1234" for c in get_status_calls)
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.copilot_cli.logger")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.time.time")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.asyncio.sleep")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    @patch.object(CopilotCliProvider, "_accept_trust_prompts")
+    async def test_initialize_timeout_logs_unrecognized_row(
+        self,
+        _mock_accept,
+        _mock_tmux,
+        mock_wait_shell,
+        _mock_async_sleep,
+        mock_status_monitor,
+        mock_time,
+        mock_logger,
+    ):
+        mock_wait_shell.return_value = True
+        mock_status_monitor.get_status.return_value = TerminalStatus.PROCESSING
+        mock_time.side_effect = [0.0, 61.0]
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+
+        with patch.object(provider, "_history", return_value="● Ready\n❯\n\nNEW ROW alpha\n"):
+            with pytest.raises(TimeoutError, match="Copilot initialization timed out"):
+                await provider.initialize()
+
+        mock_logger.warning.assert_called_once_with(
+            "Copilot idle prompt for %s:%s is followed by unrecognized row %r",
+            "test-session",
+            "window-0",
+            "NEW ROW alpha",
+        )
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.copilot_cli.logger")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.time.time")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.asyncio.sleep")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    @patch.object(CopilotCliProvider, "_accept_trust_prompts")
+    async def test_initialize_timeout_logs_missing_prompt(
+        self,
+        _mock_accept,
+        _mock_tmux,
+        mock_wait_shell,
+        _mock_async_sleep,
+        mock_status_monitor,
+        mock_time,
+        mock_logger,
+    ):
+        mock_wait_shell.return_value = True
+        mock_status_monitor.get_status.return_value = TerminalStatus.PROCESSING
+        mock_time.side_effect = [0.0, 61.0]
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+
+        with patch.object(provider, "_history", return_value="Loading environment...\n"):
+            with pytest.raises(TimeoutError, match="Copilot initialization timed out"):
+                await provider.initialize()
+
+        mock_logger.warning.assert_called_once_with(
+            "Copilot idle prompt not found for %s:%s", "test-session", "window-0"
+        )
+
 
 class TestCopilotCliProviderTrustPrompts:
     @pytest.mark.asyncio
@@ -390,6 +455,32 @@ class TestCopilotCliProviderTrustPrompts:
 
         mock_tmux.return_value.send_special_key.assert_any_call("test-session", "window-0", "y")
         assert mock_enter.call_count >= 1
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.copilot_cli.logger")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.asyncio.sleep")
+    async def test_accept_trust_prompts_returns_at_v1091_idle_prompt(
+        self, _mock_sleep, mock_logger
+    ):
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        idle_screen = (
+            "● MCP Servers reloaded: 2 servers connected\n"
+            "\n"
+            "❯\n"
+            "\n"
+            "← open sidebar · Autopilot · Allow All · / commands · tab next tab\n"
+            "data_analyst · GitHub Copilot • GPT-5.6 Terra\n"
+        )
+
+        with (
+            patch.object(provider, "_history", return_value=idle_screen) as mock_history,
+            patch.object(provider, "_send_enter") as mock_enter,
+        ):
+            await provider._accept_trust_prompts(timeout=2.0)
+
+        mock_history.assert_called_once()
+        mock_enter.assert_not_called()
+        mock_logger.warning.assert_not_called()
 
 
 class TestCopilotCliProviderStatusDetection:
@@ -552,6 +643,60 @@ class TestCopilotCliProviderStatusDetection:
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         assert provider.get_status(output) == TerminalStatus.IDLE
 
+    # ------------------------------------------------------------------
+    # Copilot v1.0.91 layout: bare ❯ followed by hint bar and agent/model bar
+    # ------------------------------------------------------------------
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    def test_get_status_idle_with_v1091_footer(self, mock_tmux):
+        """Bare ❯ + hint bar + agent/model bar → IDLE (no prior user turn)."""
+        output = (
+            "Copilot v1.0.91 uses AI.\n"
+            "\n"
+            "● Selected custom agent: data_analyst\n"
+            "\n"
+            "● MCP Servers reloaded: 2 servers connected\n"
+            "\n"
+            "/Users/me/work\n"
+            "\n"
+            "❯\n"
+            "\n"
+            "← open sidebar · Autopilot · Allow All · / commands · tab next tab\n"
+            "data_analyst · GitHub Copilot • GPT-5.6 Terra\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    def test_get_status_completed_with_v1091_footer_after_user_turn(self, mock_tmux):
+        """User turn + agent response + bare ❯ + v1.0.91 footer → COMPLETED."""
+        output = (
+            "❯ fix the bug\n"
+            "● Edit src/main.py (+3 -1)\n"
+            "\n"
+            "❯\n"
+            "\n"
+            "← open sidebar · Autopilot · Allow All · / commands · tab next tab\n"
+            "data_analyst · GitHub Copilot • GPT-5.6 Terra\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    def test_get_status_processing_with_spinner_and_v1091_footer(self, mock_tmux):
+        """Spinner line present alongside v1.0.91 footer → still PROCESSING."""
+        output = (
+            "❯ refactor utils.py\n"
+            "∙ Thinking (Esc to cancel)\n"
+            "\n"
+            "❯\n"
+            "\n"
+            "← open sidebar · Autopilot · Allow All · / commands · tab next tab\n"
+            "data_analyst · GitHub Copilot • GPT-5.6 Terra\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
 
 class TestCopilotCliProviderMessageExtraction:
     def test_extract_last_message_from_post_user_lines(self):
@@ -585,8 +730,65 @@ class TestCopilotCliProviderMessageExtraction:
         with pytest.raises(ValueError, match="No provider response content found"):
             provider.extract_last_message_from_script(output)
 
+    def test_extract_last_message_excludes_v1091_footer(self):
+        output = (
+            "❯ fix the bug\n"
+            "● Fixed the off-by-one in main.py\n"
+            "\n"
+            "❯\n"
+            "\n"
+            "← open sidebar · Autopilot · Allow All · / commands · tab next tab\n"
+            "data_analyst · GitHub Copilot • GPT-5.6 Terra\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.extract_last_message_from_script(output) == (
+            "● Fixed the off-by-one in main.py"
+        )
+
+    def test_extract_last_message_keeps_reply_lines_resembling_v1091_footer(self):
+        output = (
+            "❯ explain\n"
+            "● Here is the plan\n"
+            "Use the menu · / commands are listed\n"
+            "GitHub Copilot · supports MCP\n"
+            "Done.\n"
+            "\n"
+            "❯\n"
+            "\n"
+            "← open sidebar · Autopilot · Allow All · / commands · tab next tab\n"
+            "data_analyst · GitHub Copilot • GPT-5.6 Terra\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.extract_last_message_from_script(output) == (
+            "● Here is the plan\n"
+            "Use the menu · / commands are listed\n"
+            "GitHub Copilot · supports MCP\n"
+            "Done."
+        )
+
 
 class TestCopilotCliProviderMisc:
+    def test_supports_direct_status_probe_is_true(self):
+        assert CopilotCliProvider.supports_direct_status_probe is True
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    def test_get_status_idle_on_v1091_capture_pane_with_shared_footer_row(self, mock_tmux):
+        """Real 1.0.91 capture-pane shape: separator rules around ❯ and, in a wide
+        pane, the hint bar and the agent/model bar rendered on one row."""
+        rule = "─" * 120
+        output = (
+            " ● Selected custom agent: data_analyst\n"
+            " /tmp/repo [⎇ main*]\n"
+            f"{rule}\n"
+            "❯\n"
+            f"{rule}\n"
+            " ← open sidebar · Autopilot · Allow All · / commands · tab next tab"
+            "            data_analyst · Claude Sonnet 5\n"
+        )
+        mock_tmux.return_value.get_native_status.return_value = None
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.IDLE
+
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_send_enter_uses_tmux_client(self, mock_tmux):
         provider = CopilotCliProvider("test1234", "test-session", "window-0")

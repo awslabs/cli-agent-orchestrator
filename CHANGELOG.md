@@ -77,6 +77,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `copilot_cli` launches no longer time out after 60 seconds on Copilot CLI
+  1.0.91 (#870). Copilot repaints only changed cells in its full-screen view,
+  so the raw output stream never shows a settled idle prompt; the provider now
+  opts into the direct status probe so a quiet terminal is re-checked against
+  the rendered pane, and recognises the footer rows 1.0.91 draws below its
+  prompt. When initialization does time out, the server log names the first
+  unrecognised row below the prompt.
+
 - Address five baseline CodeQL alerts without suppressions: remove filesystem
   probes from plugin source-kind inference, confine Kiro policy-file inspection
   to its canonical agent directory, replace the flagged Kimi footer and swarm
