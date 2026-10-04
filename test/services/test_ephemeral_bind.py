@@ -701,6 +701,20 @@ async def test_bound_child_denied_by_real_mcp_gate_before_and_after_release(
         assert server._tool_denied_reason("send_message") is None
 
 
+def test_no_claim_handler_text_still_refuses(runtime_store):
+    from cli_agent_orchestrator.utils import orchestration
+
+    _, name, backend, factory = runtime_store
+    with pytest.raises(ValueError) as exc:
+        orchestration._refuse_ephemeral_target_without_claim(name)
+    assert (
+        str(exc.value)
+        == "Ephemeral targets cannot be launched through assign or handoff in this version."
+    )
+    backend.create_window.assert_not_called()
+    factory.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_mismatched_provider_refuses_before_kiro_probe(runtime_store, monkeypatch):
     env, name, backend, factory = runtime_store

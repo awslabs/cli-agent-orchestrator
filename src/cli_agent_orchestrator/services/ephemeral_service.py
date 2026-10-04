@@ -336,7 +336,7 @@ def _policy_notes(settings: dict[str, Any]) -> list[str]:
         if effort_notice
         else "effort: provider default (effort omitted, no default_effort)"
     )
-    return [model, effort, "launch: not supported by this server version"]
+    return [model, effort, "launch: not available through assign or handoff in this server version"]
 
 
 def _warn_ignored_policy(name: str, notice: Optional[str]) -> None:
