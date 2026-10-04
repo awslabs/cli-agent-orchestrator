@@ -36,7 +36,11 @@ async def test_server_refuses_before_provider_init(stores, monkeypatch, provider
     init = AsyncMock()
     factory = Mock(return_value=Mock(initialize=init))
     monkeypatch.setattr(service.ProviderManager, "create_provider", factory)
-    with pytest.raises(profiles.EphemeralProfileUnavailable):
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services.ephemeral_service import EphemeralPolicyError
+
+    monkeypatch.setattr(database, "get_ephemeral_agent", lambda _: None)
+    with pytest.raises(EphemeralPolicyError, match="unknown_ephemeral"):
         await service.create_terminal(provider, NAME, session_name="session")
     factory.assert_not_called()
     init.assert_not_called()
@@ -125,7 +129,11 @@ async def test_stored_ephemeral_never_allocates_runtime(stores, monkeypatch, pro
     monkeypatch.setattr(service, "generate_terminal_id", id_generator)
     monkeypatch.setattr(service, "db_create_terminal", insert)
     monkeypatch.setattr(service.provider_manager, "create_provider", factory)
-    with pytest.raises(profiles.EphemeralLaunchRefused):
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services.ephemeral_service import EphemeralPolicyError
+
+    monkeypatch.setattr(database, "get_ephemeral_agent", lambda _: None)
+    with pytest.raises(EphemeralPolicyError, match="unknown_ephemeral"):
         await service.create_terminal(provider, NAME, session_name="cao-session")
     id_generator.assert_not_called()
     insert.assert_not_called()
@@ -133,8 +141,8 @@ async def test_stored_ephemeral_never_allocates_runtime(stores, monkeypatch, pro
     backend.create_window.assert_not_called()
 
 
-@pytest.mark.parametrize("route,status", [("session", 400), ("terminal", 404), ("run_step", 404)])
-def test_launch_routes_preserve_valueerror_mapping(stores, monkeypatch, route, status):
+@pytest.mark.parametrize("route,status", [("session", 404), ("terminal", 404), ("run_step", 404)])
+def test_launch_routes_map_ephemeral_policy_refusals(stores, monkeypatch, route, status):
     from fastapi.testclient import TestClient
 
     from cli_agent_orchestrator.api import main
@@ -152,6 +160,9 @@ def test_launch_routes_preserve_valueerror_mapping(stores, monkeypatch, route, s
     monkeypatch.setattr(main.app.state, "plugin_registry", PluginRegistry(), raising=False)
     monkeypatch.setattr(main.session_service, "create_session", launch)
     monkeypatch.setattr(main, "run_agent_step", launch)
+    from cli_agent_orchestrator.clients import database
+
+    monkeypatch.setattr(database, "get_ephemeral_agent", lambda _: None)
     client = TestClient(main.app, base_url="http://localhost")
     params = {"agent_profile": NAME, "provider": "claude_code"}
     if route == "session":
@@ -164,10 +175,8 @@ def test_launch_routes_preserve_valueerror_mapping(stores, monkeypatch, route, s
             json={"provider": "claude_code", "agent": NAME, "prompt": "Inspect logs."},
         )
     assert response.status_code == status, response.text
-    assert (
-        response.json()["detail"]
-        == f"Ephemeral target '{NAME}' cannot be launched until claims are supported."
-    )
+    assert response.json()["detail"]["kind"] == "ephemeral_policy"
+    assert response.json()["detail"]["rule"] == "unknown_ephemeral"
 
 
 @pytest.mark.asyncio

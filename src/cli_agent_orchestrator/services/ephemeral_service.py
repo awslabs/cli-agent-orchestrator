@@ -12,7 +12,7 @@ import unicodedata
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Iterator, Optional, cast
+from typing import Any, Iterator, NoReturn, Optional, cast
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -893,3 +893,155 @@ def claim_ephemeral_agent(
             "",
         )
         raise error from None
+
+
+def _launch_tools(
+    row: dict[str, Any], model: Optional[str], allowed_tools: Optional[list[str]]
+) -> list[str]:
+    if model is not None:
+        raise EphemeralPolicyError("model_override_not_allowed", "set model_tier in the spec")
+    stored = row["effective_tools"]
+    if allowed_tools is None:
+        return list(stored)
+    excess = sorted(set(allowed_tools) - set(stored))
+    if excess:
+        # Only closed capability atoms can be echoed; arbitrary submitted strings cannot.
+        safe = [atom for atom in excess if atom in TOOL_ATOMS or atom == "@cao-mcp-server"]
+        raise EphemeralPolicyError(
+            "tool_exceeds_stored", ", ".join(safe) or "unsupported tool atom"
+        )
+    return [atom for atom in stored if atom in allowed_tools]
+
+
+def _report_refusal(
+    name: str, caller_id: Optional[str], row: Optional[dict[str, Any]], error: EphemeralPolicyError
+) -> None:
+    log_refusal(
+        error.rule,
+        caller_id,
+        name if agent_profiles.routes_to_ephemeral_store(name) else None,
+        error.detail,
+    )
+    if row is not None:
+        _audit_update(row, refusal=error.rule)
+
+
+def refuse_unavailable(name: str, caller_id: Optional[str]) -> NoReturn:
+    """Classify a missing live profile without echoing loader or creator text."""
+    row = database.get_ephemeral_agent(name)
+    if row is None:
+        error = EphemeralPolicyError("unknown_ephemeral", status_code=404)
+    elif row["state"] == "gc":
+        error = EphemeralPolicyError("ephemeral_expired", status_code=409)
+    else:
+        error = EphemeralPolicyError(
+            "spec_unavailable", "live profile unavailable; re-create the ephemeral agent", 409
+        )
+    _report_refusal(name, caller_id, row, error)
+    raise error
+
+
+def prepare_ephemeral_launch(
+    name: str,
+    model: Optional[str],
+    allowed_tools: Optional[list[str]],
+    caller_id: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> list[str]:
+    """Resolve the stored ceiling before terminal allocation; never widen it."""
+    row = None
+    try:
+        row = database.get_ephemeral_agent(name)
+        if row is None:
+            raise EphemeralPolicyError("unknown_ephemeral", status_code=404)
+        tools = _launch_tools(row, model, allowed_tools)
+        if provider is not None and provider != row["provider"]:
+            raise EphemeralPolicyError("provider_mismatch")
+        return tools
+    except EphemeralPolicyError as exc:
+        _report_refusal(name, caller_id, row, exc)
+        raise
+
+
+def _bind_rule(
+    row: Optional[dict[str, Any]], caller_id: Optional[str], provider: str, claim_id: Optional[str]
+) -> EphemeralPolicyError:
+    if row is None:
+        return EphemeralPolicyError("unknown_ephemeral", status_code=404)
+    if row["provider"] != provider:
+        return EphemeralPolicyError("provider_mismatch")
+    if row["owner_id"] != caller_id:
+        return EphemeralPolicyError("not_owner")
+    if row["state"] == "gc":
+        return EphemeralPolicyError("ephemeral_expired", status_code=409)
+    if row["state"] == "pending" and claim_id is not None:
+        return EphemeralPolicyError("claim_expired", status_code=409)
+    return EphemeralPolicyError("already_claimed", status_code=409)
+
+
+def bind_ephemeral_agent(
+    name: str,
+    terminal_id: str,
+    caller_id: Optional[str],
+    provider: str,
+    claim_id: Optional[str],
+    allowed_tools: Optional[list[str]],
+    idempotency_key: Optional[str] = None,
+) -> None:
+    """Bind exactly one owner launch before any backend resource or terminal row."""
+    row = None
+    try:
+        now = database._utcnow()
+        if claim_id is None:
+            error: Optional[EphemeralPolicyError] = None
+            config = read_settings()
+            require_enabled(config)
+            with _transaction() as db:
+                row = _row(db, name)
+                if row is None or row["provider"] != provider or row["owner_id"] != caller_id:
+                    error = _bind_rule(row, caller_id, provider, None)
+                else:
+                    row = _lapse(db, row, now)
+                    error = (
+                        None
+                        if row["state"] == "pending"
+                        else _bind_rule(row, caller_id, provider, None)
+                    )
+            if error is not None:
+                if row is not None and row["state"] == "gc":
+                    _finish_gc(row)
+                raise error
+            assert row is not None
+            _recheck_policy(row, config, None)
+        with _transaction() as db:
+            row = _row(db, name)
+            if row is not None:
+                tools = _launch_tools(row, None, allowed_tools)
+            table = database.EphemeralAgentModel
+            statement = update(table).where(
+                table.name == name, table.owner_id == caller_id, table.provider == provider
+            )
+            values = dict(state="launched", launched_terminal_id=terminal_id, bound_at=now)
+            if claim_id is None:
+                statement = statement.where(table.state == "pending", table.expires_at > now)
+                values.update(claim_id=secrets.token_hex(16), idempotency_key=idempotency_key)
+            else:
+                statement = statement.where(
+                    table.state == "claimed",
+                    table.claim_id == claim_id,
+                    table.claim_expires_at > now,
+                )
+            changed = db.execute(statement.values(**values)).rowcount
+            db.expire_all()
+            row = _row(db, name)
+            if not changed and row is not None:
+                row = _lapse(db, row, now)
+        if not changed:
+            if row is not None and row["state"] == "gc":
+                _finish_gc(row)
+            raise _bind_rule(row, caller_id, provider, claim_id)
+        assert row is not None
+        _audit_update(row, "bound", terminal_id=terminal_id, effective_tools=tools)
+    except EphemeralPolicyError as exc:
+        _report_refusal(name, caller_id, row, exc)
+        raise

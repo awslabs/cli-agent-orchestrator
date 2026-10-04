@@ -47,7 +47,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
@@ -147,6 +147,7 @@ from cli_agent_orchestrator.services.cleanup_service import (
     cleanup_old_data,
 )
 from cli_agent_orchestrator.services.config_service import ConfigService
+from cli_agent_orchestrator.services.ephemeral_service import EphemeralPolicyError
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.event_log_service import RING_CAPACITY
 from cli_agent_orchestrator.services.event_primitives import KINDS as EVENT_KINDS
@@ -601,6 +602,8 @@ class RunStepRequest(BaseModel):
             raise ValueError("CAO_WORKFLOW_GENERATION requires CAO_WORKFLOW_RUN_ID (required pair)")
         if "CAO_WORKFLOW_STEP_ID" in keys and not has_run:
             raise ValueError("CAO_WORKFLOW_STEP_ID requires CAO_WORKFLOW_RUN_ID")
+        if self.claim_id is not None and self.reuse_terminal_id:
+            raise ValueError("claim_id cannot be used with reuse_terminal_id")
         if self.env_vars and self.reuse_terminal_id:
             # run_agent_step documents env injection as ignored on reused
             # terminals — a silently dropped RUN_ID/GENERATION fence token is
@@ -626,14 +629,16 @@ class RunStepRequest(BaseModel):
         ),
     )
 
-    @field_validator("job_id")
+    claim_id: Optional[str] = None
+
+    @field_validator("job_id", "claim_id")
     @classmethod
-    def _validate_job_id(cls, v: Optional[str]) -> Optional[str]:
+    def _validate_job_id(cls, v: Optional[str], info: ValidationInfo) -> Optional[str]:
         if v is None:
             return v
         if not re.fullmatch(r"[0-9a-f]{32}", v):
             raise ValueError(
-                "job_id must be a 32-character lowercase hex string (e.g. uuid4().hex)"
+                f"{info.field_name} must be a 32-character lowercase hex string (e.g. uuid4().hex)"
             )
         return v
 
@@ -3506,6 +3511,8 @@ async def create_session(
         # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
         # rejection, not a bad request: the caller should retry on another node.
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+    except EphemeralPolicyError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except WorktreeError as e:
@@ -3631,6 +3638,7 @@ async def create_terminal_in_session(
     model: Optional[str] = None,
     use_worktree: bool = False,
     idempotency_key: Optional[str] = None,
+    claim_id: Optional[str] = Query(default=None, pattern=r"^[0-9a-f]{32}$"),
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -3745,6 +3753,7 @@ async def create_terminal_in_session(
             model=model,
             use_worktree=use_worktree,
             idempotency_key=idempotency_key,
+            claim_id=claim_id,
         )
         return result
     except HTTPException:
@@ -3768,6 +3777,8 @@ async def create_terminal_in_session(
         # rejection, not a bad request or a missing session: the caller should
         # retry on another node.
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+    except EphemeralPolicyError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except WorktreeError as e:
@@ -4576,6 +4587,7 @@ async def run_step(
             model=body.model,
             use_worktree=body.use_worktree,
             job_id=job_id,
+            claim_id=body.claim_id,
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure
@@ -4702,6 +4714,10 @@ async def run_step(
         _settle_step(None, str(e))
         await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+    except EphemeralPolicyError as e:
+        _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
+        raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
         await _record_job_state(job_id, "error", error_message=str(e))

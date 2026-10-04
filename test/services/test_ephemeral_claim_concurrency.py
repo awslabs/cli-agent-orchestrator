@@ -90,6 +90,28 @@ def test_winner_recheck_reverts_without_admitting_competitor(file_store, monkeyp
     assert database.get_ephemeral_agent(name) == row
 
 
+def test_claim_competes_with_claimless_bind(file_store):
+    env, name = file_store
+    start = threading.Barrier(2)
+
+    def run(bind):
+        start.wait(timeout=10)
+        if not bind:
+            return outcome(env, name)
+        try:
+            env[0].bind_ephemeral_agent(name, "eeeeeeee", CALLER, "claude_code", None, None)
+            return "bound"
+        except env[0].EphemeralPolicyError as exc:
+            return exc.rule
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a, b = pool.submit(run, False), pool.submit(run, True)
+        results = [a.result(timeout=10), b.result(timeout=10)]
+    assert results.count("already_claimed") == 1
+    assert sum(isinstance(r, dict) or r == "bound" for r in results) == 1
+    assert database.get_ephemeral_agent(name)["state"] in {"claimed", "launched"}
+
+
 def test_registry_survives_reconnect_and_lapses_lazily(file_store, monkeypatch):
     from datetime import timedelta
 
