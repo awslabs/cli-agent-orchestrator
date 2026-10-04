@@ -813,6 +813,51 @@ Prompt.
                 await execute_flow("bad-json-flow")
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.flow_service.subprocess.run")
+    @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
+    @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
+    async def test_execute_flow_script_dispatches_via_to_thread(
+        self, mock_db_get, mock_update_times, mock_subprocess, tmp_path
+    ):
+        """#874: the flow script can run for up to its 30s timeout, and execute_flow
+        runs on the shared event loop. Pin the asyncio.to_thread dispatch so a slow or
+        hanging script cannot stall every other request to cao-server."""
+        from cli_agent_orchestrator.services import flow_service
+
+        flow_path = tmp_path / "flow.md"
+        flow_path.write_text(
+            "---\nname: pin-script\nschedule: '* * * * *'\nagent_profile: developer\n"
+            "script: ./check.sh\n---\nPrompt.\n"
+        )
+        (tmp_path / "check.sh").write_text("#!/bin/bash\n")
+        mock_db_get.return_value = Flow(
+            name="pin-script",
+            file_path=str(flow_path),
+            schedule="* * * * *",
+            agent_profile="developer",
+            provider="kiro_cli",
+            script="./check.sh",
+            enabled=True,
+            next_run=datetime.now(),
+        )
+        mock_subprocess.return_value = MagicMock(
+            returncode=0, stdout=json.dumps({"execute": False, "output": {}}), stderr=""
+        )
+
+        with patch(
+            "cli_agent_orchestrator.services.flow_service.asyncio.to_thread",
+            wraps=asyncio.to_thread,
+        ) as mock_to_thread:
+            result = await execute_flow("pin-script")
+            script_calls = [
+                c for c in mock_to_thread.call_args_list if c.args[0] is flow_service.subprocess.run
+            ]
+
+        assert result is False
+        assert script_calls, "the flow script was never dispatched via to_thread"
+        assert script_calls[0].args[1] == [str(tmp_path / "check.sh")]
+
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
