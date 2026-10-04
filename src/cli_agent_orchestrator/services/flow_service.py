@@ -238,7 +238,11 @@ async def execute_flow(name: str) -> bool:
             if not script_path.exists():
                 raise ValueError(f"Script not found: {script_path}")
 
-            result = subprocess.run([str(script_path)], capture_output=True, text=True, timeout=30)
+            # Off the loop: the script can run for up to 30s, and execute_flow
+            # runs on the shared event loop, so every request would wait on it.
+            result = await asyncio.to_thread(
+                subprocess.run, [str(script_path)], capture_output=True, text=True, timeout=30
+            )
 
             if result.returncode != 0:
                 logger.error(f"Script failed: {result.stderr}")
