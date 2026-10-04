@@ -142,6 +142,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory, so ownership records written there by earlier releases stay in
   force (#493).
 
+- **The pipe-pane liveness watchdog re-baselined past frames the FIFO never
+  delivered.** A forwarder that stalled mid-burst could watch the pane settle
+  into a new frame before the next check and reset its healthy baseline to
+  that never-delivered frame, hiding the stall. A byte-arrived interval now
+  never strikes, and re-baselining past a frame waits until the FIFO side has
+  actually reached the pane's trailing rows — rendered-to-rendered against
+  the pyte screen the status pipeline composites when active, otherwise a
+  normalized raw-stream comparison that treats a lone carriage return without
+  a following erase as a wrap continuation, so a healthy terminal is no
+  longer re-armed on every activity-to-idle transition (#711)
 - **Workflow script run-step refusals now retain their typed reason in run
   records.** When a structured HTTP error includes a string `detail.kind`,
   `ShimHTTPError` includes that kind and its optional message in the exception
