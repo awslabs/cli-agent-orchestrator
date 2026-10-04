@@ -981,6 +981,16 @@ class TestCopilotCliProviderMisc:
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         assert provider.get_status(output) == TerminalStatus.PROCESSING
 
+    @pytest.mark.parametrize("row", ["Queued", "Waiting", "Compacting context"])
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    def test_get_status_processing_with_versionless_row_below_hint_row(self, mock_tmux, row):
+        hint = "← open sidebar · Autopilot · Allow All · / commands · tab next tab"
+        rule = "─" * 100
+        output = f"❯ do the thing\n● Working on it\n{rule}\n❯\n{rule}\n{hint}\n{row}\n"
+        mock_tmux.return_value.get_native_status.return_value = None
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
     def test_extract_last_message_without_trailing_prompt_is_not_duplicated(self):
         output = "❯ summarize\n● First point\nSecond line\n"
         provider = CopilotCliProvider("test1234", "test-session", "window-0")

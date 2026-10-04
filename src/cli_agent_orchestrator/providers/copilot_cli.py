@@ -86,6 +86,7 @@ COPILOT_HINT_BAR_PATTERN = r"^←.*[·•]\s*/ commands\b"
 COPILOT_AGENT_MODEL_BAR_PATTERN = r"^(?:[\w.-]+\s*[·•]\s*)?github copilot\s*[·•]"
 COPILOT_BUSY_ROW_PATTERN = r"\besc (?:to cancel|interrupt)\b"
 COPILOT_COLUMN_GAP_PATTERN = r"\S\s{3,}\S"
+COPILOT_MODEL_VERSION_PATTERN = r"\d"
 PROCESSING_LINE_PATTERN = r"^(?:[●◐◑◒◓◉◎∙]\s*)?.*\besc to cancel\b.*$"
 
 
@@ -567,6 +568,7 @@ class CopilotCliProvider(BaseProvider):
             cls._is_hint_row(hint_row)
             and not re.search(COPILOT_COLUMN_GAP_PATTERN, hint_row.strip())
             and not re.search(COPILOT_COLUMN_GAP_PATTERN, rows[idx].strip())
+            and bool(re.search(COPILOT_MODEL_VERSION_PATTERN, rows[idx]))
         )
 
     @classmethod
