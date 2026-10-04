@@ -719,6 +719,8 @@ def _roll_back_failed_create(
         # cleanup deferral with enough information to retry safely.
         cleanup_complete = True
     if cleanup_complete:
+        if terminal_id is not None:
+            ephemeral_service.release(terminal_id, "launch_failed")
         try:
             if terminal_id is not None:
                 db_delete_terminal(terminal_id)
@@ -1301,10 +1303,12 @@ async def create_terminal(
             claim_id=claim_id,
             ephemeral_state=state,
         )
-    except BaseException:
+    except BaseException as exc:
         if state.bound_terminal_id is None:
             if claim_id is not None:
                 ephemeral_service.end_claim(agent_profile, claim_id)
+        elif isinstance(exc, asyncio.CancelledError):
+            ephemeral_service.release(state.bound_terminal_id, "launch_failed")
         raise
 
 
@@ -2175,6 +2179,7 @@ def _notify_caller_of_deferred_failure(
             terminal_id,
         )
 
+    ephemeral_service.release(terminal_id, "launch_failed")
     if delete_worker:
         try:
             # Pass registry so post_kill_terminal hooks fire — parity with the
@@ -4628,6 +4633,7 @@ def dismantle_terminal_runtime(
     # temporary process race into a permanent private-home leak.
     if provider_manager.cleanup_provider(terminal_id) is False:
         return False
+    ephemeral_service.release(terminal_id, "terminal_deleted")
     with _memory_injected_lock:
         _memory_injected_terminals.discard(terminal_id)
     # Drop any per-curator dispatch lock so the registry doesn't grow
@@ -4674,6 +4680,8 @@ def delete_terminal_row(
         # DB row was already deleted by another lifecycle owner.
         _delete_deferred_failure_fallback(terminal_id)
         _delete_deferred_init_complete_fallback(terminal_id)
+    if deleted:
+        ephemeral_service.release(terminal_id, "terminal_gone")
     logger.info(f"Deleted terminal: {terminal_id}")
     if deleted and metadata:
         dispatch_plugin_event(

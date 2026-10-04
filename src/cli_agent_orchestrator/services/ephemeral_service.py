@@ -661,13 +661,21 @@ def _finish_gc(row: dict[str, Any]) -> None:
     """Remove only the two exact regular live files, leaving the archive."""
     if not agent_profiles.routes_to_ephemeral_store(row["name"]):
         return
-    for suffix in (".md", ".spec.json"):
-        path = EPHEMERAL_DIR / "live" / (row["name"] + suffix)
-        try:
-            if stat.S_ISREG(path.lstat().st_mode):
-                path.unlink()
-        except OSError:
-            pass
+    fd = None
+    try:
+        fd = os.open(EPHEMERAL_DIR / "live", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        for suffix in (".md", ".spec.json"):
+            name = row["name"] + suffix
+            try:
+                if stat.S_ISREG(os.lstat(name, dir_fd=fd).st_mode):
+                    os.unlink(name, dir_fd=fd)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    finally:
+        if fd is not None:
+            os.close(fd)
     _audit_update(row, "released", gc_reason=row["gc_reason"])
 
 
@@ -1045,3 +1053,25 @@ def bind_ephemeral_agent(
     except EphemeralPolicyError as exc:
         _report_refusal(name, caller_id, row, exc)
         raise
+
+
+def release(terminal_id: str, reason: str) -> None:
+    """Collect this terminal's live files once; keep its registry marker forever."""
+    try:
+        with _transaction() as db:
+            table = database.EphemeralAgentModel
+            record = db.query(table).filter(table.launched_terminal_id == terminal_id).first()
+            if record is None:
+                return
+            name = record.name
+            db.execute(
+                update(table)
+                .where(table.launched_terminal_id == terminal_id, table.state == "launched")
+                .values(state="gc", gc_reason=reason)
+            )
+            db.expire_all()
+            row = _row(db, name)
+        if row is not None and row["state"] == "gc":
+            _finish_gc(row)
+    except Exception:
+        pass  # A teardown failure must never mask the caller's original outcome.

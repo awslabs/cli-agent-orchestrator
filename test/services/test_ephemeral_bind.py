@@ -186,6 +186,20 @@ async def test_prebind_failure_ends_claim_and_allows_new_claim(runtime_store, mo
     assert database.get_terminal_metadata(CHILD) is None
 
 
+@pytest.mark.asyncio
+async def test_cancel_after_bind_calls_release_at_once(runtime_store, monkeypatch):
+    env, name, _, factory = runtime_store
+    token = claim(env, name)["claim_id"]
+    factory.return_value.initialize.side_effect = asyncio.CancelledError()
+    release = Mock()
+    monkeypatch.setattr(env[0], "release", release)
+    with pytest.raises(asyncio.CancelledError):
+        await terminal_service.create_terminal(
+            "claude_code", name, session_name="cao-session", caller_id=CALLER, claim_id=token
+        )
+    release.assert_called_once_with(CHILD, "launch_failed")
+
+
 def test_workflow_claim_end_collects_and_stale_end_preserves_row(claimed_store):
     env, name = claimed_store
     token = claim(env, name)["claim_id"]
@@ -373,6 +387,320 @@ async def test_lease_expires_during_load_without_runtime_allocation(runtime_stor
     assert claim(env, name)["replayed"] is False
 
 
+@pytest.fixture
+def release_runtime(runtime_store, monkeypatch):
+    from cli_agent_orchestrator.backends import registry
+    from cli_agent_orchestrator.services import session_service
+
+    env, name, backend, factory = runtime_store
+    backend.get_history.return_value = ""
+    backend.get_pane_working_directory.return_value = str(env[2])
+    backend.session_exists_strict.return_value = False
+    monkeypatch.setattr(registry, "get_backend", lambda: backend)
+    monkeypatch.setattr(session_service, "get_backend", lambda: backend)
+    logs = env[2] / "logs"
+    logs.mkdir()
+    monkeypatch.setattr(terminal_service, "TERMINAL_LOG_DIR", logs)
+    return env, name, backend, factory
+
+
+async def launch_runtime(runtime):
+    env, name, _, _ = runtime
+    return await terminal_service.create_terminal(
+        "claude_code", name, session_name="cao-session", caller_id=CALLER
+    )
+
+
+def assert_released(env, name, reason):
+    row = database.get_ephemeral_agent(name)
+    assert (
+        row["state"] == "gc" and row["gc_reason"] == reason and row["launched_terminal_id"] == CHILD
+    )
+    assert not list((env[2] / "ephemeral/live").iterdir())
+    assert audit(name)["gc_reason"] == reason
+    assert audit(name)["events"][-1]["event"] == "released"
+    assert database.is_ephemeral_terminal(CHILD)
+
+
+@pytest.mark.asyncio
+async def test_raw_api_launch_and_delete_releases(release_runtime, monkeypatch):
+    from cli_agent_orchestrator.api import main
+    from cli_agent_orchestrator.plugins.registry import PluginRegistry
+
+    env, name, _, _ = release_runtime
+    monkeypatch.setattr(main.app.state, "plugin_registry", PluginRegistry(), raising=False)
+    client = TestClient(main.app, base_url="http://localhost")
+    response = client.post(
+        "/sessions/cao-session/terminals",
+        params=dict(provider="claude_code", agent_profile=name, caller_id=CALLER),
+    )
+    assert response.status_code == 201 and response.json()["ephemeral"] is True
+    response = client.delete("/terminals/" + CHILD)
+    assert response.status_code == 200
+    assert_released(env, name, "terminal_deleted")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["session", "herdr"])
+async def test_session_delete_and_herdr_exit_release(release_runtime, monkeypatch, path):
+    from cli_agent_orchestrator.services import herdr_inbox_service, session_service
+
+    env, name, _, _ = release_runtime
+    await launch_runtime(release_runtime)
+    if path == "session":
+        assert "cao-session" in session_service.delete_session("cao-session")["deleted"]
+    else:
+        service = herdr_inbox_service.HerdrInboxService(socket_path=str(env[2] / "fake.sock"))
+        service._pane_to_terminal = {"child": CHILD, "parent": CALLER}
+        service._terminal_to_pane = {CHILD: "child", CALLER: "parent"}
+        monkeypatch.setattr(service, "_label_still_live", lambda _: False)
+        service._handle_lifecycle_event("pane.closed", {"pane_id": "child"})
+    assert_released(env, name, "terminal_deleted")
+
+
+@pytest.mark.asyncio
+async def test_retention_and_stale_row_delete_release(release_runtime, monkeypatch):
+    from sqlalchemy import update
+
+    from cli_agent_orchestrator.services import cleanup_service
+
+    env, name, _, _ = release_runtime
+    await launch_runtime(release_runtime)
+    with env[1]() as db:
+        db.execute(
+            update(database.TerminalModel)
+            .where(database.TerminalModel.id == CHILD)
+            .values(last_active=NOW - timedelta(days=30))
+        )
+        db.commit()
+    monkeypatch.setattr(cleanup_service, "SessionLocal", env[1])
+    cleanup_service.cleanup_old_data()
+    assert database.get_terminal_metadata(CHILD) is None
+    assert_released(env, name, "terminal_gone")
+
+
+@pytest.mark.asyncio
+async def test_stale_session_purge_releases(release_runtime):
+    env, name, _, _ = release_runtime
+    await launch_runtime(release_runtime)
+    terminal_service._purge_stale_session_rows_for_recreate("cao-session")
+    assert_released(env, name, "terminal_gone")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "cancel", "extraction", "timeout"])
+async def test_run_step_release_and_timeout_residue(release_runtime, monkeypatch, outcome):
+    from cli_agent_orchestrator.providers.base import OutputExtractionError
+    from cli_agent_orchestrator.services import agent_step
+
+    env, name, _, _ = release_runtime
+    token = claim(env, name)["claim_id"]
+    monkeypatch.setattr(agent_step, "wait_until_status", AsyncMock(return_value=True))
+    wait = AsyncMock()
+    if outcome == "cancel":
+        wait.side_effect = agent_step.StepCancelledError(CHILD)
+    if outcome == "timeout":
+        wait.side_effect = agent_step.StepExecutionError("timeout", terminal_id=CHILD)
+    monkeypatch.setattr(agent_step, "_wait_for_completion", wait)
+    monkeypatch.setattr(agent_step.frozen_run_memory, "frozen_memory_for", lambda *args: None)
+    monkeypatch.setattr(terminal_service, "send_input", lambda *args, **kw: None)
+    if outcome == "extraction":
+
+        def extract(*args):
+            raise OutputExtractionError("no marker")
+
+    else:
+
+        def extract(*args):
+            return "done"
+
+    monkeypatch.setattr(terminal_service, "get_output", extract)
+    call = agent_step.run_agent_step(
+        "claude_code", name, "inspect", session_name="cao-session", caller_id=CALLER, claim_id=token
+    )
+    if outcome == "success":
+        assert (await call).last_message == "done"
+    else:
+        expected = {
+            "cancel": agent_step.StepCancelledError,
+            "timeout": agent_step.StepExecutionError,
+            "extraction": OutputExtractionError,
+        }[outcome]
+        with pytest.raises(expected):
+            await call
+    if outcome == "timeout":
+        assert database.get_ephemeral_agent(name)["state"] == "launched"
+        assert (env[2] / "ephemeral/live" / (name + ".md")).exists()
+    else:
+        assert_released(env, name, "terminal_deleted")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["cancel", "exception"])
+async def test_postbind_failure_collects_immediately(release_runtime, failure):
+    env, name, _, factory = release_runtime
+    token = claim(env, name)["claim_id"]
+    factory.return_value.initialize.side_effect = (
+        asyncio.CancelledError() if failure == "cancel" else RuntimeError("launch failed")
+    )
+    with pytest.raises(asyncio.CancelledError if failure == "cancel" else RuntimeError):
+        await terminal_service.create_terminal(
+            "claude_code",
+            name,
+            session_name="cao-session",
+            caller_id=CALLER,
+            claim_id=token,
+            initial_message="inspect",
+        )
+    assert_released(env, name, "launch_failed")
+    assert not terminal_service.initial_delivery_pending(CHILD)
+    metadata = database.get_terminal_metadata(CHILD)
+    assert metadata is None or (metadata.get("initial_delivery") or {}).get("state") != "pending"
+
+
+@pytest.mark.asyncio
+async def test_deferred_failure_releases_even_retained_worker(release_runtime):
+    env, name, _, _ = release_runtime
+    await launch_runtime(release_runtime)
+    terminal_service._notify_caller_of_deferred_failure(CHILD, "unavailable", None, False)
+    assert_released(env, name, "launch_failed")
+    assert database.get_terminal_metadata(CHILD) is not None
+
+
+@pytest.mark.asyncio
+async def test_deferred_provider_cleanup_waits_for_delete(release_runtime, monkeypatch):
+    env, name, _, _ = release_runtime
+    await launch_runtime(release_runtime)
+    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", lambda _: False)
+    terminal_service._roll_back_failed_create(
+        CHILD,
+        "cao-session",
+        None,
+        session_created=False,
+        window_created=False,
+        worktree_repo_root=None,
+    )
+    assert database.get_ephemeral_agent(name)["state"] == "launched"
+    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", lambda _: True)
+    assert terminal_service.delete_terminal(CHILD)
+    assert_released(env, name, "terminal_deleted")
+
+
+def test_double_release_is_noop_and_recleans_gc_files(claimed_store):
+    env, name = claimed_store
+    env[0].bind_ephemeral_agent(name, CHILD, CALLER, "claude_code", None, None)
+    env[0].release(CHILD, "terminal_deleted")
+    before = audit(name)
+    for suffix in [".md", ".spec.json"]:
+        (env[2] / "ephemeral/live" / (name + suffix)).write_text("residue")
+    env[0].release(CHILD, "terminal_gone")
+    assert_released(env, name, "terminal_deleted")
+    assert audit(name) == before
+
+
+def test_release_skips_symlink_and_never_raises_on_database_failure(claimed_store, monkeypatch):
+    env, name = claimed_store
+    env[0].bind_ephemeral_agent(name, CHILD, CALLER, "claude_code", None, None)
+    path = env[2] / "ephemeral/live" / (name + ".md")
+    outside = env[2] / "outside.md"
+    outside.write_text("outside")
+    path.unlink()
+    path.symlink_to(outside)
+    env[0].release(CHILD, "terminal_deleted")
+    assert path.is_symlink() and outside.read_text() == "outside"
+    assert database.get_ephemeral_agent(name)["state"] == "gc"
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            database, "SessionLocal", Mock(side_effect=RuntimeError("database unavailable"))
+        )
+        env[0].release(CHILD, "terminal_deleted")
+
+
+def test_crash_after_bind_leaves_launched_registry_without_terminal(claimed_store):
+    env, name = claimed_store
+    token = claim(env, name)["claim_id"]
+    env[0].bind_ephemeral_agent(name, CHILD, CALLER, "claude_code", token, None)
+    assert database.get_terminal_metadata(CHILD) is None
+    with pytest.raises(env[0].EphemeralPolicyError, match="already_claimed"):
+        claim(env, name)
+    assert database.get_ephemeral_agent(name)["state"] == "launched"
+
+
+@pytest.mark.asyncio
+async def test_claim_does_not_enter_step_fingerprint(release_runtime, monkeypatch):
+    from dataclasses import fields
+
+    from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
+    from cli_agent_orchestrator.services import agent_step
+    from cli_agent_orchestrator.services.step_fingerprint import StepCallFields
+
+    assert "claim_id" not in [f.name for f in fields(StepCallFields)]
+    env, name, _, _ = release_runtime
+    terminal = Terminal(
+        id=CHILD,
+        name="child",
+        provider="claude_code",
+        session_name="cao-session",
+        status=TerminalStatus.IDLE,
+        last_active=NOW,
+    )
+    create = AsyncMock(return_value=terminal)
+    monkeypatch.setattr(terminal_service, "create_terminal", create)
+    monkeypatch.setattr(terminal_service, "send_input", lambda *args, **kwargs: None)
+    monkeypatch.setattr(terminal_service, "get_output", lambda *args: "done")
+    monkeypatch.setattr(agent_step, "wait_until_status", AsyncMock(return_value=True))
+    monkeypatch.setattr(agent_step, "_wait_for_completion", AsyncMock())
+    monkeypatch.setattr(agent_step.frozen_run_memory, "frozen_memory_for", lambda *args: None)
+    seen = []
+    for token in ["a" * 32, "b" * 32]:
+        await agent_step.run_agent_step(
+            "claude_code",
+            name,
+            "inspect",
+            session_name="cao-session",
+            working_directory=str(env[2]),
+            claim_id=token,
+            teardown=False,
+            on_step_terminal_ready=lambda tid, fp: seen.append(fp),
+        )
+        assert create.await_args.kwargs["claim_id"] == token
+    assert seen[0] == seen[1]
+
+
+@pytest.mark.asyncio
+async def test_bound_child_denied_by_real_mcp_gate_before_and_after_release(
+    release_runtime, monkeypatch
+):
+    from cli_agent_orchestrator.mcp_server import server
+    from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+    env, name, _, _ = release_runtime
+    await launch_runtime(release_runtime)
+    monkeypatch.setenv("CAO_TERMINAL_ID", CHILD)
+    monkeypatch.setattr(
+        terminal_service.status_monitor, "get_status", lambda _: TerminalStatus.IDLE
+    )
+    monkeypatch.setattr(
+        server.mcp_utils, "get_json", lambda *args, **kwargs: terminal_service.get_terminal(CHILD)
+    )
+    monkeypatch.setattr(server.requests, "get", Mock(return_value=Mock(status_code=404)))
+    for released in [False, True]:
+        if released:
+            env[0].release(CHILD, "terminal_deleted")
+        assert server._get_terminal_context_from_env()["ephemeral"] is True
+        for tool in [
+            "assign",
+            "handoff",
+            "assign_elastic",
+            "workflow_run",
+            "workflow_resume",
+            "workflow_start",
+        ]:
+            assert server._tool_denied_reason(tool) is not None
+        assert server._tool_denied_reason("create_ephemeral_agent") is not None
+        assert server._tool_denied_reason("send_message") is None
+
+
 @pytest.mark.asyncio
 async def test_mismatched_provider_refuses_before_kiro_probe(runtime_store, monkeypatch):
     env, name, backend, factory = runtime_store
@@ -387,7 +715,6 @@ async def test_mismatched_provider_refuses_before_kiro_probe(runtime_store, monk
     backend.create_window.assert_not_called()
     factory.assert_not_called()
     assert database.get_ephemeral_agent(name)["state"] == "pending"
-
 
 
 @pytest.mark.asyncio
@@ -413,7 +740,6 @@ async def test_model_override_refuses_before_any_runtime(runtime_store, with_cla
     factory.assert_not_called()
 
 
-
 def test_claimless_expired_bind_collects_name(claimed_store):
     env, name = claimed_store
     row_update(env, name, expires_at=NOW)
@@ -424,7 +750,6 @@ def test_claimless_expired_bind_collects_name(claimed_store):
     assert row["state"] == "gc" and row["gc_reason"] == "ephemeral_expired"
     assert not list((env[2] / "ephemeral/live").iterdir())
     assert audit(name)["events"][-1]["event"] == "released"
-
 
 
 def test_claimless_expiry_between_transactions_cannot_bind(claimed_store, monkeypatch):
@@ -440,6 +765,45 @@ def test_claimless_expiry_between_transactions_cannot_bind(claimed_store, monkey
         env[0].bind_ephemeral_agent(name, CHILD, CALLER, "claude_code", None, None)
     assert database.get_ephemeral_agent(name)["state"] == "gc"
 
+
+def test_archive_events_never_contain_claim_id(claimed_store):
+    env, name = claimed_store
+    token = claim(env, name)["claim_id"]
+    env[0].bind_ephemeral_agent(name, CHILD, CALLER, "claude_code", token, None)
+    env[0].release(CHILD, "terminal_deleted")
+    events = audit(name)["events"]
+    assert [e["event"] for e in events] == ["created", "claimed", "finalized", "bound", "released"]
+    assert all("claim_id" not in e for e in events)
+
+
+def test_release_refuses_symlink_live_directory(claimed_store, tmp_path):
+    env, name = claimed_store
+    token = claim(env, name)["claim_id"]
+    env[0].bind_ephemeral_agent(name, CHILD, CALLER, "claude_code", token, None)
+    live = env[2] / "ephemeral/live"
+    target = tmp_path / "target"
+    live.rename(target)
+    live.symlink_to(target, target_is_directory=True)
+    env[0].release(CHILD, "terminal_deleted")
+    assert (target / (name + ".md")).is_file()
+    assert (target / (name + ".spec.json")).is_file()
+    assert database.get_ephemeral_agent(name)["state"] == "gc"
+
+
+def test_collected_name_relaunch_is_structured(release_runtime, monkeypatch):
+    from cli_agent_orchestrator.api import main
+    from cli_agent_orchestrator.plugins.registry import PluginRegistry
+
+    env, name, _, _ = release_runtime
+    monkeypatch.setattr(main.app.state, "plugin_registry", PluginRegistry(), raising=False)
+    client = TestClient(main.app, base_url="http://localhost")
+    params = dict(provider="claude_code", agent_profile=name, caller_id=CALLER)
+    response = client.post("/sessions/cao-session/terminals", params=params)
+    assert response.status_code == 201
+    assert client.delete("/terminals/" + CHILD).status_code == 200
+    response = client.post("/sessions/cao-session/terminals", params=params)
+    assert response.status_code == 409
+    assert response.json()["detail"]["rule"] == "ephemeral_expired"
 
 
 @pytest.mark.parametrize("route", ["terminal", "session"])
@@ -458,7 +822,6 @@ def test_never_created_name_launch_is_structured(runtime_store, monkeypatch, rou
     assert response.json()["detail"]["rule"] == "unknown_ephemeral"
 
 
-
 @pytest.mark.asyncio
 async def test_missing_live_profile_is_structured(runtime_store):
     env, name, _, _ = runtime_store
@@ -472,7 +835,6 @@ async def test_missing_live_profile_is_structured(runtime_store):
     assert audit(name)["refusals"]["spec_unavailable"]["count"] == 1
 
 
-
 @pytest.mark.parametrize("field", ["job_id", "claim_id"])
 def test_run_step_validation_names_the_invalid_field(runtime_store, field):
     from cli_agent_orchestrator.api.main import app
@@ -484,6 +846,36 @@ def test_run_step_validation_names_the_invalid_field(runtime_store, field):
     )
     assert response.status_code == 422
     assert response.json()["detail"][0]["msg"].startswith("Value error, " + field + " must be")
+
+
+def test_release_ignores_live_swapped_after_open(claimed_store, tmp_path, monkeypatch):
+    import os
+
+    env, name = claimed_store
+    token = claim(env, name)["claim_id"]
+    env[0].bind_ephemeral_agent(name, CHILD, CALLER, "claude_code", token, None)
+    live = env[2] / "ephemeral/live"
+    target = tmp_path / "target"
+    target.mkdir()
+    for suffix in (".md", ".spec.json"):
+        (target / (name + suffix)).write_text("decoy")
+    real_lstat = os.lstat
+    swapped = []
+
+    def lstat(path, *args, **kwargs):
+        if not swapped:
+            swapped.append(True)
+            live.rename(tmp_path / "moved")
+            live.symlink_to(target, target_is_directory=True)
+        return real_lstat(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(env[0].os, "lstat", lstat)
+        env[0].release(CHILD, "terminal_deleted")
+    assert swapped
+    assert (target / (name + ".md")).is_file()
+    assert (target / (name + ".spec.json")).is_file()
+    assert not list((tmp_path / "moved").iterdir())
 
 
 @pytest.mark.parametrize("unknown", [False, True])
@@ -512,3 +904,57 @@ def test_fresh_session_initial_message_refuses_before_delivery(runtime_store, mo
     backend.create_session.assert_not_called()
     backend.create_window.assert_not_called()
     factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_postbind_initial_message_failure_leaves_no_pending_delivery(
+    release_runtime, monkeypatch
+):
+    env, name, _, factory = release_runtime
+    token = claim(env, name)["claim_id"]
+    factory.side_effect = RuntimeError("launch failed")
+    schedule = Mock(side_effect=AssertionError("provider factory failed before scheduling"))
+    monkeypatch.setattr(terminal_service, "_schedule_deferred_init", schedule)
+    with pytest.raises(RuntimeError, match="launch failed"):
+        await terminal_service.create_terminal(
+            "claude_code",
+            name,
+            session_name="cao-session",
+            caller_id=CALLER,
+            claim_id=token,
+            initial_message="inspect",
+            defer_init=True,
+        )
+    assert_released(env, name, "launch_failed")
+    assert not terminal_service.initial_delivery_pending(CHILD)
+    assert database.get_terminal_metadata(CHILD) is None
+    schedule.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_deferred_ephemeral_failure_settles_initial_delivery(release_runtime, monkeypatch):
+    env, name, _, factory = release_runtime
+    factory.return_value.initialize.side_effect = RuntimeError("launch failed")
+    schedule = terminal_service._schedule_deferred_init
+    owned = []
+
+    def capture(*args, **kwargs):
+        task = schedule(*args, **kwargs)
+        owned.append(task)
+        return task
+
+    monkeypatch.setattr(terminal_service, "_schedule_deferred_init", capture)
+    await terminal_service.create_terminal(
+        "claude_code",
+        name,
+        session_name="cao-session",
+        caller_id=CALLER,
+        initial_message="inspect",
+        defer_init=True,
+    )
+    assert len(owned) == 1 and owned[0] is not None
+    await asyncio.wait_for(owned[0], timeout=10)
+    assert_released(env, name, "launch_failed")
+    assert not terminal_service.initial_delivery_pending(CHILD)
+    metadata = database.get_terminal_metadata(CHILD)
+    assert metadata is None or (metadata.get("initial_delivery") or {}).get("state") == "failed"
