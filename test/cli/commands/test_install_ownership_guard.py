@@ -188,8 +188,8 @@ class TestInstalledIdIsTheFilenameNotTheParsedName:
     def alias_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
             install_service,
-            "resolve_env_vars",
-            lambda raw: raw.replace("${ALIAS}", "shared"),
+            "load_env_vars",
+            lambda: {"ALIAS": "shared"},
         )
 
     def test_placeholder_named_profile_owns_its_resolved_id(
