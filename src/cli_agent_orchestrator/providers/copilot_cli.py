@@ -84,6 +84,8 @@ COPILOT_STATUS_BAR_PATTERN = r"^\s*(?:autopilot|plan|interactive)\s*[·•]"
 COPILOT_CWD_BREADCRUMB_PATTERN = r"^\s+(?:~|/)[^\[]*\["
 COPILOT_HINT_BAR_PATTERN = r"^←.*[·•]\s*/ commands\b"
 COPILOT_AGENT_MODEL_BAR_PATTERN = r"^(?:[\w.-]+\s*[·•]\s*)?github copilot\s*[·•]"
+COPILOT_BUSY_ROW_PATTERN = r"\besc (?:to cancel|interrupt)\b"
+COPILOT_COLUMN_GAP_PATTERN = r"\S\s{3,}\S"
 PROCESSING_LINE_PATTERN = r"^(?:[●◐◑◒◓◉◎∙]\s*)?.*\besc to cancel\b.*$"
 
 
@@ -494,19 +496,24 @@ class CopilotCliProvider(BaseProvider):
         return False
 
     @staticmethod
-    def _is_idle_chrome_row(text: str) -> bool:
+    def _is_busy_or_waiting_row(text: str) -> bool:
+        stripped = text.strip().lower()
+        return bool(
+            re.search(COPILOT_BUSY_ROW_PATTERN, stripped)
+            or re.search(WAITING_PROMPT_PATTERN, stripped)
+        )
+
+    @staticmethod
+    def _is_hint_row(text: str) -> bool:
         stripped = text.strip().lower()
         return bool(
             re.search(COPILOT_HINT_BAR_PATTERN, stripped)
-            or re.search(COPILOT_AGENT_MODEL_BAR_PATTERN, stripped)
+            or re.match(COPILOT_STATUS_BAR_PATTERN, stripped)
         )
 
-    @classmethod
-    def _is_wrapped_idle_chrome(cls, rows: list[str]) -> bool:
-        stripped_rows = [row.strip() for row in rows]
-        return any(
-            cls._is_idle_chrome_row(separator.join(stripped_rows)) for separator in ("", " ")
-        )
+    @staticmethod
+    def _is_agent_model_row(text: str) -> bool:
+        return bool(re.search(COPILOT_AGENT_MODEL_BAR_PATTERN, text.strip().lower()))
 
     @staticmethod
     def _is_processing_line(line: str) -> bool:
@@ -539,21 +546,28 @@ class CopilotCliProvider(BaseProvider):
     @classmethod
     def _rows_outside_idle_chrome(cls, rows: list[str]) -> list[str]:
         rows = [row for row in rows if row.strip()]
-        remaining: list[str] = []
-        idx = 0
-        while idx < len(rows):
-            if rows[idx].strip().startswith("←"):
-                break
-            if cls._is_footer_line(rows[idx]) or cls._is_idle_chrome_row(rows[idx]):
-                idx += 1
+        unrecognized: list[str] = []
+        for idx, row in enumerate(rows):
+            if cls._is_busy_or_waiting_row(row):
+                unrecognized.append(row)
+            elif cls._is_hint_row(row) or cls._is_footer_line(row) or cls._is_agent_model_row(row):
                 continue
-            if any(
-                cls._is_wrapped_idle_chrome(rows[idx:end]) for end in range(idx + 2, len(rows) + 1)
-            ):
-                break
-            remaining.append(rows[idx])
-            idx += 1
-        return remaining
+            elif cls._is_wrapped_agent_model_row(rows, idx):
+                continue
+            else:
+                unrecognized.append(row)
+        return unrecognized
+
+    @classmethod
+    def _is_wrapped_agent_model_row(cls, rows: list[str], idx: int) -> bool:
+        if idx == 0 or idx != len(rows) - 1:
+            return False
+        hint_row = rows[idx - 1]
+        return (
+            cls._is_hint_row(hint_row)
+            and not re.search(COPILOT_COLUMN_GAP_PATTERN, hint_row.strip())
+            and not re.search(COPILOT_COLUMN_GAP_PATTERN, rows[idx].strip())
+        )
 
     @classmethod
     def _normalize_post_user_lines(cls, lines: list[str]) -> list[str]:
@@ -568,11 +582,15 @@ class CopilotCliProvider(BaseProvider):
             and not cls._is_footer_line(line)
             and not re.match(IDLE_PROMPT_LINE_PATTERN, line)
         ]
-        trailing = [
-            line
-            for line in cls._rows_outside_idle_chrome(lines[last_prompt + 1 :])
-            if not cls._is_footer_line(line)
-        ]
+        trailing = (
+            [
+                line
+                for line in cls._rows_outside_idle_chrome(lines[last_prompt + 1 :])
+                if not cls._is_footer_line(line)
+            ]
+            if last_prompt >= 0
+            else []
+        )
         normalized = body + trailing
 
         while (
@@ -673,7 +691,7 @@ class CopilotCliProvider(BaseProvider):
         return self.get_status(output)
 
     def commit_stale_processing_capture(self, output: str, expected: TerminalStatus) -> bool:
-        return True
+        return self.probe_stale_processing_capture(output) == expected
 
     def get_idle_pattern_for_log(self) -> str:
         return IDLE_PROMPT_PATTERN_LOG

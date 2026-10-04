@@ -366,6 +366,45 @@ class TestCopilotCliProviderInitialization:
     @patch("cli_agent_orchestrator.providers.copilot_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     @patch.object(CopilotCliProvider, "_accept_trust_prompts")
+    async def test_initialize_timeout_names_footer_fragment_from_narrow_pane(
+        self,
+        _mock_accept,
+        _mock_tmux,
+        mock_wait_shell,
+        _mock_async_sleep,
+        mock_status_monitor,
+        mock_time,
+        mock_logger,
+    ):
+        mock_wait_shell.return_value = True
+        mock_status_monitor.get_status.return_value = TerminalStatus.PROCESSING
+        mock_time.side_effect = [0.0, 61.0]
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        narrow_screen = (
+            "❯\n"
+            "← open · Autopilot · Allow · / commands · tab next\n"
+            "sidebar              All                  tab\n"
+        )
+
+        with patch.object(provider, "_history", return_value=narrow_screen):
+            with pytest.raises(TimeoutError, match="Copilot initialization timed out"):
+                await provider.initialize()
+
+        mock_logger.warning.assert_called_once_with(
+            "Copilot idle prompt for %s:%s is followed by unrecognized row %r",
+            "test-session",
+            "window-0",
+            "sidebar              All                  tab",
+        )
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.copilot_cli.logger")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.time.time")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.asyncio.sleep")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    @patch.object(CopilotCliProvider, "_accept_trust_prompts")
     async def test_initialize_timeout_logs_missing_prompt(
         self,
         _mock_accept,
@@ -826,18 +865,6 @@ class TestCopilotCliProviderMisc:
         )
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
-    def test_get_status_idle_when_footer_wraps_across_many_rows(self, mock_tmux):
-        rule = "─" * 12
-        output = (
-            f"{rule}\n❯\n{rule}\n"
-            "← open sid\nebar · Auto\npilot · All\now All · / c\nommands · t\n"
-            "ab next tab\ndata_analyst\n · GitHub Co\npilot • Claude\n Sonnet 5\n"
-        )
-        mock_tmux.return_value.get_native_status.return_value = None
-        provider = CopilotCliProvider("test1234", "test-session", "window-0")
-        assert provider.get_status(output) == TerminalStatus.IDLE
-
-    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_idle_with_model_row_lacking_agent_prefix(self, mock_tmux):
         rule = "─" * 120
         output = (
@@ -849,20 +876,115 @@ class TestCopilotCliProviderMisc:
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         assert provider.get_status(output) == TerminalStatus.IDLE
 
-    @pytest.mark.parametrize("separator", ["", " "])
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
-    def test_get_status_idle_when_footer_rows_wrap_in_narrow_pane(self, mock_tmux, separator):
-        hint = "← open sidebar · Autopilot · Allow All · / commands · tab next tab"
-        model = "data_analyst · GitHub Copilot • Claude Sonnet 5"
-        rule = "─" * 40
+    def test_get_status_processing_when_hint_segments_wrap_in_narrow_pane(self, mock_tmux):
+        """Below ~69 columns Copilot wraps each hint segment inside its own column, so
+        the rows interleave. They are deliberately left unrecognized: not ready."""
+        rule = "─" * 50
         output = (
             f"{rule}\n❯\n{rule}\n"
-            f"{hint[:30]}{separator}\n{hint[30:]}\n"
-            f"{model[:20]}{separator}\n{model[20:]}\n"
+            "← open · Autopilot · Allow · / commands · tab next\n"
+            "sidebar              All                  tab\n"
+            "data_analyst · Claude Sonnet 5\n"
         )
         mock_tmux.return_value.get_native_status.return_value = None
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    @pytest.mark.parametrize(
+        "agent_model_row",
+        ["data_analyst · Claude Sonnet 5", "Claude Sonnet 5", "GitHub Copilot • GPT-5.6 Terra"],
+    )
+    @pytest.mark.parametrize(
+        "hint_row",
+        [
+            "← open sidebar · Autopilot · Allow All · / commands · tab next tab",
+            "Autopilot · Allow All · / commands · tab next tab",
+        ],
+    )
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    def test_get_status_idle_with_agent_model_row_below_hint_row(
+        self, mock_tmux, hint_row, agent_model_row
+    ):
+        """Below ~115 columns the agent/model box moves to its own last row. It may
+        carry no provider label, and the hint row lacks "← open sidebar" when
+        Copilot's sidebar feature is off."""
+        rule = "─" * 100
+        output = f"{rule}\n❯\n{rule}\n {hint_row}\n {agent_model_row}\n"
+        mock_tmux.return_value.get_native_status.return_value = None
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
         assert provider.get_status(output) == TerminalStatus.IDLE
+
+    @pytest.mark.parametrize(
+        "footer_rows",
+        [
+            pytest.param(["{row}", "{hint}", "{model}"], id="above-footer"),
+            pytest.param(["{hint}", "{row}", "{model}"], id="between-hint-and-model"),
+            pytest.param(["{hint}", "{model}", "{row}"], id="below-two-row-footer"),
+            pytest.param(["{wide}", "{row}"], id="below-one-row-footer"),
+            pytest.param(["{hint}   {row}", "{model}"], id="on-hint-row"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "row, expected",
+        [
+            ("∙ Thinking (Esc to cancel)", TerminalStatus.PROCESSING),
+            ("⠋ Working · esc interrupt · enqueue", TerminalStatus.PROCESSING),
+            ("Allow this tool to run? [y/n]", TerminalStatus.WAITING_USER_ANSWER),
+        ],
+    )
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    def test_get_status_not_ready_with_busy_or_waiting_row_near_footer(
+        self, mock_tmux, footer_rows, row, expected
+    ):
+        hint = "← open sidebar · Autopilot · Allow All · / commands · tab next tab"
+        model = "data_analyst · Claude Sonnet 5"
+        rule = "─" * 120
+        rows = [
+            template.format(row=row, hint=hint, model=model, wide=f"{hint}            {model}")
+            for template in footer_rows
+        ]
+        output = "❯ do the thing\n● Working on it\n" + f"{rule}\n❯\n{rule}\n" + "\n".join(rows)
+        mock_tmux.return_value.get_native_status.return_value = None
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(output) == expected
+
+    @pytest.mark.parametrize(
+        "footer_rows",
+        [
+            pytest.param(
+                [
+                    "← open sidebar · Autopilot · Allow All · / commands · tab next tab",
+                    "Queued",
+                    "data_analyst · GitHub Copilot • GPT-5.6 Terra",
+                ],
+                id="unknown-row-before-agent-model-row",
+            ),
+            pytest.param(
+                [
+                    "← open sidebar · Autopilot · Allow All · / commands · tab next tab"
+                    "            data_analyst · Claude Sonnet 5",
+                    "NEW ROW alpha",
+                ],
+                id="unknown-row-below-one-row-footer",
+            ),
+            pytest.param(["← Back to chat"], id="arrow-row-that-is-not-the-hint-row"),
+        ],
+    )
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    def test_get_status_processing_with_unrecognized_row_near_footer(self, mock_tmux, footer_rows):
+        rule = "─" * 120
+        output = (
+            "❯ do the thing\n● Working on it\n" + f"{rule}\n❯\n{rule}\n" + "\n".join(footer_rows)
+        )
+        mock_tmux.return_value.get_native_status.return_value = None
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_extract_last_message_without_trailing_prompt_is_not_duplicated(self):
+        output = "❯ summarize\n● First point\nSecond line\n"
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.extract_last_message_from_script(output) == "● First point\nSecond line"
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_idle_on_v1091_capture_pane_with_shared_footer_row(self, mock_tmux):
