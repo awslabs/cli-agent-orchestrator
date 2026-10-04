@@ -77,6 +77,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Mitigate the documentation toolchain's `braces` nesting-depth vulnerability
+  with a local patch that preserves the published parser's behavior, and update
+  `http-cache-semantics` to 4.3.0. Document the patch and disputed cache advisory,
+  and run dependency regression checks as part of the existing site build
+  without suppressing alerts or changing scan policy.
 - Address five baseline CodeQL alerts without suppressions: remove filesystem
   probes from plugin source-kind inference, confine Kiro policy-file inspection
   to its canonical agent directory, replace the flagged Kimi footer and swarm
