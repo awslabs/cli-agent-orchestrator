@@ -551,24 +551,29 @@ class CopilotCliProvider(BaseProvider):
         for idx, row in enumerate(rows):
             if cls._is_busy_or_waiting_row(row):
                 unrecognized.append(row)
-            elif cls._is_hint_row(row) or cls._is_footer_line(row) or cls._is_agent_model_row(row):
+            elif cls._is_hint_row(row) or cls._is_footer_line(row):
                 continue
-            elif cls._is_wrapped_agent_model_row(rows, idx):
+            elif cls._is_separate_agent_model_row(rows, idx):
                 continue
             else:
                 unrecognized.append(row)
         return unrecognized
 
     @classmethod
-    def _is_wrapped_agent_model_row(cls, rows: list[str], idx: int) -> bool:
+    def _is_separate_agent_model_row(cls, rows: list[str], idx: int) -> bool:
         if idx == 0 or idx != len(rows) - 1:
             return False
         hint_row = rows[idx - 1]
+        # A provider/model label alone can be assistant prose. Only the final
+        # row immediately below a standalone hint bar has footer context.
         return (
             cls._is_hint_row(hint_row)
             and not re.search(COPILOT_COLUMN_GAP_PATTERN, hint_row.strip())
             and not re.search(COPILOT_COLUMN_GAP_PATTERN, rows[idx].strip())
-            and bool(re.search(COPILOT_MODEL_VERSION_PATTERN, rows[idx]))
+            and (
+                cls._is_agent_model_row(rows[idx])
+                or bool(re.search(COPILOT_MODEL_VERSION_PATTERN, rows[idx]))
+            )
         )
 
     @classmethod

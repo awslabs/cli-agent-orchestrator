@@ -842,6 +842,28 @@ class TestCopilotCliProviderMessageExtraction:
 
 
 class TestCopilotCliProviderMisc:
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            "vscode · GitHub Copilot • AI assistant",
+            "GitHub Copilot • GPT-5.6 Terra",
+            "Claude Sonnet 5",
+        ],
+    )
+    @pytest.mark.parametrize("trailing_prompt", ["", "\n❯\n"])
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    def test_model_like_reply_without_hint_context_is_preserved(
+        self, mock_tmux, reply, trailing_prompt
+    ):
+        mock_tmux.return_value.get_native_status.return_value = None
+        output = f"❯ who are you\n{reply}{trailing_prompt}"
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        expected = TerminalStatus.COMPLETED if trailing_prompt else TerminalStatus.PROCESSING
+
+        assert provider.get_status(output) == expected
+        assert provider.probe_stale_processing_capture(output) == expected
+        assert provider.extract_last_message_from_script(output) == reply
+
     @pytest.mark.parametrize("prior_turn", ["", "❯ previous task\n● Previous reply\n"])
     @pytest.mark.parametrize(
         "footer",
@@ -929,7 +951,12 @@ class TestCopilotCliProviderMisc:
 
     @pytest.mark.parametrize(
         "agent_model_row",
-        ["data_analyst · Claude Sonnet 5", "Claude Sonnet 5", "GitHub Copilot • GPT-5.6 Terra"],
+        [
+            "data_analyst · Claude Sonnet 5",
+            "Claude Sonnet 5",
+            "GitHub Copilot • GPT-5.6 Terra",
+            "data_analyst · GitHub Copilot • AI assistant",
+        ],
     )
     @pytest.mark.parametrize(
         "hint_row",
