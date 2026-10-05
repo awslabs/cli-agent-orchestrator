@@ -572,11 +572,17 @@ class CopilotCliProvider(BaseProvider):
         )
 
     @classmethod
-    def _normalize_post_user_lines(cls, lines: list[str]) -> list[str]:
+    def _normalize_post_user_lines(
+        cls, lines: list[str], *, after_idle_prompt: bool = False
+    ) -> list[str]:
         last_prompt = max(
             (idx for idx, line in enumerate(lines) if re.match(IDLE_PROMPT_LINE_PATTERN, line)),
             default=-1,
         )
+        if last_prompt < 0 and after_idle_prompt:
+            # The caller sliced off the final prompt because its composer contains
+            # unsent text. Everything remaining is below that prompt, not a reply.
+            return cls._rows_outside_idle_chrome(lines)
         body = [
             line
             for line in lines[: last_prompt + 1 if last_prompt >= 0 else len(lines)]
@@ -670,7 +676,7 @@ class CopilotCliProvider(BaseProvider):
             return TerminalStatus.IDLE
 
         post_lines = self._trim_tail_prompts(
-            self._normalize_post_user_lines(lines[last_user + 1 :])
+            self._normalize_post_user_lines(lines[last_user + 1 :], after_idle_prompt=True)
         )
         if not post_lines:
             return TerminalStatus.IDLE
@@ -705,13 +711,18 @@ class CopilotCliProvider(BaseProvider):
 
         if last_user >= 0:
             post_lines = self._trim_tail_prompts(
-                self._normalize_post_user_lines(lines[last_user + 1 :])
+                self._normalize_post_user_lines(
+                    lines[last_user + 1 :],
+                    after_idle_prompt=self._has_idle_prompt_near_end(lines),
+                )
             )
             while post_lines and self._is_processing_line(post_lines[-1]):
                 post_lines.pop()
             message = "\n".join(post_lines).strip()
             if message:
                 return message
+            # A previous assistant turn is not a response to the current composer.
+            raise ValueError("No provider response content found in terminal output")
 
         matches = list(
             re.finditer(ASSISTANT_PREFIX_PATTERN, clean_output, re.IGNORECASE | re.MULTILINE)

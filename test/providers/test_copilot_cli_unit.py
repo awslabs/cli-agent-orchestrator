@@ -397,6 +397,7 @@ class TestCopilotCliProviderInitialization:
             "sidebar              All                  tab",
         )
 
+    @pytest.mark.parametrize("screen", ["Loading environment...\n", "", "\n  \n"])
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.copilot_cli.logger")
     @patch("cli_agent_orchestrator.providers.copilot_cli.time.time")
@@ -414,13 +415,14 @@ class TestCopilotCliProviderInitialization:
         mock_status_monitor,
         mock_time,
         mock_logger,
+        screen,
     ):
         mock_wait_shell.return_value = True
         mock_status_monitor.get_status.return_value = TerminalStatus.PROCESSING
         mock_time.side_effect = [0.0, 61.0]
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
 
-        with patch.object(provider, "_history", return_value="Loading environment...\n"):
+        with patch.object(provider, "_history", return_value=screen):
             with pytest.raises(TimeoutError, match="Copilot initialization timed out"):
                 await provider.initialize()
 
@@ -840,6 +842,40 @@ class TestCopilotCliProviderMessageExtraction:
 
 
 class TestCopilotCliProviderMisc:
+    @pytest.mark.parametrize("prior_turn", ["", "❯ previous task\n● Previous reply\n"])
+    @pytest.mark.parametrize(
+        "footer",
+        [
+            pytest.param(
+                "← open sidebar · Autopilot · Allow All · / commands · tab next tab"
+                "            data_analyst · Claude Sonnet 5\n",
+                id="wide",
+            ),
+            pytest.param(
+                "← open sidebar · Autopilot · Allow All · / commands · tab next tab\n"
+                "data_analyst · Claude Sonnet 5\n",
+                id="separate-model-row",
+            ),
+            pytest.param(
+                "autopilot · / commands    Claude Sonnet 4.6 · (0%)\n",
+                id="old-status-bar",
+            ),
+        ],
+    )
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    def test_unsent_composer_text_is_idle_without_response(self, mock_tmux, footer, prior_turn):
+        mock_tmux.return_value.get_native_status.return_value = None
+        rule = "─" * 100
+        output = f"{prior_turn}{rule}\n❯ summarize the repo\n{rule}\n{footer}"
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.IDLE
+        assert provider.probe_stale_processing_capture(output) == TerminalStatus.IDLE
+        assert provider.commit_stale_processing_capture(output, TerminalStatus.IDLE) is True
+        assert provider.commit_stale_processing_capture(output, TerminalStatus.COMPLETED) is False
+        with pytest.raises(ValueError, match="No provider response content found"):
+            provider.extract_last_message_from_script(output)
+
     def test_opts_into_stale_capture_but_not_direct_status_probe(self):
         assert CopilotCliProvider.supports_stale_processing_capture is True
         assert CopilotCliProvider.supports_direct_status_probe is False
