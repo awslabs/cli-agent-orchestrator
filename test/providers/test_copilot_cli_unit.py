@@ -919,7 +919,6 @@ class TestCopilotCliProviderMisc:
             patch.object(provider, "_history", return_value=old_ready_transcript) as history,
             patch.object(provider, "_resolve_native_status", return_value=None),
         ):
-            # Repeated blank snapshots must not confirm a ready state from scrollback.
             assert provider.probe_stale_processing_capture(snapshot) == TerminalStatus.UNKNOWN
             assert provider.probe_stale_processing_capture(snapshot) == TerminalStatus.UNKNOWN
             assert provider.commit_stale_processing_capture(snapshot, TerminalStatus.IDLE) is False

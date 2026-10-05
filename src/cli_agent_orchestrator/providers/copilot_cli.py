@@ -564,8 +564,6 @@ class CopilotCliProvider(BaseProvider):
         if idx == 0 or idx != len(rows) - 1:
             return False
         hint_row = rows[idx - 1]
-        # A provider/model label alone can be assistant prose. Only the final
-        # row immediately below a standalone hint bar has footer context.
         return (
             cls._is_hint_row(hint_row)
             and not re.search(COPILOT_COLUMN_GAP_PATTERN, hint_row.strip())
@@ -585,8 +583,6 @@ class CopilotCliProvider(BaseProvider):
             default=-1,
         )
         if last_prompt < 0 and after_idle_prompt:
-            # The caller sliced off the final prompt because its composer contains
-            # unsent text. Everything remaining is below that prompt, not a reply.
             return cls._rows_outside_idle_chrome(lines)
         body = [
             line
@@ -701,8 +697,6 @@ class CopilotCliProvider(BaseProvider):
         return TerminalStatus.COMPLETED
 
     def probe_stale_processing_capture(self, output: str) -> TerminalStatus:
-        # A blank viewport during repaint is not evidence from scrollback.
-        # get_status's raw-stream fallback must not run for supplied snapshots.
         if not self._clean(output).strip():
             return TerminalStatus.UNKNOWN
         return self.get_status(output)
@@ -730,7 +724,6 @@ class CopilotCliProvider(BaseProvider):
             message = "\n".join(post_lines).strip()
             if message:
                 return message
-            # A previous assistant turn is not a response to the current composer.
             raise ValueError("No provider response content found in terminal output")
 
         matches = list(
