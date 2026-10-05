@@ -108,10 +108,11 @@ required check; adding a requirement does not retroactively run CI.
 The docs, web UI, and MCP Apps toolchains all install the same
 [`patches/braces+3.0.3.patch`](patches/braces+3.0.3.patch), using
 `patch-package --patch-dir ../patches --error-on-fail`. Do not disable install
-scripts. The patch bounds parsing and recursive AST traversal while retaining
-the published parser's ordinary quote/escape behavior. Each project exposes
-`npm run test:dependencies`, reusing the same brace-regression suite; the docs
-also retain their cache-policy regressions.
+scripts. The patch bounds parsing, recursive AST traversal, and expansion's
+ancestor traversal, including cyclic parent links in caller-supplied ASTs,
+while retaining the published parser's ordinary quote/escape behavior. Each
+project exposes `npm run test:dependencies`, reusing the same brace-regression
+suite; the docs also retain their cache-policy regressions.
 
 CI performs clean installs and runs those checks even when the advisory gate
 is red, reporting **mitigation verification separately from advisory status**.

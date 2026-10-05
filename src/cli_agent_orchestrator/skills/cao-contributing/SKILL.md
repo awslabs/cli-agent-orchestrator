@@ -82,6 +82,7 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 | **AI-DLC Portfolio Example** | example project builds | **Yes** |
 | **Security Scan** | Trivy | **Yes** |
 | **CodeQL** | GitHub Actions, JavaScript/TypeScript, Python, and Rust analysis and upload in the same CI run, including forks after required workflow approval | **Yes** — no project build; the hosted scan/status rules remain as documented in `SECURITY.md` |
+| **Dependency Security** | Full locked npm, Bun, uv, and Cargo inventories, including development dependencies and unfixed advisories; independent clean-install mitigation checks | **Yes** — every HIGH/CRITICAL finding or scan error fails; locally, `uv run python scripts/dependency_security.py` with Trivy installed |
 | **Dependency Review** | `actions/dependency-review-action` over the PR's dependency delta: `fail-on-severity: high` plus denied licences `GPL-3.0`/`AGPL-3.0` | **Yes** — CI-only; there is nothing to run locally, and it is skipped on forks (`if: github.repository == 'awslabs/cli-agent-orchestrator'`), so a green run on your fork has not exercised it |
 
 CodeQL's four language jobs are part of `ci.yml`, so **Re-run all jobs** includes
@@ -91,6 +92,12 @@ current `main` workflow before their new CI runs use this wiring. Resolve merge
 conflicts, update the branch, and approve fork workflows when required rather
 than merely rerunning a CI run created before the change. An **Expected**
 required check without an actual job is not a running scan.
+
+Dependency Security also runs weekly and on manual dispatch through
+`dependency-security.yml`, using the same action as CI. A passing local-patch
+check does not exempt an open HIGH/CRITICAL advisory. See
+[`SECURITY.md`](../../SECURITY.md#full-dependency-gate) for inventory artifacts,
+failure states, and the required-status rollout after the workflow lands.
 
 > **The `-m "not e2e"` on the CI command replaces your local `addopts` — it does not
 > compose with it.** So a local run that *also* deselects `integration` is a strict subset
@@ -130,7 +137,7 @@ pins this table to the workflow files.
 | **Test Claude Code Provider** (`test-claude-code-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test, `pyproject.toml`, or the workflow | **Yes** |
 | **Test Codex CLI Provider** (`test-codex-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test or fixtures, `pyproject.toml`, or the workflow | **Yes** |
 | **Test Kiro CLI Provider** (`test-kiro-cli-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test or fixtures, `pyproject.toml`, or the workflow | **Yes** |
-| **Docs site** (`gh-pages.yml`) | `build` | only PRs touching `docusaurus/**` or the workflow | **Yes** — `deploy` is push-only and never runs on a PR |
+| **Docs site** (`gh-pages.yml`) | `build` | only PRs touching `docusaurus/**`, `patches/**`, `scripts/test-braces-security.cjs`, or the workflow | **Yes** — `deploy` is push-only and never runs on a PR |
 
 > **Two checks can share a name.** Each provider workflow has its own `Unit Tests` and
 > `Code Quality`, so a PR that touches `pyproject.toml` shows those names more than once.

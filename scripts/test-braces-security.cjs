@@ -122,6 +122,54 @@ function registerTests(project) {
     });
   }
 
+  test('expand bounds cyclic AST parent links', () => {
+    for (const length of [1, 2]) {
+      const parents = Array.from({length}, () => ({
+        type: 'paren',
+        nodes: [],
+      }));
+      for (let i = 0; i < length; i++) {
+        parents[i].parent = parents[(i + 1) % length];
+      }
+      parents[0].nodes.push({type: 'text', value: 'x'});
+      for (const ast of [parents[0], {type: 'root', nodes: [parents[0]]}]) {
+        assert.throws(() => bounded(() => braces.expand(ast)), {
+          name: 'RangeError',
+          message: /AST parent depth .* exceeds max depth/,
+        });
+      }
+    }
+  });
+
+  test('expand bounds acyclic AST parent chains', () => {
+    function expandWithParents(depth, options) {
+      const ast = {
+        type: 'paren',
+        nodes: [{type: 'text', value: 'x'}],
+      };
+      let parent = ast;
+      for (let i = 1; i < depth; i++) {
+        parent.parent = {type: 'paren'};
+        parent = parent.parent;
+      }
+      parent.parent = {type: 'root', queue: []};
+      return bounded(() => braces.expand(ast, options));
+    }
+
+    assert.deepEqual(expandWithParents(maxDepth), ['x']);
+    assert.deepEqual(expandWithParents(1, {maxDepth: 1.5}), ['x']);
+    assert.throws(() => expandWithParents(2, {maxDepth: 1.5}), {
+      name: 'RangeError',
+      message: /AST parent depth .* exceeds max depth/,
+    });
+    for (const limit of [undefined, 1000, Infinity, NaN]) {
+      assert.throws(() => expandWithParents(maxDepth + 1, {maxDepth: limit}), {
+        name: 'RangeError',
+        message: /AST parent depth .* exceeds max depth/,
+      });
+    }
+  });
+
   test('ordinary nested sets, ranges, escapes, and glob matching retain their behavior', () => {
     assert.equal(braces.compile('lib/{api,cli}'), 'lib/(api|cli)');
     assert.deepEqual(braces.expand('file-{01..03}.{js,ts}'), [

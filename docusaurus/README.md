@@ -39,7 +39,8 @@ Two transitive dependencies have explicit security overrides:
   It does not consume the fork's unrelated, unreleased parser changes:
   quoted and escaped patterns retain the published package's behavior.
   It bounds brace and parenthesis nesting to 100, honors lower `maxDepth`
-  values, and applies the same recursion bound to caller-supplied ASTs.
+  values, and applies the same bound to recursion and parent-link traversal in
+  caller-supplied ASTs, rejecting cyclic ancestor chains during expansion.
   The override applies to both `chokidar` and `micromatch`.
   There is no official patched release yet. The package version remains
   `3.0.3`, so version-based scanners, including `npm audit`, still report

@@ -81,7 +81,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and weekly, including development dependencies and unfixed advisories. Block
   every HIGH/CRITICAL finding and scan error, and publish complete inventory and
   finding summaries. Extend the shared `braces` mitigation to the web UI and MCP
-  Apps toolchains; passing mitigation checks do not exempt the open advisory.
+  Apps toolchains and bound AST parent-link traversal as well as recursion;
+  passing mitigation checks do not exempt the open advisory. Keep the
+  contributor skill's gate map and packaged mirror aligned with the new job.
 - A deferred initial-message redelivery could be confirmed by a repaint of the
   provider's startup completion box. `StatusMonitor.notify_input_sent` cleared
   the "IDLE reached from COMPLETED" marker on every arm, so the flap guard from

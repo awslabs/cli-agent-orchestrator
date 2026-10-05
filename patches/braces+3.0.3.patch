@@ -49,7 +49,7 @@ index 2bb3b88..c237099 100644
  
    // Digits
 diff --git a/node_modules/braces/lib/expand.js b/node_modules/braces/lib/expand.js
-index 35b2c41..dde20c5 100644
+index 35b2c41..2c3f05e 100644
 --- a/node_modules/braces/lib/expand.js
 +++ b/node_modules/braces/lib/expand.js
 @@ -3,6 +3,7 @@
@@ -60,7 +60,7 @@ index 35b2c41..dde20c5 100644
  
  const append = (queue = '', stash = '', enclose = false) => {
    const result = [];
-@@ -32,8 +33,12 @@ const append = (queue = '', stash = '', enclose = false) => {
+@@ -32,14 +33,22 @@ const append = (queue = '', stash = '', enclose = false) => {
  
  const expand = (ast, options = {}) => {
    const rangeLimit = options.rangeLimit === undefined ? 1000 : options.rangeLimit;
@@ -74,7 +74,30 @@ index 35b2c41..dde20c5 100644
      node.queue = [];
  
      let p = parent;
-@@ -100,14 +105,14 @@ const expand = (ast, options = {}) => {
+     let q = parent.queue;
++    let parentDepth = 0;
+ 
+     while (p.type !== 'brace' && p.type !== 'root' && p.parent) {
++      if (++parentDepth > maxDepth) {
++        throw new RangeError(`AST parent depth (${parentDepth}), exceeds max depth (${maxDepth})`);
++      }
+       p = p.parent;
+       q = p.queue;
+     }
+@@ -74,8 +83,12 @@ const expand = (ast, options = {}) => {
+     const enclose = utils.encloseBrace(node);
+     let queue = node.queue;
+     let block = node;
++    parentDepth = 0;
+ 
+     while (block.type !== 'brace' && block.type !== 'root' && block.parent) {
++      if (++parentDepth > maxDepth) {
++        throw new RangeError(`AST parent depth (${parentDepth}), exceeds max depth (${maxDepth})`);
++      }
+       block = block.parent;
+       queue = block.queue;
+     }
+@@ -100,14 +113,14 @@ const expand = (ast, options = {}) => {
        }
  
        if (child.nodes) {
