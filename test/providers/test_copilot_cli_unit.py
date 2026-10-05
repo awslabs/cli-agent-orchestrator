@@ -756,12 +756,15 @@ class TestCopilotCliProviderStatusDetection:
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         assert provider.get_status(output) == TerminalStatus.COMPLETED
 
+    @pytest.mark.parametrize(
+        "busy_row", ["∙ Thinking (Esc to cancel)", "⠋ Working · esc interrupt · enqueue"]
+    )
+    @pytest.mark.parametrize("reply", ["", "● Partial reply\n"])
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
-    def test_get_status_processing_with_spinner_and_v1091_footer(self, mock_tmux):
-        """Spinner line present alongside v1.0.91 footer → still PROCESSING."""
+    def test_get_status_processing_with_spinner_and_v1091_footer(self, mock_tmux, busy_row, reply):
         output = (
             "❯ refactor utils.py\n"
-            "∙ Thinking (Esc to cancel)\n"
+            f"{reply}{busy_row}\n"
             "\n"
             "❯\n"
             "\n"
@@ -769,7 +772,15 @@ class TestCopilotCliProviderStatusDetection:
             "data_analyst · GitHub Copilot • GPT-5.6 Terra\n"
         )
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        mock_tmux.return_value.get_native_status.return_value = None
         assert provider.get_status(output) == TerminalStatus.PROCESSING
+        assert provider.probe_stale_processing_capture(output) == TerminalStatus.PROCESSING
+        assert provider.commit_stale_processing_capture(output, TerminalStatus.COMPLETED) is False
+        if reply:
+            assert provider.extract_last_message_from_script(output) == reply.strip()
+        else:
+            with pytest.raises(ValueError, match="No provider response content found"):
+                provider.extract_last_message_from_script(output)
 
 
 class TestCopilotCliProviderMessageExtraction:

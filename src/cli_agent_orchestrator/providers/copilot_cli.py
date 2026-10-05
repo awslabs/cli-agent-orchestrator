@@ -87,7 +87,7 @@ COPILOT_AGENT_MODEL_BAR_PATTERN = r"^(?:[\w.-]+\s*[·•]\s*)?github copilot\s*[
 COPILOT_BUSY_ROW_PATTERN = r"\besc (?:to cancel|interrupt)\b"
 COPILOT_COLUMN_GAP_PATTERN = r"\S\s{3,}\S"
 COPILOT_MODEL_VERSION_PATTERN = r"\d"
-PROCESSING_LINE_PATTERN = r"^(?:[●◐◑◒◓◉◎∙]\s*)?.*\besc to cancel\b.*$"
+PROCESSING_LINE_PATTERN = r"^(?:[●◐◑◒◓◉◎∙]\s*)?.*\besc (?:to cancel|interrupt)\b.*$"
 
 
 class CopilotCliProvider(BaseProvider):
