@@ -77,6 +77,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A deferred initial-message redelivery could be confirmed by a repaint of the
+  provider's startup completion box. `StatusMonitor.notify_input_sent` cleared
+  the "IDLE reached from COMPLETED" marker on every arm, so the flap guard from
+  #566 covered only the first attempt: after one swallowed Enter the full re-send
+  armed again, the old COMPLETED was re-stamped past the redelivery boundary,
+  and a task that never ran read as delivered. The marker now survives the arm
+  (it is cleared by any stamped transition instead), so the repaint is refused
+  on every attempt; the narrow pre-dispatch-eviction case this leaves
+  indistinguishable fails toward one resubmission rather than a false
+  confirmation (#566 follow-up)
+
 - **`cao launch` could drop the initial task, or tear down a worker that had
   already done it.** The initial message is now delivered by the server as
   part of `POST /sessions` instead of a second request that raced provider
