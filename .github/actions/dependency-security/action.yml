@@ -9,6 +9,7 @@ runs:
         version: v0.70.0
 
     - name: Audit all locked dependencies
+      if: ${{ !cancelled() }}
       shell: bash
       run: python3 scripts/dependency_security.py --output-dir "$RUNNER_TEMP/dependency-security"
 

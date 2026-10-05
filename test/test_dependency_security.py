@@ -334,7 +334,7 @@ def test_ci_and_scheduled_dependency_gates_are_identical_and_unconditional():
     assert "pull_request_target" not in ci.get("on", ci.get(True))
 
 
-def test_reports_and_mitigation_checks_are_not_skipped_when_the_audit_fails():
+def test_audit_reports_and_mitigations_are_not_skipped_after_scanner_setup_failure():
     action = yaml.safe_load(
         (ROOT / ".github" / "actions" / "dependency-security" / "action.yml").read_text()
     )
@@ -343,7 +343,7 @@ def test_reports_and_mitigation_checks_are_not_skipped_when_the_audit_fails():
         i for i, step in enumerate(steps) if "dependency_security.py" in step.get("run", "")
     )
     assert all("continue-on-error" not in step for step in steps)
-    assert all(step.get("if") == "${{ !cancelled() }}" for step in steps[scan_index + 1 :])
+    assert all(step.get("if") == "${{ !cancelled() }}" for step in steps[scan_index:])
     upload = next(
         step for step in steps if step.get("uses", "").startswith("actions/upload-artifact@")
     )

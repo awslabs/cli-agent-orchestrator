@@ -88,7 +88,7 @@ Cargo is scanned from `Cargo.lock` alone: Trivy
 Keeping that manifest out of the scan snapshot includes every locked crate,
 without modifying either repository file.
 
-Every run publishes an Actions summary and a `dependency-security-<attempt>`
+Each executed audit publishes an Actions summary and a `dependency-security-<attempt>`
 artifact, keeping rerun evidence separate, with scan time and CI revision.
 Completed scans (passed or blocked) include per-lockfile package names/versions and counts,
 input SHA-256 hashes, and every finding's advisory,
@@ -99,6 +99,10 @@ errors, `input_sha256` retains hashes of successfully snapshotted inputs; it may
 be partial or empty if input preparation failed. Scanner-derived `inventory`,
 `findings`, and `blocking` are explicitly `null`, not an empty/clean result.
 The summary identifies these fields as unavailable and reports no security verdict.
+The audit and upload run after scanner installation failures unless cancelled,
+so a missing scanner still produces an error report. Cancellation or a
+runner, checkout, or storage failure can prevent publication; it does not
+produce a passing check or override an earlier failed step.
 
 Require the **`Dependency Security`** GitHub Actions status in the `main`
 ruleset, with strict/up-to-date checks, alongside the existing CodeQL checks.
