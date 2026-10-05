@@ -1,5 +1,6 @@
 """Full-graph vulnerability policy, coverage and error-boundary regressions."""
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -198,13 +199,68 @@ def test_scanner_errors_replace_old_success_and_clean_up(repository, tmp_path, m
     assert audit.main(["--output-dir", str(output)]) == 2
     report = json.loads((output / "report.json").read_text())
     assert report["status"] == "error"
+    assert report["input_sha256"] == {
+        path.as_posix(): hashlib.sha256((repository / path).read_bytes()).hexdigest()
+        for path in audit.tracked_inputs(repository)
+    }
+    assert report["inventory"] is None
+    assert report["findings"] is None
+    assert report["blocking"] is None
     assert "No clean security verdict" in (output / "summary.md").read_text()
+    assert "unavailable" in (output / "summary.md").read_text()
     assert not Path(calls[0][-1]).exists()
 
 
-def test_invalid_scanner_json_fails(repository, tmp_path, monkeypatch):
-    scanner(monkeypatch, report="not JSON")
-    assert audit.main(["--output-dir", str(tmp_path / "reports")]) == 2
+@pytest.mark.parametrize("data", ["not JSON", {"SchemaVersion": 2, "Results": []}])
+def test_invalid_scanner_reports_preserve_provenance(repository, tmp_path, monkeypatch, data):
+    scanner(monkeypatch, report=data)
+    output = tmp_path / "reports"
+    assert audit.main(["--output-dir", str(output)]) == 2
+    report = json.loads((output / "report.json").read_text())
+    assert report["input_sha256"] == {
+        path.as_posix(): hashlib.sha256((repository / path).read_bytes()).hexdigest()
+        for path in audit.tracked_inputs(repository)
+    }
+    assert report["inventory"] is None
+    assert report["findings"] is None
+    assert report["blocking"] is None
+
+
+def test_input_copy_failure_retains_only_copied_hashes(repository, tmp_path, monkeypatch):
+    copy = audit.shutil.copyfile
+
+    def fail_manifest_copy(source, destination):
+        if source.name == "package.json":
+            raise OSError("Cannot copy manifest")
+        return copy(source, destination)
+
+    monkeypatch.setattr(audit.shutil, "copyfile", fail_manifest_copy)
+    calls = scanner(monkeypatch)
+    output = tmp_path / "reports"
+    assert audit.main(["--output-dir", str(output)]) == 2
+    report = json.loads((output / "report.json").read_text())
+    assert report["input_sha256"] == {
+        "package-lock.json": hashlib.sha256(
+            (repository / "package-lock.json").read_bytes()
+        ).hexdigest()
+    }
+    assert report["inventory"] is None
+    assert report["findings"] is None
+    assert report["blocking"] is None
+    assert not calls
+
+
+def test_input_discovery_failure_does_not_invent_inventory(repository, tmp_path, monkeypatch):
+    subprocess.run(["git", "rm", "--cached", "package-lock.json"], cwd=repository, check=True)
+    calls = scanner(monkeypatch)
+    output = tmp_path / "reports"
+    assert audit.main(["--output-dir", str(output)]) == 2
+    report = json.loads((output / "report.json").read_text())
+    assert report["input_sha256"] == {}
+    assert report["inventory"] is None
+    assert report["findings"] is None
+    assert report["blocking"] is None
+    assert not calls
 
 
 def test_inherited_scanner_filters_cannot_hide_findings(repository, tmp_path, monkeypatch):

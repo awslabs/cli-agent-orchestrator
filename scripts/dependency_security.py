@@ -134,7 +134,13 @@ def render_summary(report: dict) -> str:
     if report.get("revision"):
         lines += [f"Revision: {cell(report['revision'])}", ""]
     if report["status"] == "error":
-        lines += [cell(report["error"]), "", "No clean security verdict is available."]
+        lines += [
+            cell(report["error"]),
+            "",
+            "No clean security verdict is available.",
+            "Package inventory, findings, and blocking count are unavailable.",
+            f"Known input hashes retained: **{len(report['input_sha256'])}** (may be partial).",
+        ]
     else:
         lines += [
             "Full locked graphs, including development and unfixed dependencies.",
@@ -174,60 +180,72 @@ def render_summary(report: dict) -> str:
 
 
 def scan(root: Path) -> dict:
-    inputs = tracked_inputs(root)
-    expected = {path.as_posix(): LOCKFILES[path.name] for path in inputs if path.name in LOCKFILES}
-    with tempfile.TemporaryDirectory(prefix="cao-dependency-scan-") as temporary:
-        work = Path(temporary)
-        source = work / "source"
-        hashes = {}
-        for path in inputs:
-            destination = source / path
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(root / path, destination)
-            hashes[path.as_posix()] = hashlib.sha256(destination.read_bytes()).hexdigest()
-        output = work / "trivy.json"
-        config = work / "trivy.yaml"
-        config.write_text("{}\n", encoding="utf-8")
-        environment = {
-            key: value
-            for key, value in os.environ.items()
-            if not key.startswith("TRIVY_") or key == "TRIVY_CACHE_DIR"
+    hashes = {}
+    try:
+        inputs = tracked_inputs(root)
+        expected = {
+            path.as_posix(): LOCKFILES[path.name] for path in inputs if path.name in LOCKFILES
         }
-        subprocess.run(
-            [
-                "trivy",
-                "--config",
-                str(config),
-                "fs",
-                "--scanners",
-                "vuln",
-                "--include-dev-deps",
-                "--ignore-unfixed=false",
-                "--ignore-status",
-                "",
-                "--ignorefile",
-                os.devnull,
-                "--severity",
-                ",".join(sorted(SEVERITIES)),
-                "--skip-db-update=false",
-                "--list-all-pkgs",
-                "--format",
-                "json",
-                "--output",
-                str(output),
-                "--exit-code",
-                "0",
-                "--timeout",
-                "5m",
-                str(source),
-            ],
-            check=True,
-            timeout=330,
-            env=environment,
-        )
-        inventory, findings = normalize_report(
-            json.loads(output.read_text(encoding="utf-8")), expected
-        )
+        with tempfile.TemporaryDirectory(prefix="cao-dependency-scan-") as temporary:
+            work = Path(temporary)
+            source = work / "source"
+            for path in inputs:
+                destination = source / path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(root / path, destination)
+                hashes[path.as_posix()] = hashlib.sha256(destination.read_bytes()).hexdigest()
+            output = work / "trivy.json"
+            config = work / "trivy.yaml"
+            config.write_text("{}\n", encoding="utf-8")
+            environment = {
+                key: value
+                for key, value in os.environ.items()
+                if not key.startswith("TRIVY_") or key == "TRIVY_CACHE_DIR"
+            }
+            subprocess.run(
+                [
+                    "trivy",
+                    "--config",
+                    str(config),
+                    "fs",
+                    "--scanners",
+                    "vuln",
+                    "--include-dev-deps",
+                    "--ignore-unfixed=false",
+                    "--ignore-status",
+                    "",
+                    "--ignorefile",
+                    os.devnull,
+                    "--severity",
+                    ",".join(sorted(SEVERITIES)),
+                    "--skip-db-update=false",
+                    "--list-all-pkgs",
+                    "--format",
+                    "json",
+                    "--output",
+                    str(output),
+                    "--exit-code",
+                    "0",
+                    "--timeout",
+                    "5m",
+                    str(source),
+                ],
+                check=True,
+                timeout=330,
+                env=environment,
+            )
+            inventory, findings = normalize_report(
+                json.loads(output.read_text(encoding="utf-8")), expected
+            )
+    except (OSError, ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        return {
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+            "input_sha256": hashes,
+            "inventory": None,
+            "findings": None,
+            "blocking": None,
+        }
     blocking = sum(finding["severity"] in BLOCKING for finding in findings)
     return {
         "status": "blocked" if blocking else "passed",
@@ -243,12 +261,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", type=Path, default=Path("dependency-security-results"))
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parents[1]
-    try:
-        report = scan(root)
-        code = 1 if report["blocking"] else 0
-    except (OSError, ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        report = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
-        code = 2
+    report = scan(root)
+    code = 2 if report["status"] == "error" else int(bool(report["blocking"]))
     report["scanned_at"] = datetime.now(timezone.utc).isoformat()
     report["revision"] = os.environ.get("GITHUB_SHA")
     summary = render_summary(report)

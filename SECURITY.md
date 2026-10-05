@@ -89,13 +89,16 @@ Keeping that manifest out of the scan snapshot includes every locked crate,
 without modifying either repository file.
 
 Every run publishes an Actions summary and a `dependency-security-<attempt>`
-artifact, keeping rerun evidence separate:
-scan time and CI revision, per-lockfile package names/versions and counts,
+artifact, keeping rerun evidence separate, with scan time and CI revision.
+Completed scans (passed or blocked) include per-lockfile package names/versions and counts,
 input SHA-256 hashes, and every finding's advisory,
 severity, package/version, affected lockfile, and fixed-version availability.
 Only these fields are retained, not raw scanner descriptions or source content.
-Reports are published even when the gate fails. Scanner errors are identified
-separately from vulnerability findings.
+Reports are published even when the gate fails. On input, scanner, or report-validation
+errors, `input_sha256` retains hashes of successfully snapshotted inputs; it may
+be partial or empty if input preparation failed. Scanner-derived `inventory`,
+`findings`, and `blocking` are explicitly `null`, not an empty/clean result.
+The summary identifies these fields as unavailable and reports no security verdict.
 
 Require the **`Dependency Security`** GitHub Actions status in the `main`
 ruleset, with strict/up-to-date checks, alongside the existing CodeQL checks.
