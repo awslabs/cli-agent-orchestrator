@@ -77,6 +77,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `copilot_cli` launches no longer time out after 60 seconds on Copilot CLI
+  1.0.91 (#870). Copilot repaints only changed cells in its full-screen view,
+  so the raw output stream never shows a settled idle prompt; the provider now
+  opts into the stale-processing capture check so a quiet terminal is
+  re-checked against the rendered pane, and recognises the footer rows 1.0.91
+  draws below its prompt. When initialization does time out, the server log
+  names the first unrecognised row below the prompt.
+
 - A deferred initial-message redelivery could be confirmed by a repaint of the
   provider's startup completion box. `StatusMonitor.notify_input_sent` cleared
   the "IDLE reached from COMPLETED" marker on every arm, so the flap guard from
@@ -1547,4 +1555,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump to v0.51.0, update method name (#31)
 
 - accept optional U+03BB (λ) after % in kiro and q CLIs (#44)
-
