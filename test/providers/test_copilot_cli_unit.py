@@ -908,6 +908,27 @@ class TestCopilotCliProviderMisc:
         assert provider.probe_stale_processing_capture(output) == TerminalStatus.IDLE
         assert provider.commit_stale_processing_capture(output, TerminalStatus.IDLE) is True
 
+    @pytest.mark.parametrize("snapshot", ["", " \n  \n", "\x1b[2J\x1b[H\n"])
+    def test_blank_stale_capture_never_reads_history(self, snapshot):
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        old_ready_transcript = (
+            "❯ previous task\n● Previous reply\n❯\n"
+            "← open sidebar · Autopilot · / commands · tab next tab\n"
+        )
+        with (
+            patch.object(provider, "_history", return_value=old_ready_transcript) as history,
+            patch.object(provider, "_resolve_native_status", return_value=None),
+        ):
+            # Repeated blank snapshots must not confirm a ready state from scrollback.
+            assert provider.probe_stale_processing_capture(snapshot) == TerminalStatus.UNKNOWN
+            assert provider.probe_stale_processing_capture(snapshot) == TerminalStatus.UNKNOWN
+            assert provider.commit_stale_processing_capture(snapshot, TerminalStatus.IDLE) is False
+            assert (
+                provider.commit_stale_processing_capture(snapshot, TerminalStatus.COMPLETED)
+                is False
+            )
+            history.assert_not_called()
+
     def test_extract_last_message_keeps_sole_reply_resembling_agent_model_bar(self):
         output = (
             "❯ who are you\n"

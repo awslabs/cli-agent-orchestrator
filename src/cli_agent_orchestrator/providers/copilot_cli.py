@@ -701,6 +701,10 @@ class CopilotCliProvider(BaseProvider):
         return TerminalStatus.COMPLETED
 
     def probe_stale_processing_capture(self, output: str) -> TerminalStatus:
+        # A blank viewport during repaint is not evidence from scrollback.
+        # get_status's raw-stream fallback must not run for supplied snapshots.
+        if not self._clean(output).strip():
+            return TerminalStatus.UNKNOWN
         return self.get_status(output)
 
     def commit_stale_processing_capture(self, output: str, expected: TerminalStatus) -> bool:
