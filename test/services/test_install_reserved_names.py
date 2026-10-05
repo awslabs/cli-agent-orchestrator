@@ -40,10 +40,9 @@ def paths(tmp_path, monkeypatch):
     monkeypatch.setattr(skill_injection, "build_skill_catalog", lambda: "")
     seam = Mock(side_effect=AssertionError("environment file seam reached"))
     monkeypatch.setattr(env, "load_env_vars", seam)
-    monkeypatch.setattr(install_service, "load_env_vars", seam)
+    monkeypatch.setattr(install_service, "load_env_vars", Mock(return_value={}))
     monkeypatch.setattr(install_service, "set_env_var", seam)
     resolver = Mock(side_effect=lambda content: content)
-    monkeypatch.setattr(install_service, "resolve_env_vars", resolver)
     monkeypatch.setattr(agent_profiles, "resolve_env_vars", resolver)
     yield paths, seam, resolver
     seam.assert_not_called()
@@ -103,6 +102,7 @@ def test_install_namespace(surface, provider, reserved, paths, tmp_path, monkeyp
         assert f"Reserved ephemeral profile name: {name}" in message
         guard.assert_not_called()
         resolver.assert_not_called()
+        install_service.load_env_vars.assert_not_called()
         assert {p.name: p.read_bytes() for p in stores["store"].iterdir()} == before
         for key in ("context", "kiro", "copilot", "opencode"):
             assert list(stores[key].iterdir()) == []
@@ -127,6 +127,7 @@ def test_reserved_frontmatter_cannot_write_provider_artifacts(
     )
     assert not success
     assert f"Reserved ephemeral profile name: {RESERVED}" in message
+    install_service.load_env_vars.assert_not_called()
     assert all(list(path.iterdir()) == [] for path in stores.values())
 
 
@@ -203,6 +204,7 @@ def test_reserved_install_never_resolves_or_persists_supplied_env(
     guard.assert_not_called()
     seam.assert_not_called()
     resolver.assert_not_called()
+    install_service.load_env_vars.assert_not_called()
     assert all(list(path.iterdir()) == [] for path in stores.values())
 
 
@@ -221,9 +223,8 @@ def test_copilot_refresh_refuses_reserved_filename_with_ordinary_profile(paths):
 def test_variable_built_reserved_name_is_refused_after_resolution(has_env, paths, monkeypatch):
     stores, seam, resolver = paths
     content = document("${ALIAS}")
-    loader = Mock(return_value={})
+    loader = Mock(return_value={"ALIAS": "ordinary" if has_env else RESERVED})
     monkeypatch.setattr(install_service, "load_env_vars", loader)
-    resolver.side_effect = lambda text: text.replace("${ALIAS}", RESERVED)
     guard = Mock(wraps=install_service._guard_installed_copy_ownership)
     monkeypatch.setattr(install_service, "_guard_installed_copy_ownership", guard)
     result = install_service.install_agent(
@@ -236,12 +237,8 @@ def test_variable_built_reserved_name_is_refused_after_resolution(has_env, paths
     assert result.message == f"Reserved ephemeral profile name: {RESERVED}"
     guard.assert_not_called()
     seam.assert_not_called()
-    if has_env:
-        loader.assert_called_once()
-        resolver.assert_not_called()
-    else:
-        loader.assert_not_called()
-        resolver.assert_called_once_with(content)
+    loader.assert_called_once()
+    resolver.assert_not_called()
     assert all(list(path.iterdir()) == [] for path in stores.values())
 
 

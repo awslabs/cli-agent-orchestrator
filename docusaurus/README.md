@@ -22,6 +22,44 @@ npm run build
 
 This generates static content into the `build` directory.
 
+## Dependency security
+
+Use `npm ci` to install the committed dependency graph and apply its local
+security patch. Do not disable install scripts: `postinstall` runs
+`patch-package --error-on-fail`. `npm run build` runs
+`npm run test:dependencies` before assembling the courses and site; the same
+checks can be run independently while updating dependencies.
+
+Two transitive dependencies have explicit security overrides:
+
+- **`braces`** stays on the published `3.0.3` package and applies
+  `patches/braces+3.0.3.patch`. The patch uses the nesting guards proposed in
+  [micromatch/braces#72](https://github.com/micromatch/braces/pull/72).
+  It does not consume the fork's unrelated, unreleased parser changes:
+  quoted and escaped patterns retain the published package's behavior.
+  It bounds brace and parenthesis nesting to 100, honors lower `maxDepth`
+  values, and applies the same recursion bound to caller-supplied ASTs.
+  The override applies to both `chokidar` and `micromatch`.
+  There is no official patched release yet. The package version remains
+  `3.0.3`, so version-based scanners, including `npm audit`, still report
+  [GHSA-vfj7-8cjw-p6xm](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm).
+  `npm audit` also flags affected parent packages and exits nonzero; the local
+  mitigation does not close the version-based alert.
+  Replace the local patch and version override with an official fixed release
+  once one is available and the dependency checks and site build pass.
+- **`http-cache-semantics`** requires `^4.3.0`, outside the affected range
+  currently recorded for
+  [GHSA-ch52-4w7c-c8xp](https://github.com/advisories/GHSA-ch52-4w7c-c8xp).
+  The advisory's `max-stale` interpretation is
+  [disputed by the maintainer](https://github.com/kornelski/http-cache-semantics/issues/56#issuecomment-5975759591);
+  this upgrade does not claim to change that behavior. Checks preserve
+  non-storage of private/no-store responses and permitted reuse of stale
+  public responses, and cover the release's stricter wildcard `Vary` handling.
+
+These dependencies belong to the documentation build/development toolchain;
+GitHub Pages serves the resulting static site. No alert suppression or
+scanner-policy change is used.
+
 ## Adding Documentation
 
 1. Add markdown files to `docs/` following the existing directory structure

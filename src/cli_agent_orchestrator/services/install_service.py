@@ -48,7 +48,7 @@ from cli_agent_orchestrator.utils.agent_profiles import (
     _read_agent_profile_source,
     parse_agent_profile_text,
 )
-from cli_agent_orchestrator.utils.env import load_env_vars, resolve_env_vars, set_env_var
+from cli_agent_orchestrator.utils.env import load_env_vars, set_env_var
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.opencode_config import (
     OpenCodeAgentIdCollisionError,
@@ -440,6 +440,175 @@ def _yaml_single_quoted(value: str) -> str:
 
 def _context_marker_line(source_name: str, newline: str) -> str:
     return f"{_CONTEXT_SOURCE_STEM_KEY}: {_yaml_single_quoted(source_name)}{newline}"
+
+
+def _provider_frontmatter_block(lines: List[str]) -> Optional[Tuple[int, int]]:
+    """Locate metadata as python-frontmatter does, without closing on scalar text.
+
+    Only column-zero dash lines close a block (YAMLHandler.FM_BOUNDARY).
+    A BOM is not metadata to that parser; leave it in the original body.
+    This intentionally does not change the context writer's boundary helper.
+    """
+    opening: Optional[int] = None
+    for index, line in enumerate(lines):
+        body, _ = _line_body_and_ending(line)
+        if not body.strip():
+            continue
+        if _FRONTMATTER_DELIMITER_RE.fullmatch(body.strip()):
+            opening = index
+        break
+    if opening is not None:
+        for closing in range(opening + 1, len(lines)):
+            body, _ = _line_body_and_ending(lines[closing])
+            if _FRONTMATTER_DELIMITER_RE.fullmatch(body.rstrip()):
+                if _parses_as_yaml_mapping("".join(lines[opening + 1 : closing])):
+                    return opening, closing
+                break
+    return None
+
+
+def _content_with_recorded_provider(raw_content: str, provider: str) -> str:
+    """Record a provider while retaining the source's placeholders and formatting.
+
+    Flow collections cannot parse unquoted ${VARS}. Mask template references
+    with equally wide plain scalars for locating YAML nodes, never persisting
+    this view or resolving secrets. Node offsets still address the raw source.
+    """
+    masked = Template.pattern.sub(
+        lambda match: (
+            "x" * len(match.group(0))
+            if match.group("named") or match.group("braced")
+            else match.group(0)
+        ),
+        raw_content,
+    )
+    lines = raw_content.splitlines(keepends=True)
+    masked_lines = masked.splitlines(keepends=True)
+    block = _provider_frontmatter_block(masked_lines)
+    newline = _first_newline(raw_content)
+    entry = f"provider: {provider}"
+    if block is None:
+        return f"---{newline}{entry}{newline}---{newline}{raw_content}"
+
+    opening_idx, closing_idx = block
+    offset = sum(len(line) for line in lines[: opening_idx + 1])
+    metadata = "".join(masked_lines[opening_idx + 1 : closing_idx])
+    mapping = yaml.compose(metadata, Loader=yaml.SafeLoader)
+    replacements = []
+    anchored_provider = False
+    if isinstance(mapping, yaml.MappingNode):
+        tokens = list(yaml.scan(metadata, Loader=yaml.SafeLoader))
+        for index, (key, _) in enumerate(mapping.value):
+            if not isinstance(key, yaml.ScalarNode) or key.value != "provider":
+                continue
+            limit = (
+                mapping.value[index + 1][0].start_mark.index
+                if index + 1 < len(mapping.value)
+                else mapping.end_mark.index
+            )
+            value_tokens = [
+                token for token in tokens if key.end_mark.index <= token.start_mark.index < limit
+            ]
+            if any(isinstance(token, yaml.tokens.AnchorToken) for token in value_tokens):
+                # Keep anchor definitions and their aliases unchanged. A final
+                # provider entry wins under the same last-key-wins YAML loader
+                # used for the profile, including existing duplicate keys.
+                anchored_provider = True
+                continue
+            scalar = next(
+                (
+                    token
+                    for token in value_tokens
+                    if isinstance(token, (yaml.tokens.ScalarToken, yaml.tokens.AliasToken))
+                ),
+                None,
+            )
+            if scalar is None:
+                # A null value has no scalar token; insert just after its colon,
+                # not at the node mark (which can be on the following line).
+                colon = next(
+                    (token for token in value_tokens if isinstance(token, yaml.tokens.ValueToken)),
+                    None,
+                )
+                if colon is None:
+                    # YAML permits colonless keys with null values. Let the
+                    # verified raw serializer handle those instead of guessing.
+                    raise ValueError("Provider key has no value separator")
+                start = end = colon.end_mark.index
+                replacement = " " + provider
+            else:
+                start, end = scalar.start_mark.index, scalar.end_mark.index
+                suffix = metadata[start:end][len(metadata[start:end].rstrip()) :]
+                replacement = provider + suffix
+            tag = next(
+                (token for token in value_tokens if isinstance(token, yaml.tokens.TagToken)), None
+            )
+            if tag is not None:
+                start = tag.start_mark.index
+                if scalar is None:
+                    end = tag.end_mark.index
+                replacement = provider + (suffix if scalar is not None else "")
+            replacements.append((offset + start, offset + end, replacement))
+    if replacements and not anchored_provider:
+        for start, end, replacement in reversed(replacements):
+            raw_content = raw_content[:start] + replacement + raw_content[end:]
+        return raw_content
+
+    if isinstance(mapping, yaml.MappingNode) and mapping.flow_style:
+        close = offset + mapping.end_mark.index - 1
+        before = raw_content[:close]
+        trail = before.rstrip(" \t\r\n")
+        separator = "" if trail.endswith("{") else " " if trail.endswith(",") else ", "
+        return before + separator + entry + raw_content[close:]
+
+    indent = _frontmatter_block_indent(masked_lines, opening_idx, closing_idx)
+    lines.insert(closing_idx, indent + entry + newline)
+    return "".join(lines)
+
+
+def _verified_provider_record(
+    raw_content: str, resolved_content: str, provider: str, substitutions: Dict[str, str]
+) -> str:
+    """Verify raw-source edits before any persistence, with a safe legacy fallback."""
+    # Parse afresh: plugin delivery can mutate the AgentProfile already in use.
+    try:
+        expected = frontmatter.loads(resolved_content)
+    except yaml.YAMLError:
+        raise ValueError(
+            "Could not safely record the selected provider. "
+            "Check the profile's frontmatter syntax and template values."
+        ) from None
+    expected["provider"] = provider
+
+    def matches(candidate: str) -> bool:
+        try:
+            actual = frontmatter.loads(Template(candidate).safe_substitute(substitutions))
+        except (yaml.YAMLError, ValueError):
+            # Resolved YAML exceptions can contain secrets; never surface them.
+            return False
+        return bool(actual.metadata == expected.metadata and actual.content == expected.content)
+
+    try:
+        candidate = _content_with_recorded_provider(raw_content, provider)
+        if matches(candidate):
+            return candidate
+    except (yaml.YAMLError, ValueError):
+        pass
+
+    # Only raw, parseable source is eligible for the old serializer. Resolved
+    # content must never be dumped: it can contain environment secrets.
+    try:
+        legacy = frontmatter.loads(raw_content)
+        legacy["provider"] = provider
+        candidate = str(frontmatter.dumps(legacy))
+        if matches(candidate):
+            return candidate
+    except (yaml.YAMLError, ValueError):
+        pass
+    raise ValueError(
+        "Could not safely record the selected provider. Check the profile's "
+        "frontmatter syntax and template placeholders, then reinstall. No profile was written."
+    )
 
 
 def _context_content_with_provenance(raw_content: str, source_name: str) -> str:
@@ -1589,12 +1758,23 @@ def install_agent(
         # managed .env file only after the ownership guard has accepted the
         # install (below), so a refused install leaves no env side effect
         # behind either (round-7 review of #493).
-        resolved_content = (
-            Template(raw_content).safe_substitute({**load_env_vars(), **env_vars})
-            if env_vars
-            else resolve_env_vars(raw_content)
-        )
-        profile = parse_agent_profile_text(resolved_content, agent_name)
+        substitutions = {**load_env_vars(), **(env_vars or {})}
+        resolved_content = Template(raw_content).safe_substitute(substitutions)
+        try:
+            profile = parse_agent_profile_text(resolved_content, agent_name)
+        except yaml.YAMLError as exc:
+            # Report numeric coordinates only; the exception/mark text can
+            # include a resolved secret or a source snippet.
+            mark = getattr(exc, "problem_mark", None)
+            line = getattr(mark, "line", None)
+            column = getattr(mark, "column", None)
+            location = ""
+            if isinstance(line, int) and isinstance(column, int) and line >= 0 and column >= 0:
+                location = f" at line {line + 1}, column {column + 1}"
+            raise ValueError(
+                f"Could not parse profile after environment substitution{location}. "
+                "Check the profile's frontmatter syntax and unresolved template variables."
+            ) from None
         # The source stem and frontmatter name can differ; both reach installed sinks.
         if agent_profiles.routes_to_ephemeral_store(profile.name):
             raise FileNotFoundError(f"Reserved ephemeral profile name: {profile.name}")
@@ -1682,7 +1862,7 @@ def install_agent(
         # The ownership guard runs BEFORE any write this install performs, for
         # every provider. The local-store write just below is the first of
         # them: for an import it is the store copy itself, and for every
-        # install it is the re-serialisation that records the provider. A
+        # install it is the edit that records the provider. A
         # refused install must leave the stored profile byte-identical -- an
         # import used to be stored before this point, so a refused one had
         # already replaced the previous profile of that stem with the rejected
@@ -1695,17 +1875,18 @@ def install_agent(
         # store write, for the same reason; the stamped content is reused below.
         context_content = _preflight_context_file(profile.name, raw_content, agent_name)
 
+        record_provider = profile.provider != provider and not preserve_recorded_provider
+        stored_text = (
+            _verified_provider_record(raw_content, resolved_content, provider, substitutions)
+            if record_provider
+            else raw_content
+        )
+
         if env_vars:
             for key, value in env_vars.items():
                 set_env_var(key, value)
 
-        record_provider = profile.provider != provider and not preserve_recorded_provider
         if incoming is not None or record_provider:
-            stored_text = raw_content
-            if record_provider:
-                stored = frontmatter.loads(raw_content)
-                stored["provider"] = provider
-                stored_text = frontmatter.dumps(stored)
             # overwrite=True keeps the pre-existing re-import behaviour of
             # replacing the stored copy; the guard above is what decides whether
             # this install may proceed at all.
