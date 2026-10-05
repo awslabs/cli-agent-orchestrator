@@ -1312,6 +1312,16 @@ async def lifespan(app: FastAPI):
     # background cleanup can mistake them for ordinary ghosts.
     deferred_init_recovery_task: Optional[asyncio.Task] = None
     recovery_complete = await terminal_service.recover_interrupted_deferred_init_external_owners()
+    # Likewise for the initial message a deferred-init terminal was created with:
+    # a row still ``pending`` belongs to a task the previous process owned, so
+    # settle it as failed/interrupted before any client can wait on it (#566).
+    initial_delivery_recovery_complete = (
+        await terminal_service.recover_interrupted_initial_deliveries()
+    )
+    if not initial_delivery_recovery_complete:
+        logger.warning(
+            "Initial-delivery restart sweep was incomplete; stranded pending rows may remain"
+        )
     if not recovery_complete:
         # A transient SQLite/read failure during startup used to strand the
         # missed rows forever. Retry only until one complete scan succeeds.

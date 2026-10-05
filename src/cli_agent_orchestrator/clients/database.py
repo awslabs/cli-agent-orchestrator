@@ -184,6 +184,12 @@ class TerminalModel(Base):
     # Server-owned durable deferred-init failure. Kept separate from consumer
     # metadata so PATCH /metadata cannot erase or forge lifecycle truth.
     deferred_init_failure_json = Column("deferred_init_failure", Text, nullable=True)
+    # Server-owned durable outcome of the INITIAL message a deferred-init terminal
+    # was created with (PR #566): JSON ``{"state": "pending"|"delivered"|"failed",
+    # "kind": ..., "message": ...}``. Written at creation, settled by the deferred
+    # task, and swept to ``failed``/``interrupted`` on restart so a client that
+    # polls for the outcome is never left waiting on a task that no longer exists.
+    initial_delivery_json = Column("initial_delivery", Text, nullable=True)
     # Creation-time lifecycle ownership for deferred initialization.  True
     # means an external observer (rather than CAO itself) owns final failure
     # settlement, so runtime/lifecycle cleanup may dismantle provider resources
@@ -1927,6 +1933,10 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN deferred_init_failure TEXT")
             conn.commit()
             logger.info("Migration: added deferred_init_failure column to terminals table")
+        if "initial_delivery" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN initial_delivery TEXT")
+            conn.commit()
+            logger.info("Migration: added initial_delivery column to terminals table")
         if "deferred_init_external_owner" not in columns:
             conn.execute(
                 "ALTER TABLE terminals ADD COLUMN deferred_init_external_owner "
@@ -1981,6 +1991,7 @@ def create_terminal(
     new_session_incarnation: bool = False,
     model: Optional[str] = None,
     model_honored: Optional[bool] = None,
+    initial_delivery: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
 
@@ -2037,6 +2048,7 @@ def create_terminal(
             metadata_json=_json.dumps(metadata) if metadata else None,
             deferred_init_external_owner=bool(deferred_init_external_owner),
             session_incarnation_id=session_incarnation_id,
+            initial_delivery_json=_json.dumps(initial_delivery) if initial_delivery else None,
         )
         db.add(terminal)
         if idempotency_key:
@@ -2078,6 +2090,7 @@ def create_terminal(
             "group": group if group else None,
             "metadata": metadata if metadata else None,
             "deferred_init_external_owner": bool(deferred_init_external_owner),
+            "initial_delivery": initial_delivery if initial_delivery else None,
             "deferred_init_runtime_reclaimed": False,
             "session_incarnation_id": session_incarnation_id,
         }
@@ -2169,6 +2182,10 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
         deferred_init_failure = (
             _json.loads(raw_deferred_failure) if isinstance(raw_deferred_failure, str) else None
         )
+        raw_initial_delivery = getattr(terminal, "initial_delivery_json", None)
+        initial_delivery = (
+            _json.loads(raw_initial_delivery) if isinstance(raw_initial_delivery, str) else None
+        )
         return {
             "id": terminal.id,
             "tmux_session": terminal.tmux_session,
@@ -2187,6 +2204,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "group": group,
             "metadata": metadata,
             "deferred_init_failure": deferred_init_failure,
+            "initial_delivery": initial_delivery,
             "deferred_init_external_owner": bool(
                 getattr(terminal, "deferred_init_external_owner", False)
             ),
@@ -2238,6 +2256,63 @@ def update_terminal_deferred_init_failure(
         terminal.deferred_init_failure_json = _json.dumps(failure) if failure else None
         db.commit()
         return True
+
+
+def update_terminal_initial_delivery(
+    terminal_id: str,
+    delivery: Optional[Dict[str, Any]],
+    *,
+    only_if_pending: bool = False,
+) -> bool:
+    """Replace the server-owned initial-delivery outcome for one terminal.
+
+    ``only_if_pending`` makes the write conditional on the row still reading
+    ``pending`` -- a failure recorded after the task was already confirmed
+    delivered must not rewrite history, and a terminal created without an
+    initial message has nothing to settle. Returns False when the row is gone
+    or the condition did not hold.
+    """
+
+    import json as _json
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return False
+        if only_if_pending:
+            raw = getattr(terminal, "initial_delivery_json", None)
+            current = _json.loads(raw) if isinstance(raw, str) else None
+            if not isinstance(current, dict) or current.get("state") != "pending":
+                return False
+        terminal.initial_delivery_json = _json.dumps(delivery) if delivery else None
+        db.commit()
+        return True
+
+
+def list_pending_initial_delivery_terminal_ids() -> List[str]:
+    """Terminals whose initial message was accepted but never settled.
+
+    After a cao-server restart the deferred task that owned the delivery is
+    gone, so these rows can only be settled by the restart sweep.
+    """
+
+    import json as _json
+
+    with SessionLocal() as db:
+        rows = (
+            db.query(TerminalModel.id, TerminalModel.initial_delivery_json)
+            .filter(TerminalModel.initial_delivery_json.isnot(None))
+            .all()
+        )
+    pending: List[str] = []
+    for terminal_id, raw in rows:
+        try:
+            delivery = _json.loads(raw) if isinstance(raw, str) else None
+        except ValueError:
+            continue
+        if isinstance(delivery, dict) and delivery.get("state") == "pending":
+            pending.append(str(terminal_id))
+    return pending
 
 
 def update_terminal_deferred_init_external_owner(terminal_id: str, owned: bool) -> bool:

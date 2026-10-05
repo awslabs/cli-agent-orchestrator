@@ -4,10 +4,11 @@
   "private": true,
   "scripts": {
     "docusaurus": "docusaurus",
+    "postinstall": "patch-package --error-on-fail",
     "build-courses": "bash course-src/build.sh",
     "prestart": "npm run build-courses",
     "start": "docusaurus start",
-    "prebuild": "npm run build-courses",
+    "prebuild": "npm run test:dependencies && npm run build-courses",
     "build": "docusaurus build",
     "swizzle": "docusaurus swizzle",
     "deploy": "docusaurus deploy",
@@ -15,7 +16,8 @@
     "serve": "docusaurus serve",
     "write-translations": "docusaurus write-translations",
     "write-heading-ids": "docusaurus write-heading-ids",
-    "typecheck": "tsc"
+    "typecheck": "tsc",
+    "test:dependencies": "node --test test/dependency-security.test.cjs"
   },
   "dependencies": {
     "@docusaurus/core": "3.10.2",
@@ -23,6 +25,7 @@
     "@docusaurus/preset-classic": "3.10.2",
     "@mdx-js/react": "^3.0.0",
     "clsx": "^2.0.0",
+    "patch-package": "8.0.1",
     "prism-react-renderer": "^2.3.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
@@ -52,6 +55,8 @@
   "overrides": {
     "fast-uri": "^3.1.8",
     "brace-expansion": "^5.0.12",
+    "braces": "3.0.3",
+    "http-cache-semantics": "^4.3.0",
     "image-size": "npm:image-size-safe@2.0.3",
     "js-yaml": "^4.3.2",
     "nanoid": "^3.3.17",
