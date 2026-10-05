@@ -77,6 +77,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A deferred initial-message redelivery could be confirmed by a repaint of the
+  provider's startup completion box. `StatusMonitor.notify_input_sent` cleared
+  the "IDLE reached from COMPLETED" marker on every arm, so the flap guard from
+  #566 covered only the first attempt: after one swallowed Enter the full re-send
+  armed again, the old COMPLETED was re-stamped past the redelivery boundary,
+  and a task that never ran read as delivered. The marker now survives the arm
+  (it is cleared by any stamped transition instead), so the repaint is refused
+  on every attempt; the narrow pre-dispatch-eviction case this leaves
+  indistinguishable fails toward one resubmission rather than a false
+  confirmation (#566 follow-up)
+
+- **`cao launch` could drop the initial task, or tear down a worker that had
+  already done it.** The initial message is now delivered by the server as
+  part of `POST /sessions` instead of a second request that raced provider
+  startup, and the terminal reads as not-yet-completable until that delivery
+  has been made and the worker has produced output for it. Confirmation is
+  causal: `StatusMonitor` stamps every applied status with the output
+  generation it was earned at, and a send is confirmed only by a started
+  status whose own stamp is newer than the dispatch boundary sampled inside
+  the send -- so neither a completion cached from provider startup, nor an
+  unrelated redraw that merely advances the counter afterwards, nor a
+  redelivery's own keystrokes can pass for this task starting, while a worker
+  fast enough to finish before the send returns is confirmed rather than
+  resubmitted to and deleted. Event-inbox backends (herdr), which have no
+  output generation, are judged by a transition from the status read
+  immediately before dispatch instead of being exempt. The outcome of that
+  delivery is now durable: `GET /terminals/{id}` carries `initial_delivery`
+  (`pending` -> `delivered`, or `failed` with a `kind` and `message`,
+  including `waiting_user_answer` when the worker parked on a prompt and
+  `interrupted` when cao-server restarted before confirming), and `cao launch
+  --async` exits 0 only once it reads `delivered`, non-zero with the reason
+  otherwise, instead of reporting success the moment the session row existed.
+  The synchronous headless run waits for that verdict with an allowance
+  derived from the provider's `provider_init_timeout` (profile override
+  honoured) and only then starts the task's own 300s budget, so a slow but
+  valid init no longer eats the task's time (#566)
+
 - Mitigate the documentation toolchain's `braces` nesting-depth vulnerability
   with a local patch that preserves the published parser's behavior, and update
   `http-cache-semantics` to 4.3.0. Document the patch and disputed cache advisory,
