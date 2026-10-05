@@ -21,10 +21,14 @@ on:
       - main
     paths:
       - 'docusaurus/**'
+      - 'patches/**'
+      - 'scripts/test-braces-security.cjs'
       - '.github/workflows/gh-pages.yml'
   pull_request:
     paths:
       - 'docusaurus/**'
+      - 'patches/**'
+      - 'scripts/test-braces-security.cjs'
       - '.github/workflows/gh-pages.yml'
   workflow_dispatch:
 

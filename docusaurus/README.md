@@ -26,14 +26,15 @@ This generates static content into the `build` directory.
 
 Use `npm ci` to install the committed dependency graph and apply its local
 security patch. Do not disable install scripts: `postinstall` runs
-`patch-package --error-on-fail`. `npm run build` runs
+`patch-package --patch-dir ../patches --error-on-fail`. `npm run build` runs
 `npm run test:dependencies` before assembling the courses and site; the same
 checks can be run independently while updating dependencies.
 
 Two transitive dependencies have explicit security overrides:
 
 - **`braces`** stays on the published `3.0.3` package and applies
-  `patches/braces+3.0.3.patch`. The patch uses the nesting guards proposed in
+  [`../patches/braces+3.0.3.patch`](../patches/braces+3.0.3.patch), shared with
+  the web UI and MCP Apps toolchains. The patch uses the nesting guards proposed in
   [micromatch/braces#72](https://github.com/micromatch/braces/pull/72).
   It does not consume the fork's unrelated, unreleased parser changes:
   quoted and escaped patterns retain the published package's behavior.
@@ -44,7 +45,8 @@ Two transitive dependencies have explicit security overrides:
   `3.0.3`, so version-based scanners, including `npm audit`, still report
   [GHSA-vfj7-8cjw-p6xm](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm).
   `npm audit` also flags affected parent packages and exits nonzero; the local
-  mitigation does not close the version-based alert.
+  mitigation does not close the version-based alert or exempt it from the
+  full CI dependency gate.
   Replace the local patch and version override with an official fixed release
   once one is available and the dependency checks and site build pass.
 - **`http-cache-semantics`** requires `^4.3.0`, outside the affected range
@@ -57,8 +59,12 @@ Two transitive dependencies have explicit security overrides:
   public responses, and cover the release's stricter wildcard `Vary` handling.
 
 These dependencies belong to the documentation build/development toolchain;
-GitHub Pages serves the resulting static site. No alert suppression or
-scanner-policy change is used.
+GitHub Pages serves the resulting static site. No alert is suppressed.
+
+The repository's [Dependency Security gate](../SECURITY.md#full-dependency-gate)
+audits the complete locked graphs on every PR/`main` CI run and weekly. It
+reports installed mitigation verification separately from open advisories.
+Changes to the shared patch or brace tests also trigger the docs site build.
 
 ## Adding Documentation
 

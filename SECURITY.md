@@ -55,6 +55,72 @@ Security scans run:
 - On every push to the `main` branch
 - On every pull request targeting `main`
 
+### Full dependency gate
+
+**`Dependency Security` blocks every HIGH/CRITICAL dependency finding in the
+checked-out tree, including unchanged dependencies, development dependencies,
+and advisories with no published fix.** This is separate from the existing
+Trivy `Security Scan` and PR-delta `Dependency Review` checks; neither replaces
+this whole-graph gate. The older scan's lower-severity/secret policy is unchanged.
+
+The job runs inside every CI run on PRs targeting `main` (including forks) and
+pushes to `main`, without path filters. The
+[scheduled workflow](.github/workflows/dependency-security.yml) uses the same
+[action](.github/actions/dependency-security/action.yml) every Monday at 08:00
+UTC and on manual dispatch, so newly published advisories are detected without
+a dependency change. It uses only a read-only built-in token and never
+`pull_request_target` or repository secrets.
+
+[`scripts/dependency_security.py`](scripts/dependency_security.py) discovers
+all tracked `package-lock.json`, `bun.lock`, `uv.lock`, and `Cargo.lock` files.
+It copies those files and required package manifests to a temporary scan
+directory, excluding local installed packages and build output. Trivy scans every locked
+graph with development dependencies and unfixed findings included. The report
+must contain a nonempty inventory for every discovered lockfile; a missing
+graph, malformed report, missing scanner, timeout, or database/network failure
+is an error, not a clean result. Unlocked dependency declarations are not a
+resolved inventory and are outside this lockfile-based check.
+The gate uses controlled scanner configuration rather than repository ignore
+files or inherited Trivy filters; only `TRIVY_CACHE_DIR` is inherited. A database
+update is never disabled by an inherited environment setting.
+Cargo is scanned from `Cargo.lock` alone: Trivy
+[drops development dependencies when `Cargo.toml` is also supplied](https://trivy.dev/docs/latest/coverage/language/rust/).
+Keeping that manifest out of the scan snapshot includes every locked crate,
+without modifying either repository file.
+
+Every run publishes an Actions summary and a `dependency-security-<attempt>`
+artifact, keeping rerun evidence separate:
+scan time and CI revision, per-lockfile package names/versions and counts,
+input SHA-256 hashes, and every finding's advisory,
+severity, package/version, affected lockfile, and fixed-version availability.
+Only these fields are retained, not raw scanner descriptions or source content.
+Reports are published even when the gate fails. Scanner errors are identified
+separately from vulnerability findings.
+
+Require the **`Dependency Security`** GitHub Actions status in the `main`
+ruleset, with strict/up-to-date checks, alongside the existing CodeQL checks.
+A missing, pending, failed, or stale result must not satisfy this requirement.
+Existing PR branches must adopt the workflow before they can produce the new
+required check; adding a requirement does not retroactively run CI.
+
+#### Local dependency mitigations
+
+The docs, web UI, and MCP Apps toolchains all install the same
+[`patches/braces+3.0.3.patch`](patches/braces+3.0.3.patch), using
+`patch-package --patch-dir ../patches --error-on-fail`. Do not disable install
+scripts. The patch bounds parsing and recursive AST traversal while retaining
+the published parser's ordinary quote/escape behavior. Each project exposes
+`npm run test:dependencies`, reusing the same brace-regression suite; the docs
+also retain their cache-policy regressions.
+
+CI performs clean installs and runs those checks even when the advisory gate
+is red, reporting **mitigation verification separately from advisory status**.
+An applied local patch is not an exception to the HIGH/CRITICAL policy.
+`braces` retains its truthful `3.0.3` version: until an unaffected dependency is
+available or the dependency is removed, GHSA-vfj7-8cjw-p6xm remains visible and
+blocking. Do not dismiss it, rename the package to evade detection, or label a
+passing mitigation check as a clean dependency scan.
+
 ### CodeQL Static Analysis
 
 The [CI workflow](.github/workflows/ci.yml) includes four CodeQL jobs that
@@ -113,12 +179,14 @@ and builds; this policy does not limit those jobs to changed lines.
 | Code-scanning merge rule | Required CodeQL analysis and applicable open alerts in the PR diff | Analysis is available and complete, and no applicable alert reaches **High or higher** security severity or the general **Errors** threshold |
 | `main` push and weekly scans | Supported repository code at the default-branch revision, including baseline findings | Analysis completed; existing alerts can remain open |
 
-**The current policy is to prevent qualifying findings in PR changes, not
+**The CodeQL merge policy is to prevent qualifying findings in PR changes, not
 to require zero open alerts across the repository before every PR can merge.**
 Baseline findings remain a separate triage/fix track so they do not
 automatically block unrelated PRs. This is a merge-policy choice, not an
 exclusion of those findings from default-branch scanning. A whole-repository
-alert gate for every PR would be a different policy and is not configured.
+CodeQL alert gate for every PR would be a different policy and is not configured.
+The separate **Dependency Security** gate above does block HIGH/CRITICAL
+dependency findings across the complete locked graphs, including their baseline.
 
 For example, an applicable new High-security finding can leave the analysis
 job green while the code-scanning rule blocks merging. An unchanged baseline
@@ -215,6 +283,19 @@ high-cost step that never substitutes for rotation. See
 [docs/security.md](docs/security.md) for the full operational procedures.
 
 ### Running Security Scans Locally
+
+Run the same full dependency gate as CI with Trivy 0.70.0 and Python 3.10+:
+
+```bash
+scripts/security-scan.sh dependencies
+```
+
+This reads the current contents of tracked manifests/lockfiles; stage new files
+before scanning them. It writes `dependency-security-results/report.json` and
+`summary.md` (gitignored) and exits nonzero for HIGH/CRITICAL findings or scan
+errors. It does not install packages or execute their lifecycle scripts.
+Run each affected project's `npm ci && npm run test:dependencies` separately
+to verify installed mitigations. Neither action substitutes for the other.
 
 You can run Trivy locally to check for vulnerabilities before committing:
 

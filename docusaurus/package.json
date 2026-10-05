@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "docusaurus": "docusaurus",
-    "postinstall": "patch-package --error-on-fail",
+    "postinstall": "patch-package --patch-dir ../patches --error-on-fail",
     "build-courses": "bash course-src/build.sh",
     "prestart": "npm run build-courses",
     "start": "docusaurus start",

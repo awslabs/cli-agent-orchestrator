@@ -1,0 +1,51 @@
+name: Dependency Security
+description: Full dependency inventory, HIGH/CRITICAL gate, and installed mitigation checks
+runs:
+  using: composite
+  steps:
+    - name: Install Trivy
+      uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
+      with:
+        version: v0.70.0
+
+    - name: Audit all locked dependencies
+      shell: bash
+      run: python3 scripts/dependency_security.py --output-dir "$RUNNER_TEMP/dependency-security"
+
+    - name: Publish dependency inventory and findings
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: dependency-security-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/dependency-security/
+        if-no-files-found: error
+
+    - name: Set up Node.js for mitigation checks
+      if: ${{ !cancelled() }}
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: 22
+        cache: npm
+        cache-dependency-path: |
+          docusaurus/package-lock.json
+          web/package-lock.json
+          cao_mcp_apps/package-lock.json
+
+    - name: Verify installed mitigations independently of advisory status
+      if: ${{ !cancelled() }}
+      shell: bash
+      env:
+        HUSKY: "0"
+      run: |
+        result=0
+        printf '\n## Dependency mitigation verification\n\n' >> "$GITHUB_STEP_SUMMARY"
+        for project in docusaurus web cao_mcp_apps; do
+          if npm ci --prefix "$project" --no-audit --no-fund &&
+             npm run test:dependencies --prefix "$project"; then
+            printf -- '- `%s`: mitigation checks passed; advisory status is unchanged.\n' "$project" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf -- '- `%s`: installation or mitigation checks FAILED.\n' "$project" >> "$GITHUB_STEP_SUMMARY"
+            result=1
+          fi
+        done
+        exit "$result"

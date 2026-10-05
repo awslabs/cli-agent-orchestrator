@@ -51,6 +51,17 @@ cd cao_mcp_apps
 npm install
 ```
 
+Install scripts must remain enabled: `postinstall` applies the shared
+[`../patches/braces+3.0.3.patch`](../patches/braces+3.0.3.patch) and fails if it
+cannot apply. This protects the tooling's recursive brace parser.
+`npm run test:dependencies` verifies the installed mitigation and its consumers;
+`npm run build:all` runs it automatically.
+
+The package keeps its truthful `3.0.3` version. Passing mitigation checks do not
+close or exempt its advisory: the repository's
+[Dependency Security gate](../SECURITY.md#full-dependency-gate) includes
+development dependencies and blocks every HIGH/CRITICAL finding.
+
 ## Commands
 
 | Command | Description |
@@ -78,13 +89,16 @@ npm install
 
 ## CI
 
-Two jobs in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) cover this
+Three jobs in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) cover this
 package:
 
 - **CAO MCP Apps** — install → typecheck → unit tests with coverage → `build:all`
   → JIT scan → bundle-size budget → HTTP-only guard → backend coverage →
   **coverage ratchet**.
 - **CAO MCP Apps E2E (Playwright)** — installs Chromium and runs the E2E specs.
+- **Dependency Security** — audits all locked graphs, including development
+  dependencies and unfixed advisories, and independently verifies the installed
+  dependency mitigations.
 
 ### Coverage ratchet
 

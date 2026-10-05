@@ -4,11 +4,14 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "postinstall": "patch-package --patch-dir ../patches --error-on-fail",
     "dev": "vite",
+    "prebuild": "npm run test:dependencies",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:dependencies": "node --test ../scripts/test-braces-security.cjs"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",
@@ -16,6 +19,7 @@
     "graphology": "^0.26.0",
     "graphology-layout": "^0.6.1",
     "lucide-react": "^0.562.0",
+    "patch-package": "8.0.1",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "sigma": "^3.0.3",
@@ -36,6 +40,7 @@
     "vitest": "^4.1.11"
   },
   "overrides": {
+    "braces": "3.0.3",
     "nanoid": "^3.3.17"
   }
 }

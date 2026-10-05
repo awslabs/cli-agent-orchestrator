@@ -77,6 +77,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Audit all tracked npm, Bun, uv, and Cargo dependency graphs in every CI run
+  and weekly, including development dependencies and unfixed advisories. Block
+  every HIGH/CRITICAL finding and scan error, and publish complete inventory and
+  finding summaries. Extend the shared `braces` mitigation to the web UI and MCP
+  Apps toolchains; passing mitigation checks do not exempt the open advisory.
 - A deferred initial-message redelivery could be confirmed by a repaint of the
   provider's startup completion box. `StatusMonitor.notify_input_sent` cleared
   the "IDLE reached from COMPLETED" marker on every arm, so the flap guard from

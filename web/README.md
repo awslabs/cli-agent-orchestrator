@@ -2,6 +2,19 @@
 
 A single-page dashboard for managing CLI Agent Orchestrator sessions, agents, flows, and settings from the browser.
 
+## Dependency security
+
+Use `npm ci` with install scripts enabled. Its fail-on-error `postinstall`
+applies [`../patches/braces+3.0.3.patch`](../patches/braces+3.0.3.patch), shared
+with the docs and MCP Apps toolchains, to protect the build tooling's recursive
+brace parser. `npm run test:dependencies` checks the installed implementation
+and its consumers; `npm run build` runs these checks automatically.
+
+The original package version remains `3.0.3`, so the advisory remains visible
+and blocking even when the local mitigation passes. See
+[Dependency Security](../SECURITY.md#full-dependency-gate) for full-graph CI
+coverage, the strict HIGH/CRITICAL gate, and the separate mitigation status.
+
 ## Architecture
 
 ```
