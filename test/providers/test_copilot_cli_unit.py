@@ -558,6 +558,47 @@ class TestCopilotCliProviderTrustPrompts:
 
 
 class TestCopilotCliProviderStatusDetection:
+    @pytest.mark.parametrize(
+        "busy_row", ["∙ Thinking (Esc to cancel)", "⠋ Working · esc interrupt · enqueue"]
+    )
+    @pytest.mark.parametrize("composer", ["❯", "❯ unsent text"])
+    @pytest.mark.parametrize("submitted_prompt", ["", "❯ do the task\n"])
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    def test_busy_above_composer_stays_processing(
+        self, mock_tmux, busy_row, composer, submitted_prompt
+    ):
+        mock_tmux.return_value.get_native_status.return_value = None
+        rule = "─" * 100
+        output = (
+            f"{submitted_prompt}● Partial reply\n{busy_row}\n{rule}\n{composer}\n{rule}\n"
+            "← open sidebar · Autopilot · Allow All · / commands · tab next tab\n"
+            "data_analyst · Claude Sonnet 5\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+        assert provider.probe_stale_processing_capture(output) == TerminalStatus.PROCESSING
+        assert provider.commit_stale_processing_capture(output, TerminalStatus.IDLE) is False
+        assert provider.commit_stale_processing_capture(output, TerminalStatus.COMPLETED) is False
+
+    @pytest.mark.parametrize(
+        "busy_row", ["∙ Thinking (Esc to cancel)", "⠋ Working · esc interrupt · enqueue"]
+    )
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    def test_old_busy_row_before_completed_reply_does_not_block_readiness(
+        self, mock_tmux, busy_row
+    ):
+        mock_tmux.return_value.get_native_status.return_value = None
+        output = (
+            f"❯ do the task\n{busy_row}\n● Finished reply\n❯\n"
+            "← open sidebar · Autopilot · Allow All · / commands · tab next tab\n"
+            "data_analyst · Claude Sonnet 5\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+        assert provider.probe_stale_processing_capture(output) == TerminalStatus.COMPLETED
+
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_waiting_user_answer(self, mock_tmux):
         output = "confirm folder trust [y/n]"

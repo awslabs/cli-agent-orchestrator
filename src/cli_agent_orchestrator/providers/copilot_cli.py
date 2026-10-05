@@ -673,6 +673,13 @@ class CopilotCliProvider(BaseProvider):
                     return TerminalStatus.ERROR
             return TerminalStatus.PROCESSING
 
+        composer_index = max(
+            idx for idx, line in enumerate(lines) if re.match(IDLE_PROMPT_LINE_PATTERN, line)
+        )
+        before_composer = self._trim_tail_prompts(lines[:composer_index])
+        if before_composer and self._is_processing_line(before_composer[-1]):
+            return TerminalStatus.PROCESSING
+
         if last_user < 0:
             return TerminalStatus.IDLE
 
