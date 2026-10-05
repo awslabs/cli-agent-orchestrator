@@ -5056,6 +5056,76 @@ class TestConfirmationIsCausalOnTheRealMonitor:
             )
         assert confirmed is False
 
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_completable_flap_is_still_refused_after_a_full_redelivery(
+        self, mock_pm, mock_settings, mock_backend
+    ):
+        """#566 post-merge P3 (haofeif): the flap guard must survive a re-send.
+
+        Same frames as the flap test, but the Enter is swallowed on the FIRST
+        attempt, so the deferred path re-sends the whole task: ``dispatch_input``
+        arms the monitor again and samples a new boundary. The repaint of the
+        startup completion box lands after that. ``notify_input_sent`` used to
+        clear the "IDLE reached from COMPLETED" marker on every arm, so this
+        IDLE -> COMPLETED no longer counted as the return trip of a flap, was
+        stamped past the redelivery boundary, and confirmed a task that never
+        ran. For every provider except Codex a redelivery is a full re-send, so
+        this was the default path after one swallowed Enter.
+        """
+        mock_backend.return_value = self._tmux_backend()
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        mock_pm.get_provider.return_value = provider
+        sm, boundary = self._monitor_with_sticky_startup_completed(provider)
+
+        # Attempt 1: echo frame parses IDLE, nothing else arrives; the wait refuses.
+        provider.get_status.return_value = TerminalStatus.IDLE
+        sm._process_chunk("t1", "> do the task")
+        assert sm.get_status("t1") == TerminalStatus.IDLE
+
+        from cli_agent_orchestrator.services.terminal_service import (
+            _wait_for_post_dispatch_start,
+        )
+
+        with patch("cli_agent_orchestrator.services.terminal_service.status_monitor", sm):
+            assert (
+                asyncio.run(
+                    _wait_for_post_dispatch_start(
+                        "t1", boundary, timeout=0.2, polling_interval=0.05
+                    )
+                )
+                is False
+            )
+
+        # Attempt 2: a full re-send, exactly as dispatch_input samples it.
+        sm.notify_input_sent("t1")
+        sm.clear_rolling_buffer("t1")
+        redelivery_boundary = sm.output_generation("t1")
+        assert redelivery_boundary == boundary + 1
+
+        # The Enter is swallowed again; a repaint shows the startup box.
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        sm._process_chunk("t1", "\x1b[2J\x1b[H(previous answer) ✓ Done\n> do the task")
+
+        observation = sm.status_observation("t1")
+        assert observation.status == TerminalStatus.COMPLETED
+        assert observation.output_generation == 1, (
+            "the re-send's arm cleared the flap marker, so the repaint of the "
+            "startup COMPLETED was stamped past the redelivery boundary and would "
+            "confirm a task that never ran"
+        )
+
+        with patch("cli_agent_orchestrator.services.terminal_service.status_monitor", sm):
+            confirmed = asyncio.run(
+                _wait_for_post_dispatch_start(
+                    "t1", redelivery_boundary, timeout=0.2, polling_interval=0.05
+                )
+            )
+        assert confirmed is False
+
     def _monitor_with_post_init_idle(self, provider):
         """A fresh worker: init output parses IDLE and that is the pre-dispatch status."""
         from cli_agent_orchestrator.services.status_monitor import StatusMonitor
@@ -5114,14 +5184,22 @@ class TestConfirmationIsCausalOnTheRealMonitor:
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
-    def test_pre_dispatch_eviction_to_idle_does_not_poison_the_next_turn(
+    def test_pre_dispatch_eviction_to_idle_fails_toward_resubmission(
         self, mock_pm, mock_settings, mock_backend
     ):
-        """The "IDLE reached from COMPLETED" marker belongs to the turn that set it.
-        A previous turn whose completion box was evicted (COMPLETED -> IDLE while
-        armed) must not make the NEXT dispatch's first completion look like a
-        repaint: the arm resets the marker, so IDLE -> COMPLETED after the new
-        boundary is stamped."""
+        """A previous COMPLETED evicted to IDLE while armed, then a new dispatch
+        whose first detected status is COMPLETED with no PROCESSING in between.
+
+        At the status level this is indistinguishable from the flap a swallowed
+        Enter produces (COMPLETED -> echo IDLE -> repaint COMPLETED), and the
+        marker that tells them apart is not cleared by the arm any more (see
+        ``test_completable_flap_is_still_refused_after_a_full_redelivery``). So
+        this round trip keeps the old stamp and the gate refuses it: the
+        documented residual, which fails toward one resubmission rather than
+        toward confirming a task that never ran. A fresh worker is unaffected --
+        its post-init IDLE never carries the marker
+        (``test_first_completion_from_post_init_idle_is_earned``) -- and a turn
+        that shows PROCESSING, or any other transition, clears it."""
         mock_backend.return_value = self._tmux_backend()
         mock_settings.return_value = {"state_buffer_max": 32768}
         provider = MagicMock()
@@ -5134,7 +5212,7 @@ class TestConfirmationIsCausalOnTheRealMonitor:
         sm._process_chunk("t1", "> ")
         assert sm.get_status("t1") == TerminalStatus.IDLE
 
-        # New dispatch from that IDLE, then a fast completion.
+        # New dispatch from that IDLE, then a one-chunk completion.
         sm.notify_input_sent("t1")
         sm.clear_rolling_buffer("t1")
         boundary = sm.output_generation("t1")
@@ -5143,7 +5221,25 @@ class TestConfirmationIsCausalOnTheRealMonitor:
 
         observation = sm.status_observation("t1")
         assert observation.status == TerminalStatus.COMPLETED
-        assert observation.output_generation == boundary + 1
+        assert observation.output_generation == 1
+
+        from cli_agent_orchestrator.services.terminal_service import (
+            _wait_for_post_dispatch_start,
+        )
+
+        with patch("cli_agent_orchestrator.services.terminal_service.status_monitor", sm):
+            confirmed = asyncio.run(
+                _wait_for_post_dispatch_start("t1", boundary, timeout=0.2, polling_interval=0.05)
+            )
+        assert confirmed is False
+
+        # The turn's own PROCESSING frame clears the marker, so a completion
+        # reached through it is earned as usual.
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        sm._process_chunk("t1", "⠋ Thinking…")
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        sm._process_chunk("t1", "(answer) ✓ Done\n> ")
+        assert sm.status_observation("t1").output_generation > boundary
 
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")

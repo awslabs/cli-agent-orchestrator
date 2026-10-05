@@ -196,9 +196,11 @@ class StatusMonitor:
         # return trip IDLE -> COMPLETED is then the same finished turn's box being
         # re-read, not a completion the worker earned, and must not re-stamp
         # ``_status_generation`` (PR #566, round 10). Set on COMPLETED -> IDLE,
-        # consumed by the return trip, cleared by any other transition and by
-        # ``notify_input_sent`` (a new dispatch makes the pre-dispatch IDLE the
-        # baseline, so the first change away from it after the boundary counts).
+        # consumed by the return trip, cleared by any other transition. It
+        # survives ``notify_input_sent`` on purpose: a dispatch (or a redelivery)
+        # does not change what is on screen, and clearing it on every arm let a
+        # repaint of the old completion box confirm a re-sent task that never
+        # ran (see ``notify_input_sent``).
         self._idle_from_completed: Dict[str, bool] = {}
         # --- pyte rendered-screen detection state (only used when CAO_PYTE_STATUS
         # is on AND the provider opts in via supports_screen_detection) ---
@@ -900,11 +902,16 @@ class StatusMonitor:
             self._pending_stale_capture.pop(terminal_id, None)
             self._confirmed_stale_capture_commit.pop(terminal_id, None)
             self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
-            # Whatever the cached ready status is now, it is the pre-dispatch
-            # baseline for the turn this input starts; the first change away from
-            # it after the boundary is that turn's evidence, even if the status
-            # got here by a previous turn's COMPLETED -> IDLE eviction.
-            self._idle_from_completed.pop(terminal_id, None)
+            # ``_idle_from_completed`` is deliberately NOT cleared here. The marker
+            # says the current IDLE is a previous COMPLETED with its box scrolled
+            # off, and arming does not change what is on screen. Clearing it on
+            # every arm made the flap guard cover only the first attempt: after a
+            # swallowed Enter the deferred path re-sends the task, that re-send
+            # arms again, and a repaint of the startup completion box then
+            # re-stamped the old COMPLETED past the redelivery's boundary and
+            # confirmed a task that never ran. Any stamped transition still
+            # clears it, and a post-init IDLE never carries it, so a fresh
+            # worker's first IDLE -> COMPLETED is still earned.
         if assume_processing:
             # Optimistic dispatch latch only; this is not provider evidence and
             # must not authorize stale-pane recovery for the new generation.
