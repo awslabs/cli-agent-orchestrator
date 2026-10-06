@@ -460,6 +460,8 @@ def get_session(session_name: str) -> Dict:
     supervisor that will read the first entry as the conductor.
     """
     try:
+        if session_is_remote(session_name):
+            return _get_remote_session(session_name)
         terminals = list_terminals_by_session(session_name)
         backend_exists = get_backend().session_exists(session_name)
         session_data = None
@@ -521,6 +523,29 @@ def get_session(session_name: str) -> Dict:
     except Exception as e:
         logger.error(f"Failed to get session {session_name}: {e}")
         raise
+
+
+def _get_remote_session(session_name: str) -> Dict:
+    """A session whose terminals run in an execution runtime (#745), from its rows.
+
+    Its tmux session is in the runtime, so this server's backend is not asked.
+    Each terminal reads as ``GET /terminals/{id}`` reports it: the status its
+    runtime last pushed, ``unknown`` while the runtime is away. ``status`` is
+    ``detached``: nothing attaches to it through this server.
+    """
+    from cli_agent_orchestrator.services import terminal_service
+
+    terminals = []
+    for terminal in list_terminals_by_session(session_name):
+        try:
+            terminal["status"] = terminal_service.get_terminal(terminal["id"])["status"]
+        except ValueError:
+            continue  # deleted since the listing
+        terminals.append(terminal)
+    if not terminals:
+        raise ValueError(f"Session '{session_name}' not found")
+    session = {"id": session_name, "name": session_name, "status": "detached"}
+    return {"session": session, "terminals": terminals}
 
 
 class _RoutedToRuntime(Exception):

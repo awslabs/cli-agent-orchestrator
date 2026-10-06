@@ -1098,6 +1098,31 @@ class TestRemoteSessionTeardown:
 
 
 class TestRemoteSession:
+    def test_a_remote_launchs_session_can_be_read_back(self, http, start_runtime):
+        # The session_name a launch returns must be readable through the
+        # session route, with each terminal's status from its runtime and
+        # without this server's tmux (the backend here fails any use).
+        runtime = start_runtime(script=_answer, statuses={"beef0001": TerminalStatus.IDLE})
+        launched = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
+        assert launched.status_code == 201, launched.text
+        runtime.statuses["beef0001"] = TerminalStatus.COMPLETED
+        runtime.push(Status(terminal_id="beef0001", status=TerminalStatus.COMPLETED))
+        _wait_for(
+            lambda: http.get("/terminals/beef0001").json()["status"] == "completed",
+            "the pushed status",
+        )
+        response = http.get(f"/sessions/{launched.json()['session_name']}")
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["session"]["id"] == "cao-beef"
+        assert [(t["id"], t["status"]) for t in body["terminals"]] == [("beef0001", "completed")]
+
+    def test_a_remote_session_whose_runtime_is_away_reads_unknown(self, http):
+        _remote_row("abcd0001", "rt-1", session="cao-remote1")
+        response = http.get("/sessions/cao-remote1")
+        assert response.status_code == 200, response.text
+        assert [t["status"] for t in response.json()["terminals"]] == ["unknown"]
+
     def test_deleting_a_remote_session_deletes_each_terminal_in_its_runtime(
         self, http, start_runtime
     ):

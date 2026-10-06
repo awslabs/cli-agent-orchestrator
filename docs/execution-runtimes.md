@@ -156,7 +156,8 @@ retried until the runtime confirms it (see [Commands](#commands)).
   workflows target local terminals only. A message to a remote terminal is
   refused (`409`), so `send_message` reports the failure.
 - `GET /sessions` and the CLI's shared-server commands do not list remote
-  terminals; `GET /runtimes` does.
+  terminals; `GET /runtimes` does. `GET /sessions/{session_name}` reads a
+  remote session by name, with each terminal's status from its runtime.
 - Output is read on request. There is no output streaming or replay for a
   remote terminal: `GET /terminals/{id}/output/range` answers `409`, and the
   PTY WebSocket refuses one (close code `4004`).
