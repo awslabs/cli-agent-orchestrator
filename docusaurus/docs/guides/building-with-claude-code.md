@@ -76,14 +76,9 @@ unrestricted tool access.
 
 ## Eager Inbox Delivery
 
-Claude Code's Ink TUI buffers pasted input even while the agent is processing. CAO can exploit this to deliver queued inbox messages immediately, eliminating inter-turn latency.
+Claude Code's Ink TUI buffers pasted input even while the agent is processing. CAO uses this to deliver queued inbox messages while the terminal is PROCESSING, so the agent picks them up the instant it finishes its current turn. This is always on and needs no configuration.
 
-```bash
-export CAO_EAGER_INBOX_DELIVERY=true
-cao-server
-```
-
-With eager delivery enabled, messages are delivered to Claude Code terminals even during PROCESSING or WAITING_USER_ANSWER states, so the agent picks them up the instant it finishes its current turn.
+Messages are never delivered while Claude Code is waiting on a user answer (an AskUserQuestion or approval dialog). The message stays queued until the dialog closes, so it cannot be swallowed by the dialog or answer it.
 
 ## Native Agent Routing
 
