@@ -326,7 +326,7 @@ async def test_a_blocking_call_on_the_loop_itself_is_refused():
 
 
 @pytest.mark.asyncio
-async def test_a_losing_launchs_status_cannot_touch_the_winners():
+async def test_the_status_of_a_launch_that_lost_the_id_race_leaves_the_winner_alone():
     registry = RuntimeRegistry()
     winner, loser = _FakeRuntime(registry, "rt-2"), _FakeRuntime(registry, "rt-1")
     registry.place("beef0001", "rt-2")

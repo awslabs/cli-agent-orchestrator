@@ -502,9 +502,10 @@ async def _amain() -> None:
         )
     ready = os.environ.get("CAO_BRIDGE_READY_FILE", "").strip()
     ready_file = Path(ready) if ready else CAO_HOME_DIR / "bridge-ready"
-    # One a run that died left behind would report this one ready through its
-    # startup work; the channel recreates it once the hello is done. Fail
-    # closed: kept, it would report this runtime ready while disconnected too.
+    # A readiness file left behind by a run that died would report this one
+    # ready through its startup work; the channel recreates it once the hello
+    # is done. Fail closed: kept, it would report this runtime ready while
+    # disconnected too.
     try:
         ready_file.unlink(missing_ok=True)
     except OSError as exc:
