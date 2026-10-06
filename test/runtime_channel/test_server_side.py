@@ -1852,6 +1852,31 @@ class TestRemoteApproval:
         await bridge._on_waiting("abcd1234")
         assert calls == ["abcd1234"], "the prompt must be read off the event loop"
 
+    @pytest.mark.asyncio
+    async def test_a_remote_approval_names_the_rows_provider_without_a_local_provider(
+        self, monkeypatch
+    ):
+        # Production builds ApprovalBridge with no lookups injected. A remote
+        # terminal's provider runs in its runtime: the server must take the
+        # provider (whose answer keys the interrupt) from the central row, not
+        # build a provider object of its own for a pane it does not have.
+        from unittest.mock import MagicMock
+
+        from cli_agent_orchestrator.providers.manager import provider_manager
+        from cli_agent_orchestrator.services.agui.approval_bridge import ApprovalBridge
+
+        database.create_terminal(
+            "abcd1234", "cao-remote1", "developer-abcd", "claude_code", "developer",
+            runtime_id="rt-1",
+        )  # fmt: skip
+        monkeypatch.setattr(terminal_service, "get_output", lambda *a, **k: "Allow? (y/n)")
+        monkeypatch.setattr(provider_manager, "_providers", {})
+        construct = MagicMock()
+        await ApprovalBridge(construct)._on_waiting("abcd1234")
+        kwargs = construct.on_provider_waiting.call_args.kwargs
+        assert kwargs["provider"] == "claude_code"
+        assert "abcd1234" not in provider_manager._providers, "no local provider object"
+
 
 class TestUndoRetry:
     def test_a_deferred_undo_is_retried_until_the_runtime_deletes(

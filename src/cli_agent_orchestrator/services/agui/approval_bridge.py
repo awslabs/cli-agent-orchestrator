@@ -129,9 +129,18 @@ class ApprovalBridge:
                 pass
         else:
             try:
+                from cli_agent_orchestrator.clients.database import get_terminal_metadata
                 from cli_agent_orchestrator.providers.manager import provider_manager
 
-                p = provider_manager.get_provider(terminal_id)
+                metadata = get_terminal_metadata(terminal_id)
+                if metadata and metadata.get("runtime_id"):
+                    # Its provider runs in an execution runtime (#745): the
+                    # central row names it, and no provider object is built
+                    # here for a pane this server does not have.
+                    p = None
+                    provider = metadata.get("provider") or ""
+                else:
+                    p = provider_manager.get_provider(terminal_id)
                 if p:
                     # Get the provider type name
                     provider = type(p).__name__.replace("Provider", "").lower()
