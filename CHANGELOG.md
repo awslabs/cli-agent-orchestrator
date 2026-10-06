@@ -101,6 +101,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Copilot CLI readiness detection recognizes the downloaded-update notice prepended
   to the hint bar, avoiding initialization timeouts after a background update.
   Busy, waiting, error, and unrecognized rows still prevent readiness (#870).
+- Script workflows that exit while a process they started still holds their
+  stdout/stderr now settle on the script's own exit. On Python 3.11+ such a run
+  used to wait out the whole wall-clock bound and be recorded as a timeout with
+  its output dropped, and on 3.10 it did not settle until that process exited.
+  The pipes now get the reap grace to drain, and a warning names the case (#894).
 - Audit all tracked npm, Bun, uv, and Cargo dependency graphs in every CI run
   and weekly, including development dependencies and unfixed advisories. Block
   every HIGH/CRITICAL finding and scan error, and publish complete inventory and

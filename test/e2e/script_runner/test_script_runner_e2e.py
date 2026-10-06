@@ -22,6 +22,8 @@ self-contained. Run with: ``uv run pytest -m e2e test/e2e/test_script_runner_e2e
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from cli_agent_orchestrator.models.workflow_runtime import RunState
@@ -96,6 +98,29 @@ async def test_real_hang_is_reaped_within_bound(tmp_path, monkeypatch):
     result = await run_script_workflow(spec, {}, "e2e-hang")
     assert result.state == RunState.FAILED
     assert result.kind == "timeout"
+
+
+async def test_real_background_child_holding_stdout_does_not_hold_the_run(tmp_path, monkeypatch):
+    """A script that exits 0 after starting a long-lived helper completes promptly.
+
+    The helper inherits stdout/stderr, so the pipes stay open after the script
+    exits. The run must settle on the script's exit, not the helper's.
+    """
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 5.0)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.5)
+    spec = _RealSpec(
+        tmp_path,
+        source=(
+            "import json, subprocess, sys\n"
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(15)'])\n"
+            'print("CAO_WORKFLOW_OUTPUT:" + json.dumps({"ok": True}), flush=True)\n'
+        ),
+    )
+    started = time.monotonic()
+    result = await run_script_workflow(spec, {}, "e2e-held-stdout")
+    assert time.monotonic() - started < 5.0
+    assert result.state == RunState.COMPLETED
+    assert result.output == {"ok": True}
 
 
 async def test_real_nonzero_exit_is_failed(tmp_path):

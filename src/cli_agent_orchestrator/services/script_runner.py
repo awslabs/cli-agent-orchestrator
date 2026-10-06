@@ -80,6 +80,10 @@ _SENTINEL_PREFIX = "CAO_WORKFLOW_OUTPUT:"
 # has already been released, so the orphan sweep skips it (A5, BR-14).
 _TERMINAL_STEP_STATES = {"completed", "failed", "skipped", "completed_unvalidated"}
 
+# How often ``_wait_for_exit`` checks ``returncode`` while ``wait()`` is still
+# blocked on the pipes.
+_EXIT_POLL_INTERVAL = 0.1
+
 
 class ScriptLintError(Exception):
     """The pre-spawn lint gate failed (BR-1) — U5 maps this to 422 with findings.
@@ -314,15 +318,33 @@ async def _terminate(process: asyncio.subprocess.Process, grace: float) -> None:
         await process.wait()  # reap the zombie
 
 
+async def _wait_for_exit(process: asyncio.subprocess.Process) -> None:
+    """Return once the process itself has exited, whether or not its pipes are closed.
+
+    ``process.wait()`` alone is not that signal. From Python 3.11 a ``wait()``
+    that starts before the exit also waits for stdout and stderr to reach EOF,
+    and a background process the script started inherits both pipes, so it can
+    hold ``wait()`` open long after the script is gone. ``returncode`` is set
+    when the script exits, on every supported version, so it is checked
+    alongside the ``wait()``.
+    """
+    waiter = asyncio.ensure_future(process.wait())
+    try:
+        while process.returncode is None and not waiter.done():
+            await asyncio.wait({waiter}, timeout=_EXIT_POLL_INTERVAL)
+    finally:
+        waiter.cancel()
+
+
 async def _await_exit_within_bound(process: asyncio.subprocess.Process, timeout: float) -> None:
     """Await the process exit under the wall-clock bound (A1 Step 3 reaper).
 
-    A thin ``asyncio.wait_for(process.wait())`` wrapper that converts the elapsed
-    bound into a ``TimeoutBound`` the caller's timeout arm handles (reap ->
+    A thin ``asyncio.wait_for(_wait_for_exit(process))`` wrapper that converts the
+    elapsed bound into a ``TimeoutBound`` the caller's timeout arm handles (reap ->
     sweep -> FAILED,kind=timeout). Any other exit (natural, signal) returns.
     """
     try:
-        await asyncio.wait_for(process.wait(), timeout=timeout)
+        await asyncio.wait_for(_wait_for_exit(process), timeout=timeout)
     except asyncio.TimeoutError as e:
         raise TimeoutBound(
             f"script subprocess did not exit within {timeout}s wall-clock bound"
@@ -1072,7 +1094,6 @@ async def _drive_process(
 
     try:
         await _await_exit_within_bound(process, WORKFLOW_SCRIPT_TIMEOUT)
-        await asyncio.gather(*drain)  # flush both tails after a clean exit
     except TimeoutBound:
         # Timeout arm: reap -> sweep -> bump+persist generation (INV-6, the
         # straggler fence a timeout-reaped run needs) -> FAILED,kind=timeout.
@@ -1092,6 +1113,18 @@ async def _drive_process(
             warnings=[f"run exceeded the {WORKFLOW_SCRIPT_TIMEOUT}s wall-clock bound"],
         )
 
+    # Flush both tails. The script has exited, but a process it started in the
+    # background can still hold its stdout/stderr open, so the drain gets the
+    # same grace the reaper uses and then keeps whatever was read by then.
+    drain_warnings: List[str] = []
+    try:
+        await asyncio.wait_for(asyncio.gather(*drain), timeout=WORKFLOW_SCRIPT_TERM_GRACE)
+    except asyncio.TimeoutError:
+        drain_warnings.append(
+            f"stdout/stderr were still open {WORKFLOW_SCRIPT_TERM_GRACE}s after the script "
+            "exited, most likely held by a process it started; output read up to then was kept"
+        )
+
     if record.cancelled or record.state == RunState.CANCELLED:
         # A concurrent cancel_script_run already signalled, swept, and journaled
         # CANCELLED (A3) — the drive must not overwrite that with FAILED/COMPLETED
@@ -1103,7 +1136,11 @@ async def _drive_process(
     if rc == 0:
         output, warnings = _scan_sentinel(stdout_ring.text())
         return await _finalize(
-            record, state=RunState.COMPLETED, kind=None, output=output, warnings=warnings
+            record,
+            state=RunState.COMPLETED,
+            kind=None,
+            output=output,
+            warnings=warnings + drain_warnings,
         )
     # Nonzero / signal death -> sweep -> FAILED,kind=error (sentinel SKIPPED, BR-9a).
     await _reconcile_orphans(record.run_id)
@@ -1111,6 +1148,7 @@ async def _drive_process(
         record,
         state=RunState.FAILED,
         kind="error",
+        warnings=drain_warnings,
         error=stderr_ring.text().strip(),
     )
 
