@@ -667,6 +667,60 @@ class TestConnection:
         # accepted upgrade would retry every 0.05 s (~14 attempts).
         assert len(attempts) <= 5, f"{len(attempts)} attempts: the backoff never grew"
 
+    @staticmethod
+    def _silent_after_upgrade(attempts):
+        """A peer (or proxy) that completes the upgrade, then never sends a hello."""
+
+        class SilentAfterUpgrade:
+            def __init__(self):
+                self.closed = asyncio.Event()
+
+            async def __aenter__(self):
+                attempts.append(asyncio.get_running_loop().time())
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def send(self, text):
+                pass
+
+            async def recv(self):
+                await self.closed.wait()
+                raise websockets.exceptions.ConnectionClosedError(None, None)
+
+            async def close(self):
+                self.closed.set()
+
+        return SilentAfterUpgrade
+
+    @pytest.mark.asyncio
+    async def test_a_server_that_never_sends_its_hello_is_given_up_on(self, monkeypatch):
+        attempts = []
+        silent = self._silent_after_upgrade(attempts)
+        monkeypatch.setattr(bridge_mod, "connect", lambda *args, **kwargs: silent())
+        monkeypatch.setattr(bridge_mod, "HELLO_TIMEOUT", 0.1)
+        monkeypatch.setattr(bridge_mod, "BACKOFF_INITIAL", 0.01)
+        bridge = _bridge()
+        running = asyncio.ensure_future(bridge.run())
+        await asyncio.sleep(0.6)
+        bridge.stop()
+        await asyncio.wait_for(running, 5)
+        assert len(attempts) >= 2, "the bridge waited on a silent server for good"
+
+    @pytest.mark.asyncio
+    async def test_stop_during_the_hello_ends_the_bridge(self, monkeypatch):
+        attempts = []
+        silent = self._silent_after_upgrade(attempts)
+        monkeypatch.setattr(bridge_mod, "connect", lambda *args, **kwargs: silent())
+        monkeypatch.setattr(bridge_mod, "HELLO_TIMEOUT", 60.0)
+        bridge = _bridge()
+        running = asyncio.ensure_future(bridge.run())
+        await asyncio.sleep(0.1)  # waiting for the server's hello
+        bridge.stop()  # SIGTERM
+        await asyncio.wait_for(running, 2)
+        assert len(attempts) == 1
+
     @pytest.mark.asyncio
     async def test_a_server_speaking_another_version_is_fatal(self, tmp_path):
         with pytest.raises(ChannelRefused):

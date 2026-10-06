@@ -49,6 +49,9 @@ BACKOFF_INITIAL = 1.0
 BACKOFF_MAX = 30.0
 # A connection that stays up this long after its hello resets the backoff.
 STABLE_CONNECTION = 10.0
+#: Seconds to wait for the server's hello after the upgrade. A peer or proxy that
+#: accepts the upgrade and then stays silent is given up on and retried.
+HELLO_TIMEOUT = 30.0
 _STATUS_TOPIC = re.compile(r"^terminal\.([^.]+)\.status$")
 
 
@@ -77,6 +80,8 @@ class Bridge:
         self._token = token
         self._ready_file = ready_file
         self._ws: Optional[ClientConnection] = None
+        # A connection still in its hello exchange (see serve() and stop()).
+        self._handshaking: Optional[ClientConnection] = None
         self._send_lock = asyncio.Lock()
         # terminal id -> (lock, number of commands holding or awaiting it)
         self._terminal_locks: Dict[str, Tuple[asyncio.Lock, int]] = {}
@@ -319,17 +324,24 @@ class Bridge:
 
     async def serve(self, ws: ClientConnection) -> None:
         """Run one connection: hello exchange, then commands until it closes."""
-        statuses = await asyncio.to_thread(self._current_statuses)
-        await ws.send(
-            encode(
-                Hello(
-                    protocol_version=PROTOCOL_VERSION,
-                    runtime_id=self.runtime_id,
-                    statuses=statuses,
+        # Until the hello is done, stop() closes this socket (it has no _ws yet).
+        self._handshaking = ws
+        try:
+            statuses = await asyncio.to_thread(self._current_statuses)
+            await ws.send(
+                encode(
+                    Hello(
+                        protocol_version=PROTOCOL_VERSION,
+                        runtime_id=self.runtime_id,
+                        statuses=statuses,
+                    )
                 )
             )
-        )
-        reply = decode(await ws.recv())
+            # Bounded: a peer that accepts the upgrade and never answers is
+            # given up on, and the reconnect loop retries with backoff.
+            reply = decode(await asyncio.wait_for(ws.recv(), HELLO_TIMEOUT))
+        finally:
+            self._handshaking = None
         if not isinstance(reply, Hello) or reply.protocol_version != PROTOCOL_VERSION:
             raise ChannelRefused(
                 f"protocol mismatch: server speaks {getattr(reply, 'protocol_version', '?')}, "
@@ -406,7 +418,8 @@ class Bridge:
 
     def stop(self) -> None:
         self._stop.set()
-        ws = self._ws
+        # A socket still in its hello exchange has no _ws yet: close that one.
+        ws = self._ws or self._handshaking
         if ws is not None:
             asyncio.get_running_loop().create_task(ws.close())
 
