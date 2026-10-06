@@ -29,6 +29,9 @@ security patch. Do not disable install scripts: `postinstall` runs
 `patch-package --patch-dir ../patches --error-on-fail`. `npm run build` runs
 `npm run test:dependencies` before assembling the courses and site; the same
 checks can be run independently while updating dependencies.
+Keep the `.npmrc` lockfile-version setting: version 2 includes the full npm
+alias metadata needed by dependency-graph readers, without changing the
+resolved packages.
 
 Two transitive dependencies have explicit security overrides:
 

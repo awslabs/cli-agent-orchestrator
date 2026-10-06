@@ -11,6 +11,8 @@ an exact npm alias. Its fail-on-error `postinstall` applies
 with the docs and MCP Apps toolchains, to additionally bound acyclic AST
 ancestor traversal. `npm run test:dependencies` checks the installed implementation
 and its consumers; `npm run build` runs these checks automatically.
+Keep `.npmrc`'s version-2 lockfile setting so dependency-graph readers receive
+the complete npm alias metadata.
 
 This replaces the affected original with a reviewed third-party implementation;
 it is not an official fixed release or a scanner exemption. See

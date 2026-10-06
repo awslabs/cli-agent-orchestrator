@@ -295,7 +295,10 @@ def test_cargo_manifest_does_not_make_trivy_drop_development_dependencies(reposi
 
 
 @pytest.mark.skipif(shutil.which("trivy") is None, reason="Requires the CI-pinned Trivy binary")
-def test_real_trivy_keeps_dev_only_packages_in_published_inventory(repository, tmp_path):
+@pytest.mark.parametrize("lockfile_version", [2, 3])
+def test_real_trivy_keeps_dev_only_packages_in_published_inventory(
+    repository, tmp_path, lockfile_version
+):
     manifest = {
         "name": "inventory-node",
         "version": "1.0.0",
@@ -303,27 +306,28 @@ def test_real_trivy_keeps_dev_only_packages_in_published_inventory(repository, t
         "devDependencies": {"wrappy": "1.0.2"},
     }
     (repository / "package.json").write_text(json.dumps(manifest))
-    (repository / "package-lock.json").write_text(
-        json.dumps(
-            {
-                "name": "inventory-node",
-                "version": "1.0.0",
-                "lockfileVersion": 3,
-                "packages": {
-                    "": manifest,
-                    "node_modules/is-number": {
-                        "version": "7.0.0",
-                        "resolved": "https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz",
-                    },
-                    "node_modules/wrappy": {
-                        "version": "1.0.2",
-                        "resolved": "https://registry.npmjs.org/wrappy/-/wrappy-1.0.2.tgz",
-                        "dev": True,
-                    },
-                },
-            }
-        )
-    )
+    lock = {
+        "name": "inventory-node",
+        "version": "1.0.0",
+        "lockfileVersion": lockfile_version,
+        "packages": {
+            "": manifest,
+            "node_modules/is-number": {
+                "version": "7.0.0",
+                "resolved": "https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz",
+            },
+            "node_modules/wrappy": {
+                "version": "1.0.2",
+                "resolved": "https://registry.npmjs.org/wrappy/-/wrappy-1.0.2.tgz",
+                "dev": True,
+            },
+        },
+    }
+    if lockfile_version == 2:
+        lock["dependencies"] = {
+            name: lock["packages"][f"node_modules/{name}"] for name in ("is-number", "wrappy")
+        }
+    (repository / "package-lock.json").write_text(json.dumps(lock))
     python = repository / "python"
     python.mkdir()
     (python / "pyproject.toml").write_text(
@@ -454,6 +458,9 @@ def test_all_affected_projects_install_the_shared_patch_and_regressions(project)
     assert manifest["scripts"]["test:dependencies"] == f"node --test {wrapper}"
     assert "../../scripts/test-braces-security.cjs" in (ROOT / project / wrapper).read_text()
     lock = json.loads((ROOT / project / "package-lock.json").read_text())
+    assert "lockfile-version=2" in (ROOT / project / ".npmrc").read_text().splitlines()
+    assert lock["lockfileVersion"] == 2
+    assert lock["dependencies"]["braces"]["version"] == manifest["dependencies"]["braces"]
     installed = [
         entry for location, entry in lock["packages"].items() if location.endswith("/braces")
     ]

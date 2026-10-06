@@ -86,6 +86,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   acyclic AST parent-link bounds. Verify dev-only inventory with real Trivy,
   fail non-vacuously on missing consumers, and preserve three-project failure
   aggregation. No advisory exemptions or fabricated versions are used.
+- Retain npm's version-2 compatibility records for the guarded dependency
+  aliases, alongside their real package identities and integrity hashes,
+  without changing the resolved graphs. Check both npm lockfile formats in
+  the real-Trivy development-inventory regression.
 - `copilot_cli` launches no longer time out after 60 seconds on Copilot CLI
   1.0.91 (#870). Copilot repaints only changed cells in its full-screen view,
   so the raw output stream never shows a settled idle prompt; the provider now

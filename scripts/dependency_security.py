@@ -157,8 +157,10 @@ def render_summary(report: dict) -> str:
             )
         lines += [
             "",
-            f"Blocking findings: **{report['blocking']}**. Total findings: **{len(report['findings'])}**.",
-            f"Distinct advisories: **{len({finding['advisory'] for finding in report['findings']})}**.",
+            f"Blocking findings: **{report['blocking']}**. "
+            f"Total findings: **{len(report['findings'])}**.",
+            "Distinct advisories: "
+            f"**{len({finding['advisory'] for finding in report['findings']})}**.",
         ]
         if report["findings"]:
             lines += [

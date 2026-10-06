@@ -59,6 +59,8 @@ and fails if it cannot apply. The patch adds a bound on acyclic AST ancestor
 traversal to the fork's parser, recursive-AST, and cycle guards.
 `npm run test:dependencies` verifies the installed mitigation and its consumers;
 `npm run build:all` runs it automatically.
+Keep `.npmrc`'s version-2 lockfile setting so dependency-graph readers receive
+the complete npm alias metadata.
 
 The lockfile retains the fork's real package identity, version, and integrity.
 This is a third-party replacement, not an official fixed release or an advisory

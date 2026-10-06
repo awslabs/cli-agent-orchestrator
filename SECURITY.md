@@ -133,6 +133,16 @@ installation to which the local patch is applied; the regression checks this
 resolution identity. Do not use its `latest` tag, which points
 to an earlier bootstrap release rather than the reviewed guarded version.
 
+These projects retain npm's version-2 lockfile compatibility metadata through
+their `.npmrc` files. It records the complete `npm:<package>@<version>` alias in
+the legacy dependency map as well as the real name/version in `packages`.
+GitHub's dependency graph misidentified the version-3 alias as upstream
+`braces@3.0.3-pn.3`, attaching upstream advisories despite the correct tarball
+and Trivy inventory. Any format change must preserve the resolved graph and
+verify the canonical package identity in both GitHub Dependency Review and
+the full Trivy inventory; a missing package or invalid-version bypass is not
+an acceptable clean result.
+
 The published tarball's ten files were matched byte-for-byte to
 [source commit `305a2e4b`](https://github.com/dieub/braces-depth-guard/tree/305a2e4bfe324bb53c336c1b03387ee1251c926f).
 `npm audit signatures` verified registry signatures and available attestations;
