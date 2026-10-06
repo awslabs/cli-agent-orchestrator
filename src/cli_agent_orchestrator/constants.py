@@ -272,12 +272,6 @@ PYTE_QUIESCENCE_DELAY_S = 0.2
 # half-settled frame — ready statuses still wait for quiescence.
 PYTE_MIDBURST_PROBE_S = _env_positive_float("CAO_PYTE_MIDBURST_PROBE_S", 1.0)
 
-# Eager inbox delivery: when enabled, deliver queued messages to terminals in
-# PROCESSING state for providers that declare
-# accepts_input_while_processing=True. Eliminates latency between agent turns
-# for capable providers (e.g., Claude Code).
-EAGER_INBOX_DELIVERY = os.environ.get("CAO_EAGER_INBOX_DELIVERY", "false").lower() == "true"
-
 # Poll interval (seconds) for the OpenCode inbox poller. OpenCode buffers input
 # and its pipe-pane output can stop changing once the TUI settles, so the
 # FIFO/StatusMonitor pipeline may never emit an IDLE/COMPLETED status event to

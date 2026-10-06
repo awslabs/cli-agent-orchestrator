@@ -9,7 +9,7 @@ group both consult, so they cannot disagree about whether the surface is live.
 
 Modelled on the AG-UI precedent (``services/agui_enablement.py`` plus
 ``api.main._require_agui_enabled``): default-off, single env var, same truthy
-spelling as ``CAO_AGUI_ENABLED`` and ``CAO_EAGER_INBOX_DELIVERY``. With the flag
+spelling as ``CAO_AGUI_ENABLED``. With the flag
 unset the surface is absent — the routes 404 and the CLI group refuses to run any
 subcommand.
 

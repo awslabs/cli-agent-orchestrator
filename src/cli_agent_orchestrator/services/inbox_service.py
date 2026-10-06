@@ -17,7 +17,6 @@ from cli_agent_orchestrator.clients.database import (
     update_message_status,
 )
 from cli_agent_orchestrator.constants import (
-    EAGER_INBOX_DELIVERY,
     INBOX_RECONCILE_GRACE_SECONDS,
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
@@ -90,7 +89,7 @@ class InboxService:
         Status comes from the StatusMonitor (the event-driven source of truth).
         Delivery normally happens on IDLE/COMPLETED; providers that accept input
         mid-turn (``accepts_input_while_processing``) also receive messages while
-        PROCESSING/WAITING_USER_ANSWER when ``EAGER_INBOX_DELIVERY`` is on (#251).
+        PROCESSING (#251). WAITING_USER_ANSWER never receives delivery (#896).
         When a plugin registry is supplied, the originating sender and a
         ``send_message`` orchestration type are threaded to ``terminal_service``
         so ``PostSendMessageEvent`` hooks fire with correct attribution.
@@ -114,19 +113,15 @@ class InboxService:
 
         status = status_monitor.get_status(terminal_id)
         if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
-            # Not ready on the normal path. Eager delivery (#251) lets providers
-            # that accept input mid-turn receive messages while PROCESSING or
-            # WAITING_USER_ANSWER; only in that case do we need the provider.
-            eager_eligible = False
-            if EAGER_INBOX_DELIVERY and status in (
-                TerminalStatus.PROCESSING,
-                TerminalStatus.WAITING_USER_ANSWER,
-            ):
-                provider = provider_manager.get_provider(terminal_id)
-                eager_eligible = provider is not None and getattr(
-                    provider, "accepts_input_while_processing", False
-                )
-            if not eager_eligible:
+            # Not ready on the normal path. Eager delivery (#251) lets a provider
+            # that buffers input mid-turn receive messages while PROCESSING.
+            # WAITING_USER_ANSWER is never eligible: an open dialog would consume
+            # the pasted text and the trailing Enter could answer it (#896). The
+            # message stays PENDING for the status consumer or reconcile sweep.
+            if status != TerminalStatus.PROCESSING:
+                return
+            provider = provider_manager.get_provider(terminal_id)
+            if provider is None or not getattr(provider, "accepts_input_while_processing", False):
                 return
 
         # Mark DELIVERED before sending (#164). send_input() types into the tmux
