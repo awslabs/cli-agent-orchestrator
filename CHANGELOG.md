@@ -88,9 +88,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   aggregation. No advisory exemptions or fabricated versions are used.
 - Preserve canonical dependency identity for the guarded fork in GitHub's
   dependency graph: private one-statement local adapters retain existing
-  `braces` imports while the real registry package remains directly visible.
+  `braces` imports while the real package remains directly visible.
   Reject and revert the npm version-2 workaround, which produced an unparsed
   alias rather than a correctly identified dependency.
+- Vendor the verified guarded-fork tarball so cold installs in all three
+  toolchains survive registry removal without changing package identity,
+  version, license, or integrity. Document the fork's upstream-advisory blind
+  spot and concrete weekly/pre-release maintainer tracking checkpoints.
 - Consolidate the dependency fixes from #888-#890: update `source-map-js`
   throughout docs, web, and MCP Apps, plus docs `compression` and `proxy-addr`.
   Clear the remaining Joi, selector-parser, and Tinypool scan findings with
@@ -1575,4 +1579,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump to v0.51.0, update method name (#31)
 
 - accept optional U+03BB (λ) after % in kiro and q CLIs (#44)
-

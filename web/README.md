@@ -7,8 +7,10 @@ A single-page dashboard for managing CLI Agent Orchestrator sessions, agents, fl
 Use npm 10+ and `npm ci` with install scripts enabled. All `braces` consumers
 resolve the published guarded fork `@dieub/braces-depth-guard@3.0.3-pn.3` through
 the private local `braces-compat` adapter, which only re-exports the canonical
-dependency. Keep `.npmrc`'s `install-links=false` setting and include
-`braces-compat/` when installing the project. Its fail-on-error `postinstall` applies
+dependency. The unchanged fork tarball is [vendored in the repository](../vendor/README.md),
+so its registry availability is not required for a cold install. Keep `.npmrc`'s
+`install-links=false` setting and include `braces-compat/` and `../vendor/`
+when installing the project. Its fail-on-error `postinstall` applies
 [`../patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch`](../patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch), shared
 with the docs and MCP Apps toolchains, to additionally bound acyclic AST
 ancestor traversal. `npm run test:dependencies` checks the installed implementation

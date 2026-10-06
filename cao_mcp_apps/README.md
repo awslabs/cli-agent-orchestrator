@@ -54,7 +54,9 @@ npm install
 Use npm 10+ with install scripts enabled. The private local `braces-compat`
 adapter re-exports the canonical dependency
 `@dieub/braces-depth-guard@3.0.3-pn.3`. Keep `.npmrc`'s `install-links=false`
-setting and include `braces-compat/` when installing the project. `postinstall`
+setting and include `braces-compat/` and `../vendor/` when installing the project.
+The unchanged fork tarball is [vendored in the repository](../vendor/README.md),
+so a cold install does not depend on its registry availability. `postinstall`
 applies the shared
 [`../patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch`](../patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch)
 and fails if it cannot apply. The patch adds a bound on acyclic AST ancestor

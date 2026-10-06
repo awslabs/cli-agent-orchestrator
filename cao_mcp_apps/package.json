@@ -35,7 +35,7 @@
     ]
   },
   "dependencies": {
-    "@dieub/braces-depth-guard": "3.0.3-pn.3",
+    "@dieub/braces-depth-guard": "file:../vendor/dieub-braces-depth-guard-3.0.3-pn.3.tgz",
     "braces": "file:braces-compat",
     "graphology": "^0.26.0",
     "graphology-layout": "^0.6.1",

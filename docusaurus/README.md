@@ -35,9 +35,11 @@ Relevant dependency security controls include:
 - **`braces`** resolves through the private local `braces-compat` adapter to the
   canonical published third-party MIT fork
   `@dieub/braces-depth-guard@3.0.3-pn.3`, shared with the web UI and
-  MCP Apps toolchains. The adapter only re-exports the fork; keep
-  `.npmrc`'s `install-links=false` setting and include `braces-compat/` when
-  installing the project. It replaces the affected original while retaining
+  MCP Apps toolchains. The unchanged fork tarball is
+  [vendored in the repository](../vendor/README.md), so a cold install does not
+  depend on its registry availability. The adapter only re-exports the fork;
+  keep `.npmrc`'s `install-links=false` setting and include `braces-compat/`
+  and `../vendor/` when installing the project. It replaces the affected original while retaining
   quoted/escaped pattern behavior, and bounds parsing and recursive AST depth
   to 100 (or a lower `maxDepth`). Both `chokidar` and `micromatch` resolve the
   fork under their existing `braces` import.
@@ -78,7 +80,7 @@ GitHub Pages serves the resulting static site. No alert is suppressed.
 The repository's [Dependency Security gate](../SECURITY.md#full-dependency-gate)
 audits the complete locked graphs on every PR/`main` CI run and weekly. It
 reports installed mitigation verification separately from open advisories.
-Changes to the shared patch or brace tests also trigger the docs site build.
+Changes to the vendored archive, shared patch, or brace tests also trigger the docs site build.
 
 ## Adding Documentation
 

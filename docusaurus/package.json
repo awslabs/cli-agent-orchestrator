@@ -20,7 +20,7 @@
     "test:dependencies": "node --test test/dependency-security.test.cjs"
   },
   "dependencies": {
-    "@dieub/braces-depth-guard": "3.0.3-pn.3",
+    "@dieub/braces-depth-guard": "file:../vendor/dieub-braces-depth-guard-3.0.3-pn.3.tgz",
     "@docusaurus/core": "3.10.2",
     "@docusaurus/faster": "3.10.2",
     "@docusaurus/preset-classic": "3.10.2",

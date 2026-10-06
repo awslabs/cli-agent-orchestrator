@@ -1,11 +1,13 @@
 """Full-graph vulnerability policy, coverage and error-boundary regressions."""
 
+import base64
 import hashlib
 import importlib.util
 import json
 import os
 import shutil
 import subprocess
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -442,7 +444,8 @@ def test_audit_reports_and_mitigations_are_not_skipped_after_scanner_setup_failu
 def test_all_affected_projects_install_the_shared_patch_and_regressions(project):
     manifest = json.loads((ROOT / project / "package.json").read_text())
     assert manifest["dependencies"]["braces"] == "file:braces-compat"
-    assert manifest["dependencies"]["@dieub/braces-depth-guard"] == "3.0.3-pn.3"
+    source = "file:../vendor/dieub-braces-depth-guard-3.0.3-pn.3.tgz"
+    assert manifest["dependencies"]["@dieub/braces-depth-guard"] == source
     assert manifest["overrides"]["braces"] == "$braces"
     assert manifest["dependencies"]["patch-package"] == "8.0.1"
     assert (
@@ -468,10 +471,30 @@ def test_all_affected_projects_install_the_shared_patch_and_regressions(project)
     assert adapter["peerDependencies"] == {"@dieub/braces-depth-guard": "3.0.3-pn.3"}
     entry = lock["packages"]["node_modules/@dieub/braces-depth-guard"]
     assert entry["version"] == "3.0.3-pn.3"
-    assert entry["resolved"] == (
-        "https://registry.npmjs.org/@dieub/braces-depth-guard/-/"
-        "braces-depth-guard-3.0.3-pn.3.tgz"
+    assert entry["resolved"] == source
+    assert entry["license"] == "MIT"
+    assert lock["packages"][""]["dependencies"]["@dieub/braces-depth-guard"] == source
+    archive = ROOT / project / source.removeprefix("file:")
+    integrity = "sha512-" + base64.b64encode(hashlib.sha512(archive.read_bytes()).digest()).decode()
+    assert entry["integrity"] == integrity
+
+
+def test_vendored_fork_retains_the_reviewed_registry_bytes_and_metadata():
+    archive = ROOT / "vendor" / "dieub-braces-depth-guard-3.0.3-pn.3.tgz"
+    integrity = "sha512-" + base64.b64encode(hashlib.sha512(archive.read_bytes()).digest()).decode()
+    assert integrity == (
+        "sha512-QY+Uq4s42STyIMPoRkBuUZfYyvz0uZuwuUburLwMx5N+lWqnHHaBxcKPtgKVKjTy"
+        "FnS1q4ivKu9Wxi4VG7FE9Q=="
     )
+    with tarfile.open(archive) as package:
+        manifest_file = package.extractfile("package/package.json")
+        assert manifest_file is not None
+        manifest = json.load(manifest_file)
+        assert manifest["name"] == "@dieub/braces-depth-guard"
+        assert manifest["version"] == "3.0.3-pn.3"
+        assert manifest["license"] == "MIT"
+        assert not {"preinstall", "install", "postinstall"} & manifest.get("scripts", {}).keys()
+        assert package.getmember("package/LICENSE").isfile()
 
 
 @pytest.mark.parametrize(
@@ -562,4 +585,6 @@ def test_shared_patch_and_tests_trigger_the_docs_build():
     workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "gh-pages.yml").read_text())
     events = workflow.get("on", workflow.get(True))
     for event in ("push", "pull_request"):
-        assert {"patches/**", "scripts/test-braces-security.cjs"} <= set(events[event]["paths"])
+        assert {"patches/**", "vendor/**", "scripts/test-braces-security.cjs"} <= set(
+            events[event]["paths"]
+        )

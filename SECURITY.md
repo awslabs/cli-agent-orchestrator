@@ -125,10 +125,14 @@ required check; adding a requirement does not retroactively run CI.
 The docs, web UI, and MCP Apps toolchains replace the affected `braces` dependency
 with the exact canonical dependency `@dieub/braces-depth-guard@3.0.3-pn.3`.
 This is a **published third-party MIT-licensed fork**, not an official fixed
-`micromatch/braces` release. The lockfiles and installed manifest retain the
-fork's real name, version, registry tarball URL, and integrity. Do not use its
-`latest` tag, which points to an earlier bootstrap release rather than the
-reviewed guarded version.
+`micromatch/braces` release. The original, unmodified registry tarball is
+committed under [`vendor/`](vendor/README.md), and all three projects install it
+through a relative `file:` tarball dependency. Cold installs therefore do not
+depend on the fork owner retaining its npm package or GitHub repository.
+The lockfiles and installed manifest retain the fork's real name, version,
+MIT license, and original registry integrity; only the fetch location changes.
+Do not use its `latest` tag, which points to an earlier bootstrap release
+rather than the reviewed guarded version.
 
 Each isolated npm project has a private `braces-compat` package whose only
 executable statement re-exports this canonical dependency. `braces` is a
@@ -144,10 +148,12 @@ package identity. GitHub misidentified the version-3 npm alias as upstream
 `braces@3.0.3-pn.3`. Version-2 compatibility metadata instead produced an
 unparsed alias version and missing license; that apparent green result was
 rejected and the format conversion reverted. Keep normal version-3 lockfiles
-and the real fork as a directly identifiable registry dependency. Both
-Dependency Review and the full scan must cover its actual name and version.
+and the real fork as a directly identifiable package, even when its tarball is
+local. Both Dependency Review and the full scan must cover its actual name and
+version, and Dependency Review must retain its MIT license.
 
-The published tarball's ten files were matched byte-for-byte to
+The vendored tarball retains the published archive's SHA-512 integrity, and its
+ten files were matched byte-for-byte to
 [source commit `305a2e4b`](https://github.com/dieub/braces-depth-guard/tree/305a2e4bfe324bb53c336c1b03387ee1251c926f).
 `npm audit signatures` verified registry signatures and available attestations;
 the fork's npm provenance identifies that commit and its release workflow.
@@ -155,6 +161,13 @@ The fork has no install lifecycle script. Its parser/recursive-AST depth
 guards cap nesting at 100, honor lower `maxDepth` values, reject parent cycles,
 and preserve the original quote/escape behavior. These bounds are not general
 limits on AST width or expansion cardinality.
+
+Keep `vendor/`, `patches/`, `scripts/`, and the project-local adapter in the
+checkout used for installation. The archive's original MIT license is included
+inside it. If a checkout loses or corrupts the archive, restore the tracked
+file from the same trusted repository revision; do not fall back to a registry
+tag or regenerate different bytes under the same version. Regression checks
+verify the archive against the reviewed digest and all three lockfiles.
 
 The small shared
 [`patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch`](patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch)
@@ -176,10 +189,39 @@ An applied local patch is not an exception to the HIGH/CRITICAL policy.
 The vulnerable original `braces@3.0.3` is no longer in these three locked graphs.
 That is a reviewed implementation replacement, not an advisory dismissal,
 version rewrite, or scanner exemption. The default-branch alert remains open
-until the replacement reaches that branch and GitHub rescans it. Reconsider
-the fork and local patch when an official fixed release is available, retaining
-the security/compatibility checks. A passing mitigation check alone must never
-be described as a clean dependency scan.
+until the replacement reaches that branch and GitHub rescans it. A passing
+mitigation check alone must never be described as a clean dependency scan.
+
+#### Guarded-fork maintenance
+
+Advisories against upstream `braces` do **not** automatically match the
+separately named fork or private local adapter in Trivy, Dependabot, or
+Dependency Review. This includes new upstream defects outside the depth guards.
+Dependabot also cannot propose an upstream `braces` upgrade through these local
+dependencies. Vendoring removes the fork's availability risk, not this
+advisory/update visibility gap; green checks are not an upstream monitoring
+signal.
+
+The security CODEOWNERS (`@awslabs/multiq`) own a **manual upstream review as part
+of each weekly dependency-scan review and before a release**:
+
+- Track [GHSA-vfj7-8cjw-p6xm](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm)
+  and [micromatch/braces#70](https://github.com/micromatch/braces/issues/70).
+  The proposed fixes are
+  [#77](https://github.com/micromatch/braces/pull/77),
+  [#78](https://github.com/micromatch/braces/pull/78), and
+  [#79](https://github.com/micromatch/braces/pull/79); an open or merged PR is
+  not itself a published fixed release.
+- Check newly published
+  [npm `braces` advisories](https://github.com/advisories?query=ecosystem%3Anpm+affects%3Abraces)
+  against the retained source, not just advisories naming the fork. Record any
+  applicable defect and its remediation in a repository issue.
+- When an official unaffected release is published, replace the fork, adapters,
+  and local patch together only after the existing depth/cycle/ancestor and
+  compatibility suites pass in all three projects. Recheck actual package
+  names, versions, and licenses in Dependency Review and the full scan.
+
+These are explicit maintainer review checkpoints, not automated notifications.
 
 #### Additional upstream security releases
 
