@@ -35,7 +35,8 @@
     ]
   },
   "dependencies": {
-    "braces": "npm:@dieub/braces-depth-guard@3.0.3-pn.3",
+    "@dieub/braces-depth-guard": "3.0.3-pn.3",
+    "braces": "file:braces-compat",
     "graphology": "^0.26.0",
     "graphology-layout": "^0.6.1",
     "patch-package": "8.0.1",

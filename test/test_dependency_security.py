@@ -295,10 +295,7 @@ def test_cargo_manifest_does_not_make_trivy_drop_development_dependencies(reposi
 
 
 @pytest.mark.skipif(shutil.which("trivy") is None, reason="Requires the CI-pinned Trivy binary")
-@pytest.mark.parametrize("lockfile_version", [2, 3])
-def test_real_trivy_keeps_dev_only_packages_in_published_inventory(
-    repository, tmp_path, lockfile_version
-):
+def test_real_trivy_keeps_dev_only_packages_in_published_inventory(repository, tmp_path):
     manifest = {
         "name": "inventory-node",
         "version": "1.0.0",
@@ -306,28 +303,27 @@ def test_real_trivy_keeps_dev_only_packages_in_published_inventory(
         "devDependencies": {"wrappy": "1.0.2"},
     }
     (repository / "package.json").write_text(json.dumps(manifest))
-    lock = {
-        "name": "inventory-node",
-        "version": "1.0.0",
-        "lockfileVersion": lockfile_version,
-        "packages": {
-            "": manifest,
-            "node_modules/is-number": {
-                "version": "7.0.0",
-                "resolved": "https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz",
-            },
-            "node_modules/wrappy": {
-                "version": "1.0.2",
-                "resolved": "https://registry.npmjs.org/wrappy/-/wrappy-1.0.2.tgz",
-                "dev": True,
-            },
-        },
-    }
-    if lockfile_version == 2:
-        lock["dependencies"] = {
-            name: lock["packages"][f"node_modules/{name}"] for name in ("is-number", "wrappy")
-        }
-    (repository / "package-lock.json").write_text(json.dumps(lock))
+    (repository / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "name": "inventory-node",
+                "version": "1.0.0",
+                "lockfileVersion": 3,
+                "packages": {
+                    "": manifest,
+                    "node_modules/is-number": {
+                        "version": "7.0.0",
+                        "resolved": "https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz",
+                    },
+                    "node_modules/wrappy": {
+                        "version": "1.0.2",
+                        "resolved": "https://registry.npmjs.org/wrappy/-/wrappy-1.0.2.tgz",
+                        "dev": True,
+                    },
+                },
+            }
+        )
+    )
     python = repository / "python"
     python.mkdir()
     (python / "pyproject.toml").write_text(
@@ -444,7 +440,8 @@ def test_audit_reports_and_mitigations_are_not_skipped_after_scanner_setup_failu
 @pytest.mark.parametrize("project", ["docusaurus", "web", "cao_mcp_apps"])
 def test_all_affected_projects_install_the_shared_patch_and_regressions(project):
     manifest = json.loads((ROOT / project / "package.json").read_text())
-    assert manifest["dependencies"]["braces"] == "npm:@dieub/braces-depth-guard@3.0.3-pn.3"
+    assert manifest["dependencies"]["braces"] == "file:braces-compat"
+    assert manifest["dependencies"]["@dieub/braces-depth-guard"] == "3.0.3-pn.3"
     assert manifest["overrides"]["braces"] == "$braces"
     assert manifest["dependencies"]["patch-package"] == "8.0.1"
     assert (
@@ -458,20 +455,22 @@ def test_all_affected_projects_install_the_shared_patch_and_regressions(project)
     assert manifest["scripts"]["test:dependencies"] == f"node --test {wrapper}"
     assert "../../scripts/test-braces-security.cjs" in (ROOT / project / wrapper).read_text()
     lock = json.loads((ROOT / project / "package-lock.json").read_text())
-    assert "lockfile-version=2" in (ROOT / project / ".npmrc").read_text().splitlines()
-    assert lock["lockfileVersion"] == 2
-    assert lock["dependencies"]["braces"]["version"] == manifest["dependencies"]["braces"]
-    installed = [
-        entry for location, entry in lock["packages"].items() if location.endswith("/braces")
-    ]
-    assert installed
-    for entry in installed:
-        assert entry["name"] == "@dieub/braces-depth-guard"
-        assert entry["version"] == "3.0.3-pn.3"
-        assert entry["resolved"] == (
-            "https://registry.npmjs.org/@dieub/braces-depth-guard/-/"
-            "braces-depth-guard-3.0.3-pn.3.tgz"
-        )
+    assert lock["lockfileVersion"] == 3
+    assert "install-links=false" in (ROOT / project / ".npmrc").read_text().splitlines()
+    assert lock["packages"]["node_modules/braces"] == {
+        "resolved": "braces-compat",
+        "link": True,
+    }
+    adapter = json.loads((ROOT / project / "braces-compat" / "package.json").read_text())
+    assert adapter["private"] is True
+    assert adapter["name"] == "cao-braces-compat"
+    assert adapter["peerDependencies"] == {"@dieub/braces-depth-guard": "3.0.3-pn.3"}
+    entry = lock["packages"]["node_modules/@dieub/braces-depth-guard"]
+    assert entry["version"] == "3.0.3-pn.3"
+    assert entry["resolved"] == (
+        "https://registry.npmjs.org/@dieub/braces-depth-guard/-/"
+        "braces-depth-guard-3.0.3-pn.3.tgz"
+    )
 
 
 @pytest.mark.parametrize(

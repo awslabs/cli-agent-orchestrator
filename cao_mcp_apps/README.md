@@ -51,16 +51,16 @@ cd cao_mcp_apps
 npm install
 ```
 
-Use npm 10+ with install scripts enabled. The exact `braces` alias installs
-the published guarded fork `@dieub/braces-depth-guard@3.0.3-pn.3`; `postinstall`
+Use npm 10+ with install scripts enabled. The private local `braces-compat`
+adapter re-exports the canonical dependency
+`@dieub/braces-depth-guard@3.0.3-pn.3`. Keep `.npmrc`'s `install-links=false`
+setting and include `braces-compat/` when installing the project. `postinstall`
 applies the shared
-[`../patches/braces+3.0.3-pn.3.patch`](../patches/braces+3.0.3-pn.3.patch)
+[`../patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch`](../patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch)
 and fails if it cannot apply. The patch adds a bound on acyclic AST ancestor
 traversal to the fork's parser, recursive-AST, and cycle guards.
 `npm run test:dependencies` verifies the installed mitigation and its consumers;
 `npm run build:all` runs it automatically.
-Keep `.npmrc`'s version-2 lockfile setting so dependency-graph readers receive
-the complete npm alias metadata.
 
 The lockfile retains the fork's real package identity, version, and integrity.
 This is a third-party replacement, not an official fixed release or an advisory

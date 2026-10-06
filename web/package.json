@@ -14,9 +14,10 @@
     "test:dependencies": "node --test scripts/dependency-security.cjs"
   },
   "dependencies": {
+    "@dieub/braces-depth-guard": "3.0.3-pn.3",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
-    "braces": "npm:@dieub/braces-depth-guard@3.0.3-pn.3",
+    "braces": "file:braces-compat",
     "graphology": "^0.26.0",
     "graphology-layout": "^0.6.1",
     "lucide-react": "^0.562.0",

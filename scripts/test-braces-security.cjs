@@ -31,7 +31,7 @@ function nestedAst(depth, type = 'root') {
 
 function registerTests(project) {
   const localRequire = createRequire(path.join(project, 'package.json'));
-  const braces = localRequire('braces');
+  const braces = localRequire('@dieub/braces-depth-guard');
   const micromatch = localRequire('micromatch');
   const lock = localRequire('./package-lock.json');
 
@@ -253,7 +253,9 @@ function registerTests(project) {
     test(`${location} resolves the guarded braces implementation`, () => {
       assert.equal(consumer.resolve('braces'), localRequire.resolve('braces'));
       const dependency = consumer('braces');
-      const manifest = consumer('braces/package.json');
+      assert.equal(dependency, braces);
+      assert.equal(consumer('braces/package.json').private, true);
+      const manifest = consumer('@dieub/braces-depth-guard/package.json');
       assert.equal(manifest.name, '@dieub/braces-depth-guard');
       assert.equal(manifest.version, '3.0.3-pn.3');
       const pattern = '{'.repeat(maxDepth + 1) + 'x' + '}'.repeat(maxDepth + 1);

@@ -29,19 +29,19 @@ security patch. Do not disable install scripts: `postinstall` runs
 `patch-package --patch-dir ../patches --error-on-fail`. `npm run build` runs
 `npm run test:dependencies` before assembling the courses and site; the same
 checks can be run independently while updating dependencies.
-Keep the `.npmrc` lockfile-version setting: version 2 includes the full npm
-alias metadata needed by dependency-graph readers, without changing the
-resolved packages.
 
 Two transitive dependencies have explicit security overrides:
 
-- **`braces`** resolves through an exact npm alias to the published third-party
-  MIT fork `@dieub/braces-depth-guard@3.0.3-pn.3`, shared with the web UI and
-  MCP Apps toolchains. It replaces the affected original package while retaining
+- **`braces`** resolves through the private local `braces-compat` adapter to the
+  canonical published third-party MIT fork
+  `@dieub/braces-depth-guard@3.0.3-pn.3`, shared with the web UI and
+  MCP Apps toolchains. The adapter only re-exports the fork; keep
+  `.npmrc`'s `install-links=false` setting and include `braces-compat/` when
+  installing the project. It replaces the affected original while retaining
   quoted/escaped pattern behavior, and bounds parsing and recursive AST depth
   to 100 (or a lower `maxDepth`). Both `chokidar` and `micromatch` resolve the
   fork under their existing `braces` import.
-  [`../patches/braces+3.0.3-pn.3.patch`](../patches/braces+3.0.3-pn.3.patch)
+  [`../patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch`](../patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch)
   retains our additional bound on acyclic ancestor traversal; the fork already
   rejects parent cycles. This is not an official fixed upstream release or a
   scanner exemption. See [SECURITY.md](../SECURITY.md#local-dependency-mitigations)

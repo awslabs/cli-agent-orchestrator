@@ -20,11 +20,12 @@
     "test:dependencies": "node --test test/dependency-security.test.cjs"
   },
   "dependencies": {
+    "@dieub/braces-depth-guard": "3.0.3-pn.3",
     "@docusaurus/core": "3.10.2",
     "@docusaurus/faster": "3.10.2",
     "@docusaurus/preset-classic": "3.10.2",
     "@mdx-js/react": "^3.0.0",
-    "braces": "npm:@dieub/braces-depth-guard@3.0.3-pn.3",
+    "braces": "file:braces-compat",
     "clsx": "^2.0.0",
     "patch-package": "8.0.1",
     "prism-react-renderer": "^2.3.0",

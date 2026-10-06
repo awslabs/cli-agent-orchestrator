@@ -123,25 +123,29 @@ required check; adding a requirement does not retroactively run CI.
 #### Local dependency mitigations
 
 The docs, web UI, and MCP Apps toolchains replace the affected `braces` dependency
-with the exact npm alias `npm:@dieub/braces-depth-guard@3.0.3-pn.3`.
+with the exact canonical dependency `@dieub/braces-depth-guard@3.0.3-pn.3`.
 This is a **published third-party MIT-licensed fork**, not an official fixed
-`micromatch/braces` release. The alias preserves consumers' `require('braces')`
-API; the lockfiles and installed manifest retain the fork's real name, version,
-registry tarball URL, and integrity. Each project declares the alias directly
-and uses `"braces": "$braces"` in `overrides`, so consumers share the root
-installation to which the local patch is applied; the regression checks this
-resolution identity. Do not use its `latest` tag, which points
-to an earlier bootstrap release rather than the reviewed guarded version.
+`micromatch/braces` release. The lockfiles and installed manifest retain the
+fork's real name, version, registry tarball URL, and integrity. Do not use its
+`latest` tag, which points to an earlier bootstrap release rather than the
+reviewed guarded version.
 
-These projects retain npm's version-2 lockfile compatibility metadata through
-their `.npmrc` files. It records the complete `npm:<package>@<version>` alias in
-the legacy dependency map as well as the real name/version in `packages`.
-GitHub's dependency graph misidentified the version-3 alias as upstream
-`braces@3.0.3-pn.3`, attaching upstream advisories despite the correct tarball
-and Trivy inventory. Any format change must preserve the resolved graph and
-verify the canonical package identity in both GitHub Dependency Review and
-the full Trivy inventory; a missing package or invalid-version bypass is not
-an acceptable clean result.
+Each isolated npm project has a private `braces-compat` package whose only
+executable statement re-exports this canonical dependency. `braces` is a
+`file:braces-compat` dependency, and `"braces": "$braces"` overrides every
+transitive consumer to that local adapter. The adapter declares the exact fork
+as a peer, and `.npmrc` keeps `install-links=false`. Consumers retain their
+`require('braces')` API and share the patched canonical module by object identity,
+which the regression suite verifies. The adapter is private CAO source, not
+an invented upstream release.
+
+Do not replace this with a registry alias without verifying GitHub's canonical
+package identity. GitHub misidentified the version-3 npm alias as upstream
+`braces@3.0.3-pn.3`. Version-2 compatibility metadata instead produced an
+unparsed alias version and missing license; that apparent green result was
+rejected and the format conversion reverted. Keep normal version-3 lockfiles
+and the real fork as a directly identifiable registry dependency. Both
+Dependency Review and the full scan must cover its actual name and version.
 
 The published tarball's ten files were matched byte-for-byte to
 [source commit `305a2e4b`](https://github.com/dieub/braces-depth-guard/tree/305a2e4bfe324bb53c336c1b03387ee1251c926f).
@@ -153,10 +157,10 @@ and preserve the original quote/escape behavior. These bounds are not general
 limits on AST width or expansion cardinality.
 
 The small shared
-[`patches/braces+3.0.3-pn.3.patch`](patches/braces+3.0.3-pn.3.patch)
+[`patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch`](patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch)
 additionally bounds *acyclic* ancestor traversal using the same depth limit,
-which the published fork does not do. The filename uses the installed alias,
-not an invented upstream release. Use npm 10+ and keep install scripts enabled:
+which the published fork does not do. It targets the canonical installed
+package. Use npm 10+ and keep install scripts enabled:
 `postinstall` runs `patch-package --patch-dir ../patches --error-on-fail`.
 `patch-package` remains a normal dependency so that postinstall is available
 when dev dependencies are omitted.

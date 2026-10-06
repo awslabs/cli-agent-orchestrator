@@ -1,7 +1,7 @@
-diff --git a/node_modules/braces/lib/expand.js b/node_modules/braces/lib/expand.js
+diff --git a/node_modules/@dieub/braces-depth-guard/lib/expand.js b/node_modules/@dieub/braces-depth-guard/lib/expand.js
 index c144119..8e25698 100644
---- a/node_modules/braces/lib/expand.js
-+++ b/node_modules/braces/lib/expand.js
+--- a/node_modules/@dieub/braces-depth-guard/lib/expand.js
++++ b/node_modules/@dieub/braces-depth-guard/lib/expand.js
 @@ -31,9 +31,13 @@ const append = (queue = '', stash = '', enclose = false) => {
  };
  

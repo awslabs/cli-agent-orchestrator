@@ -6,13 +6,13 @@ A single-page dashboard for managing CLI Agent Orchestrator sessions, agents, fl
 
 Use npm 10+ and `npm ci` with install scripts enabled. All `braces` consumers
 resolve the published guarded fork `@dieub/braces-depth-guard@3.0.3-pn.3` through
-an exact npm alias. Its fail-on-error `postinstall` applies
-[`../patches/braces+3.0.3-pn.3.patch`](../patches/braces+3.0.3-pn.3.patch), shared
+the private local `braces-compat` adapter, which only re-exports the canonical
+dependency. Keep `.npmrc`'s `install-links=false` setting and include
+`braces-compat/` when installing the project. Its fail-on-error `postinstall` applies
+[`../patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch`](../patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch), shared
 with the docs and MCP Apps toolchains, to additionally bound acyclic AST
 ancestor traversal. `npm run test:dependencies` checks the installed implementation
 and its consumers; `npm run build` runs these checks automatically.
-Keep `.npmrc`'s version-2 lockfile setting so dependency-graph readers receive
-the complete npm alias metadata.
 
 This replaces the affected original with a reviewed third-party implementation;
 it is not an official fixed release or a scanner exemption. See
