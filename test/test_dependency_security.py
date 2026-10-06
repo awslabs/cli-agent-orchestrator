@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -123,7 +124,6 @@ def test_every_tracked_graph_is_scanned_without_a_diff_or_path_filter(
     report = audit.scan(repository)
     assert report["blocking"] == 1
     assert set(report["input_sha256"]) == {
-        "package.json",
         "package-lock.json",
         "another-project/uv.lock",
     }
@@ -227,14 +227,18 @@ def test_invalid_scanner_reports_preserve_provenance(repository, tmp_path, monke
 
 
 def test_input_copy_failure_retains_only_copied_hashes(repository, tmp_path, monkeypatch):
+    extra = repository / "z-project" / "uv.lock"
+    extra.parent.mkdir()
+    extra.write_text("version = 1\n")
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
     copy = audit.shutil.copyfile
 
-    def fail_manifest_copy(source, destination):
-        if source.name == "package.json":
-            raise OSError("Cannot copy manifest")
+    def fail_lock_copy(source, destination):
+        if source.name == "uv.lock":
+            raise OSError("Cannot copy lockfile")
         return copy(source, destination)
 
-    monkeypatch.setattr(audit.shutil, "copyfile", fail_manifest_copy)
+    monkeypatch.setattr(audit.shutil, "copyfile", fail_lock_copy)
     calls = scanner(monkeypatch)
     output = tmp_path / "reports"
     assert audit.main(["--output-dir", str(output)]) == 2
@@ -288,6 +292,87 @@ def test_cargo_manifest_does_not_make_trivy_drop_development_dependencies(reposi
     inputs = audit.tracked_inputs(repository)
     assert Path("another-project/Cargo.lock") in inputs
     assert Path("another-project/Cargo.toml") not in inputs
+
+
+@pytest.mark.skipif(shutil.which("trivy") is None, reason="Requires the CI-pinned Trivy binary")
+def test_real_trivy_keeps_dev_only_packages_in_published_inventory(repository, tmp_path):
+    manifest = {
+        "name": "inventory-node",
+        "version": "1.0.0",
+        "dependencies": {"is-number": "7.0.0"},
+        "devDependencies": {"wrappy": "1.0.2"},
+    }
+    (repository / "package.json").write_text(json.dumps(manifest))
+    (repository / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "name": "inventory-node",
+                "version": "1.0.0",
+                "lockfileVersion": 3,
+                "packages": {
+                    "": manifest,
+                    "node_modules/is-number": {
+                        "version": "7.0.0",
+                        "resolved": "https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz",
+                    },
+                    "node_modules/wrappy": {
+                        "version": "1.0.2",
+                        "resolved": "https://registry.npmjs.org/wrappy/-/wrappy-1.0.2.tgz",
+                        "dev": True,
+                    },
+                },
+            }
+        )
+    )
+    python = repository / "python"
+    python.mkdir()
+    (python / "pyproject.toml").write_text(
+        '[project]\nname = "inventory-python"\nversion = "1.0.0"\n'
+        'requires-python = ">=3.10"\ndependencies = ["idna==3.10"]\n'
+        '[dependency-groups]\ndev = ["packaging==24.2"]\n'
+    )
+    (python / "uv.lock").write_text(
+        'version = 1\nrevision = 3\nrequires-python = ">=3.10"\n'
+        '[[package]]\nname = "inventory-python"\nversion = "1.0.0"\n'
+        'source = { editable = "." }\ndependencies = [{ name = "idna" }]\n'
+        '[package.dev-dependencies]\ndev = [{ name = "packaging" }]\n'
+        '[[package]]\nname = "idna"\nversion = "3.10"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        '[[package]]\nname = "packaging"\nversion = "24.2"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+    )
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    output = tmp_path / "reports"
+    code = audit.main(["--output-dir", str(output)])
+    report = json.loads((output / "report.json").read_text())
+    assert code in {0, 1}, report
+    assert set(report["input_sha256"]) == {"package-lock.json", "python/uv.lock"}
+    inventories = {
+        graph["path"]: {(item["name"], item["version"]) for item in graph["dependencies"]}
+        for graph in report["inventory"]
+    }
+    assert {("is-number", "7.0.0"), ("wrappy", "1.0.2")} <= inventories["package-lock.json"]
+    assert {("idna", "3.10"), ("packaging", "24.2")} <= inventories["python/uv.lock"]
+
+
+def test_real_inventory_regression_has_a_required_scanner_in_ci():
+    ci = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    job = ci["jobs"]["test"]
+    assert "3.12" in job["strategy"]["matrix"]["python-version"]
+    setup = next(
+        step
+        for step in job["steps"]
+        if step.get("uses", "").startswith("aquasecurity/setup-trivy@")
+    )
+    action = yaml.safe_load(
+        (ROOT / ".github" / "actions" / "dependency-security" / "action.yml").read_text()
+    )
+    assert setup["if"] == "matrix.python-version == '3.12'"
+    assert setup["uses"] == action["runs"]["steps"][0]["uses"]
+    assert setup["with"] == action["runs"]["steps"][0]["with"]
+    tests = next(step for step in job["steps"] if "uv run pytest" in step.get("run", ""))
+    assert 'if [ "${{ matrix.python-version }}" = "3.12" ]; then' in tests["run"]
+    assert "trivy --version" in tests["run"]
 
 
 def test_dependency_input_cannot_be_a_symlink(repository, tmp_path):
@@ -355,12 +440,88 @@ def test_audit_reports_and_mitigations_are_not_skipped_after_scanner_setup_failu
 @pytest.mark.parametrize("project", ["docusaurus", "web", "cao_mcp_apps"])
 def test_all_affected_projects_install_the_shared_patch_and_regressions(project):
     manifest = json.loads((ROOT / project / "package.json").read_text())
-    assert manifest["overrides"]["braces"] == "3.0.3"
+    assert manifest["dependencies"]["braces"] == "npm:@dieub/braces-depth-guard@3.0.3-pn.3"
+    assert manifest["overrides"]["braces"] == "$braces"
     assert manifest["dependencies"]["patch-package"] == "8.0.1"
     assert (
         manifest["scripts"]["postinstall"] == "patch-package --patch-dir ../patches --error-on-fail"
     )
-    assert "test:dependencies" in manifest["scripts"]
+    wrapper = (
+        "test/dependency-security.test.cjs"
+        if project == "docusaurus"
+        else "scripts/dependency-security.cjs"
+    )
+    assert manifest["scripts"]["test:dependencies"] == f"node --test {wrapper}"
+    assert "../../scripts/test-braces-security.cjs" in (ROOT / project / wrapper).read_text()
+    lock = json.loads((ROOT / project / "package-lock.json").read_text())
+    installed = [
+        entry for location, entry in lock["packages"].items() if location.endswith("/braces")
+    ]
+    assert installed
+    for entry in installed:
+        assert entry["name"] == "@dieub/braces-depth-guard"
+        assert entry["version"] == "3.0.3-pn.3"
+        assert entry["resolved"] == (
+            "https://registry.npmjs.org/@dieub/braces-depth-guard/-/"
+            "braces-depth-guard-3.0.3-pn.3.tgz"
+        )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [None]
+    + [
+        (project, stage)
+        for project in ("docusaurus", "web", "cao_mcp_apps")
+        for stage in ("ci", "run")
+    ],
+)
+def test_mitigation_step_checks_all_projects_and_preserves_failures(tmp_path, failure):
+    action = yaml.safe_load(
+        (ROOT / ".github" / "actions" / "dependency-security" / "action.yml").read_text()
+    )
+    step = next(step for step in action["runs"]["steps"] if "npm ci" in step.get("run", ""))
+    npm = tmp_path / "npm"
+    npm.write_text(
+        '#!/bin/bash\nprintf "%s\\n" "$*" >> "$NPM_CALLS"\n'
+        'if [[ "$*" == "$FAIL_COMMAND" ]]; then exit 1; fi\nexit 0\n'
+    )
+    npm.chmod(0o755)
+    commands = {
+        (project, "ci"): f"ci --prefix {project} --no-audit --no-fund"
+        for project in ("docusaurus", "web", "cao_mcp_apps")
+    } | {
+        (project, "run"): f"run test:dependencies --prefix {project}"
+        for project in ("docusaurus", "web", "cao_mcp_apps")
+    }
+    calls = tmp_path / "calls"
+    summary = tmp_path / "summary"
+    run = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", step["run"]],
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+            "NPM_CALLS": str(calls),
+            "FAIL_COMMAND": commands[failure] if failure else "",
+            "GITHUB_STEP_SUMMARY": str(summary),
+        },
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert run.returncode == int(failure is not None), run.stderr
+    expected = []
+    for project in ("docusaurus", "web", "cao_mcp_apps"):
+        expected.append(commands[project, "ci"])
+        if failure != (project, "ci"):
+            expected.append(commands[project, "run"])
+        status = (
+            "installation or mitigation checks FAILED."
+            if failure and failure[0] == project
+            else "mitigation checks passed; advisory status is unchanged."
+        )
+        assert f"- `{project}`: {status}" in summary.read_text()
+    assert calls.read_text().splitlines() == expected
 
 
 def test_shared_patch_and_tests_trigger_the_docs_build():

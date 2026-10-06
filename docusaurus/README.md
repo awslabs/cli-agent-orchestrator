@@ -24,7 +24,7 @@ This generates static content into the `build` directory.
 
 ## Dependency security
 
-Use `npm ci` to install the committed dependency graph and apply its local
+Use npm 10+ and `npm ci` to install the committed dependency graph and apply its local
 security patch. Do not disable install scripts: `postinstall` runs
 `patch-package --patch-dir ../patches --error-on-fail`. `npm run build` runs
 `npm run test:dependencies` before assembling the courses and site; the same
@@ -32,24 +32,18 @@ checks can be run independently while updating dependencies.
 
 Two transitive dependencies have explicit security overrides:
 
-- **`braces`** stays on the published `3.0.3` package and applies
-  [`../patches/braces+3.0.3.patch`](../patches/braces+3.0.3.patch), shared with
-  the web UI and MCP Apps toolchains. The patch uses the nesting guards proposed in
-  [micromatch/braces#72](https://github.com/micromatch/braces/pull/72).
-  It does not consume the fork's unrelated, unreleased parser changes:
-  quoted and escaped patterns retain the published package's behavior.
-  It bounds brace and parenthesis nesting to 100, honors lower `maxDepth`
-  values, and applies the same bound to recursion and parent-link traversal in
-  caller-supplied ASTs, rejecting cyclic ancestor chains during expansion.
-  The override applies to both `chokidar` and `micromatch`.
-  There is no official patched release yet. The package version remains
-  `3.0.3`, so version-based scanners, including `npm audit`, still report
-  [GHSA-vfj7-8cjw-p6xm](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm).
-  `npm audit` also flags affected parent packages and exits nonzero; the local
-  mitigation does not close the version-based alert or exempt it from the
-  full CI dependency gate.
-  Replace the local patch and version override with an official fixed release
-  once one is available and the dependency checks and site build pass.
+- **`braces`** resolves through an exact npm alias to the published third-party
+  MIT fork `@dieub/braces-depth-guard@3.0.3-pn.3`, shared with the web UI and
+  MCP Apps toolchains. It replaces the affected original package while retaining
+  quoted/escaped pattern behavior, and bounds parsing and recursive AST depth
+  to 100 (or a lower `maxDepth`). Both `chokidar` and `micromatch` resolve the
+  fork under their existing `braces` import.
+  [`../patches/braces+3.0.3-pn.3.patch`](../patches/braces+3.0.3-pn.3.patch)
+  retains our additional bound on acyclic ancestor traversal; the fork already
+  rejects parent cycles. This is not an official fixed upstream release or a
+  scanner exemption. See [SECURITY.md](../SECURITY.md#local-dependency-mitigations)
+  for source/provenance verification, the exact-version requirement, and
+  conditions for returning to an official release.
 - **`http-cache-semantics`** requires `^4.3.0`, outside the affected range
   currently recorded for
   [GHSA-ch52-4w7c-c8xp](https://github.com/advisories/GHSA-ch52-4w7c-c8xp).

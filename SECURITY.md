@@ -73,8 +73,8 @@ a dependency change. It uses only a read-only built-in token and never
 
 [`scripts/dependency_security.py`](scripts/dependency_security.py) discovers
 all tracked `package-lock.json`, `bun.lock`, `uv.lock`, and `Cargo.lock` files.
-It copies those files and required package manifests to a temporary scan
-directory, excluding local installed packages and build output. Trivy scans every locked
+It copies only those lockfiles to a temporary scan directory, excluding package
+manifests, local installed packages, and build output. Trivy scans every locked
 graph with development dependencies and unfixed findings included. The report
 must contain a nonempty inventory for every discovered lockfile; a missing
 graph, malformed report, missing scanner, timeout, or database/network failure
@@ -87,6 +87,16 @@ Cargo is scanned from `Cargo.lock` alone: Trivy
 [drops development dependencies when `Cargo.toml` is also supplied](https://trivy.dev/docs/latest/coverage/language/rust/).
 Keeping that manifest out of the scan snapshot includes every locked crate,
 without modifying either repository file.
+The other supported formats also contain their resolved graphs without
+colocated manifests: Trivy's
+[npm/Bun](https://github.com/aquasecurity/trivy/blob/v0.70.0/docs/guide/coverage/language/nodejs.md)
+and [uv](https://github.com/aquasecurity/trivy/blob/v0.70.0/docs/guide/coverage/language/python.md)
+scanners include development dependencies with `--include-dev-deps`.
+`package.json` and `pyproject.toml` are therefore omitted too, rather than
+assuming their presence cannot change filtering. The Python 3.12 CI unit job
+requires the same pinned Trivy binary and runs a real-scanner regression that
+asserts production and dev-only npm/uv packages appear in the published
+inventory, with only lockfile hashes in the snapshot.
 
 Each executed audit publishes an Actions summary and a `dependency-security-<attempt>`
 artifact, keeping rerun evidence separate, with scan time and CI revision.
@@ -112,22 +122,50 @@ required check; adding a requirement does not retroactively run CI.
 
 #### Local dependency mitigations
 
-The docs, web UI, and MCP Apps toolchains all install the same
-[`patches/braces+3.0.3.patch`](patches/braces+3.0.3.patch), using
-`patch-package --patch-dir ../patches --error-on-fail`. Do not disable install
-scripts. The patch bounds parsing, recursive AST traversal, and expansion's
-ancestor traversal, including cyclic parent links in caller-supplied ASTs,
-while retaining the published parser's ordinary quote/escape behavior. Each
-project exposes `npm run test:dependencies`, reusing the same brace-regression
-suite; the docs also retain their cache-policy regressions.
+The docs, web UI, and MCP Apps toolchains replace the affected `braces` dependency
+with the exact npm alias `npm:@dieub/braces-depth-guard@3.0.3-pn.3`.
+This is a **published third-party MIT-licensed fork**, not an official fixed
+`micromatch/braces` release. The alias preserves consumers' `require('braces')`
+API; the lockfiles and installed manifest retain the fork's real name, version,
+registry tarball URL, and integrity. Each project declares the alias directly
+and uses `"braces": "$braces"` in `overrides`, so consumers share the root
+installation to which the local patch is applied; the regression checks this
+resolution identity. Do not use its `latest` tag, which points
+to an earlier bootstrap release rather than the reviewed guarded version.
+
+The published tarball's ten files were matched byte-for-byte to
+[source commit `305a2e4b`](https://github.com/dieub/braces-depth-guard/tree/305a2e4bfe324bb53c336c1b03387ee1251c926f).
+`npm audit signatures` verified registry signatures and available attestations;
+the fork's npm provenance identifies that commit and its release workflow.
+The fork has no install lifecycle script. Its parser/recursive-AST depth
+guards cap nesting at 100, honor lower `maxDepth` values, reject parent cycles,
+and preserve the original quote/escape behavior. These bounds are not general
+limits on AST width or expansion cardinality.
+
+The small shared
+[`patches/braces+3.0.3-pn.3.patch`](patches/braces+3.0.3-pn.3.patch)
+additionally bounds *acyclic* ancestor traversal using the same depth limit,
+which the published fork does not do. The filename uses the installed alias,
+not an invented upstream release. Use npm 10+ and keep install scripts enabled:
+`postinstall` runs `patch-package --patch-dir ../patches --error-on-fail`.
+`patch-package` remains a normal dependency so that postinstall is available
+when dev dependencies are omitted.
+
+Each project's explicit `npm run test:dependencies` wrapper invokes the shared
+suite, requires at least one locked consumer, and verifies every consumer's
+resolved package identity as well as depth, cycle, unmatched-closer, and
+ordinary-pattern behavior. The docs also retain their cache-policy regressions.
 
 CI performs clean installs and runs those checks even when the advisory gate
 is red, reporting **mitigation verification separately from advisory status**.
 An applied local patch is not an exception to the HIGH/CRITICAL policy.
-`braces` retains its truthful `3.0.3` version: until an unaffected dependency is
-available or the dependency is removed, GHSA-vfj7-8cjw-p6xm remains visible and
-blocking. Do not dismiss it, rename the package to evade detection, or label a
-passing mitigation check as a clean dependency scan.
+The vulnerable original `braces@3.0.3` is no longer in these three locked graphs.
+That is a reviewed implementation replacement, not an advisory dismissal,
+version rewrite, or scanner exemption. The default-branch alert remains open
+until the replacement reaches that branch and GitHub rescans it. Reconsider
+the fork and local patch when an official fixed release is available, retaining
+the security/compatibility checks. A passing mitigation check alone must never
+be described as a clean dependency scan.
 
 ### CodeQL Static Analysis
 
@@ -298,7 +336,7 @@ Run the same full dependency gate as CI with Trivy 0.70.0 and Python 3.10+:
 scripts/security-scan.sh dependencies
 ```
 
-This reads the current contents of tracked manifests/lockfiles; stage new files
+This reads the current contents of tracked lockfiles; stage new files
 before scanning them. It writes `dependency-security-results/report.json` and
 `summary.md` (gitignored) and exits nonzero for HIGH/CRITICAL findings or scan
 errors. It does not install packages or execute their lifecycle scripts.
@@ -335,14 +373,22 @@ rm -f requirements.txt
 > `[secret] Secret scanning is enabled`. `--scanners vuln` would hide the
 > secret findings CI blocks on. (See issue #568.)
 
-Or use the bundled wrapper that mirrors CI (`trivy` + optional local CodeQL):
+The bundled wrapper runs the full dependency gate first, then other available
+local scanners:
 
 ```bash
-scripts/security-scan.sh           # run all available scanners
-scripts/security-scan.sh trivy     # just Trivy
-scripts/security-scan.sh codeql    # just CodeQL (requires the CodeQL CLI)
-scripts/security-scan.sh gitleaks  # just gitleaks (requires the gitleaks CLI)
+scripts/security-scan.sh               # required dependency gate, then available other scanners
+scripts/security-scan.sh dependencies  # full locked dependency gate (requires Trivy)
+scripts/security-scan.sh trivy         # legacy filesystem/secret scan only
+scripts/security-scan.sh codeql        # just CodeQL (requires the CodeQL CLI)
+scripts/security-scan.sh gitleaks      # just gitleaks (requires the gitleaks CLI)
 ```
+
+The default `all` mode requires Trivy for the dependency gate; a missing
+scanner is not a successful skip. The Python scanner exits 2 on scan errors,
+which the wrapper maps to exit 1 (as it does for blocking findings). Other
+available scanners still run afterward, but cannot erase an earlier failure.
+Unavailable optional scanners are reported as skipped, not as verified checks.
 
 ## Tool Restrictions (allowedTools)
 

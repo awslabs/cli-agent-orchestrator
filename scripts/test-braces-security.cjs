@@ -53,6 +53,33 @@ function registerTests(project) {
           });
         }
       });
+
+      test(`${method} does not let unmatched closers reduce ${name} depth`, () => {
+        for (const prefix of [
+          close.repeat(maxDepth * 2),
+          '})'.repeat(maxDepth),
+        ]) {
+          assert.doesNotThrow(() =>
+            bounded(() =>
+              braces[method](
+                prefix + open.repeat(maxDepth) + 'x' + close.repeat(maxDepth),
+              ),
+            ),
+          );
+          assert.throws(
+            () =>
+              bounded(() =>
+                braces[method](
+                  prefix +
+                    open.repeat(maxDepth + 1) +
+                    'x' +
+                    close.repeat(maxDepth + 1),
+                ),
+              ),
+            {name: 'SyntaxError', message: /exceeds max depth/},
+          );
+        }
+      });
     }
 
     test(`${method} honors a lower limit without allowing the safety cap to increase`, () => {
@@ -135,7 +162,7 @@ function registerTests(project) {
       for (const ast of [parents[0], {type: 'root', nodes: [parents[0]]}]) {
         assert.throws(() => bounded(() => braces.expand(ast)), {
           name: 'RangeError',
-          message: /AST parent depth .* exceeds max depth/,
+          message: 'AST parent chain contains a cycle',
         });
       }
     }
@@ -209,13 +236,26 @@ function registerTests(project) {
     );
   });
 
-  for (const [location, entry] of Object.entries(lock.packages)) {
-    if (!entry.dependencies?.braces) continue;
+  const consumers = Object.entries(lock.packages).filter(
+    ([location, entry]) => location && entry.dependencies?.braces,
+  );
+  test('the locked graph contains transitive brace consumers to verify', () => {
+    assert.ok(
+      consumers.length > 0,
+      'No braces consumers found in package-lock.json',
+    );
+  });
+
+  for (const [location] of consumers) {
     const consumer = createRequire(
       path.join(project, location, 'package.json'),
     );
     test(`${location} resolves the guarded braces implementation`, () => {
+      assert.equal(consumer.resolve('braces'), localRequire.resolve('braces'));
       const dependency = consumer('braces');
+      const manifest = consumer('braces/package.json');
+      assert.equal(manifest.name, '@dieub/braces-depth-guard');
+      assert.equal(manifest.version, '3.0.3-pn.3');
       const pattern = '{'.repeat(maxDepth + 1) + 'x' + '}'.repeat(maxDepth + 1);
       assert.throws(() => bounded(() => dependency(pattern)), {
         name: 'SyntaxError',
@@ -230,4 +270,3 @@ function registerTests(project) {
 }
 
 module.exports = registerTests;
-if (require.main === module) registerTests(process.cwd());

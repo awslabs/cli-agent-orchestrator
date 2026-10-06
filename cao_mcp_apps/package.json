@@ -13,7 +13,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:dependencies": "node --test ../scripts/test-braces-security.cjs",
+    "test:dependencies": "node --test scripts/dependency-security.cjs",
     "test:e2e": "playwright test",
     "test:e2e:install": "playwright install --with-deps chromium",
     "build:dashboard": "vite build -c vite.config.dashboard.ts",
@@ -35,6 +35,7 @@
     ]
   },
   "dependencies": {
+    "braces": "npm:@dieub/braces-depth-guard@3.0.3-pn.3",
     "graphology": "^0.26.0",
     "graphology-layout": "^0.6.1",
     "patch-package": "8.0.1",
@@ -62,7 +63,7 @@
     "vitest": "^4.1.11"
   },
   "overrides": {
-    "braces": "3.0.3",
+    "braces": "$braces",
     "nanoid": "^3.3.17"
   }
 }

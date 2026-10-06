@@ -24,6 +24,7 @@
     "@docusaurus/faster": "3.10.2",
     "@docusaurus/preset-classic": "3.10.2",
     "@mdx-js/react": "^3.0.0",
+    "braces": "npm:@dieub/braces-depth-guard@3.0.3-pn.3",
     "clsx": "^2.0.0",
     "patch-package": "8.0.1",
     "prism-react-renderer": "^2.3.0",
@@ -55,7 +56,7 @@
   "overrides": {
     "fast-uri": "^3.1.8",
     "brace-expansion": "^5.0.12",
-    "braces": "3.0.3",
+    "braces": "$braces",
     "http-cache-semantics": "^4.3.0",
     "image-size": "npm:image-size-safe@2.0.3",
     "js-yaml": "^4.3.2",

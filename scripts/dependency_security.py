@@ -15,14 +15,14 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+# These formats contain resolved graphs; colocated manifests are unnecessary.
+# In particular, Cargo.toml makes Trivy drop locked development dependencies.
 LOCKFILES = {
     "package-lock.json": "npm",
     "bun.lock": "bun",
     "uv.lock": "uv",
     "Cargo.lock": "cargo",
 }
-# Trivy drops Cargo development dependencies when Cargo.toml accompanies the lockfile.
-MANIFESTS = {"package.json", "pyproject.toml"}
 SEVERITIES = {"UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL"}
 BLOCKING = {"HIGH", "CRITICAL"}
 
@@ -34,7 +34,7 @@ def tracked_inputs(root: Path) -> list[Path]:
     paths = [
         Path(os.fsdecode(name))
         for name in listing.split(b"\0")
-        if name and Path(os.fsdecode(name)).name in LOCKFILES.keys() | MANIFESTS
+        if name and Path(os.fsdecode(name)).name in LOCKFILES
     ]
     if not any(path.name in LOCKFILES for path in paths):
         raise ValueError("No tracked dependency lockfiles found; coverage cannot be verified")

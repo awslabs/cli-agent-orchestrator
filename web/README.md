@@ -4,14 +4,16 @@ A single-page dashboard for managing CLI Agent Orchestrator sessions, agents, fl
 
 ## Dependency security
 
-Use `npm ci` with install scripts enabled. Its fail-on-error `postinstall`
-applies [`../patches/braces+3.0.3.patch`](../patches/braces+3.0.3.patch), shared
-with the docs and MCP Apps toolchains, to protect the build tooling's recursive
-brace parser. `npm run test:dependencies` checks the installed implementation
+Use npm 10+ and `npm ci` with install scripts enabled. All `braces` consumers
+resolve the published guarded fork `@dieub/braces-depth-guard@3.0.3-pn.3` through
+an exact npm alias. Its fail-on-error `postinstall` applies
+[`../patches/braces+3.0.3-pn.3.patch`](../patches/braces+3.0.3-pn.3.patch), shared
+with the docs and MCP Apps toolchains, to additionally bound acyclic AST
+ancestor traversal. `npm run test:dependencies` checks the installed implementation
 and its consumers; `npm run build` runs these checks automatically.
 
-The original package version remains `3.0.3`, so the advisory remains visible
-and blocking even when the local mitigation passes. See
+This replaces the affected original with a reviewed third-party implementation;
+it is not an official fixed release or a scanner exemption. See
 [Dependency Security](../SECURITY.md#full-dependency-gate) for full-graph CI
 coverage, the strict HIGH/CRITICAL gate, and the separate mitigation status.
 

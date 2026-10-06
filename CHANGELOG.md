@@ -80,10 +80,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Audit all tracked npm, Bun, uv, and Cargo dependency graphs in every CI run
   and weekly, including development dependencies and unfixed advisories. Block
   every HIGH/CRITICAL finding and scan error, and publish complete inventory and
-  finding summaries. Extend the shared `braces` mitigation to the web UI and MCP
-  Apps toolchains and bound AST parent-link traversal as well as recursion;
-  passing mitigation checks do not exempt the open advisory. Keep the
-  contributor skill's gate map and packaged mirror aligned with the new job.
+  finding summaries. Replace the affected `braces` package in docs, web UI,
+  and MCP Apps with the provenance-verified published guarded fork
+  `@dieub/braces-depth-guard@3.0.3-pn.3`, retaining a small shared patch for
+  acyclic AST parent-link bounds. Verify dev-only inventory with real Trivy,
+  fail non-vacuously on missing consumers, and preserve three-project failure
+  aggregation. No advisory exemptions or fabricated versions are used.
 - `copilot_cli` launches no longer time out after 60 seconds on Copilot CLI
   1.0.91 (#870). Copilot repaints only changed cells in its full-screen view,
   so the raw output stream never shows a settled idle prompt; the provider now

@@ -51,14 +51,18 @@ cd cao_mcp_apps
 npm install
 ```
 
-Install scripts must remain enabled: `postinstall` applies the shared
-[`../patches/braces+3.0.3.patch`](../patches/braces+3.0.3.patch) and fails if it
-cannot apply. This protects the tooling's recursive brace parser.
+Use npm 10+ with install scripts enabled. The exact `braces` alias installs
+the published guarded fork `@dieub/braces-depth-guard@3.0.3-pn.3`; `postinstall`
+applies the shared
+[`../patches/braces+3.0.3-pn.3.patch`](../patches/braces+3.0.3-pn.3.patch)
+and fails if it cannot apply. The patch adds a bound on acyclic AST ancestor
+traversal to the fork's parser, recursive-AST, and cycle guards.
 `npm run test:dependencies` verifies the installed mitigation and its consumers;
 `npm run build:all` runs it automatically.
 
-The package keeps its truthful `3.0.3` version. Passing mitigation checks do not
-close or exempt its advisory: the repository's
+The lockfile retains the fork's real package identity, version, and integrity.
+This is a third-party replacement, not an official fixed release or an advisory
+exemption. The repository's
 [Dependency Security gate](../SECURITY.md#full-dependency-gate) includes
 development dependencies and blocks every HIGH/CRITICAL finding.
 

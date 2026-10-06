@@ -82,7 +82,7 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 | **AI-DLC Portfolio Example** | example project builds | **Yes** |
 | **Security Scan** | Trivy | **Yes** |
 | **CodeQL** | GitHub Actions, JavaScript/TypeScript, Python, and Rust analysis and upload in the same CI run, including forks after required workflow approval | **Yes** — no project build; the hosted scan/status rules remain as documented in `SECURITY.md` |
-| **Dependency Security** | Full locked npm, Bun, uv, and Cargo inventories, including development dependencies and unfixed advisories; independent clean-install mitigation checks | **Yes** — every HIGH/CRITICAL finding or scan error fails; locally, `uv run python scripts/dependency_security.py` with Trivy installed |
+| **Dependency Security** | Full locked npm, Bun, uv, and Cargo inventories, including development dependencies and unfixed advisories; independent clean-install mitigation checks | **Yes** — every HIGH/CRITICAL finding or scan error fails; locally, `scripts/security-scan.sh dependencies` with Trivy installed |
 | **Dependency Review** | `actions/dependency-review-action` over the PR's dependency delta: `fail-on-severity: high` plus denied licences `GPL-3.0`/`AGPL-3.0` | **Yes** — CI-only; there is nothing to run locally, and it is skipped on forks (`if: github.repository == 'awslabs/cli-agent-orchestrator'`), so a green run on your fork has not exercised it |
 
 CodeQL's four language jobs are part of `ci.yml`, so **Re-run all jobs** includes
