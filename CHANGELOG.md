@@ -548,6 +548,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Workflow execution and resumption through MCP now enforce the calling
+  terminal's existing `@cao-mcp-server` or `*` grant, including installed
+  profiles. Restricted callers can no longer bypass direct-delegation checks
+  through `workflow_run`, `workflow_resume`, or `workflow_start`. Operator
+  calls remain unchanged, and ephemeral delegation still requires its separate
+  opt-in (#892).
+
 - **Kiro CLI, the default provider, now applies the CAO tool policy.** `cao
   install --provider kiro_cli` writes the resolved `allowedTools` into the agent
   JSON's `tools` field, which is what Kiro lets the agent *have* (`allowedTools`

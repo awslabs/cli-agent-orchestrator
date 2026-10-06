@@ -41,8 +41,10 @@ rules.
 
 ## Setup and run
 
-Prerequisites: a working [CAO installation](../../../README.md),
+Prerequisites: [CAO installed from this checkout](../../../README.md),
 `uv`, Python 3.10+, tmux, and an authenticated Copilot CLI or Claude Code.
+Use the included workflow-permission fix: older CAO installations allowed
+restricted installed profiles to delegate through workflow tools.
 Robotics dependencies have their **own** project and lockfile; CAO's normal
 installation is unchanged.
 
@@ -231,5 +233,7 @@ files; a failed write preserves the last complete snapshot and surfaces its erro
 
 The numerical controller is not another coordinator. Goal interpretation,
 route decomposition, robot selection, delegation, and semantic evaluation
-remain in the existing CLI agents. The example changes no CAO core API,
-driver, provider, workflow engine, or normal-install dependency.
+remain in the existing CLI agents. The only core change closes the existing
+workflow-delegation allowlist bypass using CAO's shared permission guard; no
+robotics logic enters CAO core. There is no new driver, provider, workflow
+engine, or normal-install dependency.
