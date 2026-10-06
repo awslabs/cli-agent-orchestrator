@@ -45,6 +45,7 @@ from cli_agent_orchestrator.runtime_channel.protocol import (
 )
 from cli_agent_orchestrator.runtime_channel.registry import RuntimeRegistry
 from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.utils import agent_profiles
 
 TOKEN = "test-runtime-token"
 WS_HEADERS = {"x-cao-runtime-token": TOKEN, "host": "localhost"}
@@ -90,7 +91,8 @@ def isolated(monkeypatch, tmp_path):
     )
     database.Base.metadata.create_all(engine)
     monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
-    monkeypatch.setattr(terminal_service, "load_agent_profile", _no_installed_profile)
+    # The loader create_terminal calls (#866 routed it through load_launch_profile).
+    monkeypatch.setattr(agent_profiles, "load_launch_profile", _no_installed_profile)
     registry = RuntimeRegistry()
     monkeypatch.setattr(registry_mod, "runtime_registry", registry)
     monkeypatch.setattr(server_mod, "runtime_registry", registry)
@@ -2016,6 +2018,18 @@ class TestUnsuccessfulSends:
         time.sleep(0.2)
         assert self._last_active("abcd1234") == before
         assert [t for t, _ in plugins.events] == []
+
+    def test_dispatch_input_refuses_a_remote_terminal(self, start_runtime):
+        # The local dispatch path (#566) types into this server's tmux and
+        # returns an output boundary of this server's monitor: neither applies
+        # to a remote pane. Only send_input routes one, to its runtime.
+        _remote_row("abcd1234", "rt-1")
+        runtime = start_runtime(script=lambda command: {"success": True})
+        with pytest.raises(LocalExecutionDisabledError):
+            terminal_service.dispatch_input("abcd1234", "hi")
+        assert runtime.received == [], "nothing is sent to the runtime"
+        assert terminal_service.send_input("abcd1234", "hi") is True
+        assert [c.type for c in runtime.received] == [CommandType.INPUT]
 
     def test_a_key_the_runtime_did_not_send_does_not_mark_the_terminal_active(
         self, http, start_runtime

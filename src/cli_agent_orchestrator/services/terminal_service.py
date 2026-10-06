@@ -3914,7 +3914,16 @@ def send_input(
     must later prove the terminal produced output FOR THIS SEND (the deferred
     initial-message path) calls ``dispatch_input`` directly and keeps the
     boundary it returns.
+
+    A terminal in an execution runtime (#745) is routed to it from here, and
+    the runtime's answer is the result: a send it did not deliver is
+    ``False``. ``dispatch_input`` drives this server's own panes only.
     """
+    metadata = get_terminal_metadata(terminal_id)
+    if metadata and metadata.get("runtime_id"):
+        return _send_input_to_runtime(
+            metadata, message, registry, sender_id, orchestration_type, frozen_memory
+        )
     dispatch_input(
         terminal_id,
         message,
@@ -3923,6 +3932,54 @@ def send_input(
         orchestration_type=orchestration_type,
         redelivery=redelivery,
         frozen_memory=frozen_memory,
+    )
+    return True
+
+
+def _send_input_to_runtime(
+    metadata: Dict,
+    message: str,
+    registry: PluginRegistry | None,
+    sender_id: str | None,
+    orchestration_type: OrchestrationType | None,
+    frozen_memory: str | None,
+) -> bool:
+    """Send input to a terminal in an execution runtime (#745). True once delivered.
+
+    The runtime runs ``send_input`` beside the pane, with the provider guards
+    and memory injection it needs. A send it did not deliver changes nothing
+    here: the terminal is not marked active, and no event is emitted.
+    """
+    if (
+        metadata.get("provider") == ProviderType.KIRO_CLI.value
+        and resolve_kiro_engine(persisted=metadata.get("engine")) == KiroEngine.KAS
+    ):
+        raise KiroPhase0KASError(profile_has_v2_policy=False)
+    orchestration_value = (
+        orchestration_type.value
+        if isinstance(orchestration_type, OrchestrationType)
+        else str(orchestration_type or "")
+    )
+    try:
+        result = _call_runtime(
+            metadata,
+            CommandType.INPUT,
+            {
+                "message": message,
+                "sender_id": sender_id,
+                "orchestration_type": orchestration_value or None,
+                "frozen_memory": frozen_memory,
+            },
+        )
+    except Exception as e:
+        logger.error(f"Failed to send input to terminal {metadata['id']}: {e}")
+        raise
+    if not result.get("success"):
+        return False
+    update_last_active(metadata["id"])
+    # The caller's text, unchanged: memory is injected in the runtime.
+    _emit_post_send_message(
+        registry, metadata, metadata["id"], sender_id, orchestration_type, message
     )
     return True
 
@@ -3983,32 +4040,14 @@ def dispatch_input(
             if isinstance(orchestration_type, OrchestrationType)
             else str(orchestration_type or "")
         )
-        # Kept for the post_send_message event: plugins/webhooks see what the
-        # caller sent, not the internal <cao-memory> block pasted into the TUI.
-        original_message = message
 
         if metadata.get("runtime_id"):
-            # The runtime runs this same function beside the pane, with the
-            # provider guards and memory injection it needs.
-            result = _call_runtime(
-                metadata,
-                CommandType.INPUT,
-                {
-                    "message": message,
-                    "sender_id": sender_id,
-                    "orchestration_type": orchestration_value or None,
-                    "frozen_memory": frozen_memory,
-                },
+            # Its pane is in an execution runtime (#745): send_input routes it
+            # there. This path types into this server's own tmux, and its
+            # output boundary would mean nothing for a remote pane.
+            raise LocalExecutionDisabledError(
+                f"terminal {terminal_id} runs in an execution runtime; send_input routes it"
             )
-            if not result.get("success"):
-                # Not delivered: the terminal was not used, and no message went.
-                return False
-            update_last_active(terminal_id)
-            # Memory is injected in the runtime, so nothing here changed it.
-            _emit_post_send_message(
-                registry, metadata, terminal_id, sender_id, orchestration_type, original_message
-            )
-            return True
 
         provider = provider_manager.get_provider(terminal_id)
 
