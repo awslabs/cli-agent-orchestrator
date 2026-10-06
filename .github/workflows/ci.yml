@@ -46,8 +46,17 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --all-extras --dev
 
+      - name: Install Trivy for inventory regressions
+        if: matrix.python-version == '3.12'
+        uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
+        with:
+          version: v0.70.0
+
       - name: Run unit tests with coverage
         run: |
+          if [ "${{ matrix.python-version }}" = "3.12" ]; then
+            trivy --version
+          fi
           # CI intentionally includes integration-marked tests except for the Kiro
           # provider test, which requires an authenticated external CLI.
           uv run pytest test/ examples/workflow/tests/ \
@@ -774,6 +783,19 @@ jobs:
         if: always()
         with:
           sarif_file: 'trivy-results.sarif'
+
+  dependency-security:
+    name: Dependency Security
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/dependency-security
 
   dependency-review:
     name: Dependency Review

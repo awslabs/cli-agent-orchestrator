@@ -5,6 +5,7 @@
   "type": "module",
   "description": "MCP Apps (SEP-1865) UI surface for CLI Agent Orchestrator. Bundles to single-file HTML resources served via cao-mcp-server.",
   "scripts": {
+    "postinstall": "patch-package --patch-dir ../patches --error-on-fail",
     "prepare": "cd .. && husky cao_mcp_apps/.husky || true",
     "scan:jit": "node scripts/scan-jit.mjs",
     "check:size": "node scripts/check-bundle-size.mjs",
@@ -12,12 +13,14 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:dependencies": "node --test scripts/dependency-security.cjs",
     "test:e2e": "playwright test",
     "test:e2e:install": "playwright install --with-deps chromium",
     "build:dashboard": "vite build -c vite.config.dashboard.ts",
     "build:agent": "vite build -c vite.config.agent.ts",
     "build:events": "vite build -c vite.config.events.ts",
     "build:graph": "vite build -c vite.config.graph.ts",
+    "prebuild:all": "npm run test:dependencies",
     "build:all": "npm run build:dashboard && npm run build:agent && npm run build:events && npm run build:graph",
     "demo": "node scripts/record-demo.mjs",
     "lint-staged": "lint-staged"
@@ -32,8 +35,11 @@
     ]
   },
   "dependencies": {
+    "@dieub/braces-depth-guard": "file:../vendor/dieub-braces-depth-guard-3.0.3-pn.3.tgz",
+    "braces": "file:braces-compat",
     "graphology": "^0.26.0",
     "graphology-layout": "^0.6.1",
+    "patch-package": "8.0.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "sigma": "^3.0.3"
@@ -58,6 +64,7 @@
     "vitest": "^4.1.11"
   },
   "overrides": {
+    "braces": "$braces",
     "nanoid": "^3.3.17"
   }
 }
