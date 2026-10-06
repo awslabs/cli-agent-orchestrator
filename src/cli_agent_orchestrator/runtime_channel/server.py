@@ -524,6 +524,10 @@ async def _finish_launch(
             last_active=None,
             deferred_init_failure=None,
             session_incarnation_id=None,
+            # A remote launch carries no initial message (#566), and nothing
+            # registers it as ephemeral (#866's registry is read-only here).
+            initial_delivery=None,
+            ephemeral=False,
         ).model_dump(mode="json")
 
 
