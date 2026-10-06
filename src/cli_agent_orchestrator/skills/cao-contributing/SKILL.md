@@ -130,6 +130,7 @@ pins this table to the workflow files.
 | **Test Claude Code Provider** (`test-claude-code-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test, `pyproject.toml`, or the workflow | **Yes** |
 | **Test Codex CLI Provider** (`test-codex-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test or fixtures, `pyproject.toml`, or the workflow | **Yes** |
 | **Test Kiro CLI Provider** (`test-kiro-cli-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test or fixtures, `pyproject.toml`, or the workflow | **Yes** |
+| **Robotics transport example** (`robotics-transport.yml`) | `Transport simulator` | only PRs touching the cross-zone transport example, agent-profile schema, or the workflow | **Yes** — real MuJoCo and authenticated MCP tests; locally, `uv --directory examples/robotics/cross-zone-transport run --locked pytest` |
 | **Docs site** (`gh-pages.yml`) | `build` | only PRs touching `docusaurus/**` or the workflow | **Yes** — `deploy` is push-only and never runs on a PR |
 
 > **Two checks can share a name.** Each provider workflow has its own `Unit Tests` and
