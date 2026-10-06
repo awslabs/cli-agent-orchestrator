@@ -482,6 +482,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The MCP server now requires fastmcp 3.2.0 or newer (was 2.14.0), the
+  version CI tests. fastmcp 2.x does not export `ToolResult` from
+  `fastmcp.tools`, so `cao-mcp-server` would not start on it. Upgrading
+  CAO upgrades fastmcp (#801).
+
 - record the originating install handle in each shared context copy's frontmatter
   (`x-cao-source-stem`), so a reinstall can tell its own prior copy apart from a
   different profile that resolves to the same OpenCode agent id. The key is
