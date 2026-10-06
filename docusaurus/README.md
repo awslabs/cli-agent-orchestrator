@@ -30,7 +30,7 @@ security patch. Do not disable install scripts: `postinstall` runs
 `npm run test:dependencies` before assembling the courses and site; the same
 checks can be run independently while updating dependencies.
 
-Two transitive dependencies have explicit security overrides:
+Relevant dependency security controls include:
 
 - **`braces`** resolves through the private local `braces-compat` adapter to the
   canonical published third-party MIT fork
@@ -55,6 +55,22 @@ Two transitive dependencies have explicit security overrides:
   this upgrade does not claim to change that behavior. Checks preserve
   non-storage of private/no-store responses and permitted reuse of stale
   public responses, and cover the release's stricter wildcard `Vary` handling.
+- **`postcss-selector-parser`** requires `^7.1.6` for both the v6 and v7
+  consumer ranges. The v6 line has no fixed release for CVE-2026-104844.
+  Selector serialization/class traversal regressions and the full site build
+  check compatibility with the existing PostCSS plugins.
+- **`tinypool`** is pinned to `2.1.2`, which fixes CVE-2026-104848 and
+  CVE-2026-104849. Docusaurus still requests v1; v2 supports Node 20 and Node
+  22+, matching the tested site toolchains. The dependency suite
+  exercises worker creation, task execution, cleanup, and the worker-data/state
+  layout consumed by Docusaurus. Keep this override until Docusaurus selects a
+  fixed version itself.
+
+The lockfile also includes upstream security releases for `source-map-js`
+(`1.2.2`), `compression` (`1.8.2`), `proxy-addr` (`2.0.8`), and `joi`
+(`17.13.8`). Source-map regressions cover ordinary mappings, invalid offsets,
+and direct/nested aggregate line limits. Update every affected toolchain rather
+than only the lockfile named by an individual Dependabot PR.
 
 These dependencies belong to the documentation build/development toolchain;
 GitHub Pages serves the resulting static site. No alert is suppressed.

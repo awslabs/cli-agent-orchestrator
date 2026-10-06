@@ -68,6 +68,11 @@ exemption. The repository's
 [Dependency Security gate](../SECURITY.md#full-dependency-gate) includes
 development dependencies and blocks every HIGH/CRITICAL finding.
 
+`source-map-js` is locked to the upstream security release 1.2.2 for
+CVE-2026-93749, consistently with the docs and web toolchains. See
+[upstream security releases](../SECURITY.md#additional-upstream-security-releases);
+a single-project dependency update does not clear findings in other graphs.
+
 ## Commands
 
 | Command | Description |

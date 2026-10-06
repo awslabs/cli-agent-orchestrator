@@ -91,6 +91,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `braces` imports while the real registry package remains directly visible.
   Reject and revert the npm version-2 workaround, which produced an unparsed
   alias rather than a correctly identified dependency.
+- Consolidate the dependency fixes from #888-#890: update `source-map-js`
+  throughout docs, web, and MCP Apps, plus docs `compression` and `proxy-addr`.
+  Clear the remaining Joi, selector-parser, and Tinypool scan findings with
+  upstream fixed releases and explicit overrides where older consumer ranges
+  exclude them. Add source-map, selector, worker-pool, and all-copy lockfile
+  regressions without changing scanner exclusions or severity policy.
 - `copilot_cli` launches no longer time out after 60 seconds on Copilot CLI
   1.0.91 (#870). Copilot repaints only changed cells in its full-screen view,
   so the raw output stream never shows a settled idle prompt; the provider now

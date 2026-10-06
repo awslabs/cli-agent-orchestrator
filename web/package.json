@@ -43,6 +43,7 @@
   },
   "overrides": {
     "braces": "$braces",
-    "nanoid": "^3.3.17"
+    "nanoid": "^3.3.17",
+    "postcss-selector-parser": "^7.1.6"
   }
 }

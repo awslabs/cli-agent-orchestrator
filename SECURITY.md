@@ -181,6 +181,33 @@ the fork and local patch when an official fixed release is available, retaining
 the security/compatibility checks. A passing mitigation check alone must never
 be described as a clean dependency scan.
 
+#### Additional upstream security releases
+
+The lockfiles include these published fixes across all affected toolchains:
+
+| Dependency | Fixed version used | Toolchains | Advisory |
+| --- | --- | --- | --- |
+| `source-map-js` | `1.2.2` | Docs, web, MCP Apps | CVE-2026-93749 |
+| `compression` | `1.8.2` | Docs | CVE-2026-87776 |
+| `proxy-addr` | `2.0.8` | Docs | CVE-2026-90711 |
+| `joi` | `17.13.8` | Docs | CVE-2026-90771 |
+| `postcss-selector-parser` | `7.1.6` | Docs, web | CVE-2026-104844 |
+| `tinypool` | `2.1.2` | Docs | CVE-2026-104848, CVE-2026-104849 |
+
+The selector-parser v6 and Tinypool v1 consumer ranges exclude their fixed
+releases, so the affected project manifests explicitly override those ranges.
+Tinypool is pinned to the required patch release rather than pulling in unrelated
+new minor features. Its v2 supports Node 20 and Node 22+, matching the tested
+site toolchains. The docs dependency suite checks source-map boundaries,
+selector behavior, and Docusaurus's worker-data/state contract; full docs/web
+builds exercise their consumers. Lockfile regressions check every installed
+copy against the fixed-version floor.
+
+The repository-wide scan can still fail a Dependabot PR that updates only one
+package or graph: other findings remain blocking. A prior green scan is evidence
+for its recorded revision, inputs, and database at that time, not an exemption
+from newly published or subsequently indexed advisories.
+
 ### CodeQL Static Analysis
 
 The [CI workflow](.github/workflows/ci.yml) includes four CodeQL jobs that

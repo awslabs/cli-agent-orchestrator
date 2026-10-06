@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from packaging.version import Version
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location(
@@ -471,6 +472,33 @@ def test_all_affected_projects_install_the_shared_patch_and_regressions(project)
         "https://registry.npmjs.org/@dieub/braces-depth-guard/-/"
         "braces-depth-guard-3.0.3-pn.3.tgz"
     )
+
+
+@pytest.mark.parametrize(
+    ("project", "package", "minimum"),
+    [
+        ("cao_mcp_apps", "source-map-js", "1.2.2"),
+        ("docusaurus", "source-map-js", "1.2.2"),
+        ("web", "source-map-js", "1.2.2"),
+        ("docusaurus", "compression", "1.8.2"),
+        ("docusaurus", "proxy-addr", "2.0.8"),
+        ("docusaurus", "joi", "17.13.8"),
+        ("docusaurus", "postcss-selector-parser", "7.1.6"),
+        ("web", "postcss-selector-parser", "7.1.6"),
+        ("docusaurus", "tinypool", "2.1.2"),
+    ],
+)
+def test_all_locked_copies_include_upstream_security_fixes(project, package, minimum):
+    lock = json.loads((ROOT / project / "package-lock.json").read_text())
+    installed = [
+        entry
+        for location, entry in lock["packages"].items()
+        if location.endswith(f"/node_modules/{package}") or location == f"node_modules/{package}"
+    ]
+    assert installed, f"No locked {package} consumer in {project}"
+    for entry in installed:
+        assert Version(entry["version"]) >= Version(minimum), (project, package, entry["version"])
+        assert entry["resolved"].startswith(f"https://registry.npmjs.org/{package}/-/")
 
 
 @pytest.mark.parametrize(
