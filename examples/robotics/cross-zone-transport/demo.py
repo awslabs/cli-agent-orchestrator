@@ -161,6 +161,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     setup = sub.add_parser("prepare", help="create a fresh private run and scoped CAO profiles")
     setup.add_argument("--run-dir", type=Path, required=True)
+    setup.add_argument("--request", required=True, help="goal to send unchanged to the supervisor")
     setup.add_argument("--scene", type=Path, default=HERE / "site.json")
     setup.add_argument("--port", type=int, default=8766)
     setup.add_argument("--provider", choices=["copilot_cli", "claude_code"], default="copilot_cli")
@@ -174,6 +175,8 @@ def main() -> None:
     )
     args = parser.parse_args()
     if args.command == "prepare":
+        if not args.request.strip():
+            setup.error("--request must not be blank")
         manifest = prepare(args.run_dir, args.scene, port=args.port, provider=args.provider)
         run_dir = args.run_dir.resolve()
         for profile in manifest["profiles"].values():
@@ -192,6 +195,8 @@ def main() -> None:
                     f"transport-{manifest['run_id']}",
                     "--working-directory",
                     str(HERE),
+                    "--",
+                    args.request,
                 ]
             )
         )

@@ -14,14 +14,45 @@ from jsonschema import validate
 EXAMPLE = Path(__file__).resolve().parents[1]
 
 
-def test_prepare_prints_a_nonblocking_launch_for_sequential_handoffs(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize(
+    "transport_request",
+    [
+        "Move tote from stock to etch and have an independent checker verify delivery.",
+        "Return sample-tray from rack to inspection without changing its custody early.",
+        '--inspect "operator\'s tote"; preserve $STATUS\nwithout moving it.',
+    ],
+)
+def test_prepare_prints_a_nonblocking_launch_with_the_request(
+    tmp_path, monkeypatch, capsys, transport_request
+):
     run_dir = tmp_path / "run"
-    monkeypatch.setattr(sys, "argv", ["demo.py", "prepare", "--run-dir", str(run_dir)])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["demo.py", "prepare", "--run-dir", str(run_dir), f"--request={transport_request}"],
+    )
     demo.main()
-    launch = shlex.split(capsys.readouterr().out.splitlines()[-1])
+    commands = shlex.split(capsys.readouterr().out)
+    launch = commands[commands.index("launch") - 1 :]
     assert launch[:2] == ["cao", "launch"]
     assert {"--headless", "--async", "--auto-approve"} <= set(launch)
     assert "--yolo" not in launch
+    assert launch[-2:] == ["--", transport_request]
+
+
+@pytest.mark.parametrize("request_args", [[], ["--request="], ["--request= \t\n"]])
+def test_prepare_requires_a_nonblank_request_before_creating_run(
+    tmp_path, monkeypatch, capsys, request_args
+):
+    run_dir = tmp_path / "run"
+    monkeypatch.setattr(
+        sys, "argv", ["demo.py", "prepare", "--run-dir", str(run_dir), *request_args]
+    )
+    with pytest.raises(SystemExit) as error:
+        demo.main()
+    assert error.value.code == 2
+    assert "--request" in capsys.readouterr().err
+    assert not run_dir.exists()
 
 
 @pytest.mark.parametrize("scene_file", ["site.json", "return-site.json"])

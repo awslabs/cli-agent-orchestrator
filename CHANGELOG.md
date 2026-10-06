@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kinematic world through scoped MCP tools. Includes measured custody handoffs,
   operator stopping, refusal/interruption cases, alternative robot setup, and
   isolated optional dependencies; no additional reasoning framework or hardware path.
+  The generated launch command carries an explicit, nonblank operator request.
 - Security groundwork for ephemeral agents (#801): installed profiles whose
   names match the reserved pattern can no longer be launched or listed;
   installed-profile APIs and CLI lookups refuse those names, and cao-server

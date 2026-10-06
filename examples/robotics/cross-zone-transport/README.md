@@ -54,12 +54,16 @@ From the repository root:
 cd examples/robotics/cross-zone-transport
 uv sync --locked
 export RUN_DIR=/tmp/cao-transport-demo
-uv run --locked python demo.py prepare --run-dir "$RUN_DIR"
+REQUEST="Move tote from stock to etch. Coordinate the ownership handoff and have an independent checker verify delivery."
+uv run --locked python demo.py prepare \
+  --run-dir "$RUN_DIR" --request "$REQUEST"
 ```
 
-`prepare` refuses an existing directory. It creates private, per-run credentials,
-unique profile IDs, and a copy of the scene, then prints installation and launch
-commands. Pass `--provider claude_code` if using Claude Code instead. Keep this
+`prepare` requires a nonblank `--request` and refuses an existing directory.
+It creates private, per-run credentials, unique profile IDs, and a copy of the
+scene, then prints installation commands and a complete launch command carrying
+that request unchanged as one shell-quoted message.
+Pass `--provider claude_code` if using Claude Code instead. Keep this
 environment installed at the same path until cleanup: the generated profiles
 invoke its exact Python interpreter and the stdio connection script.
 
@@ -90,7 +94,7 @@ SUPERVISOR=$(uv run --locked python -c \
 
 cao launch --agents "$SUPERVISOR" --headless --async --auto-approve \
   --session-name transport-demo --working-directory "$(pwd)" \
-  "Move tote from stock to etch. Coordinate the ownership handoff and have an independent checker verify delivery."
+  -- "$REQUEST"
 ```
 
 `--async` returns after message delivery, not task completion. Follow the existing
