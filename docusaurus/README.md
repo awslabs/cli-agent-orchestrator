@@ -24,29 +24,31 @@ This generates static content into the `build` directory.
 
 ## Dependency security
 
-Use `npm ci` to install the committed dependency graph and apply its local
+Use npm 10+ and `npm ci` to install the committed dependency graph and apply its local
 security patch. Do not disable install scripts: `postinstall` runs
-`patch-package --error-on-fail`. `npm run build` runs
+`patch-package --patch-dir ../patches --error-on-fail`. `npm run build` runs
 `npm run test:dependencies` before assembling the courses and site; the same
 checks can be run independently while updating dependencies.
 
-Two transitive dependencies have explicit security overrides:
+Relevant dependency security controls include:
 
-- **`braces`** stays on the published `3.0.3` package and applies
-  `patches/braces+3.0.3.patch`. The patch uses the nesting guards proposed in
-  [micromatch/braces#72](https://github.com/micromatch/braces/pull/72).
-  It does not consume the fork's unrelated, unreleased parser changes:
-  quoted and escaped patterns retain the published package's behavior.
-  It bounds brace and parenthesis nesting to 100, honors lower `maxDepth`
-  values, and applies the same recursion bound to caller-supplied ASTs.
-  The override applies to both `chokidar` and `micromatch`.
-  There is no official patched release yet. The package version remains
-  `3.0.3`, so version-based scanners, including `npm audit`, still report
-  [GHSA-vfj7-8cjw-p6xm](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm).
-  `npm audit` also flags affected parent packages and exits nonzero; the local
-  mitigation does not close the version-based alert.
-  Replace the local patch and version override with an official fixed release
-  once one is available and the dependency checks and site build pass.
+- **`braces`** resolves through the private local `braces-compat` adapter to the
+  canonical published third-party MIT fork
+  `@dieub/braces-depth-guard@3.0.3-pn.3`, shared with the web UI and
+  MCP Apps toolchains. The unchanged fork tarball is
+  [vendored in the repository](../vendor/README.md), so a cold install does not
+  depend on its registry availability. The adapter only re-exports the fork;
+  keep `.npmrc`'s `install-links=false` setting and include `braces-compat/`
+  and `../vendor/` when installing the project. It replaces the affected original while retaining
+  quoted/escaped pattern behavior, and bounds parsing and recursive AST depth
+  to 100 (or a lower `maxDepth`). Both `chokidar` and `micromatch` resolve the
+  fork under their existing `braces` import.
+  [`../patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch`](../patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch)
+  retains our additional bound on acyclic ancestor traversal; the fork already
+  rejects parent cycles. This is not an official fixed upstream release or a
+  scanner exemption. See [SECURITY.md](../SECURITY.md#local-dependency-mitigations)
+  for source/provenance verification, the exact-version requirement, and
+  conditions for returning to an official release.
 - **`http-cache-semantics`** requires `^4.3.0`, outside the affected range
   currently recorded for
   [GHSA-ch52-4w7c-c8xp](https://github.com/advisories/GHSA-ch52-4w7c-c8xp).
@@ -55,10 +57,30 @@ Two transitive dependencies have explicit security overrides:
   this upgrade does not claim to change that behavior. Checks preserve
   non-storage of private/no-store responses and permitted reuse of stale
   public responses, and cover the release's stricter wildcard `Vary` handling.
+- **`postcss-selector-parser`** requires `^7.1.6` for both the v6 and v7
+  consumer ranges. The v6 line has no fixed release for CVE-2026-104844.
+  Selector serialization/class traversal regressions and the full site build
+  check compatibility with the existing PostCSS plugins.
+- **`tinypool`** is pinned to `2.1.2`, which fixes CVE-2026-104848 and
+  CVE-2026-104849. Docusaurus still requests v1; v2 supports Node 20 and Node
+  22+, matching the tested site toolchains. The dependency suite
+  exercises worker creation, task execution, cleanup, and the worker-data/state
+  layout consumed by Docusaurus. Keep this override until Docusaurus selects a
+  fixed version itself.
+
+The lockfile also includes upstream security releases for `source-map-js`
+(`1.2.2`), `compression` (`1.8.2`), `proxy-addr` (`2.0.8`), and `joi`
+(`17.13.8`). Source-map regressions cover ordinary mappings, invalid offsets,
+and direct/nested aggregate line limits. Update every affected toolchain rather
+than only the lockfile named by an individual Dependabot PR.
 
 These dependencies belong to the documentation build/development toolchain;
-GitHub Pages serves the resulting static site. No alert suppression or
-scanner-policy change is used.
+GitHub Pages serves the resulting static site. No alert is suppressed.
+
+The repository's [Dependency Security gate](../SECURITY.md#full-dependency-gate)
+audits the complete locked graphs on every PR/`main` CI run and weekly. It
+reports installed mitigation verification separately from open advisories.
+Changes to the vendored archive, shared patch, or brace tests also trigger the docs site build.
 
 ## Adding Documentation
 

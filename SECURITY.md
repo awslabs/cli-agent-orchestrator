@@ -55,6 +55,201 @@ Security scans run:
 - On every push to the `main` branch
 - On every pull request targeting `main`
 
+### Full dependency gate
+
+**`Dependency Security` blocks every HIGH/CRITICAL dependency finding in the
+checked-out tree, including unchanged dependencies, development dependencies,
+and advisories with no published fix.** This is separate from the existing
+Trivy `Security Scan` and PR-delta `Dependency Review` checks; neither replaces
+this whole-graph gate. The older scan's lower-severity/secret policy is unchanged.
+
+The job runs inside every CI run on PRs targeting `main` (including forks) and
+pushes to `main`, without path filters. The
+[scheduled workflow](.github/workflows/dependency-security.yml) uses the same
+[action](.github/actions/dependency-security/action.yml) every Monday at 08:00
+UTC and on manual dispatch, so newly published advisories are detected without
+a dependency change. It uses only a read-only built-in token and never
+`pull_request_target` or repository secrets.
+
+[`scripts/dependency_security.py`](scripts/dependency_security.py) discovers
+all tracked `package-lock.json`, `bun.lock`, `uv.lock`, and `Cargo.lock` files.
+It copies only those lockfiles to a temporary scan directory, excluding package
+manifests, local installed packages, and build output. Trivy scans every locked
+graph with development dependencies and unfixed findings included. The report
+must contain a nonempty inventory for every discovered lockfile; a missing
+graph, malformed report, missing scanner, timeout, or database/network failure
+is an error, not a clean result. Unlocked dependency declarations are not a
+resolved inventory and are outside this lockfile-based check.
+The gate uses controlled scanner configuration rather than repository ignore
+files or inherited Trivy filters; only `TRIVY_CACHE_DIR` is inherited. A database
+update is never disabled by an inherited environment setting.
+Cargo is scanned from `Cargo.lock` alone: Trivy
+[drops development dependencies when `Cargo.toml` is also supplied](https://trivy.dev/docs/latest/coverage/language/rust/).
+Keeping that manifest out of the scan snapshot includes every locked crate,
+without modifying either repository file.
+The other supported formats also contain their resolved graphs without
+colocated manifests: Trivy's
+[npm/Bun](https://github.com/aquasecurity/trivy/blob/v0.70.0/docs/guide/coverage/language/nodejs.md)
+and [uv](https://github.com/aquasecurity/trivy/blob/v0.70.0/docs/guide/coverage/language/python.md)
+scanners include development dependencies with `--include-dev-deps`.
+`package.json` and `pyproject.toml` are therefore omitted too, rather than
+assuming their presence cannot change filtering. The Python 3.12 CI unit job
+requires the same pinned Trivy binary and runs a real-scanner regression that
+asserts production and dev-only npm/uv packages appear in the published
+inventory, with only lockfile hashes in the snapshot.
+
+Each executed audit publishes an Actions summary and a `dependency-security-<attempt>`
+artifact, keeping rerun evidence separate, with scan time and CI revision.
+Completed scans (passed or blocked) include per-lockfile package names/versions and counts,
+input SHA-256 hashes, and every finding's advisory,
+severity, package/version, affected lockfile, and fixed-version availability.
+Only these fields are retained, not raw scanner descriptions or source content.
+Reports are published even when the gate fails. On input, scanner, or report-validation
+errors, `input_sha256` retains hashes of successfully snapshotted inputs; it may
+be partial or empty if input preparation failed. Scanner-derived `inventory`,
+`findings`, and `blocking` are explicitly `null`, not an empty/clean result.
+The summary identifies these fields as unavailable and reports no security verdict.
+The audit and upload run after scanner installation failures unless cancelled,
+so a missing scanner still produces an error report. Cancellation or a
+runner, checkout, or storage failure can prevent publication; it does not
+produce a passing check or override an earlier failed step.
+
+Require the **`Dependency Security`** GitHub Actions status in the `main`
+ruleset, with strict/up-to-date checks, alongside the existing CodeQL checks.
+A missing, pending, failed, or stale result must not satisfy this requirement.
+Existing PR branches must adopt the workflow before they can produce the new
+required check; adding a requirement does not retroactively run CI.
+
+#### Local dependency mitigations
+
+The docs, web UI, and MCP Apps toolchains replace the affected `braces` dependency
+with the exact canonical dependency `@dieub/braces-depth-guard@3.0.3-pn.3`.
+This is a **published third-party MIT-licensed fork**, not an official fixed
+`micromatch/braces` release. The original, unmodified registry tarball is
+committed under [`vendor/`](vendor/README.md), and all three projects install it
+through a relative `file:` tarball dependency. Cold installs therefore do not
+depend on the fork owner retaining its npm package or GitHub repository.
+The lockfiles and installed manifest retain the fork's real name, version,
+MIT license, and original registry integrity; only the fetch location changes.
+Do not use its `latest` tag, which points to an earlier bootstrap release
+rather than the reviewed guarded version.
+
+Each isolated npm project has a private `braces-compat` package whose only
+executable statement re-exports this canonical dependency. `braces` is a
+`file:braces-compat` dependency, and `"braces": "$braces"` overrides every
+transitive consumer to that local adapter. The adapter declares the exact fork
+as a peer, and `.npmrc` keeps `install-links=false`. Consumers retain their
+`require('braces')` API and share the patched canonical module by object identity,
+which the regression suite verifies. The adapter is private CAO source, not
+an invented upstream release.
+
+Do not replace this with a registry alias without verifying GitHub's canonical
+package identity. GitHub misidentified the version-3 npm alias as upstream
+`braces@3.0.3-pn.3`. Version-2 compatibility metadata instead produced an
+unparsed alias version and missing license; that apparent green result was
+rejected and the format conversion reverted. Keep normal version-3 lockfiles
+and the real fork as a directly identifiable package, even when its tarball is
+local. Both Dependency Review and the full scan must cover its actual name and
+version, and Dependency Review must retain its MIT license.
+
+The vendored tarball retains the published archive's SHA-512 integrity, and its
+ten files were matched byte-for-byte to
+[source commit `305a2e4b`](https://github.com/dieub/braces-depth-guard/tree/305a2e4bfe324bb53c336c1b03387ee1251c926f).
+`npm audit signatures` verified registry signatures and available attestations;
+the fork's npm provenance identifies that commit and its release workflow.
+The fork has no install lifecycle script. Its parser/recursive-AST depth
+guards cap nesting at 100, honor lower `maxDepth` values, reject parent cycles,
+and preserve the original quote/escape behavior. These bounds are not general
+limits on AST width or expansion cardinality.
+
+Keep `vendor/`, `patches/`, `scripts/`, and the project-local adapter in the
+checkout used for installation. The archive's original MIT license is included
+inside it. If a checkout loses or corrupts the archive, restore the tracked
+file from the same trusted repository revision; do not fall back to a registry
+tag or regenerate different bytes under the same version. Regression checks
+verify the archive against the reviewed digest and all three lockfiles.
+
+The small shared
+[`patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch`](patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch)
+additionally bounds *acyclic* ancestor traversal using the same depth limit,
+which the published fork does not do. It targets the canonical installed
+package. Use npm 10+ and keep install scripts enabled:
+`postinstall` runs `patch-package --patch-dir ../patches --error-on-fail`.
+`patch-package` remains a normal dependency so that postinstall is available
+when dev dependencies are omitted.
+
+Each project's explicit `npm run test:dependencies` wrapper invokes the shared
+suite, requires at least one locked consumer, and verifies every consumer's
+resolved package identity as well as depth, cycle, unmatched-closer, and
+ordinary-pattern behavior. The docs also retain their cache-policy regressions.
+
+CI performs clean installs and runs those checks even when the advisory gate
+is red, reporting **mitigation verification separately from advisory status**.
+An applied local patch is not an exception to the HIGH/CRITICAL policy.
+The vulnerable original `braces@3.0.3` is no longer in these three locked graphs.
+That is a reviewed implementation replacement, not an advisory dismissal,
+version rewrite, or scanner exemption. The default-branch alert remains open
+until the replacement reaches that branch and GitHub rescans it. A passing
+mitigation check alone must never be described as a clean dependency scan.
+
+#### Guarded-fork maintenance
+
+Advisories against upstream `braces` do **not** automatically match the
+separately named fork or private local adapter in Trivy, Dependabot, or
+Dependency Review. This includes new upstream defects outside the depth guards.
+Dependabot also cannot propose an upstream `braces` upgrade through these local
+dependencies. Vendoring removes the fork's availability risk, not this
+advisory/update visibility gap; green checks are not an upstream monitoring
+signal.
+
+The security CODEOWNERS (`@awslabs/multiq`) own a **manual upstream review as part
+of each weekly dependency-scan review and before a release**:
+
+- Track [GHSA-vfj7-8cjw-p6xm](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm)
+  and [micromatch/braces#70](https://github.com/micromatch/braces/issues/70).
+  The proposed fixes are
+  [#77](https://github.com/micromatch/braces/pull/77),
+  [#78](https://github.com/micromatch/braces/pull/78), and
+  [#79](https://github.com/micromatch/braces/pull/79); an open or merged PR is
+  not itself a published fixed release.
+- Check newly published
+  [npm `braces` advisories](https://github.com/advisories?query=ecosystem%3Anpm+affects%3Abraces)
+  against the retained source, not just advisories naming the fork. Record any
+  applicable defect and its remediation in a repository issue.
+- When an official unaffected release is published, replace the fork, adapters,
+  and local patch together only after the existing depth/cycle/ancestor and
+  compatibility suites pass in all three projects. Recheck actual package
+  names, versions, and licenses in Dependency Review and the full scan.
+
+These are explicit maintainer review checkpoints, not automated notifications.
+
+#### Additional upstream security releases
+
+The lockfiles include these published fixes across all affected toolchains:
+
+| Dependency | Fixed version used | Toolchains | Advisory |
+| --- | --- | --- | --- |
+| `source-map-js` | `1.2.2` | Docs, web, MCP Apps | CVE-2026-93749 |
+| `compression` | `1.8.2` | Docs | CVE-2026-87776 |
+| `proxy-addr` | `2.0.8` | Docs | CVE-2026-90711 |
+| `joi` | `17.13.8` | Docs | CVE-2026-90771 |
+| `postcss-selector-parser` | `7.1.6` | Docs, web | CVE-2026-104844 |
+| `tinypool` | `2.1.2` | Docs | CVE-2026-104848, CVE-2026-104849 |
+
+The selector-parser v6 and Tinypool v1 consumer ranges exclude their fixed
+releases, so the affected project manifests explicitly override those ranges.
+Tinypool is pinned to the required patch release rather than pulling in unrelated
+new minor features. Its v2 supports Node 20 and Node 22+, matching the tested
+site toolchains. The docs dependency suite checks source-map boundaries,
+selector behavior, and Docusaurus's worker-data/state contract; full docs/web
+builds exercise their consumers. Lockfile regressions check every installed
+copy against the fixed-version floor.
+
+The repository-wide scan can still fail a Dependabot PR that updates only one
+package or graph: other findings remain blocking. A prior green scan is evidence
+for its recorded revision, inputs, and database at that time, not an exemption
+from newly published or subsequently indexed advisories.
+
 ### CodeQL Static Analysis
 
 The [CI workflow](.github/workflows/ci.yml) includes four CodeQL jobs that
@@ -113,12 +308,14 @@ and builds; this policy does not limit those jobs to changed lines.
 | Code-scanning merge rule | Required CodeQL analysis and applicable open alerts in the PR diff | Analysis is available and complete, and no applicable alert reaches **High or higher** security severity or the general **Errors** threshold |
 | `main` push and weekly scans | Supported repository code at the default-branch revision, including baseline findings | Analysis completed; existing alerts can remain open |
 
-**The current policy is to prevent qualifying findings in PR changes, not
+**The CodeQL merge policy is to prevent qualifying findings in PR changes, not
 to require zero open alerts across the repository before every PR can merge.**
 Baseline findings remain a separate triage/fix track so they do not
 automatically block unrelated PRs. This is a merge-policy choice, not an
 exclusion of those findings from default-branch scanning. A whole-repository
-alert gate for every PR would be a different policy and is not configured.
+CodeQL alert gate for every PR would be a different policy and is not configured.
+The separate **Dependency Security** gate above does block HIGH/CRITICAL
+dependency findings across the complete locked graphs, including their baseline.
 
 For example, an applicable new High-security finding can leave the analysis
 job green while the code-scanning rule blocks merging. An unchanged baseline
@@ -216,6 +413,19 @@ high-cost step that never substitutes for rotation. See
 
 ### Running Security Scans Locally
 
+Run the same full dependency gate as CI with Trivy 0.70.0 and Python 3.10+:
+
+```bash
+scripts/security-scan.sh dependencies
+```
+
+This reads the current contents of tracked lockfiles; stage new files
+before scanning them. It writes `dependency-security-results/report.json` and
+`summary.md` (gitignored) and exits nonzero for HIGH/CRITICAL findings or scan
+errors. It does not install packages or execute their lifecycle scripts.
+Run each affected project's `npm ci && npm run test:dependencies` separately
+to verify installed mitigations. Neither action substitutes for the other.
+
 You can run Trivy locally to check for vulnerabilities before committing:
 
 ```bash
@@ -246,14 +456,22 @@ rm -f requirements.txt
 > `[secret] Secret scanning is enabled`. `--scanners vuln` would hide the
 > secret findings CI blocks on. (See issue #568.)
 
-Or use the bundled wrapper that mirrors CI (`trivy` + optional local CodeQL):
+The bundled wrapper runs the full dependency gate first, then other available
+local scanners:
 
 ```bash
-scripts/security-scan.sh           # run all available scanners
-scripts/security-scan.sh trivy     # just Trivy
-scripts/security-scan.sh codeql    # just CodeQL (requires the CodeQL CLI)
-scripts/security-scan.sh gitleaks  # just gitleaks (requires the gitleaks CLI)
+scripts/security-scan.sh               # required dependency gate, then available other scanners
+scripts/security-scan.sh dependencies  # full locked dependency gate (requires Trivy)
+scripts/security-scan.sh trivy         # legacy filesystem/secret scan only
+scripts/security-scan.sh codeql        # just CodeQL (requires the CodeQL CLI)
+scripts/security-scan.sh gitleaks      # just gitleaks (requires the gitleaks CLI)
 ```
+
+The default `all` mode requires Trivy for the dependency gate; a missing
+scanner is not a successful skip. The Python scanner exits 2 on scan errors,
+which the wrapper maps to exit 1 (as it does for blocking findings). Other
+available scanners still run afterward, but cannot erase an earlier failure.
+Unavailable optional scanners are reported as skipped, not as verified checks.
 
 ## Tool Restrictions (allowedTools)
 
