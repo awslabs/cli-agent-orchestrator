@@ -226,14 +226,19 @@ async def runtime_channel(ws: WebSocket) -> None:
         # Terminals whose central row names this runtime are its to report on;
         # a status for any other terminal is ignored.
         recorded = await asyncio.to_thread(list_terminal_ids_on_runtime, runtime_id)
-        for terminal_id in recorded:
-            runtime_registry.place(terminal_id, runtime_id)
-        # A delete may have dropped a row after that read and before its
-        # placement: undo the placement of any row that is gone now.
+        # Conditionally: a relaunch of an id elsewhere (deleted, then claimed by
+        # another runtime) after that read must keep its placement.
+        held_elsewhere = {t for t in recorded if not runtime_registry.claim(t, runtime_id)}
+        # Revalidate against the rows now. A delete may have dropped a row after
+        # that read and before its placement: undo this runtime's placement of
+        # any row that is gone. And a row that still names this runtime wins
+        # over another runtime's placement of its id, which is then stale.
         still_recorded = set(await asyncio.to_thread(list_terminal_ids_on_runtime, runtime_id))
         for terminal_id in recorded:
             if terminal_id not in still_recorded:
                 runtime_registry.unplace(terminal_id, runtime_id)
+            elif terminal_id in held_elsewhere:
+                runtime_registry.place(terminal_id, runtime_id)
         for terminal_id, reported in hello.statuses.items():
             runtime_registry.set_status(terminal_id, runtime_id, reported, conn=conn)
         conn.listed = set(hello.statuses)

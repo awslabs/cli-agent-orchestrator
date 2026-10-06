@@ -552,6 +552,40 @@ class TestHandshakeOrdering:
         start_runtime(script=_answer)
         assert runtimes_of(http)["rt-1"]["terminals"] == [], "a ghost placement came back"
 
+    def test_a_relaunch_on_another_runtime_during_the_hello_keeps_its_placement(
+        self, http, start_runtime, monkeypatch
+    ):
+        # rt-1's hello reads abcd1234 as its own. Before the hello places it,
+        # the terminal is deleted and its id relaunched on rt-2 (claimed and
+        # recorded). The stale read must not take rt-2's placement.
+        _remote_row("abcd1234", "rt-1")
+        real = server_mod.list_terminal_ids_on_runtime
+        calls = []
+
+        def racing(runtime_id):
+            ids = real(runtime_id)
+            calls.append(runtime_id)
+            if runtime_id == "rt-1" and len(calls) == 1:
+                database.delete_terminal("abcd1234")
+                registry_mod.runtime_registry.forget("abcd1234")
+                assert registry_mod.runtime_registry.claim("abcd1234", "rt-2")
+                _remote_row("abcd1234", "rt-2", session="cao-relaunch")
+            return ids
+
+        monkeypatch.setattr(server_mod, "list_terminal_ids_on_runtime", racing)
+        start_runtime("rt-1", script=_answer)
+        registry = registry_mod.runtime_registry
+        assert registry.is_placed("abcd1234", "rt-2"), "the relaunch's placement was taken"
+        assert database.get_terminal_metadata("abcd1234")["runtime_id"] == "rt-2"
+
+    def test_a_row_still_naming_the_runtime_wins_over_a_stale_placement(self, http, start_runtime):
+        # The placement follows the row: one left on rt-2 for a terminal whose
+        # row names rt-1 is stale, and rt-1's hello takes it back.
+        _remote_row("abcd1234", "rt-1")
+        registry_mod.runtime_registry.place("abcd1234", "rt-2")
+        start_runtime("rt-1", script=_answer)
+        assert registry_mod.runtime_registry.is_placed("abcd1234", "rt-1")
+
     def test_no_command_reaches_a_runtime_before_the_server_hello(self, http, server, monkeypatch):
         stalled, release = threading.Event(), threading.Event()
         real = server_mod.list_terminal_ids_on_runtime
