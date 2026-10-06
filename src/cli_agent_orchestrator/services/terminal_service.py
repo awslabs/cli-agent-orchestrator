@@ -53,6 +53,7 @@ from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam
     get_terminal_metadata,
     list_all_terminals,
     list_pending_deferred_init_external_owner_terminal_ids,
+    list_pending_initial_delivery_terminal_ids,
     list_siblings_by_group_prefix,
     list_terminals_by_session,
     update_last_active,
@@ -60,6 +61,7 @@ from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam
     update_terminal_deferred_init_failure,
     update_terminal_deferred_init_runtime_reclaimed,
     update_terminal_group,
+    update_terminal_initial_delivery,
     update_terminal_metadata,
     update_terminal_provider_variant,
     update_terminal_shell_command,
@@ -138,7 +140,6 @@ from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
     generate_window_name,
-    wait_until_status,
 )
 
 logger = logging.getLogger(__name__)
@@ -219,6 +220,77 @@ _CURRENT_COMPOSER_PROBE_MAX_CHARS = 64
 # deferred provider.initialize() + input-send task could be GC'd mid-run,
 # silently leaving a worker uninitialized. Tasks drop themselves on completion.
 _deferred_init_tasks: set = set()
+
+# Terminals whose deferred initial message has been ACCEPTED but not yet
+# dispatched to the pane. Written on the event loop by _schedule_deferred_init,
+# read from worker threads by the status-reporting helpers below, hence the lock
+# (mirrors _memory_injected_lock above).
+_pending_initial_delivery: set = set()
+_pending_initial_delivery_lock = threading.Lock()
+
+# Statuses a poller may read as "there is nothing left to wait for". While an
+# initial message is still pending these are exactly the readings that must not
+# escape: see reported_status().
+_COMPLETABLE_STATUSES = (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
+
+
+def _mark_initial_delivery_pending(terminal_id: str) -> None:
+    """Record that an accepted initial message has not been dispatched yet."""
+    with _pending_initial_delivery_lock:
+        _pending_initial_delivery.add(terminal_id)
+
+
+def _clear_initial_delivery_pending(terminal_id: str) -> None:
+    """Release the pending mark. Idempotent — every exit path may call it."""
+    with _pending_initial_delivery_lock:
+        _pending_initial_delivery.discard(terminal_id)
+
+
+def initial_delivery_pending(terminal_id: str) -> bool:
+    """True while an accepted initial message has not reached the pane yet."""
+    with _pending_initial_delivery_lock:
+        return terminal_id in _pending_initial_delivery
+
+
+def reported_status(terminal_id: str, status: TerminalStatus) -> TerminalStatus:
+    """Mask a completable status while the initial message is still undispatched.
+
+    PR #566 review (haofeif), P1. A client that polls for completion decides
+    "done" from the terminal's status alone, and every such poller needs the same
+    thing: evidence that is causally DOWNSTREAM of the send it is waiting on.
+    Provider startup does not qualify. On the deferred path the pane can sit at a
+    perfectly genuine IDLE for seconds after ``initialize()`` returns while
+    ``_schedule_deferred_init`` resolves shell_baseline and metadata and
+    ``send_input`` runs ``inject_memory_context`` — all strictly BEFORE any
+    keystroke is dispatched. A poller sampling that window sees a stable IDLE and
+    concludes the agent finished a task it was never given: the synchronous
+    ``cao launch`` printed empty output and exited 0.
+
+    Reporting UNKNOWN closes that window at the source, for every client at once,
+    rather than asking each one to remember to wait for a separate handshake.
+    UNKNOWN is the honest reading — the terminal exists but is not tracking the
+    task yet — and pollers already treat it as neither progress nor completion
+    (``utils.terminal.poll_until_done``, ``services.agent_step``), so no number
+    of pre-dispatch samples can satisfy an idle gate.
+
+    Deliberately NOT masked:
+
+    - **WAITING_USER_ANSWER / PROCESSING / ERROR.** Masking WAITING_USER_ANSWER
+      would hide a pane genuinely parked on a prompt, which is the one state an
+      operator has to see to clear it (and which ``send_input``'s own guard turns
+      into a TerminalInputBlockedError that releases the pending mark anyway).
+      Letting it through is harmless here: it flips a poller's "has started" flag
+      early, but with IDLE masked no idle streak can accumulate to act on it.
+    - **The internal callers of ``status_monitor.get_status``.** send_input's
+      ERROR/WAITING_USER_ANSWER guards, inbox/flow/memory services and the
+      deferred path's own retry loop all need the RAW state; masking there would
+      change delivery decisions, not just reporting. This is a reporting-layer
+      concern only, applied where a status crosses the API boundary.
+    """
+    if status in _COMPLETABLE_STATUSES and initial_delivery_pending(terminal_id):
+        return TerminalStatus.UNKNOWN
+    return status
+
 
 # External-owner deferred-init rows survive provider startup failures so Bridge
 # and other external observers can read a durable verdict. Restart recovery
@@ -1677,6 +1749,16 @@ async def create_terminal(
                         idempotency_key=idempotency_key,
                         request_fingerprint=request_fingerprint,
                         new_session_incarnation=created_session,
+                        # The initial message is ACCEPTED the moment this row is
+                        # visible, so its outcome starts life as pending in the same
+                        # transaction (#566): a restart between here and the deferred
+                        # task's first write leaves a row the startup sweep can settle,
+                        # never one a client waits on forever.
+                        **(
+                            {"initial_delivery": {"state": "pending"}}
+                            if defer_init and initial_message
+                            else {}
+                        ),
                     )
                 except BaseException:
                     _clear_deferred_init_external_owner_active(terminal_id)
@@ -2497,6 +2579,101 @@ async def retry_interrupted_deferred_init_external_owners(
         delay = min(cap, max(0.1, delay * 2 if delay else 0.1))
 
 
+def _persist_initial_delivery(
+    terminal_id: str,
+    state: str,
+    *,
+    kind: str | None = None,
+    message: str | None = None,
+    only_if_pending: bool = True,
+) -> bool:
+    """Settle the durable ``initial_delivery`` outcome of a deferred-init terminal.
+
+    ``delivered`` is written once ``_confirm_worker_started_or_resubmit`` has
+    seen post-dispatch evidence; ``failed`` carries the same ``kind`` vocabulary
+    as ``deferred_init_failure`` plus ``waiting_user_answer`` (worker parked on
+    a prompt, alive, message not delivered) and ``interrupted`` (settled by the
+    restart sweep). Conditional on the row still reading ``pending`` so a late
+    failure never overwrites a confirmed delivery and a terminal created with
+    no initial message is left alone. Blocking DB I/O: callers to_thread it.
+    """
+    payload: dict[str, Any] = {"state": state}
+    if kind:
+        payload["kind"] = str(kind)
+    if message:
+        payload["message"] = _sanitize_deferred_failure_message(message)
+    try:
+        return update_terminal_initial_delivery(
+            terminal_id, payload, only_if_pending=only_if_pending
+        )
+    except Exception as exc:  # noqa: BLE001 — the delivery itself must not fail on bookkeeping
+        logger.warning("Could not persist initial_delivery=%s for %s: %s", state, terminal_id, exc)
+        return False
+
+
+async def recover_interrupted_initial_deliveries() -> bool:
+    """Settle initial deliveries stranded by a cao-server restart.
+
+    The deferred task that owned a terminal's initial message lives only in the
+    process that accepted it. After a restart a row still reading
+    ``initial_delivery.state == "pending"`` can never progress, and a client
+    waiting on it (``cao launch`` / ``--async``) would wait until its own
+    deadline for a verdict nobody will write. Mark such rows ``failed`` with kind
+    ``interrupted`` and, unless a failure is already recorded, publish the same
+    ``interrupted_init`` deferred-init failure the external-owner sweep uses, so
+    ``GET /terminals/{id}`` reads ERROR with the reason. Rows whose delivery is
+    pending in THIS process (the in-memory mark is set) are skipped; the sweep
+    runs at startup, before any new terminal can exist, so that is a safety net
+    rather than a race the sweep relies on.
+
+    Returns False when the enumeration itself failed, so the caller can retry.
+    """
+    try:
+        terminal_ids = await asyncio.to_thread(list_pending_initial_delivery_terminal_ids)
+    except Exception as exc:  # noqa: BLE001 — startup remains resilient
+        logger.warning("Could not list interrupted initial deliveries: %s", exc)
+        return False
+
+    complete = True
+    for terminal_id in terminal_ids:
+        if initial_delivery_pending(terminal_id):
+            continue
+        message = (
+            f"Worker {terminal_id}'s initial message was accepted but cao-server restarted "
+            "before its delivery was confirmed. Re-send the task or re-launch."
+        )
+        try:
+            settled = await asyncio.to_thread(
+                _persist_initial_delivery,
+                terminal_id,
+                "failed",
+                kind="interrupted",
+                message=message,
+            )
+            if not settled:
+                continue
+            metadata = await asyncio.to_thread(get_terminal_metadata, terminal_id)
+            if not metadata:
+                continue
+            if (
+                get_deferred_init_failure(terminal_id, metadata.get("deferred_init_failure"))
+                is None
+            ):
+                await asyncio.to_thread(
+                    _persist_deferred_init_failure,
+                    terminal_id,
+                    kind="interrupted_init",
+                    message=message,
+                    exception_type="ServerRestart",
+                )
+        except Exception as exc:  # noqa: BLE001 — retry on the next pass
+            complete = False
+            logger.warning(
+                "Could not settle interrupted initial delivery for %s: %s", terminal_id, exc
+            )
+    return complete
+
+
 def _persist_deferred_init_failure(
     terminal_id: str,
     *,
@@ -2589,6 +2766,13 @@ async def _surface_deferred_init_failure(
             await asyncio.to_thread(
                 _publish_deferred_failure_fallback, terminal_id, failure_payload
             )
+    # The initial message (if this terminal had one) is now known not to have
+    # been delivered; settle its durable outcome alongside the failure marker
+    # so a client waiting on initial_delivery stops with the reason (#566).
+    if not terminal_missing:
+        await asyncio.to_thread(
+            _persist_initial_delivery, terminal_id, "failed", kind=kind, message=message
+        )
     notification = _sanitize_deferred_failure_message(message)
     if delete_worker:
         notification += " The failed worker terminal will be torn down."
@@ -2736,6 +2920,37 @@ def redeliver_dropped_message(
 ) -> bool:
     """Re-deliver a message the TUI never accepted (blocking; to_thread it).
 
+    Thin wrapper over :func:`redeliver_dropped_message_with_boundary` that keeps
+    the ``bool`` contract the synchronous step path (#562) relies on. The
+    deferred-init confirm loop calls the underlying function directly because it
+    also needs the dispatch boundary the redelivery sampled.
+    """
+    started, _boundary = redeliver_dropped_message_with_boundary(
+        terminal_id,
+        message,
+        attempt,
+        provider,
+        full_resend_requires_probe=full_resend_requires_probe,
+        registry=registry,
+        sender_id=sender_id,
+        orchestration_type=orchestration_type,
+    )
+    return started
+
+
+def redeliver_dropped_message_with_boundary(
+    terminal_id: str,
+    message: str,
+    attempt: int,
+    provider=None,
+    *,
+    full_resend_requires_probe: bool = False,
+    registry: "PluginRegistry | None" = None,
+    sender_id: Optional[str] = None,
+    orchestration_type: Optional[OrchestrationType] = None,
+) -> tuple[bool, Optional[int]]:
+    """Re-deliver a message the TUI never accepted and report the new dispatch boundary.
+
     One attempt of the confirm-and-redeliver loop shared by the deferred-init
     path (#479) and the synchronous step path (#562). First, when the provider
     opts in via ``supports_direct_status_probe``, a live capture-pane check
@@ -2762,17 +2977,28 @@ def redeliver_dropped_message(
     bare-Enter branch (which cannot duplicate a task) is still taken
     whenever the text is visible; otherwise nothing is sent and False is
     returned, leaving the caller's own timeout to classify the outcome. The
-    deferred-init path keeps the default (off) because it loops on
-    ``wait_until_status`` for the PROCESSING edge before ever reaching here,
-    and that pre-existing behavior is unchanged by this helper's extraction.
+    deferred-init path keeps the default (off) because it waits on
+    ``_wait_for_post_dispatch_start`` for post-dispatch evidence before ever
+    reaching here, and that pre-existing behavior is unchanged by this helper's
+    extraction.
 
-    The full re-send is forwarded to ``send_input`` as ``redelivery=True``: it
+    The full re-send goes through ``dispatch_input`` with ``redelivery=True``: it
     repeats the dispatch CAO is already waiting on, so the provider must treat
     it as another delivery attempt of the same logical turn rather than as a
     newly dispatched turn.
 
-    Returns True when the worker was found already started and nothing was
-    sent; False when a redelivery was attempted (or deliberately skipped).
+    Returns ``(started, boundary)``. ``started`` is True when the worker was
+    found already running and nothing was sent; False when a redelivery was
+    attempted (or deliberately skipped). ``boundary`` is the output generation
+    sampled before the redelivery's keys reached the pane -- the fresh baseline
+    the next confirmation wait must use, so that evidence has to be earned
+    after THIS attempt rather than after the original dispatch (PR #566 review,
+    gutosantos82: the recency bar has to advance per attempt). It is ``None``
+    when nothing was sent, in which case the caller keeps its current baseline.
+    A bare Enter samples the current generation directly: it submits the paste
+    that is already in the composer, so there is no monitor arm or buffer clear
+    to repeat, but output that follows it is still the only output that can
+    prove this attempt was accepted.
     """
     if provider is None:
         try:
@@ -2784,15 +3010,16 @@ def redeliver_dropped_message(
     )
     if probe_capable:
         if _worker_is_started_direct(terminal_id, provider):
-            return True
+            return True, None
     if _message_visible_in_box(terminal_id, message):
         logger.warning(
             "Delivery to %s unsubmitted (Enter swallowed); " "re-submitting via Enter (attempt %d)",
             terminal_id,
             attempt,
         )
+        boundary = status_monitor.output_generation(terminal_id)
         send_special_key(terminal_id, "Enter")
-        return False
+        return False, boundary
     if getattr(provider, "execution_evidence_ambiguous", False) is True:
         logger.warning(
             "Delivery to %s is unconfirmed after execution context was evicted; "
@@ -2800,7 +3027,7 @@ def redeliver_dropped_message(
             terminal_id,
             attempt,
         )
-        return False
+        return False, None
     if full_resend_requires_probe and not probe_capable:
         # No probe → cannot rule out a working worker whose prompt left the
         # pane; a full re-send could silently duplicate the task. Skip the
@@ -2811,13 +3038,13 @@ def redeliver_dropped_message(
             terminal_id,
             attempt,
         )
-        return False
+        return False, None
     logger.warning(
         "Delivery to %s not accepted (paste dropped); " "re-delivering message (attempt %d)",
         terminal_id,
         attempt,
     )
-    send_input(
+    boundary = dispatch_input(
         terminal_id,
         message,
         registry=registry,
@@ -2825,7 +3052,80 @@ def redeliver_dropped_message(
         orchestration_type=orchestration_type,
         redelivery=True,
     )
-    return False
+    return False, boundary
+
+
+async def _wait_for_post_dispatch_start(
+    terminal_id: str,
+    dispatch_generation: Optional[int],
+    timeout: float,
+    polling_interval: float = 0.5,
+    *,
+    pre_dispatch_status: Optional[TerminalStatus] = None,
+) -> bool:
+    """Wait for a started status that is EVIDENCE OF THIS TURN, not a cached one.
+
+    Round-6 review (haofeif), P1. ``wait_until_status`` returns on the first poll
+    whose value is in the target set, and a status VALUE cannot say when it was
+    earned. Provider startup output can legitimately parse as COMPLETED, which
+    then latches (``_STICKY_READY_STATUSES``), and ``send_input`` only ARMS the
+    next transition without touching the cached value. So a pre-dispatch
+    COMPLETED satisfied confirmation instantly -- measured at 0.008s against an
+    exact head -- releasing the pending-delivery mask before the new task had
+    emitted anything.
+
+    Round-9 review (haofeif), P1. Reading the cached status and the global output
+    generation as two independent values was not enough either: any post-boundary
+    frame (a spinner redraw, a late MCP startup line) advances the generation
+    without downgrading the sticky COMPLETED, and the pair then reads as "started
+    status + new output" -- a false confirmation of a send whose Enter was
+    swallowed. The requirement is causal, so it is checked on ONE observation:
+    ``status_monitor.status_observation`` returns the applied status together with
+    the output generation it was EARNED at (stamped when the detection was
+    applied), and confirmation requires that stamp, not the current counter, to
+    exceed ``dispatch_generation``. A status latched before the send keeps its
+    pre-send stamp however much unrelated output lands afterwards; a status the
+    worker earned by producing output for this task carries a newer one.
+
+    ``dispatch_generation`` is ``status_monitor.output_generation()`` sampled at
+    the dispatch boundary INSIDE ``dispatch_input`` -- armed, buffer cleared, no
+    key sent yet. Two things are deliberately NOT in it: the arm bump (so a
+    redelivery's own ``notify_input_sent`` cannot satisfy the gate on a
+    still-cached COMPLETED), and output emitted during ``send_keys``' submit delay
+    (so a fast worker that completes before the send returns is confirmed, not
+    resubmitted to and torn down).
+
+    Event-inbox backends (herdr) start no FIFO reader, so no output generation
+    ever advances for them and ``dispatch_generation`` is ``None``. That used to
+    disable the recency requirement outright, which the round-9 review named as a
+    bypass: ``get_native_status`` can keep reporting the PREVIOUS turn's COMPLETED
+    until the new inbox event lands, and an unconditional pass accepted it. They
+    are now judged by TRANSITION instead: the caller samples the on-demand status
+    immediately before dispatching (``pre_dispatch_status``), and a started
+    status counts only if it differs from that sample or is PROCESSING (herdr's
+    ``working`` is a live state, never a retained verdict). A turn whose
+    pre-dispatch reading was already COMPLETED must therefore be seen working or
+    waiting before its completion is believed; a sub-poll-interval turn that goes
+    straight from the old COMPLETED to a new one is the residual this cannot
+    distinguish, and it fails toward resubmission rather than toward a false
+    confirmation.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        observation = status_monitor.status_observation(terminal_id)
+        status = observation.status
+        if status in _DEFERRED_STARTED_STATUSES:
+            if dispatch_generation is None:
+                if status == TerminalStatus.PROCESSING or status != pre_dispatch_status:
+                    return True
+            elif (
+                observation.output_generation is not None
+                and observation.output_generation > dispatch_generation
+            ):
+                return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(polling_interval)
 
 
 async def _confirm_worker_started_or_resubmit(
@@ -2835,12 +3135,15 @@ async def _confirm_worker_started_or_resubmit(
     sender_id: Optional[str],
     orchestration_type: Optional[OrchestrationType],
     provider=None,
+    dispatch_generation: Optional[int] = None,
+    pre_dispatch_status: Optional[TerminalStatus] = None,
 ) -> bool:
     """Confirm a deferred-init worker began processing; re-submit if not.
 
-    Returns True once the terminal reaches a started status, False if it is
-    still stuck at IDLE after all resubmit attempts. Blocking tmux/DB I/O runs
-    off the loop via to_thread so concurrent deferred inits aren't frozen.
+    Returns True once the terminal reaches a started status EARNED AFTER dispatch
+    (see ``_wait_for_post_dispatch_start``), False if it never does after all
+    resubmit attempts. Blocking tmux/DB I/O runs off the loop via to_thread so
+    concurrent deferred inits aren't frozen.
     """
     if provider is None:
         try:
@@ -2848,7 +3151,7 @@ async def _confirm_worker_started_or_resubmit(
         except Exception:
             provider = None
 
-    async def wait_for_start() -> bool:
+    async def wait_for_start(boundary: Optional[int]) -> bool:
         if getattr(provider, "requires_execution_evidence", False) is True:
             # Cached PROCESSING/COMPLETED may be dispatch-derived too. Poll
             # independent evidence for the full grace period before resending.
@@ -2859,22 +3162,22 @@ async def _confirm_worker_started_or_resubmit(
                 if time.monotonic() >= deadline:
                     return False
                 await asyncio.sleep(0.5)
-        return await wait_until_status(
+        return await _wait_for_post_dispatch_start(
             terminal_id,
-            _DEFERRED_STARTED_STATUSES,
+            boundary,
             timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
-            polling_interval=0.5,
+            pre_dispatch_status=pre_dispatch_status,
         )
 
-    if await wait_for_start():
+    if await wait_for_start(dispatch_generation):
         return True
 
     for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
         # The redelivery decision (box check + #496's direct-probe guard for
-        # providers that opt in) lives in ``redeliver_dropped_message`` —
-        # shared with the synchronous step path (#562).
-        already_started = await asyncio.to_thread(
-            redeliver_dropped_message,
+        # providers that opt in) lives in ``redeliver_dropped_message_with_boundary``
+        # — shared, via its bool wrapper, with the synchronous step path (#562).
+        already_started, redelivery_boundary = await asyncio.to_thread(
+            redeliver_dropped_message_with_boundary,
             terminal_id,
             message,
             attempt,
@@ -2885,7 +3188,17 @@ async def _confirm_worker_started_or_resubmit(
         )
         if already_started:
             return True
-        if await wait_for_start():
+        # Same recency requirement as the first wait, measured from THIS attempt:
+        # a resubmit that lands on a still-cached pre-dispatch COMPLETED must not
+        # read as success, and neither may a status earned between the original
+        # dispatch and this redelivery -- the previous wait already judged that
+        # window and found nothing. The redelivery's own paste echo is inside the
+        # new baseline, so it cannot pass for evidence either. Event-inbox
+        # backends stay on the transition check (``None``); a skipped redelivery
+        # returns no boundary and the current one is kept.
+        if redelivery_boundary is not None and dispatch_generation is not None:
+            dispatch_generation = redelivery_boundary
+        if await wait_for_start(dispatch_generation):
             return True
 
     return False
@@ -2902,7 +3215,7 @@ def _schedule_deferred_init(
     delete_on_failure: bool | None = None,
 ) -> asyncio.Task | None:
     """Kick off provider.initialize() in the background and, on success,
-    deliver the initial message via send_input.
+    deliver the initial message via dispatch_input.
 
     Runs as an asyncio task on the running event loop so it doesn't block
     the caller. Because assign() has already returned success=True by the
@@ -2950,30 +3263,94 @@ def _schedule_deferred_init(
                 # _schedule_deferred_init), so defaulting an unstated orchestration_type
                 # to ASSIGN here is always correct and cannot affect answer_user_prompt.
                 effective_orchestration_type = orchestration_type or OrchestrationType.ASSIGN
-                # send_input is blocking tmux I/O — off the loop so it can't
+                # dispatch_input is blocking tmux I/O — off the loop so it can't
                 # freeze the server for concurrent requests.
-                await asyncio.to_thread(
-                    send_input,
+                # Event-inbox backends (herdr) derive status on demand and have no
+                # output generation, so their recency check is a TRANSITION from
+                # the reading immediately before dispatch (round-9 P1; see
+                # _wait_for_post_dispatch_start). Sampled here, with nothing yet
+                # sent, so it is the last pre-dispatch value by construction.
+                # Pipe-pane backends do not use it; their gate is the stamped
+                # output generation.
+                pre_dispatch_status: Optional[TerminalStatus] = None
+                if get_backend().supports_event_inbox():
+                    pre_dispatch_status = await asyncio.to_thread(
+                        status_monitor.get_status, terminal_id
+                    )
+                dispatch_boundary = await asyncio.to_thread(
+                    dispatch_input,
                     terminal_id,
                     initial_message,
                     registry=registry,
                     sender_id=caller_id,
                     orchestration_type=effective_orchestration_type,
                 )
+                # The pending mark is deliberately NOT released here.
+                #
+                # Round-4 review (haofeif), P1. An earlier revision cleared it at
+                # this dispatch boundary, reasoning that a keystroke had been
+                # issued so a poller's evidence was now downstream of the send. It
+                # isn't. dispatch_input only calls status_monitor.notify_input_sent(),
+                # which ARMS the next transition without changing the cached
+                # status, and no current provider enables
+                # assume_processing_on_dispatch. The status a poller reads right
+                # after this line is therefore still the pre-send IDLE, and stays
+                # that way until the agent's first output chunk is detected. The
+                # reviewer measured ~1.4s of it against a real worker; the
+                # regression test here reproduced 0.93s. Either way it is far
+                # longer than idle_stable_polls samples, so releasing at this line
+                # only moved the false-completion window from before the send to
+                # after it.
+                #
+                # _run's outer ``finally`` releases it instead, which is reached
+                # only after _confirm_worker_started_or_resubmit has observed a
+                # status in _DEFERRED_STARTED_STATUSES. That set includes
+                # COMPLETED, so holding the mark across the confirm window does
+                # NOT hide a genuine early completion (the concern that motivated
+                # releasing here): confirm returns as soon as the completion is
+                # visible, and the mark lifts with it.
+                #
+                # Cost of the change: when NO started status is ever observed the
+                # mark is now held for the confirm loop's whole budget
+                # (_DEFERRED_SUBMIT_CONFIRM_TIMEOUT x (1 + max resubmits) = ~32s)
+                # instead of being dropped at dispatch. That is inside `cao
+                # launch`'s 420s headless budget, and the worker is torn down at
+                # the end of it anyway, so UNKNOWN is the honest reading for a
+                # delivery we cannot confirm.
                 # Delivery can be silently dropped (Enter swallowed / paste lost)
                 # when the TUI isn't input-ready. Confirm the worker actually
                 # started and re-submit if not; if it never starts, surface the
                 # failure so the supervisor re-routes instead of waiting forever.
+                # The output generation at the dispatch boundary, captured INSIDE
+                # dispatch_input between arming the monitor and sending the first
+                # key. Confirmation requires the generation to exceed it, i.e. real
+                # output arrived after the send -- so a COMPLETED cached during
+                # provider startup can no longer read as this task starting.
+                # It is not sampled here, after the send returned: send_keys'
+                # submit delay is long enough for a fast worker to emit and
+                # complete, and a baseline taken afterwards would contain that
+                # output and reject the genuine completion (reviewer-reproduced).
+                #
+                # None for event-inbox backends (herdr): they run no FIFO reader,
+                # so the generation never advances from output and the requirement
+                # could never be met -- every resubmit would burn and the worker
+                # would be torn down. Their status is derived on demand instead, so
+                # there is no stale cached value for the gate to protect against.
+                dispatch_generation = (
+                    None if get_backend().supports_event_inbox() else dispatch_boundary
+                )
                 started = await _confirm_worker_started_or_resubmit(
                     terminal_id,
                     initial_message,
                     registry,
                     caller_id,
-                    # Same guard-eligible default as the initial send_input above --
+                    # Same guard-eligible default as the initial dispatch_input above --
                     # a resubmit is still an unattended initial-task delivery, so it
                     # must not silently drop back to the unguarded original type.
                     effective_orchestration_type,
                     provider=provider_instance,
+                    dispatch_generation=dispatch_generation,
+                    pre_dispatch_status=pre_dispatch_status,
                 )
                 # Strict execution-evidence providers (currently Kimi) do not
                 # accept cached PROCESSING/COMPLETED as pickup proof. Their
@@ -3036,6 +3413,11 @@ def _schedule_deferred_init(
                         delete_on_failure=delete_on_failure,
                     )
                     return
+                # Post-dispatch evidence observed (and, for strict providers, no
+                # ERROR behind it): the delivery is confirmed. Persist it BEFORE the
+                # in-memory mask lifts in ``finally`` so a client that reads
+                # delivered never sees an unmasked status first (#566).
+                await asyncio.to_thread(_persist_initial_delivery, terminal_id, "delivered")
             await _clear_deferred_init_external_owner(terminal_id)
         except TerminalInputBlockedError as e:
             # The worker initialized but is parked on an interactive prompt
@@ -3050,6 +3432,21 @@ def _schedule_deferred_init(
                 e,
             )
             await _clear_deferred_init_external_owner(terminal_id)
+            # Not a deferred_init_failure (the worker is alive and answerable), but
+            # the initial message was NOT delivered and a client waiting on the
+            # outcome must learn that rather than watch WAITING_USER_ANSWER until
+            # its deadline (round-9 P1, --async durability).
+            await asyncio.to_thread(
+                _persist_initial_delivery,
+                terminal_id,
+                "failed",
+                kind="waiting_user_answer",
+                message=(
+                    f"Worker {terminal_id} is waiting on an interactive prompt; the initial "
+                    "message was not delivered. Answer the prompt (answer_user_prompt, or "
+                    "attach), then send the task again."
+                ),
+            )
             await asyncio.to_thread(
                 _notify_caller_of_deferred_failure,
                 terminal_id,
@@ -3079,6 +3476,19 @@ def _schedule_deferred_init(
                 registry=registry,
                 delete_on_failure=delete_on_failure,
             )
+        finally:
+            # The single release point for every path, and on the happy path the
+            # first moment a completion poller's evidence is genuinely downstream
+            # of the send: reached only once _confirm_worker_started_or_resubmit
+            # has seen PROCESSING, COMPLETED or WAITING_USER_ANSWER.
+            #
+            # It also covers every abnormal exit, so a terminal can never be left
+            # permanently masked: initialize() raising, send_input raising
+            # TerminalInputBlockedError (the pane is parked on a prompt — the
+            # terminal is then honestly WAITING_USER_ANSWER and the operator has
+            # to see it), the worker never starting after all resubmits, or the
+            # loop being torn down. Idempotent, so double-clearing is harmless.
+            _clear_initial_delivery_pending(terminal_id)
 
     try:
         loop = asyncio.get_running_loop()
@@ -3086,7 +3496,51 @@ def _schedule_deferred_init(
         logger.error(f"Deferred init for {terminal_id}: no running event loop; init skipped")
         _clear_deferred_init_external_owner_active(terminal_id)
         return None
-    task = loop.create_task(_run())
+    # Mirrors _run's own ``if initial_message`` condition: defer_init is also used
+    # with no message at all (see the create_terminal call site), and there is
+    # nothing pending to mask on that path.
+    #
+    # Set here rather than inside _run so the mark is established by the time this
+    # function returns — the point at which the message has been accepted and the
+    # caller is free to start polling. That keeps the invariant independent of when
+    # the event loop first schedules _run instead of relying on it winning a race.
+    if initial_message:
+        _mark_initial_delivery_pending(terminal_id)
+    # Only _run's finally releases the mark, so a create_task that raises would
+    # leave it set with nothing left to clear it — create_terminal's own exception
+    # cleanup does not know about this mark. Cheap to close, so closed.
+    #
+    # Deliberately NOT claiming the obvious trigger: "the loop closed between the
+    # check above and this line" cannot happen. get_running_loop() only succeeds
+    # on the loop thread, so reaching here means we ARE the running loop, and
+    # loop.close() on a running loop raises "Cannot close a running event loop".
+    # What remains is the unglamorous set: _run() not being a coroutine
+    # (programming error), MemoryError, or a KeyboardInterrupt landing in the gap.
+    #
+    # Known and deliberately unguarded: after loop.stop(), create_task SUCCEEDS
+    # and the coroutine is never run, so the mark leaks with nothing raised for
+    # this to catch. That only arises while the loop is being torn down, and
+    # _pending_initial_delivery is module state that dies with the process, so
+    # there is nothing for it to leak into. Guarding it would mean a shutdown hook
+    # for state that cannot outlive shutdown.
+    # BaseException rather than Exception is deliberate, and matches the rollback
+    # guards at :415 and :796. KeyboardInterrupt is one of the two realistic
+    # triggers named above and is not an Exception subclass, so narrowing this
+    # would skip the case it exists for. The bare ``raise`` leaves shutdown
+    # semantics intact — this only cleans up on the way past.
+    coro = _run()
+    try:
+        task = loop.create_task(coro)
+    except BaseException:
+        # The coroutine object exists but was never handed to a task, so close it
+        # or the interpreter warns "coroutine was never awaited" when it is GC'd.
+        coro.close()
+        # Only clear what this call may have set: with no initial_message no mark
+        # was taken, and an unconditional discard would be reaching for state this
+        # call does not own.
+        if initial_message:
+            _clear_initial_delivery_pending(terminal_id)
+        raise
     if delete_on_failure is False:
         # Direct callers of this private scheduler may not have come through
         # create_terminal's pre-insert fence. Marking again is idempotent.
@@ -3138,7 +3592,7 @@ def get_terminal(terminal_id: str) -> Dict:
             ):
                 status = TerminalStatus.UNKNOWN.value
             else:
-                status = observed_status.value
+                status = reported_status(terminal_id, observed_status).value
 
         return {
             "id": metadata["id"],
@@ -3155,6 +3609,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "group": metadata.get("group"),
             "metadata": public_metadata,
             "deferred_init_failure": deferred_failure,
+            "initial_delivery": metadata.get("initial_delivery"),
             "session_incarnation_id": metadata.get("session_incarnation_id"),
             "status": status,
             "last_active": metadata["last_active"],
@@ -3237,7 +3692,9 @@ def list_siblings(
         caller_id, prefix, caller_session=caller_session, cross_session=cross_session
     )
     for sibling in siblings:
-        sibling["status"] = status_monitor.get_status(sibling["id"]).value
+        sibling["status"] = reported_status(
+            sibling["id"], status_monitor.get_status(sibling["id"])
+        ).value
     return siblings
 
 
@@ -3279,6 +3736,48 @@ def send_input(
     frozen_memory: str | None = None,
 ) -> bool:
     """Send input to terminal via tmux paste buffer.
+
+    Thin wrapper over :func:`dispatch_input` that keeps the ``bool`` contract.
+    The contract is load-bearing, not ceremony: ``POST /terminals/{id}/input``
+    returns this value on the wire as ``{"success": ...}``, so returning the
+    dispatch boundary here would change the API response -- and a first-ever
+    dispatch, whose boundary is 0, would read as ``"success": 0``. A caller that
+    must later prove the terminal produced output FOR THIS SEND (the deferred
+    initial-message path) calls ``dispatch_input`` directly and keeps the
+    boundary it returns.
+    """
+    dispatch_input(
+        terminal_id,
+        message,
+        registry=registry,
+        sender_id=sender_id,
+        orchestration_type=orchestration_type,
+        redelivery=redelivery,
+        frozen_memory=frozen_memory,
+    )
+    return True
+
+
+def dispatch_input(
+    terminal_id: str,
+    message: str,
+    registry: PluginRegistry | None = None,
+    sender_id: str | None = None,
+    orchestration_type: OrchestrationType | None = None,
+    redelivery: bool = False,
+    frozen_memory: str | None = None,
+) -> int:
+    """Send input to terminal via tmux paste buffer and return its dispatch boundary.
+
+    The return value is ``status_monitor.output_generation()`` sampled at the
+    dispatch boundary: after the monitor has been armed and the rolling buffer
+    cleared, and before any key reaches the pane. Any output generation strictly
+    greater than it is output the terminal produced after this send -- the
+    evidence ``_wait_for_post_dispatch_start`` needs. It has to be captured here
+    rather than by the caller after this function returns, because ``send_keys``
+    includes the provider's submit delay, during which a fast worker can already
+    emit and complete; sampled afterwards, those chunks would be inside the
+    baseline and a genuine completion would read as pre-dispatch.
 
     Uses bracketed paste mode (-p) to bypass TUI hotkey handling. The number
     of Enter keys sent after pasting is determined by the provider's
@@ -3382,6 +3881,22 @@ def send_input(
         # byte-identical completion from a retained completion screen.
         status_monitor.clear_rolling_buffer(terminal_id, provider)
 
+        # THE DISPATCH BOUNDARY. Sampled here -- armed, buffer cleared, no key
+        # sent yet -- and returned to the caller. Output that lands from this
+        # point on is output produced after this send; output that landed before
+        # it is already inside the value and can never count as evidence. This
+        # is the only place the sample is correct: one line later send_keys
+        # starts, and its submit delay is exactly the window in which a fast
+        # worker emits and completes (reviewer-reproduced on PR #566).
+        #
+        # Deliberately a separate lock acquisition AFTER the clear, not atomic
+        # with it. A chunk that lands between the two is pre-dispatch output (no
+        # key has been sent), and this ordering folds it INTO the baseline, so it
+        # cannot pass for evidence. Sampling under the clear's own lock would
+        # leave that chunk outside the baseline and count it -- the false
+        # confirmation this gate exists to prevent.
+        dispatch_boundary = status_monitor.output_generation(terminal_id)
+
         # Mark the provider before send_keys rather than after it.  send_keys
         # includes the provider-specific submit delay, during which a fast CLI
         # can already emit its first processing and completion frames.  Those
@@ -3437,7 +3952,7 @@ def send_input(
                         traceparent=inject_traceparent(),
                     ),
                 )
-        return True
+        return dispatch_boundary
 
     except Exception as e:
         logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
