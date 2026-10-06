@@ -95,16 +95,26 @@ class Bridge:
     # --- outbound ---
 
     async def _send(self, frame) -> None:
-        ws = self._ws
-        if ws is not None:
-            async with self._send_lock:
+        # The socket is read under the lock, so a send queued behind a stalled
+        # one uses whichever socket is current, not the one it saw first.
+        async with self._send_lock:
+            tried = None
+            ws = self._ws
+            while ws is not None and ws is not tried:
                 try:
                     await ws.send(encode(frame))
                     return
                 except websockets.exceptions.ConnectionClosed:
-                    pass
-        if isinstance(frame, Result):
-            self._unsent.append(frame)
+                    tried = ws
+                    # A replacement may have connected while this send was
+                    # blocked. Its drain of the unsent queue has already run, so
+                    # a result queued now would wait for yet another reconnect
+                    # (for a launch: an agent with no central row). Use it.
+                    ws = self._ws
+            # Nothing between this check and the append yields to the loop, so
+            # no new socket's drain can run in between: the next one sends it.
+            if isinstance(frame, Result):
+                self._unsent.append(frame)
 
     def _local_terminal_ids(self) -> Set[str]:
         from cli_agent_orchestrator.clients.database import list_all_terminals

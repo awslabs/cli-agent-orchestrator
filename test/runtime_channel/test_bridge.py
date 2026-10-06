@@ -560,6 +560,43 @@ class TestConnection:
         assert late in server.sent
 
     @pytest.mark.asyncio
+    async def test_a_result_whose_socket_was_replaced_mid_send_reaches_the_new_one(self):
+        # The send blocks on the old socket. Meanwhile a replacement connects and
+        # drains the unsent queue (still empty), and only then does the old send
+        # fail. Queued after that drain, the result would wait for yet another
+        # reconnect: for a launch, an agent left running with no central row.
+        bridge = _bridge()
+        # Its hello lists no terminal, so nothing holds up the replacement's
+        # drain: it runs in the same step that installs the new socket.
+        bridge._current_statuses = lambda: {}
+        release = asyncio.Event()
+
+        class StalledThenClosed:
+            async def send(self, text):
+                await release.wait()
+                raise websockets.exceptions.ConnectionClosedError(None, None)
+
+        bridge._ws = StalledThenClosed()
+        result = Result(op_id="op-launch", ok=True, payload={"terminal": {"id": "beef0001"}})
+        sending = asyncio.ensure_future(bridge._send(result))
+        await asyncio.sleep(0.05)  # the send now holds the lock, blocked
+        replacement = FakeServer()
+        serving = asyncio.ensure_future(bridge.serve(replacement))
+        for _ in range(100):
+            if bridge._ws is replacement:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)  # the replacement's drain found nothing yet
+        release.set()
+        await asyncio.wait_for(sending, 5)
+        try:
+            assert result in replacement.sent, "the result went to the replacement socket"
+            assert bridge._unsent == [], "nothing waits for another reconnect"
+        finally:
+            await replacement.close()
+            await serving
+
+    @pytest.mark.asyncio
     async def test_a_failure_right_after_the_hello_leaves_the_runtime_not_ready(self, tmp_path):
         bridge = _bridge(tmp_path)
 
