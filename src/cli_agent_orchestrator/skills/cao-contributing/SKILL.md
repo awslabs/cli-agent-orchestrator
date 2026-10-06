@@ -137,7 +137,7 @@ pins this table to the workflow files.
 | **Test Claude Code Provider** (`test-claude-code-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test, `pyproject.toml`, or the workflow | **Yes** |
 | **Test Codex CLI Provider** (`test-codex-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test or fixtures, `pyproject.toml`, or the workflow | **Yes** |
 | **Test Kiro CLI Provider** (`test-kiro-cli-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test or fixtures, `pyproject.toml`, or the workflow | **Yes** |
-| **Docs site** (`gh-pages.yml`) | `build` | only PRs touching `docusaurus/**`, `patches/**`, `scripts/test-braces-security.cjs`, or the workflow | **Yes** — `deploy` is push-only and never runs on a PR |
+| **Docs site** (`gh-pages.yml`) | `build` | only PRs touching `docusaurus/**`, `patches/**`, `vendor/**`, `scripts/test-braces-security.cjs`, or the workflow | **Yes** — `deploy` is push-only and never runs on a PR |
 
 > **Two checks can share a name.** Each provider workflow has its own `Unit Tests` and
 > `Code Quality`, so a PR that touches `pyproject.toml` shows those names more than once.
