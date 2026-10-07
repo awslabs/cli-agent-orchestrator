@@ -15,7 +15,11 @@ exactly as before.
 | Central SQLite state | yes, one row per terminal, naming its runtime | pane bookkeeping only |
 | tmux, provider CLIs, agents | no, for remote terminals; none at all with `CAO_LOCAL_EXECUTION=0` | yes |
 | Status detection | receives it | derives it beside the pane and pushes it |
-| Flow pre-scripts, Python workflow scripts | yes, even with `CAO_LOCAL_EXECUTION=0` | no |
+| Agent profiles, provider files | no, for remote terminals | yes: resolved from the runtime's own profile store, written by its `create_terminal` |
+| Workspace | no, for remote terminals | yes: a launch's `working_directory` is a path in the runtime |
+| Provider credentials | no, for remote terminals | yes: the runtime's own (in the EKS example, its service account's IAM role) |
+| Terminal logs and output | no, for remote terminals | yes: read on request through the server |
+| Flow pre-scripts, Python workflow scripts | yes, even with `CAO_LOCAL_EXECUTION=0` | no, not in this slice |
 
 Set `CAO_LOCAL_EXECUTION=0` on a central server that must run no agents
 itself. Every local terminal creation is then refused; the routes that would
@@ -23,7 +27,10 @@ start one (`POST /sessions`, `POST /sessions/{name}/terminals`,
 `POST /terminals/run-step`) return `409`. The setting covers agents only: a
 flow's pre-script and a Python workflow script still run on the server host,
 as the server's user. The flow's session launch, or the workflow's agent
-steps, are then refused.
+steps, are then refused. Moving that user code to an execution runtime, as
+[#745](https://github.com/awslabs/cli-agent-orchestrator/issues/745) requires,
+is a later slice; until then `CAO_LOCAL_EXECUTION=0` does not keep user code
+off the server.
 
 The runtime opens one WebSocket to `WS /runtime/channel`, outbound only, with
 the shared token in the `x-cao-runtime-token` header. Its runtime id (for
