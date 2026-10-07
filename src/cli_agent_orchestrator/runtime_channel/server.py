@@ -146,7 +146,23 @@ def _drop_lost_terminals(runtime_id: str, terminal_ids: List[str]) -> List[str]:
             runtime_id,
             ", ".join(dropped),
         )
+        # Not for an id that is no longer this runtime's row: a relaunch of it
+        # elsewhere is another terminal, whose status this is not.
+        _publish_unknown(dropped)
     return gone
+
+
+def _publish_unknown(terminal_ids: List[str]) -> None:
+    """Tell the server's status consumers these terminals' status is no longer
+    known, as ``GET /terminals/{id}`` now reads.
+
+    They act on ``terminal.{id}.status`` events only: an approval prompt opened
+    for a terminal waiting for its user expires on the next event with another
+    status, which no runtime sends for a terminal it is no longer connected for,
+    or no longer runs. ``bus.publish`` is safe from any thread.
+    """
+    for terminal_id in terminal_ids:
+        bus.publish(f"terminal.{terminal_id}.status", {"status": TerminalStatus.UNKNOWN.value})
 
 
 def _unreported_terminal(frame: Result) -> Optional[str]:
@@ -348,7 +364,9 @@ async def runtime_channel(ws: WebSocket) -> None:
     except Exception:  # noqa: BLE001 - one bad channel must not take down the server
         logger.exception("runtime channel error for %s", runtime_id)
     finally:
-        runtime_registry.unregister(runtime_id, conn)
+        # Only while this is the runtime's current connection does its end say
+        # anything: a replaced one's terminals are the newer connection's.
+        _publish_unknown(runtime_registry.unregister(runtime_id, conn))
 
 
 class LaunchRequest(BaseModel):

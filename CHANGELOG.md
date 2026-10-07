@@ -60,6 +60,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot. Terminal rows gain a nullable `runtime_id` column, added
   idempotently. A runtime's hello lists the terminals it runs, and the server
   drops the record of one it no longer runs (a replaced pod's, for instance).
+  Status events (`terminal.{id}.status`) report `unknown` for a runtime's
+  terminals when its channel goes, and for a record a hello drops.
   `CAO_LOCAL_EXECUTION=0` stops the server starting agents
   itself, and `CAO_RUNTIME_LAUNCH_TIMEOUT` bounds a launch. An EKS example is
   in `examples/cao-clusters/kubernetes/remote-runtime/`. See

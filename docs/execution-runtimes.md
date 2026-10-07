@@ -59,7 +59,12 @@ order; different terminals run concurrently.
 | `DELETE /terminals/{id}`, `DELETE /sessions/{name}` | `delete` | tear the terminal down, then the server drops its row |
 
 `GET /terminals/{id}` answers from the status the runtime last pushed. While
-the runtime is disconnected, the status is `unknown`.
+the runtime is disconnected, the status is `unknown`. The server publishes the
+same as `terminal.{id}.status` events, which its status consumers (approval
+prompts, inbox delivery) act on: each status the runtime pushes, `unknown` for
+each of the runtime's terminals when its channel goes, and `unknown` for a
+terminal whose record a hello drops. After a reconnect, the runtime pushes each
+terminal's status again. A connection a newer one replaced publishes nothing.
 
 Operations that work only on the server's own panes and logs refuse a remote
 terminal with `409` rather than act on nothing: reusing it in

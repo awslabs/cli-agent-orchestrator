@@ -46,6 +46,7 @@ from cli_agent_orchestrator.runtime_channel.protocol import (
 from cli_agent_orchestrator.runtime_channel.registry import RuntimeRegistry
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.utils import agent_profiles
+from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 TOKEN = "test-runtime-token"
 WS_HEADERS = {"x-cao-runtime-token": TOKEN, "host": "localhost"}
@@ -818,7 +819,7 @@ class TestLaunchAcrossAReconnect:
         assert status_now == "unknown", "the old connection's launch status must not stand"
 
     def test_a_launch_recorded_as_a_replacement_that_does_not_run_it_connects_is_dropped(
-        self, http, server, monkeypatch
+        self, http, server, monkeypatch, status_events
     ):
         # The pod is replaced while the launch result is being recorded. The
         # replacement's hello cannot reconcile a launch still in flight, and
@@ -862,6 +863,9 @@ class TestLaunchAcrossAReconnect:
         assert "replaced" in response.json()["detail"]
         assert database.get_terminal_metadata("beef0001") is None
         assert not registry_mod.runtime_registry.is_placed("beef0001", "rt-1")
+        # A status reported while it was being recorded was published: this
+        # one says it is gone.
+        assert status_events.take() == [("beef0001", "unknown")]
 
     def test_an_undo_is_not_confirmed_by_another_instance_of_the_runtime(
         self, http, server, monkeypatch
@@ -1832,6 +1836,123 @@ class TestStatusOnReconnect:
 
 async def _subscribe(bus):
     return bus.subscribe("terminal.*.status")
+
+
+class _StatusEvents:
+    """The ``terminal.*.status`` events the server publishes, as its status
+    consumers (approval prompts, inbox delivery) get them. They arrive on a
+    loop of their own, so a test can read them while its channel is open."""
+
+    def __init__(self, monkeypatch):
+        from cli_agent_orchestrator.services.event_bus import bus
+
+        self._bus = bus
+        self.loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+        self._thread.start()
+        monkeypatch.setattr(bus, "_loop", self.loop)
+        self._queue = asyncio.run_coroutine_threadsafe(_subscribe(bus), self.loop).result(DEADLINE)
+
+    def _read(self, coroutine, timeout):
+        events = asyncio.run_coroutine_threadsafe(coroutine, self.loop).result(timeout)
+        return [(terminal_id_from_topic(e["topic"]), e["data"]["status"]) for e in events]
+
+    def take(self, count=1, timeout=5.0):
+        """The next ``count`` events, as (terminal id, status)."""
+
+        async def take():
+            return [await asyncio.wait_for(self._queue.get(), timeout) for _ in range(count)]
+
+        return self._read(take(), timeout * count + 1)
+
+    def rest(self, wait=0.3):
+        """Every further event published within ``wait`` seconds."""
+
+        async def rest():
+            await asyncio.sleep(wait)
+            return [self._queue.get_nowait() for _ in range(self._queue.qsize())]
+
+        return self._read(rest(), wait + DEADLINE)
+
+    def close(self):
+        self._bus.unsubscribe("terminal.*.status", self._queue)
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self._thread.join(DEADLINE)
+        self.loop.close()
+
+
+@pytest.fixture
+def status_events(monkeypatch):
+    events = _StatusEvents(monkeypatch)
+    yield events
+    events.close()
+
+
+class TestStatusEvents:
+    # Status consumers act on these events only: an approval prompt opened for
+    # a terminal waiting for its user expires on the next event with another
+    # status. The events must say what GET /terminals/{id} reads.
+
+    def test_a_lost_channel_publishes_unknown_for_its_terminals(self, server, status_events):
+        _remote_row("abcd1234", "rt-1")
+
+        async def scenario():
+            async with _dial(server) as ws:
+                await ws.send(_hello(statuses={"abcd1234": "waiting_user_answer"}))
+                await ws.recv()
+                await ws.send(encode(Status(terminal_id="abcd1234", status="waiting_user_answer")))
+                first = await asyncio.to_thread(status_events.take)
+            # The channel is gone: GET /terminals/abcd1234 reads unknown now.
+            return first + await asyncio.to_thread(status_events.take)
+
+        assert asyncio.run(scenario()) == [
+            ("abcd1234", "waiting_user_answer"),
+            ("abcd1234", "unknown"),
+        ]
+
+    def test_a_replacement_that_does_not_run_a_terminal_publishes_it_unknown(
+        self, server, status_events
+    ):
+        # The old instance's channel is still open when its replacement
+        # connects (a pod killed without closing its connection), so the end of
+        # that channel is no longer the runtime's and publishes nothing. The
+        # replacement's hello drops the terminal: that is the event's turn.
+        _remote_row("abcd1234", "rt-1")
+
+        async def scenario():
+            async with _dial(server) as old:
+                await old.send(_hello(statuses={"abcd1234": "waiting_user_answer"}))
+                await old.recv()
+                await old.send(encode(Status(terminal_id="abcd1234", status="waiting_user_answer")))
+                first = await asyncio.to_thread(status_events.take)
+                async with _dial(server) as new:
+                    await new.send(_hello(statuses={}))  # the replacement runs nothing
+                    await new.recv()
+                    return first + await asyncio.to_thread(status_events.take)
+
+        assert asyncio.run(scenario()) == [
+            ("abcd1234", "waiting_user_answer"),
+            ("abcd1234", "unknown"),
+        ]
+        assert database.get_terminal_metadata("abcd1234") is None
+
+    def test_a_replaced_channel_publishes_nothing_over_its_replacement(self, server, status_events):
+        _remote_row("abcd1234", "rt-1")
+
+        async def scenario():
+            async with _dial(server) as old:
+                await old.send(_hello(statuses={"abcd1234": "idle"}))
+                await old.recv()
+                async with _dial(server) as new:
+                    await new.send(_hello(statuses={"abcd1234": "processing"}))
+                    await new.recv()
+                    with pytest.raises(websockets.exceptions.ConnectionClosed):
+                        await asyncio.wait_for(old.recv(), 5)  # the server let it go
+                    await new.send(encode(Status(terminal_id="abcd1234", status="processing")))
+                    taken = await asyncio.to_thread(status_events.take)
+                    return taken + await asyncio.to_thread(status_events.rest)
+
+        assert asyncio.run(scenario()) == [("abcd1234", "processing")]
 
 
 class TestUnrecordedCleanupRetry:

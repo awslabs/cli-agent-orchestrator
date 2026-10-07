@@ -262,12 +262,28 @@ class RuntimeRegistry:
             if self._runtimes.get(conn.runtime_id) is conn:
                 conn.active = True
 
-    def unregister(self, runtime_id: str, conn: RuntimeConnection) -> None:
+    def unregister(self, runtime_id: str, conn: RuntimeConnection) -> List[str]:
+        """Let ``conn`` go. When it was the runtime's current connection, returns
+        the runtime's terminals, placed or still being recorded: their status
+        reads ``unknown`` from now on. A connection a newer one replaced returns
+        none, since the newer one reports on them."""
+        lost: List[str] = []
         with self._lock:
             if self._runtimes.get(runtime_id) is conn:
                 del self._runtimes[runtime_id]
+                lost = sorted(
+                    {t for t, placed_on in self._placement.items() if placed_on == runtime_id}
+                    | {
+                        t
+                        for t, launched_on in self._reserved
+                        # Not an id another runtime holds: that terminal is its.
+                        if launched_on == runtime_id
+                        and self._placement.get(t) in (None, runtime_id)
+                    }
+                )
                 logger.info("runtime %s disconnected", runtime_id)
         conn.close("disconnected")
+        return lost
 
     def connection(self, runtime_id: str) -> Optional[RuntimeConnection]:
         """The runtime's current connection, once its hello exchange is over."""

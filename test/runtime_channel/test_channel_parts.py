@@ -291,6 +291,21 @@ async def test_status_is_unknown_while_the_runtime_is_disconnected():
 
 
 @pytest.mark.asyncio
+async def test_letting_go_of_the_current_connection_names_the_runtimes_terminals():
+    # Their status reads unknown from then on, and the server publishes that.
+    # A connection a newer one replaced names none: the newer one reports them.
+    registry = RuntimeRegistry()
+    first = _FakeRuntime(registry)
+    registry.place("t1", "rt-1")
+    registry.reserve("t2", "rt-1")  # a launch still being recorded
+    registry.place("t3", "rt-2")  # another runtime's
+    registry.reserve("t3", "rt-1")  # a colliding launch: t3 stays rt-2's
+    second = _FakeRuntime(registry)
+    assert registry.unregister("rt-1", first.conn) == []
+    assert registry.unregister("rt-1", second.conn) == ["t1", "t2"]
+
+
+@pytest.mark.asyncio
 async def test_a_new_connection_starts_with_no_status_from_the_old_one():
     registry = RuntimeRegistry()
     first = _FakeRuntime(registry)
