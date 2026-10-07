@@ -612,6 +612,71 @@ class TestConnection:
         assert not (tmp_path / "ready").exists(), "Ready must not outlive the connection"
 
     @pytest.mark.asyncio
+    async def test_a_readiness_file_it_cannot_remove_after_a_drop_stops_the_bridge(
+        self, monkeypatch, tmp_path
+    ):
+        # The channel is gone but the marker stays: the pod would keep reading
+        # Ready with no server channel. Fail closed, as startup does: stop with
+        # an error, so the container restarts and its startup check refuses
+        # the marker it cannot clear.
+        bridge = _bridge(tmp_path)
+        bridge._status_of = lambda terminal_id: TerminalStatus.IDLE
+        ready = tmp_path / "ready"
+        attempts = []
+
+        class DropsAfterHello(FakeServer):
+            async def __aenter__(self):
+                attempts.append(1)
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def _iterate(self):
+                # The marker becomes impossible to remove while connected (a
+                # read-only volume, say); then the channel drops.
+                ready.unlink()
+                ready.mkdir()
+                (ready / "keep").write_text("")
+                raise websockets.exceptions.ConnectionClosedError(None, None)
+                yield  # pragma: no cover - makes this an async generator
+
+        monkeypatch.setattr(bridge_mod, "connect", lambda *args, **kwargs: DropsAfterHello())
+        monkeypatch.setattr(bridge_mod, "BACKOFF_INITIAL", 0.05)
+        with pytest.raises(bridge_mod.ReadinessStuck, match="cannot be removed"):
+            await asyncio.wait_for(bridge.run(), 5)
+        assert attempts == [1], "it reconnected while still reporting Ready"
+
+    @pytest.mark.asyncio
+    async def test_a_drop_with_a_removable_readiness_file_keeps_reconnecting(
+        self, monkeypatch, tmp_path
+    ):
+        bridge = _bridge(tmp_path)
+        bridge._status_of = lambda terminal_id: TerminalStatus.IDLE
+        attempts = []
+
+        class DropsAfterHello(FakeServer):
+            async def __aenter__(self):
+                attempts.append(1)
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def _iterate(self):
+                raise websockets.exceptions.ConnectionClosedError(None, None)
+                yield  # pragma: no cover - makes this an async generator
+
+        monkeypatch.setattr(bridge_mod, "connect", lambda *args, **kwargs: DropsAfterHello())
+        monkeypatch.setattr(bridge_mod, "BACKOFF_INITIAL", 0.02)
+        running = asyncio.ensure_future(bridge.run())
+        await asyncio.sleep(0.3)
+        bridge.stop()
+        await asyncio.wait_for(running, 5)
+        assert len(attempts) >= 2, "a drop with a removable marker must not stop the bridge"
+        assert not (tmp_path / "ready").exists()
+
+    @pytest.mark.asyncio
     async def test_a_server_that_drops_right_after_the_hello_gets_growing_backoff(
         self, monkeypatch
     ):

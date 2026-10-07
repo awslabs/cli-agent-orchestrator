@@ -53,7 +53,9 @@ kubectl -n cao-remote rollout status statefulset/cao-server
 kubectl -n cao-remote rollout status statefulset/cao-runtime
 ```
 
-The runtime is Ready once its channel to the server is up.
+The runtime is Ready while its channel to the server is up. If `cao-bridge`
+cannot remove its readiness file once the channel goes, it exits, and so does
+each restart until the file can be removed.
 
 Claude Code on Bedrock needs AWS credentials in the runtime pod. Give the
 `cao-runtime` service account an IAM role that allows `bedrock:InvokeModel*`

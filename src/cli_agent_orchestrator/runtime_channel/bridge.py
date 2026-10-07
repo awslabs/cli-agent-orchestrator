@@ -59,6 +59,11 @@ class ChannelRefused(Exception):
     """The server refused this runtime (token or protocol version). Retrying cannot help."""
 
 
+class ReadinessStuck(Exception):
+    """The readiness file could not be removed: kept, it reports this runtime
+    Ready with no channel to the server. Stopping fails closed."""
+
+
 class UnreportedLaunch(RuntimeError):
     """A launch whose agent runs, but which could be neither reported nor stopped.
 
@@ -392,7 +397,7 @@ class Bridge:
                     max_size=16 * 1024 * 1024,
                 ) as ws:
                     await self.serve(ws)
-            except ChannelRefused:
+            except (ChannelRefused, ReadinessStuck):
                 raise
             except websockets.exceptions.InvalidStatus as exc:
                 if exc.response.status_code in (401, 403):
@@ -432,14 +437,23 @@ class Bridge:
     def _mark_ready(self, ready: bool) -> None:
         if self._ready_file is None:
             return
-        try:
-            if ready:
+        if ready:
+            try:
                 self._ready_file.parent.mkdir(parents=True, exist_ok=True)
                 self._ready_file.write_text(f"{os.getpid()}\n")
-            else:
-                self._ready_file.unlink(missing_ok=True)
+            except OSError as exc:
+                # Fails safe: the runtime reads not Ready while it is connected.
+                logger.warning("could not write readiness file %s: %s", self._ready_file, exc)
+            return
+        try:
+            self._ready_file.unlink(missing_ok=True)
         except OSError as exc:
-            logger.warning("could not update readiness file %s: %s", self._ready_file, exc)
+            # Fails closed, as at startup: kept, the file reports this runtime
+            # Ready with no channel to the server.
+            raise ReadinessStuck(
+                f"readiness file {str(self._ready_file)!r} cannot be removed ({exc}); "
+                "stopping, since it would report this runtime ready while disconnected"
+            ) from exc
 
 
 def _jsonable(terminal: Dict[str, Any]) -> Dict[str, Any]:
@@ -562,7 +576,7 @@ def main() -> None:
     setup_logging(command="cao-bridge", label="cao-bridge")
     try:
         asyncio.run(_amain())
-    except ChannelRefused as exc:
+    except (ChannelRefused, ReadinessStuck) as exc:
         raise SystemExit(f"cao-bridge: {exc}")
 
 

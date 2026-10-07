@@ -61,7 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   idempotently. A runtime's hello lists the terminals it runs, and the server
   drops the record of one it no longer runs (a replaced pod's, for instance).
   Status events (`terminal.{id}.status`) report `unknown` for a runtime's
-  terminals when its channel goes, and for a record a hello drops.
+  terminals when its channel goes, and for a record a hello drops. A
+  `cao-bridge` that cannot remove its readiness file exits rather than stay
+  Ready while disconnected.
   `CAO_LOCAL_EXECUTION=0` stops the server starting agents
   itself, and `CAO_RUNTIME_LAUNCH_TIMEOUT` bounds a launch. An EKS example is
   in `examples/cao-clusters/kubernetes/remote-runtime/`. See

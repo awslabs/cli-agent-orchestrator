@@ -474,3 +474,23 @@ def test_cao_bridge_names_itself_in_its_startup_banner(monkeypatch, capsys):
     banner = capsys.readouterr().out
     assert "cao-bridge" in banner
     assert "cao-server" not in banner and "Server logs" not in banner
+
+
+def test_cao_bridge_exits_with_an_error_when_its_readiness_file_is_stuck(monkeypatch):
+    # The container then restarts, and its startup refuses a readiness file it
+    # cannot clear: the pod stays not Ready instead of Ready with no channel.
+    import logging
+
+    import cli_agent_orchestrator.utils.logging as log_mod
+    from cli_agent_orchestrator.runtime_channel import bridge as bridge_mod
+
+    async def stuck():
+        raise bridge_mod.ReadinessStuck("readiness file /x cannot be removed")
+
+    monkeypatch.setattr(log_mod.logging, "basicConfig", lambda **kwargs: None)
+    monkeypatch.setattr(log_mod.logging, "FileHandler", lambda path: logging.NullHandler())
+    monkeypatch.setattr(bridge_mod, "_amain", stuck)
+    with pytest.raises(SystemExit) as exc:
+        bridge_mod.main()
+    assert exc.value.code not in (0, None)
+    assert "cannot be removed" in str(exc.value.code)

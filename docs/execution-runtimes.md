@@ -134,6 +134,10 @@ retried until the runtime confirms it (see [Commands](#commands)).
   refused before the WebSocket is accepted (HTTP 403), and a different
   protocol version is refused after the hello (close code 1002). `cao-bridge`
   exits on either rather than retrying.
+- `cao-bridge` reports Ready through its readiness file
+  (`CAO_BRIDGE_READY_FILE`) only while its channel is up. A readiness file it
+  cannot remove, at startup or once the channel goes, stops it with an error
+  rather than leave it reporting Ready while disconnected.
 - The token is read once from `CAO_RUNTIME_TOKEN_FILE`, or from
   `CAO_RUNTIME_TOKEN`; both are then removed from the process environment.
   When `CAO_RUNTIME_TOKEN_FILE` is set, only the file counts: if it is
