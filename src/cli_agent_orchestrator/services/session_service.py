@@ -794,7 +794,12 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
             # loop already cleared them. Deferred ids are excluded: their rows
             # are the retry handle for cleanup that has NOT happened yet.
             try:
-                delete_terminals_by_ids([i for i in incarnation_ids if i not in deferred_ids])
+                sweep_ids = [i for i in incarnation_ids if i not in deferred_ids]
+                if delete_terminals_by_ids(sweep_ids):
+                    from cli_agent_orchestrator.services import ephemeral_service
+
+                    for terminal_id in sweep_ids:
+                        ephemeral_service.release(terminal_id, "terminal_gone")
             except Exception as e:
                 logger.warning(f"Failed to sweep registry rows for {session_name}: {e}")
                 result["errors"].append(

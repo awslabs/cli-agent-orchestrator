@@ -5,8 +5,14 @@ import inspect
 import json
 import time
 from contextlib import contextmanager
+from test.services.test_ephemeral_claim import audit, claim, claimed_store  # noqa: F401
+from test.services.test_ephemeral_service import CALLER, create_store  # noqa: F401
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
+import pytest
+from sqlalchemy import event
+
+from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.services.herdr_inbox_service import (
     HerdrInboxService,
     _retain_deferred_failure_tombstone,
@@ -1877,3 +1883,63 @@ class TestHerdrInboxServiceSocketPath:
         """The 'default' session should use ~/.config/herdr/herdr.sock (no subdir)."""
         path = HerdrInboxService._default_socket_path("default")
         assert path == "/custom/config/herdr/herdr.sock"
+
+
+@pytest.mark.parametrize("site", ["startup", "ghost", "stale"])
+def test_ghost_deletion_releases_only_after_success(claimed_store, monkeypatch, site):
+    env, name = claimed_store
+    child, ordinary = "eeeeeeee", "dddddddd"
+    token = claim(env, name)["claim_id"]
+    env[0].bind_ephemeral_agent(name, child, CALLER, "claude_code", token, None)
+    database.create_terminal(child, "cao-session", "dead-window", "claude_code", agent_profile=name)
+    database.create_terminal(ordinary, "cao-session", "ordinary-window", "claude_code")
+    service = HerdrInboxService(socket_path="/tmp/test.sock")
+    snapshot = {
+        "panes": [],
+        "workspaces": [{"workspace_id": "ws", "label": "cao-session"}],
+        "tabs": [{"workspace_id": "ws", "tab_id": "ws:1", "label": "window"}],
+    }
+    if site == "stale":
+        snapshot = {"panes": [], "workspaces": [], "tabs": []}
+    monkeypatch.setattr(service, "_fetch_snapshot", lambda: snapshot)
+    monkeypatch.setattr(service, "_label_still_live", lambda _: False)
+    from cli_agent_orchestrator.backends import registry
+
+    monkeypatch.setattr(registry, "get_backend", lambda: MagicMock())
+    operation = service._startup_db_cleanup if site == "startup" else service._reconcile
+
+    def register():
+        if site == "stale":
+            service.register_terminal(child, "pane-stale")
+            service.register_terminal(ordinary, "pane-ordinary")
+
+    register()
+    with monkeypatch.context() as guarded:
+        guarded.setattr(database, "delete_terminal", lambda _: False)
+        _run_async(operation())
+    assert database.get_terminal_metadata(child) is not None
+    assert database.get_ephemeral_agent(name)["state"] == "launched"
+    assert (env[2] / "ephemeral/live" / (name + ".md")).is_file()
+    assert (env[2] / "ephemeral/live" / (name + ".spec.json")).is_file()
+    register()
+    writes = []
+    engine = env[1].kw["bind"]
+
+    def record(conn, cursor, statement, params, context, executemany):
+        if statement.startswith("UPDATE ephemeral_agents"):
+            writes.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        _run_async(operation())
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    assert database.get_terminal_metadata(child) is None
+    assert database.get_terminal_metadata(ordinary) is None
+    row = database.get_ephemeral_agent(name)
+    assert row["state"] == "gc" and row["gc_reason"] == "terminal_gone"
+    assert not list((env[2] / "ephemeral/live").iterdir())
+    assert audit(name)["events"][-1]["event"] == "released"
+    assert len(writes) == 1
+    with env[1]() as db:
+        assert db.query(database.EphemeralAgentModel).count() == 1

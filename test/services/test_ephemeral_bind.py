@@ -972,3 +972,77 @@ async def test_deferred_ephemeral_failure_settles_initial_delivery(release_runti
     assert not terminal_service.initial_delivery_pending(CHILD)
     metadata = database.get_terminal_metadata(CHILD)
     assert metadata is None or (metadata.get("initial_delivery") or {}).get("state") == "failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend_exists", [False, True])
+async def test_flow_recycling_releases_ephemeral_rows(claimed_store, monkeypatch, backend_exists):
+    from types import SimpleNamespace
+
+    from cli_agent_orchestrator.services import flow_service
+
+    env, name = claimed_store
+    token = claim(env, name)["claim_id"]
+    env[0].bind_ephemeral_agent(name, CHILD, CALLER, "claude_code", token, None)
+    session = "cao-flow-test"
+    database.create_terminal(CHILD, session, "child", "claude_code", agent_profile=name)
+    database.create_terminal("dddddddd", session, "ordinary", "claude_code")
+    rows = database.list_terminals_by_session(session)
+    backend = Mock()
+    backend.session_exists.return_value = backend_exists
+    monkeypatch.setattr(flow_service, "get_backend", lambda: backend)
+    monkeypatch.setattr(
+        flow_service,
+        "get_flow",
+        lambda _: SimpleNamespace(
+            name="test",
+            file_path=str(env[2] / "flow.md"),
+            schedule="* * * * *",
+            script=None,
+            provider="claude_code",
+            agent_profile="developer",
+            engine=None,
+        ),
+    )
+    monkeypatch.setattr(flow_service, "db_update_flow_run_times", Mock())
+    monkeypatch.setattr(flow_service, "_parse_flow_file", lambda _: ({}, "inspect"))
+    monkeypatch.setattr(flow_service, "list_current_session_terminals", lambda *a, **kw: rows)
+    monkeypatch.setattr(flow_service, "_is_terminal_busy", lambda _: False)
+    monkeypatch.setattr(flow_service.provider_manager, "cleanup_provider", lambda _: True)
+    monkeypatch.setattr(flow_service.fifo_manager, "stop_reader", Mock())
+    monkeypatch.setattr(flow_service.status_monitor, "clear_terminal", Mock())
+    monkeypatch.setattr(
+        flow_service, "create_terminal", AsyncMock(return_value=SimpleNamespace(id="ffffffff"))
+    )
+    monkeypatch.setattr(flow_service, "send_input", Mock())
+    assert await flow_service.execute_flow("test") is True
+    assert database.get_terminal_metadata(CHILD) is None
+    assert database.get_terminal_metadata("dddddddd") is None
+    assert_released(env, name, "terminal_gone")
+
+
+def test_session_bulk_fallback_releases_ephemeral_rows(release_runtime, monkeypatch):
+    from cli_agent_orchestrator.services import session_service
+
+    env, name, backend, _ = release_runtime
+    token = claim(env, name)["claim_id"]
+    env[0].bind_ephemeral_agent(name, CHILD, CALLER, "claude_code", token, None)
+    database.create_terminal(CHILD, "cao-session", "child", "claude_code", agent_profile=name)
+    database.create_terminal("dddddddd", "cao-session", "ordinary", "claude_code")
+    rows = [database.get_terminal_metadata(t) for t in [CHILD, "dddddddd"]]
+    monkeypatch.setattr(session_service, "list_terminals_by_session", lambda _: rows)
+    monkeypatch.setattr(
+        terminal_service, "capture_terminal_snapshot", database.get_terminal_metadata
+    )
+    monkeypatch.setattr(terminal_service, "dismantle_terminal_runtime", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        terminal_service,
+        "delete_terminal_row",
+        Mock(side_effect=RuntimeError("first delete failed")),
+    )
+    monkeypatch.setattr(session_service, "dispatch_plugin_event", Mock())
+    result = session_service.delete_session("cao-session")
+    assert result["deleted"] == ["cao-session"]
+    assert database.get_terminal_metadata(CHILD) is None
+    assert database.get_terminal_metadata("dddddddd") is None
+    assert_released(env, name, "terminal_gone")
