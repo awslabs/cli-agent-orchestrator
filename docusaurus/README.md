@@ -61,6 +61,12 @@ Relevant dependency security controls include:
   consumer ranges. The v6 line has no fixed release for CVE-2026-104844.
   Selector serialization/class traversal regressions and the full site build
   check compatibility with the existing PostCSS plugins.
+- **`shell-quote`** requires `^1.11.0` to fix
+  [GHSA-pqg4-j6r4-53mv](https://github.com/advisories/GHSA-pqg4-j6r4-53mv)
+  (CVE-2026-102422). It rejects line terminators in arguments after a comment
+  token. Tests exercise the dependency resolved by `launch-editor`, including
+  parsed comments and non-adjacent arguments, while preserving ordinary quoting
+  and multiline arguments before a comment.
 - **`tinypool`** is pinned to `2.1.2`, which fixes CVE-2026-104848 and
   CVE-2026-104849. Docusaurus still requests v1; v2 supports Node 20 and Node
   22+, matching the tested site toolchains. The dependency suite

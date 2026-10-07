@@ -589,6 +589,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Require `shell-quote ^1.11.0` in the documentation toolchain to fix
+  CVE-2026-102422, with comment-boundary and ordinary-argument regressions.
+  No runtime agent dependency or security-gate policy changes.
+
 - Workflow execution and resumption through MCP now enforce the calling
   terminal's existing `@cao-mcp-server` or `*` grant, including installed
   profiles. Restricted callers can no longer bypass direct-delegation checks
