@@ -146,6 +146,7 @@ provider override while keeping the same sequence.
 
 ### Configure and integrate
 
+- [Ephemeral agents](docs/ephemeral-agents.md): opt-in create-only profiles and their limits.
 - [Agent profiles](docs/agent-profile.md): profile schema, discovery, provider
   selection, and overrides.
 - [HTTP API and PTY WebSocket](docs/api.md): route-family overview and terminal

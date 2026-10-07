@@ -108,3 +108,79 @@ def test_ephemeral_skips_installed_plugin_mcp(stores, monkeypatch, tmp_path, mod
         assert "plugin-server" not in command
         assert "mcp_servers.cao-mcp-server" in command
     merge.assert_not_called()
+
+
+@pytest.mark.parametrize("provider", ["claude_code", "codex", "copilot_cli", "kiro_cli"])
+@pytest.mark.asyncio
+async def test_stored_ephemeral_never_allocates_runtime(stores, monkeypatch, provider):
+    from cli_agent_orchestrator.services import terminal_service as service
+
+    (stores[1] / f"{NAME}.md").write_text(DOCUMENT)
+    monkeypatch.setattr(service, "get_max_terminals", lambda: None)
+    backend = Mock()
+    monkeypatch.setattr(service, "get_backend", lambda: backend)
+    id_generator = Mock(side_effect=AssertionError("no allocation"))
+    insert = Mock(side_effect=AssertionError("no terminal row"))
+    factory = Mock(side_effect=AssertionError("no provider"))
+    monkeypatch.setattr(service, "generate_terminal_id", id_generator)
+    monkeypatch.setattr(service, "db_create_terminal", insert)
+    monkeypatch.setattr(service.provider_manager, "create_provider", factory)
+    with pytest.raises(profiles.EphemeralLaunchRefused):
+        await service.create_terminal(provider, NAME, session_name="cao-session")
+    id_generator.assert_not_called()
+    insert.assert_not_called()
+    factory.assert_not_called()
+    backend.create_window.assert_not_called()
+
+
+@pytest.mark.parametrize("route,status", [("session", 400), ("terminal", 404), ("run_step", 404)])
+def test_launch_routes_preserve_valueerror_mapping(stores, monkeypatch, route, status):
+    from fastapi.testclient import TestClient
+
+    from cli_agent_orchestrator.api import main
+    from cli_agent_orchestrator.services import terminal_service as service
+
+    (stores[1] / f"{NAME}.md").write_text(DOCUMENT)
+    monkeypatch.setattr(service, "get_max_terminals", lambda: None)
+    monkeypatch.setattr(service, "get_backend", lambda: Mock())
+
+    async def launch(*args, **kwargs):
+        return await service.create_terminal("claude_code", NAME, session_name="cao-session")
+
+    from cli_agent_orchestrator.plugins.registry import PluginRegistry
+
+    monkeypatch.setattr(main.app.state, "plugin_registry", PluginRegistry(), raising=False)
+    monkeypatch.setattr(main.session_service, "create_session", launch)
+    monkeypatch.setattr(main, "run_agent_step", launch)
+    client = TestClient(main.app, base_url="http://localhost")
+    params = {"agent_profile": NAME, "provider": "claude_code"}
+    if route == "session":
+        response = client.post("/sessions", params=params)
+    elif route == "terminal":
+        response = client.post("/sessions/cao-session/terminals", params=params)
+    else:
+        response = client.post(
+            "/terminals/run-step",
+            json={"provider": "claude_code", "agent": NAME, "prompt": "Inspect logs."},
+        )
+    assert response.status_code == status, response.text
+    assert (
+        response.json()["detail"]
+        == f"Ephemeral target '{NAME}' cannot be launched until claims are supported."
+    )
+
+
+@pytest.mark.asyncio
+async def test_installed_profile_passes_launch_refusal(stores, monkeypatch):
+    monkeypatch.setattr(profiles, "resolve_env_vars", lambda text: text)
+    from cli_agent_orchestrator.services import terminal_service as service
+
+    (stores[0] / "ordinary.md").write_text(DOCUMENT.replace(NAME, "ordinary"))
+    monkeypatch.setattr(service, "get_max_terminals", lambda: None)
+    backend = Mock()
+    monkeypatch.setattr(service, "get_backend", lambda: backend)
+    reached = Mock(side_effect=RuntimeError("installed launch reached allocation"))
+    monkeypatch.setattr(service, "generate_terminal_id", reached)
+    with pytest.raises(RuntimeError, match="installed launch reached allocation"):
+        await service.create_terminal("claude_code", "ordinary", session_name="cao-session")
+    reached.assert_called_once()

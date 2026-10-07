@@ -2320,6 +2320,51 @@ async def agui_run(
 mount_widget_static(app)
 
 
+def _require_ephemeral_enabled(request: Request) -> Dict[str, Any]:
+    """Gate the opt-in surface before reading an untrusted body."""
+    from cli_agent_orchestrator.services import ephemeral_service
+
+    try:
+        settings = ephemeral_service.read_settings()
+        ephemeral_service.require_enabled(settings)
+        return settings
+    except ephemeral_service.EphemeralPolicyError as exc:
+        ephemeral_service.log_refusal(
+            exc.rule, request.query_params.get("caller_id"), None, exc.detail
+        )
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from None
+
+
+@app.post(
+    "/ephemeral-agents",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(_require_ephemeral_enabled)],
+)
+async def create_ephemeral_agent_endpoint(
+    request: Request,
+    caller_id: Optional[str] = None,
+    settings: Dict[str, Any] = Depends(_require_ephemeral_enabled),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Create an agent spec and files; raw input failures never echo submitted values."""
+    from cli_agent_orchestrator.services import ephemeral_service
+
+    try:
+        try:
+            raw = await request.json()
+        except (ValueError, UnicodeError):
+            error = ephemeral_service.EphemeralPolicyError(
+                "invalid_spec", "body: json_invalid", 422
+            )
+            ephemeral_service.log_refusal(error.rule, caller_id, None, error.detail)
+            raise HTTPException(status_code=422, detail=error.as_detail()) from None
+        return await asyncio.to_thread(
+            ephemeral_service.create_ephemeral_agent, raw, caller_id, settings
+        )
+    except ephemeral_service.EphemeralPolicyError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from None
+
+
 @app.get("/agents/profiles")
 async def list_agent_profiles_endpoint(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
