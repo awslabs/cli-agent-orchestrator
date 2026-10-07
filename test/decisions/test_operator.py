@@ -56,6 +56,8 @@ def test_boundary_with_installed_plugin(tmp_path, monkeypatch):
     from cli_agent_orchestrator.decisions.targets import TargetKind, profile_source
 
     assert profile_source("reserved-looking-name") == TargetKind.INSTALLED
+    assert profile_source(None) == TargetKind.INSTALLED
+    assert profile_source("Reviewer-audit_logs-3f9a") == TargetKind.EPHEMERAL
     distribution = tmp_path / "boundary_fixture-1.0.dist-info"
     distribution.mkdir()
     (distribution / "METADATA").write_text("Name: boundary_fixture\nVersion: 1.0\n")
