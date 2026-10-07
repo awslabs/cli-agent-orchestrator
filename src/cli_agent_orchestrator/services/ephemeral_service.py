@@ -1058,6 +1058,8 @@ def bind_ephemeral_agent(
 def release(terminal_id: str, reason: str) -> None:
     """Collect this terminal's live files once; keep its registry marker forever."""
     try:
+        if not database.is_ephemeral_terminal(terminal_id):
+            return
         with _transaction() as db:
             table = database.EphemeralAgentModel
             record = db.query(table).filter(table.launched_terminal_id == terminal_id).first()
@@ -1073,5 +1075,11 @@ def release(terminal_id: str, reason: str) -> None:
             row = _row(db, name)
         if row is not None and row["state"] == "gc":
             _finish_gc(row)
-    except Exception:
-        pass  # A teardown failure must never mask the caller's original outcome.
+    except Exception as exc:
+        logger.warning(
+            "Ephemeral release failed terminal=%s reason=%s exception=%s; "
+            "live files may remain until collected",
+            terminal_id,
+            reason,
+            type(exc).__name__,
+        )

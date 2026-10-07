@@ -107,7 +107,9 @@ literal subset of the stored list; omitting tools uses the stored list.
 The lifecycle is `pending -> claimed -> launched -> gc`. The bind precedes backend
 allocation and terminal insertion. An unbound failed launch ends its own claim; cancellation
 or a completed rollback after bind collects the live files. A deleted terminal or session releases the name, as do herdr pane closes, including
-those reconciled at startup or on reconnect. Retention cleanup and stale-session row purges also release it.
+those reconciled at startup or on reconnect.
+A release that fails is logged as a warning naming the terminal id, and its live files
+stay until a later sweep. Retention cleanup and stale-session row purges also release it.
 A run-step timeout retains its live terminal and files; success, cancellation and output
 extraction failure tear down terminals owned by that call.
 

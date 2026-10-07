@@ -1046,3 +1046,33 @@ def test_session_bulk_fallback_releases_ephemeral_rows(release_runtime, monkeypa
     assert database.get_terminal_metadata(CHILD) is None
     assert database.get_terminal_metadata("dddddddd") is None
     assert_released(env, name, "terminal_gone")
+
+
+def test_release_failure_warning_is_redacted(claimed_store, monkeypatch, caplog):
+    env, name = claimed_store
+    token = claim(env, name)["claim_id"]
+    env[0].bind_ephemeral_agent(name, CHILD, CALLER, "claude_code", token, None)
+    brief = audit(name)["spec"]["brief"]
+    secret = name + " " + brief + " PRIVATE_SQL parameters"
+    monkeypatch.setattr(env[0], "_transaction", Mock(side_effect=RuntimeError(secret)))
+    caplog.clear()
+    with caplog.at_level("WARNING", logger=env[0].logger.name):
+        env[0].release(CHILD, "terminal_gone")
+    records = [r for r in caplog.records if r.name == env[0].logger.name]
+    assert len(records) == 1 and records[0].levelname == "WARNING"
+    message = records[0].getMessage()
+    assert CHILD in message and "terminal_gone" in message and "RuntimeError" in message
+    assert "live files may remain until collected" in message
+    assert name not in caplog.text and "log_triage" not in caplog.text
+    assert brief not in caplog.text and "PRIVATE_SQL" not in caplog.text
+    assert records[0].exc_info is None
+
+
+def test_ordinary_delete_never_opens_ephemeral_write_transaction(release_runtime, monkeypatch):
+    env, _, _, _ = release_runtime
+    ordinary = "dddddddd"
+    database.create_terminal(ordinary, "cao-session", "ordinary", "claude_code")
+    transaction = Mock(side_effect=AssertionError("ordinary deletion must not take write lock"))
+    monkeypatch.setattr(env[0], "_transaction", transaction)
+    assert terminal_service.delete_terminal_row(ordinary, None) is True
+    transaction.assert_not_called()
