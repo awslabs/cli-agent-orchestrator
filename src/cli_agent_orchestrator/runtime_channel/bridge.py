@@ -144,8 +144,7 @@ class Bridge:
         """Send the terminal's current status. It is read under the send lock, so
         the last frame the server gets for a terminal carries its newest status.
         With ``skip_unknown``, nothing is sent while the status is not known."""
-        ws = self._ws
-        if ws is None:
+        if self._ws is None:
             return
         async with self._send_lock:
             # Off the loop (it may capture the pane), still under the send lock
@@ -154,9 +153,16 @@ class Bridge:
             if skip_unknown and status == TerminalStatus.UNKNOWN:
                 return
             frame = Status(terminal_id=terminal_id, status=status)
+            # The socket current now, as in _send: a push queued behind a
+            # stalled send goes to a replacement that connected meanwhile.
+            ws = self._ws
+            if ws is None:
+                return
             try:
                 await ws.send(encode(frame))
             except websockets.exceptions.ConnectionClosed:
+                # Not queued: a connection's hello is followed by every
+                # terminal's status as it is then.
                 pass
 
     async def forward_status(self) -> None:

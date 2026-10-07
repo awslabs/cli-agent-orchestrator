@@ -759,6 +759,35 @@ class TestConnection:
 
 class TestStatusForwarding:
     @pytest.mark.asyncio
+    async def test_a_status_queued_behind_a_stalled_send_goes_to_the_current_socket(self):
+        # A push waiting for the send lock while a send stalls on the old
+        # socket. A replacement connects meanwhile: the push uses the socket
+        # current once it holds the lock, as _send does, not the one it saw.
+        bridge = _bridge()
+        bridge._status_of = lambda terminal_id: TerminalStatus.WAITING_USER_ANSWER
+        release = asyncio.Event()
+
+        class Stalled:
+            async def send(self, text):
+                await release.wait()
+                raise websockets.exceptions.ConnectionClosedError(None, None)
+
+        stalled = Stalled()
+        bridge._ws = stalled
+        replacement = FakeServer()
+        result = Result(op_id="op-input", ok=True, payload={"success": True})
+        sending = asyncio.ensure_future(bridge._send(result))
+        await asyncio.sleep(0.05)  # the send holds the lock, blocked
+        pushing = asyncio.ensure_future(bridge._push_status("abcd1234"))
+        await asyncio.sleep(0.05)  # the push waits for the lock
+        bridge._ws = replacement  # as serve() installs a replacement's socket
+        release.set()
+        await asyncio.wait_for(asyncio.gather(sending, pushing), 5)
+        assert Status(terminal_id="abcd1234", status=TerminalStatus.WAITING_USER_ANSWER) in (
+            replacement.sent
+        ), "the status went to the current socket"
+
+    @pytest.mark.asyncio
     async def test_every_local_status_change_is_pushed(self, monkeypatch):
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
