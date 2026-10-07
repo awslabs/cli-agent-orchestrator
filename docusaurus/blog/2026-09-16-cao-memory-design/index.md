@@ -5,7 +5,7 @@ tags: [deep-dive]
 description: How CAO gives agents one shared memory layer across sessions, models, and CLI providers.
 ---
 
-With Agentic Coding practice, how an agent uses memory is critical in many aspects. It helps you
+With Agentic context engineering, how an agent uses memory is critical in many aspects. It helps you
 increase code quality, be more token efficient, and keep consistency across a long-running session or
 session handoff.
 
@@ -15,13 +15,14 @@ history. It can hold project decisions, user preferences, reusable instructions,
 findings, and workflow lessons.
 
 The result is closer to a scoped project wiki than a transcript archive. The identity of CAO
-memory is Markdown — that is what keeps the knowledge readable. Search runs over an index backed
+memory is human readable markdown files. How CAO help agent search runs over an index backed
 by a SQLite database, and a knowledge graph projects the relationships between memory nodes, both
 in the CAO UI and in Obsidian.
 
 CAO gives every supported agent the same memory tools. An agent can remember a fact with one
 CLI provider and recall it later with another. The memory belongs to CAO, not to a specific
-model or CLI.
+model or CLI. CAO gives every agent one shared memory layer that works across sessions,
+models, and CLI providers, so your context (and code quality) survives handoffs.
 
 This post explains how that shared layer works. For commands and configuration, see the
 [original CAO memory reference](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/memory.md).
@@ -100,19 +101,50 @@ topic and becomes part of its file name.
 The file header records the memory ID, scope, type, and tags. Timestamped sections record
 when each observation was added. When an agent updates the same key, CAO appends a new
 timestamped section to that topic. It does not create a second memory with the same key and
-scope.
+scope. See below [code snippet](https://github.com/awslabs/cli-agent-orchestrator/blob/95a0975cc119caa2cfde4b2138721c7046369f0e/src/cli_agent_orchestrator/services/memory_service.py#L3895) 
+which generate the header of the memory markdown: 
+
+```python
+for position, mem in enumerate(scope_memories):
+    tag = " [related]" if getattr(mem, "is_related", False) else ""
+    rendered_content, redacted_patterns = _redact_injected_vault_content(mem)
+    line = f"- [{mem.scope}] {mem.key}{tag}: {rendered_content}"
+    ...
+    lines.append(line)
+    ...
+
+if not lines:
+    return ""
+
+context = "## Context from CAO Memory\n" + "\n".join(lines)
+return f"<cao-memory>\n{context}\n</cao-memory>"
+```
 
 SQLite tracks data used for filtering, ranking, and lifecycle rules. This includes scope
 IDs, timestamps, access counts, provenance, token estimates, and relationship state.
 BM25 still searches the Markdown content. SQLite does not replace that content search.
+See below [code](https://github.com/awslabs/cli-agent-orchestrator/blob/95a0975cc119caa2cfde4b2138721c7046369f0e/src/cli_agent_orchestrator/services/memory_service.py#L1848-L1858) 
+of how we query the memroy: 
 
-The two stores have different authority:
+```python
+q = db.query(MemoryMetadataModel).filter(
+    MemoryMetadataModel.scope == scope,
+    MemoryMetadataModel.source_kind == source_kind,
+)
+if scope_id is not None:
+    q = q.filter(MemoryMetadataModel.scope_id == scope_id)
+else:
+    q = q.filter(MemoryMetadataModel.scope_id.is_(None))
+rows = q.order_by(MemoryMetadataModel.updated_at.desc()).limit(200).all()
+```
 
-| Concern | Authority |
+Here is how Markdown and SQLite each represent memory differently:
+
+| Data | Source of truth |
 | --- | --- |
 | Topic text and timestamped history | Markdown |
 | Search metadata and usage counters | SQLite |
-| Relationship lifecycle and human decisions | SQLite |
+| Relationship state and human decisions (e.g. a rejected link) | SQLite |
 | Human-readable index | Generated from the stores |
 | `## See Also` related-topic links | Generated from relationship state |
 
@@ -149,12 +181,11 @@ The same rules run for every write.
 The shared Markdown index has its own lock. This prevents two topics from losing each
 other's index updates.
 
-**Compile mode** controls that optional second step. It has two settings. In `append`
-mode, CAO only ever appends the new timestamped section — no LLM is involved at any point,
-which reproduces the original Phase 1/2 behavior. In `llm` mode (the default), CAO still
-writes the append-form section first, then schedules a background compilation that calls an
-LLM to merge repeated entries and find related topics. Compilation only runs when it updates
-an existing topic — a brand-new topic is never compiled.
+**Compile mode** controls that optional second step. It has two settings:
+
+- append — CAO only ever appends the new timestamped section. No LLM is involved at any point. 
+This is the simplest behavior: a plain, append-only log.
+- llm (the default) — CAO still writes the same append-form section first, then schedules a background compilation. That step calls an LLM to merge repeated entries and link related topics.
 
 So the write path itself never calls an LLM, regardless of compile mode. The agent that
 *calls* `memory_store` may of course be an LLM — but recording the observation is fixed
@@ -171,7 +202,8 @@ later. An LLM only touches that second step, and only when you turn it on.
 
 CAO does not run the filesystem write and the SQLite commit in one transaction. They are two
 independent durability domains: SQLite commits through its own write-ahead log, while a
-Markdown file is made durable by a separate `write-temp-then-rename` plus `fsync`. There is no
+Markdown file is published by writing to a temporary file and atomically renaming it into
+place. There is no
 common commit or rollback that spans both — if the SQLite commit fails after the files are
 already renamed into place, nothing automatically un-writes those files. CAO owns that gap
 directly rather than pretending it does not exist.
@@ -281,21 +313,21 @@ Suppose a workflow reads a project rule today. The rule changes tomorrow. A repl
 not mix the old workflow inputs with the new rule.
 
 CAO resolves memory once for a workflow run. It stores a redacted and size-limited copy in
-the run manifest. The first run and every replay use those same bytes.
+the run manifest (A JSON file that defines how a workflow was launched). 
+The first run and every replay use those same bytes.
 
-An empty stored block also has meaning. It says the original run saw no memory. A replay
-must not fall back to the live store.
 
 CAO saves the block before the terminal uses it. If that save fails, the run continues
 without memory. This is safer than using context that cannot be reproduced.
 
 ### Keep relationships as governed data
 
-CAO stores relationships as typed edges. It does not ask a model to rebuild the graph on
+CAO stores relationships as **typed edges**. It does not ask a model to rebuild the graph on
 every read.
 
-Each edge records a type, origin, status, and source update time. It may also carry
-confidence, rank, and evidence.
+Typed means each link carries a relationship type saying what kind of link it is. An edge is a
+stored link between two memory topics (topic A → topic B). Each edge records a type, origin,
+status, and source update time, and may also carry confidence, rank, and evidence.
 
 A producer can replace only its own edges. Compiler output cannot remove a human edge.
 Rejected and deleted edges survive recomputation.
@@ -369,15 +401,17 @@ format, not a full backup.
 node, with YAML metadata, an H1 title, and `[[wikilinks]]` for relationships. This export is
 one-way. CAO does not read edits back.
 
+![CAO memory notes browsed as a graph in Obsidian](./obsidian-graph-view.png)
+
 **The CAO UI knowledge graph** renders the same relationships live, with no export step. It
 reads the current graph through `GET /graph/{provider}` and shows the memory nodes and their
 typed edges in the browser, so you can inspect the graph without leaving CAO or opening
 another tool.
 
-![Current Obsidian export and PR #674 canonical vault architecture](./obsidian-memory-architecture.svg)
+![Obsidian export compared with the canonical vault architecture](./obsidian-memory-architecture.svg)
 
-[PR #674](https://github.com/awslabs/cli-agent-orchestrator/pull/674) adds another model. A
-mapped vault folder becomes the canonical Markdown source for a scope. Unmapped scopes keep
+The [Obsidian vault integration](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/obsidian-vault.md) adds another model. 
+A mapped vault folder becomes the canonical Markdown source for a scope. Unmapped scopes keep
 the native wiki. SQLite, BM25, and graph state become rebuildable views of the vault notes.
 
 CAO writes only inside one managed folder. Other mapped folders are read-only sources.
