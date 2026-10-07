@@ -27,6 +27,7 @@ import re
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -103,7 +104,7 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     requested_kiro_capabilities,
 )
 from cli_agent_orchestrator.providers.manager import ProviderManager, provider_manager
-from cli_agent_orchestrator.services import worktree_service
+from cli_agent_orchestrator.services import ephemeral_service, worktree_service
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
     elastic_worker_gateway_headers,
 )
@@ -718,6 +719,8 @@ def _roll_back_failed_create(
         # cleanup deferral with enough information to retry safely.
         cleanup_complete = True
     if cleanup_complete:
+        if terminal_id is not None:
+            ephemeral_service.release(terminal_id, "launch_failed")
         try:
             if terminal_id is not None:
                 db_delete_terminal(terminal_id)
@@ -826,6 +829,7 @@ def _request_fingerprint(
     resume_session_id: Optional[str],
     initial_message: Optional[str],
     initial_message_orchestration_type: Optional[OrchestrationType],
+    claim_id: Optional[str] = None,
 ) -> str:
     """Fingerprint the create-terminal request an idempotency key stands for.
 
@@ -1006,9 +1010,18 @@ def _request_fingerprint(
         initial_message or "",
         orchestration_value,
     ]
+    if claim_id is not None:
+        parts.append(claim_id)
     return hashlib.sha256(
         "\x00".join(_fingerprint_component(part) for part in parts).encode("utf-8")
     ).hexdigest()
+
+
+@dataclass
+class _EphemeralLaunchState:
+    """What the create body bound, for the caller's compensation."""
+
+    bound_terminal_id: Optional[str] = None
 
 
 async def create_terminal(
@@ -1032,6 +1045,7 @@ async def create_terminal(
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
+    claim_id: Optional[str] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -1263,6 +1277,67 @@ async def create_terminal(
             server.max_terminals; unset = unlimited) is already reached
         TimeoutError: If provider initialization times out
     """
+    state = _EphemeralLaunchState()
+    try:
+        return await _create_terminal_unguarded(
+            provider=provider,
+            agent_profile=agent_profile,
+            session_name=session_name,
+            new_session=new_session,
+            working_directory=working_directory,
+            allowed_tools=allowed_tools,
+            registry=registry,
+            env_vars=env_vars,
+            caller_id=caller_id,
+            defer_init=defer_init,
+            initial_message=initial_message,
+            initial_message_orchestration_type=initial_message_orchestration_type,
+            engine=engine,
+            kiro_capability_probe=kiro_capability_probe,
+            model=model,
+            resume_session_id=resume_session_id,
+            use_worktree=use_worktree,
+            group=group,
+            metadata=metadata,
+            idempotency_key=idempotency_key,
+            claim_id=claim_id,
+            ephemeral_state=state,
+        )
+    except BaseException as exc:
+        if state.bound_terminal_id is None:
+            if claim_id is not None:
+                ephemeral_service.end_claim(agent_profile, claim_id)
+        elif isinstance(exc, asyncio.CancelledError):
+            ephemeral_service.release(state.bound_terminal_id, "launch_failed")
+        raise
+
+
+async def _create_terminal_unguarded(
+    provider: str,
+    agent_profile: str,
+    session_name: Optional[str] = None,
+    new_session: bool = False,
+    working_directory: Optional[str] = None,
+    allowed_tools: Optional[list[str]] = None,
+    registry: PluginRegistry | None = None,
+    env_vars: Optional[dict[str, str]] = None,
+    caller_id: Optional[str] = None,
+    defer_init: bool = False,
+    initial_message: Optional[str] = None,
+    initial_message_orchestration_type: Optional[OrchestrationType] = None,
+    engine: Optional[KiroEngine | str] = None,
+    kiro_capability_probe: Optional[Callable[[KiroEngine, set[str]], KiroCapabilities]] = None,
+    model: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
+    use_worktree: bool = False,
+    group: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    idempotency_key: Optional[str] = None,
+    claim_id: Optional[str] = None,
+    *,
+    ephemeral_state: _EphemeralLaunchState,
+) -> Terminal:
+    """Create body; the caller compensates an unbound claim or a cancelled bind."""
     # Idempotency resolution runs BEFORE the terminal cap check below, and the
     # order is deliberate: a key HIT returns an already-existing terminal and
     # allocates nothing, so charging it against the cap would 429 a legitimate
@@ -1285,6 +1360,7 @@ async def create_terminal(
             resume_session_id,
             initial_message,
             initial_message_orchestration_type,
+            claim_id,
         )
         existing_record = get_idempotency_record(idempotency_key)
         existing_terminal_id = existing_record.terminal_id if existing_record else None
@@ -1405,17 +1481,15 @@ async def create_terminal(
         # Resolve profile policy and Kiro engine BEFORE allocating any backend
         # resource. A KAS request must probe then fail closed with no window,
         # database row, FIFO, Herdr registration, or provider process.
+        source = agent_profiles.ProfileSource.INSTALLED
         try:
             profile, source = agent_profiles.load_launch_profile(agent_profile)
             if source is agent_profiles.ProfileSource.EPHEMERAL:
-                from cli_agent_orchestrator.services.ephemeral_service import log_refusal
-
-                log_refusal(
-                    "launch_not_supported", caller_id, agent_profile, "claims are not supported"
+                allowed_tools = ephemeral_service.prepare_ephemeral_launch(
+                    agent_profile, model, allowed_tools, caller_id, provider
                 )
-                raise agent_profiles.EphemeralLaunchRefused(
-                    f"Ephemeral target '{agent_profile}' cannot be launched until claims are supported."
-                )
+        except agent_profiles.EphemeralProfileUnavailable:
+            ephemeral_service.refuse_unavailable(agent_profile, caller_id)
         except FileNotFoundError:
             profile = None
         # Production loaders return AgentProfile. Treat a test double or an
@@ -1477,6 +1551,17 @@ async def create_terminal(
 
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
+        if source is agent_profiles.ProfileSource.EPHEMERAL:
+            ephemeral_service.bind_ephemeral_agent(
+                agent_profile,
+                terminal_id,
+                caller_id,
+                provider,
+                claim_id,
+                allowed_tools,
+                idempotency_key,
+            )
+            ephemeral_state.bound_terminal_id = terminal_id
 
         if not session_name:
             session_name = generate_session_name()
@@ -1955,7 +2040,8 @@ async def create_terminal(
         return terminal
 
     except Exception as e:
-        logger.error(f"Failed to create terminal: {e}")
+        if not isinstance(e, ephemeral_service.EphemeralPolicyError):
+            logger.error(f"Failed to create terminal: {e}")
         # Everything this call built is torn down by ONE owned operation
         # (``_roll_back_failed_create``) on ONE worker thread, and the await
         # is not cancellable: if the create request is cancelled while the
@@ -2093,6 +2179,7 @@ def _notify_caller_of_deferred_failure(
             terminal_id,
         )
 
+    ephemeral_service.release(terminal_id, "launch_failed")
     if delete_worker:
         try:
             # Pass registry so post_kill_terminal hooks fire — parity with the
@@ -4546,6 +4633,7 @@ def dismantle_terminal_runtime(
     # temporary process race into a permanent private-home leak.
     if provider_manager.cleanup_provider(terminal_id) is False:
         return False
+    ephemeral_service.release(terminal_id, "terminal_deleted")
     with _memory_injected_lock:
         _memory_injected_terminals.discard(terminal_id)
     # Drop any per-curator dispatch lock so the registry doesn't grow
@@ -4592,6 +4680,8 @@ def delete_terminal_row(
         # DB row was already deleted by another lifecycle owner.
         _delete_deferred_failure_fallback(terminal_id)
         _delete_deferred_init_complete_fallback(terminal_id)
+    if deleted:
+        ephemeral_service.release(terminal_id, "terminal_gone")
     logger.info(f"Deleted terminal: {terminal_id}")
     if deleted and metadata:
         dispatch_plugin_event(

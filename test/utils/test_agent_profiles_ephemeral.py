@@ -316,3 +316,40 @@ def test_launch_environment_resolution_is_installed_only(stores, monkeypatch, re
         assert loaded.system_prompt == "dummy-mapped-value | dummy-mapped-value | $"
         fake.assert_called_once_with(document)
         assert source == profiles.ProfileSource.INSTALLED
+
+
+@pytest.mark.parametrize("shape", ["fifo", "directory", "symlink"])
+def test_nonregular_live_profile_refuses_without_blocking(stores, shape):
+    import os
+    import threading
+
+    _, live = stores
+    path = live / (NAME + ".md")
+    if shape == "fifo":
+        os.mkfifo(path)
+    elif shape == "directory":
+        path.mkdir()
+    else:
+        target = live / "target.md"
+        target.write_text(DOCUMENT)
+        path.symlink_to(target)
+    done = threading.Event()
+    errors = []
+
+    def load():
+        try:
+            profiles.load_launch_profile(NAME)
+        except profiles.EphemeralProfileUnavailable as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=load, daemon=True)
+    worker.start()
+    completed = done.wait(timeout=2)
+    if not completed:
+        fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+        os.close(fd)
+    worker.join(timeout=2)
+    assert completed, "live profile read blocked on FIFO"
+    assert len(errors) == 1

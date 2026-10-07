@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `assign` and `handoff` still refuse them. `ephemeral.enabled` stays off by default.
 - Simulation-only cross-zone robot transport example (#845): existing CAO CLI
   supervisor, zone-operation, and checker agents share a persistent MuJoCo
   kinematic world through scoped MCP tools. Includes measured custody handoffs,
@@ -23,12 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unless the operator sets `ephemeral.child_may_delegate` to `true` in
   `settings.json`. Workflow `run`/`resume`/`start` now refuse when
   `CAO_TERMINAL_ID` is set but the calling terminal cannot be resolved.
-- Create-only ephemeral agents (#801): `create_ephemeral_agent` and
+- Ephemeral profile creation (#801): `create_ephemeral_agent` and
   `POST /ephemeral-agents` are available behind `ephemeral.enabled`, off by
-  default. Creation stores a pending row, two live files and an archive; these
-  persist without garbage collection, so keep the feature disabled outside
-  testing. cao-server refuses to launch created names
-  until claim and launch support lands.
+  default. Creation stores a pending row, two live files and an archive.
+  Live files remain until collection or release; registry rows and archives are
+  retained. There is no background sweep, so keep the feature disabled outside testing.
   The live files and archive can be deleted by exact path while no ephemeral
   terminal exists. Reserved names also refuse remote placement with
   `remote_placement_not_allowed`. Explicit tiers and efforts temporarily refuse

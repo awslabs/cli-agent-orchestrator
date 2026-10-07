@@ -439,12 +439,14 @@ def _remote_ephemeral_refusal(name: str, target_host: Optional[str]) -> Optional
 
 
 def _refuse_ephemeral_target_without_claim(name: str) -> None:
-    """Refuse reserved launch targets until the claim protocol is available."""
+    """Refuse reserved targets while orchestration does not carry launch claims."""
     from cli_agent_orchestrator.utils import agent_profiles
 
     if agent_profiles.routes_to_ephemeral_store(name):
         agent_profiles.resolve_agent_profile_source(name)
-        raise ValueError("Ephemeral targets cannot be launched until claims are supported.")
+        raise ValueError(
+            "Ephemeral targets cannot be launched through assign or handoff in this version."
+        )
 
 
 def _create_terminal(

@@ -210,6 +210,15 @@ def _is_terminal_busy(terminal_id: str) -> bool:
         return False
 
 
+def _delete_recycled_terminal_rows(terminal_ids: List[str]) -> None:
+    """Release names only after the existing bulk deletion succeeds."""
+    if delete_terminals_by_ids(terminal_ids):
+        from cli_agent_orchestrator.services import ephemeral_service
+
+        for terminal_id in terminal_ids:
+            ephemeral_service.release(terminal_id, "terminal_gone")
+
+
 async def execute_flow(name: str) -> bool:
     """Execute flow: run script, render prompt, launch session."""
     try:
@@ -337,7 +346,7 @@ async def execute_flow(name: str) -> bool:
                     name,
                 )
                 return False
-            delete_terminals_by_ids([str(t["id"]) for t in terminals])
+            _delete_recycled_terminal_rows([str(t["id"]) for t in terminals])
         elif terminals:
             # A previous recycle can have killed the backend session but safely
             # retained its terminal rows because a Grok-owned private home was
@@ -360,7 +369,7 @@ async def execute_flow(name: str) -> bool:
             if not cleanup_complete:
                 logger.warning("Flow %s has retained terminal cleanup; deferring next run", name)
                 return False
-            delete_terminals_by_ids([str(t["id"]) for t in cleanup_rows])
+            _delete_recycled_terminal_rows([str(t["id"]) for t in cleanup_rows])
         terminal = await create_terminal(
             session_name=session_name,
             provider=flow.provider,

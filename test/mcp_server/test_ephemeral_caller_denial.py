@@ -187,13 +187,17 @@ async def test_target_without_claim_refuses_before_tool_inheritance(stores, monk
     if path == "assign":
         result = orchestration._assign_impl(NAME, "task", working_directory="/workspace")
         assert result["success"] is False
-        assert "claim" in result["message"]
+        assert result["message"].endswith(
+            "Ephemeral targets cannot be launched through assign or handoff in this version."
+        )
     else:
         result = await orchestration._handoff_impl(
             NAME, "task", working_directory="/workspace", wait=path != "handoff_nowait"
         )
         assert result.success is False
-        assert "claim" in result.message
+        assert result.message.endswith(
+            "Ephemeral targets cannot be launched through assign or handoff in this version."
+        )
     inheritance.assert_not_called()
     post.assert_not_called()
 

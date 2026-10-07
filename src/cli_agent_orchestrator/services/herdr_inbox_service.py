@@ -33,6 +33,15 @@ _BACKOFF_MULTIPLIER = 2.0
 _KIRO_WORKING_THRESHOLD = 30.0  # seconds
 
 
+def _delete_ghost_terminal_row(terminal_id: str) -> None:
+    """Release a deleted ghost without altering reconciler sidecar handling."""
+    from cli_agent_orchestrator.clients.database import delete_terminal
+    from cli_agent_orchestrator.services import ephemeral_service
+
+    if delete_terminal(terminal_id):
+        ephemeral_service.release(terminal_id, "terminal_gone")
+
+
 def _retain_deferred_failure_tombstone(
     terminal_id: str,
     *,
@@ -249,7 +258,6 @@ class HerdrInboxService:
         from a herdr api snapshot.
         """
         from cli_agent_orchestrator.clients.database import (
-            delete_terminal,
             list_all_terminals,
             list_terminals_by_session,
         )
@@ -319,7 +327,7 @@ class HerdrInboxService:
                             f"({session_name}:{window}) — absent from fresh Herdr state"
                         )
                         try:
-                            delete_terminal(terminal_id)
+                            _delete_ghost_terminal_row(terminal_id)
                             deleted += 1
                         except Exception as e:
                             logger.warning(
@@ -626,7 +634,6 @@ class HerdrInboxService:
         """
         from cli_agent_orchestrator.backends.registry import get_backend
         from cli_agent_orchestrator.clients.database import (
-            delete_terminal,
             get_terminal_metadata,
             list_terminals_by_session,
         )
@@ -713,7 +720,7 @@ class HerdrInboxService:
                             f"({session_name}:{window}) — absent from fresh Herdr state"
                         )
                         try:
-                            delete_terminal(term["id"])
+                            _delete_ghost_terminal_row(term["id"])
                         except Exception as e:
                             logger.warning(
                                 f"Reconcile: failed to delete ghost terminal {term['id']}: {e}"
@@ -847,7 +854,7 @@ class HerdrInboxService:
                 continue
 
             try:
-                delete_terminal(terminal_id)
+                _delete_ghost_terminal_row(terminal_id)
                 deleted += 1
             except Exception as e:
                 logger.warning(f"Reconcile: failed to delete terminal {terminal_id}: {e}")
