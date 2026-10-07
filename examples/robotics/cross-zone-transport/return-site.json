@@ -1,0 +1,40 @@
+{
+  "zones": {
+    "assembly": {"bounds": [-2, -2, 2, 0]},
+    "stores": {"bounds": [-2, 0, 2, 3]}
+  },
+  "locations": {
+    "inspection": {"xy": [1, -1], "zones": ["assembly"]},
+    "transfer": {"xy": [1, 0], "zones": ["assembly", "stores"], "handoff": true},
+    "rack": {"xy": [-1, 2], "zones": ["stores"]}
+  },
+  "robots": {
+    "return-cart": {
+      "zone": "stores",
+      "at": "rack",
+      "locations": ["rack", "transfer"],
+      "payload_kg": 2,
+      "fixtures": ["small_tray"],
+      "speed_m_s": 0.8
+    },
+    "inspection-cart": {
+      "zone": "assembly",
+      "at": "transfer",
+      "locations": ["transfer", "inspection"],
+      "payload_kg": 4,
+      "fixtures": ["small_tray"],
+      "speed_m_s": 0.6
+    }
+  },
+  "payloads": {
+    "sample-tray": {
+      "at": "rack",
+      "owner": "stores",
+      "mass_kg": 1.5,
+      "fixture": "small_tray"
+    }
+  },
+  "step_seconds": 0.02,
+  "arrival_tolerance_m": 0.01,
+  "action_timeout_seconds": 15
+}

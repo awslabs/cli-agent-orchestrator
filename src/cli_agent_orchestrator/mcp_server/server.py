@@ -1455,9 +1455,10 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
     """Reason the calling terminal's allowlist bars ``tool_name``, or None to allow.
 
     ``assign``, ``handoff`` and ``assign_elastic`` spawn a terminal under a
-    caller-chosen ``agent_profile``, so an agent reaching them can mint a new
-    identity with its own memory scope under any profile installed on the box
-    (#671). The
+    caller-chosen ``agent_profile``. ``workflow_run``, ``workflow_resume`` and
+    ``workflow_start`` can dispatch the same work through a workflow. An agent
+    reaching any of them can mint a new identity with its own memory scope
+    under another installed profile (#671). The
     provider-native restrictions built by ``utils/tool_mapping`` cannot cover
     that: ``get_disallowed_tools`` skips every ``@``-prefixed entry because MCP
     server references have no native tool names, so CAO's own MCP surface is
@@ -1515,10 +1516,6 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
                 return f"'{tool_name}' is not permitted: ephemeral child delegation requires ephemeral.child_may_delegate"
         except Exception as exc:
             return f"cannot authorize '{tool_name}': ephemeral delegation policy could not be resolved ({exc})"
-
-    # Workflow calls keep the installed-caller contract; only ephemerals get this gate.
-    if tool_name in {"workflow_run", "workflow_resume", "workflow_start"}:
-        return None
 
     try:
         allowed = _caller_effective_allowed_tools(context)

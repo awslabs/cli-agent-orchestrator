@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `assign` and `handoff` still refuse them. `ephemeral.enabled` stays off by default.
+- Simulation-only cross-zone robot transport example (#845): existing CAO CLI
+  supervisor, zone-operation, and checker agents share a persistent MuJoCo
+  kinematic world through scoped MCP tools. Includes measured custody handoffs,
+  operator stopping, refusal/interruption cases, alternative robot setup, and
+  isolated optional dependencies; no additional reasoning framework or hardware path.
+  The generated launch command carries an explicit, nonblank operator request.
 - Security groundwork for ephemeral agents (#801): installed profiles whose
   names match the reserved pattern can no longer be launched or listed;
   installed-profile APIs and CLI lookups refuse those names, and cao-server
@@ -582,6 +588,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently, so `limit=500` keeps working rather than becoming a 422.
 
 ### Security
+
+- Require `shell-quote ^1.11.0` in the documentation toolchain to fix
+  CVE-2026-102422, with comment-boundary and ordinary-argument regressions.
+  No runtime agent dependency or security-gate policy changes.
+
+- Workflow execution and resumption through MCP now enforce the calling
+  terminal's existing `@cao-mcp-server` or `*` grant, including installed
+  profiles. Restricted callers can no longer bypass direct-delegation checks
+  through `workflow_run`, `workflow_resume`, or `workflow_start`. Operator
+  calls remain unchanged, and ephemeral delegation still requires its separate
+  opt-in (#892).
 
 - **Kiro CLI, the default provider, now applies the CAO tool policy.** `cao
   install --provider kiro_cli` writes the resolved `allowedTools` into the agent
