@@ -11,6 +11,7 @@ import logging
 import threading
 import time
 import uuid
+import weakref
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
@@ -228,6 +229,22 @@ class RuntimeRegistry:
         # launched the same id never share (or clear) each other's entry.
         self._status: Dict[Tuple[str, str], TerminalStatus] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Per runtime id, while in use (see hello_lock).
+        self._hello_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = (
+            weakref.WeakValueDictionary()
+        )
+
+    def hello_lock(self, runtime_id: str) -> asyncio.Lock:
+        """Held by a hello of ``runtime_id`` while it reconciles the server's
+        records with what it lists, and by a launch while it drops a record a
+        replacement lost: one at a time, so none acts on rows another is
+        changing. A newer connection's hello waits for an older one's."""
+        with self._lock:
+            lock = self._hello_locks.get(runtime_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._hello_locks[runtime_id] = lock
+            return lock
 
     def register(
         self,

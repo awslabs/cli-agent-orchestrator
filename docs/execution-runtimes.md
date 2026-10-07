@@ -47,7 +47,10 @@ stay, reading `unknown`. That covers a dropped connection; a restarted
 `cao-bridge` process that kept its tmux is different (see
 [Known limits](#known-limits-of-this-slice)).
 A newer connection from the same runtime replaces
-the older one, which the server then closes and no longer listens to.
+the older one, which the server then closes and no longer listens to. A
+runtime's hellos are reconciled one at a time: a newer connection's hello
+waits for an older one's, and one replaced while it is being handled drops no
+further record, so the newer hello decides which records stay.
 
 ## Commands
 

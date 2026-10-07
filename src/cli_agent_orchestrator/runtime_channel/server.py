@@ -110,19 +110,25 @@ def _launch_timeout() -> float:
 _TERMINAL_ID = TypeAdapter(TerminalId)
 
 
-def _drop_lost_terminals(runtime_id: str, terminal_ids: List[str]) -> List[str]:
+def _drop_lost_terminals(
+    runtime_id: str, terminal_ids: List[str], conn: Optional[RuntimeConnection] = None
+) -> List[str]:
     """Drop the records of terminals ``runtime_id`` no longer runs; return those gone.
 
     Each row goes only while it still names the runtime and its session, so a
     relaunch of the id elsewhere keeps its own. No plugin event is emitted: as
     with the server's own sweeps, nothing here tore a terminal down. A row that
-    cannot be dropped now is kept, routing and all, for the next hello.
+    cannot be dropped now is kept, routing and all, for the next hello. With
+    ``conn``, the connection whose hello decided these drops, none starts once
+    a newer connection has replaced it: that one's hello decides then.
     """
     from cli_agent_orchestrator.services import terminal_service
 
     gone: List[str] = []
     dropped: List[str] = []
     for terminal_id in terminal_ids:
+        if conn is not None and conn.closed:
+            break
         try:
             row = get_terminal_metadata(terminal_id)
             if row is not None and row.get("runtime_id") == runtime_id:
@@ -281,38 +287,47 @@ async def runtime_channel(ws: WebSocket) -> None:
     # awaits, so a launch settling meanwhile can tell whether this one runs it.
     conn.listed = set(hello.statuses)
     try:
-        # Terminals whose central row names this runtime are its to report on;
-        # a status for any other terminal is ignored.
-        recorded = await asyncio.to_thread(list_terminal_ids_on_runtime, runtime_id)
-        # Conditionally: a relaunch of an id elsewhere (deleted, then claimed by
-        # another runtime) after that read must keep its placement.
-        held_elsewhere = {t for t in recorded if not runtime_registry.claim(t, runtime_id)}
-        # Revalidate against the rows now. A delete may have dropped a row after
-        # that read and before its placement: undo this runtime's placement of
-        # any row that is gone. And a row that still names this runtime wins
-        # over another runtime's placement of its id, which is then stale.
-        still_recorded = set(await asyncio.to_thread(list_terminal_ids_on_runtime, runtime_id))
-        for terminal_id in recorded:
-            if terminal_id not in still_recorded:
-                runtime_registry.unplace(terminal_id, runtime_id)
-            elif terminal_id in held_elsewhere:
-                runtime_registry.place(terminal_id, runtime_id)
-        # A terminal recorded on this runtime that its hello does not list is
-        # gone, lost with the runtime's previous state: its pod was replaced, or
-        # cao-bridge restarted without the terminal's tmux. Its record goes too.
-        # A launch still being recorded is left to its own path (see
-        # _drop_if_lost_to_a_replacement), which knows where it came from.
-        lost = sorted(
-            terminal_id
-            for terminal_id in still_recorded
-            if terminal_id not in conn.listed
-            and not runtime_registry.is_reserved(terminal_id, runtime_id)
-        )
-        if lost:
-            for terminal_id in await asyncio.to_thread(_drop_lost_terminals, runtime_id, lost):
-                runtime_registry.unplace(terminal_id, runtime_id)
-        for terminal_id, reported in hello.statuses.items():
-            runtime_registry.set_status(terminal_id, runtime_id, reported, conn=conn)
+        # One reconciliation at a time per runtime: a newer connection's hello
+        # waits for an older one's, which drops no further record once it is
+        # replaced. So a replaced hello never acts on rows the newer one keeps.
+        async with runtime_registry.hello_lock(runtime_id):
+            # Terminals whose central row names this runtime are its to report on;
+            # a status for any other terminal is ignored.
+            recorded = await asyncio.to_thread(list_terminal_ids_on_runtime, runtime_id)
+            # Conditionally: a relaunch of an id elsewhere (deleted, then claimed by
+            # another runtime) after that read must keep its placement.
+            held_elsewhere = {t for t in recorded if not runtime_registry.claim(t, runtime_id)}
+            # Revalidate against the rows now. A delete may have dropped a row after
+            # that read and before its placement: undo this runtime's placement of
+            # any row that is gone. And a row that still names this runtime wins
+            # over another runtime's placement of its id, which is then stale.
+            still_recorded = set(await asyncio.to_thread(list_terminal_ids_on_runtime, runtime_id))
+            for terminal_id in recorded:
+                if terminal_id not in still_recorded:
+                    runtime_registry.unplace(terminal_id, runtime_id)
+                elif terminal_id in held_elsewhere:
+                    runtime_registry.place(terminal_id, runtime_id)
+            # A terminal recorded on this runtime that its hello does not list is
+            # gone, lost with the runtime's previous state: its pod was replaced, or
+            # cao-bridge restarted without the terminal's tmux. Its record goes too.
+            # A launch still being recorded is left to its own path (see
+            # _drop_if_lost_to_a_replacement), which knows where it came from.
+            lost = sorted(
+                terminal_id
+                for terminal_id in still_recorded
+                if terminal_id not in conn.listed
+                and not runtime_registry.is_reserved(terminal_id, runtime_id)
+            )
+            if lost:
+                for terminal_id in await asyncio.to_thread(
+                    _drop_lost_terminals, runtime_id, lost, conn
+                ):
+                    runtime_registry.unplace(terminal_id, runtime_id)
+            for terminal_id, reported in hello.statuses.items():
+                runtime_registry.set_status(terminal_id, runtime_id, reported, conn=conn)
+        if conn.closed:
+            # Replaced during the hello: the newer connection's hello decides.
+            return
         await ws.send_text(server_hello)
         runtime_registry.activate(conn)
         # The hello lists every terminal the runtime runs.
@@ -623,9 +638,19 @@ async def _drop_if_lost_to_a_replacement(
     latest = runtime_registry.latest(runtime_id)
     if latest is None or latest is origin or terminal_id in latest.listed:
         return
-    gone = await asyncio.to_thread(_drop_lost_terminals, runtime_id, [terminal_id])
-    for dropped in gone:
-        runtime_registry.unplace(dropped, runtime_id)
+    # Under the hello lock, as a hello's own drops: no hello reconciles
+    # meanwhile, and one that starts waits for this drop.
+    async with runtime_registry.hello_lock(runtime_id):
+        latest = runtime_registry.latest(runtime_id)
+        if latest is None or latest is origin or terminal_id in latest.listed:
+            return
+        gone = await asyncio.to_thread(_drop_lost_terminals, runtime_id, [terminal_id], latest)
+        for dropped in gone:
+            runtime_registry.unplace(dropped, runtime_id)
+    if not gone and latest.closed:
+        # Replaced again before the drop: the newer connection's hello, which
+        # waited for this, reconciles the terminal like any recorded one.
+        return
     outcome = (
         "its record was dropped"
         if gone
