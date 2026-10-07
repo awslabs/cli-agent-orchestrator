@@ -17,7 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unless the operator sets `ephemeral.child_may_delegate` to `true` in
   `settings.json`. Workflow `run`/`resume`/`start` now refuse when
   `CAO_TERMINAL_ID` is set but the calling terminal cannot be resolved.
-  Ephemeral agent creation is not yet available.
+- Create-only ephemeral agents (#801): `create_ephemeral_agent` and
+  `POST /ephemeral-agents` are available behind `ephemeral.enabled`, off by
+  default. Creation stores a pending row, two live files and an archive; these
+  persist without garbage collection, so keep the feature disabled outside
+  testing. cao-server refuses to launch created names
+  until claim and launch support lands.
+  The live files and archive can be deleted by exact path while no ephemeral
+  terminal exists. Reserved names also refuse remote placement with
+  `remote_placement_not_allowed`. Explicit tiers and efforts temporarily refuse
+  with `tier_not_supported` / `effort_not_supported`; `auto` requires the decision
+  platform. Tier and effort policy keys are not applied yet, so `max_tier` sets
+  no ceiling.
 - Advanced CodeQL analysis for same-repository and fork pull requests, with
   Python, JavaScript/TypeScript, GitHub Actions, and Rust coverage, plus `main`,
   weekly, and manual scans. CI workflow definitions and their `CODEOWNERS`
@@ -77,6 +88,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Audit all tracked npm, Bun, uv, and Cargo dependency graphs in every CI run
+  and weekly, including development dependencies and unfixed advisories. Block
+  every HIGH/CRITICAL finding and scan error, and publish complete inventory and
+  finding summaries. Replace the affected `braces` package in docs, web UI,
+  and MCP Apps with the provenance-verified published guarded fork
+  `@dieub/braces-depth-guard@3.0.3-pn.3`, retaining a small shared patch for
+  acyclic AST parent-link bounds. Verify dev-only inventory with real Trivy,
+  fail non-vacuously on missing consumers, and preserve three-project failure
+  aggregation. No advisory exemptions or fabricated versions are used.
+- Preserve canonical dependency identity for the guarded fork in GitHub's
+  dependency graph: private one-statement local adapters retain existing
+  `braces` imports while the real package remains directly visible.
+  Reject and revert the npm version-2 workaround, which produced an unparsed
+  alias rather than a correctly identified dependency.
+- Vendor the verified guarded-fork tarball so cold installs in all three
+  toolchains survive registry removal without changing package identity,
+  version, license, or integrity. Document the fork's upstream-advisory blind
+  spot and concrete weekly/pre-release maintainer tracking checkpoints.
+- Consolidate the dependency fixes from #888-#890: update `source-map-js`
+  throughout docs, web, and MCP Apps, plus docs `compression` and `proxy-addr`.
+  Clear the remaining Joi, selector-parser, and Tinypool scan findings with
+  upstream fixed releases and explicit overrides where older consumer ranges
+  exclude them. Add source-map, selector, worker-pool, and all-copy lockfile
+  regressions without changing scanner exclusions or severity policy.
 - `copilot_cli` launches no longer time out after 60 seconds on Copilot CLI
   1.0.91 (#870). Copilot repaints only changed cells in its full-screen view,
   so the raw output stream never shows a settled idle prompt; the provider now
@@ -520,6 +555,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of spinning on a cancelled task and never exiting (#823)
 
 ### Changed
+
+- The MCP server now requires fastmcp 3.2.0 or newer (was 2.14.0), the
+  version CI tests. fastmcp 2.x does not export `ToolResult` from
+  `fastmcp.tools`, so `cao-mcp-server` would not start on it. Upgrading
+  CAO upgrades fastmcp (#801).
 
 - record the originating install handle in each shared context copy's frontmatter
   (`x-cao-source-stem`), so a reinstall can tell its own prior copy apart from a

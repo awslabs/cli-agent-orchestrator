@@ -33,6 +33,10 @@ class EphemeralProfileUnavailable(ValueError):
     """A reserved name cannot be served by the ephemeral live store."""
 
 
+class EphemeralLaunchRefused(ValueError):
+    """The server cannot allocate an ephemeral runtime before claims are supported."""
+
+
 def routes_to_ephemeral_store(name: str) -> bool:
     """Route reserved names exclusively to the server-owned live store."""
     return _RESERVED_EPHEMERAL_PATTERN.fullmatch(name) is not None
@@ -366,7 +370,21 @@ def _read_agent_profile_source(agent_name: str) -> str:
     _validate_agent_name(agent_name)
     if routes_to_ephemeral_store(agent_name):
         raise FileNotFoundError(f"Reserved ephemeral profile name: {agent_name}")
+    return _read_installed_agent_profile_source(agent_name)
 
+
+def installed_profile_exists(agent_name: str) -> bool:
+    """Probe installed stores without reserved-name routing or environment expansion."""
+    try:
+        _read_installed_agent_profile_source(agent_name)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _read_installed_agent_profile_source(agent_name: str) -> str:
+    """Raw installed lookup for namespace collision checks and the guarded reader."""
+    _validate_agent_name(agent_name)
     from cli_agent_orchestrator.services.settings_service import (
         get_disabled_agent_dirs,
         get_extra_agent_dirs,
