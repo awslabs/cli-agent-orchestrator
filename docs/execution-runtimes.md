@@ -31,8 +31,14 @@ the shared token in the `x-cao-runtime-token` header. Its runtime id (for
 it is letters, digits, `.`, `_` and `-`; a Kubernetes pod name fits. Both sides exchange a
 hello carrying the protocol version. The runtime's hello also lists every
 terminal it runs, with its current status, so a reconnect restores status
-without replaying anything. That covers a dropped connection; a restarted
-`cao-bridge` process is different (see [Known limits](#known-limits-of-this-slice)).
+without replaying anything. A terminal the server has recorded on that runtime
+but the hello does not list is gone, lost with the runtime's previous state
+(its pod was replaced, or `cao-bridge` restarted without the terminal's tmux),
+so the server drops its record: `GET /terminals/{id}` answers `404`, and
+`GET /runtimes` no longer lists it. While the runtime is away, its records
+stay, reading `unknown`. That covers a dropped connection; a restarted
+`cao-bridge` process that kept its tmux is different (see
+[Known limits](#known-limits-of-this-slice)).
 A newer connection from the same runtime replaces
 the older one, which the server then closes and no longer listens to.
 
@@ -136,6 +142,9 @@ retried until the runtime confirms it (see [Commands](#commands)).
   says. Anyone holding the token can connect as another runtime's id. That
   replaces and closes the other runtime's connection, and the impostor then
   receives the commands for that runtime's terminals and reports their status.
+  Its hello also decides which of those terminals the server keeps: one that
+  lists none drops all of their records. Two runtimes configured with the same
+  id do the same to each other.
   Until per-runtime credentials arrive in a later slice, give the token only
   to runtimes that may act for one another.
 - The runtime token does not protect the HTTP API. Turn on API authentication
@@ -167,7 +176,8 @@ retried until the runtime confirms it (see [Commands](#commands)).
   outlived it, as a restarted `cao-server` does not for its local terminals:
   their status stays `unknown`, while input, output and delete still work.
   In the EKS example a restart of `cao-bridge` restarts its container, which
-  takes tmux and those terminals with it, and the bridge drops their rows.
+  takes tmux and those terminals with it: the bridge drops their rows, and the
+  server their records when the restarted bridge says hello.
 
 ## Deploy
 

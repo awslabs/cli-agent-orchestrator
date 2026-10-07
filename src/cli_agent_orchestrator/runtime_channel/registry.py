@@ -275,6 +275,11 @@ class RuntimeRegistry:
             conn = self._runtimes.get(runtime_id)
             return conn if conn is not None and conn.active else None
 
+    def latest(self, runtime_id: str) -> Optional[RuntimeConnection]:
+        """The runtime's newest connection, whether or not its hello exchange is over."""
+        with self._lock:
+            return self._runtimes.get(runtime_id)
+
     def list_runtimes(self) -> Dict[str, Dict[str, Any]]:
         with self._lock:
             # One pass over the placements, not one per runtime.
@@ -342,6 +347,11 @@ class RuntimeRegistry:
                 self._placement.get(terminal_id) == runtime_id
                 or (terminal_id, runtime_id) in self._reserved
             )
+
+    def is_reserved(self, terminal_id: str, runtime_id: str) -> bool:
+        """Its launch on the runtime is still being recorded (see ``reserve``)."""
+        with self._lock:
+            return (terminal_id, runtime_id) in self._reserved
 
     def claim(self, terminal_id: str, runtime_id: str) -> bool:
         """Place a newly launched terminal, unless another runtime holds its id.

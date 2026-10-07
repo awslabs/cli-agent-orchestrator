@@ -92,6 +92,10 @@ the token gets `401`.
   `kubectl -n cao-remote exec cao-server-0 -- tmux ls` lists none.
 - With the runtime stopped (`kubectl -n cao-remote scale statefulset/cao-runtime --replicas=0`),
   operations on its terminals return `503` and their status is `unknown`.
+- Started again (`--replicas=1`), the replacement pod runs none of those
+  terminals (the old pod's tmux went with it), so the server drops their
+  records: `GET /terminals/{id}` answers `404`, and `GET /runtimes` no longer
+  lists them.
 
 ## Cleanup
 

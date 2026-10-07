@@ -110,6 +110,45 @@ def _launch_timeout() -> float:
 _TERMINAL_ID = TypeAdapter(TerminalId)
 
 
+def _drop_lost_terminals(runtime_id: str, terminal_ids: List[str]) -> List[str]:
+    """Drop the records of terminals ``runtime_id`` no longer runs; return those gone.
+
+    Each row goes only while it still names the runtime and its session, so a
+    relaunch of the id elsewhere keeps its own. No plugin event is emitted: as
+    with the server's own sweeps, nothing here tore a terminal down. A row that
+    cannot be dropped now is kept, routing and all, for the next hello.
+    """
+    from cli_agent_orchestrator.services import terminal_service
+
+    gone: List[str] = []
+    dropped: List[str] = []
+    for terminal_id in terminal_ids:
+        try:
+            row = get_terminal_metadata(terminal_id)
+            if row is not None and row.get("runtime_id") == runtime_id:
+                if terminal_service.delete_terminal_row(
+                    terminal_id, row, registry=None, routed=True
+                ):
+                    dropped.append(terminal_id)
+            # Dropped now, or no longer a row of this runtime's: either way the
+            # placement, conditional on the runtime, can go.
+            gone.append(terminal_id)
+        except Exception:  # noqa: BLE001 - kept for the next hello; the channel goes on
+            logger.warning(
+                "could not drop the record of terminal %s, lost on runtime %s",
+                terminal_id,
+                runtime_id,
+                exc_info=True,
+            )
+    if dropped:
+        logger.warning(
+            "runtime %s no longer runs terminal(s) %s: dropped their records",
+            runtime_id,
+            ", ".join(dropped),
+        )
+    return gone
+
+
 def _unreported_terminal(frame: Result) -> Optional[str]:
     """The terminal a failed result names as still running, if any: a launch
     whose agent cao-bridge could neither report nor stop."""
@@ -222,6 +261,9 @@ async def runtime_channel(ws: WebSocket) -> None:
         await ws.close(code=status.WS_1000_NORMAL_CLOSURE, reason="replaced")
 
     conn = runtime_registry.register(runtime_id, ws.send_text, close_socket=close_replaced)
+    # What the instance behind this connection runs. Set before anything here
+    # awaits, so a launch settling meanwhile can tell whether this one runs it.
+    conn.listed = set(hello.statuses)
     try:
         # Terminals whose central row names this runtime are its to report on;
         # a status for any other terminal is ignored.
@@ -239,9 +281,22 @@ async def runtime_channel(ws: WebSocket) -> None:
                 runtime_registry.unplace(terminal_id, runtime_id)
             elif terminal_id in held_elsewhere:
                 runtime_registry.place(terminal_id, runtime_id)
+        # A terminal recorded on this runtime that its hello does not list is
+        # gone, lost with the runtime's previous state: its pod was replaced, or
+        # cao-bridge restarted without the terminal's tmux. Its record goes too.
+        # A launch still being recorded is left to its own path (see
+        # _drop_if_lost_to_a_replacement), which knows where it came from.
+        lost = sorted(
+            terminal_id
+            for terminal_id in still_recorded
+            if terminal_id not in conn.listed
+            and not runtime_registry.is_reserved(terminal_id, runtime_id)
+        )
+        if lost:
+            for terminal_id in await asyncio.to_thread(_drop_lost_terminals, runtime_id, lost):
+                runtime_registry.unplace(terminal_id, runtime_id)
         for terminal_id, reported in hello.statuses.items():
             runtime_registry.set_status(terminal_id, runtime_id, reported, conn=conn)
-        conn.listed = set(hello.statuses)
         await ws.send_text(server_hello)
         runtime_registry.activate(conn)
         # The hello lists every terminal the runtime runs.
@@ -536,6 +591,37 @@ async def _finish_launch(
         ).model_dump(mode="json")
 
 
+async def _drop_if_lost_to_a_replacement(
+    runtime_id: str, terminal_id: str, origin: RuntimeConnection
+) -> None:
+    """Undo a recorded launch whose runtime was replaced while it was recorded.
+
+    A newer connection's hello skips a launch still in flight. If that newer
+    instance does not run the terminal (its hello did not list it), the one
+    that ran it is gone, and so is the terminal: its record is dropped, and the
+    launch fails with ``502``. The same runtime reconnecting lists it, and
+    keeps it.
+    """
+    latest = runtime_registry.latest(runtime_id)
+    if latest is None or latest is origin or terminal_id in latest.listed:
+        return
+    gone = await asyncio.to_thread(_drop_lost_terminals, runtime_id, [terminal_id])
+    for dropped in gone:
+        runtime_registry.unplace(dropped, runtime_id)
+    outcome = (
+        "its record was dropped"
+        if gone
+        else "its record could not be dropped and is kept for the runtime's next hello"
+    )
+    raise HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail=(
+            f"runtime {runtime_id} was replaced while terminal {terminal_id} was being "
+            f"recorded, and the replacement does not run it; {outcome}"
+        ),
+    )
+
+
 @router.post(
     "/runtimes/{runtime_id}/terminals",
     response_model=Terminal,
@@ -570,11 +656,15 @@ async def launch_on_runtime(
         raw = result.get("terminal")
         reserved = raw.get("id") if isinstance(raw, dict) else None
         try:
-            return await _finish_launch(request, runtime_id, body, conn, raw)
+            launched = await _finish_launch(request, runtime_id, body, conn, raw)
         finally:
             # Recorded (and so placed) or undone: either way no longer in flight.
             if isinstance(reserved, str):
                 runtime_registry.release(reserved, runtime_id)
+        # Checked once released: from here on a newer connection's hello
+        # reconciles the terminal like any other recorded one.
+        await _drop_if_lost_to_a_replacement(runtime_id, launched["id"], conn)
+        return launched
 
     # From the moment the command is sent, the runtime may start an agent: the
     # launch and its settlement (record it, or undo it) are one task, shielded

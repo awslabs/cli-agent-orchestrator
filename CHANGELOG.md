@@ -58,7 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routes and `DELETE /sessions/{session_name}` pass a remote terminal's
   operations to its runtime, answering `503`, `504` or `502` when the runtime
   cannot. Terminal rows gain a nullable `runtime_id` column, added
-  idempotently. `CAO_LOCAL_EXECUTION=0` stops the server starting agents
+  idempotently. A runtime's hello lists the terminals it runs, and the server
+  drops the record of one it no longer runs (a replaced pod's, for instance).
+  `CAO_LOCAL_EXECUTION=0` stops the server starting agents
   itself, and `CAO_RUNTIME_LAUNCH_TIMEOUT` bounds a launch. An EKS example is
   in `examples/cao-clusters/kubernetes/remote-runtime/`. See
   [Execution runtimes](docs/execution-runtimes.md) for the limits of this

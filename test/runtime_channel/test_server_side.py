@@ -162,18 +162,58 @@ class TestHandshake:
         # Disconnected: the server cannot know, and says so.
         assert client.get("/terminals/abcd1234").json()["status"] == "unknown"
 
-    def test_a_terminal_the_reconnected_runtime_does_not_report_is_unknown(self, client):
-        # E.g. the runtime pod was replaced: its panes are gone and its hello
-        # no longer mentions them. The old connection's report must not linger.
+    def test_a_terminal_the_reconnected_runtime_does_not_list_is_dropped(self, client):
+        # The runtime pod was replaced (reported on #834): its panes went with
+        # the old container, and its hello no longer lists them. Kept, the
+        # record read unknown, answered 502 to every operation, and stayed in
+        # GET /runtimes. Only the rows naming that runtime are reconciled.
         _remote_row("abcd1234", "rt-1")
+        _remote_row("abcd5678", "rt-1", session="cao-remote2")
+        _remote_row("abcd9999", "rt-2", session="cao-remote3")
         with client.websocket_connect("/runtime/channel", headers=WS_HEADERS) as ws:
-            ws.send_text(_hello(statuses={"abcd1234": "completed"}))
+            ws.send_text(_hello(statuses={"abcd1234": "completed", "abcd5678": "idle"}))
             ws.receive_text()
+        with client.websocket_connect("/runtime/channel", headers=WS_HEADERS) as ws:
+            ws.send_text(_hello(statuses={"abcd5678": "idle"}))
+            ws.receive_text()
+            assert client.get("/runtimes").json()["runtimes"]["rt-1"]["terminals"] == ["abcd5678"]
+            assert client.get("/terminals/abcd1234").status_code == 404
+            assert client.get("/terminals/abcd5678").json()["status"] == "idle"
+        assert database.get_terminal_metadata("abcd1234") is None
+        assert database.get_terminal_metadata("abcd9999") is not None, "another runtime's row"
+
+    def test_a_hello_leaves_a_launch_still_being_recorded_to_its_launch(self, client):
+        # Its result arrived and its row is written, but the launch has not
+        # settled: that path decides (see the replacement-during-recording test).
+        _remote_row("abcd1234", "rt-1")
+        registry_mod.runtime_registry.reserve("abcd1234", "rt-1")
         with client.websocket_connect("/runtime/channel", headers=WS_HEADERS) as ws:
             ws.send_text(_hello(statuses={}))
             ws.receive_text()
             assert client.get("/runtimes").json()["runtimes"]["rt-1"]["terminals"] == ["abcd1234"]
-            assert client.get("/terminals/abcd1234").json()["status"] == "unknown"
+        assert database.get_terminal_metadata("abcd1234") is not None
+
+    def test_a_lost_terminal_whose_row_cannot_be_dropped_waits_for_the_next_hello(
+        self, http, server, monkeypatch
+    ):
+        _remote_row("abcd1234", "rt-1")
+
+        def locked(*args, **kwargs):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(terminal_service, "delete_terminal_row", locked)
+
+        async def scenario():
+            async with _dial(server) as ws:
+                await ws.send(_hello(statuses={}))
+                reply = decode(await asyncio.wait_for(ws.recv(), 5))
+                return reply, runtimes_of(http)
+
+        reply, runtimes = asyncio.run(scenario())
+        assert isinstance(reply, Hello), "the runtime still connects"
+        # Kept, row and routing both, for the next hello to reconcile.
+        assert runtimes["rt-1"]["terminals"] == ["abcd1234"]
+        assert database.get_terminal_metadata("abcd1234") is not None
 
 
 class TestRuntimeNotConnected:
@@ -255,7 +295,14 @@ def start_runtime(server, tmp_path):
 
     def start(runtime_id="rt-1", script=lambda command: {}, statuses=None):
         ready = tmp_path / f"{runtime_id}.ready"
-        runtime = ScriptedRuntime(server, runtime_id, script, statuses or {}, ready)
+        if statuses is None:
+            # By default the runtime runs the terminals recorded on it, so its
+            # hello lists them, status not yet known; the server drops a record
+            # the hello leaves out. Pass statuses (even {}) to say exactly what
+            # it runs, e.g. a replacement that lost its panes.
+            recorded = database.list_terminal_ids_on_runtime(runtime_id)
+            statuses = {terminal_id: TerminalStatus.UNKNOWN for terminal_id in recorded}
+        runtime = ScriptedRuntime(server, runtime_id, script, statuses, ready)
         runtime.loop = asyncio.new_event_loop()
         thread = threading.Thread(
             target=runtime.loop.run_until_complete, args=(runtime.run(),), daemon=True
@@ -757,9 +804,10 @@ class TestLaunchAcrossAReconnect:
                     )
                 )
                 await asyncio.to_thread(writing.wait, 5)
-                # The runtime reconnects while the row is being written.
+                # The runtime reconnects while the row is being written. Its
+                # hello lists the terminal it launched, its status not yet known.
                 async with _dial(server) as new:
-                    await new.send(_hello())
+                    await new.send(_hello(statuses={"beef0001": "unknown"}))
                     await new.recv()
                     release.set()
                     response = await asyncio.wait_for(request, 10)
@@ -768,6 +816,52 @@ class TestLaunchAcrossAReconnect:
         response, status_now = asyncio.run(scenario())
         assert response.status_code == 201, response.text
         assert status_now == "unknown", "the old connection's launch status must not stand"
+
+    def test_a_launch_recorded_as_a_replacement_that_does_not_run_it_connects_is_dropped(
+        self, http, server, monkeypatch
+    ):
+        # The pod is replaced while the launch result is being recorded. The
+        # replacement's hello cannot reconcile a launch still in flight, and
+        # does not list it: the launch itself drops the record it just wrote.
+        recording, release = threading.Event(), threading.Event()
+        real = server_mod._record_launch
+
+        def slow_record(*args, **kwargs):
+            recording.set()
+            release.wait(5)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(server_mod, "_record_launch", slow_record)
+
+        async def scenario():
+            async with _dial(server) as old:
+                await old.send(_hello())
+                await old.recv()
+                loop = asyncio.get_running_loop()
+                request = loop.run_in_executor(
+                    None,
+                    lambda: http.post(
+                        "/runtimes/rt-1/terminals", json={"agent_profile": "developer"}
+                    ),
+                )
+                launch = await _next_command(old)
+                await old.send(
+                    encode(
+                        Result(op_id=launch.op_id, ok=True, payload={"terminal": dict(LAUNCHED)})
+                    )
+                )
+                await asyncio.to_thread(recording.wait, 5)
+                async with _dial(server) as new:
+                    await new.send(_hello())  # the new instance runs nothing
+                    await new.recv()
+                    release.set()
+                    return await asyncio.wait_for(request, 10)
+
+        response = asyncio.run(scenario())
+        assert response.status_code == 502, response.text
+        assert "replaced" in response.json()["detail"]
+        assert database.get_terminal_metadata("beef0001") is None
+        assert not registry_mod.runtime_registry.is_placed("beef0001", "rt-1")
 
     def test_an_undo_is_not_confirmed_by_another_instance_of_the_runtime(
         self, http, server, monkeypatch
@@ -1095,6 +1189,33 @@ class TestRemoteSessionTeardown:
         result = session_service.delete_session("cao-remote1", registry=registry)
         assert result == {"deleted": ["cao-remote1"], "errors": []}
         assert registry.dispatch.await_args_list == [], "the other delete owns its event"
+
+
+class TestRuntimeReplacement:
+    def test_a_replacement_that_runs_nothing_drops_the_old_records(self, http, start_runtime):
+        # The scenario reported on #834: the runtime is scaled to zero, then a
+        # replacement starts with nothing (its panes went with the old pod).
+        _remote_row("abcd1234", "rt-1")
+        old = start_runtime(script=_answer, statuses={"abcd1234": TerminalStatus.IDLE})
+        assert runtimes_of(http)["rt-1"]["terminals"] == ["abcd1234"]
+        old.loop.call_soon_threadsafe(old.stop)
+        _wait_for(lambda: "rt-1" not in runtimes_of(http), "the runtime to disconnect")
+        # While it is away the record stays: the same runtime may come back.
+        assert http.get("/terminals/abcd1234").json()["status"] == "unknown"
+        assert http.post("/terminals/abcd1234/input", params={"message": "x"}).status_code == 503
+        start_runtime(script=_answer, statuses={})
+        assert runtimes_of(http)["rt-1"]["terminals"] == []
+        assert http.get("/terminals/abcd1234").status_code == 404
+        assert http.post("/terminals/abcd1234/input", params={"message": "x"}).status_code == 404
+
+    def test_a_reconnect_that_still_runs_its_terminals_keeps_them(self, http, start_runtime):
+        _remote_row("abcd1234", "rt-1")
+        old = start_runtime(script=_answer, statuses={"abcd1234": TerminalStatus.IDLE})
+        old.loop.call_soon_threadsafe(old.stop)
+        _wait_for(lambda: "rt-1" not in runtimes_of(http), "the runtime to disconnect")
+        start_runtime(script=_answer, statuses={"abcd1234": TerminalStatus.COMPLETED})
+        assert runtimes_of(http)["rt-1"]["terminals"] == ["abcd1234"]
+        assert http.get("/terminals/abcd1234").json()["status"] == "completed"
 
 
 class TestRemoteSession:
