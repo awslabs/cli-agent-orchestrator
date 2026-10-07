@@ -46,6 +46,10 @@ PROVIDER_ENFORCEMENT: Dict[str, str] = {
     "antigravity_cli": PROMPT,
     "omp": PROMPT,
     "mcode": PROMPT,
+    # --allowed-tools is an auto-approval list, not a deny mechanism; a
+    # restricted policy reaches Devin only as security-constraint prompt text
+    # via --prompt-file.
+    "devin_cli": PROMPT,
     "hermes": NONE,  # launches --yolo --accept-hooks; restrict inside the Hermes profile
     "cursor_cli": NONE,  # launches --force; allowedTools is not applied
     "mock_cli": NONE,

@@ -27,6 +27,7 @@ DISPLAY_TO_PROVIDER = {
     "Antigravity CLI": "antigravity_cli",
     "OMP": "omp",
     "MiniMax Code": "mcode",
+    "Devin CLI": "devin_cli",
     "Hermes": "hermes",
     "Cursor CLI": "cursor_cli",
 }

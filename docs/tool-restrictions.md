@@ -293,6 +293,7 @@ As described in [How Tool Restrictions Are Enforced](#how-tool-restrictions-are-
 | **OMP** | Soft | Security system prompt only |
 | **Codex** | Soft | Security system prompt only |
 | **Antigravity CLI** | Soft | Security system prompt only |
+| **Devin CLI** | Soft | Security constraint prompt via `--prompt-file`; `--allowed-tools` is auto-approval only, not a deny mechanism |
 | **Hermes** | Profile-defined | CAO launches default `hermes` or the optional `hermesProfile` wrapper declared by the CAO profile; restrict tools in that Hermes profile |
 | **Cursor CLI** | Not enforced (v2026) | `allowedTools` is currently ignored — no native flag or system-prompt path is active; see [Cursor CLI Tool Restrictions](cursor-cli.md#tool-restrictions) |
 

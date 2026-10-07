@@ -95,6 +95,7 @@ def test_every_provider_explicitly_declares_model_support() -> None:
             "model-x",
             True,
         ),
+        (ProviderType.DEVIN_CLI, "worker", _profile(), "model-x", True),
         (ProviderType.MOCK_CLI, "worker", _profile(), "model-x", False),
     ],
     ids=lambda value: value.value if isinstance(value, ProviderType) else None,
