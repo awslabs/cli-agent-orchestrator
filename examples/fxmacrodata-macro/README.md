@@ -20,7 +20,7 @@ mcpServers:
 ```
 
 The entry connects without an API key. As in
-[examples/youcom-search](../youcom-search/README.md), the profile pins
+[examples/serply-research](../serply-research/README.md), the profile pins
 `provider: claude_code` because the default `kiro_cli` provider's support for
 remote `type: http` MCP servers is undocumented. Swap the `provider` key (or
 pass `--provider` at launch) to run it on another HTTP-capable provider.
