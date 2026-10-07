@@ -6,6 +6,7 @@ const path = require('node:path');
 const {test} = require('node:test');
 const {SourceMapConsumer} = require('source-map-js');
 const selectorParser = require('postcss-selector-parser');
+const shellQuote = createRequire(require.resolve('launch-editor'))('shell-quote');
 const CachePolicy = createRequire(require.resolve('cacheable-request'))(
   'http-cache-semantics',
 );
@@ -13,6 +14,50 @@ const CachePolicy = createRequire(require.resolve('cacheable-request'))(
 require('../../scripts/test-braces-security.cjs')(
   path.resolve(__dirname, '..'),
 );
+
+for (const [name, separator] of [
+  ['LF', '\n'],
+  ['CR', '\r'],
+  ['CRLF', '\r\n'],
+  ['line separator', '\u2028'],
+  ['paragraph separator', '\u2029'],
+]) {
+  test(`shell quoting rejects ${name} in any argument after a comment`, () => {
+    for (const intervening of [[], ['ordinary argument']]) {
+      assert.throws(
+        () => shellQuote.quote([
+          'editor',
+          {comment: 'remaining arguments are comments'},
+          ...intervening,
+          `first${separator}second`,
+        ]),
+        TypeError,
+      );
+    }
+  });
+}
+
+test('shell quoting rejects multiline arguments appended to a parsed comment', () => {
+  const tokens = shellQuote.parse('editor report#notes');
+  assert.deepEqual(tokens, ['editor', 'report', {comment: 'notes'}]);
+  assert.throws(
+    () => shellQuote.quote([...tokens, "first 'quoted'\nsecond"]),
+    TypeError,
+  );
+});
+
+test('shell quoting preserves ordinary arguments and line breaks before a comment', () => {
+  for (const tokens of [
+    ['editor', 'path with spaces', "it's quoted", '$value; still literal', ''],
+    ['editor', 'line one\nline two', {comment: 'notes'}],
+  ]) {
+    assert.deepEqual(shellQuote.parse(shellQuote.quote(tokens)), tokens);
+  }
+  assert.equal(
+    shellQuote.quote(['editor', {comment: 'notes'}, 'ordinary argument']),
+    "editor #notes 'ordinary argument'",
+  );
+});
 
 const request = {
   url: 'https://example.com/resource',

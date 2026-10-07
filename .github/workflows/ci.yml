@@ -275,10 +275,10 @@ jobs:
         run: uv sync --locked --all-extras --dev
 
       - name: Check code formatting with black
-        run: uv run black --check src/ test/
+        run: uv run black --check src/ test/ examples/robotics/cross-zone-transport/
 
       - name: Check import sorting with isort
-        run: uv run isort --check-only src/ test/
+        run: uv run isort --check-only src/ test/ examples/robotics/cross-zone-transport/
 
       - name: Run type checker with mypy
         run: uv run mypy src/
