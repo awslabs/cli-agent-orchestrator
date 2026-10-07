@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 import time
 from dataclasses import replace
 from test.decisions.test_engine import setup_engine
@@ -472,6 +473,139 @@ def test_settings_layers_limits_and_flags(monkeypatch):
             apply_flags([value])
     tune(retention_days=30)
     assert load_settings().retention_days == 30
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"on_timeout_ms": 49},
+        {"on_timeout_ms": 5001},
+        {"on_timeout_ms": 60.5},
+        {"threshold": -0.01},
+        {"threshold": 1.01},
+        {"threshold": float("nan")},
+        {"threshold": float("inf")},
+        {"retention_days": 0},
+        {"retention_days": -5},
+        {"retention_days": 36501},
+        {"retention_days": True},
+        {"on_timeout_ms": 1000, "retention_days": 0},
+    ],
+)
+def test_tune_refuses_out_of_range_and_keeps_file(kwargs):
+    from cli_agent_orchestrator.decisions.settings import load_settings, tune
+    from cli_agent_orchestrator.services import settings_service
+
+    settings_service.SETTINGS_FILE.write_text('{"decisions": {"retention_days": 30}}')
+    before = settings_service.SETTINGS_FILE.read_bytes()
+    with pytest.raises(ValueError, match="must be between"):
+        tune(**kwargs)
+    assert settings_service.SETTINGS_FILE.read_bytes() == before
+    assert load_settings().retention_days == 30
+
+
+def test_tune_accepts_range_bounds():
+    from cli_agent_orchestrator.decisions.settings import load_settings, tune
+
+    tune(on_timeout_ms=50, threshold=0, retention_days=1)
+    settings = load_settings()
+    assert (settings.on_timeout_ms, settings.confidence_threshold, settings.retention_days) == (
+        50,
+        0,
+        1,
+    )
+    tune(on_timeout_ms=5000, threshold=1.0, retention_days=36500)
+    settings = load_settings()
+    assert (settings.on_timeout_ms, settings.confidence_threshold, settings.retention_days) == (
+        5000,
+        1,
+        36500,
+    )
+
+
+@pytest.mark.parametrize(
+    "args, message",
+    [
+        (["--retention-days", "0"], "1<=x<=36500"),
+        (["--retention-days", "-5"], "1<=x<=36500"),
+        (["--retention-days", "36501"], "1<=x<=36500"),
+        (["--on-timeout-ms", "49"], "50<=x<=5000"),
+        (["--threshold", "1.5"], "0.0<=x<=1.0"),
+    ],
+)
+def test_cli_tune_refuses_out_of_range(args, message):
+    from cli_agent_orchestrator.cli.commands.decisions import decisions
+    from cli_agent_orchestrator.services import settings_service
+
+    result = CliRunner().invoke(decisions, ["tune", *args])
+    assert result.exit_code == 2 and message in result.output
+    assert not settings_service.SETTINGS_FILE.exists()
+
+
+def test_cli_tune_refuses_non_finite_threshold():
+    from cli_agent_orchestrator.cli.commands.decisions import decisions
+    from cli_agent_orchestrator.services import settings_service
+
+    result = CliRunner().invoke(decisions, ["tune", "--threshold", "nan"])
+    assert result.exit_code == 1 and "threshold must be between 0 and 1" in result.output
+    assert "Traceback" not in result.output and not settings_service.SETTINGS_FILE.exists()
+
+
+@pytest.mark.parametrize(
+    "key, value, attribute, expected",
+    [
+        ("retention_days", 0, "retention_days", 1),
+        ("retention_days", -5, "retention_days", 1),
+        ("on_timeout_ms", 1, "on_timeout_ms", 50),
+        ("confidence_threshold", 9, "confidence_threshold", 1),
+    ],
+)
+def test_hand_edited_out_of_range_is_clamped_with_warning(key, value, attribute, expected, caplog):
+    from cli_agent_orchestrator.decisions.settings import load_settings
+    from cli_agent_orchestrator.services import settings_service
+
+    settings_service.SETTINGS_FILE.write_text(json.dumps({"decisions": {key: value}}))
+    assert getattr(load_settings(), attribute) == expected
+    assert "out of range; clamped" in caplog.text
+
+
+def test_in_range_settings_do_not_warn(caplog):
+    from cli_agent_orchestrator.decisions.settings import load_settings
+    from cli_agent_orchestrator.services import settings_service
+
+    settings_service.SETTINGS_FILE.write_text(
+        json.dumps({"decisions": {"retention_days": 1, "on_timeout_ms": 5000}})
+    )
+    load_settings()
+    assert "clamped" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        ["model.route=onn"],
+        ["model.route="],
+        ["model.route=ON"],
+        ["model.route=shadow", "effort.route=bad"],
+    ],
+)
+def test_decision_flag_refuses_unknown_state_before_applying(values, monkeypatch):
+    from cli_agent_orchestrator.decisions.settings import STATE_ENV, apply_flags
+
+    with pytest.raises(ValueError, match=r"decision flag must be <point>=off\|shadow\|on"):
+        apply_flags(values)
+    assert all(name not in os.environ for name in STATE_ENV.values())
+
+
+def test_server_rejects_invalid_decision_flag(monkeypatch, capsys):
+    from cli_agent_orchestrator.api import main as api_main
+
+    monkeypatch.setattr(sys, "argv", ["cao-server", "--decision", "model.route=onn"])
+    with pytest.raises(SystemExit) as raised:
+        api_main.main()
+    assert raised.value.code == 2
+    assert "decision flag must be <point>=off|shadow|on" in capsys.readouterr().err
+    assert "CAO_DECISION_MODEL_ROUTE" not in os.environ
 
 
 def test_model_tier_malformed_and_empty_maps(caplog):

@@ -13,6 +13,10 @@ from cli_agent_orchestrator.services.model_tiers import TIERS, load_model_tiers,
 
 logger = logging.getLogger(__name__)
 STATE_ENV = {point: "CAO_DECISION_" + point.upper().replace(".", "_") for point in POINTS}
+# Accepted ranges: `tune` refuses values outside them; loading clamps hand edits and overrides.
+ON_TIMEOUT_MS_RANGE = (50, 5000)
+THRESHOLD_RANGE = (0.0, 1.0)
+RETENTION_DAYS_RANGE = (1, 36500)
 SAME_USER = "'Operator only' means not settable through MCP or any agent-facing API. It is a same-user local control, not a privilege boundary: settings.json can be edited by the same user, including an agent with shell access."
 
 
@@ -49,6 +53,8 @@ def _number(value: Any, default: float, lower: float, upper: float) -> float:
         number = float(value)
         if not math.isfinite(number):
             raise ValueError()
+        if not lower <= number <= upper:
+            logger.warning("Decision numeric setting out of range; clamped")
         return min(upper, max(lower, number))
     except (ValueError, TypeError, OverflowError):
         logger.warning("Invalid decision numeric setting; using default")
@@ -93,17 +99,15 @@ def load_settings(
             _number(
                 env.get("CAO_DECISION_ON_TIMEOUT_MS", block.get("on_timeout_ms", 1000)),
                 1000,
-                50,
-                5000,
+                *ON_TIMEOUT_MS_RANGE,
             )
         ),
         confidence_threshold=_number(
             env.get("CAO_DECISION_CONFIDENCE_THRESHOLD", block.get("confidence_threshold", 0.70)),
             0.70,
-            0,
-            1,
+            *THRESHOLD_RANGE,
         ),
-        retention_days=int(_number(block.get("retention_days", 90), 90, 1, 36500)),
+        retention_days=int(_number(block.get("retention_days", 90), 90, *RETENTION_DAYS_RANGE)),
         max_concurrent=int(_number(shadow.get("max_concurrent", 4), 4, 1, 1024)),
         max_pending=int(_number(shadow.get("max_pending", 64), 64, 0, 100000)),
         shadow_timeout_ms=int(_number(shadow.get("timeout_ms", 10000), 10000, 50, 60000)),
@@ -195,12 +199,28 @@ def set_exclusions(*, add: str | None = None, remove: str | None = None) -> None
     settings_service._save(data)
 
 
+def _check_range(
+    name: str, value: float | None, bounds: tuple[float, float], *, integer: bool
+) -> None:
+    lower, upper = bounds
+    if value is not None and (
+        isinstance(value, bool)
+        or not isinstance(value, int if integer else (int, float))
+        or not math.isfinite(value)
+        or not lower <= value <= upper
+    ):
+        raise ValueError(f"{name} must be between {lower:g} and {upper:g}")
+
+
 def tune(
     *,
     on_timeout_ms: int | None = None,
     threshold: float | None = None,
     retention_days: int | None = None,
 ) -> None:
+    _check_range("on_timeout_ms", on_timeout_ms, ON_TIMEOUT_MS_RANGE, integer=True)
+    _check_range("threshold", threshold, THRESHOLD_RANGE, integer=False)
+    _check_range("retention_days", retention_days, RETENTION_DAYS_RANGE, integer=True)
     data = settings_service._load_or_raise()
     block = _object(data, "decisions")
     for key, value in (
@@ -214,8 +234,9 @@ def tune(
 
 
 def apply_flags(values: list[str]) -> None:
-    for value in values:
-        point, sep, state = value.partition("=")
-        if not sep or point not in STATE_ENV:
-            raise ValueError("decision flag must be <point>=<state>")
+    pairs = [value.partition("=") for value in values]
+    for point, sep, state in pairs:
+        if not sep or point not in STATE_ENV or state not in {s.value for s in PointState}:
+            raise ValueError("decision flag must be <point>=off|shadow|on")
+    for point, _, state in pairs:
         os.environ[STATE_ENV[point]] = state

@@ -175,3 +175,48 @@ async def test_startup_sweep_exports_each_transition_once(setup_engine, export):
     assert len(spans.get_finished_spans()) == 2 and request_count(reader) == 2
     store.sweep()
     assert len(spans.get_finished_spans()) == 2 and request_count(reader) == 2
+
+
+def _fresh_telemetry_module(monkeypatch):
+    """Drop the cached module so the next import re-runs its guarded import."""
+    import sys
+
+    import cli_agent_orchestrator.decisions as package
+    from cli_agent_orchestrator.decisions import telemetry as original
+
+    monkeypatch.setattr(package, "telemetry", original)
+    monkeypatch.delitem(sys.modules, "cli_agent_orchestrator.decisions.telemetry")
+    return original
+
+
+def test_missing_opentelemetry_makes_emission_a_noop(setup_engine, tmp_path, monkeypatch, caplog):
+    import importlib
+    import sys
+
+    from cli_agent_orchestrator.decisions.store import DecisionStore
+
+    original = _fresh_telemetry_module(monkeypatch)
+    monkeypatch.setitem(sys.modules, "opentelemetry", None)
+    fresh = importlib.import_module("cli_agent_orchestrator.decisions.telemetry")
+    assert fresh is not original and fresh.OTEL_AVAILABLE is False
+    fresh.emit_record({"point": "model.route", "state": "on", "latency_ms": 5})
+    store = DecisionStore(setup_engine[3].sessions, tmp_path / "other.key")
+    assert store.emit is fresh.emit_record
+    store._emit({"point": "model.route", "state": "on", "outcome": "fallback"})
+    assert "Decision telemetry export failed" not in caplog.text
+
+
+def test_broken_opentelemetry_dependency_is_not_masked(tmp_path, monkeypatch):
+    import importlib
+    import sys
+
+    _fresh_telemetry_module(monkeypatch)
+    for name in [n for n in sys.modules if n == "opentelemetry" or n.startswith("opentelemetry.")]:
+        monkeypatch.delitem(sys.modules, name)
+    fake = tmp_path / "opentelemetry"
+    fake.mkdir()
+    (fake / "__init__.py").write_text("import cao_missing_otel_dependency\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    with pytest.raises(ModuleNotFoundError) as raised:
+        importlib.import_module("cli_agent_orchestrator.decisions.telemetry")
+    assert raised.value.name == "cao_missing_otel_dependency"

@@ -2,7 +2,15 @@
 
 from typing import Any
 
-from opentelemetry import metrics, trace
+try:
+    from opentelemetry import metrics, trace
+
+    OTEL_AVAILABLE = True
+except ImportError as exc:  # base install without the [otel] extra
+    # Degrade only when OpenTelemetry itself is absent, as telemetry/__init__.py does.
+    if not (exc.name or "").startswith("opentelemetry"):
+        raise
+    OTEL_AVAILABLE = False
 
 FIELDS = {
     "point": "point",
@@ -20,6 +28,8 @@ FIELDS = {
 
 
 def emit_record(row: dict[str, Any]) -> None:
+    if not OTEL_AVAILABLE:
+        return
     attributes = {
         "cao.decision." + dest: row[src] for src, dest in FIELDS.items() if row.get(src) is not None
     }

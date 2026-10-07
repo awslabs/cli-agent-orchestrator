@@ -209,15 +209,20 @@ class DecisionEngine:
                     (point,),
                 )
         model_settings = settings.points.get("model.route")
-        excluded = (
+        model_excluded = (
             target == TargetKind.INSTALLED
             and model_settings is not None
             and req.agent_profile in model_settings.exclude_profiles
         )
+
+        def excluded(point: str) -> bool:
+            # An exclusion pins only the model; other points are still asked.
+            return model_excluded and point == "model.route"
+
         eligible = tuple(
             point
             for point, value in fields.items()
-            if value == "auto" and not excluded and req.owner != WORKFLOW_STEP
+            if value == "auto" and not excluded(point) and req.owner != WORKFLOW_STEP
         )
         resolved: dict[str, tuple[Decider | None, str | None]] = {}
         for point in eligible:
@@ -227,7 +232,10 @@ class DecisionEngine:
         out_of_scope = tuple(
             point
             for point, value in fields.items()
-            if value == "auto" and point in active and req.owner == WORKFLOW_STEP and not excluded
+            if value == "auto"
+            and point in active
+            and req.owner == WORKFLOW_STEP
+            and not excluded(point)
         )
         plan_model: str | None = None
         fb_model = fallbacks.get("model.route")

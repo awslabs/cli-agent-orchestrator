@@ -68,9 +68,9 @@ def exclude(add: str | None, remove: str | None) -> None:
 
 
 @decisions.command()
-@click.option("--on-timeout-ms", type=int)
-@click.option("--threshold", type=float)
-@click.option("--retention-days", type=int)
+@click.option("--on-timeout-ms", type=click.IntRange(*settings.ON_TIMEOUT_MS_RANGE))
+@click.option("--threshold", type=click.FloatRange(*settings.THRESHOLD_RANGE))
+@click.option("--retention-days", type=click.IntRange(*settings.RETENTION_DAYS_RANGE))
 def tune(on_timeout_ms: int | None, threshold: float | None, retention_days: int | None) -> None:
     """Change timeout, confidence threshold or retention."""
     if all(value is None for value in (on_timeout_ms, threshold, retention_days)):

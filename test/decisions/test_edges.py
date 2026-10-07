@@ -156,6 +156,42 @@ async def test_check_order_and_step_three_reused(setup_engine):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["shadow", "on"])
+@pytest.mark.parametrize("owner", ["delegation", "workflow_step"])
+async def test_exclusion_pins_only_model_route(setup_engine, state, owner):
+    from cli_agent_orchestrator.decisions.settings import PointSettings
+    from cli_agent_orchestrator.decisions.targets import TargetKind
+    from cli_agent_orchestrator.decisions.types import PointState
+
+    engine, req, decider, store, events, settings = setup_engine
+    engine.settings_loader = lambda: replace(
+        settings,
+        points={
+            "model.route": PointSettings(PointState(state), decider.name, ("worker",)),
+            "effort.route": PointSettings(PointState(state), decider.name),
+        },
+    )
+    plan = await engine.prepare_launch(
+        replace(
+            req,
+            owner=owner,
+            target_kind=TargetKind.INSTALLED,
+            field_states={"model.route": "auto", "effort.route": "auto"},
+        )
+    )
+    await engine.runner.drain()
+    # The excluded profile keeps its own model; only effort.route is asked or recorded.
+    assert plan.model is None
+    rows = store.list()
+    assert [row["point"] for row in rows] == ["effort.route"]
+    if owner == "workflow_step":
+        assert decider.calls == 0 and rows[0]["reason"] == "out_of_scope"
+    else:
+        assert decider.calls == 1 and decider.requests[0].points == ("effort.route",)
+        assert rows[0]["outcome"] == ("shadow" if state == "shadow" else "applied")
+
+
+@pytest.mark.asyncio
 async def test_workflow_scope_and_effort_cap(setup_engine):
     from test.fixtures.decision_conformance import AboveCeilingDecider
 

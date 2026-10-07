@@ -28,17 +28,27 @@ set refuses the launch and names `model_tiers.<provider>.<tier>`.
 
 ## Settings
 
-Settings are read fresh for each call. Point-state precedence is:
+Settings are read fresh for each call, except the shadow limits
+`shadow.max_concurrent` and `shadow.max_pending`, which the server reads once at
+startup. Point-state precedence is:
 
-1. Repeatable `cao-server --decision model.route=shadow` flags.
-2. `CAO_DECISION_MODEL_ROUTE` and `CAO_DECISION_EFFORT_ROUTE`.
-3. `decisions.points.<point>.state` in `settings.json`.
-4. `off`.
+1. `CAO_DECISION_MODEL_ROUTE` and `CAO_DECISION_EFFORT_ROUTE` in the server's
+   environment. A repeatable `cao-server --decision model.route=shadow` flag sets
+   the matching variable for that server process, replacing an inherited value.
+2. `decisions.points.<point>.state` in `settings.json`.
+3. `off`.
 
-An invalid state means off at that layer; it does not fall through. An unreadable
-settings file makes every point off. Server environment overrides are captured
-at startup. `cao decisions status` describes the CLI's environment and cannot
-see a running server's flags; the server logs effective states at startup.
+`--decision` refuses an unknown point or state at startup. An invalid state in a
+variable or in `settings.json` means off at that layer; it does not fall through.
+An unreadable settings file makes every point off. `cao decisions status`
+describes the CLI's environment and cannot see a running server's flags; the
+server logs effective states at startup.
+
+The server captures these overrides at startup and keeps them until it restarts.
+While one is set, `cao decisions set <point> off` and `decisions_set_point` change
+only `settings.json`: the running server keeps using the override for that point.
+To turn such a point off, restart the server without the flag or variable. This
+version has no single command that turns every point off.
 
 ```json
 {
@@ -70,12 +80,17 @@ are not checked by configuration validation unless listed in `allowed_providers`
 the launch check still refuses an unmapped required default on the target.
 
 `exclude_profiles` pins installed profiles to their existing model resolution:
-no question and no record for launches that pass policy. Refused launches still
-write a rejected record in shadow or on. Names not installed are retained but
-have no effect. There is no profile-frontmatter switch for decisions.
+no `model.route` question and no `model.route` record for launches that pass
+policy. Other points, such as `effort.route`, are still asked and recorded.
+Refused launches still write a rejected record in shadow or on. Names not
+installed are retained but have no effect. There is no profile-frontmatter
+switch for decisions.
 
-On timeout is clamped to 50–5000 ms; threshold to 0–1. Scalar overrides are
-`CAO_DECISION_ON_TIMEOUT_MS` and `CAO_DECISION_CONFIDENCE_THRESHOLD`. The fixed table
+`cao decisions tune` accepts an on timeout of 50–5000 ms, a threshold of 0–1 and
+a retention of 1–36500 days, and refuses anything else. A retention of `0` is
+refused; it does not mean unlimited. Values outside these ranges in
+`settings.json` or in the scalar overrides `CAO_DECISION_ON_TIMEOUT_MS` and
+`CAO_DECISION_CONFIDENCE_THRESHOLD` are clamped, with a warning. The fixed table
 looks up profile first, then role, and returns probability 1.0; a miss gives no
 answer. It is a decider, never part of fallback resolution. Shadow defaults to
 four concurrent and 64 pending tasks. Overflow is recorded as `shadow_dropped`;
@@ -141,7 +156,8 @@ a launch. Rejected launches emit telemetry at insertion, shadow tasks emit after
 deciding, and other records emit at the first bind. Each record emits once.
 Spans use `cao.decision`; metrics use `cao.decision.requests` and
 `cao.decision.latency`. No message, description, hash or probability vector is
-exported, and metric labels never contain terminal IDs.
+exported, and metric labels never contain terminal IDs. Without the
+OpenTelemetry packages (the `[otel]` extra), decision telemetry is a no-op.
 
 ## Decider packages
 

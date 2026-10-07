@@ -111,7 +111,7 @@ def test_settings_precedence_clamps_and_invalid(monkeypatch):
     assert load_settings(flags={"model.route": "off"}).points["model.route"].state.value == "off"
     monkeypatch.setenv("CAO_DECISION_MODEL_ROUTE", "invalid")
     assert load_settings().points["model.route"].state.value == "off"
-    tune(on_timeout_ms=1, threshold=9, retention_days=30)
+    tune(on_timeout_ms=50, threshold=1, retention_days=30)
     assert load_settings().on_timeout_ms == 50
     assert load_settings().confidence_threshold == 1
     set_tier("codex", "small", "model-x")
