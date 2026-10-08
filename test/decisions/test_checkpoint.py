@@ -511,7 +511,10 @@ def test_settings_layers_limits_and_flags(monkeypatch):
     assert (settings.max_concurrent, settings.max_pending, settings.shadow_timeout_ms) == (1, 0, 50)
     monkeypatch.setenv("CAO_DECISION_MODEL_ROUTE", "on")
     assert (
-        load_settings(flags={"model.route": "invalid"}).points["model.route"].state.value == "off"
+        load_settings(environment={"CAO_DECISION_MODEL_ROUTE": "invalid"})
+        .points["model.route"]
+        .state.value
+        == "off"
     )
     monkeypatch.setenv("CAO_DECISION_ON_TIMEOUT_MS", "123")
     monkeypatch.setenv("CAO_DECISION_CONFIDENCE_THRESHOLD", ".83")

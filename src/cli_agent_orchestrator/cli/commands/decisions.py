@@ -7,6 +7,7 @@ import click
 
 from cli_agent_orchestrator.decisions import operator, settings
 from cli_agent_orchestrator.decisions.types import POINTS
+from cli_agent_orchestrator.services.model_tiers import TIERS
 
 
 def _run(action: Callable[[], Any]) -> None:
@@ -30,7 +31,7 @@ def status() -> None:
 
 @decisions.command(name="set")
 @click.argument("point", type=click.Choice(tuple(POINTS)))
-@click.argument("state", type=click.Choice(("off", "shadow", "on")))
+@click.argument("state", type=click.Choice(settings.STATES))
 @click.option("--decider", default=None)
 def set_point(point: str, state: str, decider: str | None) -> None:
     """Set a point's state and optionally its installed decider name."""
@@ -39,7 +40,7 @@ def set_point(point: str, state: str, decider: str | None) -> None:
 
 @decisions.command()
 @click.argument("provider")
-@click.argument("tier", type=click.Choice(("small", "medium", "large")))
+@click.argument("tier", type=click.Choice(TIERS))
 @click.argument("model", required=False)
 @click.option("--unset", is_flag=True)
 def tier(provider: str, tier: str, model: str | None, unset: bool) -> None:
@@ -69,6 +70,8 @@ def exclude(add: str | None, remove: str | None) -> None:
 
 @decisions.command()
 @click.option("--on-timeout-ms", type=click.IntRange(*settings.ON_TIMEOUT_MS_RANGE))
+# FloatRange lets `nan` through (its comparisons are false); `settings.tune()` refuses it, so
+# `nan` exits 1 while `inf` and other out-of-range values exit 2 here.
 @click.option("--threshold", type=click.FloatRange(*settings.THRESHOLD_RANGE))
 @click.option("--retention-days", type=click.IntRange(*settings.RETENTION_DAYS_RANGE))
 def tune(on_timeout_ms: int | None, threshold: float | None, retention_days: int | None) -> None:

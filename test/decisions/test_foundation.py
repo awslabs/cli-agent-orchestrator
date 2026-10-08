@@ -108,7 +108,8 @@ def test_settings_precedence_clamps_and_invalid(monkeypatch):
     set_point("model.route", "shadow")
     monkeypatch.setenv("CAO_DECISION_MODEL_ROUTE", "on")
     assert load_settings().points["model.route"].state.value == "on"
-    assert load_settings(flags={"model.route": "off"}).points["model.route"].state.value == "off"
+    off = load_settings(environment={"CAO_DECISION_MODEL_ROUTE": "off"})
+    assert off.points["model.route"].state.value == "off"
     monkeypatch.setenv("CAO_DECISION_MODEL_ROUTE", "invalid")
     assert load_settings().points["model.route"].state.value == "off"
     tune(on_timeout_ms=50, threshold=1, retention_days=30)
@@ -128,7 +129,8 @@ def test_settings_precedence_clamps_and_invalid(monkeypatch):
 
     settings_service.SETTINGS_FILE.write_text("broken")
     assert all(
-        p.state.value == "off" for p in load_settings(flags={"model.route": "on"}).points.values()
+        p.state.value == "off"
+        for p in load_settings(environment={"CAO_DECISION_MODEL_ROUTE": "on"}).points.values()
     )
 
 

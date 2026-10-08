@@ -13,10 +13,15 @@ from cli_agent_orchestrator.services.model_tiers import TIERS, load_model_tiers,
 
 logger = logging.getLogger(__name__)
 STATE_ENV = {point: "CAO_DECISION_" + point.upper().replace(".", "_") for point in POINTS}
+STATES = tuple(state.value for state in PointState)
 # Accepted ranges: `tune` refuses values outside them; loading clamps hand edits and overrides.
 ON_TIMEOUT_MS_RANGE = (50, 5000)
 THRESHOLD_RANGE = (0.0, 1.0)
 RETENTION_DAYS_RANGE = (1, 36500)
+# Shadow limits have no setter; loading clamps them to these ranges.
+MAX_CONCURRENT_RANGE = (1, 1024)
+MAX_PENDING_RANGE = (0, 100000)
+SHADOW_TIMEOUT_MS_RANGE = (50, 60000)
 SAME_USER = "'Operator only' means not settable through MCP or any agent-facing API. It is a same-user local control, not a privilege boundary: settings.json can be edited by the same user, including an agent with shell access."
 
 
@@ -61,9 +66,7 @@ def _number(value: Any, default: float, lower: float, upper: float) -> float:
         return default
 
 
-def load_settings(
-    *, flags: Mapping[str, str] | None = None, environment: Mapping[str, str] | None = None
-) -> DecisionSettings:
+def load_settings(*, environment: Mapping[str, str] | None = None) -> DecisionSettings:
     try:
         raw = settings_service._load_or_raise()
     except settings_service.SettingsUnreadableError:
@@ -75,7 +78,7 @@ def load_settings(
     points = {}
     for point in POINTS:
         item = _block(saved.get(point))
-        state = (flags or {}).get(point, env.get(STATE_ENV[point], item.get("state", "off")))
+        state = env.get(STATE_ENV[point], item.get("state", "off"))
         try:
             parsed = PointState(state)
         except (ValueError, TypeError):
@@ -108,9 +111,11 @@ def load_settings(
             *THRESHOLD_RANGE,
         ),
         retention_days=int(_number(block.get("retention_days", 90), 90, *RETENTION_DAYS_RANGE)),
-        max_concurrent=int(_number(shadow.get("max_concurrent", 4), 4, 1, 1024)),
-        max_pending=int(_number(shadow.get("max_pending", 64), 64, 0, 100000)),
-        shadow_timeout_ms=int(_number(shadow.get("timeout_ms", 10000), 10000, 50, 60000)),
+        max_concurrent=int(_number(shadow.get("max_concurrent", 4), 4, *MAX_CONCURRENT_RANGE)),
+        max_pending=int(_number(shadow.get("max_pending", 64), 64, *MAX_PENDING_RANGE)),
+        shadow_timeout_ms=int(
+            _number(shadow.get("timeout_ms", 10000), 10000, *SHADOW_TIMEOUT_MS_RANGE)
+        ),
         deciders=_block(block.get("deciders")),
         model_tiers=load_model_tiers(raw),
     )
@@ -236,7 +241,7 @@ def tune(
 def apply_flags(values: list[str]) -> None:
     pairs = [value.partition("=") for value in values]
     for point, sep, state in pairs:
-        if not sep or point not in STATE_ENV or state not in {s.value for s in PointState}:
+        if not sep or point not in STATE_ENV or state not in STATES:
             raise ValueError("decision flag must be <point>=off|shadow|on")
     for point, _, state in pairs:
         os.environ[STATE_ENV[point]] = state
