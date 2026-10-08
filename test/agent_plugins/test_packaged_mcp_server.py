@@ -98,7 +98,10 @@ class TestCommandAndPin:
         assert " " not in ops_entry()["command"]
 
     def test_every_other_detail_lives_in_args(self):
-        assert ops_entry()["args"][:2] == ["--from", f"cli-agent-orchestrator=={_version()}"]
+        """The arguments pin the committed release, which may lag pyproject."""
+        committed = builder.committed_package_version()
+        assert committed is not None, "the committed packages must agree on a version"
+        assert ops_entry()["args"][:2] == ["--from", f"cli-agent-orchestrator=={committed}"]
 
     def test_the_version_is_pinned_exactly_not_floating(self):
         """An unpinned `--from` lets uvx resolve the latest release at first run."""
@@ -355,7 +358,3 @@ class TestDocumentedPrerequisites:
         docs = (REPO_ROOT / "docs" / "agent-plugins.md").read_text(encoding="utf-8")
         lowered = docs.lower()
         assert "not start a server" in lowered or "self-start" in lowered
-
-
-def _version() -> str:
-    return builder.package_version()

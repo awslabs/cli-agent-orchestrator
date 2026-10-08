@@ -54,8 +54,11 @@ class TestBothPackagesAreConformant:
 
     @pytest.mark.parametrize("package_dir", [OPERATOR_DIR, CONTRIBUTOR_DIR])
     def test_version_is_synced_from_cao_package_metadata(self, package_dir):
-        """Requirement 3.2 — the two values cannot diverge without a build failure."""
-        assert manifest_of(package_dir)["version"] == builder.package_version()
+        """Requirement 3.2 — packages agree and may lag, but never lead, metadata."""
+        committed = builder.committed_package_version()
+        assert committed is not None, "the committed packages must agree on a version"
+        assert manifest_of(package_dir)["version"] == committed
+        assert builder.pin_ordering_problems(committed, builder.package_version()) == []
 
     def test_the_parent_directory_is_not_itself_a_plugin_root(self):
         """``agent-plugin/`` is a container; the plugin roots are its children."""
