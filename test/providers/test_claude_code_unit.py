@@ -124,7 +124,7 @@ class TestClaudeCodeProviderInitialization:
 
     @pytest.mark.asyncio
     @_PATCH_SETTINGS
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -156,7 +156,7 @@ class TestClaudeCodeProviderInitialization:
 
     @pytest.mark.asyncio
     @_PATCH_SETTINGS
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -190,7 +190,7 @@ class TestClaudeCodeProviderInitialization:
     @pytest.mark.asyncio
     @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_initialize_with_broken_profile_raises_provider_error(
         self, mock_tmux, mock_load, mock_wait_shell, _
@@ -204,7 +204,7 @@ class TestClaudeCodeProviderInitialization:
         with pytest.raises(ProviderError, match="Failed to load agent profile"):
             await provider.initialize()
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_uses_native_agent_from_profile(self, mock_load):
         """Test profile with native_agent field uses --agent passthrough."""
         mock_profile = MagicMock()
@@ -221,7 +221,7 @@ class TestClaudeCodeProviderInitialization:
 
     @pytest.mark.asyncio
     @_PATCH_SETTINGS
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -1436,7 +1436,7 @@ class TestClaudeCodeProviderMisc:
 
         assert "--resume" not in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_claude_command_with_system_prompt(self, mock_load):
         """Test building Claude command with system prompt."""
         mock_profile = MagicMock()
@@ -1452,7 +1452,7 @@ class TestClaudeCodeProviderMisc:
         assert "claude" in command
         assert "--append-system-prompt-file" in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_mcp_injects_terminal_id(self, mock_load):
         """Test that _build_claude_command injects CAO_TERMINAL_ID into MCP server env."""
         mock_profile = MagicMock()
@@ -1472,7 +1472,7 @@ class TestClaudeCodeProviderMisc:
         server_env = mcp_data["mcpServers"]["cao-mcp-server"]["env"]
         assert server_env["CAO_TERMINAL_ID"] == "term-42"
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_resolves_bundled_mcp_command(self, mock_load):
         """The bare cao-mcp-server command is resolved to a PATH-independent
         invocation in the written MCP config (wiring guard: a refactor that
@@ -1497,7 +1497,7 @@ class TestClaudeCodeProviderMisc:
         mcp_data = _extract_mcp_config(command)
         assert mcp_data["mcpServers"]["cao-mcp-server"]["command"] == "/venv/bin/cao-mcp-server"
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_mcp_preserves_existing_env(self, mock_load):
         """Test that existing env vars in MCP config are preserved when injecting CAO_TERMINAL_ID."""
         mock_profile = MagicMock()
@@ -1523,7 +1523,7 @@ class TestClaudeCodeProviderMisc:
         # CAO_TERMINAL_ID added
         assert server_env["CAO_TERMINAL_ID"] == "term-99"
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load):
         """Test that an existing CAO_TERMINAL_ID in MCP env is NOT overwritten."""
         mock_profile = MagicMock()
@@ -1557,7 +1557,7 @@ class TestClaudeCodeProviderContainerPathTranslation:
     --mcp-config arguments.
     """
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_temp_file_paths_translated_to_guest(self, mock_load, tmp_path):
         """host CAO_HOME_DIR prefix -> guest path in both temp-file CLI args."""
         # Map the (patched) CAO_HOME_DIR host prefix to a container guest path.
@@ -1586,7 +1586,7 @@ class TestClaudeCodeProviderContainerPathTranslation:
         assert str(tmp_path) not in prompt_arg
         assert str(tmp_path) not in mcp_arg
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_temp_file_paths_unchanged_without_container(self, mock_load, tmp_path):
         """No container -> paths are the real host paths (translation is a no-op).
 
@@ -1617,7 +1617,7 @@ class TestClaudeCodeProviderContainerPathTranslation:
 class TestClaudeCodeProviderModelFlag:
     """Tests that profile.model is forwarded to Claude Code via --model."""
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_appends_model_when_set(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = "sonnet"
@@ -1631,7 +1631,7 @@ class TestClaudeCodeProviderModelFlag:
 
         assert "--model sonnet" in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_omits_model_when_unset(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -1645,7 +1645,7 @@ class TestClaudeCodeProviderModelFlag:
 
         assert "--model" not in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_explicit_model_override_wins_over_profile_model(self, mock_load):
         """An explicit per-call model (handoff/assign's own `model` param)
         takes precedence over the profile's own static model field."""
@@ -1662,7 +1662,7 @@ class TestClaudeCodeProviderModelFlag:
         assert "--model fable-5" in command
         assert "--model sonnet" not in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_explicit_model_override_applies_with_no_profile_model(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -1676,7 +1676,7 @@ class TestClaudeCodeProviderModelFlag:
 
         assert "--model fable-5" in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_model_override_ignored_for_native_agent_profile(self, mock_load):
         """A profile that maps to a native Claude Code agent handles its own
         model config -- an explicit override is not applied there (by
@@ -1700,7 +1700,7 @@ class TestClaudeCodeProviderModelFlag:
         provider = ClaudeCodeProvider("tid", "sess", "win", "agent", model="fable-5")
         # profile is None on this path (agent_profile has no CAO profile file).
         with patch(
-            "cli_agent_orchestrator.providers.claude_code.load_agent_profile",
+            "cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile",
             side_effect=FileNotFoundError,
         ):
             command = provider._build_claude_command()
@@ -1712,7 +1712,7 @@ class TestClaudeCodeProviderModelFlag:
 class TestClaudeCodeProviderClaudeConfig:
     """Tests that profile.claudeConfig maps to Claude Code CLI flags."""
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_appends_effort_from_claude_config(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -1727,7 +1727,7 @@ class TestClaudeCodeProviderClaudeConfig:
 
         assert "--effort xhigh" in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_appends_fallback_model_from_claude_config(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -1742,7 +1742,7 @@ class TestClaudeCodeProviderClaudeConfig:
 
         assert "--fallback-model sonnet" in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_omits_effort_when_claude_config_absent(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -1760,7 +1760,7 @@ class TestClaudeCodeProviderClaudeConfig:
 
 class TestClaudeCodeProviderPermissionMode:
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_uses_permission_mode_when_set_and_not_yolo(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -1775,7 +1775,7 @@ class TestClaudeCodeProviderPermissionMode:
         assert "--permission-mode auto" in command
         assert "--dangerously-skip-permissions" not in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_permission_mode_takes_priority_over_yolo(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -1790,7 +1790,7 @@ class TestClaudeCodeProviderPermissionMode:
         assert "--permission-mode auto" in command
         assert "--dangerously-skip-permissions" not in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_legacy_profile_without_permission_mode(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -1805,7 +1805,7 @@ class TestClaudeCodeProviderPermissionMode:
         assert "--dangerously-skip-permissions" in command
         assert "--permission-mode" not in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_empty_allowlist_emits_disallowed_tools(self, mock_load):
         """allowed_tools=[] must deny natives, not skip --disallowedTools."""
         mock_profile = MagicMock()
@@ -1829,7 +1829,7 @@ class TestClaudeCodeProviderYoloRootRegression:
     when running as root, and does not break normal non-root yolo launches.
     """
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.os")
     def test_yolo_non_root_includes_dangerously_skip_permissions(self, mock_os, mock_load):
         """yolo + no permissionMode + non-root => includes --dangerously-skip-permissions."""
@@ -1847,7 +1847,7 @@ class TestClaudeCodeProviderYoloRootRegression:
         assert "--dangerously-skip-permissions" in command
         assert "--permission-mode" not in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.os")
     def test_yolo_root_omits_dangerously_skip_permissions(self, mock_os, mock_load):
         """yolo + no permissionMode + root => omits --dangerously-skip-permissions."""
@@ -1865,7 +1865,7 @@ class TestClaudeCodeProviderYoloRootRegression:
         assert "--dangerously-skip-permissions" not in command
         assert "--permission-mode" not in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.os")
     def test_yolo_with_permission_mode_uses_permission_mode_flag(self, mock_os, mock_load):
         """yolo + permissionMode => uses --permission-mode <value>, omits --dangerously-skip-permissions."""

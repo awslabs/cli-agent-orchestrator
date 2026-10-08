@@ -38,6 +38,19 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
 
 ### Profiles, providers, and settings
 
+- `POST /ephemeral-agents` creates and stores an opt-in, [ephemeral agent](ephemeral-agents.md).
+- `POST /ephemeral-agents/{name}/claim?caller_id=<creator-terminal-id>` claims it under a lease,
+  rechecks policy and finalizes the profile. Its body accepts optional `idempotency_key`,
+  `claim_id` and `model`; per-call models refuse. It returns the claim, provider and stored tools,
+  or a matching launched terminal with `replayed: true`.
+- `POST /sessions/{session}/terminals` launches it with `agent_profile`, `caller_id`, `provider`
+  and optional `claim_id` query parameters. Claims are 32 lowercase hexadecimal characters.
+  `POST /sessions` has no caller or claim parameter and refuses a created, pending ephemeral
+  name with `not_owner`. Collected names get `ephemeral_expired` (409); never-created names get
+  `unknown_ephemeral` (404), including on `POST /sessions`.
+- `POST /terminals/run-step` accepts `claim_id` for a newly created terminal; combining it with
+  `reuse_terminal_id` gives 422. Policy refusals use `{kind: "ephemeral_policy", rule, message}`.
+  `assign` and `handoff` still refuse ephemeral names.
 - `GET /agents/profiles` and `GET /agents/profiles/{name}` list and inspect
   installed profiles.
 - `GET /agents/profiles/search` ranks installed, loadable profiles by capability

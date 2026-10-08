@@ -81,6 +81,39 @@ def _load_or_raise() -> Dict[str, Any]:
     return data
 
 
+EPHEMERAL_DEFAULTS = {
+    "enabled": False,
+    "allowed_providers": ["claude_code"],
+    "max_brief_bytes": 8192,
+    "pending_ttl_seconds": 900,
+    "claim_lease_seconds": 60,
+    "max_depth": 1,
+}
+
+
+def get_ephemeral_settings() -> Dict[str, Any]:
+    """Read the operator-only block strictly, without environment overrides."""
+    settings = _load_or_raise()
+    block = settings.get("ephemeral", {})
+    if not isinstance(block, dict):
+        block = {}
+    result = {**EPHEMERAL_DEFAULTS, **block}
+    result["_ignored_policy"] = [
+        "ephemeral." + key
+        for key in ("max_tier", "default_tier", "max_effort", "default_effort")
+        if block.get(key) is not None
+    ]
+    if settings.get("model_tiers") is not None:
+        result["_ignored_policy"].append("model_tiers")
+    return result
+
+
+def child_may_delegate() -> bool:
+    """Operator-only ephemeral.child_may_delegate; no environment overrides."""
+    block = _load_or_raise().get("ephemeral", {})
+    return isinstance(block, dict) and block.get("child_may_delegate") is True
+
+
 def _load() -> Dict[str, Any]:
     """Load settings from disk, tolerating an unreadable file.
 

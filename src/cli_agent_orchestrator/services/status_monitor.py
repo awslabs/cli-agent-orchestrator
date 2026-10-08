@@ -8,7 +8,7 @@ import asyncio
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 # Statuses that represent a stable "ready" state — the agent has finished
 # producing output and is waiting for further input. Once latched, the
 # StatusMonitor will not regress to PROCESSING until ``notify_input_sent``
@@ -43,6 +44,13 @@ logger = logging.getLogger(__name__)
 # wait_until_status (server-side) and the e2e tests' HTTP polling miss the
 # brief "ready" windows and time out (PR #273 codex 60s init timeouts,
 # completion-timeout failures).
+class StatusObservation(NamedTuple):
+    """A terminal status plus the output generation it was earned at (None for herdr)."""
+
+    status: TerminalStatus
+    output_generation: Optional[int]
+
+
 _STICKY_READY_STATUSES = frozenset(
     {
         TerminalStatus.IDLE,
@@ -159,6 +167,41 @@ class StatusMonitor:
         # applied across that boundary would consume the arm and latch-block the new
         # turn's genuine PROCESSING.
         self._capture_generation: Dict[str, int] = {}
+        # Per-terminal OUTPUT-ONLY generation. Bumped under the lock by
+        # _process_chunk alone -- never by notify_input_sent -- so a strictly
+        # greater value than one sampled at a dispatch boundary means real output
+        # has landed since that boundary. This is what output_generation() exposes
+        # and what delivery confirmation gates on (PR #566). It is kept separate
+        # from _capture_generation on purpose: that counter must ALSO advance on
+        # notify_input_sent (a new turn invalidates in-flight capture verdicts),
+        # and a counter that moves on arm cannot distinguish "the worker produced
+        # output" from "we sent keys again" -- a resubmit's own arm would satisfy
+        # the gate on a still-cached pre-dispatch COMPLETED. The byte-buffer epoch
+        # that clear_rolling_buffer hands stateful providers is not a substitute
+        # either: it advances on CLEAR, never on output, so it cannot say whether
+        # anything arrived after the boundary.
+        self._output_generation: Dict[str, int] = {}
+        # Per-terminal OUTPUT generation at which ``_last_status`` was last EARNED:
+        # stamped under the lock whenever a detected status is applied (a change)
+        # or genuine PROCESSING evidence is re-observed. A status VALUE cannot
+        # say when it was earned; this says which output it was computed from.
+        # Delivery confirmation (PR #566, review round 9) compares it with the
+        # generation sampled at the dispatch boundary: only a status whose OWN
+        # stamp is newer than the dispatch is evidence for that dispatch. A
+        # sticky pre-dispatch COMPLETED keeps its old stamp no matter how many
+        # unrelated frames bump ``_output_generation`` afterwards.
+        self._status_generation: Dict[str, int] = {}
+        # Per-terminal marker: the current IDLE was reached from COMPLETED (the
+        # completion box was evicted or scrolled while the latch was armed). The
+        # return trip IDLE -> COMPLETED is then the same finished turn's box being
+        # re-read, not a completion the worker earned, and must not re-stamp
+        # ``_status_generation`` (PR #566, round 10). Set on COMPLETED -> IDLE,
+        # consumed by the return trip, cleared by any other transition. It
+        # survives ``notify_input_sent`` on purpose: a dispatch (or a redelivery)
+        # does not change what is on screen, and clearing it on every arm let a
+        # repaint of the old completion box confirm a re-sent task that never
+        # ran (see ``notify_input_sent``).
+        self._idle_from_completed: Dict[str, bool] = {}
         # --- pyte rendered-screen detection state (only used when CAO_PYTE_STATUS
         # is on AND the provider opts in via supports_screen_detection) ---
         # Per-terminal pyte Screen+Stream that composites the raw byte stream
@@ -260,6 +303,7 @@ class StatusMonitor:
             # by a later read.
             self._buffer_changed_at[terminal_id] = time.monotonic()
             self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
+            self._output_generation[terminal_id] = self._output_generation.get(terminal_id, 0) + 1
             self._pending_stale_capture.pop(terminal_id, None)
             self._confirmed_stale_capture_commit.pop(terminal_id, None)
             if use_screen:
@@ -304,6 +348,19 @@ class StatusMonitor:
                     terminal_id, 0
                 )
             changed = self._apply_detection_locked(terminal_id, detected)
+            if (
+                not changed
+                and detected == TerminalStatus.PROCESSING
+                and processing_evidence
+                and self._last_status.get(terminal_id) == TerminalStatus.PROCESSING
+            ):
+                # Still PROCESSING on fresh evidence: the cached value is
+                # re-earned by this output, so its stamp moves with it. Ready
+                # statuses are deliberately NOT re-stamped on an unchanged
+                # re-detection -- a full-screen repaint composites the previous
+                # turn's completion box and re-parses as the same COMPLETED, and
+                # that is exactly the stale reading a stamp must not refresh.
+                self._status_generation[terminal_id] = self._output_generation.get(terminal_id, 0)
         if changed:
             # Publish outside the lock — subscribers must never be able to
             # re-enter StatusMonitor while the latch state is mid-update.
@@ -366,6 +423,37 @@ class StatusMonitor:
             return False
 
         self._last_status[terminal_id] = detected
+        # Earned now, from whatever output has landed so far (see
+        # ``status_observation``). Optimistic latches arrive here too
+        # (notify_input_sent(assume_processing=True)); they are stamped with
+        # the pre-send generation, which is by construction not newer than the
+        # dispatch boundary sampled right after, so they never confirm a send.
+        #
+        # Two transitions do NOT re-stamp: COMPLETED -> IDLE, and the IDLE ->
+        # COMPLETED that returns from it. Once notify_input_sent has armed the
+        # latch, COMPLETED -> IDLE is let through, so a swallowed Enter whose echo
+        # frame parses IDLE and whose next repaint composites the previous turn's
+        # completion box would otherwise re-stamp that old COMPLETED past the
+        # dispatch boundary and confirm a send that never happened. That round
+        # trip is the same finished turn read twice. Every other way of reaching
+        # COMPLETED is stamped, in particular IDLE -> COMPLETED when the IDLE was
+        # the pre-dispatch baseline (a fresh worker sits at IDLE after init, and a
+        # fast turn can land spinner and answer in one chunk with no PROCESSING
+        # detected in between): that IS this task's completion, and refusing it
+        # would resubmit the task to a worker that has already done it (round-10
+        # review, P2).
+        completed_to_idle = last == TerminalStatus.COMPLETED and detected == TerminalStatus.IDLE
+        returning_to_completed = (
+            last == TerminalStatus.IDLE
+            and detected == TerminalStatus.COMPLETED
+            and self._idle_from_completed.get(terminal_id, False)
+        )
+        if completed_to_idle:
+            self._idle_from_completed[terminal_id] = True
+        else:
+            self._idle_from_completed.pop(terminal_id, None)
+            if not returning_to_completed:
+                self._status_generation[terminal_id] = self._output_generation.get(terminal_id, 0)
         if detected == TerminalStatus.PROCESSING:
             self._allow_processing_revert[terminal_id] = False
         elif detected in _STICKY_READY_STATUSES and last not in _STICKY_READY_STATUSES:
@@ -716,6 +804,84 @@ class StatusMonitor:
             except RuntimeError:
                 pass  # loop already closed during shutdown — the timer is moot
 
+    def output_generation(self, terminal_id: str) -> int:
+        """Return the terminal's current OUTPUT generation.
+
+        Advances in exactly one place: ``_process_chunk``, when a chunk of output
+        from the terminal lands. It does NOT advance in ``notify_input_sent``, so
+        a value strictly greater than one sampled at a dispatch boundary means the
+        terminal emitted output after that boundary; in particular a redelivery's
+        own arm cannot make it read that way.
+
+        What that does and does not prove: it proves the FIFO reader delivered a
+        chunk after the sample, not that the chunk belongs to the dispatched task.
+        A late startup frame (spinner redraw, MCP startup line) landing after the
+        sample but before the pasted keys reach the pane counts too. That is the
+        same approximation the rolling-buffer status detection already makes --
+        it parses whatever bytes have landed since the clear -- and it is the
+        conservative side of the previous defect, where a real completion was
+        rejected. Callers gate a started STATUS on this; they do not treat the
+        counter alone as completion evidence.
+
+        This exists because a status VALUE cannot carry recency information.
+        ``notify_input_sent`` deliberately leaves ``_last_status`` alone while
+        arming the revert, so a ready status cached BEFORE a send is
+        indistinguishable from one earned after it — the defect PR #566 hit when
+        a pre-dispatch COMPLETED satisfied delivery confirmation instantly.
+
+        The boundary must be sampled INSIDE the send, after the monitor is armed
+        and the rolling buffer cleared but before any key reaches the pane (see
+        ``terminal_service.dispatch_input``). Sampling after the send returns is
+        too late: ``send_keys`` includes the provider's submit delay, during which
+        a fast worker can emit and complete, and those chunks would then sit
+        inside the baseline -- a genuine completion would read as pre-dispatch
+        and the worker would be resubmitted to and finally torn down.
+
+        Read-only and lock-guarded. Returns 0 for an unknown terminal, which is
+        below any real generation and so never reads as "something happened".
+
+        NOT meaningful for event-inbox backends (herdr): they start no FIFO
+        reader, so ``_process_chunk`` never runs and this never advances.
+        ``get_status`` derives their status on demand instead, which is why they
+        have no staleness problem to solve and callers must not gate on this for
+        them.
+        """
+        with self._lock:
+            return self._output_generation.get(terminal_id, 0)
+
+    def status_observation(self, terminal_id: str) -> "StatusObservation":
+        """Return the terminal's applied status together with the output generation it was earned at.
+
+        ``get_status`` answers *what* the status is; this answers *what output it
+        came from*. The pair is what a caller needs to decide whether a status is
+        evidence for a particular dispatch: a status counts for a send only when
+        its own ``output_generation`` is strictly greater than the generation
+        sampled at that send's dispatch boundary (``dispatch_input``). Reading
+        ``get_status()`` and ``output_generation()`` separately cannot establish
+        that -- a COMPLETED latched from provider startup stays cached while an
+        unrelated spinner redraw advances the counter, and the two reads then
+        pair a pre-dispatch value with post-dispatch output (PR #566, round 9).
+
+        Runs ``get_status`` first so the cached-PROCESSING fresh re-detections it
+        performs are applied (and stamped) before the pair is read under the
+        lock. The observation reports the APPLIED value: when a fresh detection
+        is refused by the sticky latch, the applied status, not the refused one,
+        is what every other reader sees, and it is the conservative choice here.
+
+        Event-inbox backends (herdr) derive status on demand and never advance
+        the output generation; for them the generation is reported as ``None``
+        and callers must judge recency another way (see
+        ``terminal_service._wait_for_post_dispatch_start``).
+        """
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        status = self.get_status(terminal_id)
+        if get_backend().supports_event_inbox():
+            return StatusObservation(status, None)
+        with self._lock:
+            applied = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            return StatusObservation(applied, self._status_generation.get(terminal_id, 0))
+
     def notify_input_sent(self, terminal_id: str, *, assume_processing: bool = False) -> None:
         """Arm the next PROCESSING transition.
 
@@ -736,6 +902,16 @@ class StatusMonitor:
             self._pending_stale_capture.pop(terminal_id, None)
             self._confirmed_stale_capture_commit.pop(terminal_id, None)
             self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
+            # ``_idle_from_completed`` is deliberately NOT cleared here. The marker
+            # says the current IDLE is a previous COMPLETED with its box scrolled
+            # off, and arming does not change what is on screen. Clearing it on
+            # every arm made the flap guard cover only the first attempt: after a
+            # swallowed Enter the deferred path re-sends the task, that re-send
+            # arms again, and a repaint of the startup completion box then
+            # re-stamped the old COMPLETED past the redelivery's boundary and
+            # confirmed a task that never ran. Any stamped transition still
+            # clears it, and a post-init IDLE never carries it, so a fresh
+            # worker's first IDLE -> COMPLETED is still earned.
         if assume_processing:
             # Optimistic dispatch latch only; this is not provider evidence and
             # must not authorize stale-pane recovery for the new generation.
@@ -797,6 +973,9 @@ class StatusMonitor:
             self._pending_stale_capture.pop(terminal_id, None)
             self._confirmed_stale_capture_commit.pop(terminal_id, None)
             self._capture_generation.pop(terminal_id, None)
+            self._output_generation.pop(terminal_id, None)
+            self._status_generation.pop(terminal_id, None)
+            self._idle_from_completed.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
@@ -824,6 +1003,9 @@ class StatusMonitor:
             self._pending_stale_capture.pop(terminal_id, None)
             self._confirmed_stale_capture_commit.pop(terminal_id, None)
             self._capture_generation.pop(terminal_id, None)
+            self._output_generation.pop(terminal_id, None)
+            self._status_generation.pop(terminal_id, None)
+            self._idle_from_completed.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 

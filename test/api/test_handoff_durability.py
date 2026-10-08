@@ -18,6 +18,7 @@ from cli_agent_orchestrator.models.terminal import (
 from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.services.agent_step import StepExecutionError
+from cli_agent_orchestrator.services.ephemeral_service import EphemeralPolicyError
 from cli_agent_orchestrator.services.install_service import KiroAgentPathError
 from cli_agent_orchestrator.services.worktree_service import WorktreeError
 
@@ -166,6 +167,7 @@ class TestRunStepDurabilityErrorBranches:
             ),
             (TerminalLimitError("node is at CAO_MAX_TERMINALS"), 429, "CAO_MAX_TERMINALS"),
             (WorktreeError("not a git repository"), 400, "not a git repository"),
+            (EphemeralPolicyError("not_owner"), 400, "not_owner"),
         ],
         ids=[
             "output_extraction",
@@ -173,6 +175,7 @@ class TestRunStepDurabilityErrorBranches:
             "kiro_agent_path",
             "terminal_limit",
             "worktree",
+            "ephemeral_policy",
         ],
     )
     def test_settled_failure_arms_persist_error_state(self, client, exc, expected_status, fragment):

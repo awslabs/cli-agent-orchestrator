@@ -47,7 +47,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
@@ -147,6 +147,7 @@ from cli_agent_orchestrator.services.cleanup_service import (
     cleanup_old_data,
 )
 from cli_agent_orchestrator.services.config_service import ConfigService
+from cli_agent_orchestrator.services.ephemeral_service import EphemeralPolicyError
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.event_log_service import RING_CAPACITY
 from cli_agent_orchestrator.services.event_primitives import KINDS as EVENT_KINDS
@@ -601,6 +602,8 @@ class RunStepRequest(BaseModel):
             raise ValueError("CAO_WORKFLOW_GENERATION requires CAO_WORKFLOW_RUN_ID (required pair)")
         if "CAO_WORKFLOW_STEP_ID" in keys and not has_run:
             raise ValueError("CAO_WORKFLOW_STEP_ID requires CAO_WORKFLOW_RUN_ID")
+        if self.claim_id is not None and self.reuse_terminal_id:
+            raise ValueError("claim_id cannot be used with reuse_terminal_id")
         if self.env_vars and self.reuse_terminal_id:
             # run_agent_step documents env injection as ignored on reused
             # terminals — a silently dropped RUN_ID/GENERATION fence token is
@@ -626,14 +629,16 @@ class RunStepRequest(BaseModel):
         ),
     )
 
-    @field_validator("job_id")
+    claim_id: Optional[str] = None
+
+    @field_validator("job_id", "claim_id")
     @classmethod
-    def _validate_job_id(cls, v: Optional[str]) -> Optional[str]:
+    def _validate_job_id(cls, v: Optional[str], info: ValidationInfo) -> Optional[str]:
         if v is None:
             return v
         if not re.fullmatch(r"[0-9a-f]{32}", v):
             raise ValueError(
-                "job_id must be a 32-character lowercase hex string (e.g. uuid4().hex)"
+                f"{info.field_name} must be a 32-character lowercase hex string (e.g. uuid4().hex)"
             )
         return v
 
@@ -1304,11 +1309,24 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("OTel telemetry init failed; continuing", exc_info=True)
     init_db()
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    agent_profiles.warn_reserved_installed_profiles()
     # Deferred-init tasks are process-local.  Recover any external-owner rows
     # left pending by a prior cao-server crash/restart into durable ERROR before
     # background cleanup can mistake them for ordinary ghosts.
     deferred_init_recovery_task: Optional[asyncio.Task] = None
     recovery_complete = await terminal_service.recover_interrupted_deferred_init_external_owners()
+    # Likewise for the initial message a deferred-init terminal was created with:
+    # a row still ``pending`` belongs to a task the previous process owned, so
+    # settle it as failed/interrupted before any client can wait on it (#566).
+    initial_delivery_recovery_complete = (
+        await terminal_service.recover_interrupted_initial_deliveries()
+    )
+    if not initial_delivery_recovery_complete:
+        logger.warning(
+            "Initial-delivery restart sweep was incomplete; stranded pending rows may remain"
+        )
     if not recovery_complete:
         # A transient SQLite/read failure during startup used to strand the
         # missed rows forever. Retry only until one complete scan succeeds.
@@ -2307,6 +2325,78 @@ async def agui_run(
 mount_widget_static(app)
 
 
+def _require_ephemeral_enabled(request: Request) -> Dict[str, Any]:
+    """Gate the opt-in surface before reading an untrusted body."""
+    from cli_agent_orchestrator.services import ephemeral_service
+
+    try:
+        settings = ephemeral_service.read_settings()
+        ephemeral_service.require_enabled(settings)
+        return settings
+    except ephemeral_service.EphemeralPolicyError as exc:
+        ephemeral_service.log_refusal(
+            exc.rule, request.query_params.get("caller_id"), None, exc.detail
+        )
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from None
+
+
+@app.post(
+    "/ephemeral-agents",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(_require_ephemeral_enabled)],
+)
+async def create_ephemeral_agent_endpoint(
+    request: Request,
+    caller_id: Optional[str] = None,
+    settings: Dict[str, Any] = Depends(_require_ephemeral_enabled),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Create an agent spec and files; raw input failures never echo submitted values."""
+    from cli_agent_orchestrator.services import ephemeral_service
+
+    try:
+        try:
+            raw = await request.json()
+        except (ValueError, UnicodeError):
+            error = ephemeral_service.EphemeralPolicyError(
+                "invalid_spec", "body: json_invalid", 422
+            )
+            ephemeral_service.log_refusal(error.rule, caller_id, None, error.detail)
+            raise HTTPException(status_code=422, detail=error.as_detail()) from None
+        return await asyncio.to_thread(
+            ephemeral_service.create_ephemeral_agent, raw, caller_id, settings
+        )
+    except ephemeral_service.EphemeralPolicyError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from None
+
+
+@app.post("/ephemeral-agents/{name}/claim", dependencies=[Depends(_require_ephemeral_enabled)])
+async def claim_ephemeral_agent_endpoint(
+    name: str,
+    request: Request,
+    caller_id: Optional[str] = None,
+    settings: Dict[str, Any] = Depends(_require_ephemeral_enabled),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Claim with a single settings snapshot and redacted body validation."""
+    from cli_agent_orchestrator.services import ephemeral_service
+
+    try:
+        try:
+            raw = await request.json()
+        except (ValueError, UnicodeError):
+            error = ephemeral_service.EphemeralPolicyError(
+                "invalid_request", "body: json_invalid", 422
+            )
+            ephemeral_service.log_refusal(error.rule, caller_id, None, error.detail)
+            raise HTTPException(status_code=422, detail=error.as_detail()) from None
+        return await asyncio.to_thread(
+            ephemeral_service.claim_ephemeral_agent, name, raw, caller_id, settings
+        )
+    except ephemeral_service.EphemeralPolicyError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from None
+
+
 @app.get("/agents/profiles")
 async def list_agent_profiles_endpoint(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
@@ -2579,6 +2669,11 @@ def _validate_profile_for_write(name: str, content: str) -> List[ProfileValidati
 
     def _reject(message: str, findings: Sequence[Any] = ()) -> None:
         raise _profile_write_rejection(message, findings)
+
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    if agent_profiles.routes_to_ephemeral_store(name):
+        _reject(f"Reserved ephemeral profile name: {name}")
 
     # Parsed once here, then handed to validate_frontmatter as metadata.
     # validate_profile_text would parse it again: its docstring exists precisely
@@ -3416,6 +3511,8 @@ async def create_session(
         # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
         # rejection, not a bad request: the caller should retry on another node.
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+    except EphemeralPolicyError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except WorktreeError as e:
@@ -3541,6 +3638,7 @@ async def create_terminal_in_session(
     model: Optional[str] = None,
     use_worktree: bool = False,
     idempotency_key: Optional[str] = None,
+    claim_id: Optional[str] = Query(default=None, pattern=r"^[0-9a-f]{32}$"),
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -3655,6 +3753,7 @@ async def create_terminal_in_session(
             model=model,
             use_worktree=use_worktree,
             idempotency_key=idempotency_key,
+            claim_id=claim_id,
         )
         return result
     except HTTPException:
@@ -3678,6 +3777,8 @@ async def create_terminal_in_session(
         # rejection, not a bad request or a missing session: the caller should
         # retry on another node.
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+    except EphemeralPolicyError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except WorktreeError as e:
@@ -4486,6 +4587,7 @@ async def run_step(
             model=body.model,
             use_worktree=body.use_worktree,
             job_id=job_id,
+            claim_id=body.claim_id,
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure
@@ -4612,6 +4714,10 @@ async def run_step(
         _settle_step(None, str(e))
         await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+    except EphemeralPolicyError as e:
+        _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
+        raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
         await _record_job_state(job_id, "error", error_message=str(e))

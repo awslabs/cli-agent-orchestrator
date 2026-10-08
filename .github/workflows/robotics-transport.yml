@@ -1,0 +1,39 @@
+name: Robotics transport example
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'examples/robotics/cross-zone-transport/**'
+      - 'src/cli_agent_orchestrator/schemas/agent_profile.schema.json'
+      - '.github/workflows/robotics-transport.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'examples/robotics/cross-zone-transport/**'
+      - 'src/cli_agent_orchestrator/schemas/agent_profile.schema.json'
+      - '.github/workflows/robotics-transport.yml'
+
+permissions:
+  contents: read
+
+env:
+  UV_LOCKED: "1"
+
+jobs:
+  simulator:
+    name: Transport simulator
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "examples/robotics/cross-zone-transport/uv.lock"
+      - name: Run measured simulation and MCP boundary tests
+        working-directory: examples/robotics/cross-zone-transport
+        run: uv run --locked --python "${{ matrix.python-version }}" pytest
