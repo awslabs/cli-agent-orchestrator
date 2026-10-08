@@ -27,11 +27,11 @@ The agent instructions are in [`prompts/`](prompts/). The agent profiles are
 not in this directory. `demo.py prepare` generates them for each run. Each
 profile contains the path to a private credential file for that run.
 
-| Agent | Generated profile | Instructions | CAO delegation | Simulator access |
+| Agent | Generated profile | Instructions | CAO delegation grant | Simulator access |
 | --- | --- | --- | --- | --- |
-| Supervisor | `transport_supervisor_<id>` | [`prompts/supervisor.md`](prompts/supervisor.md) | `@cao-mcp-server` (the instructions use `handoff`) | Read-only: `observe` |
-| Zone worker, one for each zone | `transport_zone_<id>` | [`prompts/zone.md`](prompts/zone.md) | None | Own zone only: `observe`, `move`, `offer_handoff`, `accept_handoff` |
-| Checker | `transport_checker_<id>` | [`prompts/checker.md`](prompts/checker.md) | None | Read-only: `observe` |
+| Supervisor | `transport_supervisor_<id>` | [`prompts/supervisor.md`](prompts/supervisor.md) | `@cao-mcp-server`. The instructions use `handoff`. | Read-only: `observe` |
+| Zone worker, one for each zone | `transport_zone_<id>` | [`prompts/zone.md`](prompts/zone.md) | None. CAO refuses its `assign` and `handoff` calls. | Own zone only: `observe`, `move`, `offer_handoff`, `accept_handoff` |
+| Checker | `transport_checker_<id>` | [`prompts/checker.md`](prompts/checker.md) | None. CAO refuses its `assign` and `handoff` calls. | Read-only: `observe` |
 
 With `site.json`, a run has four agents: the supervisor, the `west` zone
 worker, the `east` zone worker, and the checker. With `return-site.json`, the
@@ -44,10 +44,12 @@ What each agent does:
   Reports the evidence of each worker. It cannot move a robot.
 - **Zone worker.** Operates only its own zone. Selects a capable robot. Moves
   the payload and measures the arrival. Offers custody at the dock, or accepts
-  an offer. It cannot delegate, use a shell, or read files.
+  an offer. The provider blocks its shell and file tools. CAO refuses its
+  `assign` and `handoff` calls.
 - **Checker.** Reads fresh state. Compares the measured poses, the owner, and
-  the command records with the original request. It cannot move a robot,
-  change custody, stop the run, or delegate.
+  the command records with the original request. Its credential cannot move a
+  robot, change custody, or stop the run. CAO refuses its `assign` and
+  `handoff` calls.
 
 All zone workers use the same instructions. Each generated profile adds run
 bindings that set `your_zone`. The credential of the worker also sets its zone
@@ -116,9 +118,21 @@ Zone worker for `west`:
 ---
 ```
 
-The zone worker has no `cao-mcp-server`, so it cannot delegate. The checker
-profile has the same form as the zone worker profile. Its description ends
-with `checker`, and its credential file is `checker.json`.
+The zone worker profile does not grant `@cao-mcp-server`. Thus CAO refuses
+its `assign` and `handoff` calls, with this result:
+`'assign' is not permitted: the calling terminal's allowed tools do not include '@cao-mcp-server'`.
+The checker profile has the same form as the zone worker profile. Its
+description ends with `checker`, and its credential file is `checker.json`.
+
+The two providers give the worker different MCP servers:
+
+| Provider | MCP servers of a zone worker or the checker | Can call `send_message` |
+| --- | --- | --- |
+| GitHub Copilot CLI | `transport-sim`, plus `cao-mcp-server`. CAO adds `cao-mcp-server` to each Copilot terminal. Copilot also adds its built-in `github-mcp-server`. | Yes. CAO does not gate `send_message`. |
+| Claude Code | `transport-sim` only. CAO starts Claude Code with `--strict-mcp-config` and the servers of the profile. | No |
+
+The instructions of the zone workers and the checker tell them to return their
+evidence to the `handoff` caller. They do not tell them to send messages.
 
 After the frontmatter, each profile contains the instructions from `prompts/`
 and then the run bindings. These are the bindings of the `west` zone worker:
@@ -201,22 +215,45 @@ For `site.json`, a successful run has this sequence:
 ### Why handoff and not assign
 
 The [assign example](../../assign/README.md) uses `assign` and `handoff`
-together. This example uses only `handoff`, for these reasons:
+together. The two tools return the result of a worker in different ways:
+
+| Tool | Return of the result |
+| --- | --- |
+| `handoff` | The call blocks until the worker finishes. CAO reads the last response of the worker from its terminal and returns it as the result of the call. The worker needs no CAO tool. |
+| `assign` | The call returns immediately. CAO adds this line to the task: `[Assigned by terminal <id>. When done, send results back to terminal <id> using send_message]`. The worker must call `send_message`. CAO queues the message in the inbox of the supervisor and delivers it when the supervisor is idle. |
+
+This example uses only `handoff`, for these reasons:
 
 - Each step needs the result of the step before it. The east zone worker can
   accept custody only after the west zone worker offers it at the dock. The
-  checker can check only after the last leg.
-- `assign` returns before the worker finishes. The worker must then send its
-  result with `send_message`. The zone workers and the checker have no CAO
-  tools, so they cannot send messages.
-- To give a worker `send_message`, you must add `@cao-mcp-server` to its
-  profile. That grant applies to the full server. It also lets the worker call
-  `assign` and `handoff`. Then the supervisor is not the only agent that can
-  delegate. See [Tool restrictions](../../../docs/tool-restrictions.md).
+  checker can check only after the last leg. Parallel work gives no benefit.
+- With Claude Code, the zone workers and the checker have no `cao-mcp-server`.
+  Thus they cannot call `send_message`, and `assign` cannot get their results.
+- With Copilot CLI, the workers can call `send_message`. Thus `assign` can
+  work with Copilot CLI. But the run then needs two more steps. Each worker
+  must send its result. Then CAO must deliver the result to the inbox of the
+  supervisor. `handoff` does not need these steps.
+- A known issue affects the inbox step with Copilot CLI. The test used CAO
+  2.5.3 and Copilot CLI 1.0.93. A Copilot terminal stayed `processing` after
+  a turn that CAO delivered from the inbox or with `cao launch`. While a
+  terminal is `processing`, CAO keeps its inbox messages `pending`. In the
+  same test, a Claude Code terminal returned to `completed` and received the
+  next inbox message.
+
+To use `assign` with Claude Code, do these changes:
+
+1. In the profile of each worker, add `cao-mcp-server` to `mcpServers`. CAO
+   does not gate `send_message`, so the worker can then send its result. CAO
+   still refuses `assign` and `handoff` from the worker.
+2. Do not add `@cao-mcp-server` to `allowedTools`. That grant also lets the
+   worker call `assign` and `handoff`.
+3. Change the instructions in `prompts/`. The supervisor must use `assign`,
+   and the workers must send their results with `send_message`.
+
+See [Tool restrictions](../../../docs/tool-restrictions.md).
 
 `assign` is useful for independent work, for example two payloads that never
-share a dock. For that change, the workers also need `send_message`, with the
-tradeoff above. This example has one payload, so it uses only `handoff`.
+share a dock. This example has one payload, so it uses only `handoff`.
 
 ## Requirements
 
@@ -419,9 +456,14 @@ Use one or more of these views:
 CAO can remove a worker window after its handoff finishes. The controller keeps
 the command records of that worker.
 
-The supervisor status in CAO can show `processing` after the supervisor gives
-its final answer. To know if the transport is complete, use the controller
-state in Step 8.
+The supervisor status in CAO can be wrong during this demo:
+
+- With Copilot CLI, it can stay `processing` after the supervisor gives its
+  final answer.
+- With Claude Code, it can show `completed` while the supervisor still works.
+
+To know if the transport is complete, use the controller state in Step 8. To
+know if the supervisor finished, read its final answer in its window.
 
 ### Step 8. Check the result
 
@@ -442,7 +484,9 @@ For `site.json`, a successful run shows these values:
 | `commands` | The two `move` commands, the `offer`, and the `accept` have `"status": "finished"` |
 
 The final answer of the supervisor names each worker, each leg, the custody
-acceptance, and the evidence of the checker.
+acceptance, and the evidence of the checker. The answer can report that CAO truncated the text from a worker. This does not
+change the result, because the supervisor and the checker use the measured
+state from `observe`.
 
 A successful tool call or test run does not prove a multi-agent run. Make sure
 that each zone worker and the checker did their part.
@@ -582,8 +626,13 @@ transport. Prepare a new run and try again.
 - The credential sets the access of each agent. A tool argument or a prompt
   cannot give an agent more access. The supervisor and the checker have
   read-only credentials.
-- Only the supervisor can delegate. The zone workers and the checker have no
-  CAO tools and no shell or file-system tools.
+- Only the supervisor can delegate. CAO checks the profile grant of the
+  caller. It refuses `assign`, `handoff`, and workflow runs from the zone
+  workers and the checker.
+- The provider blocks the shell and file tools of the zone workers and the
+  checker. With Copilot CLI, they can still call `send_message`. CAO adds
+  `cao-mcp-server` to each Copilot terminal, and CAO does not gate
+  `send_message`.
 - The tokens do not appear in output, profile text, or process arguments. Each
   stdio connection reads only its own credential file.
 - The controller uses the FastMCP static-token verifier. Use it only for this
