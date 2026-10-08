@@ -9,6 +9,7 @@ backend fails the test if anything touches it.
 """
 
 import asyncio
+import json
 import socket
 import threading
 import time
@@ -151,6 +152,33 @@ class TestHandshake:
             with pytest.raises(WebSocketDisconnect) as exc:
                 ws.receive_text()
             assert exc.value.code == 1002
+
+    def test_a_hello_listing_more_terminals_than_allowed_is_refused(self, client, monkeypatch):
+        # One authenticated hello cannot make the server start unbounded work:
+        # it is refused before anything is placed, recorded or deleted.
+        from cli_agent_orchestrator.runtime_channel.protocol import MAX_HELLO_TERMINALS
+
+        cleanups = []
+        monkeypatch.setattr(server_mod, "_delete_unrecorded", lambda conn, t: cleanups.append(t))
+        statuses = {f"{n:08x}": "unknown" for n in range(MAX_HELLO_TERMINALS + 1)}
+        hello = json.dumps(
+            {"kind": "hello", "protocol_version": PROTOCOL_VERSION, "runtime_id": "rt-1",
+             "statuses": statuses}
+        )  # fmt: skip
+        with client.websocket_connect("/runtime/channel", headers=WS_HEADERS) as ws:
+            ws.send_text(hello)
+            with pytest.raises(WebSocketDisconnect) as exc:
+                ws.receive_text()
+        assert exc.value.code == 1002
+        assert cleanups == [], "no cleanup was started for an oversized hello"
+        assert registry_mod.runtime_registry.connection("rt-1") is None
+
+    def test_a_hello_at_the_limit_is_a_valid_frame(self):
+        from cli_agent_orchestrator.runtime_channel.protocol import MAX_HELLO_TERMINALS
+
+        statuses = {f"{n:08x}": "unknown" for n in range(MAX_HELLO_TERMINALS)}
+        frame = decode(_hello(statuses=statuses))
+        assert isinstance(frame, Hello) and len(frame.statuses) == MAX_HELLO_TERMINALS
 
     def test_hello_places_the_runtimes_terminals_and_restores_their_status(self, client):
         _remote_row("abcd1234", "rt-1")

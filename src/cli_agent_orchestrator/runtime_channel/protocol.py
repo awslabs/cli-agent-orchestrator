@@ -35,6 +35,12 @@ class CommandType(str, Enum):
 #: most 128 characters. A Kubernetes pod name fits.
 RUNTIME_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 
+#: The most terminals one hello may list. Each is a provider CLI the runtime
+#: runs, so a real runtime lists far fewer; the bound keeps one authenticated
+#: hello from making the server start unbounded work (one cleanup per
+#: terminal it has no record of). A hello listing more is refused.
+MAX_HELLO_TERMINALS = 1024
+
 
 class Hello(BaseModel):
     """First frame in each direction.
@@ -46,7 +52,9 @@ class Hello(BaseModel):
     kind: Literal["hello"] = "hello"
     protocol_version: int
     runtime_id: str = Field(pattern=RUNTIME_ID_PATTERN)
-    statuses: Dict[str, TerminalStatus] = Field(default_factory=dict)
+    statuses: Dict[str, TerminalStatus] = Field(
+        default_factory=dict, max_length=MAX_HELLO_TERMINALS
+    )
 
 
 class Command(BaseModel):
