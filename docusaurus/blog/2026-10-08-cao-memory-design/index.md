@@ -5,8 +5,6 @@ tags: [deep-dive]
 description: How CAO gives agents one shared memory layer across sessions, models, and CLI providers.
 ---
 
-Everything below was run against CAO `v2.5.1`.
-
 With Agentic context engineering, how an agent uses memory is critical in many aspects. It helps you
 increase code quality, be more token efficient, and keep consistency across a long-running session or
 session handoff.
@@ -23,13 +21,14 @@ in the CAO UI and in Obsidian.
 
 CAO gives every supported agent the same memory tools. An agent can remember a fact with one
 CLI provider and recall it later with another. The memory belongs to CAO, not to a specific
-model or CLI. CAO gives every agent one shared memory layer that works across sessions,
-models, and CLI providers, so your context (and code quality) survives handoffs.
+model or CLI, so your context (and code quality) survives handoffs.
 
 This post explains how that shared layer works. For commands and configuration, see the
 [original CAO memory reference](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/memory.md).
 
 {/* truncate */}
+
+Everything below was run against CAO `v2.5.1`.
 
 ## Why CAO owns memory
 
@@ -190,7 +189,7 @@ other's index updates.
   background compilation. That step calls an LLM to merge repeated entries and link related topics.
 
 So the write path itself never calls an LLM, regardless of compile mode. The agent that
-*calls* `memory_store` may of course be an LLM -- but recording the observation is fixed
+*calls* `memory_store` may of course be an LLM, but recording the observation is fixed
 code, not a model deciding what to persist. An LLM only re-enters afterward, and only in
 `llm` mode, to reorganize an existing topic. That compilation runs after the initial save.
 
@@ -206,7 +205,7 @@ CAO does not run the filesystem write and the SQLite commit in one transaction. 
 independent durability domains: SQLite commits through its own write-ahead log, while a
 Markdown file is published by writing to a temporary file and atomically renaming it into
 place. There is no
-common commit or rollback that spans both -- if the SQLite commit fails after the files are
+common commit or rollback that spans both. If the SQLite commit fails after the files are
 already renamed into place, nothing automatically un-writes those files. CAO owns that gap
 directly rather than pretending it does not exist.
 
@@ -245,9 +244,14 @@ across many sessions. Global, agent, and federated memory are designed to cross 
 session boundaries, so they do not expire. Cleanup runs when `cao-server` starts. It is not
 a continuous sweep.
 
-Scope is not the only thing that controls retention. Two memory types -- `user` and
-`feedback` -- never expire regardless of scope, so a `feedback` lesson saved in `project`
+Scope is not the only thing that controls retention. Two memory types, `user` and
+`feedback`, never expire regardless of scope, so a `feedback` lesson saved in `project`
 scope is kept past the 90-day window.
+
+The `federated` scope is machine-wide and shared, so it is credential-gated: a federated
+write whose content matches a known secret pattern is rejected before anything is stored,
+and only the matched pattern name is logged, never the content. This mirrors the credential
+hygiene CAO already applies to remote URLs and Obsidian export.
 
 Project, session, and agent scopes need an identity. CAO rejects the write if it cannot
 resolve that identity. It never falls back to a wider scope.
@@ -350,7 +354,8 @@ step of the loop.
 
 ![CAO's supervisor-guided learning loop](./learning-loop.svg)
 
-The flow has five steps:
+The flow has five steps. The first four form the supervisor loop in the diagram; recall
+(step 5) happens later, which is why the diagram draws it as a separate step outside the loop.
 
 1. A supervisor records an outcome after validation. The record contains success, an
    optional score, and short friction notes. It does not contain a transcript.
@@ -379,7 +384,7 @@ it. These sections cover the tradeoffs and the ways to move or inspect memory ou
 ### Costs and savings
 
 A good memory pays for itself by replacing repeated work: the agent skips another code search,
-document read, web search, or round-trip to you -- saving tool calls, tokens, and time.
+document read, web search, or round-trip to you, saving tool calls, tokens, and time.
 
 Memory also has costs:
 
@@ -435,5 +440,5 @@ useful and controlled across sessions, models, and CLI providers.
 
 Stan Fan (`fanhongy`) is a Solutions Architect at AWS. He works with teams on agentic
 systems and developer tooling, with a particular interest in how agents accumulate and reuse
-context reliably across sessions, models, and tools -- without turning memory into an
+context reliably across sessions, models, and tools, without turning memory into an
 unbounded transcript.

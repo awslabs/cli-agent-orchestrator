@@ -61,18 +61,18 @@
     <text class="note" x="575" y="297" text-anchor="middle">CAO remains authoritative; edits in the exported vault do not sync back.</text>
   </g>
 
-  <g id="pr674-vault-source-lane">
+  <g id="canonical-vault-lane">
     <rect x="55" y="346" width="1090" height="300" rx="20" fill="#fffbeb" stroke="#fbbf24" stroke-width="2"/>
     <rect x="78" y="364" width="150" height="28" rx="14" fill="#d97706"/>
     <text x="153" y="383" text-anchor="middle" style="font:700 12px system-ui,sans-serif;fill:#fff">CANONICAL VAULT</text>
     <text class="lane-title" x="224" y="384">Mapped vault folders become canonical content</text>
 
-    <g id="pr-memory-api" filter="url(#shadow)">
+    <g id="vault-memory-api" filter="url(#shadow)">
       <rect x="78" y="430" width="190" height="104" rx="14" fill="#fff" stroke="#f59e0b" stroke-width="2"/>
       <text class="box-title" x="173" y="468" text-anchor="middle">Memory API</text>
       <text class="box-copy" x="173" y="493" text-anchor="middle">store · recall · inject</text>
     </g>
-    <g id="pr-scope-binding" filter="url(#shadow)">
+    <g id="vault-scope-binding" filter="url(#shadow)">
       <rect x="342" y="430" width="190" height="104" rx="14" fill="#fff" stroke="#f59e0b" stroke-width="2"/>
       <text class="box-title" x="437" y="468" text-anchor="middle">ScopeBinding</text>
       <text class="box-copy" x="437" y="493" text-anchor="middle">native or mapped vault</text>
