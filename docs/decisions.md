@@ -144,7 +144,9 @@ canonical message, with a key identifier; the hash is never sent to deciders.
 The HMAC key is `decision-hash.key` in the database directory, mode 0600. Creation
 publishes a fully written temporary file with a link that cannot replace an
 existing key. A key file found with group or other access is restricted to 0600
-when it is read; if that fails, the key is not used and no record is written.
+when it is read; if that fails, the key is not used, no record is written and a
+warning names the file. Restrict or remove the file to recover; removing it starts
+a new key, as rotation does.
 Rotation removes the key; the next writer creates a new one and live writers use
 it without restarting. Purged records are deleted. Rotation breaks linkage to
 future records; it cannot revoke keys already copied elsewhere. Rotate with no

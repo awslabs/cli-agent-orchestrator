@@ -51,24 +51,42 @@ def assert_agent_boundary(tools: Sequence[Mapping[str, Any]], base: Mapping[str,
             )
 
 
-def assert_no_decision_imports(source: str, package: str) -> None:
-    """Reject static imports, and dynamic imports of a literal module name.
+def _literal(node: ast.expr | None) -> str | None:
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
 
-    A name computed at runtime is out of scope here; the import-time `sys.modules` check in the
-    boundary test covers what actually loads.
+
+def _dynamic_targets(call: ast.Call, package: str) -> list[str]:
+    func = call.func
+    kind = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+    if kind not in ("import_module", "__import__"):
+        return []
+    keywords = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg}
+    name = _literal(call.args[0] if call.args else keywords.get("name"))
+    if name is None:
+        return []
+    if kind == "import_module" and name.startswith("."):
+        anchor = call.args[1] if len(call.args) > 1 else keywords.get("package")
+        # A non-literal anchor such as `__package__` is the scanned module's own package.
+        name = resolve_name(name, _literal(anchor) or package)
+    targets = [name]
+    fromlist = call.args[3] if len(call.args) > 3 else keywords.get("fromlist")
+    if kind == "__import__" and isinstance(fromlist, (ast.List, ast.Tuple)):
+        targets.extend(f"{name}.{item}" for item in map(_literal, fromlist.elts) if item)
+    return targets
+
+
+def assert_no_decision_imports(source: str, package: str) -> None:
+    """Reject static imports, and dynamic imports whose module name is a string literal.
+
+    Literal names are checked whether they are absolute or relative, positional or passed as
+    `name=`, including `__import__` `fromlist` entries. A name computed at runtime is not caught
+    here, and the boundary test's import-time `sys.modules` check does not see an import inside
+    a function body that has not run.
     """
     for node in ast.walk(ast.parse(source)):
         targets = []
-        if isinstance(node, ast.Call) and node.args:
-            func = node.func
-            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-            first = node.args[0]
-            if (
-                name in ("import_module", "__import__")
-                and isinstance(first, ast.Constant)
-                and isinstance(first.value, str)
-            ):
-                targets.append(first.value)
+        if isinstance(node, ast.Call):
+            targets.extend(_dynamic_targets(node, package))
         elif isinstance(node, ast.Import):
             targets.extend(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):

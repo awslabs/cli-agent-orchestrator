@@ -15,6 +15,10 @@ class InvalidKeyError(OSError):
     """The published hash key does not contain exactly 32 bytes."""
 
 
+class InsecureKeyError(OSError):
+    """The hash key file has group or other access and cannot be restricted to 0600."""
+
+
 def _create_key(path: Path) -> tuple[bytes, KeyStamp] | None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temporary = path.parent / (TEMP_PREFIX + secrets.token_hex(16))
@@ -40,10 +44,13 @@ def _create_key(path: Path) -> tuple[bytes, KeyStamp] | None:
 
 def _restrict(fd: int, path: Path) -> None:
     # Owner-only, like a key created here; a key that cannot be restricted is not used.
-    if hasattr(os, "fchmod"):
-        os.fchmod(fd, 0o600)
-    else:  # pragma: no cover - platforms without fchmod
-        os.chmod(path, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        else:  # pragma: no cover - platforms without fchmod
+            os.chmod(path, 0o600)
+    except OSError as error:
+        raise InsecureKeyError("Decision hash key file cannot be restricted to 0600") from error
 
 
 def _read_key(path: Path) -> tuple[bytes, KeyStamp]:

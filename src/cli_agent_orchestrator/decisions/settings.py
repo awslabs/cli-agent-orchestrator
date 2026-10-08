@@ -242,6 +242,6 @@ def apply_flags(values: list[str]) -> None:
     pairs = [value.partition("=") for value in values]
     for point, sep, state in pairs:
         if not sep or point not in STATE_ENV or state not in STATES:
-            raise ValueError("decision flag must be <point>=off|shadow|on")
+            raise ValueError("decision flag must be <point>=" + "|".join(STATES))
     for point, _, state in pairs:
         os.environ[STATE_ENV[point]] = state

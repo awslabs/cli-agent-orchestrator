@@ -150,19 +150,22 @@ def test_owner_only_key_file_is_not_rechmodded(tmp_path, monkeypatch):
     assert len(KeyCache(path).digest("message")[0]) == 64
 
 
-def test_key_file_that_cannot_be_restricted_is_not_used(setup_engine, tmp_path, monkeypatch):
-    from cli_agent_orchestrator.decisions.hashing import KeyCache
+def test_key_file_that_cannot_be_restricted_is_not_used(
+    setup_engine, tmp_path, monkeypatch, caplog
+):
+    from cli_agent_orchestrator.decisions.hashing import InsecureKeyError, KeyCache
 
     path = tmp_path / "loose.key"
     path.write_bytes(b"k" * 32)
     path.chmod(0o644)
     monkeypatch.setattr(os, "fchmod", Mock(side_effect=PermissionError("not owner")))
-    with pytest.raises(PermissionError):
+    with pytest.raises(InsecureKeyError):
         KeyCache(path).digest("message")
     store = setup_engine[3]
     store._key = KeyCache(path)
     assert store.insert(row_values(), "message") is None
     assert store.list() == []
+    assert "cannot be restricted to 0600; records are not written" in caplog.text
 
 
 def test_key_cleanup_ignores_active_temp(tmp_path):

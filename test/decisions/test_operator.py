@@ -283,6 +283,11 @@ async def test_ops_controls_and_local_record_queries(tmp_path, monkeypatch):
         "importlib.import_module('cli_agent_orchestrator.decisions.engine')",
         "import_module('cli_agent_orchestrator.decisions')",
         "__import__('cli_agent_orchestrator.decisions.settings')",
+        "importlib.import_module('..decisions.engine', __package__)",
+        "importlib.import_module('.decisions', package='cli_agent_orchestrator')",
+        "importlib.import_module(name='cli_agent_orchestrator.decisions')",
+        "__import__('cli_agent_orchestrator', fromlist=['decisions'])",
+        "__import__('cli_agent_orchestrator', None, None, ('decisions',))",
     ],
 )
 def test_ast_guard_catches_all_decision_import_forms(source):
@@ -301,6 +306,8 @@ def test_ast_guard_catches_all_decision_import_forms(source):
         "importlib.import_module(name)",
         "__import__('json')",
         "registry.import_module",
+        "importlib.import_module('..services.terminal_service', __package__)",
+        "__import__('cli_agent_orchestrator', fromlist=['services'])",
     ],
 )
 def test_ast_guard_allows_other_dynamic_imports(source):

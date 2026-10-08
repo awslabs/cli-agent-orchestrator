@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.constants import DB_DIR
 from cli_agent_orchestrator.decisions.hashing import (
+    InsecureKeyError,
     InvalidKeyError,
     KeyCache,
     cleanup_temps,
@@ -60,6 +61,12 @@ class DecisionStore:
         except InvalidKeyError:
             logger.warning(
                 "Decision hash key file %s is invalid; records are not written", self.key_path.name
+            )
+            return None
+        except InsecureKeyError:
+            logger.warning(
+                "Decision hash key file %s cannot be restricted to 0600; records are not written",
+                self.key_path.name,
             )
             return None
         except Exception:
