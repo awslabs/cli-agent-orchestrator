@@ -1987,6 +1987,15 @@ class TestTerminalsSchemaMigration:
         assert columns.count("provider_variant") == 1
         assert columns.count("model") == 1
         assert columns.count("model_honored") == 1
+        # create_all adds new tables to old databases, including decision records.
+        with sqlite3.connect(str(db_file)) as conn:
+            indexes = conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = ?"
+                " AND name NOT LIKE 'sqlite_autoindex%'",
+                ("decision_records",),
+            ).fetchone()[0]
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+        assert "decision_records" in tables and indexes == 3
 
 
 class TestTerminalMetadataRoundTrip:

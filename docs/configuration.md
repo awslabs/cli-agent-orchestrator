@@ -446,6 +446,15 @@ These map to `network.*` / `auth.*` schema paths for documentation purposes, but
 | `CAO_WS_ALLOWED_CLIENTS` | `network.ws_allowed_clients` | comma-separated list |
 | `CAO_WS_ALLOWED_ORIGINS` | `network.ws_allowed_origins` | comma-separated list |
 
+### Launch decisions
+
+`CAO_DECISION_MODEL_ROUTE`, `CAO_DECISION_EFFORT_ROUTE`, `CAO_DECISION_ON_TIMEOUT_MS` and
+`CAO_DECISION_CONFIDENCE_THRESHOLD` are read by the decision settings loader, not through
+`ConfigService`, and override the `decisions` block of `settings.json`. The chain above does not
+apply as written: `cao-server --decision <point>=<state>` sets the matching variable, so the flag
+and the variable are one layer, and the server keeps the values it started with until it restarts.
+See [Launch decisions](decisions.md#settings).
+
 ### Not yet routed through ConfigService
 
 A number of other `CAO_*` variables (runtime/process-identity vars like `CAO_TERMINAL_ID`, `CAO_SESSION_NAME`, `CAO_WORKFLOW_RUN_ID`; provider-tuning vars like `CAO_HERMES_*`, `CAO_AGENTS_DIR`, `CAO_API_HOST`/`CAO_API_PORT`, `CAO_PYTE_STATUS`, `CAO_EAGER_INBOX_DELIVERY`; and `CAO_AUTH_LOCAL_TOKEN`) are still read ad hoc via `os.getenv` at their call sites, mostly in `constants.py`, `mcp_server/server.py`, `security/auth.py`, and the `providers/*` modules. These were deliberately left out of this pass to keep the diff scoped to the two surfaces issue #357 named explicitly (`settings.json` + `config.json`); folding them into the registry is a natural follow-up but not required for config unification.

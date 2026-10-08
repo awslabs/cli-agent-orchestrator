@@ -7,6 +7,7 @@ import click
 from cli_agent_orchestrator.cli.commands.agent import agent
 from cli_agent_orchestrator.cli.commands.agent_plugin import agent_plugin
 from cli_agent_orchestrator.cli.commands.config import config
+from cli_agent_orchestrator.cli.commands.decisions import decisions
 from cli_agent_orchestrator.cli.commands.env import env
 from cli_agent_orchestrator.cli.commands.fleet import fleet
 from cli_agent_orchestrator.cli.commands.info import info
@@ -43,6 +44,7 @@ cli.add_command(agent)
 cli.add_command(profile)
 cli.add_command(launch)
 cli.add_command(config)
+cli.add_command(decisions)
 cli.add_command(init)
 cli.add_command(install)
 cli.add_command(shutdown)
