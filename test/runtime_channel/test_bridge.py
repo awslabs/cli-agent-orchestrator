@@ -760,6 +760,19 @@ class TestConnection:
             await asyncio.wait_for(bridge.run(), 5)
         assert attempts == [1], "it reconnected while still reporting Ready"
 
+    def test_a_readiness_file_it_cannot_write_only_warns(self, tmp_path, caplog):
+        # Fails safe: the runtime reads not Ready while connected, so the
+        # bridge goes on (unlike a file it cannot remove, which fails closed).
+        blocker = tmp_path / "not-a-directory"
+        blocker.write_text("")
+        bridge = Bridge(
+            "ws://server/runtime/channel", "rt-1", "token", ready_file=blocker / "ready"
+        )
+        with caplog.at_level("WARNING"):
+            bridge._mark_ready(True)  # must not raise
+        assert "could not write readiness file" in caplog.text
+        assert not (blocker / "ready").exists()
+
     @pytest.mark.asyncio
     async def test_a_drop_with_a_removable_readiness_file_keeps_reconnecting(
         self, monkeypatch, tmp_path
@@ -943,10 +956,11 @@ class TestStatusForwarding:
         # current once it holds the lock, as _send does, not the one it saw.
         bridge = _bridge()
         bridge._status_of = lambda terminal_id: TerminalStatus.WAITING_USER_ANSWER
-        release = asyncio.Event()
+        release, entered = asyncio.Event(), asyncio.Event()
 
         class Stalled:
             async def send(self, text):
+                entered.set()
                 await release.wait()
                 raise websockets.exceptions.ConnectionClosedError(None, None)
 
@@ -955,9 +969,11 @@ class TestStatusForwarding:
         replacement = FakeServer()
         result = Result(op_id="op-input", ok=True, payload={"success": True})
         sending = asyncio.ensure_future(bridge._send(result))
-        await asyncio.sleep(0.05)  # the send holds the lock, blocked
+        await asyncio.wait_for(entered.wait(), 5)  # the send holds the lock, blocked
         pushing = asyncio.ensure_future(bridge._push_status("abcd1234"))
-        await asyncio.sleep(0.05)  # the push waits for the lock
+        # One loop turn: the push runs up to the send lock and waits there.
+        await asyncio.sleep(0)
+        assert bridge._send_lock.locked() and not pushing.done()
         bridge._ws = replacement  # as serve() installs a replacement's socket
         release.set()
         await asyncio.wait_for(asyncio.gather(sending, pushing), 5)

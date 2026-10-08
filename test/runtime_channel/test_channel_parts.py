@@ -291,6 +291,38 @@ async def test_status_is_unknown_while_the_runtime_is_disconnected():
 
 
 @pytest.mark.asyncio
+async def test_latest_is_the_newest_connection_whether_or_not_its_hello_is_over():
+    registry = RuntimeRegistry()
+    assert registry.latest("rt-1") is None
+    first = _FakeRuntime(registry)  # activated, as after the server's hello
+    assert registry.latest("rt-1") is first.conn
+
+    async def send_text(text):
+        return None
+
+    newer = registry.register("rt-1", send_text)  # its hello is not over yet
+    assert registry.connection("rt-1") is None, "not callable before its hello"
+    assert registry.latest("rt-1") is newer
+    assert registry.latest("rt-2") is None
+    registry.unregister("rt-1", first.conn)  # the replaced one: no effect
+    assert registry.latest("rt-1") is newer
+    registry.unregister("rt-1", newer)
+    assert registry.latest("rt-1") is None
+
+
+@pytest.mark.asyncio
+async def test_is_reserved_holds_only_while_that_runtimes_launch_is_being_recorded():
+    registry = RuntimeRegistry()
+    assert not registry.is_reserved("t1", "rt-1")
+    registry.reserve("t1", "rt-1")
+    assert registry.is_reserved("t1", "rt-1")
+    assert not registry.is_reserved("t1", "rt-2"), "per runtime"
+    assert not registry.is_reserved("t2", "rt-1"), "per terminal"
+    registry.release("t1", "rt-1")
+    assert not registry.is_reserved("t1", "rt-1")
+
+
+@pytest.mark.asyncio
 async def test_letting_go_of_the_current_connection_names_the_runtimes_terminals():
     # Their status reads unknown from then on, and the server publishes that.
     # A connection a newer one replaced names none: the newer one reports them.
