@@ -73,6 +73,8 @@ def _command(type_, terminal_id="abcd1234", session=None, **payload):
 class TestExecute:
     @pytest.mark.asyncio
     async def test_launch_starts_a_local_terminal_and_reports_plain_fields(self, monkeypatch):
+        import cli_agent_orchestrator.clients.database as database
+
         calls = {}
 
         async def create_terminal(**kwargs):
@@ -80,6 +82,13 @@ class TestExecute:
             return SimpleNamespace(id="beef0001")
 
         monkeypatch.setattr(terminal_service, "create_terminal", create_terminal)
+        # The runtime's own row: create_terminal records the directory it
+        # resolved there (its cwd, for an omitted one).
+        monkeypatch.setattr(
+            database,
+            "get_terminal_metadata",
+            lambda tid: {"id": tid, "working_directory": "/home/cao/workspace"},
+        )
         monkeypatch.setattr(
             terminal_service,
             "get_terminal",
@@ -118,6 +127,8 @@ class TestExecute:
                 # The launch model and whether the provider applies it (#856).
                 "model": "model-x",
                 "model_honored": True,
+                # Where it launched, as the runtime recorded it (not the request).
+                "working_directory": "/home/cao/workspace",
             }
         }
 

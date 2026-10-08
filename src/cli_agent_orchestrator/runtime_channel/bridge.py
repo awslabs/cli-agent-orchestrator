@@ -269,7 +269,12 @@ class Bridge:
             )
             try:
                 local = await asyncio.to_thread(terminal_service.get_terminal, terminal.id)
-                return {"terminal": _jsonable(local)}
+                reported = _jsonable(local)
+                # Where it launched, as this runtime resolved it (its own cwd
+                # for an omitted directory): the central row records this.
+                row = await asyncio.to_thread(get_terminal_metadata, terminal.id)
+                reported["working_directory"] = (row or {}).get("working_directory")
+                return {"terminal": reported}
             except Exception as exc:
                 # The agent runs but the server would never learn of it: stop it.
                 stopped = False

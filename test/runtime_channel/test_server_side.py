@@ -2282,6 +2282,34 @@ class TestLaunchMetadata:
         row = database.get_terminal_metadata("beef0001")
         assert (row["model"], row["model_honored"]) == (None, None)
 
+    @pytest.mark.parametrize("requested", [None, "repo"])
+    def test_the_row_records_the_working_directory_the_runtime_resolved(
+        self, http, start_runtime, requested
+    ):
+        # Omitted, the runtime launches in its own cwd; relative, it resolves
+        # the path in the runtime. The central row records what it launched in.
+        launched = {**LAUNCHED, "working_directory": "/home/cao/workspace/repo"}
+        start_runtime(script=lambda command: {"terminal": dict(launched)})
+        body = {"agent_profile": "developer"}
+        if requested is not None:
+            body["working_directory"] = requested
+        response = http.post("/runtimes/rt-1/terminals", json=body)
+        assert response.status_code == 201, response.text
+        row = database.get_terminal_metadata("beef0001")
+        assert row["working_directory"] == "/home/cao/workspace/repo"
+
+    def test_a_runtime_that_reports_no_working_directory_keeps_the_requested_one(
+        self, http, start_runtime
+    ):
+        # A cao-bridge from before this field: the request's, as before.
+        start_runtime(script=lambda command: {"terminal": dict(LAUNCHED)})
+        response = http.post(
+            "/runtimes/rt-1/terminals",
+            json={"agent_profile": "developer", "working_directory": "/work/repo"},
+        )
+        assert response.status_code == 201, response.text
+        assert database.get_terminal_metadata("beef0001")["working_directory"] == "/work/repo"
+
     def test_the_bridge_reports_the_engine_it_launched_with(self):
         from cli_agent_orchestrator.models.kiro_engine import KiroEngine
         from cli_agent_orchestrator.runtime_channel.bridge import _jsonable

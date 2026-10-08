@@ -434,6 +434,9 @@ class _Launched(BaseModel):
     # it (#856). A cao-bridge from before #856 sends neither: unknown.
     model: Optional[str] = None
     model_honored: Optional[bool] = None
+    # The working directory as the runtime resolved it (its own cwd for an
+    # omitted one). A cao-bridge that sends none: the request's is recorded.
+    working_directory: Optional[str] = None
 
     @field_validator("name", "session_name")
     @classmethod
@@ -588,7 +591,10 @@ async def _finish_launch(
         runtime_registry.seed_status(terminal_id, runtime_id, launched.status, conn=conn)
     try:
         conflict = await asyncio.to_thread(
-            _record_launch, runtime_id, launched, body.working_directory
+            _record_launch,
+            runtime_id,
+            launched,
+            launched.working_directory or body.working_directory,
         )
     except Exception as exc:  # noqa: BLE001
         # The agent is running with no central row: tear it down so nothing is
