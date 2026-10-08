@@ -16,7 +16,7 @@ exactly as before.
 | tmux, provider CLIs, agents | no, for remote terminals; none at all with `CAO_LOCAL_EXECUTION=0` | yes |
 | Status detection | receives it | derives it beside the pane and pushes it |
 | Agent profiles, provider files | no, for remote terminals | yes: resolved from the runtime's own profile store, written by its `create_terminal` |
-| Workspace | no, for remote terminals | yes: a launch's `working_directory` is a path in the runtime |
+| Workspace | no, for remote terminals | yes: a launch's `working_directory` is a path in the runtime; the central row records the directory the runtime resolved |
 | Provider credentials | no, for remote terminals | yes: the runtime's own (in the EKS example, its service account's IAM role) |
 | Terminal logs and output | no, for remote terminals | yes: read on request through the server |
 | Flow pre-scripts, Python workflow scripts | yes, even with `CAO_LOCAL_EXECUTION=0` | no, not in this slice |
@@ -50,7 +50,8 @@ A newer connection from the same runtime replaces
 the older one, which the server then closes and no longer listens to. A
 runtime's hellos are reconciled one at a time: a newer connection's hello
 waits for an older one's, and one replaced while it is being handled drops no
-further record, so the newer hello decides which records stay.
+further record (the newer connection registers only once a drop in progress
+has landed), so the newer hello decides which records stay.
 
 ## Commands
 
@@ -70,11 +71,17 @@ order; different terminals run concurrently.
 
 `GET /terminals/{id}` answers from the status the runtime last pushed. While
 the runtime is disconnected, the status is `unknown`. The server publishes the
-same as `terminal.{id}.status` events, which its status consumers (approval
-prompts, inbox delivery) act on: each status the runtime pushes, `unknown` for
-each of the runtime's terminals when its channel goes, and `unknown` for a
-terminal whose record a hello drops. After a reconnect, the runtime pushes each
-terminal's status again. A connection a newer one replaced publishes nothing.
+same as `terminal.{id}.status` events, which its status consumers (such as
+approval prompts) act on: each status the runtime pushes, and each status a
+hello restores; `unknown` for each of the runtime's terminals when its channel
+goes; and `unknown` for a terminal whose record a hello drops, or cannot drop.
+A connection a newer one replaced publishes nothing.
+
+Each command for a terminal names the session of the central row it was
+routed by, and the runtime acts only on its terminal under that id in that
+session. A command that outlived its terminal therefore never reaches a newer
+terminal reusing the id: a delete of one no longer there succeeds, and any
+other command fails with `502`.
 
 Operations that work only on the server's own panes and logs refuse a remote
 terminal with `409` rather than act on nothing: reusing it in
@@ -140,7 +147,14 @@ retried until the runtime confirms it (see [Commands](#commands)).
 - `cao-bridge` reports Ready through its readiness file
   (`CAO_BRIDGE_READY_FILE`) only while its channel is up. A readiness file it
   cannot remove, at startup or once the channel goes, stops it with an error
-  rather than leave it reporting Ready while disconnected.
+  rather than leave it reporting Ready while disconnected. That is deliberate
+  even for a transient error: its restart removes the file, or refuses to
+  start. An agent in the runtime (the same user) can therefore keep it from
+  starting, as it can with anything else the token is trusted with (below).
+  A readiness file it cannot write only logs a warning: the runtime then
+  reads not Ready while connected.
+- A hello lists at most 1024 terminals; a larger one is refused (close code
+  1002), so one hello cannot make the server start unbounded work.
 - The token is read once from `CAO_RUNTIME_TOKEN_FILE`, or from
   `CAO_RUNTIME_TOKEN`; both are then removed from the process environment.
   When `CAO_RUNTIME_TOKEN_FILE` is set, only the file counts: if it is
@@ -162,8 +176,11 @@ retried until the runtime confirms it (see [Commands](#commands)).
   replaces and closes the other runtime's connection, and the impostor then
   receives the commands for that runtime's terminals and reports their status.
   Its hello also decides which of those terminals the server keeps: one that
-  lists none drops all of their records. Two runtimes configured with the same
-  id do the same to each other.
+  lists none drops all of their records. Dropping a record does not stop the
+  agent in the runtime, but once the genuine runtime reconnects and lists that
+  terminal again, the server has no record of it and deletes it there. So the
+  token lets its holder tear down another runtime's agents. Two runtimes
+  configured with the same id do the same to each other.
   Until per-runtime credentials arrive in a later slice, give the token only
   to runtimes that may act for one another.
 - The runtime token does not protect the HTTP API. Turn on API authentication
@@ -192,11 +209,19 @@ retried until the runtime confirms it (see [Commands](#commands)).
 - The memory context added to a remote terminal's first input is resolved
   in the runtime, not from the server's memory store.
 - A restarted `cao-bridge` process does not re-attach to tmux panes that
-  outlived it, as a restarted `cao-server` does not for its local terminals:
-  their status stays `unknown`, while input, output and delete still work.
-  In the EKS example a restart of `cao-bridge` restarts its container, which
-  takes tmux and those terminals with it: the bridge drops their rows, and the
-  server their records when the restarted bridge says hello.
+  outlived it, as a restarted `cao-server` does not for its local terminals.
+  What follows depends on what the restarted bridge's hello lists:
+  - Its tmux survived, and with it the runtime's rows: the hello lists those
+    terminals, so the server keeps their records. Their status stays
+    `unknown`, while input, output and delete still work.
+  - Its tmux did not (in the EKS example a restart of `cao-bridge` restarts
+    its container, which takes tmux and those terminals with it): the bridge
+    drops their rows, its hello does not list them, and the server drops
+    their records (`404`, and `unknown` is published).
+  - The runtime lost its rows but kept its tmux (its state was removed by
+    hand, say): the hello does not list those terminals either, so the server
+    drops their records, but their agents keep running in the runtime with
+    nothing tracking them. Stop them there.
 
 ## Deploy
 
