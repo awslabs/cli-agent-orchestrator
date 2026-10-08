@@ -195,7 +195,7 @@ class TestHandshake:
         assert database.get_terminal_metadata("abcd1234") is not None
 
     def test_a_lost_terminal_whose_row_cannot_be_dropped_waits_for_the_next_hello(
-        self, http, server, monkeypatch
+        self, http, server, monkeypatch, status_events
     ):
         _remote_row("abcd1234", "rt-1")
 
@@ -208,13 +208,17 @@ class TestHandshake:
             async with _dial(server) as ws:
                 await ws.send(_hello(statuses={}))
                 reply = decode(await asyncio.wait_for(ws.recv(), 5))
-                return reply, runtimes_of(http)
+                # Read while the channel is open: its end publishes unknown too.
+                events = await asyncio.to_thread(status_events.take)
+                return reply, runtimes_of(http), events
 
-        reply, runtimes = asyncio.run(scenario())
+        reply, runtimes, events = asyncio.run(scenario())
         assert isinstance(reply, Hello), "the runtime still connects"
         # Kept, row and routing both, for the next hello to reconcile.
         assert runtimes["rt-1"]["terminals"] == ["abcd1234"]
         assert database.get_terminal_metadata("abcd1234") is not None
+        # It reads unknown, and status consumers are told so.
+        assert events == [("abcd1234", "unknown")]
 
 
 class TestRuntimeNotConnected:
@@ -682,15 +686,17 @@ class TestHandshakeOrdering:
         assert database.get_terminal_metadata("abcd1234") is not None
         assert "runtime channel error" not in caplog.text, "the replaced hello carried on"
 
-    def test_a_newer_hello_waits_for_a_replaced_ones_drop_in_flight(
+    def test_a_newer_connection_registers_only_once_a_drop_in_flight_has_landed(
         self, http, server, isolated, monkeypatch
     ):
         # The older connection's hello lists nothing, so it drops both recorded
         # terminals. Its first drop is in flight when the newer connection,
-        # which runs both, says hello. The older one stops before its next
-        # drop, and the newer hello is handled once it has: the terminal whose
-        # row is gone is deleted in the runtime (it has no record now), and the
-        # other is kept. Neither is left running with a placement and no row.
+        # which runs both, says hello. No drop may straddle that replacement:
+        # the newer connection registers only once the drop in flight has
+        # landed (the older hello decided it while it was the newest), and the
+        # older one then stops before its next drop. The terminal whose row is
+        # gone is deleted in the runtime (it has no record now); the other is
+        # kept. Neither is left running with a placement and no row.
         _remote_row("abcd0001", "rt-1", session="cao-remote1")
         _remote_row("abcd0002", "rt-1", session="cao-remote2")
         deleting, release = threading.Event(), threading.Event()
@@ -710,9 +716,12 @@ class TestHandshakeOrdering:
                 assert await asyncio.to_thread(deleting.wait, 5)
                 async with _dial(server) as new:
                     await new.send(_hello(statuses={"abcd0001": "idle", "abcd0002": "idle"}))
-                    with pytest.raises(websockets.exceptions.ConnectionClosed):
-                        await asyncio.wait_for(old.recv(), 5)  # replaced by the newer one
+                    with pytest.raises(asyncio.TimeoutError):
+                        # Not replaced while its drop is in flight.
+                        await asyncio.wait_for(old.recv(), 0.5)
                     release.set()
+                    with pytest.raises(websockets.exceptions.ConnectionClosed):
+                        await asyncio.wait_for(old.recv(), 5)  # replaced once it has landed
                     await new.recv()  # the server's hello
                     command = await _next_command(new)
                     await new.send(
@@ -1028,12 +1037,14 @@ class TestLaunchAcrossAReconnect:
                     armed.set()
                     async with _dial(server) as third:
                         await third.send(_hello(statuses={"beef0001": "idle"}))
-                        with pytest.raises(websockets.exceptions.ConnectionClosed):
-                            await asyncio.wait_for(second.recv(), 5)  # replaced
-                        # Unfenced, the third hello reads the rows while the drop
-                        # is in flight; fenced, it waits for the drop to finish.
-                        await asyncio.to_thread(third_read.wait, 1)
+                        with pytest.raises(asyncio.TimeoutError):
+                            # The second is not replaced while the drop is in
+                            # flight, and the third reads no rows meanwhile.
+                            await asyncio.wait_for(second.recv(), 0.5)
+                        assert not third_read.is_set(), "the third hello read rows mid-drop"
                         release_drop.set()
+                        with pytest.raises(websockets.exceptions.ConnectionClosed):
+                            await asyncio.wait_for(second.recv(), 5)  # replaced once it landed
                         await third.recv()  # the server's hello
                         command = await _next_command(third)
                         await third.send(
@@ -1046,6 +1057,80 @@ class TestLaunchAcrossAReconnect:
         assert (command.type, command.terminal_id) == (CommandType.DELETE, "beef0001")
         assert database.get_terminal_metadata("beef0001") is None
         assert not registry_mod.runtime_registry.is_placed("beef0001", "rt-1")
+
+    def test_a_launch_lost_to_a_replacement_whose_record_cannot_be_dropped_is_kept(
+        self, http, server, monkeypatch, status_events
+    ):
+        recording, release = threading.Event(), threading.Event()
+        real_record = server_mod._record_launch
+
+        def slow_record(*args, **kwargs):
+            recording.set()
+            release.wait(5)
+            return real_record(*args, **kwargs)
+
+        def locked(*args, **kwargs):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(server_mod, "_record_launch", slow_record)
+        monkeypatch.setattr(terminal_service, "delete_terminal_row", locked)
+
+        async def scenario():
+            async with _dial(server) as old:
+                await old.send(_hello())
+                await old.recv()
+                loop = asyncio.get_running_loop()
+                request = loop.run_in_executor(
+                    None,
+                    lambda: http.post(
+                        "/runtimes/rt-1/terminals", json={"agent_profile": "developer"}
+                    ),
+                )
+                launch = await _next_command(old)
+                await old.send(
+                    encode(
+                        Result(op_id=launch.op_id, ok=True, payload={"terminal": dict(LAUNCHED)})
+                    )
+                )
+                await asyncio.to_thread(recording.wait, 5)
+                async with _dial(server) as new:
+                    await new.send(_hello())  # the new instance runs nothing
+                    await new.recv()
+                    release.set()
+                    response = await asyncio.wait_for(request, 10)
+                    # Read while the channels are open: their end publishes too.
+                    return response, await asyncio.to_thread(status_events.take)
+
+        response, events = asyncio.run(scenario())
+        assert response.status_code == 502, response.text
+        assert "could not be dropped" in response.json()["detail"]
+        assert database.get_terminal_metadata("beef0001") is not None, "kept for the next hello"
+        assert events == [("beef0001", "unknown")]
+
+    @pytest.mark.asyncio
+    async def test_a_launch_drop_superseded_by_a_newer_connection_leaves_it_to_that_hello(
+        self, isolated, monkeypatch
+    ):
+        # Decided for the connection that replaced the launch's own, but a still
+        # newer one registered before the drop: that one's hello decides, so
+        # nothing is dropped and the launch stands.
+        async def send_text(text):
+            return None
+
+        origin = isolated.register("rt-1", send_text)
+        replacement = isolated.register("rt-1", send_text)  # lists nothing
+        real_drop_lost = server_mod._drop_lost
+
+        async def newer_registers_first(runtime_id, terminal_ids, conn):
+            isolated.register("rt-1", send_text)  # closes ``replacement``
+            return await real_drop_lost(runtime_id, terminal_ids, conn)
+
+        monkeypatch.setattr(server_mod, "_drop_lost", newer_registers_first)
+        monkeypatch.setattr(
+            server_mod, "_drop_lost_row", lambda *a: pytest.fail("dropped a record")
+        )
+        assert replacement.listed == set()
+        await server_mod._drop_if_lost_to_a_replacement("rt-1", "beef0001", origin)
 
     def test_an_undo_is_not_confirmed_by_another_instance_of_the_runtime(
         self, http, server, monkeypatch

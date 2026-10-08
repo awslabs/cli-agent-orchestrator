@@ -241,18 +241,35 @@ class RuntimeRegistry:
         self._hello_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = (
             weakref.WeakValueDictionary()
         )
+        # Per runtime id, while in use (see drop_lock).
+        self._drop_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = (
+            weakref.WeakValueDictionary()
+        )
+
+    def _lock_for(
+        self, locks: "weakref.WeakValueDictionary[str, asyncio.Lock]", runtime_id: str
+    ) -> asyncio.Lock:
+        with self._lock:
+            lock = locks.get(runtime_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                locks[runtime_id] = lock
+            return lock
 
     def hello_lock(self, runtime_id: str) -> asyncio.Lock:
         """Held by a hello of ``runtime_id`` while it reconciles the server's
         records with what it lists, and by a launch while it drops a record a
         replacement lost: one at a time, so none acts on rows another is
         changing. A newer connection's hello waits for an older one's."""
-        with self._lock:
-            lock = self._hello_locks.get(runtime_id)
-            if lock is None:
-                lock = asyncio.Lock()
-                self._hello_locks[runtime_id] = lock
-            return lock
+        return self._lock_for(self._hello_locks, runtime_id)
+
+    def drop_lock(self, runtime_id: str) -> asyncio.Lock:
+        """Held across each drop of a record ``runtime_id`` no longer runs, from
+        the check that its connection is still the runtime's to the row write,
+        and by a newer connection of the runtime while it registers. So a newer
+        connection registers only once a drop in flight has landed, and the
+        reconciliation it replaced drops nothing after that."""
+        return self._lock_for(self._drop_locks, runtime_id)
 
     def register(
         self,

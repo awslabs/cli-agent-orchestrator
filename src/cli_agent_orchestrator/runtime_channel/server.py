@@ -10,6 +10,7 @@
 """
 
 import asyncio
+import contextlib
 import hmac
 import logging
 import os
@@ -110,51 +111,76 @@ def _launch_timeout() -> float:
 _TERMINAL_ID = TypeAdapter(TerminalId)
 
 
-def _drop_lost_terminals(
-    runtime_id: str, terminal_ids: List[str], conn: Optional[RuntimeConnection] = None
-) -> List[str]:
-    """Drop the records of terminals ``runtime_id`` no longer runs; return those gone.
+def _drop_lost_row(runtime_id: str, terminal_id: str) -> bool:
+    """Drop one record ``runtime_id`` no longer runs (see ``_drop_lost``).
 
-    Each row goes only while it still names the runtime and its session, so a
-    relaunch of the id elsewhere keeps its own. No plugin event is emitted: as
-    with the server's own sweeps, nothing here tore a terminal down. A row that
-    cannot be dropped now is kept, routing and all, for the next hello. With
-    ``conn``, the connection whose hello decided these drops, none starts once
-    a newer connection has replaced it: that one's hello decides then.
+    True if this dropped it. False if it is no longer a row of this runtime's
+    (gone, or relaunched elsewhere, which keeps its own row). Raises if it
+    could not be dropped: the row is then kept, routing and all, for the next
+    hello. No plugin event is emitted: as with the server's own sweeps,
+    nothing here tore a terminal down.
     """
     from cli_agent_orchestrator.services import terminal_service
 
+    row = get_terminal_metadata(terminal_id)
+    if row is None or row.get("runtime_id") != runtime_id:
+        return False
+    return terminal_service.delete_terminal_row(terminal_id, row, registry=None, routed=True)
+
+
+async def _drop_lost(
+    runtime_id: str, terminal_ids: List[str], conn: RuntimeConnection
+) -> List[str]:
+    """Drop the records of terminals ``runtime_id`` no longer runs, as decided
+    for ``conn``: by its hello, or by a launch on its behalf. Returns those
+    whose placement can go (dropped, or no longer this runtime's row).
+
+    Each drop holds the runtime's drop lock from the check that ``conn`` is
+    still the runtime's connection to the row write, and a newer connection
+    takes that lock to register. So none straddles a replacement: once a
+    newer connection has registered, its hello decides, and nothing more is
+    dropped here. ``unknown`` is published for each record dropped, and for
+    each one that could not be (it reads ``unknown`` now too).
+    """
     gone: List[str] = []
     dropped: List[str] = []
+    kept: List[str] = []
     for terminal_id in terminal_ids:
-        if conn is not None and conn.closed:
-            break
-        try:
-            row = get_terminal_metadata(terminal_id)
-            if row is not None and row.get("runtime_id") == runtime_id:
-                if terminal_service.delete_terminal_row(
-                    terminal_id, row, registry=None, routed=True
-                ):
-                    dropped.append(terminal_id)
-            # Dropped now, or no longer a row of this runtime's: either way the
-            # placement, conditional on the runtime, can go.
-            gone.append(terminal_id)
-        except Exception:  # noqa: BLE001 - kept for the next hello; the channel goes on
-            logger.warning(
-                "could not drop the record of terminal %s, lost on runtime %s",
-                terminal_id,
-                runtime_id,
-                exc_info=True,
+        async with runtime_registry.drop_lock(runtime_id):
+            if conn.closed:
+                break
+            write = asyncio.ensure_future(
+                asyncio.to_thread(_drop_lost_row, runtime_id, terminal_id)
             )
+            try:
+                was_dropped = await asyncio.shield(write)
+            except asyncio.CancelledError:
+                # The server is stopping: hold the lock until the row write
+                # has landed, so it cannot land after a newer registration.
+                with contextlib.suppress(BaseException):
+                    await write
+                raise
+            except Exception:  # noqa: BLE001 - kept for the next hello; the channel goes on
+                logger.warning(
+                    "could not drop the record of terminal %s, lost on runtime %s",
+                    terminal_id,
+                    runtime_id,
+                    exc_info=True,
+                )
+                kept.append(terminal_id)
+                continue
+        if was_dropped:
+            dropped.append(terminal_id)
+        gone.append(terminal_id)
     if dropped:
         logger.warning(
             "runtime %s no longer runs terminal(s) %s: dropped their records",
             runtime_id,
             ", ".join(dropped),
         )
-        # Not for an id that is no longer this runtime's row: a relaunch of it
-        # elsewhere is another terminal, whose status this is not.
-        _publish_unknown(dropped)
+    # Not for an id that is no longer this runtime's row: a relaunch of it
+    # elsewhere is another terminal, whose status this is not.
+    _publish_unknown(dropped + kept)
     return gone
 
 
@@ -282,10 +308,14 @@ async def runtime_channel(ws: WebSocket) -> None:
     async def close_replaced() -> None:
         await ws.close(code=status.WS_1000_NORMAL_CLOSURE, reason="replaced")
 
-    conn = runtime_registry.register(runtime_id, ws.send_text, close_socket=close_replaced)
-    # What the instance behind this connection runs. Set before anything here
-    # awaits, so a launch settling meanwhile can tell whether this one runs it.
-    conn.listed = set(hello.statuses)
+    # Under the runtime's drop lock: never while an older connection's record
+    # drop is in flight (see _drop_lost), which then drops nothing more.
+    async with runtime_registry.drop_lock(runtime_id):
+        conn = runtime_registry.register(runtime_id, ws.send_text, close_socket=close_replaced)
+        # What the instance behind this connection runs. Set before anything
+        # here awaits, so a launch settling meanwhile can tell whether this one
+        # runs it.
+        conn.listed = set(hello.statuses)
     try:
         # One reconciliation at a time per runtime: a newer connection's hello
         # waits for an older one's, which drops no further record once it is
@@ -319,9 +349,7 @@ async def runtime_channel(ws: WebSocket) -> None:
                 and not runtime_registry.is_reserved(terminal_id, runtime_id)
             )
             if lost:
-                for terminal_id in await asyncio.to_thread(
-                    _drop_lost_terminals, runtime_id, lost, conn
-                ):
+                for terminal_id in await _drop_lost(runtime_id, lost, conn):
                     runtime_registry.unplace(terminal_id, runtime_id)
             for terminal_id, reported in hello.statuses.items():
                 runtime_registry.set_status(terminal_id, runtime_id, reported, conn=conn)
@@ -651,7 +679,7 @@ async def _drop_if_lost_to_a_replacement(
         latest = runtime_registry.latest(runtime_id)
         if latest is None or latest is origin or terminal_id in latest.listed:
             return
-        gone = await asyncio.to_thread(_drop_lost_terminals, runtime_id, [terminal_id], latest)
+        gone = await _drop_lost(runtime_id, [terminal_id], latest)
         for dropped in gone:
             runtime_registry.unplace(dropped, runtime_id)
     if not gone and latest.closed:
