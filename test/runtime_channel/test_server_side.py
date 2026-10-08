@@ -368,6 +368,9 @@ class TestRemoteTerminal:
         assert runtime.received[0].payload == {"agent_profile": "developer", "provider": "mock_cli"}
         assert runtime.received[1].payload["message"] == "hi"
         assert runtime.received[3].payload == {"mode": "last"}
+        # Each names the session of the row it was routed by, so a runtime that
+        # reused the id for a newer terminal does not act on that one.
+        assert [c.session_name for c in runtime.received[1:]] == [LAUNCHED["session_name"]] * 5
 
     def test_the_working_directory_comes_from_the_runtime(self, http, start_runtime):
         _remote_row("abcd1234", "rt-1")
@@ -1579,6 +1582,8 @@ class TestSessionNameCollisions:
         assert [(c.type, c.terminal_id) for c in runtime.received][1:] == [
             (CommandType.DELETE, "beef0001")
         ]
+        # Fenced to the terminal the launch reported: not a later launch of the id.
+        assert runtime.received[1].session_name == "cao-beef"
         assert [t["id"] for t in database.list_terminals_by_session("cao-beef")] == ["aaaa0001"]
         assert runtimes_of(http)["rt-1"]["terminals"] == []
 

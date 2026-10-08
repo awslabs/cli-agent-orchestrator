@@ -416,7 +416,10 @@ class _Launched(BaseModel):
 
 
 async def _undo_launch(
-    runtime_id: str, terminal_id: str, origin: Optional[RuntimeConnection]
+    runtime_id: str,
+    terminal_id: str,
+    origin: Optional[RuntimeConnection],
+    session_name: Optional[str] = None,
 ) -> bool:
     """Delete a launched terminal the server will not record. True if it is gone.
 
@@ -426,6 +429,8 @@ async def _undo_launch(
     same runtime id would answer that the terminal is absent while the
     original may still run it; then the outcome is reported unconfirmed, and
     the original's next hello lists the terminal and gets it deleted.
+    ``session_name``, the session the launch result reported, fences the
+    delete to that terminal, not a later launch reusing its id.
 
     If the runtime defers or fails it, the delete is retried in the background
     (see ``_delete_unrecorded``): with no central row, nothing else would.
@@ -443,7 +448,9 @@ async def _undo_launch(
         )
         return False
     try:
-        deleted = await conn.call(CommandType.DELETE, {}, terminal_id=terminal_id)
+        deleted = await conn.call(
+            CommandType.DELETE, {}, terminal_id=terminal_id, session_name=session_name
+        )
         if deleted.get("deleted"):
             return True
     except RemoteRuntimeError as exc:
@@ -559,7 +566,7 @@ async def _finish_launch(
         # The agent is running with no central row: tear it down so nothing is
         # left running that the server cannot see.
         logger.exception("could not record terminal %s from runtime %s", terminal_id, runtime_id)
-        cleaned = await _undo_launch(runtime_id, terminal_id, conn)
+        cleaned = await _undo_launch(runtime_id, terminal_id, conn, launched.session_name)
         detail = f"launched terminal {terminal_id} on runtime {runtime_id} but could not record it"
         if not cleaned:
             detail += "; it may still be running there"
@@ -567,7 +574,7 @@ async def _finish_launch(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=detail
         ) from exc
     if conflict:
-        cleaned = await _undo_launch(runtime_id, terminal_id, conn)
+        cleaned = await _undo_launch(runtime_id, terminal_id, conn, launched.session_name)
         detail = f"runtime {runtime_id} launched terminal {terminal_id}, but {conflict}; " + (
             "it was deleted" if cleaned else "it may still be running there"
         )

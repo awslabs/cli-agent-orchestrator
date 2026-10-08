@@ -54,6 +54,11 @@ class Command(BaseModel):
     op_id: str
     type: CommandType
     terminal_id: Optional[str] = None
+    # The session of the central row the command was routed by. Terminal ids
+    # are reused once a terminal is gone; with its session, a runtime that has
+    # since launched another terminal under the same id does not act on that
+    # one. None where no row names one (an unrecorded terminal's cleanup).
+    session_name: Optional[str] = None
     payload: Dict[str, Any] = Field(default_factory=dict)
 
 

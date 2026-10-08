@@ -289,6 +289,19 @@ class Bridge:
         if not terminal_id:
             raise ValueError(f"{command.type.value} requires a terminal_id")
 
+        if command.session_name is not None:
+            # Fenced to the terminal the server routed it for: a terminal under
+            # this id in another session is a newer launch reusing the id, and
+            # the command (sent before that launch, say) is not for it.
+            local = await asyncio.to_thread(get_terminal_metadata, terminal_id)
+            if local is None or local.get("tmux_session") != command.session_name:
+                if command.type == CommandType.DELETE:
+                    # The terminal it was for is gone: as with a pod replaced.
+                    return {"deleted": True, "absent": True}
+                raise LookupError(
+                    f"terminal {terminal_id} in session {command.session_name} not found"
+                )
+
         if command.type == CommandType.INPUT:
             orchestration = payload.get("orchestration_type")
             success = await asyncio.to_thread(

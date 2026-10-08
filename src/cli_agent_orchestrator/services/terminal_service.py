@@ -3701,6 +3701,10 @@ def _call_runtime(
         payload,
         terminal_id=metadata["id"],
         timeout=timeout,
+        # The row's session: the runtime acts on its terminal only while its
+        # local one under that id is still in this session, so a command that
+        # outlived the terminal cannot reach a newer one reusing the id.
+        session_name=metadata.get("tmux_session"),
     )
 
 

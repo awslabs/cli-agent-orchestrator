@@ -60,8 +60,14 @@ def _bridge(tmp_path=None):
     return bridge
 
 
-def _command(type_, terminal_id="abcd1234", **payload):
-    return Command(op_id=f"op-{type_.value}", type=type_, terminal_id=terminal_id, payload=payload)
+def _command(type_, terminal_id="abcd1234", session=None, **payload):
+    return Command(
+        op_id=f"op-{type_.value}",
+        type=type_,
+        terminal_id=terminal_id,
+        session_name=session,
+        payload=payload,
+    )
 
 
 class TestExecute:
@@ -216,6 +222,78 @@ class TestExecute:
         monkeypatch.setattr(database, "get_terminal_metadata", lambda tid: {"id": tid})
         monkeypatch.setattr(terminal_service, "delete_terminal", lambda tid: False)
         assert await _bridge().execute(_command(CommandType.DELETE)) == {"deleted": False}
+
+    @pytest.mark.asyncio
+    async def test_a_delete_for_a_terminal_id_now_reused_leaves_the_new_terminal_alone(
+        self, monkeypatch
+    ):
+        # The server deleted abcd1234 (session cao-old) and a launch reused the
+        # id in a new session before this delete ran: it is not for this pane.
+        import cli_agent_orchestrator.clients.database as database
+
+        monkeypatch.setattr(
+            database, "get_terminal_metadata", lambda tid: {"id": tid, "tmux_session": "cao-new"}
+        )
+        monkeypatch.setattr(
+            terminal_service, "delete_terminal", lambda tid: pytest.fail("deleted the relaunch")
+        )
+        result = await _bridge().execute(_command(CommandType.DELETE, session="cao-old"))
+        assert result == {"deleted": True, "absent": True}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "type_, payload",
+        [
+            (CommandType.INPUT, {"message": "hi"}),
+            (CommandType.KEY, {"key": "Enter"}),
+            (CommandType.OUTPUT, {"mode": "last"}),
+            (CommandType.EXIT, {}),
+            (CommandType.WORKING_DIRECTORY, {}),
+        ],
+    )
+    async def test_a_command_for_a_terminal_id_now_reused_is_refused(
+        self, monkeypatch, type_, payload
+    ):
+        import cli_agent_orchestrator.clients.database as database
+
+        monkeypatch.setattr(
+            database, "get_terminal_metadata", lambda tid: {"id": tid, "tmux_session": "cao-new"}
+        )
+        for name in (
+            "send_input",
+            "send_special_key",
+            "get_output",
+            "exit_terminal_cli",
+            "get_working_directory",
+        ):
+            monkeypatch.setattr(
+                terminal_service, name, lambda *a, **k: pytest.fail("reached the relaunch")
+            )
+        with pytest.raises(LookupError, match="not found"):
+            await _bridge().execute(_command(type_, session="cao-old", **payload))
+
+    @pytest.mark.asyncio
+    async def test_a_command_for_the_same_session_runs(self, monkeypatch):
+        import cli_agent_orchestrator.clients.database as database
+
+        monkeypatch.setattr(
+            database, "get_terminal_metadata", lambda tid: {"id": tid, "tmux_session": "cao-one"}
+        )
+        monkeypatch.setattr(terminal_service, "delete_terminal", lambda tid: True)
+        result = await _bridge().execute(_command(CommandType.DELETE, session="cao-one"))
+        assert result == {"deleted": True}
+
+    @pytest.mark.asyncio
+    async def test_a_command_with_no_session_still_runs(self, monkeypatch):
+        # An unrecorded terminal's cleanup has no central row to name a
+        # session: it is addressed by the id the runtime itself listed.
+        import cli_agent_orchestrator.clients.database as database
+
+        monkeypatch.setattr(
+            database, "get_terminal_metadata", lambda tid: {"id": tid, "tmux_session": "cao-one"}
+        )
+        monkeypatch.setattr(terminal_service, "delete_terminal", lambda tid: True)
+        assert await _bridge().execute(_command(CommandType.DELETE)) == {"deleted": True}
 
     @pytest.mark.asyncio
     async def test_a_command_for_a_terminal_needs_its_id(self):

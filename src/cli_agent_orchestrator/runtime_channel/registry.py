@@ -110,9 +110,11 @@ class RuntimeConnection:
         terminal_id: Optional[str] = None,
         timeout: float = COMMAND_TIMEOUT,
         on_sent: Optional[Callable[[], None]] = None,
+        session_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Send one command and return its result payload. ``on_sent`` is called
-        once the frame has been written.
+        once the frame has been written. ``session_name`` is the session of the
+        row the command is routed by (see ``Command.session_name``).
 
         ``timeout`` bounds the whole call: waiting for the channel, the send and
         the result. Not yet written when it runs out: 503, safe to retry.
@@ -120,7 +122,13 @@ class RuntimeConnection:
         already have run in the runtime.
         """
         op_id = uuid.uuid4().hex
-        frame = Command(op_id=op_id, type=command_type, terminal_id=terminal_id, payload=payload)
+        frame = Command(
+            op_id=op_id,
+            type=command_type,
+            terminal_id=terminal_id,
+            session_name=session_name,
+            payload=payload,
+        )
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
 
@@ -463,11 +471,18 @@ class RuntimeRegistry:
         payload: Dict[str, Any],
         terminal_id: Optional[str] = None,
         timeout: float = COMMAND_TIMEOUT,
+        session_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         conn = self.connection(runtime_id)
         if conn is None:
             raise RuntimeUnavailableError(f"runtime {runtime_id} is not connected")
-        return await conn.call(command_type, payload, terminal_id=terminal_id, timeout=timeout)
+        return await conn.call(
+            command_type,
+            payload,
+            terminal_id=terminal_id,
+            timeout=timeout,
+            session_name=session_name,
+        )
 
     def call_blocking(
         self,
@@ -476,6 +491,7 @@ class RuntimeRegistry:
         payload: Dict[str, Any],
         terminal_id: Optional[str] = None,
         timeout: float = COMMAND_TIMEOUT,
+        session_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """:meth:`call` from a worker thread (the synchronous terminal service).
 
@@ -493,7 +509,14 @@ class RuntimeRegistry:
         if on_loop:
             raise RuntimeError("call_blocking used on the channel loop; await call() instead")
         future = asyncio.run_coroutine_threadsafe(
-            self.call(runtime_id, command_type, payload, terminal_id=terminal_id, timeout=timeout),
+            self.call(
+                runtime_id,
+                command_type,
+                payload,
+                terminal_id=terminal_id,
+                timeout=timeout,
+                session_name=session_name,
+            ),
             loop,
         )
         try:
