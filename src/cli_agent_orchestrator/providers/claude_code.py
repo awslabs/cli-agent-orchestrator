@@ -239,6 +239,15 @@ NEW_TUI_BOX_CHROME_PATTERN = re.compile(r"^[ \t]*(?:⎿|tmux (?:detected|focus-e
 # retry loop) costs one grace period rather than the step timeout. A streaming
 # answer repaints sub-second and a retry countdown every second.
 TURN_END_GRACE_S = 15.0
+# Rows above the input box the grace clock keys on. Small enough that every
+# view of the pane holds them (a 50-row capture-pane read with paragraph
+# spacing has ~20 non-blank rows above the box); see _turn_still_in_flight.
+TURN_END_GATE_ROWS = 8
+# Distinct gated frames remembered per detector path, oldest evicted first. Two
+# is what the composite/capture-pane pair needs; the rest is slack for a view
+# that wobbles between a few stable renderings. A streaming answer churns
+# through this in well under the grace period, so no stale frame can age.
+TURN_END_GATE_FRAMES = 4
 # The newest Claude Code TUI renders the ❯ input prompt BOXED between two
 # horizontal separator lines (the older TUI used a single separator ABOVE ❯).
 # Detecting this box GATES the new-TUI status logic so legacy output is
@@ -313,8 +322,9 @@ class ClaudeCodeProvider(BaseProvider):
         # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
         # lives on BaseProvider and is consumed by _resolve_native_status().
         self._input_generation: int = 0
-        # Turn-end gate: last gated frame per detector path and when it was first seen.
-        self._turn_gate_frames: Dict[str, Tuple[str, float]] = {}
+        # Turn-end gate: per detector path, the gated frames seen recently and when
+        # each was first seen (bounded by TURN_END_GATE_FRAMES).
+        self._turn_gate_frames: Dict[str, Dict[str, float]] = {}
         self._turn_gate_clock: Callable[[], float] = time.monotonic
         self._snapshot_tail_hash: Optional[str] = None
         self._snapshot_last_response: Optional[str] = None
@@ -1271,27 +1281,45 @@ class ClaudeCodeProvider(BaseProvider):
 
     def _turn_still_in_flight(self, path: str, above_lines: List[str]) -> bool:
         """After a dispatch, a box without the summary as its newest line above is
-        a running turn, until the same frame has sat unchanged for
-        TURN_END_GRACE_S. ``path`` keeps the two detectors' frame clocks apart.
+        a running turn, until a frame first seen TURN_END_GRACE_S ago comes back
+        unchanged. ``path`` keeps the two detectors' frame clocks apart.
+
+        The clock is per frame, not per path. The "screen" path is fed by two
+        views of the same pane: the PYTE_SCREEN_ROWS-tall composite on every
+        poll and the pane-height capture-pane read of the stale re-check (#558).
+        The composite can hold rows the real pane has since cleared (a hook
+        spinner, a slash-command hint), so the two views need not agree on the
+        newest rows, and a single last-frame clock that each view restarts never
+        reaches the grace period while a waiter polls. Each distinct frame keeps
+        the time it was first seen; a view whose frame has not changed for the
+        grace period falls back regardless of what the other view shows. A
+        streaming answer and a retry countdown produce a new frame on every
+        repaint, so their frames never age. The newest TURN_END_GATE_ROWS
+        non-blank rows above the box are the frame, so a view's height does not
+        enter into it either.
         """
         if not self._task_dispatched:
             return False
         if self._turn_ended_above_box(above_lines):
             self._turn_gate_frames.pop(path, None)
             return False
-        frame = "\n".join(ln.strip() for ln in above_lines[-40:] if ln.strip())
+        newest = [ln.strip() for ln in above_lines if ln.strip()][-TURN_END_GATE_ROWS:]
+        frame = "\n".join(newest)
         now = self._turn_gate_clock()
-        seen = self._turn_gate_frames.get(path)
-        if seen is None or seen[0] != frame:
-            self._turn_gate_frames[path] = (frame, now)
+        seen = self._turn_gate_frames.setdefault(path, {})
+        first_seen = seen.get(frame)
+        if first_seen is None:
+            seen[frame] = now
+            while len(seen) > TURN_END_GATE_FRAMES:
+                del seen[min(seen, key=seen.__getitem__)]
             return True
-        if now - seen[1] < TURN_END_GRACE_S:
+        if now - first_seen < TURN_END_GRACE_S:
             return True
         logger.info(
             "claude_code %s: no end-of-turn summary above the input box on a frame "
-            "unchanged for %.0fs; falling back to the legacy ready verdict",
+            "first seen %.0fs ago; falling back to the legacy ready verdict",
             self.terminal_id,
-            now - seen[1],
+            now - first_seen,
         )
         return False
 

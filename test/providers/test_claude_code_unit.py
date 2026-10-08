@@ -2804,7 +2804,7 @@ class TestClaudeCodeTurnEndGate:
     def _dispatched(mock_backend) -> ClaudeCodeProvider:
         """A provider that has had one task sent to it (what every run-step/handoff
         worker looks like after ``send_input``). The snapshot history is empty so the
-        #407 tail-hash guard cannot be the reason a frame reads PROCESSING."""
+        paste-echo tail-hash guard cannot be the reason a frame reads PROCESSING."""
         mock_backend.get_native_status.return_value = None
         mock_backend.supports_event_inbox.return_value = False
         mock_backend.get_history.return_value = ""
@@ -2957,8 +2957,8 @@ class TestClaudeCodeTurnEndGate:
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
     def test_frame_change_restarts_grace(self, mock_backend):
-        """A streaming answer repaints sub-second; each change restarts the clock,
-        so the valve never fires while output is still arriving."""
+        """A streaming answer repaints sub-second; each repaint is a new frame with
+        a fresh clock, so the valve never fires while output is still arriving."""
         from cli_agent_orchestrator.providers.claude_code import TURN_END_GRACE_S
 
         provider = self._dispatched(mock_backend)
@@ -2983,6 +2983,96 @@ class TestClaudeCodeTurnEndGate:
         provider.mark_input_received()
         clock["now"] += 2.0
         assert provider.get_status_from_screen(frame) == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_alternating_composite_and_capture_views_fall_back_after_grace(self, mock_backend):
+        """With pyte on, the "screen" detector is fed by two views of the same pane:
+        the 400x200 composite (the per-poll re-check) and the 50-row capture-pane
+        read (the #558 stale re-check, every 3 s). A no-summary end state under a
+        long answer with paragraph spacing shows fewer non-blank rows above the box
+        in the short view than in the tall one. With a single last-frame clock
+        keyed on more rows than the short view holds, each alternation restarts
+        the clock and the valve never fires."""
+        from cli_agent_orchestrator.providers.claude_code import TURN_END_GRACE_S
+
+        provider = self._dispatched(mock_backend)
+        clock = {"now": 1000.0}
+        provider._turn_gate_clock = lambda: clock["now"]
+
+        body = ["⏺ Here is the answer"]
+        for i in range(60):
+            body += [f"  paragraph {i} of the answer", ""]
+        body += ["❯ /compact", "  ⎿  Compacted (ctrl+o to see full summary)"]
+        full = self._boxed(*body).split("\n")
+        composite, capture = full[-200:], full[-50:]
+        assert (
+            len([ln for ln in capture if ln.strip()])
+            < 40
+            < len([ln for ln in composite if ln.strip()])
+        )
+
+        fell_back_at = None
+        for t in range(1, 61):
+            clock["now"] = 1000.0 + t
+            verdicts = [provider.get_status_from_screen(composite)]
+            if t % 3 == 0:
+                verdicts.append(provider.get_status_from_screen(capture))
+            if any(v != TerminalStatus.PROCESSING for v in verdicts):
+                fell_back_at = t
+                break
+        assert fell_back_at is not None, "valve never fired: the two views reset each other's clock"
+        assert TURN_END_GRACE_S <= fell_back_at <= TURN_END_GRACE_S + 3
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_views_that_disagree_on_a_stale_row_still_fall_back(self, mock_backend):
+        """The composite can keep a row the real pane has cleared (recorded live:
+        the slash-command hint and the hook spinner of a `/compact` sent through
+        run_step), so the two views disagree on the newest rows, not just on how
+        many they hold. Each view's frame is stable, so each must age on its own
+        clock; a single last-frame clock that the views restart in turn never
+        reaches the grace period while a waiter polls every second."""
+        from cli_agent_orchestrator.providers.claude_code import TURN_END_GRACE_S
+
+        provider = self._dispatched(mock_backend)
+        clock = {"now": 1000.0}
+        provider._turn_gate_clock = lambda: clock["now"]
+
+        pane = ["❯ /compact", "  ⎿  Not enough messages to compact."]
+        capture = self._boxed(*pane).split("\n")
+        composite = self._boxed(
+            *pane, "  ❯ /compact        Free up context by summarizing the conversation so far"
+        ).split("\n")
+        assert capture != composite
+
+        fell_back_at = None
+        for t in range(1, 61):
+            clock["now"] = 1000.0 + t
+            verdicts = [provider.get_status_from_screen(composite)]
+            if t % 3 == 0:
+                verdicts.append(provider.get_status_from_screen(capture))
+            if any(v != TerminalStatus.PROCESSING for v in verdicts):
+                fell_back_at = t
+                break
+        assert fell_back_at is not None, "valve never fired: the two views reset each other's clock"
+        assert TURN_END_GRACE_S <= fell_back_at <= TURN_END_GRACE_S + 3
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_streaming_frames_never_age(self, mock_backend):
+        """A streaming answer produces a new frame on every repaint. Frames are
+        remembered per path, so an old one must be evicted before it can come
+        back and read as aged; here every frame is new for well over the grace
+        period and the valve never fires."""
+        from cli_agent_orchestrator.providers.claude_code import TURN_END_GRACE_S
+
+        provider = self._dispatched(mock_backend)
+        clock = {"now": 1000.0}
+        provider._turn_gate_clock = lambda: clock["now"]
+        body = ["⏺ BEGIN"]
+        for t in range(1, int(TURN_END_GRACE_S) * 3):
+            clock["now"] = 1000.0 + t
+            body.append(f"  {t} element")
+            frame = self._boxed(*body).split("\n")
+            assert provider.get_status_from_screen(frame) == TerminalStatus.PROCESSING
 
     def test_claude_opts_into_screen_status_poll(self):
         """The poll re-check must read Claude from the composite: the raw rolling
