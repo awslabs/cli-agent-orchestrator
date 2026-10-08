@@ -368,7 +368,7 @@ wheels = [
 
 [[package]]
 name = "cli-agent-orchestrator"
-version = "2.5.0"
+version = "2.5.3"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
