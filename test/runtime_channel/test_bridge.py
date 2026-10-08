@@ -133,6 +133,30 @@ class TestExecute:
         }
 
     @pytest.mark.asyncio
+    async def test_a_launch_whose_working_directory_cannot_be_read_still_succeeds(
+        self, monkeypatch
+    ):
+        import cli_agent_orchestrator.clients.database as database
+
+        async def create_terminal(**kwargs):
+            return SimpleNamespace(id="beef0001")
+
+        def unreadable(tid):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(terminal_service, "create_terminal", create_terminal)
+        monkeypatch.setattr(terminal_service, "get_terminal", lambda tid: {"id": tid})
+        monkeypatch.setattr(database, "get_terminal_metadata", unreadable)
+        monkeypatch.setattr(
+            terminal_service, "delete_terminal", lambda tid: pytest.fail("stopped a launch")
+        )
+        result = await _bridge().execute(
+            _command(CommandType.LAUNCH, None, agent_profile="developer", provider="mock_cli")
+        )
+        assert result["terminal"]["id"] == "beef0001"
+        assert result["terminal"]["working_directory"] is None  # the server keeps the request's
+
+    @pytest.mark.asyncio
     async def test_launch_without_a_provider_uses_the_profiles_provider(self, monkeypatch):
         import cli_agent_orchestrator.utils.agent_profiles as agent_profiles
 

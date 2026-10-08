@@ -272,8 +272,9 @@ class Bridge:
                 reported = _jsonable(local)
                 # Where it launched, as this runtime resolved it (its own cwd
                 # for an omitted directory): the central row records this.
-                row = await asyncio.to_thread(get_terminal_metadata, terminal.id)
-                reported["working_directory"] = (row or {}).get("working_directory")
+                reported["working_directory"] = await asyncio.to_thread(
+                    _launched_working_directory, terminal.id
+                )
                 return {"terminal": reported}
             except Exception as exc:
                 # The agent runs but the server would never learn of it: stop it.
@@ -472,6 +473,21 @@ class Bridge:
                 f"readiness file {str(self._ready_file)!r} cannot be removed ({exc}); "
                 "stopping, since it would report this runtime ready while disconnected"
             ) from exc
+
+
+def _launched_working_directory(terminal_id: str) -> Optional[str]:
+    """The working directory this runtime recorded for a terminal it just
+    launched (``create_terminal`` resolved it), or None if it cannot be read:
+    the server then records the requested one. Best effort, so a launch that
+    runs is never reported as failed over it."""
+    from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+    try:
+        row = get_terminal_metadata(terminal_id)
+    except Exception:  # noqa: BLE001 - see the docstring
+        logger.debug("could not read the working directory of %s", terminal_id, exc_info=True)
+        return None
+    return (row or {}).get("working_directory")
 
 
 def _jsonable(terminal: Dict[str, Any]) -> Dict[str, Any]:
