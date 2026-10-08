@@ -192,6 +192,25 @@ async def test_exclusion_pins_only_model_route(setup_engine, state, owner):
 
 
 @pytest.mark.asyncio
+async def test_exclusion_does_not_apply_to_ephemeral_targets(setup_engine):
+    from cli_agent_orchestrator.decisions.settings import PointSettings
+    from cli_agent_orchestrator.decisions.targets import TargetKind
+    from cli_agent_orchestrator.decisions.types import PointState
+
+    engine, req, decider, store, events, settings = setup_engine
+    engine.settings_loader = lambda: replace(
+        settings,
+        points={"model.route": PointSettings(PointState.ON, decider.name, ("worker",))},
+    )
+    plan = await engine.prepare_launch(
+        replace(req, target_kind=TargetKind.EPHEMERAL, field_states={"model.route": "auto"})
+    )
+    # Exclusions name installed profiles; an ephemeral target with the same name is still asked.
+    assert decider.calls == 1 and plan.model == "model-x"
+    assert [row["point"] for row in store.list()] == ["model.route"]
+
+
+@pytest.mark.asyncio
 async def test_workflow_scope_and_effort_cap(setup_engine):
     from test.fixtures.decision_conformance import AboveCeilingDecider
 

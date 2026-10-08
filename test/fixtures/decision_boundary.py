@@ -1,4 +1,10 @@
-"""Strict agent-surface vocabulary scan with three immutable base fields."""
+"""Strict agent-surface vocabulary scan with three immutable base fields.
+
+The scan covers every agent-facing tool, so it is coupled to tools outside the decision package
+on purpose: `VOCABULARY` holds generic words, and the base pins the unrelated descriptions of
+`workflow_resume` and `memory_store`. If an unrelated tool's text changes and trips the scan,
+first confirm that no decision surface reached the agent server, then re-pin the base JSON.
+"""
 
 import ast
 import copy
@@ -46,9 +52,24 @@ def assert_agent_boundary(tools: Sequence[Mapping[str, Any]], base: Mapping[str,
 
 
 def assert_no_decision_imports(source: str, package: str) -> None:
+    """Reject static imports, and dynamic imports of a literal module name.
+
+    A name computed at runtime is out of scope here; the import-time `sys.modules` check in the
+    boundary test covers what actually loads.
+    """
     for node in ast.walk(ast.parse(source)):
         targets = []
-        if isinstance(node, ast.Import):
+        if isinstance(node, ast.Call) and node.args:
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            first = node.args[0]
+            if (
+                name in ("import_module", "__import__")
+                and isinstance(first, ast.Constant)
+                and isinstance(first.value, str)
+            ):
+                targets.append(first.value)
+        elif isinstance(node, ast.Import):
             targets.extend(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             base = node.module or ""

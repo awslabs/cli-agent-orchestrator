@@ -143,9 +143,13 @@ canonical message, with a key identifier; the hash is never sent to deciders.
 
 The HMAC key is `decision-hash.key` in the database directory, mode 0600. Creation
 publishes a fully written temporary file with a link that cannot replace an
-existing key. Rotation removes the key; the next writer creates a new one and
-live writers use it without restarting. Purged records are deleted. Rotation
-breaks linkage to future records; it cannot revoke keys already copied elsewhere.
+existing key. A key file found with group or other access is restricted to 0600
+when it is read; if that fails, the key is not used and no record is written.
+Rotation removes the key; the next writer creates a new one and live writers use
+it without restarting. Purged records are deleted. Rotation breaks linkage to
+future records; it cannot revoke keys already copied elsewhere. Rotate with no
+launches in flight: a record written while the purge runs keeps a hash from the
+old key and is not purged.
 An exported record set without the key cannot confirm guessed messages. The
 same user can read the key and database.
 
@@ -153,7 +157,9 @@ Retention defaults to 90 days, independent of terminal retention. A startup
 sweep marks pending decision work interrupted and pending launches unknown;
 rejected rows remain done/not-launched. Store errors are logged and do not fail
 a launch. Rejected launches emit telemetry at insertion, shadow tasks emit after
-deciding, and other records emit at the first bind. Each record emits once.
+deciding, and other records emit at the first bind. Each record emits once. A
+shadow decision that finishes before its launch is bound emits without the
+launched model or the honored flag; its record still gets both at bind.
 Spans use `cao.decision`; metrics use `cao.decision.requests` and
 `cao.decision.latency`. No message, description, hash or probability vector is
 exported, and metric labels never contain terminal IDs. Without the
@@ -164,7 +170,10 @@ OpenTelemetry packages (the `[otel]` extra), decision telemetry is a no-op.
 An installed package registers a class under `cao.deciders`. Its entry-point
 name must equal its declared name; the class declares a version and supported
 points. CAO discovers names at startup and constructs a decider only when an
-active point needs it. Failures are cached until restart. `async decide` must
+active point needs it. A decider package is trusted code, like any other
+installed dependency: CAO imports and constructs its class before checking what
+it declares. With every point off, no decider code runs. Failures are cached
+until restart. `async decide` must
 not block the event loop; every call has a timeout. External deciders must not
 expose decision access through agent-tool registration hooks. This version includes only
 `fixed_table` and makes no external calls.

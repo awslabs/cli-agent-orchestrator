@@ -562,7 +562,9 @@ def test_tune_refuses_out_of_range_and_keeps_file(kwargs):
 
 def test_tune_accepts_range_bounds():
     from cli_agent_orchestrator.decisions.settings import load_settings, tune
+    from cli_agent_orchestrator.services import settings_service
 
+    settings_service.SETTINGS_FILE.write_text("{}")
     tune(on_timeout_ms=50, threshold=0, retention_days=1)
     settings = load_settings()
     assert (settings.on_timeout_ms, settings.confidence_threshold, settings.retention_days) == (

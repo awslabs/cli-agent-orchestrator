@@ -7,6 +7,8 @@ import pytest
 
 @pytest.fixture
 def export(setup_engine, monkeypatch):
+    # The SDK providers below are no-ops when the host sets OTEL_SDK_DISABLED=true.
+    monkeypatch.delenv("OTEL_SDK_DISABLED", raising=False)
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import InMemoryMetricReader
     from opentelemetry.sdk.trace import TracerProvider

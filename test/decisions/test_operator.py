@@ -280,6 +280,9 @@ async def test_ops_controls_and_local_record_queries(tmp_path, monkeypatch):
         "from cli_agent_orchestrator import decisions",
         "from ..decisions.engine import X",
         "from .. import decisions",
+        "importlib.import_module('cli_agent_orchestrator.decisions.engine')",
+        "import_module('cli_agent_orchestrator.decisions')",
+        "__import__('cli_agent_orchestrator.decisions.settings')",
     ],
 )
 def test_ast_guard_catches_all_decision_import_forms(source):
@@ -289,6 +292,23 @@ def test_ast_guard_catches_all_decision_import_forms(source):
         assert_no_decision_imports(
             "def lazy():\n    " + source + "\n", "cli_agent_orchestrator.mcp_server"
         )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "importlib.import_module('cli_agent_orchestrator.services.terminal_service')",
+        "importlib.import_module(name)",
+        "__import__('json')",
+        "registry.import_module",
+    ],
+)
+def test_ast_guard_allows_other_dynamic_imports(source):
+    from test.fixtures.decision_boundary import assert_no_decision_imports
+
+    assert_no_decision_imports(
+        "def lazy():\n    " + source + "\n", "cli_agent_orchestrator.mcp_server"
+    )
 
 
 def test_decision_catalog_help_and_group_order():
