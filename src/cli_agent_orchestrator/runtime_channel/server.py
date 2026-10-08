@@ -351,13 +351,21 @@ async def runtime_channel(ws: WebSocket) -> None:
             if lost:
                 for terminal_id in await _drop_lost(runtime_id, lost, conn):
                     runtime_registry.unplace(terminal_id, runtime_id)
-            for terminal_id, reported in hello.statuses.items():
-                runtime_registry.set_status(terminal_id, runtime_id, reported, conn=conn)
+            restored = {
+                terminal_id: reported
+                for terminal_id, reported in hello.statuses.items()
+                if runtime_registry.set_status(terminal_id, runtime_id, reported, conn=conn)
+            }
         if conn.closed:
             # Replaced during the hello: the newer connection's hello decides.
             return
         await ws.send_text(server_hello)
         runtime_registry.activate(conn)
+        if conn.active:
+            # GET /terminals/{id} reads these from now on: status consumers are
+            # told so by the server itself, before any status frame is read.
+            for terminal_id, reported in restored.items():
+                bus.publish(f"terminal.{terminal_id}.status", {"status": reported.value})
         # The hello lists every terminal the runtime runs.
         for terminal_id in hello.statuses:
             if not runtime_registry.is_known(terminal_id, runtime_id):

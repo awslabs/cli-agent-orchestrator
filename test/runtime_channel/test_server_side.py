@@ -2167,8 +2167,7 @@ class TestStatusEvents:
             async with _dial(server) as ws:
                 await ws.send(_hello(statuses={"abcd1234": "waiting_user_answer"}))
                 await ws.recv()
-                await ws.send(encode(Status(terminal_id="abcd1234", status="waiting_user_answer")))
-                first = await asyncio.to_thread(status_events.take)
+                first = await asyncio.to_thread(status_events.take)  # the hello's
             # The channel is gone: GET /terminals/abcd1234 reads unknown now.
             return first + await asyncio.to_thread(status_events.take)
 
@@ -2190,18 +2189,32 @@ class TestStatusEvents:
             async with _dial(server) as old:
                 await old.send(_hello(statuses={"abcd1234": "waiting_user_answer"}))
                 await old.recv()
-                await old.send(encode(Status(terminal_id="abcd1234", status="waiting_user_answer")))
-                first = await asyncio.to_thread(status_events.take)
+                first = await asyncio.to_thread(status_events.take)  # the hello's
                 async with _dial(server) as new:
                     await new.send(_hello(statuses={}))  # the replacement runs nothing
                     await new.recv()
-                    return first + await asyncio.to_thread(status_events.take)
+                    taken = await asyncio.to_thread(status_events.take)
+                    return first + taken + await asyncio.to_thread(status_events.rest)
 
         assert asyncio.run(scenario()) == [
             ("abcd1234", "waiting_user_answer"),
             ("abcd1234", "unknown"),
         ]
         assert database.get_terminal_metadata("abcd1234") is None
+
+    def test_a_hello_publishes_the_statuses_it_restores(self, server, status_events):
+        # The server's own contract, not the bridge's re-push: a runtime that
+        # sends no status frame after its hello still restores its terminals'
+        # statuses for status consumers.
+        _remote_row("abcd1234", "rt-1")
+
+        async def scenario():
+            async with _dial(server) as ws:
+                await ws.send(_hello(statuses={"abcd1234": "waiting_user_answer"}))
+                await ws.recv()
+                return await asyncio.to_thread(status_events.take)
+
+        assert asyncio.run(scenario()) == [("abcd1234", "waiting_user_answer")]
 
     def test_a_replaced_channel_publishes_nothing_over_its_replacement(self, server, status_events):
         _remote_row("abcd1234", "rt-1")
@@ -2216,10 +2229,16 @@ class TestStatusEvents:
                     with pytest.raises(websockets.exceptions.ConnectionClosed):
                         await asyncio.wait_for(old.recv(), 5)  # the server let it go
                     await new.send(encode(Status(terminal_id="abcd1234", status="processing")))
-                    taken = await asyncio.to_thread(status_events.take)
+                    # Each hello's restored status, then the newer one's frame:
+                    # nothing from the replaced connection's end.
+                    taken = await asyncio.to_thread(status_events.take, 3)
                     return taken + await asyncio.to_thread(status_events.rest)
 
-        assert asyncio.run(scenario()) == [("abcd1234", "processing")]
+        assert asyncio.run(scenario()) == [
+            ("abcd1234", "idle"),
+            ("abcd1234", "processing"),
+            ("abcd1234", "processing"),
+        ]
 
 
 class TestUnrecordedCleanupRetry:
