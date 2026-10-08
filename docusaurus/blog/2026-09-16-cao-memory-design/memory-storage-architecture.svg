@@ -30,7 +30,7 @@
   <rect width="1200" height="720" fill="#ffffff"/>
   <text class="eyebrow" x="60" y="54">LOCAL MEMORY ARCHITECTURE</text>
   <text class="title" x="60" y="94">Readable content, durable metadata, focused retrieval</text>
-  <text class="subtitle" x="60" y="124">Markdown and SQLite have different authority. BM25 searches the content without becoming another store.</text>
+  <text class="subtitle" x="60" y="124">Markdown and SQLite are the source of truth for different data. BM25 searches the content without becoming another store.</text>
 
   <g filter="url(#shadow)">
     <rect x="416" y="164" width="368" height="118" rx="22" fill="#eff6ff" stroke="#2563eb" stroke-width="2.5"/>
@@ -48,7 +48,7 @@
   <g filter="url(#shadow)">
     <rect x="62" y="382" width="420" height="244" rx="22" fill="#f8fafc" stroke="#334155" stroke-width="2"/>
     <rect x="88" y="408" width="190" height="34" rx="17" fill="#e2e8f0"/>
-    <text class="label" x="183" y="430" text-anchor="middle" fill="#334155">CONTENT AUTHORITY</text>
+    <text class="label" x="183" y="430" text-anchor="middle" fill="#334155">SOURCE OF TRUTH: CONTENT</text>
     <text class="box-title" x="88" y="478">Markdown topic files</text>
     <text class="box-copy" x="88" y="503">Human-readable and directly inspectable</text>
     <circle cx="98" cy="539" r="4" fill="#2563eb"/>
@@ -62,7 +62,7 @@
   <g filter="url(#shadow)">
     <rect x="718" y="382" width="420" height="244" rx="22" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
     <rect x="744" y="408" width="206" height="34" rx="17" fill="#fef3c7"/>
-    <text class="label" x="847" y="430" text-anchor="middle" fill="#92400e">METADATA AUTHORITY</text>
+    <text class="label" x="847" y="430" text-anchor="middle" fill="#92400e">SOURCE OF TRUTH: METADATA</text>
     <text class="box-title" x="744" y="478">SQLite</text>
     <text class="box-copy" x="744" y="503">Structured state for filtering and governance</text>
     <circle cx="754" cy="539" r="4" fill="#d97706"/>

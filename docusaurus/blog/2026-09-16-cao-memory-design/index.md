@@ -5,6 +5,8 @@ tags: [deep-dive]
 description: How CAO gives agents one shared memory layer across sessions, models, and CLI providers.
 ---
 
+Everything below was run against CAO `v2.5.1`.
+
 With Agentic context engineering, how an agent uses memory is critical in many aspects. It helps you
 increase code quality, be more token efficient, and keep consistency across a long-running session or
 session handoff.
@@ -15,7 +17,7 @@ history. It can hold project decisions, user preferences, reusable instructions,
 findings, and workflow lessons.
 
 The result is closer to a scoped project wiki than a transcript archive. The identity of CAO
-memory is human readable markdown files. How CAO help agent search runs over an index backed
+memory is human readable markdown files. Search runs over an index backed
 by a SQLite database, and a knowledge graph projects the relationships between memory nodes, both
 in the CAO UI and in Obsidian.
 
@@ -101,30 +103,29 @@ topic and becomes part of its file name.
 The file header records the memory ID, scope, type, and tags. Timestamped sections record
 when each observation was added. When an agent updates the same key, CAO appends a new
 timestamped section to that topic. It does not create a second memory with the same key and
-scope. See below [code snippet](https://github.com/awslabs/cli-agent-orchestrator/blob/95a0975cc119caa2cfde4b2138721c7046369f0e/src/cli_agent_orchestrator/services/memory_service.py#L3895) 
-which generate the header of the memory markdown: 
+scope. A topic file looks like this:
 
-```python
-for position, mem in enumerate(scope_memories):
-    tag = " [related]" if getattr(mem, "is_related", False) else ""
-    rendered_content, redacted_patterns = _redact_injected_vault_content(mem)
-    line = f"- [{mem.scope}] {mem.key}{tag}: {rendered_content}"
-    ...
-    lines.append(line)
-    ...
+```markdown
+# build-tooling
+<!-- id: 7c1e9f20-... | scope: project | type: knowledge | tags: build,ci -->
 
-if not lines:
-    return ""
+### 2026-09-14T08:12:03Z
+Run `make build` before every push; CI rejects an unbuilt tree.
 
-context = "## Context from CAO Memory\n" + "\n".join(lines)
-return f"<cao-memory>\n{context}\n</cao-memory>"
+### 2026-09-16T11:40:55Z
+The build step now also regenerates the Rust bindings, so a stale
+`target/` no longer breaks the wheel.
 ```
+
+The `# <key>` line and the `<!-- id | scope | type | tags -->` comment are the header; each
+`### <timestamp>` block is one observation. An update appends a new dated section rather than
+rewriting the ones above it.
 
 SQLite tracks data used for filtering, ranking, and lifecycle rules. This includes scope
 IDs, timestamps, access counts, provenance, token estimates, and relationship state.
 BM25 still searches the Markdown content. SQLite does not replace that content search.
-See below [code](https://github.com/awslabs/cli-agent-orchestrator/blob/95a0975cc119caa2cfde4b2138721c7046369f0e/src/cli_agent_orchestrator/services/memory_service.py#L1848-L1858) 
-of how we query the memroy: 
+See below [code](https://github.com/awslabs/cli-agent-orchestrator/blob/95a0975cc119caa2cfde4b2138721c7046369f0e/src/cli_agent_orchestrator/services/memory_service.py#L1848-L1858)
+of how CAO lists a scope's topics from SQLite metadata, newest first:
 
 ```python
 q = db.query(MemoryMetadataModel).filter(
@@ -172,7 +173,7 @@ message, guess, or secret into long-lived memory.
 
 A CAO agent calls `memory_store`. The memory service then follows a fixed write path:
 
-![CAO memory store write path](./memory-store-write-path.svg)
+![CAO saves memory now and organizes it later](./memory-store-write-path.svg)
 
 This first path is deterministic because it uses fixed code, not model output. CAO locks
 the topic, writes a known append format, and publishes it with an atomic file replacement.
@@ -183,19 +184,20 @@ other's index updates.
 
 **Compile mode** controls that optional second step. It has two settings:
 
-- append — CAO only ever appends the new timestamped section. No LLM is involved at any point. 
-This is the simplest behavior: a plain, append-only log.
-- llm (the default) — CAO still writes the same append-form section first, then schedules a background compilation. That step calls an LLM to merge repeated entries and link related topics.
+- `append` -- CAO only ever appends the new timestamped section. No LLM is involved at any point.
+  This keeps the file a plain, append-only log.
+- `llm` (the default) -- CAO still writes the same append-form section first, then schedules a
+  background compilation. That step calls an LLM to merge repeated entries and link related topics.
 
 So the write path itself never calls an LLM, regardless of compile mode. The agent that
-*calls* `memory_store` may of course be an LLM — but recording the observation is fixed
+*calls* `memory_store` may of course be an LLM -- but recording the observation is fixed
 code, not a model deciding what to persist. An LLM only re-enters afterward, and only in
 `llm` mode, to reorganize an existing topic. That compilation runs after the initial save.
 
 The compiler checks for newer writes before it publishes a result. If the topic changed,
 CAO drops the stale result. A slow or failed LLM never removes the saved observation.
 
-The rule is simple, and it is deliberate: save the observation first, improve the structure
+The rule is strict, and it is deliberate: save the observation first, improve the structure
 later. An LLM only touches that second step, and only when you turn it on.
 
 ### Partial writes are visible
@@ -204,7 +206,7 @@ CAO does not run the filesystem write and the SQLite commit in one transaction. 
 independent durability domains: SQLite commits through its own write-ahead log, while a
 Markdown file is published by writing to a temporary file and atomically renaming it into
 place. There is no
-common commit or rollback that spans both — if the SQLite commit fails after the files are
+common commit or rollback that spans both -- if the SQLite commit fails after the files are
 already renamed into place, nothing automatically un-writes those files. CAO owns that gap
 directly rather than pretending it does not exist.
 
@@ -242,6 +244,10 @@ so it expires first. Project memory lasts longer because project decisions often
 across many sessions. Global, agent, and federated memory are designed to cross project or
 session boundaries, so they do not expire. Cleanup runs when `cao-server` starts. It is not
 a continuous sweep.
+
+Scope is not the only thing that controls retention. Two memory types -- `user` and
+`feedback` -- never expire regardless of scope, so a `feedback` lesson saved in `project`
+scope is kept past the 90-day window.
 
 Project, session, and agent scopes need an identity. CAO rejects the write if it cannot
 resolve that identity. It never falls back to a wider scope.
@@ -313,9 +319,8 @@ Suppose a workflow reads a project rule today. The rule changes tomorrow. A repl
 not mix the old workflow inputs with the new rule.
 
 CAO resolves memory once for a workflow run. It stores a redacted and size-limited copy in
-the run manifest (A JSON file that defines how a workflow was launched). 
+the run manifest (a JSON file that defines how a workflow was launched).
 The first run and every replay use those same bytes.
-
 
 CAO saves the block before the terminal uses it. If that save fails, the run continues
 without memory. This is safer than using context that cannot be reproduced.
@@ -343,7 +348,7 @@ promotion copies a lesson into an agent profile.
 CAO does not learn from every conversation. Learning is opt-in. A supervisor starts each
 step of the loop.
 
-![CAO's opt-in learning loop](./learning-loop.svg)
+![CAO's supervisor-guided learning loop](./learning-loop.svg)
 
 The flow has five steps:
 
@@ -374,7 +379,7 @@ it. These sections cover the tradeoffs and the ways to move or inspect memory ou
 ### Costs and savings
 
 A good memory pays for itself by replacing repeated work: the agent skips another code search,
-document read, web search, or round-trip to you — saving tool calls, tokens, and time.
+document read, web search, or round-trip to you -- saving tool calls, tokens, and time.
 
 Memory also has costs:
 
@@ -384,7 +389,7 @@ Memory also has costs:
 - A stored fact can be wrong.
 - More injected lessons use more prompt space.
 
-The useful question is simple: is storing and checking the conclusion cheaper than finding
+The useful question is direct: is storing and checking the conclusion cheaper than finding
 it again on every run?
 
 ### Move and view memory outside CAO
@@ -401,16 +406,16 @@ format, not a full backup.
 node, with YAML metadata, an H1 title, and `[[wikilinks]]` for relationships. This export is
 one-way. CAO does not read edits back.
 
-![CAO memory notes browsed as a graph in Obsidian](./obsidian-graph-view.png)
+![CAO memory notes browsed as a graph in Obsidian](./obsidian-graph-view.svg)
 
 **The CAO UI knowledge graph** renders the same relationships live, with no export step. It
 reads the current graph through `GET /graph/{provider}` and shows the memory nodes and their
 typed edges in the browser, so you can inspect the graph without leaving CAO or opening
 another tool.
 
-![Obsidian export compared with the canonical vault architecture](./obsidian-memory-architecture.svg)
+![Obsidian one-way export compared with the canonical vault architecture](./obsidian-memory-architecture.svg)
 
-The [Obsidian vault integration](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/obsidian-vault.md) adds another model. 
+The [Obsidian vault integration](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/obsidian-vault.md) adds another model.
 A mapped vault folder becomes the canonical Markdown source for a scope. Unmapped scopes keep
 the native wiki. SQLite, BM25, and graph state become rebuildable views of the vault notes.
 
@@ -425,3 +430,10 @@ every conversation. Every supported agent uses the same MCP tools and CAO-owned 
 Markdown keeps the content readable, while SQLite tracks metadata and relationship state.
 Bounded injection, explicit recall, retention, repair, and workflow replay keep that knowledge
 useful and controlled across sessions, models, and CLI providers.
+
+## About the author
+
+Stan Fan (`fanhongy`) is a Solutions Architect at AWS. He works with teams on agentic
+systems and developer tooling, with a particular interest in how agents accumulate and reuse
+context reliably across sessions, models, and tools -- without turning memory into an
+unbounded transcript.
