@@ -128,6 +128,43 @@ def test_key_cache_refresh_has_one_key_open(tmp_path, monkeypatch):
     assert len(opened) == 1
 
 
+def test_loose_key_file_is_restricted_on_read(tmp_path):
+    import stat
+
+    from cli_agent_orchestrator.decisions.hashing import KeyCache
+
+    path = tmp_path / "decision-hash.key"
+    path.write_bytes(b"k" * 32)
+    path.chmod(0o644)
+    expected = KeyCache(path).digest("message")
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert KeyCache(path).digest("message") == expected
+
+
+def test_owner_only_key_file_is_not_rechmodded(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.decisions.hashing import KeyCache, load_key
+
+    path = tmp_path / "decision-hash.key"
+    load_key(path)
+    monkeypatch.setattr(os, "fchmod", Mock(side_effect=AssertionError("chmod")))
+    assert len(KeyCache(path).digest("message")[0]) == 64
+
+
+def test_key_file_that_cannot_be_restricted_is_not_used(setup_engine, tmp_path, monkeypatch):
+    from cli_agent_orchestrator.decisions.hashing import KeyCache
+
+    path = tmp_path / "loose.key"
+    path.write_bytes(b"k" * 32)
+    path.chmod(0o644)
+    monkeypatch.setattr(os, "fchmod", Mock(side_effect=PermissionError("not owner")))
+    with pytest.raises(PermissionError):
+        KeyCache(path).digest("message")
+    store = setup_engine[3]
+    store._key = KeyCache(path)
+    assert store.insert(row_values(), "message") is None
+    assert store.list() == []
+
+
 def test_key_cleanup_ignores_active_temp(tmp_path):
     from cli_agent_orchestrator.decisions.hashing import cleanup_temps
 
@@ -307,19 +344,6 @@ def test_malformed_block_cli_and_ops_errors():
     assert result["success"] is False and "must be an object" in result["message"]
 
 
-def test_migration_logs_and_reraises(monkeypatch, caplog):
-    from cli_agent_orchestrator.clients import database
-
-    class Table:
-        def create(self, **kwargs):
-            raise RuntimeError("migration failed")
-
-    monkeypatch.setattr(database, "DecisionRecordModel", SimpleNamespace(__table__=Table()))
-    with pytest.raises(RuntimeError, match="migration failed"):
-        database._migrate_decision_records()
-    assert "Decision record migration failed" in caplog.text
-
-
 @pytest.mark.parametrize("value", [True, False, float("nan"), "bad", None])
 def test_invalid_numeric_uses_defaults(value, caplog):
     from cli_agent_orchestrator.decisions.settings import load_settings
@@ -387,6 +411,35 @@ def test_policy_checked_set_and_lower_tiers():
     IDENTITY_POLICY.validate({"codex": {}})
     with pytest.raises(PolicyConfigError, match=r"model_tiers.codex.small is not mapped"):
         PolicyBounds(default_tier="medium", max_tier="medium").validate({"codex": {"medium": "m"}})
+
+
+@pytest.mark.parametrize("empty_target", [None, {}], ids=["absent", "empty"])
+def test_explicit_allowed_provider_requires_a_mapping(empty_target):
+    from cli_agent_orchestrator.decisions.policy import PolicyBounds, PolicyConfigError
+
+    tiers = {"claude_code": {"small": "model-c"}}
+    if empty_target is not None:
+        tiers["codex"] = empty_target
+    policy = PolicyBounds(
+        default_tier="small", allowed_providers=frozenset({"claude_code", "codex"})
+    )
+    with pytest.raises(
+        PolicyConfigError, match=r"^model_tiers\.codex\.small is not mapped \(required by policy\)$"
+    ) as raised:
+        policy.validate(tiers)
+    assert raised.value.reason == "policy_invalid"
+
+
+@pytest.mark.parametrize("empty_target", [None, {}], ids=["absent", "empty"])
+def test_unrestricted_provider_validation_keeps_empty_maps_unchanged(empty_target):
+    from cli_agent_orchestrator.decisions.policy import IDENTITY_POLICY, PolicyBounds
+
+    tiers = {"claude_code": {"small": "model-c"}}
+    if empty_target is not None:
+        tiers["codex"] = empty_target
+    assert IDENTITY_POLICY.allowed_providers is None
+    PolicyBounds(default_tier="small", allowed_providers=None).validate(tiers)
+    IDENTITY_POLICY.validate({"codex": {}})
 
 
 def test_exact_input_error_texts():

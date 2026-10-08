@@ -237,7 +237,6 @@ def test_store_migration_bind_sweep_purge_retention(tmp_path):
 
     engine = create_engine("sqlite:///" + str(tmp_path / "state.db"))
     database.DecisionRecordModel.__table__.create(engine)
-    database._migrate_decision_records(engine)
     assert len(inspect(engine).get_indexes("decision_records")) == 3
     store = DecisionStore(
         sessionmaker(bind=engine), tmp_path / "decision-hash.key", emit=lambda row: None
@@ -329,20 +328,23 @@ def test_tier_reader_unreadable_and_invalid_root():
     assert load_model_tiers({"model_tiers": []}) == {}
 
 
-def test_migration_is_additive_and_idempotent(tmp_path):
+def test_create_all_adds_decision_table_to_existing_database(tmp_path):
     from sqlalchemy import text
 
     from cli_agent_orchestrator.clients import database
 
+    # init_db's create_all creates the table on old databases; no separate migrator is needed.
+    assert database.DecisionRecordModel.__table__ in database.Base.metadata.sorted_tables
     db = create_engine("sqlite:///" + str(tmp_path / "old.db"))
     with db.begin() as conn:
         conn.execute(text("CREATE TABLE old_data (value TEXT)"))
         conn.execute(text("INSERT INTO old_data VALUES ('preserved')"))
-    database._migrate_decision_records(db)
-    database._migrate_decision_records(db)
+    database.Base.metadata.create_all(bind=db)
+    database.Base.metadata.create_all(bind=db)
     with db.begin() as conn:
         assert conn.execute(text("SELECT value FROM old_data")).scalar() == "preserved"
     assert "decision_records" in inspect(db).get_table_names()
+    assert len(inspect(db).get_indexes("decision_records")) == 3
 
 
 def test_cleanup_uses_decision_retention_window(tmp_path, monkeypatch):

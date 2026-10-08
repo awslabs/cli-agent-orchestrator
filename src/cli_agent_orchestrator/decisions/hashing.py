@@ -38,12 +38,22 @@ def _create_key(path: Path) -> tuple[bytes, KeyStamp] | None:
             temporary.unlink(missing_ok=True)
 
 
+def _restrict(fd: int, path: Path) -> None:
+    # Owner-only, like a key created here; a key that cannot be restricted is not used.
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, 0o600)
+    else:  # pragma: no cover - platforms without fchmod
+        os.chmod(path, 0o600)
+
+
 def _read_key(path: Path) -> tuple[bytes, KeyStamp]:
     for attempt in range(2):
         try:
             with path.open("rb") as stream:
                 key = stream.read(33)
                 stat = os.fstat(stream.fileno())
+                if stat.st_mode & 0o077:
+                    _restrict(stream.fileno(), path)
         except FileNotFoundError:
             try:
                 created = _create_key(path)

@@ -302,12 +302,7 @@ class DecisionEngine:
                         settings.on_timeout_ms,
                     )
                 )
-                fb = fallbacks[point]
-                if values["outcome"] == "fallback" and isinstance(fb, MissingTier):
-                    reject(
-                        DefaultUnmappedTierError(point, fb.provider, fb.tier, "default_unmapped"),
-                        (point,),
-                    )
+                # A missing default tier was already refused above, before any decider call.
                 if point == "model.route" and values.get("candidate_model"):
                     plan_model = values["candidate_model"]
                 insert({**base(point, decider), **values}, message())

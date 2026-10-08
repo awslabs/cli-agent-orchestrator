@@ -112,7 +112,7 @@ class PolicyBounds:
             self.allowed_providers if self.allowed_providers is not None else model_tiers.keys()
         )
         for provider in sorted(providers):
-            if not model_tiers.get(provider):
+            if self.allowed_providers is None and not model_tiers.get(provider):
                 continue
             required: list[str] = []
             if self.max_tier is not None:

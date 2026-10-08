@@ -797,8 +797,6 @@ def init_db() -> None:
     # Appended LAST (issue #447, ``handoff_results``). Its own new table, no shared
     # columns with anything above, so registry order is immaterial here too.
     _migrate_add_handoff_results()
-    # Appended LAST: its independent table and indexes do not alter other migrations.
-    _migrate_decision_records()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -3261,12 +3259,3 @@ def get_flows_to_run() -> List[Flow]:
             )
             for f in flows
         ]
-
-
-def _migrate_decision_records(bind: Any = None) -> None:
-    """Add the independent decision table and indexes without changing old rows."""
-    try:
-        DecisionRecordModel.__table__.create(bind=engine if bind is None else bind, checkfirst=True)
-    except Exception:
-        logger.warning("Decision record migration failed")
-        raise
