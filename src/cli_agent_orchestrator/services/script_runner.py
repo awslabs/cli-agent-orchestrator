@@ -10,7 +10,8 @@ monotonic through every (re)spawn/cancel/timeout (INV-6).
 The five algorithms + two helpers (business-logic-model A1-A7):
 
 - A1 ``run_script_workflow`` — lint gate -> journal row -> spawn -> serve
-  run-step calls while awaiting exit -> sentinel scan -> ``WorkflowRunResult``.
+  run-step calls while awaiting exit -> grace-bounded drain of the pipes ->
+  sentinel scan -> ``WorkflowRunResult``.
 - A2 ``resume_script_run`` — typed admission (delegated to U3) -> generation
   bump -> materialize frozen snapshot -> re-spawn with ``CAO_WORKFLOW_RESUME=1``.
 - A3 ``cancel_script_run`` — signal-first -> sweep -> journal CANCELLED,
@@ -319,7 +320,7 @@ async def _terminate(process: asyncio.subprocess.Process, grace: float) -> None:
 
 
 async def _wait_for_exit(process: asyncio.subprocess.Process) -> None:
-    """Return once the process itself has exited, whether or not its pipes are closed.
+    """Return once the process itself has exited, pipes closed or not (A1 Step 3 reaper).
 
     ``process.wait()`` alone is not that signal. From Python 3.11 a ``wait()``
     that starts before the exit also waits for stdout and stderr to reach EOF,
@@ -334,6 +335,7 @@ async def _wait_for_exit(process: asyncio.subprocess.Process) -> None:
             await asyncio.wait({waiter}, timeout=_EXIT_POLL_INTERVAL)
     finally:
         waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
 
 
 async def _await_exit_within_bound(process: asyncio.subprocess.Process, timeout: float) -> None:
@@ -346,6 +348,10 @@ async def _await_exit_within_bound(process: asyncio.subprocess.Process, timeout:
     try:
         await asyncio.wait_for(_wait_for_exit(process), timeout=timeout)
     except asyncio.TimeoutError as e:
+        if process.returncode is not None:
+            # The exit landed between two returncode polls just before the bound
+            # elapsed. asyncio has already recorded it, so it is not a timeout.
+            return
         raise TimeoutBound(
             f"script subprocess did not exit within {timeout}s wall-clock bound"
         ) from e
@@ -1047,8 +1053,23 @@ async def _finalize(
     )
 
 
+def _close_pipes(process: asyncio.subprocess.Process) -> None:
+    """Close the parent's end of both pipes once their readers are cancelled.
+
+    Cancelling ``_pump`` stops the reads but leaves the pipe transports open. A
+    process the script started that keeps writing then fills a buffer nobody
+    drains, blocks on the write and never exits, and the two read fds stay open
+    in the server for good. ``asyncio.subprocess.Process`` has no public close,
+    so this goes through its transport. ``returncode`` is already set on every
+    caller, and with it set ``close()`` closes the pipes without signalling.
+    """
+    transport = getattr(process, "_transport", None)
+    if transport is not None:
+        transport.close()
+
+
 # ---------------------------------------------------------------------------
-# Shared drive: spawn -> concurrent drain -> reap -> exit interp -> finalize
+# Shared drive: spawn -> concurrent drain -> reap -> bounded drain -> exit interp -> finalize
 # ---------------------------------------------------------------------------
 async def _drive_process(
     record: ScriptRunRecord, script_path: str, env: Dict[str, str]
@@ -1118,11 +1139,15 @@ async def _drive_process(
     # same grace the reaper uses and then keeps whatever was read by then.
     drain_warnings: List[str] = []
     try:
-        await asyncio.wait_for(asyncio.gather(*drain), timeout=WORKFLOW_SCRIPT_TERM_GRACE)
+        await asyncio.wait_for(
+            asyncio.gather(*drain, return_exceptions=True), timeout=WORKFLOW_SCRIPT_TERM_GRACE
+        )
     except asyncio.TimeoutError:
+        _close_pipes(process)
         drain_warnings.append(
             f"stdout/stderr were still open {WORKFLOW_SCRIPT_TERM_GRACE}s after the script "
-            "exited, most likely held by a process it started; output read up to then was kept"
+            "exited, most likely held by a process it started; output read up to then was "
+            "kept and the pipes were closed"
         )
 
     if record.cancelled or record.state == RunState.CANCELLED:
@@ -1188,10 +1213,11 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
     Steps: (0) lint gate — a ``fail`` raises ``ScriptLintError`` before any journal
     row or subprocess (BR-1); (1) journal the run row (tier=script, gen=1) +
     register the live record; (2) spawn with the constructed env (INV-2); (3) drain
-    both pipes concurrently while awaiting exit under the wall-clock bound; (4)
-    interpret the exit + sentinel scan. Only the lint gate raises, and it raises
-    exactly one type — ``ScriptLintError`` — while a run failure/timeout returns a
-    FAILED result instead. Naming the type matters: it is the only exception a
+    both pipes concurrently while awaiting exit under the wall-clock bound, then
+    give the drain ``WORKFLOW_SCRIPT_TERM_GRACE`` after the exit and close pipes a
+    background process still holds; (4) interpret the exit + sentinel scan. Only
+    the lint gate raises, and it raises exactly one type — ``ScriptLintError`` —
+    while a run failure/timeout returns a FAILED result instead. Naming the type matters: it is the only exception a
     caller of this function must handle, so an ``except Exception`` here would be
     both too broad and a silent way to swallow it.
     """

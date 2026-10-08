@@ -173,29 +173,57 @@ class _HeldOpenStream(_FakeStream):
         if chunk:
             return chunk
         await asyncio.Event().wait()
-        return b""
+
+
+class _FakeTransport:
+    """Records whether the drive closed the subprocess pipes."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class _HeldPipesProcess:
-    """A script that has already exited 0 while its stdout/stderr stay open.
+    """A script that exits while its stdout/stderr stay open.
 
-    ``returncode`` is set from the start, as asyncio sets it when the process
-    exits. ``wait_holds_for_pipes`` picks the ``wait()`` behaviour: on Python
-    3.10 it returns at exit, and from 3.11 a ``wait()`` started before the exit
-    does not return until the pipes reach EOF, which here is never.
+    ``returncode`` flips from None to ``exit_rc`` after ``exit_after`` seconds,
+    as asyncio sets it when the process exits, whether or not anything is in
+    ``wait()``. ``wait_holds_for_pipes`` picks the ``wait()`` behaviour: on
+    Python 3.10 it returns at the exit, and from 3.11 a ``wait()`` started
+    before the exit does not return until the pipes reach EOF, which here is
+    never.
     """
 
-    def __init__(self, *, stdout: bytes, wait_holds_for_pipes: bool):
-        self.returncode: Optional[int] = 0
+    def __init__(
+        self,
+        *,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+        wait_holds_for_pipes: bool,
+        exit_rc: int = 0,
+        exit_after: float = 0.05,
+    ):
+        self.returncode: Optional[int] = None
         self.stdout = _HeldOpenStream(stdout)
-        self.stderr = _HeldOpenStream(b"")
+        self.stderr = _HeldOpenStream(stderr)
         self._wait_holds_for_pipes = wait_holds_for_pipes
+        self._exit_rc = exit_rc
+        self._exited = asyncio.Event()
+        self._transport = _FakeTransport()
         self.signals: List[str] = []
+        asyncio.get_running_loop().call_later(exit_after, self._exit)
+
+    def _exit(self) -> None:
+        self.returncode = self._exit_rc
+        self._exited.set()
 
     async def wait(self) -> int:
         if self._wait_holds_for_pipes:
             await asyncio.Event().wait()
-        return 0
+        await self._exited.wait()
+        return self._exit_rc
 
     def terminate(self) -> None:
         self.signals.append("SIGTERM")
@@ -508,6 +536,46 @@ async def test_exit_with_pipes_held_open_completes(
     assert result.output == {"ok": True}
     assert any("still open" in w for w in result.warnings)
     assert proc.signals == []  # an exited script is never signalled
+    assert proc._transport.closed  # the held pipes are not left open in the server
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wait_holds_for_pipes", [False, True], ids=["wait-returns-at-exit", "wait-holds-for-pipes"]
+)
+async def test_nonzero_exit_with_pipes_held_open_fails_with_warning(
+    monkeypatch: pytest.MonkeyPatch, wait_holds_for_pipes: bool
+):
+    """A nonzero exit with the pipes held open settles FAILED,kind=error, not timeout."""
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 1.0)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.05)
+    proc = _HeldPipesProcess(stderr=b"boom\n", wait_holds_for_pipes=wait_holds_for_pipes, exit_rc=3)
+    _install_fake_spawn(monkeypatch, proc)
+
+    result = await asyncio.wait_for(
+        run_script_workflow(_FakeScriptSpec(), {}, "run-held-pipes-rc3"), timeout=5.0
+    )
+    assert result.state == RunState.FAILED
+    assert result.kind == "error"
+    assert any("boom" in w for w in result.warnings)  # stderr tail surfaced
+    assert any("still open" in w for w in result.warnings)
+    assert proc.signals == []
+    assert proc._transport.closed
+
+
+@pytest.mark.asyncio
+async def test_exit_just_before_the_bound_is_not_a_timeout(monkeypatch: pytest.MonkeyPatch):
+    """An exit asyncio recorded before the bound elapsed is not reported as a timeout.
+
+    The poll interval is stretched past the bound so the exit lands while
+    ``_wait_for_exit`` is between two ``returncode`` checks.
+    """
+    monkeypatch.setattr(script_runner, "_EXIT_POLL_INTERVAL", 10.0)
+    proc = _HeldPipesProcess(wait_holds_for_pipes=True, exit_after=0.05)
+
+    await script_runner._await_exit_within_bound(proc, timeout=0.3)
+    assert proc.returncode == 0
 
 
 # ---------------------------------------------------------------------------
