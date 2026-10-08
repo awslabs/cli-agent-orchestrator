@@ -91,8 +91,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Inbox messages are no longer pasted into a terminal that is waiting on a user
   answer, such as an open Claude Code AskUserQuestion or approval dialog. The
   dialog consumed the text, so the message was marked delivered but lost, and
-  the trailing Enter could select an option for the user. The message now
-  stays pending and is delivered after the dialog closes (#896).
+  the trailing Enter could select an option for the user. While the terminal
+  reports WAITING_USER_ANSWER, the message now stays pending and is delivered
+  after the dialog closes. On the herdr backend, Claude Code 2.1.281+ sessions
+  started with `--agent` can report `idle`/`done` for an open dialog because of
+  an upstream detection bug (herdrdev/herdr#4573); see
+  `docs/inbox-delivery.md` for a workaround (#896).
 - Audit all tracked npm, Bun, uv, and Cargo dependency graphs in every CI run
   and weekly, including development dependencies and unfixed advisories. Block
   every HIGH/CRITICAL finding and scan error, and publish complete inventory and

@@ -28,6 +28,8 @@ Eager delivery lets messages be delivered while the terminal is **PROCESSING**, 
 
 A terminal in **WAITING_USER_ANSWER** never receives a message, even from a capable provider. That state means a dialog owns the input (for Claude Code, an AskUserQuestion or approval prompt). Pasted text would be consumed by the dialog, and the trailing Enter could select an option on the user's behalf. The message stays PENDING and is delivered after the dialog closes, on the next IDLE/COMPLETED status event or by the reconciliation sweep below.
 
+This protection depends on the backend reporting WAITING_USER_ANSWER. On the herdr backend, status comes from herdr's own detection. With Claude Code 2.1.281 or later, a session started with `--agent` (as CAO launches Claude Code) or `--name` draws an agent-name rule under the dialog footer, and herdr then reports the open dialog as `idle` or `done` ([herdrdev/herdr#4573](https://github.com/herdrdev/herdr/issues/4573)). CAO then sees the terminal as ready and delivers. To check a pane, run `herdr agent explain <pane>`. An open dialog that reports `rule: osc_title_idle` is affected. Until herdr ships a fix, a local override of herdr's Claude detection manifest (`~/.config/herdr/agent-detection/claude.toml`) with the rule posted in that issue makes these dialogs report `blocked`. Remove the override once the upstream fix lands, because it shadows herdr's remote manifest updates.
+
 ### Provider Capability: `accepts_input_while_processing`
 
 A property on `BaseProvider` (default `False`) that signals whether a provider's TUI safely buffers pasted input during processing. Override to `True` in providers that support this.
