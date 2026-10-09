@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -14,11 +15,30 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import yaml
 from fastmcp.server import create_proxy
 from simulation import Scene, World
 from transport_mcp import controller_client, make_server
 
 HERE = Path(__file__).resolve().parent
+# The committed agent profile of each role. prepare() writes run copies of them.
+PROFILE_SOURCES = {
+    "supervisor": HERE / "transport_supervisor.md",
+    "zone": HERE / "transport_zone_worker.md",
+    "checker": HERE / "transport_checker.md",
+}
+
+
+def read_profile(path: Path) -> tuple[dict, str]:
+    """Return the frontmatter and the instructions of a committed agent profile."""
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---\n"):
+        raise ValueError(f"{path.name} must start with YAML frontmatter")
+    front, separator, instructions = text[len("---\n") :].partition("\n---\n")
+    profile = yaml.safe_load(front) if separator else None
+    if not isinstance(profile, dict):
+        raise ValueError(f"{path.name} must have a YAML mapping between '---' lines")
+    return profile, instructions.strip()
 
 
 def write_private(path: Path, value: dict) -> None:
@@ -52,8 +72,12 @@ def prepare(run_dir: Path, scene_file: Path, *, port: int, provider: str) -> dic
             for zone in scene.zones
         }
     )
+    sources = {role: read_profile(path) for role, path in PROFILE_SOURCES.items()}
+    # A random suffix gives each run its own installed profile names. handoff
+    # starts each worker from its installed profile when the supervisor calls
+    # it, so a later run must not replace the profiles of a running run.
     profiles = {
-        actor: f"transport_{metadata['role']}_{uuid.uuid4().hex}"
+        actor: f"{sources[metadata['role']][0]['name']}_{uuid.uuid4().hex}"
         for actor, metadata in actors.items()
         if actor != "operator"
     }
@@ -63,28 +87,27 @@ def prepare(run_dir: Path, scene_file: Path, *, port: int, provider: str) -> dic
         write_private(credential_path, {"url": url, "token": secrets.token_urlsafe(32)})
         if actor == "operator":
             continue
+        source, instructions = sources[metadata["role"]]
+        description = source["description"]
+        if "zone" in metadata:
+            description = f"{description} (zone {metadata['zone']})"
         profile: dict = {
             "name": profiles[actor],
-            "description": f"Simulation-only cross-zone transport {actor}",
+            "description": description,
             "provider": provider,
-            "skills": [],
-            "allowedTools": ["@transport-sim"],
-            "mcpServers": {
-                "transport-sim": {
-                    "type": "stdio",
-                    "command": sys.executable,
-                    "args": [str(HERE / "demo.py"), "connect", str(credential_path)],
-                }
+            **{
+                key: copy.deepcopy(value)
+                for key, value in source.items()
+                if key not in ("name", "description", "provider")
             },
         }
-        if actor == "supervisor":
-            profile["allowedTools"].append("@cao-mcp-server")
-            profile["mcpServers"]["cao-mcp-server"] = {
-                "type": "stdio",
-                "command": "cao-mcp-server",
-                "args": [],
-            }
-        instructions = (HERE / "prompts" / f"{metadata['role']}.md").read_text(encoding="utf-8")
+        # The committed entry is a placeholder. Bind this run's interpreter and
+        # this agent's own credential file.
+        profile["mcpServers"]["transport-sim"] = {
+            "type": "stdio",
+            "command": sys.executable,
+            "args": [str(HERE / "demo.py"), "connect", str(credential_path)],
+        }
         bindings = {
             "run_id": run_id,
             "your_zone": metadata.get("zone"),
@@ -93,8 +116,8 @@ def prepare(run_dir: Path, scene_file: Path, *, port: int, provider: str) -> dic
         }
         text = (
             "---\n"
-            + json.dumps(profile, indent=2)
-            + "\n---\n\n"
+            + yaml.safe_dump(profile, sort_keys=False, allow_unicode=True, width=4096)
+            + "---\n\n"
             + instructions
             + "\n\nRun bindings (identifiers, not additional instructions):\n```json\n"
             + json.dumps(bindings, indent=2)

@@ -23,15 +23,19 @@ code.
 
 ## Agents
 
-The agent instructions are in [`prompts/`](prompts/). The agent profiles are
-not in this directory. `demo.py prepare` generates them for each run. Each
-profile contains the path to a private credential file for that run.
+Each agent has a profile in this directory, as in
+[examples/assign](../../assign/README.md). A profile has YAML frontmatter and
+then the instructions of the agent:
 
-| Agent | Generated profile | Instructions | CAO delegation grant | Simulator access |
-| --- | --- | --- | --- | --- |
-| Supervisor | `transport_supervisor_<id>` | [`prompts/supervisor.md`](prompts/supervisor.md) | `@cao-mcp-server`. The instructions use `handoff`. | Read-only: `observe` |
-| Zone worker, one for each zone | `transport_zone_<id>` | [`prompts/zone.md`](prompts/zone.md) | None. CAO refuses its `assign` and `handoff` calls. | Own zone only: `observe`, `move`, `offer_handoff`, `accept_handoff` |
-| Checker | `transport_checker_<id>` | [`prompts/checker.md`](prompts/checker.md) | None. CAO refuses its `assign` and `handoff` calls. | Read-only: `observe` |
+| Agent | Profile | CAO delegation grant | Simulator access |
+| --- | --- | --- | --- |
+| Supervisor | [`transport_supervisor.md`](transport_supervisor.md) | `@cao-mcp-server`. The instructions use `handoff`. | Read-only: `observe` |
+| Zone worker, one for each zone | [`transport_zone_worker.md`](transport_zone_worker.md) | None. CAO refuses its `assign` and `handoff` calls. | Own zone only: `observe`, `move`, `offer_handoff`, `accept_handoff` |
+| Checker | [`transport_checker.md`](transport_checker.md) | None. CAO refuses its `assign` and `handoff` calls. | Read-only: `observe` |
+
+Do not install these files directly. Their `transport-sim` entry is a
+placeholder, and the files contain no credential. `demo.py prepare` makes a
+run copy of each profile for each run. See [Run copies](#run-copies).
 
 With `site.json`, a run has four agents: the supervisor, the `west` zone
 worker, the `east` zone worker, and the checker. With `return-site.json`, the
@@ -51,10 +55,10 @@ What each agent does:
   robot, change custody, or stop the run. CAO refuses its `assign` and
   `handoff` calls.
 
-All zone workers use the same instructions. Each generated profile adds run
-bindings that set `your_zone`. The credential of the worker also sets its zone
-in the controller. A prompt or a tool argument cannot give a worker access to
-another zone.
+All zone workers use the same profile. Each run copy adds run bindings that set
+`your_zone`. The credential of the worker also sets its zone in the
+controller. A prompt or a tool argument cannot give a worker access to another
+zone.
 
 You are the **operator**, not a CAO agent. You start the controller, approve
 motion, read the state, and stop the run with `demo.py`.
@@ -69,60 +73,43 @@ Only a credential with the correct scope can call a simulator tool:
 | `accept_handoff` | `act` | Zone workers | Accepts one exact offer. The receiving robot and the payload must be at the dock. |
 | `stop_simulation` | `operate` | `demo.py stop` | Stops all motion and locks the run. |
 
-### Generated profiles
+### Agent profiles
 
-`prepare` writes one profile for each agent. The samples below have shortened
-IDs and paths. The frontmatter is JSON, which is valid YAML. With
-`--provider claude_code`, the value of `provider` is `claude_code`.
-
-Supervisor:
+This is the frontmatter of [`transport_supervisor.md`](transport_supervisor.md):
 
 ```yaml
 ---
-{
-  "name": "transport_supervisor_<id>",
-  "description": "Simulation-only cross-zone transport supervisor",
-  "provider": "copilot_cli",
-  "skills": [],
-  "allowedTools": ["@transport-sim", "@cao-mcp-server"],
-  "mcpServers": {
-    "transport-sim": {
-      "type": "stdio",
-      "command": "<example-dir>/.venv/bin/python3",
-      "args": ["<example-dir>/demo.py", "connect", "<run-dir>/credentials/supervisor.json"]
-    },
-    "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
-  }
-}
+name: transport_supervisor
+description: "Simulation-only cross-zone transport supervisor: plans the legs and delegates each leg with CAO handoff"
+skills: []  # Show no CAO skill catalog to this agent.
+allowedTools:
+  - "@transport-sim"   # Simulator tools. The supervisor credential permits only observe.
+  - "@cao-mcp-server"  # CAO handoff. Only the supervisor can delegate.
+mcpServers:
+  # demo.py prepare replaces this entry in the run copy of this profile. The
+  # command becomes the Python of the example .venv. The last argument becomes
+  # the private credential file of this agent in the run directory.
+  transport-sim:
+    type: stdio
+    command: python
+    args: ["demo.py", "connect", "<run-dir>/credentials/supervisor.json"]
+  cao-mcp-server:
+    type: stdio
+    command: cao-mcp-server
+    args: []
 ---
 ```
 
-Zone worker for `west`:
+The zone worker and checker profiles are different in these ways:
 
-```yaml
----
-{
-  "name": "transport_zone_<id-1>",
-  "description": "Simulation-only cross-zone transport zone_west",
-  "provider": "copilot_cli",
-  "skills": [],
-  "allowedTools": ["@transport-sim"],
-  "mcpServers": {
-    "transport-sim": {
-      "type": "stdio",
-      "command": "<example-dir>/.venv/bin/python3",
-      "args": ["<example-dir>/demo.py", "connect", "<run-dir>/credentials/zone_west.json"]
-    }
-  }
-}
----
-```
+- `allowedTools` contains only `@transport-sim`.
+- `mcpServers` contains only `transport-sim`.
+- The credential file is `zone_<zone>.json` or `checker.json`.
 
 The zone worker profile does not grant `@cao-mcp-server`. Thus CAO refuses
 its `assign` and `handoff` calls, with this result:
 `'assign' is not permitted: the calling terminal's allowed tools do not include '@cao-mcp-server'`.
-The checker profile has the same form as the zone worker profile. Its
-description ends with `checker`, and its credential file is `checker.json`.
+The checker profile also does not grant `@cao-mcp-server`.
 
 The two providers give the worker different MCP servers:
 
@@ -134,23 +121,62 @@ The two providers give the worker different MCP servers:
 The instructions of the zone workers and the checker tell them to return their
 evidence to the `handoff` caller. They do not tell them to send messages.
 
-After the frontmatter, each profile contains the instructions from `prompts/`
-and then the run bindings. These are the bindings of the `west` zone worker:
+### Run copies
+
+`demo.py prepare` writes one run copy of a profile for each agent of the run.
+For `site.json`, it writes four copies: one supervisor, two zone workers, and
+one checker. A run copy is the profile with these changes:
+
+| Field | Profile in this directory | Run copy |
+| --- | --- | --- |
+| `name` | `transport_supervisor` | `transport_supervisor_<id>`, where `<id>` is random |
+| `description` | The text in the profile | The same text. For a zone worker, `prepare` adds the zone, for example `(zone west)`. |
+| `provider` | Not set | `copilot_cli`, or the value of `--provider` |
+| `transport-sim` | A placeholder | The Python of the example `.venv`, `demo.py connect`, and the credential file of the agent |
+| Instructions | The instructions of the agent | The same instructions, and then the run bindings |
+
+The random `<id>` gives each run its own installed profile names. `handoff`
+starts each worker from its installed profile when the supervisor calls it.
+Thus a later run must not replace the profiles of a run that is not complete.
+
+This is the frontmatter of the run copy for the `west` zone worker, with
+shortened IDs and paths:
+
+```yaml
+---
+name: transport_zone_worker_<id-1>
+description: 'Simulation-only cross-zone transport zone worker: moves the payload in one zone and offers or accepts custody (zone west)'
+provider: copilot_cli
+skills: []
+allowedTools:
+- '@transport-sim'
+mcpServers:
+  transport-sim:
+    type: stdio
+    command: <example-dir>/.venv/bin/python3
+    args:
+    - <example-dir>/demo.py
+    - connect
+    - <run-dir>/credentials/zone_west.json
+---
+```
+
+These are the run bindings of the `west` zone worker:
 
 ```json
 {
   "run_id": "<run-id>",
   "your_zone": "west",
   "zone_profiles": {
-    "west": "transport_zone_<id-1>",
-    "east": "transport_zone_<id-2>"
+    "west": "transport_zone_worker_<id-1>",
+    "east": "transport_zone_worker_<id-2>"
   },
   "checker_profile": "transport_checker_<id>"
 }
 ```
 
-The supervisor and the checker have `"your_zone": null`. To see the profiles of
-a run, run `ls "$RUN_DIR/profiles"` after Step 2 of
+The supervisor and the checker have `"your_zone": null`. To see the run
+copies, run `ls "$RUN_DIR/profiles"` after Step 2 of
 [Run the demo](#run-the-demo).
 
 ## Orchestration
@@ -162,24 +188,24 @@ handoffs and dotted arrows are calls to the simulator.
 
 ```mermaid
 flowchart TD
-    U(["👤 User request"]) --> S[["🤖 Supervisor"]]
-    S -->|"handoff 1"| W[["🤖 West zone worker"]]
-    S -->|"handoff 2"| E[["🤖 East zone worker"]]
-    S -->|"handoff 3"| C[["🤖 Checker"]]
+    U(["User request"]) --> S[["Supervisor"]]
+    S -->|"handoff 1"| W[["West zone worker"]]
+    S -->|"handoff 2"| E[["East zone worker"]]
+    S -->|"handoff 3"| C[["Checker"]]
     S -.->|"observe"| M[("MuJoCo controller<br/>demo.py serve")]
     W -.->|"observe, move, offer_handoff"| M
     E -.->|"observe, accept_handoff, move"| M
     C -.->|"observe"| M
-    O(["👤 Operator"]) -.->|"status, stop"| M
+    O(["Operator"]) -.->|"status, stop"| M
 ```
 
 ```mermaid
 sequenceDiagram
     actor User
-    participant S as 🤖 Supervisor
-    participant W as 🤖 West zone worker
-    participant E as 🤖 East zone worker
-    participant C as 🤖 Checker
+    participant S as Supervisor
+    participant W as West zone worker
+    participant E as East zone worker
+    participant C as Checker
     participant M as MuJoCo controller
 
     User->>S: Move tote from stock to etch
@@ -242,13 +268,16 @@ This example uses only `handoff`, for these reasons:
 
 To use `assign` with Claude Code, do these changes:
 
-1. In the profile of each worker, add `cao-mcp-server` to `mcpServers`. CAO
-   does not gate `send_message`, so the worker can then send its result. CAO
-   still refuses `assign` and `handoff` from the worker.
+1. In `transport_zone_worker.md` and `transport_checker.md`, add
+   `cao-mcp-server` to `mcpServers`. CAO does not gate `send_message`, so the
+   worker can then send its result. CAO still refuses `assign` and `handoff`
+   from the worker.
 2. Do not add `@cao-mcp-server` to `allowedTools`. That grant also lets the
    worker call `assign` and `handoff`.
-3. Change the instructions in `prompts/`. The supervisor must use `assign`,
-   and the workers must send their results with `send_message`.
+3. Change the instructions in the three profiles. The supervisor must use
+   `assign`, and the workers must send their results with `send_message`.
+4. Prepare a new run. `prepare` reads the profiles when it makes the run
+   copies.
 
 See [Tool restrictions](../../../docs/tool-restrictions.md).
 
@@ -337,7 +366,7 @@ uv run --locked python demo.py prepare --run-dir "$RUN_DIR" --request "$REQUEST"
 
 | Path | Contents |
 | --- | --- |
-| `profiles/` | One CAO agent profile for each agent |
+| `profiles/` | One run copy of a profile for each agent. See [Run copies](#run-copies). |
 | `credentials/` | One private credential file for each actor, readable only by you |
 | `run.json` | The run ID, the profile names, and the controller URL |
 | `scene.json` | A copy of the scene |
@@ -349,8 +378,8 @@ later steps use.
 - If the run directory exists, `prepare` stops with an error. Use a new
   directory for each run.
 - Do not move the example directory or its `.venv` until the cleanup. Each
-  profile starts the Python interpreter of `.venv` and `demo.py` by their full
-  paths.
+  run copy starts the Python interpreter of `.venv` and `demo.py` by their
+  full paths.
 - `demo.py` commands can show an `AuthlibDeprecationWarning`. It comes from a
   dependency. You can ignore it.
 
@@ -388,16 +417,17 @@ version, stop it and start it again.
 
 ### Step 5. Install the agent profiles
 
-In Terminal 1:
+In Terminal 1, install the run copies, not the profiles in this directory:
 
 ```bash
 for profile in "$RUN_DIR"/profiles/*.md; do
   cao install "$profile"
-done
+done | tee "$RUN_DIR/install.log"
 ```
 
-For each profile, `cao install` prints `✓ Agent '<name>' installed
-successfully` and the paths of the installed copies.
+For each run copy, `cao install` prints `✓ Agent '<name>' installed
+successfully` and the paths of the files that it writes. `tee` also writes this
+output to `install.log`. The cleanup uses these paths.
 
 ### Step 6. Launch the supervisor
 
@@ -513,21 +543,20 @@ Do these steps in this sequence:
    `already removed`, compare `$SESSION` with the output of `cao session list`.
 3. In Terminal 2, press Ctrl+C. The controller stops and writes
    `last-state.json` to the run directory.
-4. In Terminal 1, remove the installed copies of the profiles of this run. If
-   you set `CAO_HOME_DIR`, change `$HOME/.aws/cli-agent-orchestrator` in the
-   command to that directory.
+4. In Terminal 1, remove the installed files of this run. `cao profile remove`
+   removes the copy in the CAO profile store. Then the loop reads
+   `install.log` and removes each other path that `cao install` printed in
+   Step 5. These paths depend on the provider and on your CAO settings.
 
    ```bash
    for profile in "$RUN_DIR"/profiles/*.md; do
-     name=$(basename "$profile" .md)
-     cao profile remove --yes "$name"
-     rm -f -- "$HOME/.aws/cli-agent-orchestrator/agent-context/$name.md" \
-       "$HOME/.copilot/agents/$name.agent.md"
+     cao profile remove --yes "$(basename "$profile" .md)"
    done
+   sed -n -E 's/^✓ (Context file|[a-z_]+ agent): //p' "$RUN_DIR/install.log" |
+     while IFS= read -r path; do rm -f -- "$path"; done
    ```
 
-   Step 5 printed the paths of the installed copies. The `.agent.md` file
-   exists only for Copilot CLI. Remove only the files of this run.
+   Remove only the files of this run.
 5. Keep `last-state.json` if you need it. Then remove the run directory:
 
    ```bash
@@ -677,7 +706,9 @@ transport. Prepare a new run and try again.
 | `demo.py` | The operator commands `prepare`, `serve`, `status`, and `stop`, and the `connect` stdio relay that the profiles start |
 | `simulation.py` | The shared MuJoCo world: ownership and capability checks, bounded motion, command history, and custody changes |
 | `transport_mcp.py` | The authenticated FastMCP server and its scoped tools. It does no planning and no language interpretation. |
-| `prompts/` | Instructions for the supervisor, the zone workers, and the checker |
+| `transport_supervisor.md` | Agent profile of the supervisor |
+| `transport_zone_worker.md` | Agent profile of the zone workers. All zones use this profile. |
+| `transport_checker.md` | Agent profile of the checker |
 | `site.json` | Default scene: zones `west` and `east`, tote from `stock` to `etch` |
 | `return-site.json` | Alternative scene: zones `stores` and `assembly`, tray from `rack` to `inspection` |
 | `tests/` | Simulator, MCP, and setup tests |

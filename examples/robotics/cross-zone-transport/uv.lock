@@ -226,13 +226,13 @@ dependencies = [
     { name = "httpx" },
     { name = "mujoco" },
     { name = "pydantic" },
+    { name = "pyyaml" },
 ]
 
 [package.dev-dependencies]
 dev = [
     { name = "jsonschema" },
     { name = "pytest" },
-    { name = "pyyaml" },
     { name = "uvicorn" },
 ]
 
@@ -242,13 +242,13 @@ requires-dist = [
     { name = "httpx", specifier = "==0.28.1" },
     { name = "mujoco", specifier = "==3.15.0" },
     { name = "pydantic", specifier = ">=2.11,<3" },
+    { name = "pyyaml", specifier = "==6.0.3" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "jsonschema", specifier = "==4.26.0" },
     { name = "pytest", specifier = "==9.0.3" },
-    { name = "pyyaml", specifier = "==6.0.3" },
     { name = "uvicorn", specifier = "==0.54.0" },
 ]
 
