@@ -7,12 +7,13 @@ import { ConfirmModal } from './ConfirmModal'
 import { InboxPanel } from './InboxPanel'
 import { StatusBadge, STATUS_CONFIG } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
+import { parseServerTime } from '../time'
 
 const STATUS_ORDER = ['PROCESSING', 'IDLE', 'WAITING_USER_ANSWER', 'ERROR', 'COMPLETED', 'UNKNOWN']
 
 function fmtRel(dateStr: string | null | undefined): string | null {
   if (!dateStr) return null
-  const d = new Date(dateStr)
+  const d = parseServerTime(dateStr)
   if (isNaN(d.getTime())) return null
   const diff = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000))
   if (diff < 60) return 'just now'
@@ -28,7 +29,7 @@ function fmtRel(dateStr: string | null | undefined): string | null {
 
 function fmtAbs(dateStr: string | null | undefined): string | null {
   if (!dateStr) return null
-  const d = new Date(dateStr)
+  const d = parseServerTime(dateStr)
   if (isNaN(d.getTime())) return null
   return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
 }
@@ -109,8 +110,8 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
       })
     )
     return filtered.sort((a, b) => {
-      const latestA = Math.max(...a.terminals.map(t => t.last_active ? new Date(t.last_active).getTime() : 0))
-      const latestB = Math.max(...b.terminals.map(t => t.last_active ? new Date(t.last_active).getTime() : 0))
+      const latestA = Math.max(...a.terminals.map(t => t.last_active ? parseServerTime(t.last_active).getTime() : 0))
+      const latestB = Math.max(...b.terminals.map(t => t.last_active ? parseServerTime(t.last_active).getTime() : 0))
       return sortOrder === 'desc' ? latestB - latestA : latestA - latestB
     })
   }, [sessionData, agentTypeFilter, statusFilter, sortOrder, terminalStatuses])
@@ -358,8 +359,8 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
             })
             const statusCounts = getStatusCounts(session.terminals)
             const sortedTerminals = [...visibleTerminals].sort((a, b) => {
-              const ta = a.last_active ? new Date(a.last_active).getTime() : 0
-              const tb = b.last_active ? new Date(b.last_active).getTime() : 0
+              const ta = a.last_active ? parseServerTime(a.last_active).getTime() : 0
+              const tb = b.last_active ? parseServerTime(b.last_active).getTime() : 0
               return sortOrder === 'desc' ? tb - ta : ta - tb
             })
             const grouped: Record<string, TerminalMeta[]> = {}
@@ -377,12 +378,12 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
             const sessionStart = session.terminals.reduce<string | null>((earliest, t) => {
               if (!t.created_at) return earliest
               if (!earliest) return t.created_at
-              return new Date(t.created_at) < new Date(earliest) ? t.created_at : earliest
+              return parseServerTime(t.created_at) < parseServerTime(earliest) ? t.created_at : earliest
             }, null)
             const sessionLastActive = session.terminals.reduce<string | null>((latest, t) => {
               if (!t.last_active) return latest
               if (!latest) return t.last_active
-              return new Date(t.last_active) > new Date(latest) ? t.last_active : latest
+              return parseServerTime(t.last_active) > parseServerTime(latest) ? t.last_active : latest
             }, null)
 
             return (

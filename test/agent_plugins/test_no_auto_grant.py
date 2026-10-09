@@ -191,7 +191,7 @@ class TestEveryGrantSiteUsesTheHelper:
     GRANT_SITES = (
         "services/install_service.py",
         "services/terminal_service.py",
-        "mcp_server/server.py",
+        "utils/caller_tools.py",
         "utils/orchestration.py",
         "cli/commands/launch.py",
     )

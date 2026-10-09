@@ -210,11 +210,27 @@ def _is_terminal_busy(terminal_id: str) -> bool:
         return False
 
 
+def _delete_recycled_terminal_rows(terminal_ids: List[str]) -> None:
+    """Release names only after the existing bulk deletion succeeds."""
+    if delete_terminals_by_ids(terminal_ids):
+        from cli_agent_orchestrator.services import ephemeral_service
+
+        for terminal_id in terminal_ids:
+            ephemeral_service.release(terminal_id, "terminal_gone")
+
+
 async def execute_flow(name: str) -> bool:
     """Execute flow: run script, render prompt, launch session."""
     try:
         logger.info(f"Executing flow: {name}")
         flow = get_flow(name)
+
+        # Advance the schedule before anything below can raise. A failed run
+        # then waits for its next cron slot, as an execute=false run does,
+        # instead of staying due and re-running on every flow_daemon poll.
+        now = datetime.now()
+        next_run = _get_next_run_time(flow.schedule)
+        db_update_flow_run_times(name, last_run=now, next_run=next_run)
 
         # Read flow file
         file_path = Path(flow.file_path)
@@ -238,7 +254,11 @@ async def execute_flow(name: str) -> bool:
             if not script_path.exists():
                 raise ValueError(f"Script not found: {script_path}")
 
-            result = subprocess.run([str(script_path)], capture_output=True, text=True, timeout=30)
+            # Off the loop: the script can run for up to 30s, and execute_flow
+            # runs on the shared event loop, so every request would wait on it.
+            result = await asyncio.to_thread(
+                subprocess.run, [str(script_path)], capture_output=True, text=True, timeout=30
+            )
 
             if result.returncode != 0:
                 logger.error(f"Script failed: {result.stderr}")
@@ -257,11 +277,6 @@ async def execute_flow(name: str) -> bool:
 
             if "output" not in output:
                 raise ValueError("Script output missing 'output' field")
-
-        # Update last_run and calculate next_run
-        now = datetime.now()
-        next_run = _get_next_run_time(flow.schedule)
-        db_update_flow_run_times(name, last_run=now, next_run=next_run)
 
         # Check if we should execute
         if not output["execute"]:
@@ -331,7 +346,7 @@ async def execute_flow(name: str) -> bool:
                     name,
                 )
                 return False
-            delete_terminals_by_ids([str(t["id"]) for t in terminals])
+            _delete_recycled_terminal_rows([str(t["id"]) for t in terminals])
         elif terminals:
             # A previous recycle can have killed the backend session but safely
             # retained its terminal rows because a Grok-owned private home was
@@ -354,7 +369,7 @@ async def execute_flow(name: str) -> bool:
             if not cleanup_complete:
                 logger.warning("Flow %s has retained terminal cleanup; deferring next run", name)
                 return False
-            delete_terminals_by_ids([str(t["id"]) for t in cleanup_rows])
+            _delete_recycled_terminal_rows([str(t["id"]) for t in cleanup_rows])
         terminal = await create_terminal(
             session_name=session_name,
             provider=flow.provider,

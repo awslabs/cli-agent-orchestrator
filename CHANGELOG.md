@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `assign` and `handoff` still refuse them. `ephemeral.enabled` stays off by default.
+- Simulation-only cross-zone robot transport example (#845): existing CAO CLI
+  supervisor, zone-operation, and checker agents share a persistent MuJoCo
+  kinematic world through scoped MCP tools. Includes measured custody handoffs,
+  operator stopping, refusal/interruption cases, alternative robot setup, and
+  isolated optional dependencies; no additional reasoning framework or hardware path.
+  The generated launch command carries an explicit, nonblank operator request.
+- Security groundwork for ephemeral agents (#801): installed profiles whose
+  names match the reserved pattern can no longer be launched or listed;
+  installed-profile APIs and CLI lookups refuse those names, and cao-server
+  warns about them at startup. Terminal responses include a registry-derived
+  `ephemeral` boolean. Ephemeral callers cannot delegate or start workflows
+  unless the operator sets `ephemeral.child_may_delegate` to `true` in
+  `settings.json`. Workflow `run`/`resume`/`start` now refuse when
+  `CAO_TERMINAL_ID` is set but the calling terminal cannot be resolved.
+- Ephemeral profile creation (#801): `create_ephemeral_agent` and
+  `POST /ephemeral-agents` are available behind `ephemeral.enabled`, off by
+  default. Creation stores a pending row, two live files and an archive.
+  Live files remain until collection or release; registry rows and archives are
+  retained. There is no background sweep, so keep the feature disabled outside testing.
+  The live files and archive can be deleted by exact path while no ephemeral
+  terminal exists. Reserved names also refuse remote placement with
+  `remote_placement_not_allowed`. Explicit tiers and efforts temporarily refuse
+  with `tier_not_supported` / `effort_not_supported`; `auto` requires the decision
+  platform. Tier and effort policy keys are not applied yet, so `max_tier` sets
+  no ceiling.
 - Advanced CodeQL analysis for same-repository and fork pull requests, with
   Python, JavaScript/TypeScript, GitHub Actions, and Rust coverage, plus `main`,
   weekly, and manual scans. CI workflow definitions and their `CODEOWNERS`
@@ -68,6 +94,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Audit all tracked npm, Bun, uv, and Cargo dependency graphs in every CI run
+  and weekly, including development dependencies and unfixed advisories. Block
+  every HIGH/CRITICAL finding and scan error, and publish complete inventory and
+  finding summaries. Replace the affected `braces` package in docs, web UI,
+  and MCP Apps with the provenance-verified published guarded fork
+  `@dieub/braces-depth-guard@3.0.3-pn.3`, retaining a small shared patch for
+  acyclic AST parent-link bounds. Verify dev-only inventory with real Trivy,
+  fail non-vacuously on missing consumers, and preserve three-project failure
+  aggregation. No advisory exemptions or fabricated versions are used.
+- Preserve canonical dependency identity for the guarded fork in GitHub's
+  dependency graph: private one-statement local adapters retain existing
+  `braces` imports while the real package remains directly visible.
+  Reject and revert the npm version-2 workaround, which produced an unparsed
+  alias rather than a correctly identified dependency.
+- Vendor the verified guarded-fork tarball so cold installs in all three
+  toolchains survive registry removal without changing package identity,
+  version, license, or integrity. Document the fork's upstream-advisory blind
+  spot and concrete weekly/pre-release maintainer tracking checkpoints.
+- Consolidate the dependency fixes from #888-#890: update `source-map-js`
+  throughout docs, web, and MCP Apps, plus docs `compression` and `proxy-addr`.
+  Clear the remaining Joi, selector-parser, and Tinypool scan findings with
+  upstream fixed releases and explicit overrides where older consumer ranges
+  exclude them. Add source-map, selector, worker-pool, and all-copy lockfile
+  regressions without changing scanner exclusions or severity policy.
+- `copilot_cli` launches no longer time out after 60 seconds on Copilot CLI
+  1.0.91 (#870). Copilot repaints only changed cells in its full-screen view,
+  so the raw output stream never shows a settled idle prompt; the provider now
+  opts into the stale-processing capture check so a quiet terminal is
+  re-checked against the rendered pane, and recognises the footer rows 1.0.91
+  draws below its prompt. When initialization does time out, the server log
+  names the first unrecognised row below the prompt.
+
+- A deferred initial-message redelivery could be confirmed by a repaint of the
+  provider's startup completion box. `StatusMonitor.notify_input_sent` cleared
+  the "IDLE reached from COMPLETED" marker on every arm, so the flap guard from
+  #566 covered only the first attempt: after one swallowed Enter the full re-send
+  armed again, the old COMPLETED was re-stamped past the redelivery boundary,
+  and a task that never ran read as delivered. The marker now survives the arm
+  (it is cleared by any stamped transition instead), so the repaint is refused
+  on every attempt; the narrow pre-dispatch-eviction case this leaves
+  indistinguishable fails toward one resubmission rather than a false
+  confirmation (#566 follow-up)
+
+- **`cao launch` could drop the initial task, or tear down a worker that had
+  already done it.** The initial message is now delivered by the server as
+  part of `POST /sessions` instead of a second request that raced provider
+  startup, and the terminal reads as not-yet-completable until that delivery
+  has been made and the worker has produced output for it. Confirmation is
+  causal: `StatusMonitor` stamps every applied status with the output
+  generation it was earned at, and a send is confirmed only by a started
+  status whose own stamp is newer than the dispatch boundary sampled inside
+  the send -- so neither a completion cached from provider startup, nor an
+  unrelated redraw that merely advances the counter afterwards, nor a
+  redelivery's own keystrokes can pass for this task starting, while a worker
+  fast enough to finish before the send returns is confirmed rather than
+  resubmitted to and deleted. Event-inbox backends (herdr), which have no
+  output generation, are judged by a transition from the status read
+  immediately before dispatch instead of being exempt. The outcome of that
+  delivery is now durable: `GET /terminals/{id}` carries `initial_delivery`
+  (`pending` -> `delivered`, or `failed` with a `kind` and `message`,
+  including `waiting_user_answer` when the worker parked on a prompt and
+  `interrupted` when cao-server restarted before confirming), and `cao launch
+  --async` exits 0 only once it reads `delivered`, non-zero with the reason
+  otherwise, instead of reporting success the moment the session row existed.
+  The synchronous headless run waits for that verdict with an allowance
+  derived from the provider's `provider_init_timeout` (profile override
+  honoured) and only then starts the task's own 300s budget, so a slow but
+  valid init no longer eats the task's time (#566)
+
+- Mitigate the documentation toolchain's `braces` nesting-depth vulnerability
+  with a local patch that preserves the published parser's behavior, and update
+  `http-cache-semantics` to 4.3.0. Document the patch and disputed cache advisory,
+  and run dependency regression checks as part of the existing site build
+  without suppressing alerts or changing scan policy.
+- Address five baseline CodeQL alerts without suppressions: remove filesystem
+  probes from plugin source-kind inference, confine Kiro policy-file inspection
+  to its canonical agent directory, replace the flagged Kimi footer and swarm
+  status regex constructs, and check canonical schema-source metadata rather
+  than a hostname substring in policy prose. Explicit local plugin paths,
+  legacy Kiro filename mapping, and Kimi's content/chrome boundaries remain
+  covered by regression cases.
 - Run all four required CodeQL language jobs inside the main CI workflow,
   including full CI reruns, instead of relying on a separate PR trigger.
   Weekly and manual scans share the same maintainer-owned scan steps, with
@@ -461,6 +568,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The MCP server now requires fastmcp 3.2.0 or newer (was 2.14.0), the
+  version CI tests. fastmcp 2.x does not export `ToolResult` from
+  `fastmcp.tools`, so `cao-mcp-server` would not start on it. Upgrading
+  CAO upgrades fastmcp (#801).
+
 - record the originating install handle in each shared context copy's frontmatter
   (`x-cao-source-stem`), so a reinstall can tell its own prior copy apart from a
   different profile that resolves to the same OpenCode agent id. The key is
@@ -482,6 +594,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently, so `limit=500` keeps working rather than becoming a 422.
 
 ### Security
+
+- Require `shell-quote ^1.11.0` in the documentation toolchain to fix
+  CVE-2026-102422, with comment-boundary and ordinary-argument regressions.
+  No runtime agent dependency or security-gate policy changes.
+
+- Workflow execution and resumption through MCP now enforce the calling
+  terminal's existing `@cao-mcp-server` or `*` grant, including installed
+  profiles. Restricted callers can no longer bypass direct-delegation checks
+  through `workflow_run`, `workflow_resume`, or `workflow_start`. Operator
+  calls remain unchanged, and ephemeral delegation still requires its separate
+  opt-in (#892).
 
 - **Kiro CLI, the default provider, now applies the CAO tool policy.** `cao
   install --provider kiro_cli` writes the resolved `allowedTools` into the agent
@@ -1495,4 +1618,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump to v0.51.0, update method name (#31)
 
 - accept optional U+03BB (λ) after % in kiro and q CLIs (#44)
-

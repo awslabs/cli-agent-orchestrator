@@ -640,6 +640,7 @@ class TestInstallSkillCatalogBaking:
     @pytest.fixture
     def install_workspace(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
         """Patch install and skills paths into a temp workspace."""
+        monkeypatch.setattr("cli_agent_orchestrator.utils.env.load_env_vars", lambda: {})
         local_store_dir = tmp_path / "agent-store"
         context_dir = tmp_path / "agent-context"
         kiro_dir = tmp_path / "kiro"
@@ -1190,6 +1191,57 @@ class TestKiroInstallPredatesNativeEnforcement:
         (install_paths["kiro_dir"] / "odd.json").write_text(json.dumps({"tools": "*"}))
         assert installed_kiro_tools("odd") is None
 
-    def test_profile_name_is_flattened_like_the_installer_does(self, install_paths):
-        (install_paths["kiro_dir"] / "a_b.json").write_text(json.dumps({"tools": ["*"]}))
-        assert installed_kiro_tools("a/b") in (["*"], None)
+    @pytest.mark.parametrize(
+        "profile_name,filename",
+        [
+            ("a/b", "a__b.json"),
+            (r"a\b", "a__b.json"),
+            ("../../outside", "..__..__outside.json"),
+            (r"..\..\outside", "..__..__outside.json"),
+            (r"C:\outside", "C:__outside.json"),
+            ("caf\u00e9 reviewer", "caf\u00e9 reviewer.json"),
+        ],
+    )
+    def test_profile_name_is_flattened_like_the_installer_does(
+        self, install_paths, profile_name, filename
+    ):
+        (install_paths["kiro_dir"] / filename).write_text(json.dumps({"tools": ["read"]}))
+        assert installed_kiro_tools(profile_name) == ["read"]
+
+    @pytest.mark.parametrize("outside_dir", ["outside", "kiro-neighbor"])
+    def test_outside_symlink_is_refused_before_reading(self, install_paths, tmp_path, outside_dir):
+        outside = tmp_path / outside_dir / "agent.json"
+        outside.parent.mkdir()
+        outside.write_text(json.dumps({"tools": ["*"]}))
+        (install_paths["kiro_dir"] / "linked.json").symlink_to(outside)
+
+        with patch.object(Path, "read_text") as read:
+            with pytest.raises(ValueError, match="beneath the agent directory"):
+                installed_kiro_tools("linked")
+        read.assert_not_called()
+
+    def test_link_to_agent_directory_itself_is_refused(self, install_paths):
+        directory = install_paths["kiro_dir"]
+        (directory / "linked.json").symlink_to(directory, target_is_directory=True)
+
+        with pytest.raises(ValueError, match="beneath the agent directory"):
+            installed_kiro_tools("linked")
+
+    def test_symlink_within_agent_directory_remains_readable(self, install_paths):
+        target = install_paths["kiro_dir"] / "real.json"
+        target.write_text(json.dumps({"tools": ["read"]}))
+        (install_paths["kiro_dir"] / "linked.json").symlink_to(target)
+
+        assert installed_kiro_tools("linked") == ["read"]
+
+    def test_configured_agent_directory_can_be_a_symlink(
+        self, install_paths, tmp_path, monkeypatch
+    ):
+        (install_paths["kiro_dir"] / "sup.json").write_text(json.dumps({"tools": ["read"]}))
+        alias = tmp_path / "agent-directory"
+        alias.symlink_to(install_paths["kiro_dir"], target_is_directory=True)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.install_service.KIRO_AGENTS_DIR", alias
+        )
+
+        assert installed_kiro_tools("sup") == ["read"]

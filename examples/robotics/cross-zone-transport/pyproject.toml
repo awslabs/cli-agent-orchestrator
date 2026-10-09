@@ -1,0 +1,20 @@
+[project]
+name = "cao-cross-zone-transport"
+version = "0.1.0"
+description = "Simulation-only ownership-zone transport with existing CAO CLI agents"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = [
+    "fastmcp==3.2.0",
+    "httpx==0.28.1",
+    "mujoco==3.15.0",
+    "pydantic>=2.11,<3",
+]
+
+[dependency-groups]
+dev = ["jsonschema==4.26.0", "pytest==9.0.3", "pyyaml==6.0.3", "uvicorn==0.54.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"

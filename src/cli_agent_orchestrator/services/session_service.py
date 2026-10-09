@@ -498,6 +498,7 @@ def get_session(session_name: str) -> Dict:
         # single source of truth and is backend-aware (tmux push vs herdr
         # native), so derive it here rather than persisting a stale column.
         from cli_agent_orchestrator.services.status_monitor import status_monitor
+        from cli_agent_orchestrator.services.terminal_service import reported_status
 
         for terminal in terminals:
             failure = failures.get(str(terminal["id"]))
@@ -507,7 +508,13 @@ def get_session(session_name: str) -> Dict:
             elif not backend_exists:
                 terminal["status"] = "unknown"
             else:
-                terminal["status"] = status_monitor.get_status(terminal["id"]).value
+                # reported_status keeps this in step with GET /terminals/{id}: a
+                # terminal whose accepted initial message has not been dispatched
+                # yet must not read IDLE/COMPLETED anywhere a client can see it
+                # (#566).
+                terminal["status"] = reported_status(
+                    terminal["id"], status_monitor.get_status(terminal["id"])
+                ).value
         return {"session": session_data, "terminals": terminals}
 
     except Exception as e:
@@ -787,7 +794,12 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
             # loop already cleared them. Deferred ids are excluded: their rows
             # are the retry handle for cleanup that has NOT happened yet.
             try:
-                delete_terminals_by_ids([i for i in incarnation_ids if i not in deferred_ids])
+                sweep_ids = [i for i in incarnation_ids if i not in deferred_ids]
+                if delete_terminals_by_ids(sweep_ids):
+                    from cli_agent_orchestrator.services import ephemeral_service
+
+                    for terminal_id in sweep_ids:
+                        ephemeral_service.release(terminal_id, "terminal_gone")
             except Exception as e:
                 logger.warning(f"Failed to sweep registry rows for {session_name}: {e}")
                 result["errors"].append(

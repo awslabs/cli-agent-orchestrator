@@ -1,0 +1,35 @@
+{
+  "zones": {
+    "west": {"bounds": [-3, -1, 0, 1]},
+    "east": {"bounds": [0, -1, 3, 1]}
+  },
+  "locations": {
+    "stock": {"xy": [-2, 0], "zones": ["west"]},
+    "dock": {"xy": [0, 0], "zones": ["west", "east"], "handoff": true},
+    "etch": {"xy": [2, 0], "zones": ["east"]}
+  },
+  "robots": {
+    "cart-west": {
+      "zone": "west",
+      "at": "stock",
+      "locations": ["stock", "dock"],
+      "payload_kg": 8,
+      "fixtures": ["tote_clamp"],
+      "speed_m_s": 1
+    },
+    "cart-east": {
+      "zone": "east",
+      "at": "dock",
+      "locations": ["dock", "etch"],
+      "payload_kg": 5,
+      "fixtures": ["tote_clamp"],
+      "speed_m_s": 1
+    }
+  },
+  "payloads": {
+    "tote": {"at": "stock", "owner": "west", "mass_kg": 3, "fixture": "tote_clamp"}
+  },
+  "step_seconds": 0.02,
+  "arrival_tolerance_m": 0.01,
+  "action_timeout_seconds": 15
+}

@@ -22,6 +22,72 @@ npm run build
 
 This generates static content into the `build` directory.
 
+## Dependency security
+
+Use npm 10+ and `npm ci` to install the committed dependency graph and apply its local
+security patch. Do not disable install scripts: `postinstall` runs
+`patch-package --patch-dir ../patches --error-on-fail`. `npm run build` runs
+`npm run test:dependencies` before assembling the courses and site; the same
+checks can be run independently while updating dependencies.
+
+Relevant dependency security controls include:
+
+- **`braces`** resolves through the private local `braces-compat` adapter to the
+  canonical published third-party MIT fork
+  `@dieub/braces-depth-guard@3.0.3-pn.3`, shared with the web UI and
+  MCP Apps toolchains. The unchanged fork tarball is
+  [vendored in the repository](../vendor/README.md), so a cold install does not
+  depend on its registry availability. The adapter only re-exports the fork;
+  keep `.npmrc`'s `install-links=false` setting and include `braces-compat/`
+  and `../vendor/` when installing the project. It replaces the affected original while retaining
+  quoted/escaped pattern behavior, and bounds parsing and recursive AST depth
+  to 100 (or a lower `maxDepth`). Both `chokidar` and `micromatch` resolve the
+  fork under their existing `braces` import.
+  [`../patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch`](../patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch)
+  retains our additional bound on acyclic ancestor traversal; the fork already
+  rejects parent cycles. This is not an official fixed upstream release or a
+  scanner exemption. See [SECURITY.md](../SECURITY.md#local-dependency-mitigations)
+  for source/provenance verification, the exact-version requirement, and
+  conditions for returning to an official release.
+- **`http-cache-semantics`** requires `^4.3.0`, outside the affected range
+  currently recorded for
+  [GHSA-ch52-4w7c-c8xp](https://github.com/advisories/GHSA-ch52-4w7c-c8xp).
+  The advisory's `max-stale` interpretation is
+  [disputed by the maintainer](https://github.com/kornelski/http-cache-semantics/issues/56#issuecomment-5975759591);
+  this upgrade does not claim to change that behavior. Checks preserve
+  non-storage of private/no-store responses and permitted reuse of stale
+  public responses, and cover the release's stricter wildcard `Vary` handling.
+- **`postcss-selector-parser`** requires `^7.1.6` for both the v6 and v7
+  consumer ranges. The v6 line has no fixed release for CVE-2026-104844.
+  Selector serialization/class traversal regressions and the full site build
+  check compatibility with the existing PostCSS plugins.
+- **`shell-quote`** requires `^1.11.0` to fix
+  [GHSA-pqg4-j6r4-53mv](https://github.com/advisories/GHSA-pqg4-j6r4-53mv)
+  (CVE-2026-102422). It rejects line terminators in arguments after a comment
+  token. Tests exercise the dependency resolved by `launch-editor`, including
+  parsed comments and non-adjacent arguments, while preserving ordinary quoting
+  and multiline arguments before a comment.
+- **`tinypool`** is pinned to `2.1.2`, which fixes CVE-2026-104848 and
+  CVE-2026-104849. Docusaurus still requests v1; v2 supports Node 20 and Node
+  22+, matching the tested site toolchains. The dependency suite
+  exercises worker creation, task execution, cleanup, and the worker-data/state
+  layout consumed by Docusaurus. Keep this override until Docusaurus selects a
+  fixed version itself.
+
+The lockfile also includes upstream security releases for `source-map-js`
+(`1.2.2`), `compression` (`1.8.2`), `proxy-addr` (`2.0.8`), and `joi`
+(`17.13.8`). Source-map regressions cover ordinary mappings, invalid offsets,
+and direct/nested aggregate line limits. Update every affected toolchain rather
+than only the lockfile named by an individual Dependabot PR.
+
+These dependencies belong to the documentation build/development toolchain;
+GitHub Pages serves the resulting static site. No alert is suppressed.
+
+The repository's [Dependency Security gate](../SECURITY.md#full-dependency-gate)
+audits the complete locked graphs on every PR/`main` CI run and weekly. It
+reports installed mitigation verification separately from open advisories.
+Changes to the vendored archive, shared patch, or brace tests also trigger the docs site build.
+
 ## Adding Documentation
 
 1. Add markdown files to `docs/` following the existing directory structure

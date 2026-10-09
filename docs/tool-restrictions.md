@@ -218,8 +218,9 @@ CAO defines a universal tool vocabulary (`execute_bash`, `fs_read`, `fs_write`, 
 Provider-native restrictions cannot reach CAO's own MCP tools. `TOOL_MAPPING` translates the CAO
 vocabulary into native tool names, and MCP server references have none, so `get_disallowed_tools`
 skips every `@`-prefixed entry. A profile without `@cao-mcp-server` therefore still reached
-`assign`, `handoff` and `assign_elastic`, the tools that launch an agent under a caller-chosen
-profile.
+`assign`, `handoff` and `assign_elastic`, which launch an agent under a caller-chosen
+profile. `workflow_run`, `workflow_resume` and `workflow_start` can dispatch agents
+through a workflow and require the same permission.
 
 These check the caller themselves, at the MCP boundary:
 
@@ -234,6 +235,11 @@ These check the caller themselves, at the MCP boundary:
 
 `cao assign` and `cao handoff` on the command line are unaffected: the operator is not an agent
 and no profile allowlist applies to them.
+
+Installed workflow callers with an explicit restricted allowlist must include
+`@cao-mcp-server` to execute or resume workflows; installed profiles do not bypass
+this check. Ephemeral callers additionally remain subject to
+`ephemeral.child_may_delegate`. Read-only workflow inspection is unchanged.
 
 ## How Overrides Work
 

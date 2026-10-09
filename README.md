@@ -136,6 +136,8 @@ provider override while keeping the same sequence.
   outcomes into lessons and promoted instructions.
 - [AI-DLC portfolio example](examples/aidlc-portfolio/README.md): coordinate
   parallel AI-DLC intents across repositories and isolated worktrees.
+- [Cross-zone robot transport](examples/robotics/cross-zone-transport/README.md):
+  coordinate simulated transport, measured custody handoffs, and independent checks.
 - [Tool restrictions](docs/tool-restrictions.md): roles, allowlists, and
   provider enforcement.
 - [Kubernetes deployment](examples/cao-clusters/kubernetes/eks/README.md): run a supervisor and worker fleet on
@@ -144,6 +146,7 @@ provider override while keeping the same sequence.
 
 ### Configure and integrate
 
+- [Ephemeral agents](docs/ephemeral-agents.md): opt-in create-only profiles and their limits.
 - [Agent profiles](docs/agent-profile.md): profile schema, discovery, provider
   selection, and overrides.
 - [HTTP API and PTY WebSocket](docs/api.md): route-family overview and terminal

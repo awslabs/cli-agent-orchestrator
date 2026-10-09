@@ -978,7 +978,7 @@ def test_stale_processing_capture_opt_in_does_not_certify_deferred_task_pickup()
     with (
         patch.object(ts, "_worker_is_started_direct") as direct_probe,
         patch.object(ts, "_message_visible_in_box", return_value=False),
-        patch.object(ts, "send_input") as resend,
+        patch.object(ts, "dispatch_input") as resend,
     ):
         assert ts.redeliver_dropped_message("test-terminal", "new task", 1, provider) is False
 

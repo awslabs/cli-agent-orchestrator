@@ -8,7 +8,8 @@ from typing import Annotated, Any, Dict, List, Optional, Tuple, Union
 
 import requests
 from fastmcp import FastMCP
-from pydantic import Field
+from fastmcp.tools import Tool, ToolResult
+from pydantic import Field, WithJsonSchema
 
 from cli_agent_orchestrator.constants import (
     ADVERTISED_URL_ENV,
@@ -41,6 +42,9 @@ from cli_agent_orchestrator.services.outcome_service import (
     LEARNING_DISABLED_MESSAGE,
 )
 from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT
+from cli_agent_orchestrator.utils.caller_tools import (
+    caller_effective_allowed_tools as _caller_effective_allowed_tools,
+)
 from cli_agent_orchestrator.utils.orchestration import (
     ENABLE_SENDER_ID_INJECTION,
     REMOTE_CONNECT_TIMEOUT,
@@ -719,6 +723,19 @@ async def assign_elastic(
     denied = await asyncio.to_thread(_tool_denied_reason, "assign_elastic")
     if denied:
         return {"success": False, "terminal_id": None, "elastic": True, "message": denied}
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    if agent_profiles.routes_to_ephemeral_store(agent_profile):
+        from cli_agent_orchestrator.services.ephemeral_service import log_refusal
+
+        text = f"remote_placement_not_allowed: ephemeral agent '{agent_profile}' can only launch on the node that created it; use assign or handoff"
+        log_refusal(
+            "remote_placement_not_allowed",
+            os.environ.get("CAO_TERMINAL_ID"),
+            agent_profile,
+            "use assign or handoff",
+        )
+        return {"success": False, "terminal_id": None, "elastic": True, "message": text}
     try:
         callback_terminal_id = _current_terminal_id()
         if not callback_terminal_id:
@@ -1384,6 +1401,7 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
             "provider": meta["provider"],
             "agent_profile": meta.get("agent_profile"),
             "allowed_tools": meta.get("allowed_tools"),
+            "ephemeral": meta.get("ephemeral", False),
         }
         # Try to get working directory for project scope resolution. Same header
         # reasoning as above — best-effort, so a failure degrades project scope
@@ -1433,38 +1451,14 @@ def _caller_has_store_lesson_capability(caller_profile: Optional[str]) -> bool:
 CAO_MCP_SERVER_SELECTOR = "@cao-mcp-server"
 
 
-def _caller_effective_allowed_tools(context: Dict[str, Any]) -> Optional[List[str]]:
-    """Effective CAO allowlist for the calling terminal, or None if unresolvable.
-
-    Mirrors ``create_terminal``: a recorded ``allowed_tools`` IS the effective
-    list, while ``None`` means "resolve from the agent profile" rather than
-    "unrestricted", so the profile goes through the same
-    ``resolve_allowed_tools`` the launch path uses.
-    """
-    recorded = context.get("allowed_tools")
-    if recorded is not None:
-        return list(recorded)
-
-    profile_name = context.get("agent_profile")
-    if not profile_name:
-        return None
-
-    from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
-    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-    from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
-
-    profile = load_agent_profile(profile_name)
-    mcp_server_names = grantable_server_names(profile)
-    return resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
-
-
 def _tool_denied_reason(tool_name: str) -> Optional[str]:
     """Reason the calling terminal's allowlist bars ``tool_name``, or None to allow.
 
     ``assign``, ``handoff`` and ``assign_elastic`` spawn a terminal under a
-    caller-chosen ``agent_profile``, so an agent reaching them can mint a new
-    identity with its own memory scope under any profile installed on the box
-    (#671). The
+    caller-chosen ``agent_profile``. ``workflow_run``, ``workflow_resume`` and
+    ``workflow_start`` can dispatch the same work through a workflow. An agent
+    reaching any of them can mint a new identity with its own memory scope
+    under another installed profile (#671). The
     provider-native restrictions built by ``utils/tool_mapping`` cannot cover
     that: ``get_disallowed_tools`` skips every ``@``-prefixed entry because MCP
     server references have no native tool names, so CAO's own MCP surface is
@@ -1504,6 +1498,25 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
             "terminal could not be resolved"
         )
 
+    if tool_name == "create_ephemeral_agent" and context.get("ephemeral"):
+        return "max_depth_exceeded: ephemeral agents cannot create ephemeral agents (ephemeral.max_depth=1)"
+
+    if tool_name in {
+        "assign",
+        "handoff",
+        "assign_elastic",
+        "workflow_run",
+        "workflow_resume",
+        "workflow_start",
+    }:
+        try:
+            from cli_agent_orchestrator.services.settings_service import child_may_delegate
+
+            if context.get("ephemeral") and not child_may_delegate():
+                return f"'{tool_name}' is not permitted: ephemeral child delegation requires ephemeral.child_may_delegate"
+        except Exception as exc:
+            return f"cannot authorize '{tool_name}': ephemeral delegation policy could not be resolved ({exc})"
+
     try:
         allowed = _caller_effective_allowed_tools(context)
     except Exception as e:  # noqa: BLE001  (an unknown result must not dispatch)
@@ -1523,6 +1536,184 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
         f"'{tool_name}' is not permitted: the calling terminal's allowed tools do not "
         f"include '{CAO_MCP_SERVER_SELECTOR}'"
     )
+
+
+async def create_ephemeral_agent(
+    purpose: Annotated[Any, WithJsonSchema({"type": "string"})],
+    brief: Annotated[Any, WithJsonSchema({"type": "string"})],
+    tools: Annotated[
+        Any,
+        WithJsonSchema(
+            {
+                "anyOf": [
+                    {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["fs_read", "fs_list", "fs_write", "execute_bash", "web_fetch"],
+                        },
+                    },
+                    {"type": "null"},
+                ]
+            }
+        ),
+    ] = None,
+    provider: Annotated[
+        Any,
+        WithJsonSchema(
+            {"anyOf": [{"type": "string", "enum": ["claude_code", "codex"]}, {"type": "null"}]}
+        ),
+    ] = None,
+    model_tier: Annotated[
+        Any,
+        WithJsonSchema(
+            {
+                "anyOf": [
+                    {"type": "string", "enum": ["small", "medium", "large", "auto"]},
+                    {"type": "null"},
+                ]
+            }
+        ),
+    ] = None,
+    effort: Annotated[
+        Any,
+        WithJsonSchema(
+            {
+                "anyOf": [
+                    {"type": "string", "enum": ["low", "medium", "high", "auto"]},
+                    {"type": "null"},
+                ]
+            }
+        ),
+    ] = None,
+    description: Annotated[
+        Any, WithJsonSchema({"anyOf": [{"type": "string"}, {"type": "null"}]})
+    ] = None,
+) -> Dict[str, Any]:
+    """Create and store a bounded agent profile; these names cannot launch yet.
+
+    The CAO-recorded tool list is bounded by the creator's effective list.
+    This is not an OS privilege boundary or a per-tool MCP restriction.
+    Codex tools are advisory when the operator enables Codex. The feature
+    defaults off; see docs/ephemeral-agents.md for the full honesty statement.
+    """
+    return await _create_ephemeral_from_arguments(
+        {
+            "purpose": purpose,
+            "brief": brief,
+            "description": description,
+            "provider": provider,
+            "tools": tools,
+            "model_tier": model_tier,
+            "effort": effort,
+        }
+    )
+
+
+async def _create_ephemeral_from_arguments(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Gate before forwarding raw arguments to the sole, server-side validator."""
+    from cli_agent_orchestrator.services.ephemeral_service import log_refusal
+
+    caller_id = os.environ.get("CAO_TERMINAL_ID")
+    if not caller_id:
+        rule, detail = "creator_unresolved", "a registered calling terminal is required"
+    else:
+        denied = await asyncio.to_thread(_tool_denied_reason, "create_ephemeral_agent")
+        if denied:
+            rule = (
+                "max_depth_exceeded"
+                if "max_depth_exceeded" in denied
+                else (
+                    "creator_unresolved" if "cannot authorize" in denied else "tool_exceeds_creator"
+                )
+            )
+            detail = (
+                "ephemeral agents cannot create ephemeral agents"
+                if rule == "max_depth_exceeded"
+                else (
+                    "@cao-mcp-server"
+                    if rule == "tool_exceeds_creator"
+                    else "calling terminal could not be resolved"
+                )
+            )
+        else:
+            payload = {"spec_version": 1, **arguments}
+            try:
+                response = await asyncio.to_thread(
+                    requests.post,
+                    f"{API_BASE_URL}/ephemeral-agents",
+                    params={"caller_id": caller_id},
+                    json=payload,
+                    headers=mcp_utils._auth_headers() or None,
+                    timeout=_mcp_timeout(),
+                )
+                data = response.json()
+                if response.status_code == 201:
+                    return data
+                error = data.get("detail", {}) if isinstance(data, dict) else None
+                if not isinstance(error, dict):
+                    # Auth refusals use string details, outside the policy error contract.
+                    log_refusal("unexpected_failure", caller_id, None, "")
+                    return {
+                        "success": False,
+                        "rule": "unexpected_failure",
+                        "message": "ephemeral policy: unexpected_failure",
+                    }
+                return {
+                    "success": False,
+                    "rule": error.get("rule", "unexpected_failure"),
+                    "message": error.get("message", "ephemeral policy: unexpected_failure"),
+                }
+            except requests.exceptions.JSONDecodeError:
+                # requests' JSON error is also a RequestException; it is not a network failure.
+                rule, detail = "unexpected_failure", ""
+            except requests.RequestException:
+                rule, detail = "creator_unresolved", "cao-server could not be reached"
+            except ValueError:
+                rule, detail = "unexpected_failure", ""
+    log_refusal(rule, caller_id, None, detail)
+    return {
+        "success": False,
+        "rule": rule,
+        "message": f"ephemeral policy: {rule}" + (f" {detail}" if detail else ""),
+    }
+
+
+class _EphemeralCreateTool(Tool):
+    """Use normal tool resolution, but never bind untrusted creation arguments."""
+
+    async def run(self, arguments: Dict[str, Any]) -> ToolResult:
+        return ToolResult(structured_content=await _create_ephemeral_from_arguments(arguments))
+
+
+def _register_ephemeral_tool(target: FastMCP, enabled: Any) -> None:
+    """Register only on literal operator opt-in; agent terminals must restart to see it."""
+    if enabled is True:
+        # The function supplies documentation/schema only, not the execution binder.
+        advertised = Tool.from_function(create_ephemeral_agent)
+        target.add_tool(
+            _EphemeralCreateTool(
+                name=advertised.name,
+                description=advertised.description,
+                parameters=advertised.parameters,
+                output_schema=advertised.output_schema,
+            )
+        )
+
+
+def _ephemeral_enabled_at_startup() -> bool:
+    from cli_agent_orchestrator.services.settings_service import (
+        SettingsUnreadableError,
+        get_ephemeral_settings,
+    )
+
+    try:
+        return get_ephemeral_settings()["enabled"] is True
+    except SettingsUnreadableError:
+        return False
+
+
+_register_ephemeral_tool(mcp, _ephemeral_enabled_at_startup())
 
 
 @mcp.tool()
@@ -2166,6 +2357,10 @@ async def workflow_run(
     (``_check_run_id_available``, 409 on collision), surfaced through the envelope.
     The tool stays blocking (FR-5.2); the async ``:submit`` spine is a separate seam.
     """
+    denied = await asyncio.to_thread(_tool_denied_reason, "workflow_run")
+    if denied:
+        return {"ok": False, "error": denied}
+
     payload: Dict[str, Any] = {"name_or_path": name_or_path, "inputs": inputs or {}}
     # Forward the id ONLY when a real value was supplied. ``isinstance(..., str)``
     # (not ``is not None``) so the omitted case is byte-identical to today whether
@@ -2246,6 +2441,10 @@ async def workflow_resume(
     values. The tool's contract is otherwise unchanged: a 400 from the route is still
     just another ``ok=False`` detail.
     """
+    denied = await asyncio.to_thread(_tool_denied_reason, "workflow_resume")
+    if denied:
+        return {"ok": False, "error": denied}
+
     # ``decisions`` arrives as a real dict from an MCP client (fastmcp resolves the
     # declared default through the generated model) and as the ``FieldInfo`` SENTINEL
     # when a Python caller omits the argument entirely — this module's tools are
@@ -2354,6 +2553,10 @@ async def workflow_start(
     blocking tool); admission (uniqueness) is the server's and a collision surfaces
     as ``ok=False``.
     """
+    denied = await asyncio.to_thread(_tool_denied_reason, "workflow_start")
+    if denied:
+        return {"ok": False, "error": denied}
+
     payload: Dict[str, Any] = {"name_or_path": name_or_path, "inputs": inputs or {}}
     # Forward the id ONLY when a real value was supplied — ``isinstance(..., str)``
     # (not ``is not None``) so the omitted case is byte-identical whether invoked

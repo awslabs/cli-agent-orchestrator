@@ -121,6 +121,25 @@ Override via REST API, Web UI Settings page, `cao config set agents.dirs.<provid
 
 `agents.roles` defines custom [role](../CODEBASE.md) → `allowedTools` bundles, layered on top of the built-in `supervisor` / `reviewer` / `developer` / `workflow_scout` roles.
 
+### Ephemeral agents (`ephemeral`)
+
+Creation and owner-only HTTP launch are opt-in. `assign` and `handoff` still refuse
+ephemeral names.
+Only JSON `true` enables the tool, and agent terminals must restart to see it.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `false` | Enable ephemeral creation, claims and owner-only HTTP launch. |
+| `allowed_providers` | `["claude_code"]` | Providers permitted for creation; re-checked at every claim. Codex is an operator opt-in. |
+| `max_brief_bytes` | `8192` | Maximum UTF-8 bytes after brief normalization. |
+| `pending_ttl_seconds` | `900` | Checked at claim; expired names are collected when touched. |
+| `claim_lease_seconds` | `60` | Lease from claim to terminal creation. |
+| `max_depth` | `1` | Only integer 1 is supported; ephemeral callers cannot create ephemerals. |
+| `child_may_delegate` | `false` | Permit the existing ephemeral delegation/workflow tools; never permits ephemeral creation by an ephemeral caller. |
+
+See [Ephemeral agents](ephemeral-agents.md) for policy limits, ignored tier/effort keys,
+and the lifecycle residue warning. Keep the feature disabled outside testing.
+
 ### Skills (`skills`)
 
 Skills (loaded on demand via the `load_skill` MCP tool) are discovered from, in order:

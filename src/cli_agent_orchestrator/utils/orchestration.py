@@ -421,6 +421,34 @@ def _resolve_child_allowed_tools(
     return ",".join(child_allowed)
 
 
+def _remote_ephemeral_refusal(name: str, target_host: Optional[str]) -> Optional[str]:
+    """Refuse before contacting another node; the name belongs to its creator node."""
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    if target_host and agent_profiles.routes_to_ephemeral_store(name):
+        from cli_agent_orchestrator.services.ephemeral_service import log_refusal
+
+        log_refusal(
+            "remote_placement_not_allowed",
+            os.environ.get("CAO_TERMINAL_ID"),
+            name,
+            "omit target_host",
+        )
+        return f"remote_placement_not_allowed: ephemeral agent '{name}' can only launch on the node that created it; omit target_host"
+    return None
+
+
+def _refuse_ephemeral_target_without_claim(name: str) -> None:
+    """Refuse reserved targets while orchestration does not carry launch claims."""
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    if agent_profiles.routes_to_ephemeral_store(name):
+        agent_profiles.resolve_agent_profile_source(name)
+        raise ValueError(
+            "Ephemeral targets cannot be launched through assign or handoff in this version."
+        )
+
+
 def _create_terminal(
     agent_profile: str,
     working_directory: Optional[str] = None,
@@ -488,6 +516,8 @@ def _create_terminal(
     Raises:
         Exception: If terminal creation fails
     """
+    _refuse_ephemeral_target_without_claim(agent_profile)
+
     provider = DEFAULT_PROVIDER
     parent_allowed_tools = None
 
@@ -747,6 +777,8 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
     the single combined run-step call, while preserving the same-session /
     caller_id / allowed_tools behavior the old six-call path had.
     """
+    _refuse_ephemeral_target_without_claim(agent_profile)
+
     current_terminal_id = _current_terminal_id()
     if not current_terminal_id:
         return HandoffContext(
@@ -1186,6 +1218,17 @@ async def _handoff_impl(
     table), so a keyed retry that lands on a different ``target_host`` could
     not dedupe even if the plumbing were threaded.
     """
+    refusal = _remote_ephemeral_refusal(agent_profile, target_host)
+    if refusal:
+        return HandoffResult(
+            success=False,
+            message=refusal,
+            output=None,
+            terminal_id=None,
+            job_id=None,
+            pending=False,
+        )
+
     start_time = time.time()
     terminal_id: Optional[str] = None
 
@@ -1600,6 +1643,10 @@ def _assign_impl(
     worker-side ``send_message`` uses to deliver replies to this node.
     Omitting ``target_host`` preserves local behavior byte-for-byte.
     """
+    refusal = _remote_ephemeral_refusal(agent_profile, target_host)
+    if refusal:
+        return {"success": False, "terminal_id": None, "message": refusal}
+
     terminal_id: Optional[str] = None
     try:
         # Fail fast before creating the worker terminal when CAO_TERMINAL_ID is

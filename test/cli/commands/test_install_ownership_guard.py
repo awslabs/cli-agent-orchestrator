@@ -29,6 +29,14 @@ from cli_agent_orchestrator.services.install_service import (
 )
 from cli_agent_orchestrator.utils import skill_injection
 
+
+@pytest.fixture(autouse=True)
+def no_managed_env(monkeypatch):
+    """Ownership tests use supplied values, never the operator environment file."""
+    monkeypatch.setattr("cli_agent_orchestrator.utils.env.load_env_vars", lambda: {})
+    monkeypatch.setattr(install_service, "load_env_vars", lambda: {})
+
+
 # ---------------------------------------------------------------------------
 # Finding 1: occupancy comes from the destination, not from lossy discovery.
 # ---------------------------------------------------------------------------
@@ -180,8 +188,8 @@ class TestInstalledIdIsTheFilenameNotTheParsedName:
     def alias_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
             install_service,
-            "resolve_env_vars",
-            lambda raw: raw.replace("${ALIAS}", "shared"),
+            "load_env_vars",
+            lambda: {"ALIAS": "shared"},
         )
 
     def test_placeholder_named_profile_owns_its_resolved_id(
