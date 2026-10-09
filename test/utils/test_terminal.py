@@ -761,16 +761,84 @@ class TestWaitForInitialDelivery:
         assert "t1" in str(excinfo.value)
         assert "Timed out" in str(excinfo.value)
 
-    def test_transport_failure_raises_click_exception(self):
+    @staticmethod
+    def _http_error(status_code):
+        import requests
+
+        response = MagicMock(status_code=status_code)
+        return requests.exceptions.HTTPError(f"{status_code} from server", response=response)
+
+    @pytest.mark.parametrize(
+        "transient",
+        ["connection_error", "read_timeout", "server_error"],
+    )
+    @patch("cli_agent_orchestrator.utils.terminal.time.sleep")
+    def test_keeps_polling_through_a_transient_transport_failure(self, mock_sleep, transient):
+        """#882: the server is still initializing and delivering, so one failed poll is not a verdict."""
+        import requests
+
+        from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
+
+        failure = {
+            "connection_error": requests.exceptions.ConnectionError("refused"),
+            "read_timeout": requests.exceptions.ReadTimeout("read timed out"),
+            "server_error": None,
+        }[transient]
+        if failure is None:
+            first = MagicMock()
+            first.raise_for_status.side_effect = self._http_error(503)
+        else:
+            first = failure
+        delivered = {"status": "processing", "initial_delivery": {"state": "delivered"}}
+        with patch(
+            "cli_agent_orchestrator.utils.terminal.api_http.get",
+            side_effect=[first, self._resp(delivered)],
+        ) as g:
+            payload = wait_for_initial_delivery("t1", timeout=60)
+        assert payload == delivered
+        assert g.call_count == 2
+
+    @pytest.mark.parametrize("status_code", [404, 401])
+    def test_client_error_fails_fast(self, status_code):
+        """A 4xx will not change on retry: a deleted terminal (404) or a missing credential (401)."""
+        import click
+
+        from cli_agent_orchestrator.utils.api_http import AuthNotConfiguredError
+        from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
+
+        if status_code == 401:
+            side_effect = AuthNotConfiguredError("no token", response=MagicMock(status_code=401))
+        else:
+            resp = MagicMock()
+            resp.raise_for_status.side_effect = self._http_error(status_code)
+            side_effect = [resp]
+        with patch(
+            "cli_agent_orchestrator.utils.terminal.api_http.get", side_effect=side_effect
+        ) as g:
+            with pytest.raises(click.ClickException) as excinfo:
+                wait_for_initial_delivery("t1", timeout=60)
+        assert g.call_count == 1
+        assert "Failed to poll terminal delivery state" in str(excinfo.value)
+
+    @patch("cli_agent_orchestrator.utils.terminal.time.sleep")
+    def test_persistent_transport_failure_times_out_naming_the_last_error(self, mock_sleep):
         import click
         import requests
 
         from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
 
-        with patch(
-            "cli_agent_orchestrator.utils.terminal.api_http.get",
-            side_effect=requests.exceptions.ConnectionError("boom"),
+        clock = iter([0.0, 0.0, 1.0, 2.5])
+        with (
+            patch(
+                "cli_agent_orchestrator.utils.terminal.api_http.get",
+                side_effect=requests.exceptions.ConnectionError("boom"),
+            ) as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.time", side_effect=clock),
         ):
             with pytest.raises(click.ClickException) as excinfo:
-                wait_for_initial_delivery("t1", timeout=5)
-        assert "boom" in str(excinfo.value)
+                wait_for_initial_delivery("t1", timeout=2)
+        assert g.call_count == 2
+        message = str(excinfo.value)
+        assert "Timed out" in message
+        assert "boom" in message
+        assert "may already have been delivered" in message
