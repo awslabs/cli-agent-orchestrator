@@ -67,7 +67,10 @@ def memory():
     help="Plan or apply rollback for exactly one migration receipt.",
 )
 def repair_cmd(do_apply, receipt_id):
-    """Reconcile surviving canonical topics into SQLite and index.md."""
+    """Reconcile topics into SQLite and index.md.
+
+    Reconciles the surviving canonical topics. Dry-run unless --apply.
+    """
     from cli_agent_orchestrator.services.memory_reconciliation import (
         MemoryReconciliationError,
         MemoryReconciliationService,
@@ -243,7 +246,10 @@ def vault_status(out_format):
     help="Accepted for explicit review workflows; scan is always read-only.",
 )
 def vault_scan(dry_run):
-    """Scan configured vault notes without changing files or derived rows."""
+    """Scan vault notes (read-only).
+
+    Scans the configured vault notes without changing files or derived rows.
+    """
     from cli_agent_orchestrator.services.vault.scan import scan_vault
 
     _config, configured_vault = _configured_vault()
@@ -288,7 +294,10 @@ def vault_reconcile(do_apply, out_format):
     help="Required: delete and re-derive vault state, resetting vault access counts.",
 )
 def vault_rebuild(do_apply):
-    """Delete and re-derive vault state; vault access counts reset by design."""
+    """Delete and re-derive vault state.
+
+    Requires --apply; vault access counts reset by design.
+    """
     from cli_agent_orchestrator.services.vault.reconcile import rebuild
 
     if not do_apply:
@@ -327,7 +336,10 @@ def vault_rebuild(do_apply):
     help="Second confirmation required with --delete-source.",
 )
 def vault_migrate(scope, scope_id, do_apply, delete_source, confirm_delete_source):
-    """Migrate native memories into a managed vault folder, dry-run by default."""
+    """Migrate native memories into the vault.
+
+    Writes them into a managed vault folder. Dry-run unless --apply.
+    """
     from cli_agent_orchestrator.services.vault.migrate import migrate_scope
 
     if delete_source and not do_apply:
@@ -553,6 +565,7 @@ def clear(scope, yes):
 def lint_cmd(scope, out_format):
     """Run wiki lint detectors and print findings.
 
+    \b
     Exit codes:
       0  no error-severity issues found
       1  one or more error-severity issues found
@@ -660,6 +673,8 @@ def compact_cmd(scope, key):
     lost a concurrency race. Drives the locally installed coding-agent CLI
     (claude / codex / kiro-cli); requires no API key. Compiles run one at a
     time and can take a minute or two each.
+
+    Acts immediately; there is no confirmation prompt.
     """
     if key is not None:
         key = _validate_key(key)
@@ -729,8 +744,9 @@ def compact_cmd(scope, key):
     help="Output format.",
 )
 def heal_cmd(scope, do_apply, aggressive, issue_type, out_format):
-    """Repair wiki lint findings (orphan pages, contradictions, stale claims).
+    """Repair wiki lint findings.
 
+    Covers orphan pages, contradictions, and stale claims.
     Dry-run by DEFAULT — prints what would change. Pass --apply to mutate.
     poison_frequency healing additionally requires --aggressive.
     graph_density is flag-only and never mutated.
@@ -886,7 +902,10 @@ def _resolve_export_scope_id(svc: MemoryService, scope: str) -> "str | None":
     help="Delete destination topics no longer in the scope (directory output only).",
 )
 def export_cmd(fmt, scope, output, include_private, include_history, redact, prune):
-    """Export a memory scope as an archive bundle (OKF directory by default)."""
+    """Export a memory scope as an archive bundle.
+
+    The default format is an OKF directory.
+    """
     # Private-scope gate (D5): whole-command error BEFORE any write.
     if scope in _PRIVATE_SCOPES and not include_private:
         raise click.ClickException(
@@ -968,7 +987,12 @@ def export_cmd(fmt, scope, output, include_private, include_history, redact, pru
     help="Full parse/validate/secret pipeline, report only — no writes.",
 )
 def import_cmd(path, fmt, scope, conflict, dry_run):
-    """Import an archive bundle directory into a memory scope."""
+    """Import an archive bundle directory into a memory scope.
+
+    --conflict replace overwrites existing keys in the target scope.
+
+    Acts immediately; there is no confirmation prompt.
+    """
     svc = _get_memory_service()
     try:
         report = svc.import_memories(
@@ -1088,7 +1112,7 @@ def _reject_builtin_profile_path(path: Path) -> None:
     help="Explicit profile .md path (overrides agent-dir lookup).",
 )
 def promote_cmd(agent_name, do_apply, min_recalls, profile_path):
-    """Promote reinforced agent-scope lessons into AGENT_NAME's profile file.
+    """Promote AGENT_NAME's reinforced lessons.
 
     Reads agent-scope memories (feedback/project types) recalled at least
     --min-recalls times and writes them as itemized entries in the profile's
@@ -1169,7 +1193,7 @@ def _resolve_cli_scope_id(svc, scope: str):
 
 @memory.group(name="relationships")
 def relationships():
-    """Inspect and curate typed memory relationships (issue #511)."""
+    """Inspect and curate typed memory relationships."""
 
 
 @relationships.command(name="list")
@@ -1215,7 +1239,10 @@ def relationships_list(scope, scope_id, source_key, status_filter, stale, out_fo
 @click.argument("relationship_id")
 @click.option("--format", "out_format", type=click.Choice(["table", "json"]), default="table")
 def relationships_inspect(relationship_id, out_format):
-    """Show one relationship's endpoints, provenance, status, and timestamps."""
+    """Show one relationship in full.
+
+    Prints its endpoints, provenance, status, and timestamps.
+    """
     import json as _json
 
     rsvc = _relationship_service()

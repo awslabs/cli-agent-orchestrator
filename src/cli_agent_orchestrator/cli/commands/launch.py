@@ -226,8 +226,7 @@ def _parse_env_pairs(pairs):
     help="Forward an env var to the supervisor AND every worker spawned later "
     "in the same session. Repeatable. Values travel in the request body, not "
     "the URL. Rejected: provider prefixes (CLAUDE/CODEX_/__MISE_), the loader, "
-    "shell, interpreter and AWS-config startup keys listed in docs/tmux.md, and "
-    ">=2048-byte values. See issue #248.",
+    "shell, interpreter and AWS-config startup keys, and >=2048-byte values.",
 )
 @click.option(
     "--resume-session-id",
@@ -253,7 +252,20 @@ def launch(
     env_pairs,
     resume_session_id,
 ):
-    """Launch cao session with specified agent profile."""
+    """Launch cao session with specified agent profile.
+
+    Without --headless, attaches your terminal to the new session. With
+    --headless and MESSAGE, waits for the provider to start and confirm
+    delivery, then up to 300s for the reply; --async returns once delivery
+    is confirmed.
+
+    Requires a running cao-server.
+
+    \b
+    Examples:
+      cao launch --agents developer
+      cao launch --agents developer --headless --auto-approve "Run the tests"
+    """
     try:
         display_dir = working_directory or os.path.realpath(os.getcwd())
         explicit_provider = provider is not None  # True only when --provider was passed

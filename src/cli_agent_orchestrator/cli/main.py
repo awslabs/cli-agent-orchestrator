@@ -39,7 +39,7 @@ _COMMANDS: tuple[tuple[str, str, str, str, bool], ...] = (
         "install",
         _PKG + "install",
         "install",
-        "Install an agent from local store, built-in store, URL, or file path.",
+        "Install an agent by name, file path, or URL.",
         False,
     ),
     (

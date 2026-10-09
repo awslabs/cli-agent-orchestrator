@@ -31,8 +31,9 @@ from cli_agent_orchestrator.utils.orchestration import (
     _status_impl,
 )
 
-# Heartbeat cadence (seconds) for `cao agent handoff`'s progress ticker -- see
-# handoff_cmd's docstring for why this can't be true incremental progress.
+# Heartbeat cadence (seconds) for `cao agent handoff`'s progress ticker. The
+# handoff is ONE blocking call to cao-server with no run id to poll, so the
+# ticker can only report elapsed time, not real progress.
 _HANDOFF_HEARTBEAT_INTERVAL_S = 30
 
 
@@ -79,7 +80,15 @@ def agent():
     handoff, send_message, delete_terminal) plus status/result for checking
     on a worker -- for use when a terminal's MCP connection is unavailable.
     The caller's own terminal is inferred from the CAO_TERMINAL_ID
-    environment variable, exactly like the MCP tools.
+    environment variable, exactly like the MCP tools. `handoff` also works
+    outside a CAO terminal; `assign` must run inside one.
+
+    Requires a running cao-server.
+
+    \b
+    Examples:
+      cao agent handoff developer "Add a unit test for parse_args" --timeout 900
+      cao agent handoff developer "Run the test suite" --no-wait
     """
 
 
@@ -113,6 +122,8 @@ def assign_cmd(agent_profile, message, working_directory, engine, model, use_wor
     back to this terminal), or you can poll it with `cao agent status` /
     `cao agent result`. Clean it up with `cao agent cancel --delete
     TERMINAL_ID` once you no longer need it.
+
+    Requires a running cao-server.
     """
     result = _assign_impl(
         agent_profile,
@@ -156,7 +167,7 @@ def assign_cmd(agent_profile, message, working_directory, engine, model, use_wor
     "no_wait",
     is_flag=True,
     default=False,
-    help="Return immediately after creating the worker; don't wait for it to complete.",
+    help="Return once the worker exists; don't wait for it.",
 )
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
 def handoff_cmd(
@@ -170,46 +181,26 @@ def handoff_cmd(
     no_wait,
     as_json,
 ):
-    """Hand off a task to a worker terminal and BLOCK until it completes.
+    """Hand off a task to a worker and wait for it.
 
-    Equivalent to the MCP `handoff` tool: creates a worker, sends MESSAGE,
-    waits up to --timeout seconds, and prints its output. The worker is torn
-    down automatically on success. Works outside a CAO terminal too (a fresh
-    session is created for it), but run this from inside one so the worker
-    inherits the caller's session and tool restrictions.
+    Creates an AGENT_PROFILE worker, sends it MESSAGE, prints its output,
+    and deletes the worker on success. Works outside a CAO terminal, but run
+    it inside one so the worker inherits that terminal's session and tool
+    restrictions.
 
-    Recovering from a kill: the worker's terminal_id is printed to stderr as
-    soon as the worker exists -- before the wait for completion, not just at
-    the end -- so `Ctrl-C`-ing this command still leaves you a handle: check
-    on it with `cao agent status TERMINAL_ID`, read whatever it produced with
-    `cao agent result TERMINAL_ID`, or free it with `cao agent cancel --delete
-    TERMINAL_ID`.
+    The worker's terminal_id is printed to stderr as soon as it exists.
+    --no-wait returns once MESSAGE is sent and leaves the worker running;
+    follow up with `cao agent status`, `cao agent result`, and
+    `cao agent cancel --delete`. Re-running after an interrupt starts a new
+    worker; it does not resume the old one.
 
-    That handle is a MANUAL recovery route, not an automatic one: re-running
-    this command after a kill creates a NEW worker. Retry-safety needs a
-    durable run record so a retry can return the existing run instead of
-    starting the task again -- tracked in #715, which is also what closes
-    #616's "killing the CLI process does not lose the job or its result".
+    Requires a running cao-server.
 
-    --no-wait: returns as soon as the worker exists and has been sent MESSAGE,
-    without waiting for -- or extracting -- its result, and without tearing it
-    down. Prints the terminal_id and exits 0 immediately; poll it with `cao
-    agent status`/`result` and clean it up with `cao agent cancel --delete`
-    same as above. Use this for a task you don't want to block your shell on.
-
-    Progress: absent --no-wait, this is ONE blocking call to cao-server for
-    its whole duration -- unlike `cao workflow run`, there is no server-side
-    run id to poll incrementally, so a heartbeat line prints every 30s on a
-    TTY (elapsed time only) so a long wait doesn't look hung. Suppressed
-    under --json or when stdout is not a TTY.
-
+    \b
     Exit codes:
-      0    the worker completed successfully (or was created, under --no-wait)
-      1    the worker failed, errored, or the request timed out
-      130  interrupted (Ctrl-C) -- the request may still be running on
-           cao-server. Check the terminal_id printed to stderr above (if any
-           was printed yet) with `cao agent status`, or `cao session list` to
-           find and clean up an orphaned worker if not.
+      0    completed (or created, with --no-wait)
+      1    failed, errored, or timed out
+      130  interrupted; the worker may still be running
     """
     machine = _machine_mode(as_json)
     if not machine and not no_wait:
@@ -281,6 +272,8 @@ def send_message_cmd(message, receiver_id, as_json):
     terminal is IDLE. Omit --to to reply to the recorded caller -- the
     terminal that created this one via assign/handoff, resolved from
     CAO_TERMINAL_ID -- the reliable way to send results back to a supervisor.
+
+    Requires a running cao-server.
     """
     result = _send_message_impl(receiver_id, message)
     if not _emit(result, as_json):
@@ -291,12 +284,17 @@ def send_message_cmd(message, receiver_id, as_json):
 @click.argument("terminal_id")
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
 def status_cmd(terminal_id, as_json):
-    """Show a worker terminal's current status (idle, processing, ...).
+    """Show a worker terminal's current status.
+
+    The status is one of: unknown, idle, processing, completed,
+    waiting_user_answer, error.
 
     No MCP tool exposes this today -- an assign caller normally learns
     completion from the worker's own send_message callback. This is the
     poll-style check for when that callback hasn't arrived yet (or the
     worker was never told to send one).
+
+    Requires a running cao-server.
     """
     result = _status_impl(terminal_id)
     if not _emit(result, as_json):
@@ -311,6 +309,8 @@ def result_cmd(terminal_id, as_json):
 
     The tail of its most recent turn -- the CLI counterpart of what a
     supervisor would otherwise learn from a worker's send_message callback.
+
+    Requires a running cao-server.
     """
     result = _result_impl(terminal_id)
     if not _emit(result, as_json):
@@ -338,6 +338,10 @@ def cancel_cmd(terminal_id, delete_flag, as_json):
     instead frees the terminal entirely, equivalent to the delete_terminal
     MCP tool -- use it once you are done with a worker (assign's own success
     message points here for cleanup).
+
+    --delete acts immediately; there is no confirmation prompt.
+
+    Requires a running cao-server.
     """
     result = _cancel_impl(terminal_id, delete=delete_flag)
     if not _emit(result, as_json):

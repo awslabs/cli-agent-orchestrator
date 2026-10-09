@@ -66,13 +66,25 @@ def _format_launch_model(terminal):
 
 @click.group()
 def session():
-    """Manage CAO sessions."""
+    """Manage CAO sessions.
+
+    Requires a running cao-server.
+
+    \b
+    Examples:
+      cao session list
+      cao session status cao-1a2b3c4d --workers
+      cao session send cao-1a2b3c4d "Summarize your progress" --timeout 600
+    """
 
 
 @session.command("list")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 def list_sessions(as_json):
-    """List all active CAO sessions."""
+    """List all active CAO sessions.
+
+    Requires a running cao-server.
+    """
     try:
         sessions = _get_sessions()
     except api_http.exceptions.RequestException as e:
@@ -136,7 +148,10 @@ def list_sessions(as_json):
 )
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 def status(session_name, terminal_id, workers, as_json):
-    """Show status of a session's conductor (or specific terminal)."""
+    """Show status of a session's conductor (or specific terminal).
+
+    Requires a running cao-server.
+    """
     try:
         if terminal_id:
             target = _get_terminal(terminal_id)
@@ -235,7 +250,10 @@ def status(session_name, terminal_id, workers, as_json):
     help=f"Timeout in seconds (default: {_DEFAULT_SEND_TIMEOUT}s; ignored with --async)",
 )
 def send(session_name, message, terminal_id, is_async, timeout):
-    """Send a message to a session's conductor (or specific terminal)."""
+    """Send a message to a session's conductor (or specific terminal).
+
+    Requires a running cao-server.
+    """
     try:
         if terminal_id:
             target_id = terminal_id

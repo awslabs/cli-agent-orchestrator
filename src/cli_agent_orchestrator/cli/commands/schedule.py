@@ -58,7 +58,10 @@ def list():
 @schedule.command()
 @click.argument("name")
 def remove(name):
-    """Remove a flow."""
+    """Remove a flow.
+
+    Acts immediately; there is no confirmation prompt.
+    """
     init_db()
     try:
         flow_service.remove_flow(name)
