@@ -115,6 +115,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The EKS example image (`examples/cao-clusters/kubernetes/eks/Dockerfile`)
+  builds on Wolfi (`cgr.dev/chainguard/wolfi-base`, pinned by digest) instead
+  of `python:3.12-slim`. Amazon Inspector reported two critical and five high
+  findings on the Debian 13 image (curl, expat, zlib, gnupg2), none with a
+  fixed build in Debian; the Wolfi image scanned with none. Node and npm come
+  from the distribution rather than NodeSource, so no gnupg is installed, and
+  pip is current. A Debian-family `BASE_PROVIDER_IMAGE` still builds.
+
 - Audit all tracked npm, Bun, uv, and Cargo dependency graphs in every CI run
   and weekly, including development dependencies and unfixed advisories. Block
   every HIGH/CRITICAL finding and scan error, and publish complete inventory and

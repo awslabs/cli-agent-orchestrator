@@ -164,6 +164,16 @@ Code from public registries and carries `entrypoint.sh`, which runs
 `cao init`, installs the profiles named in `CAO_INSTALL_PROFILES`, and execs
 `cao-server`. Nothing out-of-tree is required to reproduce it.
 
+Its base is Wolfi (`cgr.dev/chainguard/wolfi-base`, pinned by digest), not
+Debian. Amazon Inspector, which scans the image in ECR, reports a package
+vulnerability until the distribution ships a fixed build of it, and Debian 13
+had none for the curl, expat and zlib findings that the `python:3.12-slim`-based
+image carried (two critical, five high). Each build upgrades Wolfi's packages
+before installing any, so it takes their current fixes. To move the base itself,
+replace the digest in `ARG BASE_PROVIDER_IMAGE` with the current one of
+`cgr.dev/chainguard/wolfi-base:latest`. A Debian-family `BASE_PROVIDER_IMAGE`
+still builds, with its own distribution's findings.
+
 ECR tags are `IMMUTABLE` in both repositories, deliberately: a mutable `latest`
 once left a cluster running a build that predated a fix while the manifests
 advertised it, with nothing to indicate the mismatch.
@@ -223,8 +233,9 @@ It fetches the pinned `musl` archive and runs the vendor installer with
 the image to roughly double: the archive is ~689MB for `aarch64` and installs to
 1.1GB, of which `kiro-cli-chat` is 943MB. The URL is built from `$(uname -m)`, so
 it follows the build platform and needs no change if that ever moves. The `musl` build is not a preference: the *gnu*
-archive requires glibc 2.39 and bookworm ships 2.36, so its own installer refuses
-it and points at musl, which skips the glibc check. `ARG BASE_PROVIDER_IMAGE` remains for any other provider: point it at
+archive requires glibc 2.39, which a Debian provider base may not have (bookworm
+ships 2.36), and its own installer then refuses it and points at musl, which skips
+the glibc check on any base. `ARG BASE_PROVIDER_IMAGE` remains for any other provider: point it at
 an image that already carries that CLI, pass `INSTALL_CLAUDE_CODE=0`, and set
 `CAO_PROFILE_PROVIDER` to the provider name CAO uses. That last argument pins
 the image's seeded supervisor and worker profiles to the CLI the image actually
