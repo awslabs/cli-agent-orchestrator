@@ -33,6 +33,24 @@ then the instructions of the agent:
 | Zone worker, one for each zone | [`transport_zone_worker.md`](transport_zone_worker.md) | None. CAO refuses its `assign` and `handoff` calls. | Own zone only: `observe`, `move`, `offer_handoff`, `accept_handoff` |
 | Checker | [`transport_checker.md`](transport_checker.md) | None. CAO refuses its `assign` and `handoff` calls. | Read-only: `observe` |
 
+The instructions of each profile have the same sections as the profiles of
+the assign example:
+
+| Section | Contents |
+| --- | --- |
+| Role and Identity | What the agent is, and what it cannot do |
+| Core Responsibilities | The tasks of the agent |
+| Available MCP Tools | Each tool that the credential of the agent can call, with its parameters |
+| Run Bindings | The run identifiers that `demo.py prepare` adds |
+| Workflow | The numbered steps of the agent, with the tool calls |
+| Critical Rules | The rules for proof, retries, and safety |
+| Example | One worked example, with placeholders instead of scene names |
+| Final Report Format or Result Format | The items of the final response of the agent |
+
+The supervisor profile also has a section for failures and uncertain results.
+The zone worker profile also has a table of the rejection reasons of the
+controller.
+
 Do not install these files directly. Their `transport-sim` entry is a
 placeholder, and the files contain no credential. `demo.py prepare` makes a
 run copy of each profile for each run. See [Run copies](#run-copies).
@@ -86,9 +104,7 @@ allowedTools:
   - "@transport-sim"   # Simulator tools. The supervisor credential permits only observe.
   - "@cao-mcp-server"  # CAO handoff. Only the supervisor can delegate.
 mcpServers:
-  # demo.py prepare replaces this entry in the run copy of this profile. The
-  # command becomes the Python of the example .venv. The last argument becomes
-  # the private credential file of this agent in the run directory.
+  # Placeholder. demo.py prepare sets the Python and the credential file of the run.
   transport-sim:
     type: stdio
     command: python
@@ -425,9 +441,10 @@ for profile in "$RUN_DIR"/profiles/*.md; do
 done | tee "$RUN_DIR/install.log"
 ```
 
-For each run copy, `cao install` prints `✓ Agent '<name>' installed
-successfully` and the paths of the files that it writes. `tee` also writes this
-output to `install.log`. The cleanup uses these paths.
+For each run copy, `cao install` prints lines that start with `✓`, for example
+`✓ Agent '<name>' installed successfully`. Some lines give the paths of the
+files that it writes. `tee` also writes this output to `install.log`. The
+cleanup uses these paths.
 
 ### Step 6. Launch the supervisor
 
@@ -453,8 +470,10 @@ cao launch --agents "$SUPERVISOR" --headless --async --auto-approve \
 ```
 
 - The command prints `Session created: cao-transport-<run_id>`. The launch
-  command that `prepare` printed makes the same session. The later steps use
-  `$SESSION`.
+  command that `prepare` printed uses the same session name. The later steps
+  use `$SESSION`.
+- The command can also print `To skip this prompt next time, relaunch with
+  --auto-approve`. You can ignore this line.
 - `--async` returns when CAO delivers the request. It does not wait for the
   task. The run continues if the client times out. Do not launch the request
   again.
@@ -492,6 +511,12 @@ The supervisor status in CAO can be wrong during this demo:
   final answer.
 - With Claude Code, it can show `completed` while the supervisor still works.
 
+With Claude Code, CAO can also end a handoff too early, while the worker still
+works. Then CAO closes the window of that worker, and the supervisor gets no
+evidence. The supervisor then checks the command records and hands off the
+same leg or the check again. Thus you can see more worker windows than legs.
+The command records in Step 8 show what each worker did.
+
 To know if the transport is complete, use the controller state in Step 8. To
 know if the supervisor finished, read its final answer in its window.
 
@@ -514,9 +539,9 @@ For `site.json`, a successful run shows these values:
 | `commands` | The two `move` commands, the `offer`, and the `accept` have `"status": "finished"` |
 
 The final answer of the supervisor names each worker, each leg, the custody
-acceptance, and the evidence of the checker. The answer can report that CAO truncated the text from a worker. This does not
-change the result, because the supervisor and the checker use the measured
-state from `observe`.
+acceptance, and the evidence of the checker. The answer can report that CAO
+truncated the text from a worker. This does not change the result, because the
+supervisor and the checker use the measured state from `observe`.
 
 A successful tool call or test run does not prove a multi-agent run. Make sure
 that each zone worker and the checker did their part.

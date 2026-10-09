@@ -37,6 +37,8 @@ def test_prepare_prints_a_nonblocking_launch_with_the_request(
     assert launch[:2] == ["cao", "launch"]
     assert {"--headless", "--async", "--auto-approve"} <= set(launch)
     assert "--yolo" not in launch
+    run_id = json.loads((run_dir / "run.json").read_text())["run_id"]
+    assert launch[launch.index("--session-name") + 1] == f"cao-transport-{run_id}"
     assert launch[-2:] == ["--", transport_request]
 
 

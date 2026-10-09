@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import secrets
 import socket
 import threading
@@ -9,6 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import demo
 import httpx
 import pytest
 import uvicorn
@@ -66,6 +68,36 @@ def controller(tmp_path):
             thread.join(timeout=10)
             assert not thread.is_alive(), "the owned MCP controller did not shut down"
     assert json.loads(snapshot.read_text())["stopped"] is True
+
+
+def documented_tools(role):
+    """Return the transport-sim tools, with parameters, that a committed profile documents."""
+    _, body = demo.read_profile(demo.PROFILE_SOURCES[role])
+    section = body.split("### transport-sim", 1)[1]
+    section = section.split("\n### ", 1)[0].split("\n## ", 1)[0]
+    return {
+        name: [parameter.strip() for parameter in parameters.split(",") if parameter.strip()]
+        for name, parameters in re.findall(r"\*\*(\w+)\*\*\(([^)]*)\)", section)
+    }
+
+
+def test_profiles_document_exactly_the_tools_of_their_credential(controller):
+    url, credentials, _, _ = controller
+
+    async def exercise():
+        for role, credential in (
+            ("supervisor", "observer"),
+            ("checker", "observer"),
+            ("zone", "west"),
+        ):
+            async with controller_client(url, credentials[credential].get_secret_value()) as client:
+                tools = {
+                    tool.name: list(tool.inputSchema.get("properties", {}))
+                    for tool in await client.list_tools()
+                }
+            assert documented_tools(role) == tools, role
+
+    asyncio.run(exercise())
 
 
 def test_observer_cannot_gain_actions_by_asking_or_naming_a_robot(controller):
