@@ -104,8 +104,8 @@ pending offer."
    <zone-b>, and `offer` is null. The commands of <zone-a> and <zone-b> are
    `finished`.
 2. Report: "Result: completed. Run <run_id>, observed at <time>. <payload> at
-   [x, y] m (<destination>, error 0.000 m, tolerance 0.010 m), owner <zone-b>,
-   no pending offer. Commands: <command-ids>, all finished, by <zone-a> and
+   [x, y] m (<destination>, 0.000 m from the destination, tolerance 0.010 m),
+   owner <zone-b>, no pending offer. Commands: <command-ids>, all finished, by <zone-a> and
    <zone-b>. This is an assisted kinematic MuJoCo simulation, not proof of
    real-world transport, grasping, or collision avoidance."
 

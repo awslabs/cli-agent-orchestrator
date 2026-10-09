@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import stat
 import sys
@@ -58,7 +59,7 @@ def test_prepare_requires_a_nonblank_request_before_creating_run(
 
 
 @pytest.mark.parametrize("scene_file", ["site.json", "return-site.json"])
-@pytest.mark.parametrize("provider", ["copilot_cli", "claude_code"])
+@pytest.mark.parametrize("provider", sorted(demo.CAO_PROVIDERS))
 def test_profiles_bind_only_their_own_credential_and_no_builtin_tools(
     tmp_path, scene_file, provider
 ):
@@ -180,7 +181,7 @@ def test_committed_profiles_are_valid_cao_profiles(role):
     assert ("cao-mcp-server" in profile["mcpServers"]) == (role == "supervisor")
 
 
-@pytest.mark.parametrize("provider", ["copilot_cli", "claude_code"])
+@pytest.mark.parametrize("provider", sorted(demo.CAO_PROVIDERS))
 def test_run_copies_are_the_committed_profiles_with_run_values(tmp_path, provider):
     run_dir = tmp_path / "run"
     manifest = demo.prepare(run_dir, EXAMPLE / "site.json", port=8766, provider=provider)
@@ -208,3 +209,48 @@ def test_read_profile_refuses_a_file_without_frontmatter(tmp_path):
     path.write_text("No frontmatter here.\n")
     with pytest.raises(ValueError, match="frontmatter"):
         demo.read_profile(path)
+
+
+CAO_SOURCE = EXAMPLE.parents[2] / "src/cli_agent_orchestrator"
+
+
+def test_provider_lists_match_cao():
+    enum = (CAO_SOURCE / "models/provider.py").read_text()
+    providers = set(re.findall(r'^\s+[A-Z_]+ = "([a-z_]+)"$', enum, flags=re.M)) - {"mock_cli"}
+    assert demo.CAO_PROVIDERS == providers
+    levels = (CAO_SOURCE / "utils/enforcement.py").read_text()
+    assert demo.NATIVE_ENFORCEMENT == set(
+        re.findall(r'^\s+"([a-z_]+)": NATIVE', levels, flags=re.M)
+    )
+
+
+def test_prepare_refuses_an_unknown_provider_before_creating_a_run(tmp_path):
+    run_dir = tmp_path / "run"
+    with pytest.raises(ValueError, match="unknown CAO provider"):
+        demo.prepare(run_dir, EXAMPLE / "site.json", port=8766, provider="not_a_provider")
+    assert not run_dir.exists()
+
+
+@pytest.mark.parametrize("provider", sorted(demo.CAO_PROVIDERS))
+def test_prepare_warns_only_when_the_provider_does_not_enforce_the_allowlist(
+    tmp_path, monkeypatch, capsys, provider
+):
+    run_dir = tmp_path / "run"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "demo.py",
+            "prepare",
+            "--run-dir",
+            str(run_dir),
+            "--request=check",
+            "--provider",
+            provider,
+        ],
+    )
+    demo.main()
+    captured = capsys.readouterr()
+    warned = "does not enforce the tool allowlist" in captured.err
+    assert warned == (provider not in demo.NATIVE_ENFORCEMENT)
+    assert "warning" not in captured.out
