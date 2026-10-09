@@ -133,7 +133,7 @@ def test_additional_zones_get_the_same_shared_operator_prompt(tmp_path):
     run_dir = tmp_path / "run"
     manifest = demo.prepare(run_dir, scene_file, port=8766, provider="copilot_cli")
     assert len(manifest["profiles"]) == len(data["zones"]) + 2
-    shared = (EXAMPLE / "prompts" / "zone.md").read_text()
+    _, shared = demo.read_profile(EXAMPLE / "transport_zone_worker.md")
     for zone in data["zones"]:
         name = manifest["profiles"][f"zone_{zone}"]
         assert shared in (run_dir / "profiles" / f"{name}.md").read_text()
@@ -159,3 +159,50 @@ def test_long_zone_identifiers_do_not_overflow_cao_profile_names(tmp_path):
     for name in manifest["profiles"].values():
         text = (run_dir / "profiles" / f"{name}.md").read_text()
         validate(yaml.safe_load(text.split("---", 2)[1]), schema)
+
+
+SCHEMA = EXAMPLE.parents[2] / "src/cli_agent_orchestrator/schemas/agent_profile.schema.json"
+
+
+@pytest.mark.parametrize("role", sorted(demo.PROFILE_SOURCES))
+def test_committed_profiles_are_valid_cao_profiles(role):
+    source = demo.PROFILE_SOURCES[role]
+    profile, instructions = demo.read_profile(source)
+    validate(profile, json.loads(SCHEMA.read_text()))
+    assert source.parent == EXAMPLE
+    assert profile["name"] == source.stem
+    assert "provider" not in profile
+    assert instructions
+    assert "transport-sim" in profile["mcpServers"]
+    assert ("@cao-mcp-server" in profile["allowedTools"]) == (role == "supervisor")
+    assert ("cao-mcp-server" in profile["mcpServers"]) == (role == "supervisor")
+
+
+@pytest.mark.parametrize("provider", ["copilot_cli", "claude_code"])
+def test_run_copies_are_the_committed_profiles_with_run_values(tmp_path, provider):
+    run_dir = tmp_path / "run"
+    manifest = demo.prepare(run_dir, EXAMPLE / "site.json", port=8766, provider=provider)
+    for actor, name in manifest["profiles"].items():
+        role = manifest["actors"][actor]["role"]
+        source, instructions = demo.read_profile(demo.PROFILE_SOURCES[role])
+        path = run_dir / "profiles" / f"{name}.md"
+        run_copy, body = demo.read_profile(path)
+        assert name.startswith(source["name"] + "_")
+        assert run_copy["description"].startswith(source["description"])
+        assert run_copy["provider"] == provider
+        for key in ("skills", "allowedTools"):
+            assert run_copy[key] == source[key]
+        assert set(run_copy["mcpServers"]) == set(source["mcpServers"])
+        for server, entry in source["mcpServers"].items():
+            if server != "transport-sim":
+                assert run_copy["mcpServers"][server] == entry
+        assert run_copy["mcpServers"]["transport-sim"]["command"] == sys.executable
+        assert body.startswith(instructions)
+        assert "<run-dir>" not in path.read_text()
+
+
+def test_read_profile_refuses_a_file_without_frontmatter(tmp_path):
+    path = tmp_path / "broken.md"
+    path.write_text("No frontmatter here.\n")
+    with pytest.raises(ValueError, match="frontmatter"):
+        demo.read_profile(path)
