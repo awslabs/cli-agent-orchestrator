@@ -89,6 +89,14 @@ class TestFooter:
         assert group.epilog is not None
         assert group.epilog.count("cao --skill") == 1
 
+    def test_footer_is_appended_to_an_existing_epilog(self):
+        group = click.Group("demo", epilog="Existing epilog.")
+        group.add_command(click.Group("nested"))
+        cli_main._add_footer(group)
+        cli_main._add_footer(group)
+        assert group.epilog == f"Existing epilog.\n\n{FOOTER}"
+        assert group.commands["nested"].epilog == FOOTER
+
 
 class TestCommandTable:
     def test_table_matches_real_commands(self):
