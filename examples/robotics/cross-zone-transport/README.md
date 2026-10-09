@@ -127,12 +127,15 @@ its `assign` and `handoff` calls, with this result:
 `'assign' is not permitted: the calling terminal's allowed tools do not include '@cao-mcp-server'`.
 The checker profile also does not grant `@cao-mcp-server`.
 
-The two providers give the worker different MCP servers:
+The provider decides which MCP servers a worker gets. These are the results
+for the tested providers:
 
 | Provider | MCP servers of a zone worker or the checker | Can call `send_message` |
 | --- | --- | --- |
 | GitHub Copilot CLI | `transport-sim`, plus `cao-mcp-server`. CAO adds `cao-mcp-server` to each Copilot terminal. Copilot also adds its built-in `github-mcp-server`. | Yes. CAO does not gate `send_message`. |
 | Claude Code | `transport-sim` only. CAO starts Claude Code with `--strict-mcp-config` and the servers of the profile. | No |
+| Kiro CLI | `transport-sim` only. The installed Kiro agent has `tools: ["@transport-sim"]`. | No |
+| Codex | `transport-sim` only, given with `-c mcp_servers...` options. | No |
 
 The instructions of the zone workers and the checker tell them to return their
 evidence to the `handoff` caller. They do not tell them to send messages.
@@ -269,7 +272,8 @@ This example uses only `handoff`, for these reasons:
 - Each step needs the result of the step before it. The east zone worker can
   accept custody only after the west zone worker offers it at the dock. The
   checker can check only after the last leg. Parallel work gives no benefit.
-- With Claude Code, the zone workers and the checker have no `cao-mcp-server`.
+- With Claude Code, Kiro CLI, or Codex, the zone workers and the checker have
+  no `cao-mcp-server`.
   Thus they cannot call `send_message`, and `assign` cannot get their results.
 - With Copilot CLI, the workers can call `send_message`. Thus `assign` can
   work with Copilot CLI. But the run then needs two more steps. Each worker
@@ -310,7 +314,7 @@ share a dock. This example has one payload, so it uses only `handoff`.
 | tmux | 3.3 or later | `tmux -V` |
 | uv | A recent release | `uv --version` |
 | Python | 3.10 or later | Step 1 finds or installs it with `uv` |
-| Provider CLI | GitHub Copilot CLI (default) or Claude Code | Start the CLI one time and sign in |
+| Provider CLI | Any CAO provider. GitHub Copilot CLI is the default. | Start the CLI one time and sign in |
 
 CAO 2.5.3 is the first release that contains this example. It also contains the
 permission fix for workflow delegation that this example uses. To install or
@@ -322,13 +326,43 @@ uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@main -
 
 For other installation methods, see [Install CAO](../../../README.md#install-cao).
 
-The provider must enforce the tool allowlist of each profile. For this reason,
-`prepare` accepts only `copilot_cli` and `claude_code`. See the
-[Copilot CLI](../../../docs/copilot-cli.md) and
-[Claude Code](../../../docs/claude-code.md) guides.
+The example works with every CAO provider. See [Providers](#providers).
 
 The example has its own Python project and lockfile. It does not change the CAO
 installation.
+
+### Providers
+
+Select the provider with `--provider` in Step 2. `prepare` writes it into each
+run copy, so `cao install` and `cao launch` use the same provider for all the
+agents.
+
+The isolation of the zones depends on how the provider enforces the allowlist
+of a profile. CAO shows the level in the `Enforcement:` line of `cao launch`:
+
+| Enforcement | Providers | Effect on the zone workers and the checker |
+| --- | --- | --- |
+| Native | `copilot_cli` (default), `claude_code`, `kiro_cli`, `opencode_cli`, `grok_cli` | The provider blocks each tool that the profile does not allow, for example the shell. |
+| Prompt only | `codex`, `kimi_cli`, `antigravity_cli`, `omp`, `mcode` | Only the instructions forbid the other tools. |
+| None | `hermes`, `cursor_cli` | CAO does not restrict the tools. |
+
+> [!WARNING]
+> Without native enforcement, an agent can use a shell and read the credential
+> files of the other zones. Then it can act for another zone. `prepare` prints
+> a warning for these providers. Use them only for a trusted local demo.
+
+Test results of this example with CAO 2.5.3:
+
+| Provider | Result |
+| --- | --- |
+| Copilot CLI 1.0.94 | Complete. Each worker and the checker returned its report. |
+| Claude Code 2.1.294 | Complete. CAO sometimes ended a handoff early; the supervisor then handed off the same leg again. |
+| Kiro CLI 2.28 | The transport was correct. CAO could not read the replies of the workers, so the final report has no evidence from the checker. |
+| Codex 0.154 | The transport was correct. CAO marked the workers as failed while they worked, so the final report has no evidence from the checker. |
+
+The other providers are not tested with this example. For each provider, see
+its guide in the [CAO documentation](../../../README.md#prerequisites) and
+[Tool restrictions](../../../docs/tool-restrictions.md).
 
 ### Compute and GPU
 
@@ -369,8 +403,9 @@ uv sync --locked
 
 ### Step 2. Prepare a run
 
-In Terminal 1, run these commands. To use Claude Code, add
-`--provider claude_code` to the `prepare` command.
+In Terminal 1, run these commands. To use a provider other than Copilot CLI,
+add `--provider <provider>` to the `prepare` command, for example
+`--provider kiro_cli`. See [Providers](#providers).
 
 ```bash
 export RUN_DIR=/tmp/cao-transport-demo
@@ -486,6 +521,14 @@ cao launch --agents "$SUPERVISOR" --headless --async --auto-approve \
   2. Run `uv run --locked python demo.py status --run-dir "$RUN_DIR"`.
   3. If `commands` is empty, do Step 6 again. If `commands` is not empty,
      stop and clean up this run, and prepare a new run.
+- If the command prints `Initial message was not delivered` and
+  `waiting_user_answer`, the provider shows a first-run prompt that CAO does
+  not answer. For example, Codex 0.154 asks `Trust this folder?` for the
+  repository. Do these steps:
+  1. Run `cao shutdown --session "$SESSION"`.
+  2. Start the provider CLI one time in this directory, accept the prompt, and
+     exit the CLI.
+  3. Do Step 6 again.
 
 ### Step 7. Watch the agents
 
@@ -683,10 +726,13 @@ transport. Prepare a new run and try again.
 - Only the supervisor can delegate. CAO checks the profile grant of the
   caller. It refuses `assign`, `handoff`, and workflow runs from the zone
   workers and the checker.
-- The provider blocks the shell and file tools of the zone workers and the
-  checker. With Copilot CLI, they can still call `send_message`. CAO adds
-  `cao-mcp-server` to each Copilot terminal, and CAO does not gate
-  `send_message`.
+- With a provider that has native enforcement, the provider blocks the shell
+  and file tools of the zone workers and the checker. With Copilot CLI, they
+  can still call `send_message`. CAO adds `cao-mcp-server` to each Copilot
+  terminal, and CAO does not gate `send_message`.
+- With a provider that has no native enforcement, only the instructions forbid
+  the shell and file tools. An agent can then read the credential files of the
+  other zones. See [Providers](#providers).
 - The tokens do not appear in output, profile text, or process arguments. Each
   stdio connection reads only its own credential file.
 - The controller uses the FastMCP static-token verifier. Use it only for this

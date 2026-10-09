@@ -27,6 +27,31 @@ PROFILE_SOURCES = {
     "zone": HERE / "transport_zone_worker.md",
     "checker": HERE / "transport_checker.md",
 }
+# Every CAO provider (cli_agent_orchestrator.models.provider.ProviderType),
+# without the test-only mock_cli. CAO installs an unknown provider name as
+# kiro_cli, so prepare() refuses a name that is not in this set.
+CAO_PROVIDERS = frozenset(
+    {
+        "antigravity_cli",
+        "claude_code",
+        "codex",
+        "copilot_cli",
+        "cursor_cli",
+        "grok_cli",
+        "hermes",
+        "kimi_cli",
+        "kiro_cli",
+        "mcode",
+        "omp",
+        "opencode_cli",
+    }
+)
+# The providers whose runtime refuses the tools that a profile does not allow
+# (level NATIVE in cli_agent_orchestrator.utils.enforcement). With the other
+# providers, the allowlist of a profile is only an instruction.
+NATIVE_ENFORCEMENT = frozenset(
+    {"claude_code", "copilot_cli", "grok_cli", "kiro_cli", "opencode_cli"}
+)
 
 
 def read_profile(path: Path) -> tuple[dict, str]:
@@ -52,8 +77,10 @@ def prepare(run_dir: Path, scene_file: Path, *, port: int, provider: str) -> dic
     scene = Scene.model_validate_json(scene_file.read_text(encoding="utf-8"))
     if not 1 <= port <= 65535:
         raise ValueError("port must be between 1 and 65535")
-    if provider not in ("copilot_cli", "claude_code"):
-        raise ValueError("use a supported provider with native tool restrictions")
+    if provider not in CAO_PROVIDERS:
+        raise ValueError(
+            f"unknown CAO provider {provider!r}; use one of: {', '.join(sorted(CAO_PROVIDERS))}"
+        )
     run_dir = run_dir.resolve()
     run_dir.mkdir(mode=0o700)
     (run_dir / "credentials").mkdir(mode=0o700)
@@ -187,7 +214,7 @@ def main() -> None:
     setup.add_argument("--request", required=True, help="goal to send unchanged to the supervisor")
     setup.add_argument("--scene", type=Path, default=HERE / "site.json")
     setup.add_argument("--port", type=int, default=8766)
-    setup.add_argument("--provider", choices=["copilot_cli", "claude_code"], default="copilot_cli")
+    setup.add_argument("--provider", choices=sorted(CAO_PROVIDERS), default="copilot_cli")
     serve_parser = sub.add_parser("serve", help="own the persistent simulator outside CAO workers")
     serve_parser.add_argument("--run-dir", type=Path, required=True)
     serve_parser.add_argument("--allow-motion", action="store_true")
@@ -201,6 +228,14 @@ def main() -> None:
         if not args.request.strip():
             setup.error("--request must not be blank")
         manifest = prepare(args.run_dir, args.scene, port=args.port, provider=args.provider)
+        if args.provider not in NATIVE_ENFORCEMENT:
+            print(
+                f"warning: {args.provider} does not enforce the tool allowlist of a profile. "
+                "The zone workers and the checker can then use tools that their profile does "
+                "not allow, for example a shell, and read the credential files of other "
+                f"zones. Use {args.provider} only for a trusted local demo.",
+                file=sys.stderr,
+            )
         run_dir = args.run_dir.resolve()
         for profile in manifest["profiles"].values():
             print(shlex.join(["cao", "install", str(run_dir / "profiles" / f"{profile}.md")]))
