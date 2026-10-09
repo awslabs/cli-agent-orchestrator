@@ -150,6 +150,44 @@ class TestCreateSession:
         assert mock_create_terminal.call_args.kwargs["idempotency_key"] == "retry-1"
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    async def test_lookup_only_is_forwarded_and_publishes_no_creation_event(
+        self, mock_create_terminal, mock_dispatch
+    ):
+        """Review on PR #773: a lookup resolves an existing terminal, so it
+        must not publish post_create_session a second time."""
+        mock_terminal = MagicMock()
+        mock_terminal.session_name = "cao-test"
+        mock_create_terminal.return_value = mock_terminal
+
+        result = await create_session(
+            provider="kiro_cli",
+            agent_profile="my_agent",
+            idempotency_key="retry-1",
+            lookup_only=True,
+        )
+
+        assert result is mock_terminal
+        assert mock_create_terminal.call_args.kwargs["lookup_only"] is True
+        mock_dispatch.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    async def test_ordinary_create_still_publishes_the_creation_event(
+        self, mock_create_terminal, mock_dispatch
+    ):
+        mock_terminal = MagicMock()
+        mock_terminal.session_name = "cao-test"
+        mock_create_terminal.return_value = mock_terminal
+
+        await create_session(provider="kiro_cli", agent_profile="my_agent")
+
+        assert "lookup_only" not in mock_create_terminal.call_args.kwargs
+        assert mock_dispatch.call_args.args[1] == "post_create_session"
+
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.session_service.create_terminal")
     async def test_create_session_rejects_orchestration_type_without_message(
         self, mock_create_terminal

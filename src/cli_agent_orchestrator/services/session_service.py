@@ -141,6 +141,10 @@ async def create_session(
         group=group,
         metadata=metadata,
     )
+    if lookup_only:
+        # A lookup resolved a terminal that an earlier call created; no session
+        # was created here, so there is no creation event to publish.
+        return terminal
     dispatch_plugin_event(
         registry,
         "post_create_session",
