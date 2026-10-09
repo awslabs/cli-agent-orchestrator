@@ -215,7 +215,7 @@ def main() -> None:
                     "--async",
                     "--auto-approve",
                     "--session-name",
-                    f"transport-{manifest['run_id']}",
+                    f"cao-transport-{manifest['run_id']}",
                     "--working-directory",
                     str(HERE),
                     "--",
