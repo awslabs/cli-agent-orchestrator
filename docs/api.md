@@ -211,6 +211,32 @@ security boundary on top of them.
 Terminal identifiers used in these routes are eight-character hexadecimal
 strings. See [Control Planes](control-planes.md) for operator-facing choices.
 
+### Execution runtimes
+
+- `WS /runtime/channel` is the channel an execution runtime (`cao-bridge`)
+  dials, authenticated by the shared runtime token in the
+  `x-cao-runtime-token` header, not by an API bearer. It is refused when the
+  server has no token.
+- `POST /runtimes/{runtime_id}/terminals` launches a terminal in a connected
+  runtime (`agent_profile`, optional `provider` and `working_directory`) and
+  returns `201` with the terminal. Like `GET /runtimes`, it takes the API
+  bearer when authentication is on.
+- `GET /runtimes` lists the connected runtimes and the terminals placed on
+  them.
+- With `CAO_LOCAL_EXECUTION=0`, routes that would start an agent beside the
+  server (`POST /sessions`, `POST /sessions/{session_name}/terminals`,
+  `POST /terminals/run-step`) return `409`.
+- The `/terminals/{terminal_id}*` operations above (input, key, output,
+  working directory, exit, delete), and `DELETE /sessions/{session_name}`,
+  route a remote terminal to its runtime. They
+  return `503` when the runtime is not connected, `504` when the outcome is
+  unknown, and `502` when the runtime reports a failure. See
+  [Execution runtimes](execution-runtimes.md).
+- Routes that work only on the server's own panes and logs return `409` for a
+  remote terminal: `POST /terminals/run-step` reusing one,
+  `POST /terminals/{terminal_id}/inbox/messages` to one, and
+  `GET /terminals/{terminal_id}/output/range`.
+
 ### Durable handoff results
 
 - `POST /terminals/run-step` runs one agent step and accepts an optional
@@ -421,7 +447,9 @@ WebSocket close frame. The handler uses these server-side refusal codes:
 After the connection is accepted:
 
 - `4003`: terminal/backend target metadata is invalid.
-- `4004`: the terminal does not exist, or the backend cannot attach to it.
+- `4004`: the terminal does not exist, the backend cannot attach to it, or it
+  runs in an [execution runtime](execution-runtimes.md), whose panes are not
+  relayed yet.
 - A normal viewer disconnect detaches that viewer and preserves the session.
 
 Malformed JSON, missing input data, unsupported message types, and other

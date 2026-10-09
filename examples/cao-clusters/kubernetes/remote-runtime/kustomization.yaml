@@ -1,0 +1,18 @@
+# One central cao-server plus one execution runtime (#745, first slice).
+#
+# The server owns the API and state; the runtime runs agents beside its own tmux
+# and dials the server over one outbound WebSocket. See README.md.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: cao-remote
+resources:
+  - namespace.yaml
+  - server.yaml
+  - runtime.yaml
+  - networkpolicy.yaml
+# Both pods run the image built from ../eks/Dockerfile: set newName and newTag
+# to it (or run: kustomize edit set image cao-node=<registry>/<repository>:<tag>).
+images:
+  - name: cao-node
+    newName: cao-node
+    newTag: latest

@@ -34,6 +34,7 @@ from cli_agent_orchestrator.clients.database import (
     get_session_incarnations,
     list_terminals_by_session,
     list_terminals_in_sessions,
+    session_is_remote,
     update_terminals_session_incarnation,
 )
 from cli_agent_orchestrator.constants import SESSION_PREFIX
@@ -459,6 +460,8 @@ def get_session(session_name: str) -> Dict:
     supervisor that will read the first entry as the conductor.
     """
     try:
+        if session_is_remote(session_name):
+            return _get_remote_session(session_name)
         terminals = list_terminals_by_session(session_name)
         backend_exists = get_backend().session_exists(session_name)
         session_data = None
@@ -520,6 +523,112 @@ def get_session(session_name: str) -> Dict:
     except Exception as e:
         logger.error(f"Failed to get session {session_name}: {e}")
         raise
+
+
+def _get_remote_session(session_name: str) -> Dict:
+    """A session whose terminals run in an execution runtime (#745), from its rows.
+
+    Its tmux session is in the runtime, so this server's backend is not asked.
+    Each terminal reads as ``GET /terminals/{id}`` reports it: the status its
+    runtime last pushed, ``unknown`` while the runtime is away. ``status`` is
+    ``detached``: nothing attaches to it through this server.
+    """
+    from cli_agent_orchestrator.services import terminal_service
+
+    terminals = []
+    for terminal in list_terminals_by_session(session_name):
+        try:
+            terminal["status"] = terminal_service.get_terminal(terminal["id"])["status"]
+        except ValueError:
+            continue  # deleted since the listing
+        terminals.append(terminal)
+    if not terminals:
+        raise ValueError(f"Session '{session_name}' not found")
+    session = {"id": session_name, "name": session_name, "status": "detached"}
+    return {"session": session, "terminals": terminals}
+
+
+class _RoutedToRuntime(Exception):
+    """Raised inside a local teardown that finds the session's terminals in a runtime."""
+
+
+def _delete_remote_session(session_name: str, registry: PluginRegistry | None) -> Optional[Dict]:
+    """Tear down a session whose terminals run in an execution runtime (#745).
+
+    Returns None for a local session. Each terminal is deleted in its runtime
+    (``terminal_service.delete_remote_terminal``); the local tmux is never
+    consulted. As for a local session, the lifecycle lock is held across the
+    teardown and plugin events are dispatched after it is released:
+    ``post_kill_terminal`` for each terminal whose row this call dropped,
+    ``post_kill_session`` only once every terminal is gone. A
+    ``RemoteRuntimeError`` (runtime not connected, no answer) propagates to the
+    caller.
+    """
+    if not session_is_remote(session_name):
+        return None
+    from cli_agent_orchestrator.services import terminal_service
+
+    result: Dict = {"deleted": [], "errors": []}
+    torn_down: List[Dict] = []
+    try:
+        with session_lifecycle_lock(session_name):
+            if not session_is_remote(session_name):
+                # The remote incarnation went while this call waited for the
+                # lock (another delete). If the name is taken again (a new local
+                # session), that one is not this call's, and the name is not free.
+                if list_terminals_by_session(session_name):
+                    return {
+                        "deleted": [],
+                        "errors": [
+                            {
+                                "session": session_name,
+                                "error": "already deleted; the name now belongs to another session",
+                            }
+                        ],
+                    }
+                return {"deleted": [session_name], "errors": []}
+            # Serial, under the lock, each bounded by REMOTE_DELETE_TIMEOUT. A
+            # remote session holds one terminal in this slice: a runtime launches
+            # each in a new session, and neither a launch's record step nor a
+            # local create adds one to it. Fan these out if that changes.
+            for terminal in list_terminals_by_session(session_name):
+                gone, dropped = terminal_service.delete_remote_terminal(terminal["id"])
+                if dropped:
+                    torn_down.append(terminal)
+                elif not gone:
+                    result["errors"].append(
+                        {
+                            "terminal_id": terminal["id"],
+                            "error": "cleanup deferred; retry delete_session",
+                        }
+                    )
+                # Gone but not dropped here: a concurrent delete of the
+                # terminal dropped its row, and dispatched its event.
+    finally:
+        # Also when a runtime could not be reached: these are already gone.
+        for terminal in torn_down:
+            try:
+                dispatch_plugin_event(
+                    registry,
+                    "post_kill_terminal",
+                    PostKillTerminalEvent(
+                        session_id=terminal["tmux_session"],
+                        terminal_id=terminal["id"],
+                        agent_name=terminal.get("agent_profile"),
+                    ),
+                )
+            except Exception as e:  # noqa: BLE001 - one bad event must not fail the others
+                logger.warning(f"Failed to emit post_kill_terminal for {terminal['id']}: {e}")
+    if not result["errors"]:
+        result["deleted"].append(session_name)
+        # A concurrent delete that already tore it down found nothing to delete.
+        if torn_down:
+            dispatch_plugin_event(
+                registry,
+                "post_kill_session",
+                PostKillSessionEvent(session_id=session_name, session_name=session_name),
+            )
+    return result
 
 
 def delete_session(session_name: str, registry: PluginRegistry | None = None) -> Dict:
@@ -625,6 +734,9 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
             f"'{SESSION_PREFIX}'); refusing to delete a session CAO did not create"
         )
     result: Dict = {"deleted": [], "errors": []}
+    remote = _delete_remote_session(session_name, registry)
+    if remote is not None:
+        return remote
     # Terminals whose row was actually dropped, with the metadata their
     # post_kill_terminal payload needs. Collected under the lock, dispatched
     # after it is released.
@@ -638,6 +750,10 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
         # self-deadlock path. Guaranteed released on every exit, exceptions
         # included (context manager).
         with session_lifecycle_lock(session_name):
+            if session_is_remote(session_name):
+                # A runtime recorded this session after it was routed here as
+                # local (#745): its terminals are not this tmux's to tear down.
+                raise _RoutedToRuntime()
             terminals = list_terminals_by_session(session_name)
             # A session NAME is only a reusable backend label.  Retained
             # deferred-init failures from an older incarnation can legitimately
@@ -871,6 +987,11 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
         )
         return result
 
+    except _RoutedToRuntime:
+        # Nothing was touched: the check ran first under the lock. Tear the
+        # session down in its runtime; no rows left means another delete did.
+        remote = _delete_remote_session(session_name, registry)
+        return remote if remote is not None else {"deleted": [session_name], "errors": []}
     except Exception as e:
         logger.error(f"Failed to delete session {session_name}: {e}")
         raise
