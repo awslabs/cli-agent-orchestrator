@@ -26,26 +26,48 @@ import shutil
 import signal
 import stat
 import tempfile
+import threading
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any, Literal, Optional
 
 import psutil
+from wcwidth import wcswidth
 
+from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
+from cli_agent_orchestrator.utils.tool_mapping import granted_mcp_servers
 
 logger = logging.getLogger(__name__)
 
 
 class ProviderError(Exception):
     """Exception raised for Grok CLI provider-specific errors."""
+
+
+#: CAO transport name → the ``type`` value Grok's TOML expects.
+#:
+#: The two vocabularies differ: CAO (and the Agent Plugins ``mcp.json`` schema)
+#: uses the MCP spec's ``streamable-http``, while Grok names the same transport
+#: ``http``. Translating rather than passing the value straight through is what
+#: lets ``grok_cli`` be listed as carrying all transports: without this map a
+#: plugin's perfectly valid ``streamable-http`` server reached
+#: ``_render_mcp_config`` and raised, taking terminal creation down with it.
+GROK_URL_TRANSPORTS: dict[str, str] = {
+    "streamable-http": "http",
+    "http": "http",
+    "sse": "sse",
+}
 
 
 # Render-stable current-turn signals from Grok Build 1.0.0.
@@ -147,6 +169,42 @@ _CHROME_LINE = re.compile(
 _MCP_SERVER_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
+def _strip_rendered_scrollbar(output: str) -> str:
+    """Remove Grok's right-edge scrollbar from a rendered viewport.
+
+    A scrollable pane paints a block at the same column on otherwise blank
+    rows. It also paints that block beside the answer and completion marker.
+    Preserve blocks in response text; the composer's symmetric margins and
+    repeated blank rows must agree on the viewport's rightmost display cell.
+    Removing the associated cell padding
+    keeps visible chrome within the detector's bounded completion/footer tail.
+    """
+
+    lines = output.splitlines()
+    right_edges = set()
+    for line in lines:
+        border = re.fullmatch(r"([ \t]*)╭─+╮[ \t]*", line)
+        if border is not None:
+            right_edges.add(wcswidth(line.rstrip()) + wcswidth(border.group(1)) - 1)
+    columns = Counter(
+        wcswidth(line.rstrip()) - 1
+        for line in lines
+        if line.strip() == "█" and line.startswith((" ", "\t"))
+    )
+    scrollbar_columns = {
+        column for column, count in columns.items() if count >= 3 and column in right_edges
+    }
+    if not scrollbar_columns:
+        return output
+    rendered = []
+    for line in lines:
+        line = line.rstrip()
+        if line.endswith("█") and wcswidth(line) - 1 in scrollbar_columns:
+            line = line[:-1].rstrip()
+        rendered.append(line)
+    return "\n".join(rendered)
+
+
 def _toml_string(value: Any) -> str:
     """Serialize a scalar as a TOML-compatible basic string."""
 
@@ -155,6 +213,26 @@ def _toml_string(value: Any) -> str:
 
 class GrokCliProvider(BaseProvider):
     """Provider for the official ``grok`` interactive TUI."""
+
+    # Grok's status detector normalizes terminal escapes and uses structural,
+    # line-oriented chrome (processing markers, completion rows, composer and
+    # footer), so it is safe to run against a settled rendered tmux viewport.
+    # Opt in only to StatusMonitor's quiet stale-PROCESSING recovery. Do NOT opt
+    # into ``supports_direct_status_probe``: after a new dispatch Grok
+    # deliberately reports a retained previous completion as PROCESSING, which
+    # is the safe status verdict but is not proof that the new paste was
+    # accepted. Using it as deferred-init pickup evidence would suppress the
+    # redelivery that a genuinely dropped paste needs.
+    supports_stale_processing_capture = True
+
+    @classmethod
+    def honors_model(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+        requested_model: Optional[str],
+    ) -> bool:
+        return True
 
     def __init__(
         self,
@@ -187,10 +265,28 @@ class GrokCliProvider(BaseProvider):
         self._last_completion_identity: Optional[str] = None
         self._last_completion_stream_offset: Optional[int] = None
         self._last_completion_buffer_epoch: Optional[int] = None
+        self._last_completion_query_identity: Optional[str] = None
+        self._current_turn_query_identity: Optional[str] = None
+        self._previous_turn_query_identity: Optional[str] = None
+        self._dispatched_query_identity: Optional[str] = None
         self._turn_activity_seen = False
         self._status_buffer_epoch = 0
         self._last_status_buffer: Optional[str] = None
         self._last_status_buffer_stream_start = 0
+        # ``get_status`` mutates turn-attribution state. Stale-pane recovery
+        # deliberately snapshots those fields, runs a speculative detection,
+        # then restores them until StatusMonitor confirms the pane. Serialize
+        # that transaction with normal detection and turn-boundary updates: an
+        # otherwise-correct speculative restore must never erase a concurrent
+        # ``mark_input_received`` or normal status observation.
+        self._status_state_lock = threading.RLock()
+        # Side-effect-free stale-pane probes run outside StatusMonitor's lock.
+        # Keep the latest probe's before/after detector snapshots so the later
+        # commit can be pure in-memory: no provider.get_status() (and therefore
+        # no native-backend probe) while the monitor lock is held.
+        self._stale_capture_probe_candidate: Optional[tuple[str, TerminalStatus, tuple, tuple]] = (
+            None
+        )
 
     @property
     def paste_enter_count(self) -> int:
@@ -220,7 +316,9 @@ class GrokCliProvider(BaseProvider):
         if self._agent_profile is None:
             return None
         try:
-            return load_agent_profile(self._agent_profile)
+            return _with_plugin_mcp(
+                load_agent_profile(self._agent_profile), ProviderType.GROK_CLI.value
+            )
         except Exception:
             return None
 
@@ -228,7 +326,9 @@ class GrokCliProvider(BaseProvider):
         if self._agent_profile is None:
             return None
         try:
-            return load_agent_profile(self._agent_profile)
+            return _with_plugin_mcp(
+                load_agent_profile(self._agent_profile), ProviderType.GROK_CLI.value
+            )
         except FileNotFoundError:
             raise
         except Exception as exc:
@@ -320,15 +420,17 @@ class GrokCliProvider(BaseProvider):
             if config.get("url"):
                 transport = config.get("type")
                 if transport is not None:
-                    if transport not in {"http", "sse"}:
+                    rendered = GROK_URL_TRANSPORTS.get(transport)
+                    if rendered is None:
                         raise ProviderError(
                             f"MCP server '{name}' has unsupported URL transport "
-                            f"{transport!r}; Grok supports 'http' and 'sse'"
+                            f"{transport!r}; Grok supports "
+                            f"{', '.join(repr(k) for k in sorted(GROK_URL_TRANSPORTS))}"
                         )
                     # Grok defaults an untyped URL to HTTP.  SSE requires an
                     # explicit type, so preserve the profile transport rather
                     # than silently changing an SSE server into HTTP.
-                    lines.append(f"type = {_toml_string(transport)}")
+                    lines.append(f"type = {_toml_string(rendered)}")
                 lines.append(f"url = {_toml_string(config['url'])}")
             elif config.get("command"):
                 lines.append(f"command = {_toml_string(config['command'])}")
@@ -368,27 +470,31 @@ class GrokCliProvider(BaseProvider):
 
         Grok's ``MCPTool(server__*)`` permission language accepts a pattern.
         Never interpolate an arbitrary ``@...`` CAO entry into that pattern:
-        only a conventional server name that is actually configured for this
-        profile (or CAO's built-in orchestration server) may grant MCP access.
-        ``@builtin`` is a CAO vocabulary marker, not an MCP server reference.
-        Unknown or malformed entries remain denied by the enclosing dontAsk
-        policy instead of widening it.
+        a CAO entry is expanded against the server names actually configured for
+        this profile (plus CAO's built-in orchestration server) by the shared
+        ``tool_mapping.granted_mcp_servers`` rule, and only a resulting CONCRETE
+        name that is also a conventional server identifier may grant MCP access.
+        So ``@plugin-*`` — which ``docs/agent-plugins.md`` documents and which
+        this site used to deny by requiring an exact literal — grants
+        ``MCPTool(plugin-tools__*)`` when that server is configured and nothing at
+        all when it is not. The pattern itself never reaches Grok's permission
+        language, and ``@builtin`` is CAO vocabulary rather than an MCP server
+        reference. Unknown or malformed entries remain denied by the enclosing
+        dontAsk policy instead of widening it.
+
+        The matching rule is shared with OpenCode's ``agent.<id>.tools`` grant in
+        ``services/install_service.py`` on purpose: two hand-written matchers are
+        how the documented glob came to work on neither.
         """
         configured = {"cao-mcp-server"}
         if isinstance(mcp_servers, dict):
             configured.update(name for name in mcp_servers if isinstance(name, str))
 
-        return sorted(
-            {
-                name
-                for tool_ref in allowed_tools
-                if isinstance(tool_ref, str)
-                and tool_ref.startswith("@")
-                and (name := tool_ref[1:]) != "builtin"
-                and _MCP_SERVER_REF.fullmatch(name)
-                and name in configured
-            }
-        )
+        return [
+            name
+            for name in granted_mcp_servers(allowed_tools, configured)
+            if _MCP_SERVER_REF.fullmatch(name)
+        ]
 
     @staticmethod
     def _atomic_write_private(path: Path, content: str) -> None:
@@ -472,8 +578,6 @@ class GrokCliProvider(BaseProvider):
             command_parts.extend(["--model", model])
 
         rules = self._apply_skill_prompt(profile.system_prompt if profile is not None else "")
-        if rules:
-            command_parts.extend(["--rules", rules])
 
         if self._allowed_tools is not None and "*" not in self._allowed_tools:
             from cli_agent_orchestrator.utils.tool_mapping import (
@@ -508,7 +612,32 @@ class GrokCliProvider(BaseProvider):
         else:
             command_parts.append("--always-approve")
 
-        return shlex.join(command_parts)
+        command = shlex.join(command_parts)
+        if rules:
+            # The rules text (profile system prompt plus the skill catalog) is
+            # commonly several KB. The launch line is typed into a bare shell,
+            # where a line longer than the tty's canonical-mode limit
+            # (MAX_CANON, 4096 bytes on Linux) is cut by the line discipline
+            # before the shell sees it. Inlining the text made the line's
+            # length depend on the profile, and put the permission flags after
+            # it. A cut always landed inside the quoted text, leaving an
+            # unclosed quote, so the shell hung at a continuation prompt and
+            # Grok never started (fail-closed, surfacing as an init timeout);
+            # but an unrestricted launch was one shlex quirk away from losing
+            # ``--deny`` instead. The text now lives in a 0600 file inside the
+            # terminal's private GROK_HOME, and the line carries only a short
+            # ``$(cat <path>)`` substitution, expanded by the shell before
+            # exec and therefore not subject to the tty line limit. Same
+            # mechanism as the Codex provider's developer_instructions file.
+            # Double quotes keep the substitution active while suppressing
+            # word-splitting and globbing of the substituted text; it is
+            # appended raw because ``shlex.join`` would single-quote the
+            # fragment and disable the substitution. The permission flags are
+            # already on the line ahead of it, so any cut can only lose rules.
+            rules_file = home / "rules.md"
+            self._atomic_write_private(rules_file, rules)
+            command += f' --rules "$(cat {shlex.quote(str(rules_file))})"'
+        return command
 
     async def initialize(self) -> bool:
         profile = self._try_load_profile()
@@ -640,13 +769,200 @@ class GrokCliProvider(BaseProvider):
         first chunk for the newly dispatched turn.
         """
 
-        if epoch <= self._status_buffer_epoch:
-            return
-        self._status_buffer_epoch = epoch
-        self._last_status_buffer = None
-        self._last_status_buffer_stream_start = 0
+        with self._status_state_lock:
+            if epoch <= self._status_buffer_epoch:
+                return
+            self._status_buffer_epoch = epoch
+            self._last_status_buffer = None
+            self._last_status_buffer_stream_start = 0
+            self._stale_capture_probe_candidate = None
+
+    def _status_probe_state(self) -> tuple:
+        """Mutable status-detector state touched by :meth:`get_status`.
+
+        Stale capture-pane recovery samples a rendered snapshot before the
+        monitor has decided whether to trust it.  Those speculative reads must
+        not advance completion identity or replace the rolling-FIFO coordinate
+        baseline, so the monitor uses the transactional helpers below.
+        """
+
+        return (
+            self._awaiting_turn_activity,
+            self._turn_activity_seen,
+            self._last_completion_identity,
+            self._last_completion_stream_offset,
+            self._last_completion_buffer_epoch,
+            self._last_status_buffer,
+            self._last_status_buffer_stream_start,
+            self._last_completion_query_identity,
+            self._current_turn_query_identity,
+            self._previous_turn_query_identity,
+            self._dispatched_query_identity,
+        )
+
+    def _restore_status_probe_state(self, state: tuple) -> None:
+        (
+            self._awaiting_turn_activity,
+            self._turn_activity_seen,
+            self._last_completion_identity,
+            self._last_completion_stream_offset,
+            self._last_completion_buffer_epoch,
+            self._last_status_buffer,
+            self._last_status_buffer_stream_start,
+            self._last_completion_query_identity,
+            self._current_turn_query_identity,
+            self._previous_turn_query_identity,
+            self._dispatched_query_identity,
+        ) = state
+
+    def probe_stale_processing_capture(self, output: str) -> TerminalStatus:
+        """Classify a rendered stale-PROCESSING snapshot without side effects."""
+
+        with self._status_state_lock:
+            # The very first turn has no predecessor identity by definition, so it
+            # must be allowed to recover the #813 raw-FIFO wedge from its rendered
+            # completion.  On later turns, however, a missing predecessor identity
+            # means CAO never established which completion belonged to the previous
+            # turn.  In that state a rendered ready pane is fundamentally
+            # unattributable: a dropped new paste can leave turn N-1's completion on
+            # screen, and even a fresh raw repaint may transiently re-establish a
+            # PROCESSING status for generation N.  Never let that generic activity
+            # turn an identity-less old pane into N's completion.  Fail closed until
+            # some normal/recovered completion has established the predecessor
+            # identity.
+            #
+            # ``_turns`` counts logical turns only: a full redelivery of the same
+            # dispatch (``mark_redelivery_received``) deliberately leaves it
+            # unchanged, so a redelivered first turn stays exempt above instead of
+            # inheriting this guard from a second delivery attempt.
+            if self._turns > 1 and self._last_completion_identity is None:
+                recovered_current_turn = (
+                    self._turn_activity_seen
+                    and self._current_turn_query_identity is not None
+                    and self._previous_turn_query_identity is not None
+                    and self._queries_are_distinct(
+                        self._current_turn_query_identity, self._previous_turn_query_identity
+                    )
+                )
+                if not recovered_current_turn:
+                    self._stale_capture_probe_candidate = None
+                    return TerminalStatus.PROCESSING
+
+            state = self._status_probe_state()
+            try:
+                detected = self._get_status_unlocked(_strip_rendered_scrollbar(output))
+                committed = self._status_probe_state()
+            finally:
+                self._restore_status_probe_state(state)
+            self._stale_capture_probe_candidate = (
+                hashlib.sha256(output.encode("utf-8")).hexdigest(),
+                detected,
+                state,
+                committed,
+            )
+            return detected
+
+    def commit_stale_processing_capture(self, output: str, expected: TerminalStatus) -> bool:
+        """Commit one previously-confirmed rendered snapshot transactionally.
+
+        If provider state changed concurrently and the same bytes no longer
+        classify as the confirmed verdict, restore the pre-commit state and
+        fail closed; StatusMonitor will leave the terminal PROCESSING.
+        """
+
+        with self._status_state_lock:
+            candidate = self._stale_capture_probe_candidate
+            self._stale_capture_probe_candidate = None
+            if candidate is None:
+                return False
+            fingerprint, detected, state, committed = candidate
+            if (
+                fingerprint != hashlib.sha256(output.encode("utf-8")).hexdigest()
+                or detected != expected
+                or self._status_probe_state() != state
+            ):
+                return False
+
+            # ``output`` is a rendered viewport, not StatusMonitor's rolling FIFO.
+            # Keep the semantic detector changes earned by the confirmed pane, but
+            # restore the FIFO overlap baseline/cursor coordinate space completely.
+            # If this pane establishes a new completion identity, its FIFO position
+            # is deliberately unknown rather than a viewport-relative byte offset
+            # masquerading as a stream cursor.
+            self._awaiting_turn_activity = committed[0]
+            self._turn_activity_seen = committed[1]
+            if committed[2] != state[2]:
+                self._last_completion_identity = committed[2]
+                self._last_completion_stream_offset = None
+                self._last_completion_buffer_epoch = committed[4]
+                self._last_completion_query_identity = committed[7]
+                self._current_turn_query_identity = committed[8]
+            return True
 
     def get_status(self, output: Optional[str]) -> TerminalStatus:
+        with self._status_state_lock:
+            return self._get_status_unlocked(output)
+
+    @staticmethod
+    def _queries_are_distinct(left: Optional[str], right: Optional[str]) -> bool:
+        """Reject equal or prefix-related query fragments as wrapping ambiguity.
+
+        The visible first line may be only part of a soft-wrapped query. A
+        shorter fragment of an old query must never certify a new dispatch.
+        """
+        return bool(left and right and not left.startswith(right) and not right.startswith(left))
+
+    def _record_processing_evidence(self, latest_query_identity: Optional[str]) -> None:
+        """Attribute a live processing marker to the in-flight turn.
+
+        A processing repaint is current-turn evidence only when it can be
+        attributed. When the dispatched message is known, its normalized query
+        must match: an older turn can differ from the immediate predecessor
+        without belonging to this dispatch. Across a dispatch reset, only a
+        query distinct from the predecessor's can attribute a spinner. Without
+        a predecessor completion identity, a query distinct from the previous
+        turn's is enough to recover from an interrupted predecessor. The
+        pane-recovered same-query case stays ambiguous here and deliberately
+        leaves ``_turn_activity_seen`` False.
+
+        This is deliberately NOT generation-level evidence: a spinner merely
+        drawn in a fresh buffer generation cannot prove which turn drew it. The
+        predecessor's own busy frame, replayed after the dispatch boundary, is
+        drawn in the new generation too, so a generation change plus a spinner
+        is not ownership. See the byte-identical cross-generation guard in
+        ``_get_status_unlocked``, which fails closed on exactly that replay.
+        """
+
+        if (
+            self._dispatched_query_identity is not None
+            and latest_query_identity != self._dispatched_query_identity
+        ):
+            return
+
+        if self._last_completion_identity is not None:
+            if self._last_completion_buffer_epoch != self._status_buffer_epoch:
+                attributable = self._queries_are_distinct(
+                    latest_query_identity, self._last_completion_query_identity
+                )
+            else:
+                attributable = not (
+                    self._last_completion_stream_offset is None
+                    and latest_query_identity is not None
+                    and not self._queries_are_distinct(
+                        latest_query_identity, self._last_completion_query_identity
+                    )
+                )
+            if attributable:
+                self._turn_activity_seen = True
+        elif latest_query_identity is not None and (
+            self._previous_turn_query_identity is None
+            or self._queries_are_distinct(latest_query_identity, self._previous_turn_query_identity)
+        ):
+            self._turn_activity_seen = True
+        if self._turn_activity_seen and latest_query_identity is not None:
+            self._current_turn_query_identity = latest_query_identity
+
+    def _get_status_unlocked(self, output: Optional[str]) -> TerminalStatus:
         native = self._resolve_native_status(output)
         if native is not None:
             return native
@@ -735,6 +1051,28 @@ class GrokCliProvider(BaseProvider):
                 completion_matches.append(match)
         last_completion = completion_matches[-1].start() if completion_matches else -1
         last_error = max((match.start() for match in ERROR_PATTERN.finditer(tail)), default=-1)
+        all_queries = list(QUERY_PATTERN.finditer(clean))
+        latest_query = all_queries[-1] if all_queries else None
+        latest_query_identity = (
+            re.sub(r"\s+", "", _TIMESTAMP_SUFFIX.sub("", latest_query.group()))
+            if latest_query is not None
+            else None
+        )
+        # Grok's per-cell redraw can echo the submitted text without ever
+        # emitting the rendered query's leading ❯. Bind that echo to the exact
+        # dispatched message, and only use it when a later busy marker proves
+        # execution activity. A settled pane must still carry the same distinct
+        # current query; neither the sent text nor an old busy repaint alone
+        # can complete the new turn.
+        if (
+            latest_query_identity is None
+            and last_processing >= 0
+            and self._dispatched_query_identity is not None
+            and re.sub(r"\s+", "", clean[: tail_start + last_processing]).startswith(
+                self._dispatched_query_identity[1:]
+            )
+        ):
+            latest_query_identity = self._dispatched_query_identity
 
         # The usage-limit refusal counts only as part of a picker that is still
         # drawn: the boxed refusal line must be followed by one of the picker's
@@ -782,9 +1120,20 @@ class GrokCliProvider(BaseProvider):
         if last_picker_answer > max(last_completion, last_ready, last_processing):
             return TerminalStatus.WAITING_USER_ANSWER
 
+        # A live processing marker is current-turn evidence even when a later
+        # completion sits in the SAME observation (Grok can emit the busy frame
+        # and the finished frame in one FIFO burst). The position branch below
+        # is skipped in that case, so record the evidence first: otherwise
+        # ``_turn_activity_seen`` stays False and the completion guards reject a
+        # genuine turn forever. Recording is strictly attribution-gated by
+        # ``_record_processing_evidence``: the mere presence of a spinner in a
+        # fresh buffer generation is NOT ownership, because the predecessor's
+        # own busy frame replayed after the dispatch boundary is drawn in the
+        # new generation too.
+        if last_processing >= 0 and self._awaiting_turn_activity:
+            self._record_processing_evidence(latest_query_identity)
+
         if last_processing > last_completion:
-            if self._awaiting_turn_activity:
-                self._turn_activity_seen = True
             return TerminalStatus.PROCESSING
 
         if last_error > max(last_completion, last_ready, last_processing):
@@ -792,15 +1141,53 @@ class GrokCliProvider(BaseProvider):
 
         if last_ready >= 0:
             if last_completion >= 0 and self._turns > 0:
+                # A completion on turn 2+ is attributable only when CAO has a
+                # predecessor completion identity to compare it against. A
+                # dropped paste can be followed by a raw repaint of turn N-1's
+                # completed screen; that repaint may first look PROCESSING and
+                # then become a structurally complete ready frame as its old
+                # ``Worked for`` row arrives. Generic redraw activity cannot
+                # establish ownership when N-1 was never identified. Turn 1 is
+                # exempt because it has no predecessor and is the #813 recovery
+                # case itself.
+                #
+                # ``_turns`` counts logical turns only, so a redelivery of the
+                # same dispatch (``mark_redelivery_received``) does not turn a
+                # first turn into "turn 2 with no predecessor identity" and
+                # strand the genuinely successful resend here forever.
                 completion_match = completion_matches[-1]
                 completion_start = len(clean) - len(tail) + completion_match.start()
                 completion_end = len(clean) - len(tail) + completion_match.end()
                 completion_stream_offset = stream_start + completion_start
                 query_matches = list(QUERY_PATTERN.finditer(clean[:completion_start]))
+                completion_query = query_matches[-1] if query_matches else None
+                completion_query_identity = (
+                    re.sub(r"\s+", "", _TIMESTAMP_SUFFIX.sub("", completion_query.group()))
+                    if completion_query is not None
+                    else None
+                )
+                if (
+                    self._awaiting_turn_activity
+                    and self._turns > 1
+                    and self._last_completion_identity is None
+                    and not (
+                        self._turn_activity_seen
+                        and completion_query_identity is not None
+                        and self._previous_turn_query_identity is not None
+                        and self._queries_are_distinct(
+                            completion_query_identity, self._previous_turn_query_identity
+                        )
+                    )
+                ):
+                    return TerminalStatus.PROCESSING
                 turn_start = query_matches[-1].start() if query_matches else completion_start
-                fingerprint = hashlib.sha256(
-                    clean[turn_start:completion_end].encode("utf-8")
-                ).hexdigest()
+                # Cursor-positioned raw output and its rendered pane can differ
+                # in indentation, blank lines and wrapping. Those presentation
+                # differences cannot prove that a new turn ran. Keep one
+                # identity across both observation paths; whitespace-only
+                # changes deliberately remain unattributable after a reset.
+                completion_content = re.sub(r"\s+", "", clean[turn_start:completion_end])
+                fingerprint = hashlib.sha256(completion_content.encode("utf-8")).hexdigest()
                 same_completion = (
                     self._last_completion_identity == fingerprint
                     and self._last_completion_buffer_epoch == self._status_buffer_epoch
@@ -809,11 +1196,40 @@ class GrokCliProvider(BaseProvider):
                 if self._awaiting_turn_activity and same_completion:
                     return TerminalStatus.PROCESSING
 
-                # A byte-identical completion can be legitimate on a new turn.
-                # Accept it only when its stable stream position has advanced.
-                # A short discontinuous snapshot has no such proof and must
-                # remain processing; otherwise a stale completion seen after a
-                # processing frame could complete the new task.
+                # A completion cannot be attributed to the current turn once a
+                # fresh buffer generation has begun unless it carries a signal a
+                # replay of the predecessor cannot fake. The predecessor's own
+                # busy frame and finished frame, replayed after the dispatch
+                # boundary, are byte-identical to a genuine repeat; the stream
+                # coordinate space restarts at the reset, so neither the
+                # generation change nor a spinner drawn in it proves which turn
+                # drew these bytes. Two shapes stay unattributable here: a
+                # completion whose preceding query is absent (no current-turn
+                # identity to compare), a repeated predecessor query, or a pane
+                # without the current query's processing evidence. Fingerprint
+                # changes cannot establish freshness: transient raw busy chrome
+                # can disappear from an unchanged rendered predecessor pane.
+                if (
+                    self._awaiting_turn_activity
+                    and self._last_completion_identity is not None
+                    and self._last_completion_buffer_epoch != self._status_buffer_epoch
+                    and (
+                        completion_query_identity is None
+                        or self._last_completion_identity == fingerprint
+                        or not self._queries_are_distinct(
+                            completion_query_identity, self._last_completion_query_identity
+                        )
+                        or not self._turn_activity_seen
+                        or completion_query_identity != self._current_turn_query_identity
+                    )
+                ):
+                    return TerminalStatus.PROCESSING
+
+                # A byte-identical completion can be legitimate WITHIN one
+                # generation: accept it only when its stable stream position has
+                # advanced. A short discontinuous snapshot has no such proof and
+                # must remain processing; otherwise a stale completion seen after
+                # a processing frame could complete the new task.
                 if (
                     self._awaiting_turn_activity
                     and self._last_completion_identity == fingerprint
@@ -836,32 +1252,37 @@ class GrokCliProvider(BaseProvider):
                     and self._last_completion_identity is not None
                     and not self._turn_activity_seen
                 ):
-                    # A fresh buffer generation makes a processing marker that
-                    # precedes the completion reliable current-turn evidence,
-                    # even when Grok emits both frames in one FIFO chunk.  Do
-                    # not accept an identical completion without that marker:
-                    # a delayed old completed screen after clear must remain
-                    # PROCESSING.
+                    # No attributable current-turn activity was observed. For a
+                    # byte-identical completion the only remaining proof would be
+                    # an advanced raw coordinate; a pane-recovered predecessor
+                    # (offset None) has none. Never let a same-query repaint
+                    # stand in for ownership: that is exactly the dropped-paste
+                    # replay.
+                    latest_query_start = query_matches[-1].start() if query_matches else None
                     if (
-                        self._last_completion_identity == fingerprint
-                        and self._last_completion_buffer_epoch != self._status_buffer_epoch
-                        and 0 <= last_processing < last_completion
-                    ):
-                        self._turn_activity_seen = True
-                    else:
-                        latest_query_start = query_matches[-1].start() if query_matches else None
-                        if (
-                            latest_query_start is None
-                            or self._last_completion_stream_offset is not None
+                        latest_query_start is None
+                        or (
+                            self._last_completion_stream_offset is None
+                            and not self._queries_are_distinct(
+                                completion_query_identity, self._last_completion_query_identity
+                            )
+                            and fingerprint == self._last_completion_identity
+                        )
+                        or (
+                            self._last_completion_stream_offset is not None
                             and stream_start + latest_query_start
                             <= self._last_completion_stream_offset
-                        ):
-                            return TerminalStatus.PROCESSING
-                        self._turn_activity_seen = True
+                        )
+                    ):
+                        return TerminalStatus.PROCESSING
+                    self._turn_activity_seen = True
+                    self._current_turn_query_identity = completion_query_identity
                 self._awaiting_turn_activity = False
                 self._last_completion_identity = fingerprint
                 self._last_completion_stream_offset = completion_stream_offset
                 self._last_completion_buffer_epoch = self._status_buffer_epoch
+                self._last_completion_query_identity = completion_query_identity
+                self._current_turn_query_identity = completion_query_identity
                 return TerminalStatus.COMPLETED
             # After dispatch, do not mistake the previous empty composer for
             # instant completion before Grok has rendered this turn.
@@ -875,7 +1296,7 @@ class GrokCliProvider(BaseProvider):
         return r"Shift\+Tab:mode[^\n]*Ctrl\+x:shortcuts"
 
     def extract_last_message_from_script(self, script_output: str) -> str:
-        clean = strip_terminal_escapes(script_output)
+        clean = _strip_rendered_scrollbar(strip_terminal_escapes(script_output))
         completions = list(COMPLETION_PATTERN.finditer(clean))
         if not completions:
             raise ValueError("No Grok CLI completion boundary found")
@@ -1177,8 +1598,43 @@ class GrokCliProvider(BaseProvider):
             self._grok_home_root = None
             return True
 
+    def _begin_delivery(self, *, new_logical_turn: bool) -> None:
+        """Reset per-delivery-attempt tracking for one delivered prompt.
+
+        ``_awaiting_turn_activity`` and ``_turn_activity_seen`` describe the
+        current delivery attempt within the current StatusMonitor buffer
+        generation, so every delivery — including a redelivery — resets them.
+        ``_turns`` counts LOGICAL turns instead. The identity-less fail-closed
+        guards in ``_get_status_unlocked`` and
+        ``probe_stale_processing_capture`` consult it to decide whether a
+        rendered pane may belong to the turn CAO is waiting on at all, so a
+        redelivery of the SAME dispatch must not advance it: otherwise a
+        genuinely successful resend of turn 1 becomes "turn 2 with no
+        predecessor identity" and its own real completion is rejected forever.
+        """
+        with self._status_state_lock:
+            super().mark_input_received()
+            if new_logical_turn:
+                predecessor_query = (
+                    self._current_turn_query_identity or self._last_completion_query_identity
+                )
+                if predecessor_query is not None:
+                    self._previous_turn_query_identity = predecessor_query
+                self._current_turn_query_identity = None
+                self._turns += 1
+            self._awaiting_turn_activity = True
+            self._turn_activity_seen = False
+            self._dispatched_query_identity = None
+            self._stale_capture_probe_candidate = None
+
+    def record_dispatched_message(self, message: str) -> None:
+        with self._status_state_lock:
+            normalized = re.sub(r"\s+", "", message)
+            self._dispatched_query_identity = "❯" + normalized if normalized else None
+            self._stale_capture_probe_candidate = None
+
     def mark_input_received(self) -> None:
-        super().mark_input_received()
-        self._turns += 1
-        self._awaiting_turn_activity = True
-        self._turn_activity_seen = False
+        self._begin_delivery(new_logical_turn=True)
+
+    def mark_redelivery_received(self) -> None:
+        self._begin_delivery(new_logical_turn=False)

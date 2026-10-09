@@ -51,6 +51,30 @@ cd cao_mcp_apps
 npm install
 ```
 
+Use npm 10+ with install scripts enabled. The private local `braces-compat`
+adapter re-exports the canonical dependency
+`@dieub/braces-depth-guard@3.0.3-pn.3`. Keep `.npmrc`'s `install-links=false`
+setting and include `braces-compat/` and `../vendor/` when installing the project.
+The unchanged fork tarball is [vendored in the repository](../vendor/README.md),
+so a cold install does not depend on its registry availability. `postinstall`
+applies the shared
+[`../patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch`](../patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch)
+and fails if it cannot apply. The patch adds a bound on acyclic AST ancestor
+traversal to the fork's parser, recursive-AST, and cycle guards.
+`npm run test:dependencies` verifies the installed mitigation and its consumers;
+`npm run build:all` runs it automatically.
+
+The lockfile retains the fork's real package identity, version, and integrity.
+This is a third-party replacement, not an official fixed release or an advisory
+exemption. The repository's
+[Dependency Security gate](../SECURITY.md#full-dependency-gate) includes
+development dependencies and blocks every HIGH/CRITICAL finding.
+
+`source-map-js` is locked to the upstream security release 1.2.2 for
+CVE-2026-93749, consistently with the docs and web toolchains. See
+[upstream security releases](../SECURITY.md#additional-upstream-security-releases);
+a single-project dependency update does not clear findings in other graphs.
+
 ## Commands
 
 | Command | Description |
@@ -78,13 +102,16 @@ npm install
 
 ## CI
 
-Two jobs in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) cover this
+Three jobs in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) cover this
 package:
 
 - **CAO MCP Apps** — install → typecheck → unit tests with coverage → `build:all`
   → JIT scan → bundle-size budget → HTTP-only guard → backend coverage →
   **coverage ratchet**.
 - **CAO MCP Apps E2E (Playwright)** — installs Chromium and runs the E2E specs.
+- **Dependency Security** — audits all locked graphs, including development
+  dependencies and unfixed advisories, and independently verifies the installed
+  dependency mitigations.
 
 ### Coverage ratchet
 

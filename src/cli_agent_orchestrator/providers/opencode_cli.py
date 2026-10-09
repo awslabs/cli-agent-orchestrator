@@ -24,6 +24,7 @@ from typing import List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -45,7 +46,10 @@ USER_MESSAGE_PATTERN = r"^┃\s{2}"
 # Two middle-dot separators and a trailing duration are required.
 # OpenCode formats duration as "Ns" for short runs and "Nm Ns" once the turn
 # exceeds 60 seconds (e.g. "1m 8s").  Both forms must be matched.
-COMPLETION_MARKER_PATTERN = r"▣\s+\S+\s+·\s+.+?\s+·\s+(?:\d+m\s+)?\d+(?:\.\d+)?s"
+# The agent is shown by its display name, which may contain spaces
+# ("Sisyphus - Ultraworker"), so it runs up to the first separator.  It must not
+# cross a newline, or a stray "▣" earlier in the response would start the match.
+COMPLETION_MARKER_PATTERN = r"▣\s+[^·\n]+·\s+.+?\s+·\s+(?:\d+m\s+)?\d+(?:\.\d+)?s"
 
 # Processing footer — keybind hint present while the agent is generating.
 PROCESSING_FOOTER_PATTERN = r"\besc interrupt\b"
@@ -73,6 +77,15 @@ class OpenCodeCliProvider(BaseProvider):
         _agent_profile: Name of the installed OpenCode agent to launch
         _model: Optional model override (e.g. ``anthropic/claude-sonnet-4-6``)
     """
+
+    @classmethod
+    def honors_model(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+        requested_model: Optional[str],
+    ) -> bool:
+        return True
 
     def __init__(
         self,

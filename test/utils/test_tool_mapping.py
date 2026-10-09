@@ -3,10 +3,15 @@
 import pytest
 
 from cli_agent_orchestrator.utils.tool_mapping import (
+    ALL_NATIVE_TOOLS,
+    KIRO_BUILTIN_CHROME,
     format_tool_summary,
     get_allowed_tools,
     get_disallowed_tools,
+    granted_mcp_servers,
+    kiro_agent_tools,
     resolve_allowed_tools,
+    tool_constraint_instruction,
 )
 
 
@@ -36,6 +41,15 @@ class TestResolveAllowedTools:
         assert "fs_*" in result
         assert "web_fetch" in result
 
+    def test_workflow_scout_role_defaults(self):
+        """Shipped scout role: read + cao workflow list/get, not developer."""
+        result = resolve_allowed_tools(None, "workflow_scout")
+        assert result == ["@builtin", "fs_read", "execute_bash", "@cao-mcp-server"]
+        assert "fs_*" not in result
+        assert "fs_write" not in result
+        assert "web_fetch" not in result
+        assert "*" not in result
+
     def test_developer_default_when_no_role_no_tools(self):
         """No role + no allowedTools = developer defaults (secure default)."""
         result = resolve_allowed_tools(None, None)
@@ -59,6 +73,89 @@ class TestResolveAllowedTools:
         """Wildcard '*' in profile tools is preserved."""
         result = resolve_allowed_tools(["*"], "supervisor")
         assert result == ["*"]
+
+    def test_unknown_role_raises(self):
+        """A typo must not grant ['*'] — that is more privilege than omitting role."""
+        with pytest.raises(ValueError, match="Unknown role 'Supervisor'"):
+            resolve_allowed_tools(None, "Supervisor")
+
+    def test_explicit_tools_with_unknown_role_are_honored(self):
+        """Explicit allowedTools short-circuit role lookup and do not raise."""
+        result = resolve_allowed_tools(["fs_read"], "bogus_role")
+        assert result == ["fs_read"]
+
+
+class TestExplicitAllowedToolsIsTheWholeList:
+    """Regression for #772: an explicit allowedTools does not get MCP refs appended.
+
+    The append exists so that declaring a server in ``mcpServers`` is enough to use
+    it. Applied to an explicit ``allowedTools`` it also meant the operator could not
+    withhold one, and ``--allowed-tools`` never got the append, so the two spellings
+    ``docs/tool-restrictions.md`` calls priority 2 and 3 resolved to different
+    policies from the same list.
+    """
+
+    def test_a_declared_server_is_not_added_to_an_explicit_list(self):
+        result = resolve_allowed_tools(["fs_read"], None, ["cao-mcp-server"])
+        assert result == ["fs_read"]
+
+    def test_the_same_holds_when_a_role_is_also_set(self):
+        """``allowedTools`` outranks ``role``, so the role must not reintroduce it."""
+        result = resolve_allowed_tools(["fs_read"], "developer", ["cao-mcp-server"])
+        assert result == ["fs_read"]
+
+    def test_naming_the_server_still_grants_it(self):
+        """The supported way to keep the grant is to write it in the list."""
+        result = resolve_allowed_tools(["fs_read", "@cao-mcp-server"], None, ["cao-mcp-server"])
+        assert result == ["fs_read", "@cao-mcp-server"]
+
+    def test_an_empty_list_denies_everything(self):
+        """``allowedTools: []`` is a deny-all and used to resolve to one grant."""
+        assert resolve_allowed_tools([], None, ["cao-mcp-server"]) == []
+
+    def test_the_cli_and_the_profile_agree_on_the_same_list(self):
+        """The disagreement in #772.
+
+        ``cli/commands/launch.py`` assigns ``list(allowed_tools)`` for
+        ``--allowed-tools`` and never calls this function, so the CLI spelling was
+        already unappended. Matching it here is what makes the two priorities
+        express one policy.
+        """
+        written_by_the_operator = ["fs_read", "execute_bash"]
+        via_cli = list(written_by_the_operator)
+        via_profile = resolve_allowed_tools(written_by_the_operator, None, ["cao-mcp-server"])
+        assert via_profile == via_cli
+
+    def test_the_role_branch_still_appends(self):
+        """Unchanged: a role default is CAO's list, not the operator's."""
+        result = resolve_allowed_tools(None, "supervisor", ["my-server"])
+        assert "@my-server" in result
+
+    def test_the_no_role_fallback_still_appends(self):
+        result = resolve_allowed_tools(None, None, ["my-server"])
+        assert "@my-server" in result
+
+    def test_an_explicit_wildcard_is_still_untouched(self):
+        assert resolve_allowed_tools(["*"], None, ["cao-mcp-server"]) == ["*"]
+
+
+class TestToolConstraintInstruction:
+    """Regression for the #803 review: the sentence has to hold for an empty list.
+
+    Five soft-enforcement providers built this by joining the allowlist, so a
+    deny-all produced a sentence that named no tools and read as an authoring
+    slip rather than as a restriction.
+    """
+
+    def test_a_deny_all_says_so_in_words(self):
+        assert tool_constraint_instruction([]) == (
+            "You may not use any tools. Do not attempt to call one."
+        )
+
+    def test_a_restricted_policy_keeps_the_existing_wording(self):
+        assert tool_constraint_instruction(["fs_read", "fs_list"]) == (
+            "You only have access to these tools: fs_read, fs_list"
+        )
 
 
 class TestGetDisallowedTools:
@@ -295,3 +392,172 @@ class TestClaudeCodeSubagentEscape:
 
     def test_unrestricted_star_keeps_everything(self):
         assert get_disallowed_tools("claude_code", ["*"]) == []
+
+
+class TestGrantedMcpServers:
+    """The one matching rule both grant sites share.
+
+    These pin the rule's vocabulary. They are NOT what proves the defect fixed:
+    the rule was always easy to write correctly, and the gap was that neither
+    call site applied one. That is asserted on the emitted artifacts in
+    ``test/agent_plugins/test_no_auto_grant.py`` (OpenCode's ``opencode.json``)
+    and ``test/providers/test_grok_cli_unit.py`` (Grok's launch command).
+    """
+
+    SERVERS = ["plugin-tools", "other-tools", "cao-mcp-server"]
+
+    def test_a_glob_selects_the_matching_servers(self):
+        assert granted_mcp_servers(["fs_read", "@plugin-*"], self.SERVERS) == ["plugin-tools"]
+
+    def test_an_exact_reference_still_works(self):
+        assert granted_mcp_servers(["@cao-mcp-server"], self.SERVERS) == ["cao-mcp-server"]
+
+    def test_star_grants_every_delivered_server(self):
+        assert granted_mcp_servers(["*"], self.SERVERS) == sorted(self.SERVERS)
+
+    def test_an_empty_allowlist_grants_nothing(self):
+        assert granted_mcp_servers([], self.SERVERS) == []
+
+    def test_a_non_matching_glob_grants_nothing(self):
+        assert granted_mcp_servers(["@ghost-*"], self.SERVERS) == []
+
+    def test_matching_is_case_sensitive(self):
+        """``fnmatchcase``, not ``fnmatch``: the latter case-folds on some hosts."""
+        assert granted_mcp_servers(["@PLUGIN-*"], self.SERVERS) == []
+        assert granted_mcp_servers(["@Plugin-Tools"], self.SERVERS) == []
+
+    def test_expansion_is_over_the_given_names_only(self):
+        """A pattern is never returned as though it were a server name."""
+        assert granted_mcp_servers(["@plugin-*"], []) == []
+        assert granted_mcp_servers(["@*"], None) == []
+
+    def test_builtin_is_cao_vocabulary_not_a_server_reference(self):
+        """``@builtin`` names a provider's own tool set, so it matches nothing."""
+        assert granted_mcp_servers(["@builtin"], ["builtin", "plugin-tools"]) == []
+
+    def test_a_bare_at_sign_matches_nothing(self):
+        assert granted_mcp_servers(["@"], self.SERVERS) == []
+
+    def test_an_exact_name_containing_glob_syntax_still_matches(self):
+        """Exact membership is checked independently, so nothing the old rule
+        granted is lost — even for a name ``fnmatch`` would read as syntax.
+
+        Such a reference now ALSO matches what it denotes as a pattern
+        (``@srv[1]`` is a one-character class), which is inherent to the
+        documented glob semantics. Conventional MCP names contain no ``fnmatch``
+        metacharacter, so the two readings coincide in practice, and Grok's
+        ``_MCP_SERVER_REF`` refuses such a name outright.
+        """
+        assert granted_mcp_servers(["@srv[1]"], ["srv[1]", "srv1"]) == ["srv1", "srv[1]"]
+        assert granted_mcp_servers(["@srv[1]"], ["srv[1]"]) == ["srv[1]"]
+
+    def test_non_string_entries_are_ignored(self):
+        assert granted_mcp_servers(["@plugin-*", None, 7], self.SERVERS) == ["plugin-tools"]
+
+
+class TestKiroAgentTools:
+    """``kiro_agent_tools`` writes the resolved CAO policy into Kiro's ``tools``.
+
+    On Kiro ``tools`` is availability: a tool not listed does not exist for the
+    agent. ``allowedTools`` (which CAO also writes) only names what runs without
+    a prompt, and CAO launches ``--trust-all-tools``, so ``tools`` is the only
+    field that restricts anything. Measured on kiro-cli 2.25.0 (2026-09-29):
+    the inventory under ``tools: ["*"]`` is the 14 names in
+    ``KIRO_NATIVE_INVENTORY_2_25`` below, the older ``fs_read``/``execute_bash``
+    spellings still work as aliases, an unknown name is ignored, and a bare
+    ``@builtin`` grants every built-in INCLUDING the shell.
+    """
+
+    # What `tools: ["*"]` exposes on kiro-cli 2.25.0. If Kiro adds a tool, this
+    # test fails until someone decides which CAO capability gates it; until
+    # then the new tool is simply unavailable to restricted profiles, which is
+    # the safe direction.
+    KIRO_NATIVE_INVENTORY_2_25 = {
+        "code",
+        "glob",
+        "goal",
+        "grep",
+        "introspect",
+        "knowledge",
+        "read",
+        "shell",
+        "subagent",
+        "todo_list",
+        "use_aws",
+        "web_fetch",
+        "web_search",
+        "write",
+    }
+    SHELL_CLASS = {"shell", "execute_bash", "subagent", "use_aws"}
+    WRITE_CLASS = {"write", "fs_write", "code"}
+
+    def test_wildcard_stays_wildcard(self):
+        assert kiro_agent_tools(["*"]) == ["*"]
+        assert kiro_agent_tools(["fs_read", "*"]) == ["*"]
+
+    def test_empty_allowlist_is_an_agent_with_no_tools(self):
+        assert kiro_agent_tools([]) == []
+
+    def test_supervisor_default_has_no_shell_write_or_network(self):
+        tools = set(kiro_agent_tools(resolve_allowed_tools(None, "supervisor", ["cao-mcp-server"])))
+        assert "@cao-mcp-server" in tools
+        assert {"read", "fs_read", "glob", "grep", "knowledge"} <= tools
+        assert not (tools & self.SHELL_CLASS), tools
+        assert not (tools & self.WRITE_CLASS), tools
+        assert not (tools & {"web_fetch", "web_search"}), tools
+
+    def test_builtin_grants_chrome_only_never_the_shell(self):
+        """A bare ``@builtin`` in Kiro's ``tools`` is every built-in, shell included.
+
+        The reviewer default carries ``@builtin``; written through it would hand
+        a read-only reviewer a shell. It must become the harmless chrome only.
+        """
+        assert set(kiro_agent_tools(["@builtin"])) == set(KIRO_BUILTIN_CHROME)
+        reviewer = set(
+            kiro_agent_tools(resolve_allowed_tools(None, "reviewer", ["cao-mcp-server"]))
+        )
+        assert "@builtin" not in reviewer
+        assert not (reviewer & self.SHELL_CLASS), reviewer
+        assert not (reviewer & self.WRITE_CLASS), reviewer
+        assert set(KIRO_BUILTIN_CHROME) <= reviewer
+
+    def test_developer_default_covers_every_measured_builtin(self):
+        """The unrestricted role must lose nothing: every 2.25.0 built-in is granted."""
+        developer = set(
+            kiro_agent_tools(resolve_allowed_tools(None, "developer", ["cao-mcp-server"]))
+        )
+        assert self.KIRO_NATIVE_INVENTORY_2_25 <= developer, (
+            self.KIRO_NATIVE_INVENTORY_2_25 - developer
+        )
+        assert "@cao-mcp-server" in developer
+
+    def test_mapping_knows_exactly_the_measured_inventory(self):
+        """Every native name the mapping grants is a real 2.25.0 tool (or its alias),
+        and every real tool is gated by some capability -- no tool is unreachable
+        for the unrestricted role, none is invented."""
+        aliases = {"fs_read", "fs_write", "execute_bash"}
+        mapped = (ALL_NATIVE_TOOLS["kiro_cli"] - aliases) | set(KIRO_BUILTIN_CHROME)
+        assert mapped == self.KIRO_NATIVE_INVENTORY_2_25, sorted(
+            mapped ^ self.KIRO_NATIVE_INVENTORY_2_25
+        )
+        # The chrome is not gated by any capability, only by @builtin.
+        assert not (set(KIRO_BUILTIN_CHROME) & ALL_NATIVE_TOOLS["kiro_cli"])
+
+    def test_privilege_equivalent_tools_gate_with_the_capability_they_equal(self):
+        assert self.SHELL_CLASS <= set(kiro_agent_tools(["execute_bash"]))
+        assert self.WRITE_CLASS <= set(kiro_agent_tools(["fs_write"]))
+        assert "knowledge" in kiro_agent_tools(["fs_read"])
+        assert set(kiro_agent_tools(["fs_list"])) == {"glob", "grep"}
+        assert set(kiro_agent_tools(["web_fetch"])) == {"web_fetch", "web_search"}
+
+    def test_mcp_references_pass_through_verbatim(self):
+        assert kiro_agent_tools(["@probe", "@probe/ping", "fs_read"]) == sorted(
+            {"@probe", "@probe/ping", "fs_read", "read", "knowledge"}
+        )
+
+    def test_unknown_capability_grants_nothing(self):
+        assert kiro_agent_tools(["not_a_capability"]) == []
+
+    def test_output_is_sorted_and_deduplicated(self):
+        out = kiro_agent_tools(["fs_*", "fs_read", "fs_write", "fs_list"])
+        assert out == sorted(set(out))

@@ -76,6 +76,7 @@ def _clear_auth_env(monkeypatch):
         "AUTH0_AUDIENCE",
         "CAO_AUTH_AUDIENCE",
         "CAO_AUTH_ISSUER",
+        "CAO_AUTH_LOCAL_TOKEN",
     ):
         monkeypatch.delenv(var, raising=False)
     auth.get_jwks_cache().clear()
@@ -266,3 +267,67 @@ async def test_ws_auth_origin_check_still_precedes_auth(monkeypatch, jwt_factory
 
     ws.accept.assert_not_called()
     assert ws.close.call_args.kwargs.get("code") == 4403
+
+
+# --- local-token mode (issue #706): CAO_AUTH_LOCAL_TOKEN with no IdP --------
+
+LOCAL_TOKEN = "s3cret-local-token"
+
+
+@pytest.mark.asyncio
+async def test_ws_local_token_mode_missing_token_rejected(monkeypatch):
+    """Standalone ``CAO_AUTH_LOCAL_TOKEN`` gates the PTY handshake: no token → 4401."""
+    from cli_agent_orchestrator.api.main import terminal_ws
+
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", LOCAL_TOKEN)
+    ws = _make_ws()
+    with _admitted_patches():
+        await terminal_ws(ws, "abcd1234")
+
+    ws.accept.assert_not_called()
+    ws.close.assert_awaited_once()
+    assert ws.close.call_args.kwargs.get("code") == 4401
+
+
+@pytest.mark.asyncio
+async def test_ws_local_token_mode_wrong_token_rejected(monkeypatch):
+    """A bearer that is not the configured value fails closed → 4401."""
+    from cli_agent_orchestrator.api.main import terminal_ws
+
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", LOCAL_TOKEN)
+    ws = _make_ws(headers={"authorization": "Bearer wrong"})
+    with _admitted_patches():
+        await terminal_ws(ws, "abcd1234")
+
+    ws.accept.assert_not_called()
+    assert ws.close.call_args.kwargs.get("code") == 4401
+
+
+@pytest.mark.asyncio
+async def test_ws_local_token_mode_header_token_attaches(monkeypatch):
+    """The configured token in ``Authorization: Bearer`` proceeds past the gate
+    (closes 4004 terminal-not-found, never 4401)."""
+    from cli_agent_orchestrator.api.main import terminal_ws
+
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", LOCAL_TOKEN)
+    ws = _make_ws(headers={"authorization": f"Bearer {LOCAL_TOKEN}"})
+    with _admitted_patches():
+        await terminal_ws(ws, "abcd1234")
+
+    ws.accept.assert_awaited_once()
+    ws.close.assert_awaited_once()
+    assert ws.close.call_args.kwargs.get("code") == 4004
+
+
+@pytest.mark.asyncio
+async def test_ws_local_token_mode_query_token_attaches(monkeypatch):
+    """Browsers cannot set handshake headers, so ``?token=`` carries it too."""
+    from cli_agent_orchestrator.api.main import terminal_ws
+
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", LOCAL_TOKEN)
+    ws = _make_ws(query_params={"token": LOCAL_TOKEN})
+    with _admitted_patches():
+        await terminal_ws(ws, "abcd1234")
+
+    ws.accept.assert_awaited_once()
+    assert ws.close.call_args.kwargs.get("code") == 4004

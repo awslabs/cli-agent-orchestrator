@@ -11,8 +11,14 @@ import requests  # type: ignore[import-untyped]
 
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
-from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
+from cli_agent_orchestrator.services.install_service import (
+    InstallResult,
+    install_agent,
+    installed_kiro_tools,
+    kiro_install_predates_native_enforcement,
+)
 from cli_agent_orchestrator.utils.skill_injection import refresh_agent_md_prompt
+from cli_agent_orchestrator.utils.tool_mapping import kiro_agent_tools
 
 
 def _profile_text(*, name: str, include_prompt: bool = True, provider: str | None = None) -> str:
@@ -191,7 +197,7 @@ class TestInstallAgent:
     ) -> None:
         """Bare names resolved from the local store should be converted for Copilot.
 
-        File-path handling moved to the CLI (``_copy_local_profile_to_store``)
+        File-path handling moved to the CLI (``_read_local_profile``)
         so the service only ever sees the bare stem. That's the shape under
         test here.
         """
@@ -288,20 +294,25 @@ class TestInstallAgent:
         assert "Cedar" in result.message
         assert not (install_paths["kiro_dir"] / "kas-agent.json").exists()
 
-    def test_install_sets_env_vars_before_profile_loading(
+    def test_install_resolves_env_vars_before_parsing_and_persists_them_after_the_guard(
         self, install_paths: dict[str, Path]
     ) -> None:
-        """Env vars should be persisted before profile parsing begins."""
+        """``--env`` values take part in resolution (so a ``${VAR}`` in the profile,
+        including its ``name:``, is seen resolved) but are persisted to the managed
+        .env file only once the ownership guard has accepted the install, so a
+        refused install leaves no env side effect (round-7 review of #493)."""
         local_profile = install_paths["local_store_dir"] / "developer.md"
         local_profile.write_text(_profile_text(name="developer"), encoding="utf-8")
 
         call_order: list[str] = []
+        parsed_texts: list[str] = []
 
         def track_set_env_var(key: str, value: str) -> None:
             call_order.append(f"set:{key}")
 
         def track_parse_agent_profile_text(resolved_text: str, profile_name: str):
             call_order.append(f"parse:{profile_name}")
+            parsed_texts.append(resolved_text)
             from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
 
             return parse_agent_profile_text(resolved_text, profile_name)
@@ -319,7 +330,9 @@ class TestInstallAgent:
             result = install_agent("developer", "claude_code", {"API_TOKEN": "secret-token"})
 
         assert result.success is True
-        assert call_order == ["set:API_TOKEN", "parse:developer"]
+        assert call_order == ["parse:developer", "set:API_TOKEN"]
+        assert "secret-token" in parsed_texts[0]
+        assert "${API_TOKEN}" not in parsed_texts[0]
 
     def test_install_returns_failure_for_invalid_source(
         self, install_paths: dict[str, Path]
@@ -627,6 +640,7 @@ class TestInstallSkillCatalogBaking:
     @pytest.fixture
     def install_workspace(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
         """Patch install and skills paths into a temp workspace."""
+        monkeypatch.setattr("cli_agent_orchestrator.utils.env.load_env_vars", lambda: {})
         local_store_dir = tmp_path / "agent-store"
         context_dir = tmp_path / "agent-context"
         kiro_dir = tmp_path / "kiro"
@@ -698,8 +712,14 @@ class TestInstallSkillCatalogBaking:
         assert agent_json["prompt"] == "Build things"
         assert "Available Skills" not in agent_json["prompt"]
         skill_resources = [r for r in agent_json["resources"] if r.startswith("skill://")]
-        assert len(skill_resources) == 1
-        assert skill_resources[0].endswith("/**/SKILL.md")
+        # Two globs. `*/SKILL.md` is what guarantees a projected agent-plugin
+        # skill (a symlink into the plugin store) is found whatever `**` means to
+        # Kiro's glob; `**/SKILL.md` keeps Kiro's native nested-directory support.
+        assert len(skill_resources) == 2
+        assert [r.rsplit("/skills", 1)[-1] for r in skill_resources] == [
+            "/**/SKILL.md",
+            "/*/SKILL.md",
+        ]
 
     def test_install_kiro_keeps_prompt_clean_with_skill_resources(
         self, install_workspace: dict
@@ -723,7 +743,7 @@ class TestInstallSkillCatalogBaking:
         assert agent_json["prompt"] == "Build things"
         assert "Available Skills" not in agent_json["prompt"]
         skill_resources = [r for r in agent_json["resources"] if r.startswith("skill://")]
-        assert len(skill_resources) == 1
+        assert len(skill_resources) == 2
 
     def test_install_kiro_omits_prompt_field_when_profile_prompt_is_empty(
         self, install_workspace: dict
@@ -742,7 +762,7 @@ class TestInstallSkillCatalogBaking:
         agent_json = json.loads(agent_path.read_text())
         assert "prompt" not in agent_json
         skill_resources = [r for r in agent_json["resources"] if r.startswith("skill://")]
-        assert len(skill_resources) == 1
+        assert len(skill_resources) == 2
 
     def test_install_non_ascii_prompt_round_trips_through_refresh_without_byte_drift(
         self, install_workspace: dict
@@ -1046,3 +1066,182 @@ def test_install_omp_writes_context_only(install_paths: dict[str, Path]) -> None
     assert result.provider == "omp"
     assert result.agent_file is None
     assert (install_paths["context_dir"] / "omp-agent.md").exists()
+
+
+def _kiro_profile_text(
+    *, name: str, role: str | None, allowed_tools: str | None, tools: str | None
+) -> str:
+    """A minimal profile whose tool policy is the thing under test."""
+    role_line = f"role: {role}\n" if role else ""
+    allowed_line = f"allowedTools: {allowed_tools}\n" if allowed_tools else ""
+    tools_line = f"tools: {tools}\n" if tools else ""
+    return (
+        "---\n"
+        f"name: {name}\n"
+        "description: Test agent\n"
+        f"{role_line}{allowed_line}{tools_line}"
+        "mcpServers:\n"
+        "  cao-mcp-server:\n"
+        "    command: cao-mcp-server\n"
+        "prompt: |\n  Probe\n"
+        "---\n"
+        "Probe body.\n"
+    )
+
+
+class TestKiroToolsWrittenAtInstall:
+    """``cao install --provider kiro_cli`` writes the resolved policy into ``tools``.
+
+    On Kiro ``tools`` is availability and ``allowedTools`` only suppresses
+    prompts (CAO launches --trust-all-tools), so ``tools`` is the only field
+    that restricts anything. See ``kiro_agent_tools`` for the translation.
+    """
+
+    def _install(self, install_paths, tmp_path, text, name):
+        built_in_dir = tmp_path / "builtin-agent-store"
+        built_in_dir.mkdir(exist_ok=True)
+        (built_in_dir / f"{name}.md").write_text(text, encoding="utf-8")
+        with patch(
+            "cli_agent_orchestrator.utils.agent_profiles.resources.files",
+            return_value=built_in_dir,
+        ):
+            result = install_agent(name, "kiro_cli", {})
+        assert result.success is True, result
+        return json.loads((install_paths["kiro_dir"] / f"{name}.json").read_text())
+
+    def test_restricted_role_writes_a_tools_list_without_a_shell(self, install_paths, tmp_path):
+        cfg = self._install(
+            install_paths,
+            tmp_path,
+            _kiro_profile_text(name="sup", role="supervisor", allowed_tools=None, tools=None),
+            "sup",
+        )
+        assert cfg["tools"] != ["*"]
+        assert cfg["tools"] == kiro_agent_tools(cfg["allowedTools"])
+        assert not ({"shell", "execute_bash", "subagent", "use_aws"} & set(cfg["tools"])), cfg
+        assert "@cao-mcp-server" in cfg["tools"]
+        assert {"read", "fs_read", "glob", "grep"} <= set(cfg["tools"])
+
+    def test_unrestricted_policy_writes_wildcard(self, install_paths, tmp_path):
+        cfg = self._install(
+            install_paths,
+            tmp_path,
+            _kiro_profile_text(name="dev", role=None, allowed_tools='["*"]', tools=None),
+            "dev",
+        )
+        assert cfg["tools"] == ["*"]
+
+    def test_developer_role_grants_the_shell(self, install_paths, tmp_path):
+        cfg = self._install(
+            install_paths,
+            tmp_path,
+            _kiro_profile_text(name="dev2", role="developer", allowed_tools=None, tools=None),
+            "dev2",
+        )
+        assert {"shell", "write", "read", "web_fetch"} <= set(cfg["tools"]), cfg
+
+    def test_explicit_profile_tools_win(self, install_paths, tmp_path):
+        cfg = self._install(
+            install_paths,
+            tmp_path,
+            _kiro_profile_text(
+                name="own", role="supervisor", allowed_tools=None, tools='["read", "shell"]'
+            ),
+            "own",
+        )
+        assert cfg["tools"] == ["read", "shell"]
+
+    def test_builtin_in_the_policy_does_not_reach_tools_verbatim(self, install_paths, tmp_path):
+        """A bare ``@builtin`` in Kiro's ``tools`` means every built-in, shell included."""
+        cfg = self._install(
+            install_paths,
+            tmp_path,
+            _kiro_profile_text(name="rev", role="reviewer", allowed_tools=None, tools=None),
+            "rev",
+        )
+        assert "@builtin" in cfg["allowedTools"]
+        assert "@builtin" not in cfg["tools"]
+        assert not ({"shell", "execute_bash", "write", "code"} & set(cfg["tools"])), cfg
+
+
+class TestKiroInstallPredatesNativeEnforcement:
+    def test_wildcard_tools_with_a_restricted_policy_is_stale(self, install_paths):
+        (install_paths["kiro_dir"] / "sup.json").write_text(
+            json.dumps({"name": "sup", "tools": ["*"], "allowedTools": ["fs_read"]})
+        )
+        assert installed_kiro_tools("sup") == ["*"]
+        assert kiro_install_predates_native_enforcement("sup", ["fs_read"]) is True
+
+    def test_a_written_policy_is_not_stale(self, install_paths):
+        (install_paths["kiro_dir"] / "sup.json").write_text(
+            json.dumps({"name": "sup", "tools": ["read"], "allowedTools": ["fs_read"]})
+        )
+        assert kiro_install_predates_native_enforcement("sup", ["fs_read"]) is False
+
+    def test_unrestricted_request_is_never_stale(self, install_paths):
+        (install_paths["kiro_dir"] / "dev.json").write_text(json.dumps({"tools": ["*"]}))
+        assert kiro_install_predates_native_enforcement("dev", ["*"]) is False
+        assert kiro_install_predates_native_enforcement("dev", None) is False
+
+    def test_missing_or_unreadable_agent_file_is_not_reported(self, install_paths):
+        assert installed_kiro_tools("nope") is None
+        assert kiro_install_predates_native_enforcement("nope", ["fs_read"]) is False
+        (install_paths["kiro_dir"] / "bad.json").write_text("{not json")
+        assert installed_kiro_tools("bad") is None
+        (install_paths["kiro_dir"] / "odd.json").write_text(json.dumps({"tools": "*"}))
+        assert installed_kiro_tools("odd") is None
+
+    @pytest.mark.parametrize(
+        "profile_name,filename",
+        [
+            ("a/b", "a__b.json"),
+            (r"a\b", "a__b.json"),
+            ("../../outside", "..__..__outside.json"),
+            (r"..\..\outside", "..__..__outside.json"),
+            (r"C:\outside", "C:__outside.json"),
+            ("caf\u00e9 reviewer", "caf\u00e9 reviewer.json"),
+        ],
+    )
+    def test_profile_name_is_flattened_like_the_installer_does(
+        self, install_paths, profile_name, filename
+    ):
+        (install_paths["kiro_dir"] / filename).write_text(json.dumps({"tools": ["read"]}))
+        assert installed_kiro_tools(profile_name) == ["read"]
+
+    @pytest.mark.parametrize("outside_dir", ["outside", "kiro-neighbor"])
+    def test_outside_symlink_is_refused_before_reading(self, install_paths, tmp_path, outside_dir):
+        outside = tmp_path / outside_dir / "agent.json"
+        outside.parent.mkdir()
+        outside.write_text(json.dumps({"tools": ["*"]}))
+        (install_paths["kiro_dir"] / "linked.json").symlink_to(outside)
+
+        with patch.object(Path, "read_text") as read:
+            with pytest.raises(ValueError, match="beneath the agent directory"):
+                installed_kiro_tools("linked")
+        read.assert_not_called()
+
+    def test_link_to_agent_directory_itself_is_refused(self, install_paths):
+        directory = install_paths["kiro_dir"]
+        (directory / "linked.json").symlink_to(directory, target_is_directory=True)
+
+        with pytest.raises(ValueError, match="beneath the agent directory"):
+            installed_kiro_tools("linked")
+
+    def test_symlink_within_agent_directory_remains_readable(self, install_paths):
+        target = install_paths["kiro_dir"] / "real.json"
+        target.write_text(json.dumps({"tools": ["read"]}))
+        (install_paths["kiro_dir"] / "linked.json").symlink_to(target)
+
+        assert installed_kiro_tools("linked") == ["read"]
+
+    def test_configured_agent_directory_can_be_a_symlink(
+        self, install_paths, tmp_path, monkeypatch
+    ):
+        (install_paths["kiro_dir"] / "sup.json").write_text(json.dumps({"tools": ["read"]}))
+        alias = tmp_path / "agent-directory"
+        alias.symlink_to(install_paths["kiro_dir"], target_is_directory=True)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.install_service.KIRO_AGENTS_DIR", alias
+        )
+
+        assert installed_kiro_tools("sup") == ["read"]

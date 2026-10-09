@@ -81,6 +81,39 @@ def _load_or_raise() -> Dict[str, Any]:
     return data
 
 
+EPHEMERAL_DEFAULTS = {
+    "enabled": False,
+    "allowed_providers": ["claude_code"],
+    "max_brief_bytes": 8192,
+    "pending_ttl_seconds": 900,
+    "claim_lease_seconds": 60,
+    "max_depth": 1,
+}
+
+
+def get_ephemeral_settings() -> Dict[str, Any]:
+    """Read the operator-only block strictly, without environment overrides."""
+    settings = _load_or_raise()
+    block = settings.get("ephemeral", {})
+    if not isinstance(block, dict):
+        block = {}
+    result = {**EPHEMERAL_DEFAULTS, **block}
+    result["_ignored_policy"] = [
+        "ephemeral." + key
+        for key in ("max_tier", "default_tier", "max_effort", "default_effort")
+        if block.get(key) is not None
+    ]
+    if settings.get("model_tiers") is not None:
+        result["_ignored_policy"].append("model_tiers")
+    return result
+
+
+def child_may_delegate() -> bool:
+    """Operator-only ephemeral.child_may_delegate; no environment overrides."""
+    block = _load_or_raise().get("ephemeral", {})
+    return isinstance(block, dict) and block.get("child_may_delegate") is True
+
+
 def _load() -> Dict[str, Any]:
     """Load settings from disk, tolerating an unreadable file.
 
@@ -131,6 +164,85 @@ def get_agent_dirs() -> Dict[str, str]:
     result = dict(_DEFAULTS)
     result.update(saved)
     return result
+
+
+def installed_context_dir_override() -> Optional[Path]:
+    """Return ``agents.dirs.cao_installed`` when configured away from its default.
+
+    Returns None when the setting is absent or spells the default location.
+
+    The installed-profile context directory has two names for one default: the
+    ``AGENT_CONTEXT_DIR`` constant and this setting's default entry, both
+    ``CAO_HOME_DIR / "agent-context"``. Every consumer that has to find that
+    directory -- the install writer, the opencode collision guard, the Copilot
+    skill-injection probe -- calls this and falls back to its own imported
+    constant on None. So with an unconfigured setting the constant stays the
+    single source of truth (and a test that redirects the constant redirects
+    every consumer), while an operator who points the setting elsewhere moves
+    every consumer together instead of splitting them (PR #493).
+
+    Compared through ``normalized_path`` (realpath + expanduser), so a trailing
+    slash, a ``~`` or a symlinked spelling of the default is still the default
+    rather than an override to a directory nobody else looks in.
+    """
+    configured = usable_agent_dirs().get("cao_installed")
+    if configured is None:
+        return None
+    if normalized_path(configured) == normalized_path(_DEFAULTS["cao_installed"]):
+        return None
+    return Path(configured).expanduser()
+
+
+def usable_agent_dirs() -> Dict[str, str]:
+    """``get_agent_dirs()`` with every value that is not a directory replaced by its default.
+
+    ``get_agent_dirs`` returns what settings.json says, which is right for the
+    Settings UI. It is wrong for anything that walks the filesystem: a blank
+    value is ``Path("")``, i.e. ``Path(".")`` -- the server's working directory
+    -- and a relative one moves with whoever launched the process. Fed to
+    profile discovery, the lookup behind ``cao install <name>``, memory
+    promotion's profile lookup or the installed-context resolver, either would
+    turn the working directory into a
+    profile source and, for ``cao_installed``, the trusted write root, so a
+    profile named ``README`` or ``AGENTS`` lands on a repository file. Every
+    consumer that opens directories goes through this instead; each bad value is
+    logged once per call and falls back to the built-in default for its key, and
+    every surviving value is returned with ``~`` expanded.
+    """
+    result = dict(get_agent_dirs())
+    for key, value in list(result.items()):
+        if not isinstance(value, str) or not value.strip():
+            logger.warning(f"Ignoring blank agents.dirs.{key}; using its default directory")
+        elif not Path(value).expanduser().is_absolute():
+            logger.warning(
+                f"Ignoring relative agents.dirs.{key}={value!r}; using its default directory"
+            )
+        else:
+            # Returned expanded: a ``~`` spelling is a real directory to every
+            # consumer, not a literal path named "~" that discovery finds empty.
+            result[key] = str(Path(value).expanduser())
+            continue
+        if key in _DEFAULTS:
+            result[key] = _DEFAULTS[key]
+        else:
+            del result[key]
+    return result
+
+
+def installed_context_lookup_dirs(default: Path) -> List[Path]:
+    """Directories an existing installed context copy may live in, in probe order.
+
+    The configured override first, then ``default`` -- the constant the caller
+    imports -- when an override is active, because releases before the writer
+    honoured the setting deposited every copy at the default regardless. With no
+    override, just ``default``. Consumers that need to FIND a copy (the install
+    ownership guard, the Copilot skill-injection probe) iterate this; the writer
+    uses only the first entry.
+    """
+    override = installed_context_dir_override()
+    if override is None or normalized_path(override) == normalized_path(default):
+        return [default]
+    return [override, default]
 
 
 def set_agent_dirs(dirs: Dict[str, str]) -> Dict[str, str]:
@@ -422,6 +534,9 @@ def get_memory_settings() -> Dict[str, Any]:
         saved = {}
     result = dict(defaults)
     result.update(saved)
+    # Vault config has cross-field safety invariants and is intentionally
+    # available only through get_vault_config().
+    result.pop("vault", None)
 
     # Env-var overlay: CAO_MEMORY_ENABLED beats settings.json
     env_enabled = os.environ.get("CAO_MEMORY_ENABLED")
@@ -462,6 +577,25 @@ def get_memory_settings() -> Dict[str, Any]:
 
     result["lint_enabled"] = is_memory_lint_enabled(settings=settings)
     return result
+
+
+def get_vault_config():
+    """Load the validated ``memory.vault`` object with a disable-only env gate."""
+    from cli_agent_orchestrator.services.vault.config import VaultConfig
+
+    settings = _load()
+    memory = settings.get("memory", {})
+    raw_vault = memory.get("vault", {}) if isinstance(memory, dict) else {}
+    if not isinstance(raw_vault, dict):
+        raise ValueError("memory.vault must be an object")
+    config = VaultConfig.model_validate(raw_vault)
+
+    # This operational override may only reduce exposure. In particular, an
+    # env value of true never enables a file-disabled or absent configuration.
+    raw_env = os.environ.get("CAO_MEMORY_VAULT_ENABLED")
+    if raw_env is not None and raw_env.strip().lower() in _BOOL_FALSE_VALUES:
+        config.enabled = False
+    return config
 
 
 def _coerce_optional_bool(value: Any, *, label: str) -> Optional[bool]:
@@ -858,6 +992,43 @@ def get_extra_skill_dirs() -> List[str]:
     if not isinstance(dirs, list):
         return []
     return [d.strip() for d in dirs if isinstance(d, str) and d.strip()]
+
+
+def get_skill_projection_mode() -> str:
+    """How Agent-Plugin skills are materialized into the global skill store.
+
+    ``"symlink"`` (default) links each projected skill at
+    ``SKILLS_DIR/<name>``; ``"copy"`` copies the content instead, for
+    environments where symlink creation is unsupported (Windows without
+    Developer Mode or elevation). Copy mode re-copies on every projection
+    rebuild, so it is correct but not free.
+
+    Reads ``skills.projection_mode``, alongside the existing
+    ``skills.extra_dirs``. Any unrecognized value falls back to ``"symlink"``
+    rather than raising — a hand-edited ``settings.json`` must not be able to
+    break plugin installation.
+    """
+    settings = _load()
+    nested = settings.get("skills", {})
+    mode = nested.get("projection_mode") if isinstance(nested, dict) else None
+    if isinstance(mode, str) and mode.strip().lower() in ("symlink", "copy"):
+        return mode.strip().lower()
+    return "symlink"
+
+
+def set_skill_projection_mode(mode: str) -> str:
+    """Set the Agent-Plugin skill projection mode (``"symlink"`` or ``"copy"``)."""
+    normalized = (mode or "").strip().lower()
+    if normalized not in ("symlink", "copy"):
+        raise ValueError(f"projection_mode must be 'symlink' or 'copy', got {mode!r}")
+    settings = _load()
+    skills_section = settings.get("skills", {})
+    if not isinstance(skills_section, dict):
+        skills_section = {}
+    skills_section["projection_mode"] = normalized
+    settings["skills"] = skills_section
+    _save(settings)
+    return normalized
 
 
 def set_extra_skill_dirs(dirs: List[str]) -> List[str]:

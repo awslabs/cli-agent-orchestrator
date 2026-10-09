@@ -9,12 +9,350 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `assign` and `handoff` still refuse them. `ephemeral.enabled` stays off by default.
+- Simulation-only cross-zone robot transport example (#845): existing CAO CLI
+  supervisor, zone-operation, and checker agents share a persistent MuJoCo
+  kinematic world through scoped MCP tools. Includes measured custody handoffs,
+  operator stopping, refusal/interruption cases, alternative robot setup, and
+  isolated optional dependencies; no additional reasoning framework or hardware path.
+  The generated launch command carries an explicit, nonblank operator request.
+- Security groundwork for ephemeral agents (#801): installed profiles whose
+  names match the reserved pattern can no longer be launched or listed;
+  installed-profile APIs and CLI lookups refuse those names, and cao-server
+  warns about them at startup. Terminal responses include a registry-derived
+  `ephemeral` boolean. Ephemeral callers cannot delegate or start workflows
+  unless the operator sets `ephemeral.child_may_delegate` to `true` in
+  `settings.json`. Workflow `run`/`resume`/`start` now refuse when
+  `CAO_TERMINAL_ID` is set but the calling terminal cannot be resolved.
+- Ephemeral profile creation (#801): `create_ephemeral_agent` and
+  `POST /ephemeral-agents` are available behind `ephemeral.enabled`, off by
+  default. Creation stores a pending row, two live files and an archive.
+  Live files remain until collection or release; registry rows and archives are
+  retained. There is no background sweep, so keep the feature disabled outside testing.
+  The live files and archive can be deleted by exact path while no ephemeral
+  terminal exists. Reserved names also refuse remote placement with
+  `remote_placement_not_allowed`. Explicit tiers and efforts temporarily refuse
+  with `tier_not_supported` / `effort_not_supported`; `auto` requires the decision
+  platform. Tier and effort policy keys are not applied yet, so `max_tier` sets
+  no ceiling.
+- Advanced CodeQL analysis for same-repository and fork pull requests, with
+  Python, JavaScript/TypeScript, GitHub Actions, and Rust coverage, plus `main`,
+  weekly, and manual scans. CI workflow definitions and their `CODEOWNERS`
+  policy are assigned to repository maintainers; the security guidance covers
+  required owner review, stale-approval dismissal, merge gates, and the
+  administrator-managed cutover (#857, #858).
+- terminal records keep the model each terminal was launched with (`model`)
+  and whether its provider applies a launch model (`model_honored`). Each
+  provider declares the second through `honors_model`; the base default is
+  `False`, so a provider that has not declared it is never reported as having
+  run a model. Both columns are nullable and added by migration, and rows from
+  before it read as unknown. Terminal and session responses,
+  `cao session status`, and the ops MCP `get_terminal_status` and
+  `get_session_info` return both fields; `list_siblings` and the delegation
+  tool results are unchanged (#810)
+- pane-mode windows caption each pane with the terminal running in it.
+  `pane_window` gets `pane-border-status` and a border format reading the
+  `@cao_terminal` mark, so the caption survives an agent whose TUI sets its own
+  pane title. Set on that window only, and skipped for a window that carries a
+  `pane-border-status` of its own, so an arrangement by hand is left alone. A
+  tmux that refuses the options costs a warning rather than the spawn (#74)
+- built-in `workflow_scout` role (`@builtin`, `fs_read`, `execute_bash`,
+  `@cao-mcp-server`). The shipped scout profile previously resolved through
+  the unknown-role fallback to unrestricted `["*"]`. It now resolves to this
+  allowlist. `execute_bash` is still a full shell, so withholding `fs_write`
+  and `web_fetch` is a category restriction, not a sandbox. (#746)
+- `terminal.pane_layout` chooses how a pane-mode window is arranged after each
+  spawn: `tiled` (default, unchanged behaviour), `even-vertical`,
+  `even-horizontal`, or `none` to leave tmux's own splitting alone. The split
+  direction follows the layout rather than being configured separately, because
+  `select-layout` overrides the direction a pane was split in. Each layout holds
+  a different number of agents before the window is full, and the terminal that
+  does not fit still falls back to a window of its own (#74)
+- `terminal.spawn_mode: "pane"` puts every terminal `assign` / `handoff` creates
+  into one tmux window as a pane, re-tiled after each spawn, so a supervisor
+  watches the whole fleet at once instead of cycling through a window per agent.
+  The window is named by `terminal.pane_window` (default `cao-agents`) and the
+  first pane terminal in a session creates it; when tmux has no room for another
+  pane, that terminal falls back to a window of its own. Default is unchanged
+  (`window`), and window mode addresses terminals exactly as before (#74, #73)
+- **`CAO_AUTH_LOCAL_TOKEN` now works on its own** (#706). Setting it with no IdP
+  configured switches the auth layer on in a local-token mode: every scope-gated
+  route, the PTY WebSocket handshake and the AG-UI stream must present exactly that
+  value as a bearer, compared in constant time, and anything else is refused with
+  401. Previously the variable was read only when an IdP was already configured, so
+  on a default install it did nothing, while the environment-variable reference
+  described it as a working local bearer token. Opt-in: with none of the three auth
+  variables set, behavior is unchanged. The default-unauthenticated posture is now
+  spelled out in `docs/configuration.md`, along with two consequences of turning
+  the mode on: the `cao` CLI and the bundled Web UI send no bearer yet, and the
+  token is inherited by every agent pane's environment.
+
 - Profiles tab in the Web UI: browse, search, create (from template with live
   preview, or from scratch via a schema-driven form), edit, clone, and delete
   agent profiles over the profile management APIs, with validate-before-save
   surfacing bounded findings and the truncation-marker contract (#510)
 
 ### Fixed
+
+- Audit all tracked npm, Bun, uv, and Cargo dependency graphs in every CI run
+  and weekly, including development dependencies and unfixed advisories. Block
+  every HIGH/CRITICAL finding and scan error, and publish complete inventory and
+  finding summaries. Replace the affected `braces` package in docs, web UI,
+  and MCP Apps with the provenance-verified published guarded fork
+  `@dieub/braces-depth-guard@3.0.3-pn.3`, retaining a small shared patch for
+  acyclic AST parent-link bounds. Verify dev-only inventory with real Trivy,
+  fail non-vacuously on missing consumers, and preserve three-project failure
+  aggregation. No advisory exemptions or fabricated versions are used.
+- Preserve canonical dependency identity for the guarded fork in GitHub's
+  dependency graph: private one-statement local adapters retain existing
+  `braces` imports while the real package remains directly visible.
+  Reject and revert the npm version-2 workaround, which produced an unparsed
+  alias rather than a correctly identified dependency.
+- Vendor the verified guarded-fork tarball so cold installs in all three
+  toolchains survive registry removal without changing package identity,
+  version, license, or integrity. Document the fork's upstream-advisory blind
+  spot and concrete weekly/pre-release maintainer tracking checkpoints.
+- Consolidate the dependency fixes from #888-#890: update `source-map-js`
+  throughout docs, web, and MCP Apps, plus docs `compression` and `proxy-addr`.
+  Clear the remaining Joi, selector-parser, and Tinypool scan findings with
+  upstream fixed releases and explicit overrides where older consumer ranges
+  exclude them. Add source-map, selector, worker-pool, and all-copy lockfile
+  regressions without changing scanner exclusions or severity policy.
+- `copilot_cli` launches no longer time out after 60 seconds on Copilot CLI
+  1.0.91 (#870). Copilot repaints only changed cells in its full-screen view,
+  so the raw output stream never shows a settled idle prompt; the provider now
+  opts into the stale-processing capture check so a quiet terminal is
+  re-checked against the rendered pane, and recognises the footer rows 1.0.91
+  draws below its prompt. When initialization does time out, the server log
+  names the first unrecognised row below the prompt.
+
+- A deferred initial-message redelivery could be confirmed by a repaint of the
+  provider's startup completion box. `StatusMonitor.notify_input_sent` cleared
+  the "IDLE reached from COMPLETED" marker on every arm, so the flap guard from
+  #566 covered only the first attempt: after one swallowed Enter the full re-send
+  armed again, the old COMPLETED was re-stamped past the redelivery boundary,
+  and a task that never ran read as delivered. The marker now survives the arm
+  (it is cleared by any stamped transition instead), so the repaint is refused
+  on every attempt; the narrow pre-dispatch-eviction case this leaves
+  indistinguishable fails toward one resubmission rather than a false
+  confirmation (#566 follow-up)
+
+- **`cao launch` could drop the initial task, or tear down a worker that had
+  already done it.** The initial message is now delivered by the server as
+  part of `POST /sessions` instead of a second request that raced provider
+  startup, and the terminal reads as not-yet-completable until that delivery
+  has been made and the worker has produced output for it. Confirmation is
+  causal: `StatusMonitor` stamps every applied status with the output
+  generation it was earned at, and a send is confirmed only by a started
+  status whose own stamp is newer than the dispatch boundary sampled inside
+  the send -- so neither a completion cached from provider startup, nor an
+  unrelated redraw that merely advances the counter afterwards, nor a
+  redelivery's own keystrokes can pass for this task starting, while a worker
+  fast enough to finish before the send returns is confirmed rather than
+  resubmitted to and deleted. Event-inbox backends (herdr), which have no
+  output generation, are judged by a transition from the status read
+  immediately before dispatch instead of being exempt. The outcome of that
+  delivery is now durable: `GET /terminals/{id}` carries `initial_delivery`
+  (`pending` -> `delivered`, or `failed` with a `kind` and `message`,
+  including `waiting_user_answer` when the worker parked on a prompt and
+  `interrupted` when cao-server restarted before confirming), and `cao launch
+  --async` exits 0 only once it reads `delivered`, non-zero with the reason
+  otherwise, instead of reporting success the moment the session row existed.
+  The synchronous headless run waits for that verdict with an allowance
+  derived from the provider's `provider_init_timeout` (profile override
+  honoured) and only then starts the task's own 300s budget, so a slow but
+  valid init no longer eats the task's time (#566)
+
+- Mitigate the documentation toolchain's `braces` nesting-depth vulnerability
+  with a local patch that preserves the published parser's behavior, and update
+  `http-cache-semantics` to 4.3.0. Document the patch and disputed cache advisory,
+  and run dependency regression checks as part of the existing site build
+  without suppressing alerts or changing scan policy.
+- Address five baseline CodeQL alerts without suppressions: remove filesystem
+  probes from plugin source-kind inference, confine Kiro policy-file inspection
+  to its canonical agent directory, replace the flagged Kimi footer and swarm
+  status regex constructs, and check canonical schema-source metadata rather
+  than a hostname substring in policy prose. Explicit local plugin paths,
+  legacy Kiro filename mapping, and Kimi's content/chrome boundaries remain
+  covered by regression cases.
+- Run all four required CodeQL language jobs inside the main CI workflow,
+  including full CI reruns, instead of relying on a separate PR trigger.
+  Weekly and manual scans share the same maintainer-owned scan steps, with
+  unchanged check names and fork permissions. Document how existing PR
+  branches adopt the updated workflow (#857).
+- refuse an install that would silently overwrite another profile's installed
+  artifacts, instead of letting the second install clobber the first (#493).
+  Two profile files can carry the same `name:`; the second used to replace the
+  first's shared context copy — which the installed agent reads at runtime —
+  and, for OpenCode, its agent file and `opencode.json` section. The check now
+  runs for **every provider** and reads ownership from the context copy at its
+  destination path rather than from profile discovery, so it holds when the
+  installed copy is shadowed by a same-named file elsewhere, when its `name:`
+  holds a `${VAR}` placeholder, when the directory is disabled, or when
+  discovery fails. A profile that merely *could* produce the same id — a
+  packaged built-in, or a local-store profile that has not been installed —
+  does not block the install, since it owns no file yet; installing a profile
+  whose `name:` matches one of the built-ins therefore still works, and the
+  same profile still installs for any number of providers. The provider's own
+  agent file (OpenCode `<id>.md`, Kiro `<name>.json`, Copilot `<name>.agent.md`)
+  is probed as well, under that directory's case rules, so a context directory
+  on case-sensitive storage can no longer let `Agent` silently replace an
+  installed `agent` in a case-folding provider directory, and a provider file
+  left behind by a hand-deleted context copy is refused rather than overwritten.
+  That last rule holds for every provider's file, not only the one being
+  installed for: while any provider's agent file for a name has no context
+  record vouching for it, no install may create a new record for that name
+  (which would otherwise let a later install for that provider replace the
+  file on the strength of the new record). A provider directory whose listing
+  cannot be read is refused as an I/O fault rather than treated as confirming
+  the requested spelling. And an import — a local `.md` file or a URL — is
+  written to the local store only after this check and the context writer's
+  own checks (a symlink or directory at the context target, a provenance marker
+  that does not read back, an unwritable context directory) accept it, so a
+  refused import leaves the previously stored profile of that stem
+  byte-identical; `--env` values are likewise persisted only after that point.
+  Plugin install and uninstall, which replay `cao install` for every installed
+  agent to re-materialise MCP servers, now enumerate the configured
+  `agents.dirs.cao_installed` directory (and the default) instead of only the
+  default, and replay each agent from the stem its provenance marker records
+  rather than from its resolved name, so agents whose `name:` differs from
+  their filename are refreshed instead of refused by the new check.
+
+- the shared context copy is written to the configured installed-profile
+  directory (`agents.dirs.cao_installed`), the directory profile discovery, the
+  collision guard and the Copilot skill-injection probe read, instead of always
+  the default path; a `~`, trailing-slash or symlinked spelling of the default
+  still counts as the default, and with the default setting nothing moves. A
+  blank or relative value under `agents.dirs` — for `cao_installed` or any
+  other key — is ignored with a warning wherever CAO opens directories (profile
+  discovery, the lookup behind `cao install <name>`, memory promotion's profile
+  lookup, the context-copy writer),
+  rather than making the server's working directory a profile source or the
+  write root; the Settings API still reports the value as saved. With an
+  override configured, the guard and the probe also consult the default
+  directory, so ownership records written there by earlier releases stay in
+  force (#493).
+
+- **Workflow script run-step refusals now retain their typed reason in run
+  records.** When a structured HTTP error includes a string `detail.kind`,
+  `ShimHTTPError` includes that kind and its optional message in the exception
+  text, so replay divergence, decision-required halts, worker errors, and
+  timeouts remain distinguishable after an uncaught exception reaches the
+  script's stderr tail. Unstructured responses keep the previous message.
+  (#830)
+- **Kiro CLI 2.25.0 turns never reached COMPLETED.** 2.25 prints the
+  completion marker as `▸ Credits: turn 0.20 • session 0.20 | Time: 29s`; the
+  detector wanted a number straight after `Credits:`, so every finished turn
+  fell through to the separator fallback, which the new "Trust All Tools
+  active" band defeats as well. A terminal reported PROCESSING for the whole
+  task and then IDLE forever while the pane showed the finished response, so a
+  supervisor never saw its worker complete and the Kiro e2e cases timed out.
+  The marker now accepts a word between `Credits:` and the number; fixtures cut
+  from live 2.25.0 frames pin idle, working and finished. The 2.25 reply
+  extractor also anchors extraction to the turn's Credits lines and starts at
+  the bullet-prefixed assistant row, so the startup banner, echoed prompt and
+  `Trust All Tools` footer are no longer returned as the answer (#832, #837)
+
+- **The `cao` CLI and the bundled Web UI can now talk to an auth-enabled
+  server.** Neither presented a bearer, so with an IdP or a standalone
+  `CAO_AUTH_LOCAL_TOKEN` configured every `cao launch`/`session`/`terminal`/
+  `workflow`/`info`/`shutdown` call and every Web UI request got a bare `401`.
+  The CLI's HTTP calls (36 sites across the six commands and the polling
+  helpers in `utils/terminal`) now go through `utils/api_http`, which attaches
+  `CAO_AUTH_LOCAL_TOKEN` from the CLI's environment to requests aimed at this
+  node's API and to nothing else, and turns a `401` with no token configured
+  into an error naming the variable. The Web UI takes a token from the URL
+  fragment (`/#token=…`, moved into `sessionStorage` and stripped from the
+  address bar before anything renders) or from a new **Server Access Token**
+  field in Settings, and sends it as `Authorization: Bearer` on every request,
+  `?token=` on the terminal WebSocket and `?access_token=` on the workflow event
+  stream. With no token set every client sends exactly what it did before
+  (#838, closes #807)
+
+- **OpenCode agents whose display name contains spaces never reported COMPLETED.**
+  The completion marker read the agent name as one `\S+` token, so a marker such
+  as `▣  Sisyphus - Ultraworker · Big Pickle · 3.1s` never matched and every
+  handoff to that agent ran out its timeout. The name now runs to the first `·`
+  on the same line. It stops at a newline so that a reply line starting with `▣`
+  cannot begin a match and cut the lines before it out of the extracted reply
+  (#806, #816)
+
+- **a custom role in `settings.json` now outranks the built-in role of the same
+  name.** The resolver consulted the built-ins first, so when CAO shipped a
+  built-in `workflow_scout` an operator's saved `workflow_scout` policy was
+  silently replaced by the built-in's list: resolution and delegated child policy
+  gained `execute_bash` and lost the listing or web-fetch tools the saved policy
+  granted, while `settings.json` read back unchanged. Settings roles are now
+  consulted first for every name, so a saved `supervisor`, `developer` or
+  `reviewer` also takes effect where it was previously ignored. A settings role
+  that shadows a built-in is logged by name (never its contents). (#746)
+- **a PTY WebSocket handshake with no peer address skipped the client-IP allowlist.**
+  `/terminals/{id}/ws` checked `client_host not in WS_ALLOWED_CLIENTS` only when a
+  peer address was present, so a `None` peer passed instead of failing closed. Not
+  reachable on a default install: the pinned uvicorn populates the peer for every
+  TCP connection and its proxy-headers middleware never rewrites it to `None`, so
+  this guards against other ASGI servers or middleware that leave the peer unset.
+  An unattributable peer is now refused with 4003 unless the explicit `*` opt-out
+  is set.
+
+- **The terminal WebSocket's `?token=` query parameter reached uvicorn's logs
+  in clear.** Two gaps: the redaction filter only knew `access_token` and
+  `ticket`, and it was attached only to `uvicorn.access`, while uvicorn writes
+  the WebSocket handshake line (`"WebSocket /terminals/<id>/ws?token=…"
+  [accepted]`, and the `403` variant) on `uvicorn.error`, which a filter on a
+  sibling logger never sees. With authentication enabled every web-viewer
+  attach therefore wrote the `cao:write`-scoped JWT to stderr. `token` is now
+  redacted and the filter is attached to both loggers. The filter also decodes
+  percent-encoded parameter names before deciding: the server accepts
+  `?%61ccess_token=<JWT>` exactly like `?access_token=`, and uvicorn logs the
+  raw bytes.
+- **Six read routes lacked the `cao:read` gate their siblings carry:**
+  `GET /agents/profiles/search`, `GET /agents/providers` (which provider
+  binaries exist on the host), `GET /sessions/{name}/terminals`,
+  `GET /terminals/{id}/working-directory`, `GET /settings/skill-dirs` and
+  `GET /settings/memory`. With authentication enabled they answered without a
+  token. No change with authentication off (the default). The read-gating
+  structural test now covers them; the only GETs left open are `/health`, the
+  OAuth discovery document, the static profile schema/template metadata and the
+  AG-UI stream, which carries its own credential.
+
+- **`@builtin` in an `allowedTools` list enabled `bash`, `edit` and `write` on
+  OpenCode.** The OpenCode permission translator expanded the selector into the
+  four standard categories, while `utils/tool_mapping.py` treats every
+  `@`-prefixed entry as a non-grant for the providers it translates. The shipped
+  `reviewer` role lists `@builtin`, so an OpenCode reviewer was not read-only.
+  The selector now grants nothing on OpenCode either; run `cao install` again
+  for existing OpenCode agents, since the `permission:` block is written at
+  install time. A profile whose `allowedTools` listed **only** `@builtin`
+  previously got `read`/`grep`/`glob` (and the write and bash tools) on
+  OpenCode and now gets none of them: add `fs_read`, `fs_list` and the rest
+  explicitly, as the shipped roles already do (#824)
+
+- **Codex startup handling could stall a launch, or press keys into the wrong
+  dialog.** `startup_prompt_handler_timeout` is now the idle gap between
+  startup prompts, with `provider_init_timeout` as the hard cap, so lowering
+  the gap for another provider no longer truncates Codex's handler; the
+  first-run sign-in menu is recognised as a settled state instead of running
+  the handler to its cap; the handler now decides once per frame which startup
+  block is actually live at the bottom of the pane and sends a key only to
+  that block, so stale trust text left in scrollback can no longer answer a
+  live update dialog or sign-in menu; a frame in which a further dialog is
+  still being drawn is held rather than keyed, whether or not a complete
+  dialog is on screen above it; the idle gap is judged on a freshly read frame
+  with no dialog on it, not on the clock alone; the idle composer takes part in
+  that same positional decision and status detection uses the same resolver, so
+  trust wording a dismissed dialog leaves above the live composer no longer
+  reports `WAITING_USER_ANSWER` and a modal arriving below a stale composer no
+  longer reads as ready; initialisation fails, instead of succeeding through
+  the login menu's `WAITING_USER_ANSWER` path, when a trust or update dialog is
+  still on screen at the handler's cap or after the readiness wait; a
+  profile's own `provider_init_timeout` now governs every Codex initialisation
+  wait; the resolver's mid-redraw ("transitional") reading is honoured only
+  until initialisation is over, so assistant prose quoting a startup phrase
+  mid-turn no longer flips a processing terminal to `WAITING_USER_ANSWER` on
+  the runtime status path; and the post-readiness check re-reads a mid-redraw
+  frame a few times instead of failing an otherwise-valid login start on a
+  single capture (#731)
 
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
   The `/internal/memory/store` and `/forget` routes validated the wire `key` as
@@ -49,10 +387,267 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   import executed its import-time `DB_DIR.mkdir()` in agents — and failed outright
   wherever the data dir is unreadable. The import is now lazy.
 
+- **Grok's launch line inlined the whole `--rules` text ahead of the
+  permission flags.** A profile plus skill catalog of several KB pushed the
+  line past the tty's 4096-byte limit. The cut landed inside the quoted text,
+  so the shell hung on an unclosed quote and Grok never started (an init
+  timeout, not an unrestricted run), but the `--permission-mode`/`--allow`/
+  `--deny` flags were the part of the line behind the text. The rules now live
+  in a 0600 `rules.md` inside the terminal's private `GROK_HOME`, referenced
+  from the line with `"$(cat …)"` (as the Codex provider already does for its
+  instructions), the line no longer grows with the profile, and the permission
+  flags precede it (#824)
+
+- **The launch confirmation showed a Blocked list on providers that cannot
+  enforce one.** `cao launch` printed `Allowed:`/`Blocked:` for every provider
+  and `--auto-approve` said restrictions were "still enforced", while Hermes
+  (`--yolo --accept-hooks`) and Cursor CLI (`--force`) apply no restriction at
+  all and were missing from the server's soft-enforcement set, so a restricted
+  supervisor on them ran unrestricted with nothing telling the operator. One
+  table (`utils/enforcement.py`) now classifies every provider as native,
+  prompt-only or none; the confirmation prints an `Enforcement:` line and a
+  warning on prompt-only and none providers, the empty deny list on untranslated
+  providers no longer reads as `(none)`, the server warning covers Hermes and
+  Cursor, and a test keeps the SECURITY.md and docs tables equal to the code
+  (SECURITY.md gains the seven missing rows, the docs table gains OMP). Kiro
+  CLI, the default provider, moves from "Hard" to "None": it is launched with
+  `--trust-all-tools` on every profile, and the `allowedTools` CAO writes into
+  the agent JSON only suppresses approval prompts in Kiro; `tools` decides
+  availability and is `["*"]` unless the profile sets it. Applying the CAO
+  policy to Kiro at launch, and refusing restricted roles on providers that
+  cannot enforce them, are separate decisions. OpenCode is the one native provider whose policy is the INSTALLED agent's: the gate now says `native at install time` and that launch overrides do not change it, instead of `Blocked: (none)` beside a native promise; the third copy of the "providers with native tool denial" list (docs/cursor-cli.md) and the prompt-only provider prose in docs/tool-restrictions.md now agree with the table, and the Kiro e2e case that asserted blocking now asserts the opposite directly (a restricted Kiro supervisor can run bash), so an environmental failure cannot pass as the expected result; on the author's machine the case has not yet produced a result (kiro-cli 2.24.1 timed out waiting for its agent prompt), so the classification rests on the launch flags and Kiro's documentation, not on an observed run (#824)
+- **The local API bearer was sent to other nodes.** `handoff`/`assign` with a
+  `target_host`, `delete_terminal` with a `target_host`, `get_handoff_result`
+  with a `target_host`, and a remote worker's `send_message` back to its
+  supervisor's `CAO_CALLBACK_URL` all attached
+  `CAO_AUTH_LOCAL_TOKEN` to requests aimed at another host. The token now goes
+  only to this node's own `API_BASE_URL`; cross-node requests carry no
+  `Authorization` header (the elastic worker gateway headers are unaffected).
+  No change when authentication is off. Behaviour change when it is on: a
+  multi-node deployment that gave every node the same `CAO_AUTH_LOCAL_TOKEN`
+  was authenticating these cross-node calls by accident, and they now fail
+  with 401 on the remote node; the token is documented as this node's
+  loopback credential only (#822)
+
+- **Both MCP servers now pin `transport="stdio"`.** FastMCP otherwise honours
+  `FASTMCP_TRANSPORT` from the environment, and an `http` value would have
+  turned a stdio tool into a loopback listener with no MCP-level auth in front
+  of its API hop (#822)
+- **The credential gate on federated memory writes and `--redact` exports
+  missed common key formats.** It now recognises Anthropic and OpenAI API
+  keys, GitHub fine-grained and OAuth/app tokens, Slack tokens, JSON Web
+  Tokens, Slack bot/user/app-level (`xapp-`) tokens and AWS secret access
+  keys (next to an `aws ... secret`/`access` context word or a
+  `SecretAccessKey` key), and it no longer lets an invisible character inside
+  a prefix hide a credential: the whole Unicode format category (zero-width
+  characters, bidi marks, soft hyphen, invisible operators; frozen at Unicode
+  16.0 so Python 3.10 and 3.11, whose own tables are older, catch the same
+  code points) plus the variation selectors, not a short list. Parsed
+  documents keep their key
+  context: the execution manifest and step output redact a 40-character value
+  under a `SecretAccessKey`-style key, a value whose key makes the pair read
+  as a credential assignment (`{"password": …}`, `{"api_key": …}`), and the
+  `value` of a `{name: AWS_SECRET_ACCESS_KEY, value: …}` entry, none of which
+  the text pattern can see once key and value are scanned apart. The graph export gate
+  scans the parsed view (`scan_json_for_secrets`) rather than its
+  `json.dumps` form, whose default `ensure_ascii` had turned a hidden
+  character into a `\u` escape before the gate could strip it.
+  Vendor patterns are matched before the generic `bearer`/`secret` ones, so
+  the reported pattern name is the specific one (#821)
+
+- **Atomic file writes read the process umask by setting it to 0.** The
+  writer behind profile and archive updates (`utils/atomic_file`) and the
+  vault writer behind federated memory notes (`services/vault/writer`) both
+  derived a new file's mode with `os.umask(0)` followed by a restore. The
+  umask is process-wide and cao-server is threaded, so a file created with
+  the default mode by any other thread inside that window could be born
+  world-writable. A new file's temp is now created with `O_EXCL` and mode
+  0666 so the kernel applies the umask itself; an existing file's mode is
+  preserved as before, and the umask is never touched (#821)
+
+- **The blocked-path list for working directories and archive targets was
+  exact-match only.** `/etc/passwd` passed with `allow_file`, and an existing
+  directory such as `/etc/ssl` was a valid working directory. System
+  configuration, kernel and device pseudo-filesystems, boot files, the
+  system binary and library directories and the crontab spool (`/etc`,
+  `/proc`, `/sys`, `/dev`, `/boot`, `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`,
+  `/lib`, `/lib64`, `/usr/lib`, `/usr/lib64`, `/root`, `/var/spool/cron`, and
+  `/private/etc` on macOS; the `/usr/lib*` entries are what makes the `/lib`
+  rule hold on usr-merged Linux, where `/lib` resolves to `/usr/lib`) are now refused at any
+  depth, with `/dev/shm` carved out. `/tmp`, `/var`, `/home`-style roots stay
+  exact-only because projects legitimately live beneath them; a cao-server
+  that runs as root must keep its projects outside `/root` (#821)
+- **CI referenced GitHub Actions by mutable tag**, including in the jobs that
+  hold `RELEASE_DEPLOY_KEY`, `CODECOV_TOKEN` and the Pages OIDC token; five
+  steps ran `npm install` rather than `npm ci` against committed lockfiles, and
+  no `uv` command was held to the committed lock: a PR that changed
+  `pyproject.toml` without updating `uv.lock` had `uv run` re-resolve and
+  install the new dependencies. All 66 tag references across `ci.yml`,
+  `release.yml`, `gh-pages.yml`, `secret-scan.yml` and the four provider test
+  workflows are pinned to the commit each tag resolved to (tag kept as a
+  comment), `npm ci` is used throughout, every workflow that runs `uv` sets
+  `UV_LOCKED=1` so `uv sync`, `uv run` (including inside `make`) and
+  `uv export` fail on a stale lock instead of re-resolving, and the `uv sync`
+  and `uv export` commands spell `--locked` as well (`publish-to-pypi.yml`
+  gains the same). `.github/dependabot.yml` now exists so the SHA pins move;
+  a test asserts every `uses:` is a full SHA and every uv workflow carries the
+  lock policy. `cargo-deny.yml`'s actions were already pinned (#820)
+
+- **Forwarded session environment accepted loader, shell and interpreter
+  startup variables.** `--env`, the ops-MCP `launch_session` tool and
+  `POST /sessions` now refuse `LD_*`, `DYLD_*`, `GCONV_PATH`, `PATH`, `HOME`,
+  `SHELL`, `BASH_ENV`, `ENV`, `ZDOTDIR`, `PROMPT_COMMAND`, `PS0`, `PS1`, `PS2`,
+  `PS4`, `PYTHONSTARTUP`, `PYTHONPATH`, `PYTHONHOME`, `PERL5OPT`, `PERL5LIB`,
+  `NODE_OPTIONS`, `RUBYOPT` and `RUBYLIB`, whose value decides what runs as the
+  operator the moment the pane starts, plus their siblings `PYTHONUSERBASE`,
+  `PERLLIB` and `NODE_PATH`, and `AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE`,
+  which the AWS SDK reads when the provider CLI authenticates at startup and
+  whose `credential_process` runs the command the file names. `POST /sessions` also applies the existing forwarded-env rules at
+  the HTTP boundary (422 naming the key) instead of dropping violating keys
+  server-side with only a log warning (#823)
+
+- **The per-terminal output FIFO accepted whatever sat at its path.** The
+  reader checked `exists()` then called `mkfifo`, and opened the path following
+  symlinks, so a same-user process that planted a symlink or regular file at
+  the predictable `<CAO_HOME_DIR>/fifos/<terminal>.fifo` (by default under
+  `~/.aws/cli-agent-orchestrator`) could redirect the output stream. The FIFO is now created exclusively with mode 0600, an existing
+  non-FIFO at the path fails terminal creation instead of being used, and both
+  opens use `O_NOFOLLOW` and verify the descriptor is a FIFO. The write end
+  had the same gap from the other side: `pipe-pane -o "cat >> <path>"` follows
+  a symlink and appends to a regular file, so a swapped path received the
+  pane's output while the hardened reader stayed on the old pipe. tmux now
+  runs `utils/fifo_writer.py` (standard library only, started by file path with `-I -S`)
+  instead of `cat`, which opens with `O_NOFOLLOW`, checks the descriptor is a
+  FIFO, and only then copies the pane's output into it (#823)
+
+- **Session teardown could reach tmux sessions CAO did not create.** CAO
+  shares the operator's default tmux server and names every session it creates
+  `cao-<name>`, but `DELETE /sessions/{name}` (and so `cao shutdown --session`
+  and the ops `shutdown_session` tool) passed any valid name straight to the
+  kill, so a request for `dev` destroyed a personal session called `dev`. A
+  bare name is now canonicalised to `cao-<name>` on the route, the same rule
+  `POST /sessions` applies, and `session_service.delete_session`,
+  `TmuxClient.kill_session` and `TmuxClient.kill_window` refuse any name
+  without the prefix. Behaviour change: a shutdown request for an unprefixed
+  name now targets the CAO session of that name and can no longer remove a
+  personal one. A dedicated tmux socket is tracked separately (#823)
+
+- **A failed herdr command put its raw stderr into the error returned to API
+  clients.** herdr's stderr can name local paths, socket locations and flags.
+  The exception now carries the redacted command and exit status only; stderr
+  goes to the cao-server log (#823)
+
+- **A failed terminal create could kill a newer session of the same name.**
+  When provider initialisation failed after the session and its registry row
+  were committed, the rollback killed the tmux session by name without the
+  lifecycle lock, so a teardown and recreate of that name landing in between
+  lost the new session. The rollback now reacquires the lock and proceeds only
+  if this create's own registry row still names the session; otherwise the
+  name belongs to someone else and the backend session is left alone. The
+  same check now guards the compensator for a create whose caller was
+  cancelled after the row committed, which killed by name too. Both rollbacks
+  run off the event loop: they block on the lifecycle lock, and a same-name
+  teardown holding it would otherwise have stalled every API request until it
+  finished. The failure handler's whole cleanup (reader, status buffer, backend
+  session or window, provider, registry row, worktree) is now one operation
+  that a cancellation of the create request cannot interrupt: a cancel landing
+  while the rollback waited for the lock used to unwind the handler after the
+  backend kill but before the provider and row were removed, leaving a
+  registered provider and a row for a terminal that no longer existed; the
+  cancellation is still raised to the caller, once the cleanup is durable. The
+  cleanup thread is driven by an executor future rather than a task, so a
+  whole-server shutdown that lands while the rollback waits for the lock
+  cancels only the waiting request and returns once the thread finishes,
+  instead of spinning on a cancelled task and never exiting (#823)
+
 ### Changed
+
+- The MCP server now requires fastmcp 3.2.0 or newer (was 2.14.0), the
+  version CI tests. fastmcp 2.x does not export `ToolResult` from
+  `fastmcp.tools`, so `cao-mcp-server` would not start on it. Upgrading
+  CAO upgrades fastmcp (#801).
+
+- record the originating install handle in each shared context copy's frontmatter
+  (`x-cao-source-stem`), so a reinstall can tell its own prior copy apart from a
+  different profile that resolves to the same OpenCode agent id. The key is
+  CAO-written: a source profile that declares it at the top level of its
+  frontmatter has that line replaced by CAO's own at install, and the install is
+  refused when the result does not read back as the marker CAO wrote. Only the
+  top-level entry is touched — a literal scalar whose text mentions the key, or
+  a nested mapping key spelled the same way, is left as written — and
+  frontmatter written as a single flow mapping (`{name: x, ...}`) receives the
+  marker as an entry inside the braces, so valid flow-style profiles install
+  (#493).
+
+- write the shared context copy atomically, via a same-directory temporary file
+  and `os.replace`, so an interrupted install cannot leave a truncated copy; a new
+  copy is created `0o600` regardless of umask, and a reinstall preserves the
+  existing file's mode (#493).
 
 - `list_outcomes` clamps `limit` to 200 client-side; the service already clamped
   silently, so `limit=500` keeps working rather than becoming a 422.
+
+### Security
+
+- Require `shell-quote ^1.11.0` in the documentation toolchain to fix
+  CVE-2026-102422, with comment-boundary and ordinary-argument regressions.
+  No runtime agent dependency or security-gate policy changes.
+
+- Workflow execution and resumption through MCP now enforce the calling
+  terminal's existing `@cao-mcp-server` or `*` grant, including installed
+  profiles. Restricted callers can no longer bypass direct-delegation checks
+  through `workflow_run`, `workflow_resume`, or `workflow_start`. Operator
+  calls remain unchanged, and ephemeral delegation still requires its separate
+  opt-in (#892).
+
+- **Kiro CLI, the default provider, now applies the CAO tool policy.** `cao
+  install --provider kiro_cli` writes the resolved `allowedTools` into the agent
+  JSON's `tools` field, which is what Kiro lets the agent *have* (`allowedTools`
+  only names what runs without a prompt, and CAO launches `--trust-all-tools`),
+  so a restricted role has no shell, write or network tool to call: on kiro-cli
+  2.25.0 a `code_supervisor` gets `read`/`glob`/`grep`/`knowledge` plus
+  `@cao-mcp-server`, and `@builtin` becomes the harmless chrome
+  (`goal`/`introspect`/`todo_list`) rather than every built-in, shell included,
+  which is what a bare `@builtin` means in Kiro. `subagent` and `use_aws` gate
+  with `execute_bash`, `code` (it can rewrite files) with `fs_write`,
+  `knowledge` with `fs_read`. Both the current names and the older
+  `fs_read`/`fs_write`/`execute_bash` aliases are written so 2.22 and 2.25
+  read the same grant; an unrestricted policy still writes `["*"]` and an
+  explicit profile `tools` list still wins. Kiro moves from **None** to
+  **Hard (install time)** in SECURITY.md and docs/tool-restrictions.md, next to
+  OpenCode: the policy is the installed agent's, and `--allowed-tools` or a
+  role override at launch does not change it. **Reinstall your Kiro profiles**:
+  one installed before this change still carries `tools: ["*"]`; `cao launch`
+  and the server warn when they find one and keep treating that terminal as
+  unrestricted. The Kiro e2e restricted case asserts bash is refused again
+  (#836, follow-up to #824)
+
+- **Agent plugin git sources are allowlisted by scheme and host.** The plugin
+  resolver handed the source string to `git clone` unchanged, and for git the
+  text before `://` is a transport: `file://` read any repository the server
+  user could, `git://` opened a TCP connection from the server to any host and
+  port it could reach, and the `ext::` helper runs a command wherever git's
+  protocol policy allows it; `--` on the argv guards against option injection
+  only. The surface is default-off (`CAO_AGENT_PLUGINS_ENABLED`) and, with auth
+  on, needs `cao:write`, but with auth off any local caller of `POST /plugins`
+  could reach it, and `"kind": "git"` skipped the CLI's shape check. A plugin is
+  now cloned only over `https://` or `ssh://` (URL or scp-style) from an allowed
+  host (`github.com` by default; `CAO_PLUGIN_ALLOWED_HOSTS` replaces the list),
+  with no query, fragment or embedded credential, the clone target is rebuilt
+  from the validated parts, and every `git` CAO runs is pinned with
+  `GIT_ALLOW_PROTOCOL=https:ssh` and `http.followRedirects=false` so the rule
+  holds inside git as well. Same posture as the profile downloader's
+  `CAO_PROFILE_ALLOWED_HOSTS` guard. Reported by Chowdhury Faizal Ahammed
+  through the AWS Vulnerability Reporting Program; thank you. (#847)
+
+- **an unknown `role` no longer falls open to unrestricted `["*"]`.** Omitting
+  `role` still uses developer defaults. A typo or a role that is not defined
+  now raises `ValueError` on install, launch, and delegation, so providers no
+  longer skip native deny flags. **Breaking:** profiles that previously
+  launched because an undefined role fell open to `["*"]` now fail closed.
+  Define the role under `agents.roles` (or the legacy flat `roles` key), or
+  omit `role` for developer defaults. An explicit `allowedTools` list still
+  wins and does not raise. (#746)
 
 
 ## [2.5.0] - 2026-08-28
@@ -1017,5 +1612,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump to v0.51.0, update method name (#31)
 
 - accept optional U+03BB (λ) after % in kiro and q CLIs (#44)
-
-

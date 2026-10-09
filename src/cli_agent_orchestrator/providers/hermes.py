@@ -7,6 +7,7 @@ import shlex
 from typing import Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -112,6 +113,15 @@ class HermesProvider(BaseProvider):
     provider.
     """
 
+    @classmethod
+    def honors_model(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+        requested_model: Optional[str],
+    ) -> bool:
+        return True
+
     def __init__(
         self,
         terminal_id: str,
@@ -173,7 +183,7 @@ class HermesProvider(BaseProvider):
                 "configure skills and MCP servers inside the selected Hermes profile"
             )
 
-        if self._allowed_tools and "*" not in self._allowed_tools:
+        if self._allowed_tools is not None and "*" not in self._allowed_tools:
             logger.warning(
                 "Hermes provider has no CAO-native tool restriction flag; "
                 "restrictions rely on the selected Hermes profile configuration"

@@ -315,6 +315,65 @@ class TestTerminalCreationWithWorkingDirectory:
 
         assert response.status_code == 400
 
+    @pytest.mark.parametrize(
+        "endpoint,target",
+        [
+            ("/sessions", "session_service.create_session"),
+            ("/sessions/test-session/terminals", "terminal_service.create_terminal"),
+        ],
+    )
+    def test_kiro_policy_path_refusal_is_a_bad_request(
+        self, client, tmp_path, monkeypatch, endpoint, target
+    ):
+        from cli_agent_orchestrator.services.install_service import installed_kiro_tools
+
+        directory = tmp_path / "agents"
+        directory.mkdir()
+        outside = tmp_path / "outside.json"
+        outside.write_text('{"tools": ["*"]}')
+        (directory / "analyst.json").symlink_to(outside)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.install_service.KIRO_AGENTS_DIR", directory
+        )
+
+        def check_policy(**kwargs):
+            return installed_kiro_tools(kwargs["agent_profile"])
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch(
+                f"cli_agent_orchestrator.api.main.{target}", new=AsyncMock(side_effect=check_policy)
+            ),
+        ):
+            response = client.post(
+                endpoint, params={"provider": "kiro_cli", "agent_profile": "analyst"}
+            )
+
+        assert response.status_code == 400, response.text
+        assert "beneath the agent directory" in response.json()["detail"]
+
+    def test_create_terminal_missing_session_remains_404(self, client):
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.terminal_service.create_terminal",
+                new=AsyncMock(side_effect=ValueError("Session not found")),
+            ),
+        ):
+            response = client.post(
+                "/sessions/missing/terminals",
+                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+            )
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Session not found"
+
     def test_create_terminal_rejects_malformed_caller_id(self, client):
         """caller_id is validated against the TerminalId pattern — IDs arrive
         from agent input and must not be persisted unvalidated."""
@@ -747,6 +806,61 @@ class TestWebSocketLocalhostRestriction:
         ws.close.assert_awaited_once()
         kwargs = ws.close.call_args.kwargs
         assert kwargs.get("code") == 4003
+
+    @pytest.mark.asyncio
+    async def test_websocket_endpoint_rejects_null_peer_address(self):
+        """A handshake with no peer address (``websocket.client`` is None) fails
+        CLOSED with 4003.
+
+        Uvicorn always populates the ASGI ``client`` for TCP, so a null peer
+        arises only when a trusted forwarding proxy rewrote ``scope["client"]``
+        from a forwarded header. That is exactly the shape where the previous
+        ``client_host is not None`` guard let an unattributable peer SKIP the
+        allowlist instead of being refused.
+        """
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        ws = MagicMock()
+        ws.client = None
+        ws.headers = {}
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        with patch(
+            "cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS",
+            ["127.0.0.1", "::1", "localhost"],
+        ):
+            await terminal_ws(ws, "abcd1234")
+
+        ws.accept.assert_not_called()
+        ws.close.assert_awaited_once()
+        assert ws.close.call_args.kwargs.get("code") == 4003
+
+    @pytest.mark.asyncio
+    async def test_websocket_endpoint_wildcard_still_admits_null_peer(self):
+        """The explicit ``*`` opt-out keeps working for a null peer: it disables
+        the IP check outright, so the handshake proceeds to the terminal lookup
+        (4004 here, never 4003)."""
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        ws = MagicMock()
+        ws.client = None
+        ws.headers = {}
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        with (
+            patch("cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS", ["*"]),
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value=None,
+            ),
+        ):
+            await terminal_ws(ws, "abcd1234")
+
+        ws.accept.assert_awaited_once()
+        ws.close.assert_awaited_once()
+        assert ws.close.call_args.kwargs.get("code") == 4004
 
     @pytest.mark.asyncio
     async def test_websocket_endpoint_rejects_invalid_tmux_metadata(self):

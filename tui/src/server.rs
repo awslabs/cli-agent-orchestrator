@@ -191,7 +191,7 @@ pub struct Route {
 /// silence `catalog.rs`'s own docs explain the enum exists to remove. [`TuiError::NoRoute`]
 /// stays a typed variant for the genuinely routeless (BR-18), not a fallback arm.
 ///
-/// # 21 routes for 22 IN-APP commands
+/// # 23 routes for 24 IN-APP commands
 ///
 /// `profile find` has **no** route and is served client-side by
 /// [`ServerClient::find_profiles`] (OQ-6 Q2). Every other IN-APP command maps to a route
@@ -468,6 +468,14 @@ fn route(id: CommandId) -> Option<Route> {
         CommandId::MemoryLint => None,
         CommandId::MemoryPromote => None,
         CommandId::MemoryRepair => None,
+        // HIDE: U11-A vault maintenance commands intentionally have no TUI route or MCP
+        // equivalent. A rescan may read a curator's files, so only an operator-selected CLI
+        // invocation can trigger it. U11-B may add a read-only status endpoint separately.
+        CommandId::MemoryVaultMigrate => None,
+        CommandId::MemoryVaultRebuild => None,
+        CommandId::MemoryVaultReconcile => None,
+        CommandId::MemoryVaultScan => None,
+        CommandId::MemoryVaultStatus => None,
 
         // ── `cao profile *` ──────────────────────────────────────────────────────────────
         CommandId::ProfileList => plain(Method::Get, "/agents/profiles"),
@@ -492,7 +500,7 @@ fn route(id: CommandId) -> Option<Route> {
             }],
             &[],
         ),
-        // **`profile find` is the one IN-APP command with no route** — 21 routes for 22
+        // **`profile find` is the one IN-APP command with no route** — 23 routes for 24
         // commands. `search_profiles` is reachable only from the CLI (`profile.py:385`) and the
         // **stdio-only** MCP server (`mcp_server/server.py:2120`, `mcp.run()`), so it is not
         // HTTP-reachable at all. Served client-side by `find_profiles` over `GET
@@ -581,6 +589,22 @@ fn route(id: CommandId) -> Option<Route> {
         CommandId::SessionStatus => {
             templated(Method::Get, "/terminals/{terminal_id}", &["terminal_id"])
         }
+
+        // ── `cao plugin *` — HIDE, all four ───────────────────────────────────────────────
+        // Routeless on purpose, not for want of endpoints: `/plugins` exists (and now carries a
+        // read-scope gate). `catalog.rs` classifies all four as `Policy::Hidden`, which is what
+        // requirements.md 16.5 requires while the verb is unresolved (M1): a HANDOFF row is
+        // offered in navigation and drives the terminal, so it would ship the surface just as
+        // much as IN-APP, and only HIDE is "not offered at all" (FR-4.3).
+        //
+        // **When M1 lands these become HANDOFF, not IN-APP**, and they stay routeless even then:
+        // `remove` requires a warn-then-confirm exchange that a captured one-shot request cannot
+        // carry, and `add` runs untrusted content whose warning belongs on real stdio. Wiring a
+        // route here would satisfy the table while defeating the confirmation.
+        CommandId::PluginAdd => None,
+        CommandId::PluginList => None,
+        CommandId::PluginRemove => None,
+        CommandId::PluginValidate => None,
 
         // ── `cao skills *` — HANDOFF, all three (OQ-6) ───────────────────────────────────
         // The entire group is routeless. `GET/POST /settings/skill-dirs` is NOT this: it returns
@@ -725,6 +749,12 @@ fn route(id: CommandId) -> Option<Route> {
         // path to a human authorisation act that nothing in the interface has reviewed.
         // (#583 Bolt 2, approval-operation)
         CommandId::WorkflowApprove => None,
+        // HIDE (issue #640), so it is unreachable through `commands()` and needs no route — the
+        // arm exists because this `match` is exhaustive, not because a route was withheld. A route
+        // does exist (`POST /workflows/runs/{run_id}/steps/{step_id}:replay`); it is unrouted here
+        // for the same reason every other HIDE row is, and `no HANDOFF or HIDE command may carry a
+        // route` is asserted below.
+        CommandId::WorkflowStep => None,
     }
 }
 
@@ -2638,9 +2668,9 @@ mod tests {
 
     // ── The route table (BR-18, FR-3.1, OQ-6) ────────────────────────────────────────────
 
-    /// **21 routes for the 22 IN-APP commands, and `profile find` is the one without.**
+    /// **23 routes for the 24 IN-APP commands, and `profile find` is the one without.**
     ///
-    /// The distribution is settled ground truth — 22 IN-APP / 16 HANDOFF / 23 HIDE = 61 — and
+    /// The distribution is settled ground truth — 24 IN-APP / 18 HANDOFF / 49 HIDE = 91 — and
     /// every number below is a **hard-coded literal**. Deriving any of them from `route()` or
     /// from the catalog would compare production against itself, which is the vacuous shape this
     /// project has hit repeatedly.
@@ -2704,7 +2734,7 @@ mod tests {
             .count();
         assert_eq!(
             in_app, 24,
-            "the settled distribution is 24 IN-APP / 18 HANDOFF / 33 HIDE = 75; if this moved, \
+            "the settled distribution is 24 IN-APP / 18 HANDOFF / 49 HIDE = 91; if this moved, \
              the 23-route figure above needs re-deriving rather than adjusting"
         );
     }

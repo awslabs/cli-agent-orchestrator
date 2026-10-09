@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+from cli_agent_orchestrator.providers.kiro_cli import TUI_CREDITS_PATTERN, KiroCliProvider
 
 # Test fixtures directory
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -2101,3 +2101,169 @@ class TestKiroCli211Regressions:
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         provider.mark_input_received()
         assert provider.get_status(output) != TerminalStatus.COMPLETED
+
+
+class TestKiroCli225Tui:
+    """kiro-cli 2.25.0 frames, captured live on 2026-09-29 (fixtures
+    ``kiro_cli_tui_2_25_*``).
+
+    2.25 changed the completion marker from ``▸ Credits: 0.20 • Time: 29s`` to
+    ``▸ Credits: turn 0.20 • session 0.20 | Time: 29s``. The old pattern wanted a
+    number straight after ``Credits:``, so every finished turn fell through to
+    the separator fallback, which fails too on 2.25 because the new "Trust All
+    Tools active, confirmations are off" band sits between the last two
+    separators with a single content line. The observable result was a
+    terminal that reported PROCESSING for the whole task and then IDLE forever,
+    never COMPLETED, while the pane showed the finished response. The e2e
+    allowed-tools cases timed out on exactly that.
+    """
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_idle_after_init_is_idle(self, mock_tmux):
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        assert provider.get_status(load_fixture("kiro_cli_tui_2_25_idle_output.txt")) == (
+            TerminalStatus.IDLE
+        )
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_working_frame_is_processing(self, mock_tmux):
+        """``›  Kiro is working · 10s · Type to steer · Ctrl+S to queue`` replaces
+        the idle placeholder while a tool runs."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        assert provider.get_status(load_fixture("kiro_cli_tui_2_25_processing_output.txt")) == (
+            TerminalStatus.PROCESSING
+        )
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_finished_frame_is_completed(self, mock_tmux):
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        assert provider.get_status(load_fixture("kiro_cli_tui_2_25_completed_output.txt")) == (
+            TerminalStatus.COMPLETED
+        )
+
+    def test_finished_frame_extracts_the_response(self):
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        message = provider.extract_last_message_from_script(
+            load_fixture("kiro_cli_tui_2_25_completed_output.txt")
+        )
+        assert message == "done"
+        assert "SLEEP-MARK" not in message
+        assert "What's new" not in message
+        assert "Run this exact shell command" not in message
+        assert "Trust All Tools active" not in message
+
+    def test_first_turn_extracts_only_the_one_word_reply(self):
+        """A one-word reply must not absorb the startup banner or echoed prompt."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        message = provider.extract_last_message_from_script(
+            load_fixture("kiro_cli_tui_2_25_first_turn_zebra42.txt")
+        )
+        assert message == "ZEBRA42"
+
+    def test_multiturn_extracts_only_the_latest_reply(self):
+        """The previous turn, footer band, and current prompt echo are not reply text."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        message = provider.extract_last_message_from_script(
+            load_fixture("kiro_cli_tui_2_25_multiturn_output.txt")
+        )
+        assert message == "SECOND42"
+
+    def test_225_extractor_uses_the_final_bullet_block_for_the_reply(self):
+        """A bulleted prompt echo must not be prepended to the assistant reply."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        lines = [
+            "▸ Credits: turn 0.08 • session 0.08 | Time: 1s",
+            "  • Map the public endpoints.",
+            "",
+            "• There are two public endpoints.",
+            "▸ Credits: turn 0.12 • session 0.20 | Time: 2s",
+        ]
+        assert provider._extract_tui_225_message(lines, 4) == "There are two public endpoints."
+
+    def test_225_extractor_returns_none_without_a_bullet_reply(self):
+        """A 2.25 turn with no assistant bullet must not reuse chrome as the answer."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        lines = [
+            "▸ Credits: turn 0.08 • session 0.08 | Time: 1s",
+            "› ask a question or describe a task ↵",
+            "▸ Credits: turn 0.12 • session 0.20 | Time: 2s",
+        ]
+        assert provider._extract_tui_225_message(lines, 2) is None
+
+    def test_225_ignores_indented_single_line_prompt_echo(self):
+        """An indented echoed bullet must not be prepended when no blank line follows."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        output = "\n".join(
+            [
+                "▸ Credits: turn 0.08 • session 0.08 | Time: 1s",
+                "  • Map the public endpoints.",
+                "• There are two public endpoints.",
+                "▸ Credits: turn 0.12 • session 0.20 | Time: 2s",
+            ]
+        )
+
+        assert (
+            provider.extract_last_message_from_script(output) == "There are two public endpoints."
+        )
+
+    def test_225_ignores_multiline_prompt_echo_bullets(self):
+        """Every indented bullet in a multiline prompt echo is prompt, not reply."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        output = "\n".join(
+            [
+                "▸ Credits: turn 0.08 • session 0.08 | Time: 1s",
+                "  • Map the public endpoints.",
+                "  • Include their HTTP methods.",
+                "• There are two public endpoints.",
+                "▸ Credits: turn 0.12 • session 0.20 | Time: 2s",
+            ]
+        )
+
+        assert (
+            provider.extract_last_message_from_script(output) == "There are two public endpoints."
+        )
+
+    def test_225_colored_tool_bullet_is_not_part_of_final_reply(self):
+        """The blue assistant bullet is the boundary even if a green tool row touches it."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        output = (
+            "▸ Credits: turn 0.08 • session 0.08 | Time: 1s\n"
+            "\x1b[38;2;0;215;135m•\x1b[39m Shell echo SLEEP-MARK\n"
+            "\x1b[38;2;95;135;215m•\x1b[39m done\n"
+            "▸ Credits: turn 0.12 • session 0.20 | Time: 2s\n"
+        )
+
+        message = provider.extract_last_message_from_script(output)
+
+        assert message == "done"
+        assert "SLEEP-MARK" not in message
+
+    def test_225_colored_tool_block_without_assistant_reply_is_not_reply(self):
+        """A green tool row must not be recycled as the assistant reply."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        output = (
+            "▸ Credits: turn 0.08 • session 0.08 | Time: 1s\n"
+            "────────────────────────────────────────────────────────────────────\n"
+            "\x1b[38;2;0;215;135m•\x1b[39m Shell echo SLEEP-MARK\n"
+            "    ╰ output:\n"
+            "        SLEEP-MARK\n"
+            "▸ Credits: turn 0.12 • session 0.20 | Time: 2s\n"
+        )
+
+        with pytest.raises(ValueError):
+            provider.extract_last_message_from_script(output)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "▸ Credits: 0.20 • Time: 29s",
+            "▸ Credits: 0.24 - Time: 3s",
+            "▸ Credits: turn 0.20 • session 0.20 | Time: 29s",
+        ],
+    )
+    def test_credits_marker_accepts_both_shapes(self, line):
+        assert re.search(TUI_CREDITS_PATTERN, line), line
+
+    def test_credits_marker_still_needs_the_arrow_and_a_number(self):
+        assert not re.search(TUI_CREDITS_PATTERN, "Credits: turn 0.20")
+        assert not re.search(TUI_CREDITS_PATTERN, "▸ Credits: turn")

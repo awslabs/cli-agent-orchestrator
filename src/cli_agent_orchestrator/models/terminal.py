@@ -1,8 +1,8 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated, Any, Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.provider import ProviderType
@@ -82,6 +82,13 @@ class Terminal(BaseModel):
     provider: ProviderType = Field(..., description="CLI tool provider")
     session_name: str = Field(..., description="Session name")
     agent_profile: Optional[str] = Field(None, description="Agent profile")
+    model: Optional[str] = Field(None, description="Model requested at launch")
+    model_honored: Optional[bool] = Field(
+        None, description="Whether the provider applies the requested launch model"
+    )
+    ephemeral: bool = Field(
+        default=False, description="Server-computed ephemeral registry membership"
+    )
     caller_id: Optional[str] = Field(
         None, description="Terminal that created this one via handoff/assign (callback target)"
     )
@@ -103,10 +110,39 @@ class Terminal(BaseModel):
     metadata: Optional[Dict[str, Any]] = Field(
         None, description="Free-form, consumer-defined JSON describing what this terminal is doing"
     )
+    deferred_init_failure: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "CAO-owned durable deferred-initialization failure metadata. "
+            "Separate from consumer metadata so clients cannot overwrite lifecycle truth."
+        ),
+    )
+    initial_delivery: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "Durable outcome of the initial message this terminal was created with "
+            "(deferred init): state pending/delivered/failed plus kind and message. "
+            "None when no initial message was accepted at creation."
+        ),
+    )
+    session_incarnation_id: Optional[str] = Field(
+        None,
+        description=(
+            "Durable CAO session incarnation identifier. Session names may be reused; "
+            "this value distinguishes retained rows from a later replacement."
+        ),
+    )
     status: Optional[TerminalStatus] = Field(
         None, description="Current terminal status (live only)"
     )
-    last_active: Optional[datetime] = Field(None, description="Last active timestamp")
+    last_active: Optional[datetime] = Field(None, description="Last active timestamp (UTC)")
+
+    @field_validator("last_active")
+    @classmethod
+    def _last_active_is_utc(cls, v: Optional[datetime]) -> Optional[datetime]:
+        if v is not None and v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v
 
 
 class AgentStepResult(BaseModel):

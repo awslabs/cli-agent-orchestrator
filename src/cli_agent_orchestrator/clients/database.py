@@ -1,5 +1,6 @@
 """Minimal database client with only terminal metadata."""
 
+import json as _json
 import logging
 import os
 import uuid
@@ -22,6 +23,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
+from sqlalchemy.types import TypeDecorator
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.flow import Flow
@@ -32,6 +34,121 @@ logger = logging.getLogger(__name__)
 Base: Any = declarative_base()
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def as_utc(value: Optional[datetime]) -> Optional[datetime]:
+    """Normalize a datetime to UTC, treating naive values as UTC."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+class UTCDateTime(TypeDecorator):
+    """Store naive UTC in SQLite and return aware UTC datetimes."""
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value: Optional[datetime], dialect: Any) -> Optional[datetime]:
+        utc = as_utc(value)
+        return None if utc is None else utc.replace(tzinfo=None)
+
+    def process_result_value(self, value: Optional[datetime], dialect: Any) -> Optional[datetime]:
+        return as_utc(value)
+
+
+class SessionIncarnationModel(Base):
+    """Current logical lifetime of a reusable session name.
+
+    Keep the pointer after teardown so retries cannot claim historical terminal
+    rows. A successful new-session creation replaces it in the same transaction
+    as its initial terminal; individual terminal deletion never removes it.
+    """
+
+    __tablename__ = "session_incarnations"
+
+    session_name = Column(String, primary_key=True)
+    incarnation_id = Column(String, nullable=False)
+
+
+class EphemeralAgentModel(Base):
+    """Server-owned ephemeral registry with guarded lifecycle transitions."""
+
+    __tablename__ = "ephemeral_agents"
+
+    name = Column(String, primary_key=True)
+    owner_kind = Column(String, nullable=False)
+    owner_id = Column(String, nullable=False)
+    session_name = Column(String, nullable=False)
+    state = Column(String, nullable=False)
+    claim_id = Column(String, nullable=True)
+    idempotency_key = Column(String, nullable=True)
+    claim_expires_at = Column(UTCDateTime, nullable=True)
+    launched_terminal_id = Column(String, nullable=True, index=True)
+    bound_at = Column(UTCDateTime, nullable=True)
+    model_tier = Column(String, nullable=True)
+    effort = Column(String, nullable=True)
+    provider = Column(String, nullable=False)
+    effective_tools = Column(Text, nullable=False)
+    created_at = Column(UTCDateTime, nullable=False)
+    expires_at = Column(UTCDateTime, nullable=False)
+    gc_reason = Column(String, nullable=True)
+    spec_sha256 = Column(String, nullable=False)
+    profile_sha256 = Column(String, nullable=False)
+    audit_path = Column(String, nullable=False)
+
+
+def get_ephemeral_agent(name: str) -> Optional[Dict[str, Any]]:
+    """Read registry facts without creating, claiming or modifying a row."""
+    with SessionLocal() as db:
+        row = db.query(EphemeralAgentModel).filter(EphemeralAgentModel.name == name).first()
+        if row is None:
+            return None
+        result = {
+            column.name: getattr(row, column.name)
+            for column in EphemeralAgentModel.__table__.columns
+        }
+        result["effective_tools"] = _json.loads(result["effective_tools"])
+        return result
+
+
+def _is_ephemeral_terminal(db: Any, terminal_id: str) -> bool:
+    """Check registry membership using the caller's existing session."""
+    return (
+        db.query(
+            db.query(EphemeralAgentModel)
+            .filter(EphemeralAgentModel.launched_terminal_id == terminal_id)
+            .exists()
+        ).scalar()
+        is True
+    )
+
+
+def is_ephemeral_terminal(terminal_id: str) -> bool:
+    """Registry membership in ANY state, including gc; lookup errors propagate."""
+    with SessionLocal() as db:
+        return _is_ephemeral_terminal(db, terminal_id)
+
+
+def _ephemeral_terminal_ids(db: Any, terminal_query: Any) -> set[str]:
+    """Batch membership for a terminal selection, without one lookup per row.
+
+    The subquery also avoids SQLite's parameter limit for large terminal lists.
+    State is deliberately unrestricted: a gc row still marks a surviving terminal.
+    """
+    selected_ids = terminal_query.with_entities(TerminalModel.id).order_by(None)
+    return {
+        row[0]
+        for row in db.query(EphemeralAgentModel.launched_terminal_id)
+        .filter(EphemeralAgentModel.launched_terminal_id.in_(selected_ids))
+        .all()
+    }
+
+
 class TerminalModel(Base):
     """SQLAlchemy model for terminal metadata only."""
 
@@ -39,14 +156,21 @@ class TerminalModel(Base):
 
     id = Column(String, primary_key=True)  # "abc123ef"
     tmux_session = Column(String, nullable=False)  # "cao-session-name"
-    tmux_window = Column(String, nullable=False)  # "window-name"
+    tmux_window = Column(String, nullable=False)  # a window name, or a pane mark
     provider = Column(String, nullable=False)  # "kiro_cli", "claude_code"
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
+    model = Column(String, nullable=True)  # resolved per-launch model; NULL = provider default
+    model_honored = Column(Boolean, nullable=True)  # NULL = unknown for pre-migration rows
     working_directory = Column(String, nullable=True)  # launch-time cwd (optional)
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
     engine = Column(String, nullable=True)  # resolved Kiro engine; NULL for legacy/non-Kiro rows
+    # Provider-specific launch variant whose semantics must survive cao-server
+    # restarts.  Kept generic so providers other than Kimi can use the same
+    # lifecycle seam without overloading Kiro's ``engine`` or user-owned
+    # ``metadata``.  Currently Kimi stores ``legacy`` / ``code`` here.
+    provider_variant = Column(String, nullable=True)
     # Ordered, general-to-specific array of strings (JSON-encoded), e.g.
     # '["tenant_1", "project_5", "folder_12"]'. CAO only does ordered-prefix
     # matching (list_siblings); consumers own what the levels mean (#432).
@@ -57,7 +181,35 @@ class TerminalModel(Base):
     # MetaData object on every mapped class; the DB column itself is still
     # literally named "metadata" per #432's design.
     metadata_json = Column("metadata", Text, nullable=True)
-    last_active = Column(DateTime, default=datetime.now)
+    # Server-owned durable deferred-init failure. Kept separate from consumer
+    # metadata so PATCH /metadata cannot erase or forge lifecycle truth.
+    deferred_init_failure_json = Column("deferred_init_failure", Text, nullable=True)
+    # Server-owned durable outcome of the INITIAL message a deferred-init terminal
+    # was created with (PR #566): JSON ``{"state": "pending"|"delivered"|"failed",
+    # "kind": ..., "message": ...}``. Written at creation, settled by the deferred
+    # task, and swept to ``failed``/``interrupted`` on restart so a client that
+    # polls for the outcome is never left waiting on a task that no longer exists.
+    initial_delivery_json = Column("initial_delivery", Text, nullable=True)
+    # Creation-time lifecycle ownership for deferred initialization.  True
+    # means an external observer (rather than CAO itself) owns final failure
+    # settlement, so runtime/lifecycle cleanup may dismantle provider resources
+    # but must retain this registry row until that observer acknowledges it.
+    deferred_init_external_owner = Column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
+    # True once provider/FIFO/worktree runtime state has been fully dismantled
+    # for a retained external-owner tombstone.  The row may remain for durable
+    # failure observation, but it no longer consumes a live runtime slot.
+    deferred_init_runtime_reclaimed = Column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
+    # Durable identity for one logical lifetime of a reusable session name.
+    # Retained deferred-init tombstones can outlive the backend session; when a
+    # later session reuses the same label this value lets read/lifecycle paths
+    # distinguish the old rows from failures that belong to the CURRENT live
+    # session. NULL is reserved for rows created before this column existed.
+    session_incarnation_id = Column(String, nullable=True)
+    last_active = Column(UTCDateTime, default=_utcnow)
 
     # ORDERING CONTRACT: the two session-scoped reads -- ``list_terminals_by_session``
     # and ``list_terminals_in_sessions`` -- order by SQLite's implicit ``rowid``,
@@ -123,11 +275,7 @@ class InboxModel(Base):
     receiver_id = Column(String, nullable=False)
     message = Column(String, nullable=False)
     status = Column(String, nullable=False)  # MessageStatus enum value
-    created_at = Column(DateTime, default=datetime.now)
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    created_at = Column(UTCDateTime, default=_utcnow)
 
 
 class MemoryMetadataModel(Base):
@@ -145,6 +293,9 @@ class MemoryMetadataModel(Base):
     memory_type = Column(String, nullable=False)
     scope = Column(String, nullable=False)
     scope_id = Column(String, nullable=True)
+    # A NOT NULL discriminator keeps the widened unique constraint total:
+    # SQLite considers NULL values distinct inside UNIQUE indexes.
+    source_kind = Column(String, nullable=False, default="native", server_default="native")
     file_path = Column(String, nullable=False)
     tags = Column(String, nullable=False, default="")
     source_provider = Column(String, nullable=True)
@@ -171,16 +322,15 @@ class MemoryMetadataModel(Base):
     related_keys = Column(Text, nullable=True, default=None)
 
     __table_args__ = (
-        UniqueConstraint("key", "scope", "scope_id", name="uq_memory_key_scope"),
-        # Same NULL-distinctness the sentinel comment below documents for
-        # ``memory_relationships``: ``uq_memory_key_scope`` never fires for
-        # global/federated rows because SQLite treats ``NULL != NULL`` in a
-        # UNIQUE index. This partial index covers exactly those rows
-        # (issue #657). Existing DBs get it from ``_migrate_memory_scope_null_uniqueness``.
+        UniqueConstraint("key", "scope", "scope_id", "source_kind", name="uq_memory_key_scope"),
+        # SQLite treats NULL scope_id values as distinct in the table-level
+        # constraint. Keep PR #674's source_kind-aware identity while enforcing
+        # issue #657 uniqueness within each global/federated source tier.
         Index(
             "uq_memory_key_scope_null",
             "key",
             "scope",
+            "source_kind",
             unique=True,
             sqlite_where=text("scope_id IS NULL"),
         ),
@@ -189,6 +339,129 @@ class MemoryMetadataModel(Base):
             name="ck_related_keys_length",
         ),
     )
+
+
+# Vault-note identity needs a non-null scope id for global mappings: SQLite
+# considers NULL values distinct inside UNIQUE indexes. This is table-local;
+# memory_metadata keeps its historical nullable global scope_id convention.
+VAULT_NOTE_SCOPE_ID_SENTINEL = ""
+
+
+class VaultNoteModel(Base):
+    """Durable projection metadata for a note indexed from an Obsidian vault."""
+
+    __tablename__ = "vault_note"
+
+    note_uid = Column(String, primary_key=True)
+    vault_id = Column(String, nullable=False)
+    scope = Column(String, nullable=False)
+    scope_id = Column(
+        String,
+        nullable=False,
+        default=VAULT_NOTE_SCOPE_ID_SENTINEL,
+        server_default=VAULT_NOTE_SCOPE_ID_SENTINEL,
+    )
+    cao_key = Column(String, nullable=False)
+    vault_relpath = Column(String, nullable=False)
+    managed = Column(Boolean, nullable=False)
+    content_sha256 = Column(String, nullable=True)
+    frontmatter_sha256 = Column(String, nullable=True)
+    size_bytes = Column(Integer, nullable=True)
+    mtime_ns = Column(Integer, nullable=True)
+    status = Column(String, nullable=False)
+    last_reconciled_at = Column(DateTime(timezone=True), nullable=True)
+    key_source = Column(String, nullable=True)
+    key_source_reason = Column(String, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("vault_id", "scope", "scope_id", "cao_key", name="uq_vault_note_key"),
+        UniqueConstraint("vault_id", "vault_relpath", name="uq_vault_note_path"),
+    )
+
+
+class VaultExclusionModel(Base):
+    """Authoritative user-forget intent for a vault memory identity."""
+
+    __tablename__ = "vault_exclusion"
+
+    vault_id = Column(String, primary_key=True)
+    scope = Column(String, primary_key=True)
+    scope_id = Column(
+        String,
+        primary_key=True,
+        default=VAULT_NOTE_SCOPE_ID_SENTINEL,
+        server_default=VAULT_NOTE_SCOPE_ID_SENTINEL,
+    )
+    cao_key = Column(String, primary_key=True)
+    last_known_relpath = Column(String, nullable=False)
+    content_sha256 = Column(String, nullable=True)
+    key_source = Column(String, nullable=True)
+    key_source_reason = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
+class VaultMigrationReceiptModel(Base):
+    """Durable authority binding one native snapshot to its vault migration."""
+
+    __tablename__ = "vault_migration_receipt"
+
+    receipt_id = Column(String, primary_key=True)
+    scope = Column(String, nullable=False)
+    scope_id = Column(
+        String,
+        nullable=False,
+        default=VAULT_NOTE_SCOPE_ID_SENTINEL,
+        server_default=VAULT_NOTE_SCOPE_ID_SENTINEL,
+    )
+    cao_key = Column(String, nullable=False)
+    native_relpath = Column(String, nullable=False)
+    native_snapshot_sha256 = Column(String, nullable=False)
+    vault_id = Column(String, nullable=False)
+    managed_relpath = Column(String, nullable=False)
+    vault_note_uid = Column(String, nullable=False)
+    published_content_sha256 = Column(String, nullable=False)
+    superseded_edges = Column(Text, nullable=False, default="[]", server_default="[]")
+    status = Column(String, nullable=False, default="active", server_default="active")
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
+class VaultFindingModel(Base):
+    """Content-free finding emitted while reconciling a vault."""
+
+    __tablename__ = "vault_finding"
+
+    id = Column(String, primary_key=True)
+    vault_id = Column(String, nullable=False)
+    vault_relpath = Column(String, nullable=False)
+    code = Column(String, nullable=False)
+    severity = Column(String, nullable=False)
+    detail = Column(String, nullable=False)
+    reconcile_run_id = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
+class VaultNoteAliasModel(Base):
+    """Former vault paths retained to make note renames observable."""
+
+    __tablename__ = "vault_note_alias"
+
+    vault_id = Column(String, primary_key=True)
+    former_relpath = Column(String, primary_key=True)
+    cao_key = Column(String, nullable=False)
+    scope = Column(String, nullable=True)
+    scope_id = Column(String, nullable=True)
+    content_sha256 = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
+class VaultRecallCounterModel(Base):
+    """Durable, content-free operational counters for vault recall outcomes."""
+
+    __tablename__ = "vault_recall_counter"
+
+    vault_id = Column(String, primary_key=True)
+    counter_name = Column(String, primary_key=True)
+    value = Column(Integer, nullable=False, default=0, server_default="0")
 
 
 # Relationship-store sentinel: ``memory_relationships.scope_id`` is NOT NULL and
@@ -234,7 +507,7 @@ class MemoryRelationshipModel(Base):
     target_key = Column(String, nullable=False)
     # Closed taxonomy reusing the graph EdgeType values.
     type = Column(String, nullable=False)  # relates_to | contradiction | supersedes
-    # compiler | wiki_lint | human | legacy_related_keys | external_import(reserved)
+    # compiler | wiki_lint | human | legacy_related_keys | external_import(reserved) | vault
     origin = Column(String, nullable=False)
     # active | proposal | rejected | superseded | deleted (auditable soft-delete)
     status = Column(String, nullable=False, default="active")
@@ -339,6 +612,43 @@ class FlowModel(Base):
     enabled = Column(Boolean, default=True)
 
 
+class HandoffResultModel(Base):
+    """Durable record of a handoff step result (issue #447).
+
+    The caller generates a ``job_id`` and passes it to ``POST /terminals/run-step``;
+    the server upserts on that key. Client-side generation exists so the MCP client
+    holds the key BEFORE the request it might not get an answer to -- NOT for
+    deduplication: ``_handoff_impl`` mints a fresh ``uuid4().hex`` per call, so a
+    retry carries a different key and runs a second step.
+
+    ``state``:
+      - ``"running"`` — step in progress (written by the run-step handler at
+        request start, after the generation fence)
+      - ``"completed"`` — step finished successfully; ``last_message`` populated.
+        Written inside ``run_agent_step``, between result extraction and terminal
+        teardown -- the terminal is the only other copy of the result, so the row
+        must exist before it is destroyed.
+      - ``"error"`` — step failed; ``error_message`` populated. Written by the
+        run-step handler's failure arms, which are the only place that can tell
+        which exception occurred.
+
+    ``created_at``/``updated_at`` carry ``DateTime(timezone=True)``, which is a
+    no-op on SQLite: the offset is dropped on write, so the stored values are
+    NAIVE UTC. The retention sweep must therefore compare against a UTC cutoff --
+    see ``cleanup_service.cleanup_old_data``.
+    """
+
+    __tablename__ = "handoff_results"
+
+    job_id = Column(String, primary_key=True)
+    state = Column(String, nullable=False)  # "running" | "completed" | "error"
+    terminal_id = Column(String, nullable=True)
+    last_message = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+
+
 class IdempotencyKeyModel(Base):
     """Maps a caller-supplied idempotency key to the terminal it created.
 
@@ -379,7 +689,7 @@ class IdempotencyKeyModel(Base):
     # from an earlier revision of this branch, whose fix is deleting the file.
     # It is compared like any other value and simply mismatches, loudly.
     request_fingerprint = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(UTCDateTime, default=_utcnow)
 
 
 def _ensure_db_dir() -> None:
@@ -410,10 +720,13 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _restrict_db_file_permissions()
     _migrate_terminals_schema()
-    _migrate_memory_indexes()
     _migrate_add_access_count()
     _migrate_add_last_compiled_at()
     _migrate_add_related_keys()
+    # Must run after additive legacy-column migrations and before the separate
+    # index migrator, which recreates the three secondary indexes after a rebuild.
+    _migrate_memory_source_kind()
+    _migrate_memory_indexes()
     _migrate_workflow_index()
     _migrate_workflow_run()
     _migrate_workflow_run_indexes()
@@ -428,9 +741,20 @@ def init_db() -> None:
     # Appended LAST (issue #583 Bolt 2, ``approval-store``). Disjoint from every table above —
     # its own new table, no shared columns — so registry order is immaterial here too.
     _migrate_workflow_plan_approval()
-    # Appended LAST (issue #657). Adds one partial index to memory_metadata;
-    # reads no other table, so registry order is immaterial here too.
+    # Add the nullable columns before the exclusion backfill so a pre-existing
+    # excluded note can carry its provenance into the durable tombstone.
+    _migrate_vault_key_provenance()
+    # Appended LAST (PR #674). Disjoint from every table above except for the
+    # one-time backfill read from vault_note.
+    _migrate_vault_exclusions()
+    # Appended LAST (PR #674 S5). One additive receipt table; no backfill.
+    _migrate_vault_migration_receipts()
+    # Appended LAST (issue #657). Runs after the source_kind table rebuild so
+    # the partial index enforces the full PR #674 memory identity.
     _migrate_memory_scope_null_uniqueness()
+    # Appended LAST (issue #447, ``handoff_results``). Its own new table, no shared
+    # columns with anything above, so registry order is immaterial here too.
+    _migrate_add_handoff_results()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -454,6 +778,44 @@ def _restrict_db_file_permissions() -> None:
             os.chmod(path, 0o600)
         except OSError as e:
             logger.warning(f"Could not restrict DB file permissions on {path}: {e}")
+
+
+def _migrate_add_handoff_results() -> None:
+    """Create the handoff_results table on existing databases (issue #447).
+
+    ``Base.metadata.create_all`` already handles fresh databases; this
+    idempotent migration handles existing ones where the table does not
+    exist yet.  SQLite supports ``CREATE TABLE IF NOT EXISTS``, so we
+    delegate to raw SQL rather than a full schema rebuild.
+
+    The bare ``DATETIME`` columns here and the ORM model's
+    ``DateTime(timezone=True)`` are not a divergence in what gets STORED:
+    ``timezone=True`` is a no-op on SQLite, which keeps no offset either way, so
+    both paths hold naive UTC wall-clock (the writer's default is ``_utcnow``).
+    Registered LAST in ``init_db`` and order-independent: it touches its own new
+    table and no column of any other, so it neither depends on nor perturbs the
+    migrators above it.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS handoff_results (
+                    job_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    terminal_id TEXT,
+                    last_message TEXT,
+                    error_message TEXT,
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """)
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"Migration check for handoff_results failed: {e}")
 
 
 def _migrate_project_aliases_schema() -> None:
@@ -510,6 +872,94 @@ def _migrate_memory_indexes() -> None:
             )
     except Exception as e:
         logger.debug(f"Memory index migration skipped: {e}")
+
+
+def _migrate_memory_source_kind() -> None:
+    """Widen memory identity with a non-null source discriminator.
+
+    SQLite cannot alter a UNIQUE constraint, so installed databases require a
+    transactional table rebuild.  The gate compares UNIQUE-index column lists,
+    not index names: SQLite discards names given to table-level constraints.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    expected_unique_columns = ("key", "scope", "scope_id", "source_kind")
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_metadata'"
+            ).fetchone()
+            if table_exists is None:
+                return
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(memory_metadata)")}
+            unique_indexes = [
+                row[1]
+                for row in conn.execute("PRAGMA index_list(memory_metadata)").fetchall()
+                if row[3] == "u"
+            ]
+            if any(
+                tuple(
+                    column[2]
+                    for column in conn.execute(
+                        f'PRAGMA index_info("{index_name.replace(chr(34), chr(34) * 2)}")'
+                    ).fetchall()
+                )
+                == expected_unique_columns
+                for index_name in unique_indexes
+            ):
+                if "source_kind" not in columns:
+                    raise RuntimeError(
+                        "memory_metadata unique index references missing source_kind"
+                    )
+                return
+
+            conn.execute("BEGIN")
+            conn.execute("""
+                CREATE TABLE memory_metadata_new (
+                    id VARCHAR NOT NULL PRIMARY KEY,
+                    key VARCHAR NOT NULL,
+                    memory_type VARCHAR NOT NULL,
+                    scope VARCHAR NOT NULL,
+                    scope_id VARCHAR,
+                    source_kind VARCHAR NOT NULL DEFAULT 'native',
+                    file_path VARCHAR NOT NULL,
+                    tags VARCHAR NOT NULL,
+                    source_provider VARCHAR,
+                    source_terminal_id VARCHAR,
+                    token_estimate INTEGER,
+                    created_at DATETIME,
+                    updated_at DATETIME,
+                    access_count INTEGER NOT NULL DEFAULT 0,
+                    last_accessed_at DATETIME,
+                    last_compiled_at DATETIME,
+                    related_keys TEXT,
+                    CONSTRAINT uq_memory_key_scope UNIQUE (key, scope, scope_id, source_kind)
+                )
+                """)
+            conn.execute("""
+                INSERT INTO memory_metadata_new (
+                    id, key, memory_type, scope, scope_id, source_kind, file_path, tags,
+                    source_provider, source_terminal_id, token_estimate, created_at, updated_at,
+                    access_count, last_accessed_at, last_compiled_at, related_keys
+                )
+                SELECT
+                    id, key, memory_type, scope, scope_id, 'native', file_path, tags,
+                    source_provider, source_terminal_id, token_estimate, created_at, updated_at,
+                    access_count, last_accessed_at, last_compiled_at, related_keys
+                FROM memory_metadata
+                """)
+            conn.execute("DROP TABLE memory_metadata")
+            conn.execute("ALTER TABLE memory_metadata_new RENAME TO memory_metadata")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(memory_metadata)")}
+            if "source_kind" not in columns:
+                raise RuntimeError("memory_metadata rebuild did not add source_kind")
+            conn.commit()
+            logger.info("Migration: widened memory_metadata identity with source_kind")
+    except Exception as e:
+        logger.error(f"Memory source_kind migration failed: {e}")
+        raise
 
 
 def _migrate_add_access_count() -> None:
@@ -704,7 +1154,7 @@ def _migrate_workflow_plan_approval() -> None:
 
 def _migrate_memory_scope_null_uniqueness(engine: Any = None, *, strict: bool = False) -> None:
     """Create the partial unique index backing ``uq_memory_key_scope`` for
-    NULL ``scope_id`` rows (issue #657). Appended LAST to the ``init_db()``
+    NULL ``scope_id`` rows within each ``source_kind`` (issue #657). Appended LAST to the ``init_db()``
     registry.
 
     SQLite treats ``NULL != NULL`` in a UNIQUE index, so the table-level
@@ -747,12 +1197,13 @@ def _migrate_memory_scope_null_uniqueness(engine: Any = None, *, strict: bool = 
                 if index_rows:
                     return
                 duplicates = conn.exec_driver_sql(
-                    "SELECT key, scope, COUNT(*) FROM memory_metadata "
-                    "WHERE scope_id IS NULL GROUP BY key, scope HAVING COUNT(*) > 1"
+                    "SELECT key, scope, source_kind, COUNT(*) FROM memory_metadata "
+                    "WHERE scope_id IS NULL GROUP BY key, scope, source_kind HAVING COUNT(*) > 1"
                 ).fetchall()
                 if duplicates:
                     rendered = ", ".join(
-                        f"{scope}:{key}x{count}" for key, scope, count in duplicates
+                        f"{scope}:{key}[{source_kind}]x{count}"
+                        for key, scope, source_kind, count in duplicates
                     )
                     logger.warning(
                         "Skipping uq_memory_key_scope_null creation: duplicate global/federated "
@@ -762,7 +1213,7 @@ def _migrate_memory_scope_null_uniqueness(engine: Any = None, *, strict: bool = 
                     return
                 conn.exec_driver_sql(
                     "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_key_scope_null "
-                    "ON memory_metadata (key, scope) WHERE scope_id IS NULL"
+                    "ON memory_metadata (key, scope, source_kind) WHERE scope_id IS NULL"
                 )
                 conn.commit()
                 if strict:
@@ -778,11 +1229,14 @@ def _migrate_memory_scope_null_uniqueness(engine: Any = None, *, strict: bool = 
             return
         with sqlite3.connect(target) as conn:
             duplicates = conn.execute(
-                "SELECT key, scope, COUNT(*) FROM memory_metadata "
-                "WHERE scope_id IS NULL GROUP BY key, scope HAVING COUNT(*) > 1"
+                "SELECT key, scope, source_kind, COUNT(*) FROM memory_metadata "
+                "WHERE scope_id IS NULL GROUP BY key, scope, source_kind HAVING COUNT(*) > 1"
             ).fetchall()
             if duplicates:
-                rendered = ", ".join(f"{scope}:{key}x{count}" for key, scope, count in duplicates)
+                rendered = ", ".join(
+                    f"{scope}:{key}[{source_kind}]x{count}"
+                    for key, scope, source_kind, count in duplicates
+                )
                 logger.warning(
                     "Skipping uq_memory_key_scope_null creation: duplicate global/federated "
                     f"rows in memory_metadata ({rendered}). Run `cao memory repair` to "
@@ -791,7 +1245,7 @@ def _migrate_memory_scope_null_uniqueness(engine: Any = None, *, strict: bool = 
                 return
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_key_scope_null "
-                "ON memory_metadata (key, scope) WHERE scope_id IS NULL"
+                "ON memory_metadata (key, scope, source_kind) WHERE scope_id IS NULL"
             )
             if strict:
                 created = conn.execute(
@@ -807,6 +1261,113 @@ def _migrate_memory_scope_null_uniqueness(engine: Any = None, *, strict: bool = 
         if strict:
             raise
         logger.debug(f"memory scope NULL uniqueness migration skipped: {e}")
+
+
+def _migrate_vault_exclusions() -> None:
+    """Create and backfill durable vault-forget identities.
+
+    ``vault_note.status`` is a rebuildable projection and cannot safely retain
+    user intent across path reuse, quarantine, or rebuild. Existing excluded
+    rows are therefore copied into the identity-keyed authoritative table.
+    Failure propagates because continuing without the backfill could republish
+    content that the user explicitly forgot.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS vault_exclusion ("
+                "vault_id VARCHAR NOT NULL, "
+                "scope VARCHAR NOT NULL, "
+                "scope_id VARCHAR NOT NULL DEFAULT '', "
+                "cao_key VARCHAR NOT NULL, "
+                "last_known_relpath VARCHAR NOT NULL, "
+                "content_sha256 VARCHAR, "
+                "key_source VARCHAR, "
+                "key_source_reason VARCHAR, "
+                "created_at DATETIME NOT NULL, "
+                "PRIMARY KEY (vault_id, scope, scope_id, cao_key)"
+                ")"
+            )
+            note_table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vault_note'"
+            ).fetchone()
+            if note_table_exists is None:
+                return
+            conn.execute(
+                "INSERT OR IGNORE INTO vault_exclusion ("
+                "vault_id, scope, scope_id, cao_key, last_known_relpath, "
+                "content_sha256, key_source, key_source_reason, created_at"
+                ") "
+                "SELECT vault_id, scope, scope_id, cao_key, vault_relpath, "
+                "content_sha256, key_source, key_source_reason, "
+                "COALESCE(last_reconciled_at, CURRENT_TIMESTAMP) "
+                "FROM vault_note WHERE status = 'excluded'"
+            )
+    except Exception as e:
+        logger.error(f"Vault exclusion migration failed: {e}")
+        raise
+
+
+def _migrate_vault_migration_receipts() -> None:
+    """Create the additive migration-receipt table on legacy databases."""
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            columns = conn.execute("PRAGMA table_info(vault_migration_receipt)").fetchall()
+            if columns:
+                return
+            conn.execute(
+                "CREATE TABLE vault_migration_receipt ("
+                "receipt_id VARCHAR NOT NULL PRIMARY KEY, "
+                "scope VARCHAR NOT NULL, "
+                "scope_id VARCHAR NOT NULL DEFAULT '', "
+                "cao_key VARCHAR NOT NULL, "
+                "native_relpath VARCHAR NOT NULL, "
+                "native_snapshot_sha256 VARCHAR NOT NULL, "
+                "vault_id VARCHAR NOT NULL, "
+                "managed_relpath VARCHAR NOT NULL, "
+                "vault_note_uid VARCHAR NOT NULL, "
+                "published_content_sha256 VARCHAR NOT NULL, "
+                "superseded_edges TEXT NOT NULL DEFAULT '[]', "
+                "status VARCHAR NOT NULL DEFAULT 'active', "
+                "created_at DATETIME NOT NULL"
+                ")"
+            )
+    except Exception as e:
+        logger.error(f"Vault migration receipt schema migration failed: {e}")
+        raise
+
+
+def _migrate_vault_key_provenance() -> None:
+    """Add nullable key provenance columns to legacy vault tables."""
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            for table in ("vault_note", "vault_exclusion"):
+                table_exists = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    (table,),
+                ).fetchone()
+                if table_exists is None:
+                    continue
+                columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                if "key_source" not in columns:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN key_source VARCHAR")
+                if "key_source_reason" not in columns:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN key_source_reason VARCHAR")
+    except Exception as e:
+        logger.error(f"Vault key provenance schema migration failed: {e}")
+        raise
 
 
 def _backfill_legacy_related_keys(conn: Any) -> None:
@@ -1350,6 +1911,10 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN engine TEXT")
             conn.commit()
             logger.info("Migration: added engine column to terminals table")
+        if "provider_variant" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN provider_variant TEXT")
+            conn.commit()
+            logger.info("Migration: added provider_variant column to terminals table")
         if "group" not in columns:
             # "group" is a SQL reserved word in some dialects but not SQLite;
             # quoted defensively so this ALTER survives if that ever changes.
@@ -1364,6 +1929,42 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN working_directory TEXT")
             conn.commit()
             logger.info("Migration: added working_directory column to terminals table")
+        if "deferred_init_failure" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN deferred_init_failure TEXT")
+            conn.commit()
+            logger.info("Migration: added deferred_init_failure column to terminals table")
+        if "initial_delivery" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN initial_delivery TEXT")
+            conn.commit()
+            logger.info("Migration: added initial_delivery column to terminals table")
+        if "deferred_init_external_owner" not in columns:
+            conn.execute(
+                "ALTER TABLE terminals ADD COLUMN deferred_init_external_owner "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.commit()
+            logger.info("Migration: added deferred_init_external_owner column to terminals table")
+        if "deferred_init_runtime_reclaimed" not in columns:
+            conn.execute(
+                "ALTER TABLE terminals ADD COLUMN deferred_init_runtime_reclaimed "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.commit()
+            logger.info(
+                "Migration: added deferred_init_runtime_reclaimed column to terminals table"
+            )
+        if "session_incarnation_id" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN session_incarnation_id TEXT")
+            conn.commit()
+            logger.info("Migration: added session_incarnation_id column to terminals table")
+        if "model" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN model TEXT")
+            conn.commit()
+            logger.info("Migration: added model column to terminals table")
+        if "model_honored" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN model_honored BOOLEAN")
+            conn.commit()
+            logger.info("Migration: added model_honored column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -1379,11 +1980,18 @@ def create_terminal(
     shell_command: Optional[str] = None,
     caller_id: Optional[str] = None,
     engine: Optional[str] = None,
+    provider_variant: Optional[str] = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     working_directory: Optional[str] = None,
+    deferred_init_external_owner: bool = False,
+    session_incarnation_id: Optional[str] = None,
     idempotency_key: Optional[str] = None,
     request_fingerprint: Optional[str] = None,
+    new_session_incarnation: bool = False,
+    model: Optional[str] = None,
+    model_honored: Optional[bool] = None,
+    initial_delivery: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
 
@@ -1407,19 +2015,40 @@ def create_terminal(
     import json as _json
 
     with SessionLocal() as db:
+        if new_session_incarnation:
+            if not session_incarnation_id:
+                raise ValueError("A new session incarnation requires an incarnation id")
+            incarnation = db.get(SessionIncarnationModel, tmux_session)
+            if incarnation is None:
+                db.add(
+                    SessionIncarnationModel(
+                        session_name=tmux_session, incarnation_id=session_incarnation_id
+                    )
+                )
+            else:
+                incarnation.incarnation_id = session_incarnation_id
         terminal = TerminalModel(
             id=terminal_id,
             tmux_session=tmux_session,
             tmux_window=tmux_window,
             provider=provider,
             agent_profile=agent_profile,
+            model=model,
+            model_honored=model_honored,
             working_directory=working_directory,
-            allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
+            # ``[]`` is an explicit deny-all and must round-trip as ``[]``: a
+            # falsiness test stores it as SQL NULL, and every reader treats
+            # NULL as "nothing resolved", which is unrestricted.
+            allowed_tools=_json.dumps(allowed_tools) if allowed_tools is not None else None,
             shell_command=shell_command,
             caller_id=caller_id,
             engine=engine,
+            provider_variant=provider_variant,
             group=_json.dumps(group) if group else None,
             metadata_json=_json.dumps(metadata) if metadata else None,
+            deferred_init_external_owner=bool(deferred_init_external_owner),
+            session_incarnation_id=session_incarnation_id,
+            initial_delivery_json=_json.dumps(initial_delivery) if initial_delivery else None,
         )
         db.add(terminal)
         if idempotency_key:
@@ -1443,11 +2072,15 @@ def create_terminal(
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "model": terminal.model,
+            "model_honored": terminal.model_honored,
+            "ephemeral": _is_ephemeral_terminal(db, str(terminal.id)),
             "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
             "engine": terminal.engine,
+            "provider_variant": terminal.provider_variant,
             # Normalized the same way as what was actually stored (an empty
             # container is stored as NULL, same as omitted) -- self-ROAST
             # finding: echoing the raw `group`/`metadata` input here made
@@ -1456,6 +2089,10 @@ def create_terminal(
             # returns {"group": None}, an API-consistency gap.
             "group": group if group else None,
             "metadata": metadata if metadata else None,
+            "deferred_init_external_owner": bool(deferred_init_external_owner),
+            "initial_delivery": initial_delivery if initial_delivery else None,
+            "deferred_init_runtime_reclaimed": False,
+            "session_incarnation_id": session_incarnation_id,
         }
 
 
@@ -1541,19 +2178,40 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
         allowed_tools = _json.loads(terminal.allowed_tools) if terminal.allowed_tools else None
         group = _json.loads(terminal.group) if terminal.group else None
         metadata = _json.loads(terminal.metadata_json) if terminal.metadata_json else None
+        raw_deferred_failure = getattr(terminal, "deferred_init_failure_json", None)
+        deferred_init_failure = (
+            _json.loads(raw_deferred_failure) if isinstance(raw_deferred_failure, str) else None
+        )
+        raw_initial_delivery = getattr(terminal, "initial_delivery_json", None)
+        initial_delivery = (
+            _json.loads(raw_initial_delivery) if isinstance(raw_initial_delivery, str) else None
+        )
         return {
             "id": terminal.id,
             "tmux_session": terminal.tmux_session,
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "model": terminal.model,
+            "model_honored": terminal.model_honored,
+            "ephemeral": _is_ephemeral_terminal(db, str(terminal.id)),
             "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
             "engine": terminal.engine or ("v2" if terminal.provider == "kiro_cli" else None),
+            "provider_variant": terminal.provider_variant,
             "group": group,
             "metadata": metadata,
+            "deferred_init_failure": deferred_init_failure,
+            "initial_delivery": initial_delivery,
+            "deferred_init_external_owner": bool(
+                getattr(terminal, "deferred_init_external_owner", False)
+            ),
+            "deferred_init_runtime_reclaimed": bool(
+                getattr(terminal, "deferred_init_runtime_reclaimed", False)
+            ),
+            "session_incarnation_id": getattr(terminal, "session_incarnation_id", None),
             "last_active": terminal.last_active,
         }
 
@@ -1582,6 +2240,191 @@ def update_terminal_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]
         terminal.metadata_json = _json.dumps(metadata) if metadata else None
         db.commit()
         return True
+
+
+def update_terminal_deferred_init_failure(
+    terminal_id: str, failure: Optional[Dict[str, Any]]
+) -> bool:
+    """Replace CAO-owned deferred-init failure state for one terminal."""
+
+    import json as _json
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return False
+        terminal.deferred_init_failure_json = _json.dumps(failure) if failure else None
+        db.commit()
+        return True
+
+
+def update_terminal_initial_delivery(
+    terminal_id: str,
+    delivery: Optional[Dict[str, Any]],
+    *,
+    only_if_pending: bool = False,
+) -> bool:
+    """Replace the server-owned initial-delivery outcome for one terminal.
+
+    ``only_if_pending`` makes the write conditional on the row still reading
+    ``pending`` -- a failure recorded after the task was already confirmed
+    delivered must not rewrite history, and a terminal created without an
+    initial message has nothing to settle. Returns False when the row is gone
+    or the condition did not hold.
+    """
+
+    import json as _json
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return False
+        if only_if_pending:
+            raw = getattr(terminal, "initial_delivery_json", None)
+            current = _json.loads(raw) if isinstance(raw, str) else None
+            if not isinstance(current, dict) or current.get("state") != "pending":
+                return False
+        terminal.initial_delivery_json = _json.dumps(delivery) if delivery else None
+        db.commit()
+        return True
+
+
+def list_pending_initial_delivery_terminal_ids() -> List[str]:
+    """Terminals whose initial message was accepted but never settled.
+
+    After a cao-server restart the deferred task that owned the delivery is
+    gone, so these rows can only be settled by the restart sweep.
+    """
+
+    import json as _json
+
+    with SessionLocal() as db:
+        rows = (
+            db.query(TerminalModel.id, TerminalModel.initial_delivery_json)
+            .filter(TerminalModel.initial_delivery_json.isnot(None))
+            .all()
+        )
+    pending: List[str] = []
+    for terminal_id, raw in rows:
+        try:
+            delivery = _json.loads(raw) if isinstance(raw, str) else None
+        except ValueError:
+            continue
+        if isinstance(delivery, dict) and delivery.get("state") == "pending":
+            pending.append(str(terminal_id))
+    return pending
+
+
+def update_terminal_deferred_init_external_owner(terminal_id: str, owned: bool) -> bool:
+    """Update server-owned deferred-init lifecycle ownership for one terminal."""
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return False
+        terminal.deferred_init_external_owner = bool(owned)
+        db.commit()
+        return True
+
+
+def update_terminal_deferred_init_runtime_reclaimed(terminal_id: str, reclaimed: bool) -> bool:
+    """Persist whether a retained deferred-init row still owns live runtime resources."""
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return False
+        terminal.deferred_init_runtime_reclaimed = bool(reclaimed)
+        db.commit()
+        return True
+
+
+def get_session_incarnation(session_name: str) -> Optional[str]:
+    """Read the durable current pointer, including for an already-deleted session."""
+
+    if not session_name:
+        return None
+    with SessionLocal() as db:
+        incarnation = db.get(SessionIncarnationModel, session_name)
+        return str(incarnation.incarnation_id) if incarnation is not None else None
+
+
+def get_session_incarnations(session_names: List[str]) -> Dict[str, str]:
+    """Read current pointers in one query for a fleet listing."""
+
+    names = [name for name in session_names if name]
+    if not names:
+        return {}
+    with SessionLocal() as db:
+        return {
+            str(row.session_name): str(row.incarnation_id)
+            for row in db.query(SessionIncarnationModel)
+            .filter(SessionIncarnationModel.session_name.in_(names))
+            .all()
+        }
+
+
+def update_terminals_session_incarnation(
+    terminal_ids: List[str], incarnation_id: str, *, session_name: Optional[str] = None
+) -> bool:
+    """Atomically assign one session incarnation to the specified terminal rows.
+
+    Used while the per-session lifecycle lock is held. All requested rows must
+    exist and have no conflicting identity. When session_name is supplied, its
+    durable pointer is committed atomically with the backfill. A conflicting
+    pointer or a row belonging to another session rejects the whole assignment.
+    """
+
+    unique_ids = list(dict.fromkeys(str(terminal_id) for terminal_id in terminal_ids))
+    if not unique_ids and session_name is None:
+        return True
+    with SessionLocal() as db:
+        terminals = db.query(TerminalModel).filter(TerminalModel.id.in_(unique_ids)).all()
+        if len(terminals) != len(unique_ids) or any(
+            (terminal.session_incarnation_id not in (None, incarnation_id))
+            or (session_name is not None and terminal.tmux_session != session_name)
+            for terminal in terminals
+        ):
+            db.rollback()
+            return False
+        if session_name is not None:
+            current = db.get(SessionIncarnationModel, session_name)
+            if current is not None and current.incarnation_id != incarnation_id:
+                db.rollback()
+                return False
+            if current is None:
+                db.add(
+                    SessionIncarnationModel(
+                        session_name=session_name, incarnation_id=incarnation_id
+                    )
+                )
+        for terminal in terminals:
+            terminal.session_incarnation_id = str(incarnation_id)
+        db.commit()
+        return True
+
+
+def list_pending_deferred_init_external_owner_terminal_ids() -> List[str]:
+    """External-owner deferred inits whose background task cannot resume after restart."""
+
+    with SessionLocal() as db:
+        rows = (
+            db.query(TerminalModel.id)
+            .filter(TerminalModel.deferred_init_external_owner.is_(True))
+            .all()
+        )
+        return [str(row[0]) for row in rows]
+
+
+def count_runtime_allocated_terminals() -> int:
+    """Count terminal rows that still represent live/allocated provider runtime."""
+
+    with SessionLocal() as db:
+        return int(
+            db.query(TerminalModel)
+            .filter(TerminalModel.deferred_init_runtime_reclaimed.is_(False))
+            .count()
+        )
 
 
 def get_terminal_group(terminal_id: str) -> Optional[List[str]]:
@@ -1750,12 +2593,13 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
     cannot quietly change which terminal is the conductor.
     """
     with SessionLocal() as db:
-        terminals = (
+        terminal_query = (
             db.query(TerminalModel)
             .filter(TerminalModel.tmux_session == tmux_session)
             .order_by(literal_column("terminals.rowid"))
-            .all()
         )
+        terminals = terminal_query.all()
+        ephemeral_ids = _ephemeral_terminal_ids(db, terminal_query)
         return [
             {
                 "id": t.id,
@@ -1763,8 +2607,20 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "model": t.model,
+                "model_honored": t.model_honored,
+                "ephemeral": str(t.id) in ephemeral_ids,
                 "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
+                "deferred_init_failure": (
+                    _json.loads(t.deferred_init_failure_json)
+                    if isinstance(t.deferred_init_failure_json, str)
+                    and t.deferred_init_failure_json
+                    else None
+                ),
+                "deferred_init_external_owner": bool(t.deferred_init_external_owner),
+                "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
+                "session_incarnation_id": t.session_incarnation_id,
                 "last_active": t.last_active,
             }
             for t in terminals
@@ -1776,7 +2632,7 @@ def update_last_active(terminal_id: str) -> bool:
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal:
-            terminal.last_active = datetime.now()
+            terminal.last_active = _utcnow()
             db.commit()
             return True
         return False
@@ -1788,6 +2644,18 @@ def update_terminal_shell_command(terminal_id: str, shell_command: str) -> bool:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal:
             terminal.shell_command = shell_command
+            db.commit()
+            return True
+        return False
+
+
+def update_terminal_provider_variant(terminal_id: str, provider_variant: str) -> bool:
+    """Persist a resolved provider runtime variant for restart reconstruction."""
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal:
+            terminal.provider_variant = provider_variant
             db.commit()
             return True
         return False
@@ -1830,12 +2698,13 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
     if not tmux_sessions:
         return []
     with SessionLocal() as db:
-        terminals = (
+        terminal_query = (
             db.query(TerminalModel)
             .filter(TerminalModel.tmux_session.in_(tmux_sessions))
             .order_by(literal_column("terminals.rowid"))
-            .all()
         )
+        terminals = terminal_query.all()
+        ephemeral_ids = _ephemeral_terminal_ids(db, terminal_query)
         return [
             {
                 "id": t.id,
@@ -1843,8 +2712,20 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "model": t.model,
+                "model_honored": t.model_honored,
+                "ephemeral": str(t.id) in ephemeral_ids,
                 "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
+                "deferred_init_failure": (
+                    _json.loads(t.deferred_init_failure_json)
+                    if isinstance(t.deferred_init_failure_json, str)
+                    and t.deferred_init_failure_json
+                    else None
+                ),
+                "deferred_init_external_owner": bool(t.deferred_init_external_owner),
+                "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
+                "session_incarnation_id": t.session_incarnation_id,
                 "last_active": t.last_active,
             }
             for t in terminals
@@ -1854,7 +2735,9 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
 def list_all_terminals() -> List[Dict[str, Any]]:
     """List all terminals."""
     with SessionLocal() as db:
-        terminals = db.query(TerminalModel).all()
+        terminal_query = db.query(TerminalModel)
+        terminals = terminal_query.all()
+        ephemeral_ids = _ephemeral_terminal_ids(db, terminal_query)
         return [
             {
                 "id": t.id,
@@ -1862,8 +2745,20 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "model": t.model,
+                "model_honored": t.model_honored,
+                "ephemeral": str(t.id) in ephemeral_ids,
                 "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
+                "deferred_init_failure": (
+                    _json.loads(t.deferred_init_failure_json)
+                    if isinstance(t.deferred_init_failure_json, str)
+                    and t.deferred_init_failure_json
+                    else None
+                ),
+                "deferred_init_external_owner": bool(t.deferred_init_external_owner),
+                "deferred_init_runtime_reclaimed": bool(t.deferred_init_runtime_reclaimed),
+                "session_incarnation_id": t.session_incarnation_id,
                 "last_active": t.last_active,
             }
             for t in terminals
@@ -1897,11 +2792,9 @@ def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
     The join on ``terminals`` drops messages whose receiver terminal no longer
     exists, so the sweep does not keep retrying deliveries to deleted agents.
 
-    ``created_at`` is stored local-naive (``InboxModel.created_at`` defaults to
-    ``datetime.now``), so the cutoff uses ``datetime.now()`` to match — the same
-    convention as the retention query in ``cleanup_service.cleanup_old_data``.
+    ``created_at`` is stored in UTC, so the cutoff uses the same clock.
     """
-    cutoff = datetime.now() - timedelta(seconds=min_age_seconds)
+    cutoff = _utcnow() - timedelta(seconds=min_age_seconds)
     with SessionLocal() as db:
         rows = (
             db.query(InboxModel.receiver_id)
@@ -2049,8 +2942,16 @@ def record_project_alias(project_id: str, alias: str, kind: str) -> None:
         logger.debug(f"record_project_alias failed (non-fatal): {e}")
 
 
-def get_project_id_by_alias(alias: str) -> Optional[str]:
-    """Return the canonical ``project_id`` for an alias, or None if unknown."""
+class ProjectAliasLookupUnavailableError(RuntimeError):
+    """Raised when a required project-alias lookup cannot reach the database."""
+
+
+def get_project_id_by_alias(alias: str, *, fail_closed: bool = False) -> Optional[str]:
+    """Return the canonical ``project_id`` for an alias, or None if unknown.
+
+    Callers that enforce a vault boundary can request ``fail_closed`` so a
+    database outage cannot be mistaken for an unrecognized alias.
+    """
     if not alias:
         return None
     try:
@@ -2058,6 +2959,8 @@ def get_project_id_by_alias(alias: str) -> Optional[str]:
             row = db.query(ProjectAliasModel).filter(ProjectAliasModel.alias == alias).first()
             return cast(Optional[str], row.project_id) if row else None
     except Exception as e:
+        if fail_closed:
+            raise ProjectAliasLookupUnavailableError(str(e)) from e
         logger.debug(f"get_project_id_by_alias failed (non-fatal): {e}")
         return None
 
@@ -2075,6 +2978,96 @@ def list_aliases_for_project(project_id: str) -> List[Dict[str, Any]]:
     except Exception as e:
         logger.debug(f"list_aliases_for_project failed (non-fatal): {e}")
         return []
+
+
+# ---------------------------------------------------------------------------
+# Handoff result durability helpers (issue #447)
+# ---------------------------------------------------------------------------
+
+
+def upsert_handoff_result(
+    job_id: str,
+    state: str,
+    *,
+    terminal_id: Optional[str] = None,
+    last_message: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> None:
+    """Create or update the durable record for a handoff step (issue #447).
+
+    Called from three places, NOT two, and only one of them is the handler:
+
+    1. ``api.main.run_step``, at request start — ``state="running"``.
+    2. ``services.agent_step.run_agent_step``, between result extraction and
+       terminal teardown — ``state="completed"``. NOT the handler after
+       ``run_agent_step`` returns: by then the terminal holding the only other
+       copy of the result is already gone.
+    3. ``api.main.run_step``'s failure arms — ``state="error"``. The handler owns
+       these because only it can distinguish the exception types.
+
+    Together, 2 and 3 make the result retrievable via
+    ``GET /handoff-results/{job_id}`` even if the transport closes before the
+    response arrives.
+
+    Idempotent per key: a second call for the same ``job_id`` updates the existing
+    row. That is last-write-wins bookkeeping, NOT execution deduplication -- there
+    is no mechanism by which a concurrent or retried call observes ``"running"``
+    and waits; a second call with the same key runs a second step.
+    """
+    now = _utcnow()
+    with SessionLocal() as db:
+        row = db.query(HandoffResultModel).filter(HandoffResultModel.job_id == job_id).first()
+        if row is None:
+            row = HandoffResultModel(
+                job_id=job_id,
+                state=state,
+                terminal_id=terminal_id,
+                last_message=last_message,
+                error_message=error_message,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(row)
+        else:
+            row.state = state
+            if terminal_id is not None:
+                row.terminal_id = terminal_id
+            if last_message is not None:
+                row.last_message = last_message
+            if error_message is not None:
+                row.error_message = error_message
+            row.updated_at = now
+        db.commit()
+
+
+def get_handoff_result(job_id: str) -> Optional[dict]:
+    """Return the handoff result record for ``job_id``, or None if not found."""
+    with SessionLocal() as db:
+        row = db.query(HandoffResultModel).filter(HandoffResultModel.job_id == job_id).first()
+        if row is None:
+            return None
+        return {
+            "job_id": row.job_id,
+            "state": row.state,
+            "terminal_id": row.terminal_id,
+            "last_message": row.last_message,
+            "error_message": row.error_message,
+            "created_at": row.created_at,
+            "updated_at": row.updated_at,
+        }
+
+
+def delete_old_handoff_results(cutoff: datetime) -> int:
+    """Delete handoff result rows older than ``cutoff`` (retention sweep).
+
+    Returns the number of rows deleted.
+    """
+    with SessionLocal() as db:
+        deleted = (
+            db.query(HandoffResultModel).filter(HandoffResultModel.created_at < cutoff).delete()
+        )
+        db.commit()
+        return deleted
 
 
 def update_message_status(message_id: int, status: MessageStatus) -> bool:

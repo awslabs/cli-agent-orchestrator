@@ -42,6 +42,8 @@ def _ok_run_step_response(terminal_id="dev-term", last_message="task done"):
         "terminal_id": terminal_id,
         "last_message": last_message,
         "status": "completed",
+        "model": "model-x",
+        "model_honored": True,
     }
     resp.raise_for_status.return_value = None
     return resp
@@ -213,6 +215,16 @@ class TestHandoffOutcomes:
         assert result.success is True
         assert result.output == "done"
         assert result.terminal_id == "dev-t1"
+        assert set(result.model_dump()) == {
+            "success",
+            "message",
+            "output",
+            "terminal_id",
+            "job_id",
+            "pending",
+        }
+        assert "model" not in result.model_dump()
+        assert "model_honored" not in result.model_dump()
         # The single combined call requests server-side teardown.
         assert mock_requests.post.call_args[1]["json"]["teardown"] is True
 
@@ -1041,19 +1053,65 @@ class TestHandoffCreateTimeoutRecovery:
     @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
     @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
-    def test_retries_are_bounded(self, mock_create, mock_provider, _nudge):
+    def test_retries_are_bounded_and_nothing_committed_reports_no_id(
+        self, mock_create, mock_provider, _nudge
+    ):
+        """Every attempt and the final lookup time out or miss: the handoff
+        fails as before, with no terminal_id to report."""
         import requests
 
         from cli_agent_orchestrator.utils.orchestration import _HANDOFF_CREATE_ATTEMPTS
 
         mock_provider.return_value = _ctx("kiro_cli")
         mock_create.side_effect = requests.exceptions.ReadTimeout("read timed out")
+        seen = []
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.exceptions = requests.exceptions
+            mock_requests.Timeout = requests.Timeout
+            result = asyncio.run(_handoff_impl("developer", "Do task", on_terminal_id=seen.append))
+
+        assert result.success is False
+        assert result.terminal_id is None
+        assert seen == []
+        # The bounded attempts, then exactly one non-allocating lookup.
+        assert mock_create.call_count == _HANDOFF_CREATE_ATTEMPTS + 1
+        flags = [c.kwargs.get("lookup_only", False) for c in mock_create.call_args_list]
+        assert flags == [False] * _HANDOFF_CREATE_ATTEMPTS + [True]
+
+    @pytest.mark.parametrize("wait", [True, False])
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_exhausted_wait_still_reports_the_committed_terminal_id(
+        self, mock_create, mock_provider, _nudge, wait
+    ):
+        """Review on PR #773: an initialization that outlasts every bounded
+        attempt must not cost the caller the worker's identity. The id is
+        reported for inspection and cleanup, and NO input is sent, because the
+        terminal has not finished initializing."""
+        import requests
+
+        from cli_agent_orchestrator.utils.orchestration import _HANDOFF_CREATE_ATTEMPTS
+
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.side_effect = [
+            requests.exceptions.ReadTimeout("read timed out")
+        ] * _HANDOFF_CREATE_ATTEMPTS + [("dev-t9", "kiro_cli")]
+        seen = []
         with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
             mock_requests.exceptions = requests.exceptions
             mock_requests.Timeout = requests.Timeout
             result = asyncio.run(
-                _handoff_impl("developer", "Do task", on_terminal_id=lambda _t: None)
+                _handoff_impl("developer", "Do task", on_terminal_id=seen.append, wait=wait)
             )
 
         assert result.success is False
-        assert mock_create.call_count == _HANDOFF_CREATE_ATTEMPTS
+        assert result.terminal_id == "dev-t9"
+        assert "dev-t9" in result.message
+        assert seen == ["dev-t9"]
+        lookup = mock_create.call_args_list[-1]
+        assert lookup.kwargs["lookup_only"] is True
+        keys = {c.kwargs["idempotency_key"] for c in mock_create.call_args_list}
+        assert len(keys) == 1
+        # Neither the direct-input send nor the run-step call happened.
+        mock_requests.post.assert_not_called()

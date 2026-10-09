@@ -16,14 +16,11 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import create_flow as db_create_flow
 from cli_agent_orchestrator.clients.database import delete_flow as db_delete_flow
 from cli_agent_orchestrator.clients.database import (
-    delete_terminals_by_session,
+    delete_terminals_by_ids,
 )
 from cli_agent_orchestrator.clients.database import get_flow as db_get_flow
 from cli_agent_orchestrator.clients.database import get_flows_to_run as db_get_flows_to_run
 from cli_agent_orchestrator.clients.database import list_flows as db_list_flows
-from cli_agent_orchestrator.clients.database import (
-    list_terminals_by_session,
-)
 from cli_agent_orchestrator.clients.database import update_flow_enabled as db_update_flow_enabled
 from cli_agent_orchestrator.clients.database import (
     update_flow_run_times as db_update_flow_run_times,
@@ -34,8 +31,13 @@ from cli_agent_orchestrator.models.kiro_engine import parse_kiro_engine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
+from cli_agent_orchestrator.services.session_service import list_current_session_terminals
 from cli_agent_orchestrator.services.status_monitor import status_monitor
-from cli_agent_orchestrator.services.terminal_service import create_terminal, send_input
+from cli_agent_orchestrator.services.terminal_service import (
+    create_terminal,
+    send_input,
+    should_retain_deferred_failure_tombstone,
+)
 from cli_agent_orchestrator.utils.template import render_template
 
 logger = logging.getLogger(__name__)
@@ -208,11 +210,27 @@ def _is_terminal_busy(terminal_id: str) -> bool:
         return False
 
 
+def _delete_recycled_terminal_rows(terminal_ids: List[str]) -> None:
+    """Release names only after the existing bulk deletion succeeds."""
+    if delete_terminals_by_ids(terminal_ids):
+        from cli_agent_orchestrator.services import ephemeral_service
+
+        for terminal_id in terminal_ids:
+            ephemeral_service.release(terminal_id, "terminal_gone")
+
+
 async def execute_flow(name: str) -> bool:
     """Execute flow: run script, render prompt, launch session."""
     try:
         logger.info(f"Executing flow: {name}")
         flow = get_flow(name)
+
+        # Advance the schedule before anything below can raise. A failed run
+        # then waits for its next cron slot, as an execute=false run does,
+        # instead of staying due and re-running on every flow_daemon poll.
+        now = datetime.now()
+        next_run = _get_next_run_time(flow.schedule)
+        db_update_flow_run_times(name, last_run=now, next_run=next_run)
 
         # Read flow file
         file_path = Path(flow.file_path)
@@ -236,7 +254,11 @@ async def execute_flow(name: str) -> bool:
             if not script_path.exists():
                 raise ValueError(f"Script not found: {script_path}")
 
-            result = subprocess.run([str(script_path)], capture_output=True, text=True, timeout=30)
+            # Off the loop: the script can run for up to 30s, and execute_flow
+            # runs on the shared event loop, so every request would wait on it.
+            result = await asyncio.to_thread(
+                subprocess.run, [str(script_path)], capture_output=True, text=True, timeout=30
+            )
 
             if result.returncode != 0:
                 logger.error(f"Script failed: {result.stderr}")
@@ -256,11 +278,6 @@ async def execute_flow(name: str) -> bool:
             if "output" not in output:
                 raise ValueError("Script output missing 'output' field")
 
-        # Update last_run and calculate next_run
-        now = datetime.now()
-        next_run = _get_next_run_time(flow.schedule)
-        db_update_flow_run_times(name, last_run=now, next_run=next_run)
-
         # Check if we should execute
         if not output["execute"]:
             logger.info(f"Flow {name}: skipped (execute=false)")
@@ -274,8 +291,10 @@ async def execute_flow(name: str) -> bool:
 
         # Launch session
         session_name = f"cao-flow-{flow.name}"
-        terminals = list_terminals_by_session(session_name)
-        if get_backend().session_exists(session_name):
+        backend = get_backend()
+        backend_exists = backend.session_exists(session_name)
+        terminals = list_current_session_terminals(session_name, backend_exists=backend_exists)
+        if backend_exists:
             # Only check the first (conductor) terminal for busy status.
             # Worker terminals spawned by the conductor may have stale status
             # after /exit and should not block flow recycling.
@@ -310,7 +329,7 @@ async def execute_flow(name: str) -> bool:
                     status_monitor.clear_terminal(t["id"])
                 except Exception as e:
                     logger.warning(f"Failed to clear status buffers for {t['id']}: {e}")
-            get_backend().kill_session(session_name)
+            backend.kill_session(session_name)
             # A provider's private state must outlive the process that owns
             # it.  Grok cleanup confirms any escaped updater has stopped
             # before recursively deleting its private GROK_HOME.
@@ -327,21 +346,30 @@ async def execute_flow(name: str) -> bool:
                     name,
                 )
                 return False
-            delete_terminals_by_session(session_name)
+            _delete_recycled_terminal_rows([str(t["id"]) for t in terminals])
         elif terminals:
             # A previous recycle can have killed the backend session but safely
             # retained its terminal rows because a Grok-owned private home was
             # still in use.  Do not create a same-named flow session until those
             # rows have been retried: doing so would abandon their only cleanup
             # handle and could collide with the deterministic GROK_HOME path.
+            # The absent-backend view is raw history, including tombstones
+            # whose external owners have not acknowledged their failures.
+            cleanup_rows = [
+                terminal_metadata
+                for terminal_metadata in terminals
+                if not should_retain_deferred_failure_tombstone(
+                    str(terminal_metadata["id"]), terminal_metadata
+                )
+            ]
             cleanup_complete = True
-            for terminal_metadata in terminals:
+            for terminal_metadata in cleanup_rows:
                 if provider_manager.cleanup_provider(terminal_metadata["id"]) is False:
                     cleanup_complete = False
             if not cleanup_complete:
                 logger.warning("Flow %s has retained terminal cleanup; deferring next run", name)
                 return False
-            delete_terminals_by_session(session_name)
+            _delete_recycled_terminal_rows([str(t["id"]) for t in cleanup_rows])
         terminal = await create_terminal(
             session_name=session_name,
             provider=flow.provider,

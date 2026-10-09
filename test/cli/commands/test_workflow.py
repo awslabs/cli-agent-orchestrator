@@ -19,6 +19,8 @@ from cli_agent_orchestrator.constants import (
     MCP_REQUEST_TIMEOUT,
     WORKFLOW_POLL_INTERVAL_SECONDS,
     WORKFLOW_RUN_REQUEST_TIMEOUT,
+    WORKFLOW_STEP_REQUEST_TIMEOUT,
+    WORKFLOW_STEP_TIMEOUT,
 )
 
 
@@ -90,7 +92,7 @@ def _snap(state, run_id="run1", current=None, steps=None):
 def test_run_bare_follows_to_completed_exit_0(runner):
     """T1 (EC-1): bare ``run`` submits, follows the poll to ``completed``, exits 0."""
     with (
-        patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req,
+        patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req,
         patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
     ):
         mock_req.post.return_value = _submit_resp()
@@ -108,7 +110,7 @@ def test_run_bare_follows_to_completed_exit_0(runner):
 def test_run_bare_follows_to_failed_exit_1(runner):
     """T1 (EC-1): a poll settling on ``failed`` yields exit 1 (failed/cancelled -> 1)."""
     with (
-        patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req,
+        patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req,
         patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
     ):
         mock_req.post.return_value = _submit_resp()
@@ -121,7 +123,7 @@ def test_run_non_tty_failed_run_nonzero_exit(runner):
     """T2 (EC-2, MANDATED NFR-2b): with stdout NOT a TTY (CliRunner default), a
     FAILED run still follows to terminal and still yields a NON-ZERO exit."""
     with (
-        patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req,
+        patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req,
         patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
         patch("cli_agent_orchestrator.cli.commands.workflow.sys.stdout.isatty", return_value=False),
     ):
@@ -138,7 +140,7 @@ def test_run_json_follow_stable_and_preserves_exit(runner):
     """T3 (EC-3): ``run --json`` emits parseable JSON and the exit code still equals
     the terminal status (JSON does not drift the exit code)."""
     with (
-        patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req,
+        patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req,
         patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
     ):
         mock_req.post.return_value = _submit_resp()
@@ -164,7 +166,7 @@ def test_follow_renders_each_step_transition(runner):
     (only the first line is printed; s2/s3 never appear).
     """
     with (
-        patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req,
+        patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req,
         patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
         patch("cli_agent_orchestrator.cli.commands.workflow._machine_mode", return_value=False),
     ):
@@ -185,7 +187,7 @@ def test_follow_does_not_reprint_an_unchanged_step(runner):
     """FP-6 must not become chatty: repeated identical (state, step) snapshots print
     ONCE, so a 1s poll on a 10-minute step does not emit 600 identical lines."""
     with (
-        patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req,
+        patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req,
         patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
         patch("cli_agent_orchestrator.cli.commands.workflow._machine_mode", return_value=False),
     ):
@@ -205,7 +207,7 @@ def test_follow_json_mode_emits_no_progress_lines(runner):
     """FP-6 must not leak human progress lines into a machine stream: under ``--json``
     the step-transition printer stays silent and stdout is exactly one JSON object."""
     with (
-        patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req,
+        patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req,
         patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
     ):
         mock_req.post.return_value = _submit_resp()
@@ -224,7 +226,7 @@ def test_run_ctrl_c_detaches_without_cancel(runner):
     """T4 (CC-1, MANDATED): a KeyboardInterrupt mid-follow DETACHES — exit 0, a
     "still running" hint is printed, and NO cancel POST is issued."""
     with (
-        patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req,
+        patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req,
         patch(
             "cli_agent_orchestrator.cli.commands.workflow._poll_to_terminal",
             side_effect=KeyboardInterrupt,
@@ -251,11 +253,11 @@ def test_run_prints_id_before_follow_survives_first_poll_interrupt(runner):
     """
     with (
         patch(
-            "cli_agent_orchestrator.cli.commands.workflow.requests.post",
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.post",
             return_value=_submit_resp(),
         ),
         patch(
-            "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
             side_effect=KeyboardInterrupt,
         ),
         patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
@@ -276,11 +278,11 @@ def test_run_lost_socket_is_not_run_death(runner):
     """
     with (
         patch(
-            "cli_agent_orchestrator.cli.commands.workflow.requests.post",
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.post",
             return_value=_submit_resp(),
         ),
         patch(
-            "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
             side_effect=requests.exceptions.ConnectionError("down"),
         ),
         patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
@@ -294,7 +296,7 @@ def test_run_lost_socket_is_not_run_death(runner):
 def test_run_detach_exits_0_after_submit_no_follow(runner):
     """T7 (VR-1): ``run --detach`` returns exit 0 right after a 202, prints id +
     links, and does NOT enter the poll loop (no snapshot GET)."""
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.post.return_value = _submit_resp()
         result = runner.invoke(workflow, ["run", "wf", "--detach"])
     assert result.exit_code == 0
@@ -306,7 +308,7 @@ def test_run_wait_uses_blocking_route_and_long_timeout(runner):
     """T8 (VR-2, C-6): ``run --wait`` POSTs the blocking ``/workflows/runs`` (NOT
     ``:submit``) with the worst-case ``WORKFLOW_RUN_REQUEST_TIMEOUT``."""
     body = {"run_id": "run1", "state": "completed", "steps": []}
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.post.return_value = _resp(200, body)
         result = runner.invoke(workflow, ["run", "wf", "--wait"])
     assert result.exit_code == 0
@@ -318,7 +320,7 @@ def test_run_wait_uses_blocking_route_and_long_timeout(runner):
 
 
 def test_run_unknown_workflow_404(runner):
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.post.return_value = _resp(404, {"detail": "unknown workflow 'ghost'"})
         result = runner.invoke(workflow, ["run", "ghost"])
     assert result.exit_code != 0
@@ -326,7 +328,7 @@ def test_run_unknown_workflow_404(runner):
 
 
 def test_run_reserved_mode_501_surfaces_detail(runner):
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.post.return_value = _resp(501, {"detail": "mode 'parallel' is reserved"})
         result = runner.invoke(workflow, ["run", "wf"])
     assert result.exit_code != 0
@@ -341,7 +343,7 @@ def test_poll_interval_is_named_constant():
 def test_run_follow_poll_uses_normal_timeout(runner):
     """T13 (FP-4): each follow poll uses MCP_REQUEST_TIMEOUT, not the long timeout."""
     with (
-        patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req,
+        patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req,
         patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
     ):
         mock_req.post.return_value = _submit_resp()
@@ -357,7 +359,7 @@ def test_resume_keeps_long_blocking_timeout(runner):
     flat MCP_REQUEST_TIMEOUT — a 30s ceiling would report a still-running resume as
     a failure)."""
     body = {"run_id": "run1", "state": "completed", "steps": []}
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.post.return_value = _resp(200, body)
         result = runner.invoke(workflow, ["resume", "run1"])
     assert result.exit_code == 0
@@ -391,12 +393,12 @@ def test_c6_timeout_split_guard_cli(runner):
 
     # (b) BLOCKING family -> the long timeout.
     body = {"run_id": "run1", "state": "completed", "steps": []}
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.post.return_value = _resp(200, body)
         runner.invoke(workflow, ["run", "wf", "--wait"])
     assert mock_req.post.call_args.kwargs["timeout"] == WORKFLOW_RUN_REQUEST_TIMEOUT
 
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.post.return_value = _resp(200, body)
         runner.invoke(workflow, ["resume", "run1"])
     assert mock_req.post.call_args.kwargs["timeout"] == WORKFLOW_RUN_REQUEST_TIMEOUT
@@ -404,7 +406,7 @@ def test_c6_timeout_split_guard_cli(runner):
     # (c) ASYNC family -> the normal per-call timeout. Assert the submit POST and
     # each read GET (poll, wait, result, runs, status) all pass MCP_REQUEST_TIMEOUT.
     with (
-        patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req,
+        patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req,
         patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
     ):
         mock_req.post.return_value = _submit_resp()
@@ -421,7 +423,7 @@ def test_c6_timeout_split_guard_cli(runner):
         (["status", "run1"], _snap("completed")),
     ):
         with (
-            patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req,
+            patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req,
             patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
         ):
             mock_req.get.return_value = _resp(200, body_or_rows)
@@ -439,7 +441,7 @@ def test_status_happy(runner):
         "current_step_id": "s1",
         "steps": [{"id": "s1", "state": "running", "attempts": 1}],
     }
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.return_value = _resp(200, body)
         result = runner.invoke(workflow, ["status", "run1"])
     assert result.exit_code == 0
@@ -447,7 +449,7 @@ def test_status_happy(runner):
 
 
 def test_status_unknown_404(runner):
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.return_value = _resp(404, {"detail": "unknown run 'ghost'"})
         result = runner.invoke(workflow, ["status", "ghost"])
     assert result.exit_code != 0
@@ -468,7 +470,7 @@ def test_status_no_id_resolves_most_recent(runner):
             "current_step_id": "s1",
         },
     ]
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.side_effect = [
             _resp(200, rows),  # list ?limit=1
             _resp(200, _snap("running", run_id="recent", current="s1")),  # snapshot
@@ -484,7 +486,7 @@ def test_status_no_id_resolves_most_recent(runner):
 def test_status_no_id_empty_list(runner):
     """T12 (VR-4): ``status`` with no id and an empty run list prints "no runs
     found" and exits 0 (never a 404)."""
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.return_value = _resp(200, [])
         result = runner.invoke(workflow, ["status"])
     assert result.exit_code == 0
@@ -507,7 +509,7 @@ def test_runs_renders_table(runner):
             "current_step_id": None,
         },
     ]
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.return_value = _resp(200, rows)
         result = runner.invoke(workflow, ["runs"])
     assert result.exit_code == 0
@@ -530,7 +532,7 @@ def test_runs_json_and_filters(runner):
             "current_step_id": None,
         }
     ]
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.return_value = _resp(200, rows)
         result = runner.invoke(workflow, ["runs", "--state", "failed", "--limit", "5", "--json"])
     assert result.exit_code == 0
@@ -540,7 +542,7 @@ def test_runs_json_and_filters(runner):
 
 
 def test_runs_empty(runner):
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.return_value = _resp(200, [])
         result = runner.invoke(workflow, ["runs"])
     assert result.exit_code == 0
@@ -548,7 +550,7 @@ def test_runs_empty(runner):
 
 
 def test_runs_illegal_state_400(runner):
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.return_value = _resp(400, {"detail": "illegal run state filter 'bogus'"})
         result = runner.invoke(workflow, ["runs", "--state", "bogus"])
     assert result.exit_code != 0
@@ -570,7 +572,7 @@ def test_runs_help_distinct_from_list(runner):
 # ---------------------------------------------------------------------------
 def test_wait_polls_to_terminal_exit_0(runner):
     with (
-        patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req,
+        patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req,
         patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
     ):
         mock_req.get.side_effect = [_resp(200, _snap("running")), _resp(200, _snap("completed"))]
@@ -581,7 +583,7 @@ def test_wait_polls_to_terminal_exit_0(runner):
 
 def test_wait_failed_exit_1(runner):
     with (
-        patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req,
+        patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req,
         patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
     ):
         mock_req.get.return_value = _resp(200, _snap("cancelled"))
@@ -590,7 +592,7 @@ def test_wait_failed_exit_1(runner):
 
 
 def test_wait_unknown_404(runner):
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.return_value = _resp(404, {"detail": "unknown run 'ghost'"})
         result = runner.invoke(workflow, ["wait", "ghost"])
     assert result.exit_code != 0
@@ -610,7 +612,7 @@ def test_result_happy(runner):
         "finished_at": "t2",
         "kind": None,
     }
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.return_value = _resp(200, body)
         result = runner.invoke(workflow, ["result", "run1"])
     assert result.exit_code == 0
@@ -627,7 +629,7 @@ def test_result_json_verbatim(runner):
         "finished_at": "t2",
         "kind": "error",
     }
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.return_value = _resp(200, body)
         result = runner.invoke(workflow, ["result", "run1", "--json"])
     assert result.exit_code == 0
@@ -636,7 +638,7 @@ def test_result_json_verbatim(runner):
 
 
 def test_result_unknown_404(runner):
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.return_value = _resp(404, {"detail": "unknown run 'ghost'"})
         result = runner.invoke(workflow, ["result", "ghost"])
     assert result.exit_code != 0
@@ -673,7 +675,7 @@ def test_result_renders_failure_envelope_for_failed_run(runner):
     envelope fields (failing step, attempt, error kind, terminal reference, next
     command)."""
     body = _failed_result_body()
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.return_value = _resp(200, body)
         result = runner.invoke(workflow, ["result", "run1"])
     assert result.exit_code == 0
@@ -689,7 +691,7 @@ def test_result_renders_retained_run_diagnostic(runner):
     """Issue #753: human output must show the stderr retained in warnings."""
     body = _failed_result_body()
     body["warnings"] = ["Traceback: script failed"]
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.return_value = _resp(200, body)
         result = runner.invoke(workflow, ["result", "run1"])
 
@@ -702,7 +704,7 @@ def test_result_failed_json_verbatim_carries_envelope(runner):
     body verbatim — the failure envelope (and its stable next_command hint) is in
     the JSON, round-trippable, not re-shaped by the CLI."""
     body = _failed_result_body(kind="timeout")
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.return_value = _resp(200, body)
         result = runner.invoke(workflow, ["result", "run1", "--json"])
     assert result.exit_code == 0
@@ -723,7 +725,7 @@ def test_result_completed_run_renders_no_failure_block(runner):
         "finished_at": "t2",
         "kind": None,
     }
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.return_value = _resp(200, body)
         result = runner.invoke(workflow, ["result", "run1"])
     assert result.exit_code == 0
@@ -734,7 +736,7 @@ def test_result_completed_run_renders_no_failure_block(runner):
 # cancel
 # ---------------------------------------------------------------------------
 def test_cancel_happy(runner):
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.post.return_value = _resp(200, {"success": True, "run_id": "run1"})
         result = runner.invoke(workflow, ["cancel", "run1"])
     assert result.exit_code == 0
@@ -745,7 +747,7 @@ def test_cancel_happy(runner):
 
 
 def test_cancel_finished_409(runner):
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.post.return_value = _resp(409, {"detail": "run 'run1' is already completed"})
         result = runner.invoke(workflow, ["cancel", "run1"])
     assert result.exit_code != 0
@@ -761,7 +763,7 @@ def test_list_renders_none_step_count_as_dash(runner):
         {"name": "yamlwf", "mode": "sequential", "step_count": 3, "description": "a yaml one"},
         {"name": "scriptwf", "mode": "script", "step_count": None, "description": "a script one"},
     ]
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.return_value = _resp(200, rows)
         result = runner.invoke(workflow, ["list"])
     assert result.exit_code == 0
@@ -783,7 +785,7 @@ def test_list_all_rows_script_none_step_count(runner):
         {"name": "s1", "mode": "script", "step_count": None, "description": ""},
         {"name": "s2", "mode": "script", "step_count": None, "description": "second"},
     ]
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.return_value = _resp(200, rows)
         result = runner.invoke(workflow, ["list"])
     assert result.exit_code == 0
@@ -792,7 +794,7 @@ def test_list_all_rows_script_none_step_count(runner):
 
 def test_list_empty(runner):
     """Edge case: an empty index prints a friendly message, not an empty table."""
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.return_value = _resp(200, [])
         result = runner.invoke(workflow, ["list"])
     assert result.exit_code == 0
@@ -802,8 +804,174 @@ def test_list_empty(runner):
 def test_list_json_passthrough_preserves_none(runner):
     """The --json path emits rows verbatim (step_count stays null), never coerced."""
     rows = [{"name": "scriptwf", "mode": "script", "step_count": None, "description": ""}]
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests") as mock_req:
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.return_value = _resp(200, rows)
         result = runner.invoke(workflow, ["list", "--json"])
     assert result.exit_code == 0
     assert '"step_count": null' in result.output
+
+
+# ---------------------------------------------------------------------------
+# step — single-step re-execution against a recorded run (issue #640)
+# ---------------------------------------------------------------------------
+def _replay_body(**overrides):
+    """A ``:replay`` response body (the shape ``replay_single_step`` returns)."""
+    body = {
+        "run_id": "run1",
+        "step_id": "s2",
+        "provider": "claude_code",
+        "agent": "reviewer",
+        "prompt": "write about 42 for cats",
+        "terminal_id": "t1",
+        "last_message": "done",
+        "output": {"answer": "fresh"},
+        "validated": True,
+        "error": None,
+        "error_kind": None,
+    }
+    body.update(overrides)
+    return body
+
+
+def test_step_replays_one_step_and_renders_prompt_and_output(runner):
+    """Happy path: POSTs the :replay route, renders the resolved prompt + output, exits 0."""
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
+        mock_req.post.return_value = _resp(200, _replay_body())
+        result = runner.invoke(workflow, ["step", "run1", "s2"])
+    assert result.exit_code == 0
+    args, kwargs = mock_req.post.call_args
+    assert args[0].endswith("/workflows/runs/run1/steps/s2:replay")
+    # No override sent when neither flag is given (the server reuses the snapshot).
+    assert kwargs["json"] == {}
+    # A step runs an agent inline server-side, so this is a BLOCKING client path —
+    # but it runs at most ONE step, so it takes the single-step ceiling, NOT the
+    # multi-step WORKFLOW_RUN_REQUEST_TIMEOUT (~2.45h of idle socket on a hung
+    # server). Bracketed on both sides so neither drift is silent.
+    assert kwargs["timeout"] == WORKFLOW_STEP_REQUEST_TIMEOUT
+    assert MCP_REQUEST_TIMEOUT < WORKFLOW_STEP_REQUEST_TIMEOUT < WORKFLOW_RUN_REQUEST_TIMEOUT
+    assert WORKFLOW_STEP_REQUEST_TIMEOUT == WORKFLOW_STEP_TIMEOUT + 180.0
+    assert "write about 42 for cats" in result.output
+    assert '"answer": "fresh"' in result.output
+
+
+def test_step_json_emits_body_verbatim(runner):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
+        mock_req.post.return_value = _resp(200, _replay_body())
+        result = runner.invoke(workflow, ["step", "run1", "s2", "--json"])
+    assert result.exit_code == 0
+    assert json.loads(result.output) == _replay_body()
+
+
+def test_step_prompt_override_is_sent(runner):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
+        mock_req.post.return_value = _resp(200, _replay_body(prompt="be terse"))
+        result = runner.invoke(workflow, ["step", "run1", "s2", "--prompt-override", "be terse"])
+    assert result.exit_code == 0
+    assert mock_req.post.call_args.kwargs["json"] == {"prompt_override": "be terse"}
+
+
+def test_step_prompt_file_is_read_and_sent(runner, tmp_path):
+    prompt_path = tmp_path / "p.md"
+    prompt_path.write_text("from a file\n", encoding="utf-8")
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
+        mock_req.post.return_value = _resp(200, _replay_body(prompt="from a file\n"))
+        result = runner.invoke(workflow, ["step", "run1", "s2", "--prompt-file", str(prompt_path)])
+    assert result.exit_code == 0
+    assert mock_req.post.call_args.kwargs["json"] == {"prompt_override": "from a file\n"}
+
+
+def test_step_prompt_flags_are_mutually_exclusive(runner, tmp_path):
+    """Both prompt flags together is rejected BEFORE any request is issued."""
+    prompt_path = tmp_path / "p.md"
+    prompt_path.write_text("x", encoding="utf-8")
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
+        result = runner.invoke(
+            workflow,
+            ["step", "run1", "s2", "--prompt-file", str(prompt_path), "--prompt-override", "y"],
+        )
+    assert result.exit_code != 0
+    assert "mutually exclusive" in result.output
+    assert mock_req.post.called is False
+
+
+def test_step_missing_prompt_file_is_a_clear_error(runner, tmp_path):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
+        result = runner.invoke(
+            workflow, ["step", "run1", "s2", "--prompt-file", str(tmp_path / "nope.md")]
+        )
+    assert result.exit_code != 0
+    assert "could not read --prompt-file" in result.output
+    assert mock_req.post.called is False
+
+
+def test_step_empty_prompt_override_is_rejected_before_any_request(runner):
+    """An empty override is not ``None``: without this it POSTed a blank prompt."""
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
+        result = runner.invoke(workflow, ["step", "run1", "s2", "--prompt-override", ""])
+    assert result.exit_code != 0
+    assert "--prompt-override is empty" in result.output
+    assert mock_req.post.called is False
+
+
+def test_step_whitespace_only_prompt_file_is_rejected_and_names_the_file(runner, tmp_path):
+    """The common shape of the mistake: a "prompt file" holding only a newline."""
+    prompt_path = tmp_path / "blank.md"
+    prompt_path.write_text("\n  \n", encoding="utf-8")
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
+        result = runner.invoke(workflow, ["step", "run1", "s2", "--prompt-file", str(prompt_path)])
+    assert result.exit_code != 0
+    assert "is empty" in result.output
+    assert str(prompt_path) in result.output  # names the file, not just the flag
+    assert mock_req.post.called is False
+
+
+def test_step_renders_a_run_with_no_structured_output(runner):
+    """A step that emitted nothing structured still succeeds — output is just absent.
+
+    Distinct from the failure path below: no ``error``, so exit 0, and the render says
+    so explicitly rather than printing an empty ``Output:`` heading.
+    """
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
+        mock_req.post.return_value = _resp(
+            200, _replay_body(output=None, validated=None, last_message="all done")
+        )
+        result = runner.invoke(workflow, ["step", "run1", "s2"])
+    assert result.exit_code == 0
+    assert "(no structured output)" in result.output
+    assert "all done" in result.output
+
+
+def test_step_unknown_run_surfaces_the_server_detail(runner):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
+        mock_req.post.return_value = _resp(404, {"detail": "run 'run1' has no step 's9'"})
+        result = runner.invoke(workflow, ["step", "run1", "s9"])
+    assert result.exit_code != 0
+    assert "has no step 's9'" in result.output
+
+
+def test_step_unresolvable_prompt_400_surfaces_detail(runner):
+    detail = "cannot resolve the prompt for step 's2' of run 'run1': ... produced no output"
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
+        mock_req.post.return_value = _resp(400, {"detail": detail})
+        result = runner.invoke(workflow, ["step", "run1", "s2"])
+    assert result.exit_code != 0
+    assert "produced no output" in result.output
+
+
+def test_step_failed_step_exits_1(runner):
+    """A failed step is a 200 whose body carries ``error`` — the exit code follows it."""
+    body = _replay_body(error="terminal reached ERROR", error_kind="error", output=None)
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
+        mock_req.post.return_value = _resp(200, body)
+        result = runner.invoke(workflow, ["step", "run1", "s2"])
+    assert result.exit_code == 1
+    assert "terminal reached ERROR" in result.output
+
+
+def test_step_unreachable_server(runner):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
+        mock_req.exceptions = requests.exceptions
+        mock_req.post.side_effect = requests.exceptions.ConnectionError("refused")
+        result = runner.invoke(workflow, ["step", "run1", "s2"])
+    assert result.exit_code != 0
+    assert "could not reach cao-server" in result.output

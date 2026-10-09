@@ -6,7 +6,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-from cli_agent_orchestrator.cli.commands.launch import _parse_env_pairs, launch
+from cli_agent_orchestrator.cli.commands.launch import (
+    _HEADLESS_TASK_TIMEOUT,
+    _READINESS_WAIT_TIMEOUT,
+    _is_waiting_on_user,
+    _parse_env_pairs,
+    launch,
+)
+from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 # ── Backend auto-detection (issue #308) ──────────────────────────────
 
@@ -22,7 +29,7 @@ def test_launch_syncs_backend_from_server_before_attach():
     call_order = []
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
         patch("cli_agent_orchestrator.cli.commands.launch.sync_backend_from_server") as mock_sync,
@@ -56,7 +63,7 @@ def test_launch_headless_does_not_sync_backend():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.sync_backend_from_server") as mock_sync,
     ):
         mock_post.return_value.json.return_value = {
@@ -77,7 +84,7 @@ def test_launch_passes_cwd_by_default():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
@@ -105,7 +112,7 @@ def test_launch_passes_explicit_working_directory():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
@@ -139,7 +146,7 @@ def test_launch_passes_explicit_kiro_engine():
     """The direct CLI surface forwards engine selection without changing provider selection."""
     runner = CliRunner()
 
-    with patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post:
+    with patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post:
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
             "id": "test-terminal-id",
@@ -156,14 +163,20 @@ def test_launch_passes_explicit_kiro_engine():
 
 
 def test_launch_headless_message_sends_to_terminal():
-    """Test headless mode with message waits for IDLE then sends and polls for output."""
+    """Headless+message hands MESSAGE to the server in the create body, then polls.
+
+    Regression guard for caom-7it: the CLI used to create the session and then
+    issue a SEPARATE ``POST /terminals/{id}/input``. When provider init outlived
+    the client's read timeout on ``POST /sessions``, that second request never
+    happened and MESSAGE was silently dropped. There must be exactly ONE POST,
+    carrying ``initial_message``.
+    """
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
-        patch("cli_agent_orchestrator.cli.commands.launch.time.sleep"),
     ):
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
@@ -181,7 +194,7 @@ def test_launch_headless_message_sends_to_terminal():
         output_resp.raise_for_status.return_value = None
         output_resp.json.return_value = {"output": "task done"}
 
-        mock_get.side_effect = [poll_resp, output_resp]
+        mock_get.side_effect = [_delivered_response(), poll_resp, output_resp]
 
         result = runner.invoke(
             launch,
@@ -196,9 +209,15 @@ def test_launch_headless_message_sends_to_terminal():
 
         assert result.exit_code == 0
         assert "task done" in result.output
-        mock_wait.assert_called_once()
-        # Two POST calls: create session + send message
-        assert mock_post.call_count == 2
+        # ONE POST: create session, with MESSAGE in the body. No follow-up
+        # /terminals/{id}/input — the server delivers it off the deferred-init
+        # path and re-submits if the TUI swallowed it.
+        assert mock_post.call_count == 1
+        assert mock_post.call_args.kwargs["json"]["initial_message"] == "do something"
+        assert "/input" not in str(mock_post.call_args)
+        # No client-side readiness gate either: the create response returns
+        # before init finishes (status UNKNOWN), and poll_until_done handles it.
+        mock_wait.assert_not_called()
 
 
 def test_launch_invalid_provider():
@@ -216,7 +235,7 @@ def test_launch_with_session_name():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
@@ -244,7 +263,7 @@ def test_launch_request_exception():
     """Test launch handles RequestException."""
     runner = CliRunner()
 
-    with patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post:
+    with patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post:
         import requests
 
         mock_post.side_effect = requests.exceptions.RequestException("Connection refused")
@@ -259,7 +278,7 @@ def test_launch_generic_exception():
     """Test launch handles generic exception."""
     runner = CliRunner()
 
-    with patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post:
+    with patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post:
         mock_post.side_effect = Exception("Unexpected error")
 
         result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
@@ -273,7 +292,7 @@ def test_launch_headless_mode():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
     ):
         mock_post.return_value.json.return_value = {
@@ -301,7 +320,7 @@ def test_launch_non_headless_waits_for_idle_before_attach():
     call_order = []
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
@@ -340,7 +359,7 @@ def test_launch_non_headless_attaches_even_if_wait_times_out():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
@@ -360,12 +379,178 @@ def test_launch_non_headless_attaches_even_if_wait_times_out():
         mock_get_backend.return_value.attach_session.assert_called_once_with("test-session")
 
 
+# ── A screen that legitimately needs the operator is settled, not a stall ──
+#
+# A provider can finish init on a prompt only a human can answer (Codex's
+# first-run login menu is the case that forced this). Such a screen never
+# becomes IDLE on its own, so a readiness poll that accepts only
+# {IDLE, COMPLETED} burned the full _READINESS_WAIT_TIMEOUT and then blamed
+# init for a pane that was merely waiting — while telling the operator nothing
+# about the sign-in they had to complete.
+
+
+def test_readiness_poll_accepts_waiting_user_answer():
+    """WAITING_USER_ANSWER is in the pre-attach target set.
+
+    This is the assertion that matters: it pins the set itself, so narrowing it
+    back to {IDLE, COMPLETED} fails here rather than only showing up as a 120s
+    stall nothing in the suite waits around for.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch._is_waiting_on_user") as mock_waiting,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+        mock_waiting.return_value = False
+        mock_get_backend.return_value.attach_session.return_value = None
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        target_set = mock_wait.call_args[0][1]
+        assert TerminalStatus.WAITING_USER_ANSWER in target_set, (
+            "pre-attach poll must treat WAITING_USER_ANSWER as settled, or a "
+            f"first-run sign-in stalls for {_READINESS_WAIT_TIMEOUT}s; got {target_set}"
+        )
+        # The pre-existing members must survive the widening.
+        assert {TerminalStatus.IDLE, TerminalStatus.COMPLETED} <= target_set
+
+
+def test_launch_tells_the_operator_when_the_pane_awaits_an_answer():
+    """On a settled WAITING_USER_ANSWER the operator is told to finish it, not warned.
+
+    The "did not reach idle" warning would be actively wrong here: init did
+    finish, and the only thing outstanding is the human's answer.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch._is_waiting_on_user") as mock_waiting,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+        mock_waiting.return_value = True
+        mock_get_backend.return_value.attach_session.return_value = None
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        assert "waiting for an answer in the pane" in result.output
+        assert "did not reach idle" not in result.output
+        mock_get_backend.return_value.attach_session.assert_called_once_with("test-session")
+
+
+def test_launch_stays_quiet_when_the_terminal_settles_idle():
+    """The new hint must not fire on the ordinary path."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch._is_waiting_on_user") as mock_waiting,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+        mock_waiting.return_value = False
+        mock_get_backend.return_value.attach_session.return_value = None
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        assert "waiting for an answer" not in result.output
+        assert "did not reach idle" not in result.output
+
+
+def test_is_waiting_on_user_reads_the_live_status():
+    """True only for WAITING_USER_ANSWER."""
+    with patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get:
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {
+            "status": TerminalStatus.WAITING_USER_ANSWER.value
+        }
+        assert _is_waiting_on_user("t1") is True
+
+        mock_get.return_value.json.return_value = {"status": TerminalStatus.IDLE.value}
+        assert _is_waiting_on_user("t1") is False
+
+
+def test_is_waiting_on_user_swallows_transport_errors():
+    """A blip must not turn a successful launch into "Failed to connect to cao-server".
+
+    This helper only decides which advisory line to print, and it runs inside the
+    command's ``RequestException`` handler — so letting one escape would report a
+    connection failure to a server the poll just finished talking to.
+    """
+    import requests as _requests
+
+    with patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get:
+        mock_get.side_effect = _requests.exceptions.ConnectionError("boom")
+        assert _is_waiting_on_user("t1") is False
+
+
+@pytest.mark.parametrize("status_code", [201, 204, 400, 401, 404, 500, 503])
+def test_is_waiting_on_user_ignores_a_non_200_even_with_a_waiting_body(status_code):
+    """Only a 200 is believed — and the body must be a real dict to prove it.
+
+    Leaving ``json()`` as an unconfigured MagicMock would make this pass on the
+    isinstance guard alone, so deleting the status check would not fail any test.
+    A concrete waiting body is what makes the status check the thing under test.
+    """
+    with patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get:
+        mock_get.return_value.status_code = status_code
+        mock_get.return_value.json.return_value = {
+            "status": TerminalStatus.WAITING_USER_ANSWER.value
+        }
+        assert _is_waiting_on_user("t1") is False
+
+
+@pytest.mark.parametrize("payload", [[], ["a"], None, "waiting_user_answer", 3])
+def test_is_waiting_on_user_survives_a_200_that_is_not_a_json_object(payload):
+    """A parseable-but-non-object body must not abort the launch.
+
+    ``AttributeError`` from ``[].get`` is no kind of ``RequestException``, so
+    without the isinstance check it escapes this function, reaches the command's
+    generic handler, and exits 1 *after* ``POST /sessions`` has already created
+    the session — orphaning it in tmux, which is the exact outcome the local
+    except exists to prevent. Parametrized because each JSON scalar type reaches
+    ``.get`` by a different route.
+    """
+    with patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get:
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = payload
+        assert _is_waiting_on_user("t1") is False
+
+
 def test_launch_workspace_confirmation_accepted():
     """Test workspace confirmation is shown for claude_code provider and accepted."""
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
     ):
         mock_post.return_value.json.return_value = {
@@ -407,7 +592,7 @@ def test_launch_workspace_confirmation_skipped_with_yolo_flag():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
     ):
         mock_post.return_value.json.return_value = {
@@ -432,7 +617,7 @@ def test_launch_workspace_confirmation_for_default_provider():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
     ):
         mock_post.return_value.json.return_value = {
@@ -454,7 +639,7 @@ def test_launch_yolo_sets_unrestricted_allowed_tools():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
@@ -479,7 +664,7 @@ def test_launch_allowed_tools_override():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
     ):
         mock_post.return_value.json.return_value = {
@@ -513,7 +698,7 @@ def test_launch_builtin_profile_resolves_role_defaults():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
     ):
         mock_post.return_value.json.return_value = {
@@ -536,12 +721,20 @@ def test_launch_builtin_profile_resolves_role_defaults():
         assert "@cao-mcp-server" in params["allowed_tools"]
 
 
-def test_launch_headless_message_conductor_not_ready():
-    """Test headless+message raises when conductor does not become ready."""
+def test_launch_headless_message_does_not_gate_delivery_on_client_readiness():
+    """Headless+message must not abort just because the CLI never saw IDLE.
+
+    The old flow waited for IDLE client-side and raised "did not become ready"
+    before sending — a launch that hit that branch dropped MESSAGE outright even
+    though the terminal was alive and would have accepted it moments later. The
+    server now owns readiness, so a never-IDLE reading from the CLI's own poll
+    helper is irrelevant: MESSAGE is already in the create body.
+    """
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
         mock_post.return_value.json.return_value = {
@@ -551,6 +744,14 @@ def test_launch_headless_message_conductor_not_ready():
         }
         mock_post.return_value.raise_for_status.return_value = None
         mock_wait.return_value = False
+
+        poll_resp = MagicMock()
+        poll_resp.raise_for_status.return_value = None
+        poll_resp.json.return_value = {"status": "completed"}
+        output_resp = MagicMock()
+        output_resp.raise_for_status.return_value = None
+        output_resp.json.return_value = {"output": "task done"}
+        mock_get.side_effect = [_delivered_response(), poll_resp, output_resp]
 
         result = runner.invoke(
             launch,
@@ -563,8 +764,9 @@ def test_launch_headless_message_conductor_not_ready():
             ],
         )
 
-        assert result.exit_code != 0
-        assert "did not become ready" in result.output
+        assert result.exit_code == 0
+        assert "did not become ready" not in result.output
+        assert mock_post.call_args.kwargs["json"]["initial_message"] == "do something"
 
 
 def test_launch_headless_message_poll_error_status():
@@ -572,10 +774,9 @@ def test_launch_headless_message_poll_error_status():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
-        patch("cli_agent_orchestrator.cli.commands.launch.time.sleep"),
     ):
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
@@ -610,10 +811,9 @@ def test_launch_headless_message_poll_processing_then_completed():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
-        patch("cli_agent_orchestrator.cli.commands.launch.time.sleep"),
     ):
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
@@ -635,7 +835,7 @@ def test_launch_headless_message_poll_processing_then_completed():
         output_resp.raise_for_status.return_value = None
         output_resp.json.return_value = {"output": "done"}
 
-        mock_get.side_effect = [processing_resp, completed_resp, output_resp]
+        mock_get.side_effect = [_delivered_response(), processing_resp, completed_resp, output_resp]
 
         result = runner.invoke(
             launch,
@@ -657,7 +857,7 @@ def test_launch_honors_profile_provider_when_flag_not_given():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch(
             "cli_agent_orchestrator.utils.agent_profiles.resolve_provider",
@@ -694,7 +894,7 @@ def test_launch_yolo_still_resolves_profile_provider():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
         patch(
@@ -725,7 +925,7 @@ def test_launch_allowed_tools_still_resolves_profile_provider():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch(
             "cli_agent_orchestrator.utils.agent_profiles.resolve_provider",
@@ -765,7 +965,7 @@ def test_launch_explicit_provider_skips_profile_resolution():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
         patch("cli_agent_orchestrator.utils.agent_profiles.resolve_provider") as mock_resolve,
@@ -797,7 +997,7 @@ def test_launch_yolo_falls_back_to_default_when_profile_lacks_provider():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
         patch(
@@ -905,7 +1105,7 @@ def test_launch_forwards_env_in_json_body_not_url():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
@@ -950,7 +1150,7 @@ def test_launch_without_env_omits_request_body():
     runner = CliRunner()
 
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
@@ -974,7 +1174,7 @@ def test_launch_rejects_blocked_env_prefix_before_calling_api():
     silent server-side drop."""
     runner = CliRunner()
 
-    with patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post:
+    with patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post:
         result = runner.invoke(
             launch,
             ["--agents", "test-agent", "--yolo", "--env", "CLAUDE_SESSION_ID=abc"],
@@ -988,7 +1188,7 @@ def test_launch_rejects_blocked_env_prefix_before_calling_api():
 def test_launch_omp_requires_workspace_confirmation():
     runner = CliRunner()
     with (
-        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
     ):
         mock_post.return_value.json.return_value = {
@@ -1023,3 +1223,546 @@ def test_minimax_code_requires_workspace_access_confirmation():
     )
 
     assert "mcode" in PROVIDERS_REQUIRING_WORKSPACE_ACCESS
+
+
+# ── Server-side initial_message delivery (caom-7it) ────────────────────
+
+
+def _delivered_response(status="processing"):
+    """``GET /terminals/{id}`` once the server has confirmed the initial delivery."""
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {"status": status, "initial_delivery": {"state": "delivered"}}
+    return resp
+
+
+def _pending_response(status="unknown"):
+    """``GET /terminals/{id}`` while the server is still initializing/delivering."""
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {"status": status, "initial_delivery": {"state": "pending"}}
+    return resp
+
+
+def _failed_delivery_response(kind, message, status="waiting_user_answer"):
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {
+        "status": status,
+        "initial_delivery": {"state": "failed", "kind": kind, "message": message},
+    }
+    return resp
+
+
+def _create_session_response():
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {
+        "session_name": "test-session",
+        "id": "test-terminal-id",
+        "name": "test-terminal",
+    }
+    return resp
+
+
+def test_launch_create_call_keeps_mcp_request_timeout():
+    """``POST /sessions`` stays on the ordinary ``mcp_request_timeout``.
+
+    Widening this instead of moving delivery server-side was the wrong fix: it
+    raises requests' CONNECT timeout as well (``timeout=`` is a single scalar,
+    so a dead server takes minutes to report), and it only helps callers that
+    happen to be this CLI. With ``initial_message`` in the body the server
+    returns before init even starts, so no widening is needed at all.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_server_settings") as mock_settings,
+    ):
+        mock_settings.return_value = {"mcp_request_timeout": 30, "provider_init_timeout": 60}
+        mock_post.return_value = _create_session_response()
+
+        poll_resp = MagicMock()
+        poll_resp.raise_for_status.return_value = None
+        poll_resp.json.return_value = {"status": "completed"}
+        output_resp = MagicMock()
+        output_resp.raise_for_status.return_value = None
+        output_resp.json.return_value = {"output": "task done"}
+        mock_get.side_effect = [_delivered_response(), poll_resp, output_resp]
+
+        result = runner.invoke(
+            launch, ["--agents", "test-agent", "--headless", "--yolo", "do something"]
+        )
+
+        assert result.exit_code == 0
+        assert mock_post.call_args.kwargs["timeout"] == 30
+        # The /output read is an ordinary request too.
+        assert mock_get.call_args_list[-1].kwargs["timeout"] == 30
+
+
+def test_launch_headless_message_travels_in_body_not_query_string():
+    """MESSAGE must not land in the URL: prompts are large (414 risk) and are
+    routinely captured verbatim in HTTP access logs and traces. Same reason
+    ``--env`` values were moved into the body in issue #248."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get,
+    ):
+        mock_post.return_value = _create_session_response()
+
+        poll_resp = MagicMock()
+        poll_resp.raise_for_status.return_value = None
+        poll_resp.json.return_value = {"status": "completed"}
+        output_resp = MagicMock()
+        output_resp.raise_for_status.return_value = None
+        output_resp.json.return_value = {"output": ""}
+        mock_get.side_effect = [_delivered_response(), poll_resp, output_resp]
+
+        result = runner.invoke(
+            launch, ["--agents", "test-agent", "--headless", "--yolo", "secret prompt"]
+        )
+
+        assert result.exit_code == 0
+        assert mock_post.call_args.kwargs["json"]["initial_message"] == "secret prompt"
+        assert "message" not in mock_post.call_args.kwargs["params"]
+        assert "secret prompt" not in str(mock_post.call_args.kwargs["params"])
+
+
+def test_launch_headless_message_shares_body_with_forwarded_env():
+    """``initial_message`` and ``env_vars`` are both body fields on
+    ``CreateSessionBody`` — passing both must not drop either."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get,
+    ):
+        mock_post.return_value = _create_session_response()
+
+        poll_resp = MagicMock()
+        poll_resp.raise_for_status.return_value = None
+        poll_resp.json.return_value = {"status": "completed"}
+        output_resp = MagicMock()
+        output_resp.raise_for_status.return_value = None
+        output_resp.json.return_value = {"output": ""}
+        mock_get.side_effect = [_delivered_response(), poll_resp, output_resp]
+
+        result = runner.invoke(
+            launch,
+            [
+                "--agents",
+                "test-agent",
+                "--headless",
+                "--yolo",
+                "--env",
+                "AWS_PROFILE=dev",
+                "do something",
+            ],
+        )
+
+        assert result.exit_code == 0
+        body = mock_post.call_args.kwargs["json"]
+        assert body["initial_message"] == "do something"
+        assert body["env_vars"] == {"AWS_PROFILE": "dev"}
+
+
+def test_launch_async_returns_without_sending_input():
+    """``--async`` must not fall back to a client-side send or wait for IDLE first;
+    the server delivers MESSAGE once init completes. It returns once the server
+    reports that delivery as confirmed (round-9 review, P1)."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch.poll_until_done") as mock_poll,
+    ):
+        mock_post.return_value = _create_session_response()
+        mock_get.return_value = _delivered_response()
+
+        result = runner.invoke(
+            launch,
+            ["--agents", "test-agent", "--headless", "--async", "--yolo", "do something"],
+        )
+
+        assert result.exit_code == 0
+        assert "Running in background" in result.output
+        assert mock_post.call_count == 1
+        assert mock_post.call_args.kwargs["json"]["initial_message"] == "do something"
+        assert "/input" not in str(mock_post.call_args)
+        mock_wait.assert_not_called()
+        mock_poll.assert_not_called()
+        # The only GET is the delivery-verdict poll, never /output.
+        assert all("/output" not in str(c) for c in mock_get.call_args_list)
+
+
+class TestAsyncLaunchWaitsForADurableDeliveryOutcome:
+    """Round-9 review (haofeif), P1: ``--async`` must not report success before
+    delivery has an observable durable outcome.
+
+    The previous head exited 0 the moment ``POST /sessions`` returned, so a
+    later init failure was log-only, a startup WAITING_USER_ANSWER silently
+    dropped the pending message, and a server restart lost the in-memory task
+    with nothing to tell the caller. The CLI now waits on the terminal row's
+    ``initial_delivery`` verdict: pending -> delivered (exit 0) or failed with
+    a reason (exit non-zero).
+    """
+
+    def _invoke(self, mock_get_sequence, extra_args=()):
+        runner = CliRunner()
+        with (
+            patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+            patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get,
+            patch("cli_agent_orchestrator.cli.commands.launch.poll_until_done") as mock_poll,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            mock_post.return_value = _create_session_response()
+            mock_get.side_effect = mock_get_sequence
+            result = runner.invoke(
+                launch,
+                ["--agents", "test-agent", "--headless", "--async", "--yolo", "do something"]
+                + list(extra_args),
+            )
+        return result, mock_get, mock_poll
+
+    def test_async_waits_through_pending_until_delivered(self):
+        result, mock_get, mock_poll = self._invoke(
+            [_pending_response(), _pending_response("idle"), _delivered_response()]
+        )
+        assert result.exit_code == 0, result.output
+        assert "delivered" in result.output
+        # Three polls: two pending readings were not enough to return.
+        assert mock_get.call_count == 3
+        mock_poll.assert_not_called()
+
+    def test_async_init_failure_exits_non_zero_with_the_reason(self):
+        failed = MagicMock()
+        failed.raise_for_status.return_value = None
+        failed.json.return_value = {
+            "status": "error",
+            "initial_delivery": {
+                "state": "failed",
+                "kind": "provider_init_error",
+                "message": "Worker test-terminal-id failed to initialize: boom",
+            },
+            "deferred_init_failure": {"kind": "provider_init_error", "message": "boom"},
+        }
+        result, _, _ = self._invoke([_pending_response(), failed])
+        assert result.exit_code != 0
+        assert "not delivered" in result.output
+        assert "provider_init_error" in result.output
+        assert "Running in background" not in result.output
+
+    def test_async_startup_prompt_surfaces_instead_of_dropping_the_message(self):
+        result, _, _ = self._invoke(
+            [
+                _pending_response(),
+                _failed_delivery_response(
+                    "waiting_user_answer",
+                    "Worker test-terminal-id is waiting on an interactive prompt; the "
+                    "initial message was not delivered.",
+                ),
+            ]
+        )
+        assert result.exit_code != 0
+        assert "waiting_user_answer" in result.output
+        assert "interactive prompt" in result.output
+
+    def test_async_error_status_before_any_verdict_exits_non_zero(self):
+        errored = MagicMock()
+        errored.raise_for_status.return_value = None
+        errored.json.return_value = {
+            "status": "error",
+            "initial_delivery": {"state": "pending"},
+            "deferred_init_failure": {"kind": "interrupted_init", "message": "server restarted"},
+        }
+        result, _, _ = self._invoke([errored])
+        assert result.exit_code != 0
+        assert "ERROR" in result.output
+        assert "server restarted" in result.output
+
+
+def test_launch_headless_no_message_omits_initial_message():
+    """A headless launch with no MESSAGE must not put the terminal on the
+    deferred-init path — it has nothing to deliver, and deferring would report
+    UNKNOWN instead of IDLE to a caller that expects a ready terminal."""
+    runner = CliRunner()
+
+    with patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post:
+        mock_post.return_value = _create_session_response()
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--headless", "--yolo"])
+
+        assert result.exit_code == 0
+        assert "json" not in mock_post.call_args.kwargs
+
+
+def test_launch_non_headless_does_not_defer_init():
+    """The attach path never sent MESSAGE and must not start now.
+
+    Deferring init here would leave the pre-attach readiness poll racing the
+    agent's first turn: the terminal reports UNKNOWN until init finishes and
+    then goes straight to PROCESSING, so the wait for IDLE would usually expire
+    and print a spurious "did not reach idle" warning before attaching.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+        patch("cli_agent_orchestrator.cli.commands.launch.sync_backend_from_server"),
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+    ):
+        mock_post.return_value = _create_session_response()
+        mock_wait.return_value = True
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo", "do something"])
+
+        assert result.exit_code == 0
+        assert "json" not in mock_post.call_args.kwargs
+        assert mock_post.call_count == 1
+
+
+def test_launch_headless_task_budget_starts_at_confirmed_delivery():
+    """Round-9 review (haofeif), P2: init must not eat the task's budget.
+
+    The previous head folded a flat 120s init allowance into one combined wait
+    with the 300s task budget. Supported providers can legitimately spend more
+    than 120s initializing, so a valid init consumed task time (or blew the
+    client deadline while the server went on to run the task, and a retry
+    duplicated the work). Now the CLI first waits for the server's delivery
+    verdict with an allowance derived from the provider's init timeout, and
+    only then starts the task budget.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_for_initial_delivery") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch.poll_until_done") as mock_poll,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_server_settings") as mock_settings,
+    ):
+        mock_settings.return_value = {"mcp_request_timeout": 30, "provider_init_timeout": 60}
+        mock_post.return_value = _create_session_response()
+        output_resp = MagicMock()
+        output_resp.raise_for_status.return_value = None
+        output_resp.json.return_value = {"output": "task done"}
+        mock_get.return_value = output_resp
+        order = []
+        mock_wait.side_effect = lambda *a, **k: order.append("delivery") or {}
+        mock_poll.side_effect = lambda *a, **k: order.append("task")
+
+        result = runner.invoke(
+            launch, ["--agents", "test-agent", "--headless", "--yolo", "do something"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert order == ["delivery", "task"], "task budget started before delivery was confirmed"
+        # Init allowance: 4 init phases x the server default, plus the confirm loop.
+        mock_wait.assert_called_once_with("test-terminal-id", timeout=4 * 60 + 60)
+        # Task budget is the task's alone -- no init allowance folded in.
+        mock_poll.assert_called_once_with("test-terminal-id", timeout=_HEADLESS_TASK_TIMEOUT)
+
+
+def _restricted_launch(provider: str):
+    runner = CliRunner()
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        return runner.invoke(
+            launch,
+            [
+                "--agents",
+                "test-agent",
+                "--provider",
+                provider,
+                "--allowed-tools",
+                "fs_read",
+                "--headless",
+            ],
+            input="y\n",
+        )
+
+
+def test_launch_gate_names_native_enforcement():
+    result = _restricted_launch("claude_code")
+    assert result.exit_code == 0
+    assert "Enforcement: native" in result.output
+    assert "WARNING: this provider does not enforce" not in result.output
+
+
+def test_launch_gate_warns_when_the_provider_cannot_enforce():
+    """A restricted profile on cursor_cli runs unrestricted; the gate must say so
+    instead of showing a Blocked list that looks real."""
+    result = _restricted_launch("cursor_cli")
+    assert result.exit_code == 0
+    assert "Enforcement: none" in result.output
+    assert "WARNING: this provider does not enforce the Blocked list" in result.output
+    # No TOOL_MAPPING entry means an empty deny list; it must not read as "(none)".
+    assert "Blocked:  (none)" not in result.output
+    assert "not translated for this provider" in result.output
+
+
+def test_launch_gate_qualifies_opencode_install_time_enforcement():
+    """opencode enforces the permission block `cao install` wrote and ignores the
+    list resolved at launch, and it has no TOOL_MAPPING, so the deny list is
+    always empty. The gate must not attach the native promise to the requested
+    list or print an empty Blocked list as `(none)`."""
+    result = _restricted_launch("opencode_cli")
+    assert result.exit_code == 0
+    assert "Enforcement: native at install time" in result.output
+    assert "launch overrides do not change it" in result.output
+    assert "Blocked:  (none)" not in result.output
+    assert "set at install time from the installed agent's policy" in result.output
+    assert "WARNING: this provider does not enforce" not in result.output
+
+
+def test_launch_gate_on_unrestricted_opencode_still_names_the_installed_policy():
+    """An unrestricted request does not loosen opencode either: what runs is the
+    installed agent's permission block, so the gate says so for ["*"] too."""
+    runner = CliRunner()
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+    ):
+        mock_post.return_value.json.return_value = {"session_name": "s", "name": "t"}
+        mock_post.return_value.raise_for_status.return_value = None
+        result = runner.invoke(
+            launch,
+            ["--agents", "a", "--provider", "opencode_cli", "--allowed-tools", "*", "--headless"],
+            input="y\n",
+        )
+    assert result.exit_code == 0, result.output
+    assert "Enforcement: native at install time" in result.output
+    assert "set at install time from the installed agent's policy" in result.output
+
+
+def test_describe_enforcement_distinguishes_install_time_from_runtime_native():
+    from cli_agent_orchestrator.utils.enforcement import describe_enforcement, is_install_time
+
+    assert is_install_time("opencode_cli") is True
+    assert is_install_time("claude_code") is False
+    assert describe_enforcement("opencode_cli", ["fs_read"]).startswith("native at install time")
+    assert (
+        describe_enforcement("claude_code", ["fs_read"])
+        == "native (the provider refuses blocked tools)"
+    )
+    # An unrestricted request on opencode still describes where the policy lives.
+    assert describe_enforcement("opencode_cli", ["*"]).startswith("native at install time")
+
+
+def test_launch_gate_marks_prompt_only_enforcement():
+    result = _restricted_launch("codex")
+    assert result.exit_code == 0
+    assert "Enforcement: prompt-only" in result.output
+    assert "WARNING: this provider does not enforce" in result.output
+
+
+def test_auto_approve_help_does_not_claim_enforcement():
+    runner = CliRunner()
+    result = runner.invoke(launch, ["--help"])
+    flat = " ".join(result.output.split())  # click re-wraps help text
+    assert "restrictions still enforced" not in flat
+    assert "Does not change the tool policy" in flat
+
+
+def test_launch_gate_names_kiro_install_time_enforcement():
+    """Kiro enforces the installed agent JSON's `tools`, written by `cao install`
+    from the profile; the list resolved at launch does not change it. The gate
+    says so and prints no "does not enforce" warning for a restricted profile."""
+    with patch(
+        "cli_agent_orchestrator.cli.commands.launch.kiro_install_predates_native_enforcement",
+        return_value=False,
+    ):
+        result = _restricted_launch("kiro_cli")
+    assert result.exit_code == 0
+    assert "Enforcement: native at install time" in result.output
+    assert "set at install time from the installed agent's policy" in result.output
+    assert "WARNING: this provider does not enforce" not in result.output
+    assert "WARNING: the installed Kiro agent" not in result.output
+
+
+def test_launch_gate_warns_when_the_installed_kiro_agent_predates_native_enforcement():
+    """An agent JSON with tools ["*"] was written before CAO put the policy into
+    `tools`; the restriction the gate prints is not what the agent runs with, so
+    the gate must say so and name the reinstall command."""
+    with patch(
+        "cli_agent_orchestrator.cli.commands.launch.kiro_install_predates_native_enforcement",
+        return_value=True,
+    ) as stale:
+        result = _restricted_launch("kiro_cli")
+    assert result.exit_code == 0
+    stale.assert_called_once_with("test-agent", ["fs_read"])
+    assert "WARNING: the installed Kiro agent 'test-agent' has tools" in result.output
+    assert "cao install test-agent --provider kiro_cli" in result.output
+
+
+def test_launch_reports_an_escaping_kiro_policy_path(tmp_path, monkeypatch):
+    kiro_dir = tmp_path / "agents"
+    kiro_dir.mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"tools": ["*"]}')
+    (kiro_dir / "test-agent.json").symlink_to(outside)
+    monkeypatch.setattr("cli_agent_orchestrator.services.install_service.KIRO_AGENTS_DIR", kiro_dir)
+
+    result = _restricted_launch("kiro_cli")
+
+    assert result.exit_code != 0
+    assert "beneath the agent directory" in result.output
+    assert "launched successfully" not in result.output
+
+
+def test_launch_yolo_on_kiro_says_it_does_not_widen_the_tool_set():
+    runner = CliRunner()
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+    ):
+        mock_post.return_value.json.return_value = {"session_name": "s", "name": "t"}
+        mock_post.return_value.raise_for_status.return_value = None
+        result = runner.invoke(
+            launch,
+            ["--agents", "a", "--provider", "kiro_cli", "--yolo", "--headless"],
+        )
+    assert result.exit_code == 0, result.output
+    assert "--yolo does not widen kiro_cli's tool set" in result.output
+    assert "re-run 'cao install'" in result.output
+
+
+def test_launch_init_allowance_follows_the_profile_init_timeout():
+    """A profile that declares ``provider_init_timeout`` sizes the client wait,
+    exactly as ``BaseProvider.get_init_timeout`` sizes the server's."""
+    from cli_agent_orchestrator.cli.commands.launch import _init_allowance
+
+    profile = MagicMock()
+    profile.provider_init_timeout = 180
+    with patch(
+        "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile", return_value=profile
+    ):
+        assert _init_allowance("slow-agent", {"provider_init_timeout": 60}) == 4 * 180 + 60
+
+    profile.provider_init_timeout = None
+    with patch(
+        "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile", return_value=profile
+    ):
+        assert _init_allowance("plain-agent", {"provider_init_timeout": 90}) == 4 * 90 + 60
+
+    with patch(
+        "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile",
+        side_effect=FileNotFoundError("no such profile"),
+    ):
+        # An unloadable profile sizes the wait from the server default rather
+        # than failing the launch; the server resolves the real profile itself.
+        assert _init_allowance("missing", {"provider_init_timeout": 60}) == 4 * 60 + 60

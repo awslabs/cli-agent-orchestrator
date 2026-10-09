@@ -819,6 +819,77 @@ class TestStaleProcessingCapturePane:
 class TestScreenDetection:
     """Rendered-screen detection should fail soft and keep monitoring alive."""
 
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_kimi_private_dsr_invalid_model_frame_latches_error(self, mock_pm, mock_settings):
+        """Regression for the live Kimi Code 2.1.1 invalid-model incident.
+
+        The same output burst contains a DEC-private DSR query and an indented
+        ``Error: Failed to start a session`` row. Before this fix pyte raised on
+        the DSR before rendered-screen detection ran; even when replayed past
+        that crash, Kimi's top-anchored error regex missed the indented row and
+        the empty composer read as ready. Feed the whole shape through the real
+        StatusMonitor ingestion path and pin the required terminal verdict.
+        """
+
+        from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider, KimiDialect
+
+        provider = KimiCliProvider("t1", "s", "w")
+        provider._dialect = KimiDialect.CODE
+        mock_pm.get_provider.return_value = provider
+        mock_settings.return_value = {"state_buffer_max": 32768}
+
+        sm = StatusMonitor()
+        sm._process_chunk(
+            "t1",
+            "\x1b[?6n"
+            '   Error: Failed to start a session: Model "bad-model" is\r\n'
+            " not configured in config.toml.\r\n"
+            "╭────────────────────────────────────────────╮\r\n"
+            "│ >                                          │\r\n"
+            "╰────────────────────────────────────────────╯\r\n"
+            "Never Ask  bad-model thinking  /tmp/project\r\n"
+            "context: 0%\r\n",
+        )
+
+        assert sm._last_status["t1"] is TerminalStatus.ERROR
+
+    def test_private_device_status_query_does_not_break_pyte_feed(self):
+        """pyte 0.8.2 passes ``private=True`` to DSR handlers.
+
+        Kimi Code 2.1.x emits ``CSI ? 6 n`` during ordinary TUI redraws. The
+        stock ``pyte.Screen.report_device_status(mode)`` rejects that keyword,
+        which used to abort the output chunk before StatusMonitor could
+        schedule rendered-screen detection. CAO only needs a passive
+        compositor, so the private query is ignored and the rest of the frame
+        must still render.
+        """
+
+        sm = StatusMonitor()
+        with sm._lock:
+            sm._feed_screen_locked(
+                "t1",
+                '\x1b[?6nError: Failed to start a session: Model "bad" is not configured.\r\n',
+            )
+
+        rendered, _ = sm._screen_lines("t1")
+        assert rendered is not None
+        assert any("Failed to start a session" in line for line in rendered)
+
+    def test_multi_parameter_device_attributes_do_not_break_pyte_feed(self):
+        """Passive composition ignores DA frames pyte 0.8.2 cannot dispatch."""
+
+        sm = StatusMonitor()
+        with sm._lock:
+            sm._feed_screen_locked(
+                "t1",
+                "\x1b[?1;2c\x1b[1;2cKimi frame survived\r\n",
+            )
+
+        rendered, _ = sm._screen_lines("t1")
+        assert rendered is not None
+        assert any("Kimi frame survived" in line for line in rendered)
+
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     def test_render_error_falls_back_to_raw_buffer_detection(self, mock_pm):
         class BrokenScreen:
@@ -1409,3 +1480,174 @@ class TestMidBurstProcessingProbe:
         sm._bursting["t1"] = True
         sm._schedule_screen_detection("t1", provider)
         assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+
+class TestOutputGenerationIsOutputOnly:
+    """PR #566: the delivery-confirmation gate needs a counter only OUTPUT can move.
+
+    ``_capture_generation`` must advance on ``notify_input_sent`` too (a new turn
+    invalidates in-flight capture verdicts), so it cannot serve: a redelivery's own
+    arm would satisfy "output arrived since dispatch" on a still-cached COMPLETED.
+    ``output_generation()`` therefore exposes a separate counter that only
+    ``_process_chunk`` bumps.
+    """
+
+    def test_unknown_terminal_reads_zero(self):
+        assert StatusMonitor().output_generation("never-seen") == 0
+
+    def test_arming_a_turn_does_not_advance_it(self):
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")
+        sm.notify_input_sent("t1", assume_processing=False)
+        assert sm.output_generation("t1") == 0, (
+            "notify_input_sent moved the output generation: a redelivery's own arm would "
+            "now pass for post-dispatch output and confirm a stale COMPLETED"
+        )
+        # The capture generation, by contrast, MUST have moved -- that is its job.
+        assert sm._capture_generation["t1"] == 2
+
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_each_real_chunk_advances_it_by_one(self, mock_pm, mock_settings):
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")  # dispatch: arms, does not count
+        boundary = sm.output_generation("t1")
+        for chunk in ("thinking ", "done.\n", "> "):
+            sm._process_chunk("t1", chunk)
+
+        assert sm.output_generation("t1") == boundary + 3
+        # Interleaving another arm (a redelivery) still adds nothing.
+        sm.notify_input_sent("t1")
+        assert sm.output_generation("t1") == boundary + 3
+
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_forgetting_a_terminal_resets_it(self, mock_pm, mock_settings):
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        sm._process_chunk("t1", "x")
+        assert sm.output_generation("t1") == 1
+        sm.reset_buffer("t1")
+        assert sm.output_generation("t1") == 0
+        sm._process_chunk("t1", "y")
+        sm.clear_terminal("t1")
+        assert sm.output_generation("t1") == 0
+
+
+class TestStatusObservationIsStampedWhenEarned:
+    """PR #566 round 9: a status VALUE cannot say when it was earned, so the monitor
+    stamps each applied status with the output generation it was computed from and
+    ``status_observation`` returns the pair. Delivery confirmation compares that
+    stamp (not the live counter) with the dispatch boundary.
+    """
+
+    @staticmethod
+    def _tmux_backend():
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        return backend
+
+    def test_unknown_terminal_observes_unknown_at_generation_zero(self):
+        with patch(
+            "cli_agent_orchestrator.backends.registry.get_backend",
+            return_value=self._tmux_backend(),
+        ):
+            observation = StatusMonitor().status_observation("never-seen")
+        assert observation.status == TerminalStatus.UNKNOWN
+        assert observation.output_generation == 0
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_a_changed_status_is_stamped_with_the_output_that_produced_it(
+        self, mock_pm, mock_settings, mock_backend
+    ):
+        mock_backend.return_value = self._tmux_backend()
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        mock_pm.get_provider.return_value = provider
+        sm = StatusMonitor()
+
+        provider.get_status.return_value = TerminalStatus.IDLE
+        sm._process_chunk("t1", "> ")  # generation 1
+        assert sm.status_observation("t1") == (TerminalStatus.IDLE, 1)
+
+        sm.notify_input_sent("t1")  # a dispatch arms the sticky latch; not output
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        sm._process_chunk("t1", "⠋")  # generation 2
+        sm._process_chunk("t1", "⠙")  # generation 3, still PROCESSING: re-earned
+        assert sm.status_observation("t1") == (TerminalStatus.PROCESSING, 3)
+
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        sm._process_chunk("t1", "✓ done\n> ")  # generation 4
+        assert sm.status_observation("t1") == (TerminalStatus.COMPLETED, 4)
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_an_unchanged_ready_status_keeps_its_old_stamp(
+        self, mock_pm, mock_settings, mock_backend
+    ):
+        """The round-9 defect in one assertion: unrelated output moves the counter,
+        a sticky COMPLETED re-detected from a repaint must NOT move with it."""
+        mock_backend.return_value = self._tmux_backend()
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        mock_pm.get_provider.return_value = provider
+        sm = StatusMonitor()
+
+        sm._process_chunk("t1", "startup ✓\n> ")  # earned at 1
+        sm.notify_input_sent("t1")  # a dispatch: arms, does not count
+        sm.clear_rolling_buffer("t1")
+        for frame in ("\x1b[2J", "(repaint) ✓\n> ", "\x1b[?25h"):
+            sm._process_chunk("t1", frame)  # 2, 3, 4 -- all re-parse as COMPLETED
+        assert sm.output_generation("t1") == 4
+        assert sm.status_observation("t1") == (TerminalStatus.COMPLETED, 1)
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_optimistic_processing_latch_is_stamped_at_the_pre_send_generation(self, mock_backend):
+        mock_backend.return_value = self._tmux_backend()
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.IDLE
+        sm._output_generation["t1"] = 6
+        sm.notify_input_sent("t1", assume_processing=True)
+        boundary = sm.output_generation("t1")
+        observation = sm.status_observation("t1")
+        assert observation.status == TerminalStatus.PROCESSING
+        assert (
+            observation.output_generation == 6 == boundary
+        ), "a guessed PROCESSING must never read as newer than the dispatch it was guessed at"
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_event_inbox_backends_report_no_generation(self, mock_backend):
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = True
+        mock_backend.return_value = backend
+        sm = StatusMonitor()
+        with patch.object(sm, "get_status", return_value=TerminalStatus.COMPLETED):
+            observation = sm.status_observation("herd1")
+        assert observation == (TerminalStatus.COMPLETED, None)
+
+    def test_forgetting_a_terminal_drops_the_stamp(self):
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm._status_generation["t1"] = 5
+        sm.clear_terminal("t1")
+        assert "t1" not in sm._status_generation
+        sm._status_generation["t1"] = 5
+        sm.reset_buffer("t1")
+        assert "t1" not in sm._status_generation

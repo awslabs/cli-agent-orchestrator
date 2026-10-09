@@ -63,17 +63,52 @@ def _mcp_timeout() -> float:
 def _auth_headers() -> Dict[str, str]:
     """Return the ``Authorization`` header for the internal client->API hop, if any.
 
-    Mirrors ``mcp_server.utils._auth_headers`` / ``mcp_server.app_tools._auth_headers``:
+    Same behaviour as ``mcp_server.utils._auth_headers`` / ``mcp_server.app_tools._auth_headers``;
+    the copies are per module, and what they share is the decision that matters,
+    ``_is_local_api`` (see ``_auth_headers_for``). ``test/test_bearer_scope_boundary.py``
+    holds every ``requests`` call in ``src/`` to the rule that an unscoped helper may
+    only be paired with a URL built on ``API_BASE_URL``. This helper
     attaches the operator-provisioned ``CAO_AUTH_LOCAL_TOKEN`` when the auth layer is
     enabled, and returns an empty mapping default-off so the no-auth posture stays
     byte-for-byte unchanged. Every ``requests`` call in this module passes
     ``headers=_auth_headers() or None`` -- without this, an auth-enabled deployment's
     cao-server rejects every one of these calls with a 401 and the CLI/MCP orchestration
     surface (assign, handoff, send_message, status, result, cancel, delete_terminal)
-    cannot be used at all.
+    cannot be used at all. Calls whose base URL may be another node go through
+    ``_auth_headers_for(base_url)`` so the token never leaves this node.
     """
     token = get_local_bearer()
     return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def _is_local_api(base_url: str) -> bool:
+    """True when ``base_url`` is this node's own cao-server (``API_BASE_URL``).
+
+    An exact string compare after trailing-slash normalisation, deliberately: it
+    is not this module's job to decide that ``localhost`` or ``::1`` names the
+    same listener as ``CAO_API_HOST``. The normal local path passes the
+    ``API_BASE_URL`` constant itself, and a differently spelled self-reference
+    fails closed (no bearer, 401) rather than leaking the token on a guess.
+    ``mcp_server.utils._auth_headers_for`` shares this predicate.
+    """
+    return base_url.rstrip("/") == API_BASE_URL.rstrip("/")
+
+
+def _auth_headers_for(base_url: str) -> Dict[str, str]:
+    """``_auth_headers()`` for the local API only; empty for any other host.
+
+    ``CAO_AUTH_LOCAL_TOKEN`` authenticates the client->API hop on THIS node.
+    Requests whose base URL came from a ``target_host`` argument or a
+    ``CAO_CALLBACK_URL`` env var go to some other host, and sending the token
+    there is a disclosure: whoever answers at that URL receives the operator's
+    bearer. Every caller here that may address another node uses this instead
+    of ``_auth_headers()``; ``get_handoff_result`` in ``mcp_server.server`` uses
+    the ``mcp_server.utils`` twin. These hops carry no credential for a remote node's own
+    auth layer; a deployment that provisioned the same token to every node was
+    authenticating cross-node calls by accident, and those calls now arrive
+    without a bearer.
+    """
+    return _auth_headers() if _is_local_api(base_url) else {}
 
 
 # Environment variable to enable/disable automatic sender terminal ID injection.
@@ -389,14 +424,13 @@ def _resolve_child_allowed_tools(
     Returns:
         Comma-separated string of allowed tools, or None for unrestricted.
     """
+    from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
     from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
     from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
     try:
         child_profile = load_agent_profile(child_profile_name)
-        mcp_server_names = (
-            list(child_profile.mcpServers.keys()) if child_profile.mcpServers else None
-        )
+        mcp_server_names = grantable_server_names(child_profile)
         child_allowed = resolve_allowed_tools(
             child_profile.allowedTools, child_profile.role, mcp_server_names
         )
@@ -423,6 +457,34 @@ def _resolve_child_allowed_tools(
     return ",".join(child_allowed)
 
 
+def _remote_ephemeral_refusal(name: str, target_host: Optional[str]) -> Optional[str]:
+    """Refuse before contacting another node; the name belongs to its creator node."""
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    if target_host and agent_profiles.routes_to_ephemeral_store(name):
+        from cli_agent_orchestrator.services.ephemeral_service import log_refusal
+
+        log_refusal(
+            "remote_placement_not_allowed",
+            os.environ.get("CAO_TERMINAL_ID"),
+            name,
+            "omit target_host",
+        )
+        return f"remote_placement_not_allowed: ephemeral agent '{name}' can only launch on the node that created it; omit target_host"
+    return None
+
+
+def _refuse_ephemeral_target_without_claim(name: str) -> None:
+    """Refuse reserved targets while orchestration does not carry launch claims."""
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    if agent_profiles.routes_to_ephemeral_store(name):
+        agent_profiles.resolve_agent_profile_source(name)
+        raise ValueError(
+            "Ephemeral targets cannot be launched through assign or handoff in this version."
+        )
+
+
 def _create_terminal(
     agent_profile: str,
     working_directory: Optional[str] = None,
@@ -434,12 +496,19 @@ def _create_terminal(
     use_worktree: bool = False,
     create_timeout: Optional[float] = None,
     idempotency_key: Optional[str] = None,
+    lookup_only: bool = False,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
     Args:
         agent_profile: Agent profile for the terminal
         working_directory: Optional working directory for the terminal
+        lookup_only: Review on PR #773. Ask cao-server only to RESOLVE
+            ``idempotency_key`` to the terminal a prior call committed: it
+            returns at once (without waiting for that terminal's provider
+            initialization), never allocates, and answers 404 when nothing is
+            committed. The result identifies a worker for inspection and
+            cleanup; it is not permission to send it input.
         idempotency_key: Review on PR #634, issue #616. Forwarded as a query
             param to whichever endpoint this call hits (existing-session or
             new-session); the server returns the terminal a PRIOR call with
@@ -495,6 +564,8 @@ def _create_terminal(
     Raises:
         Exception: If terminal creation fails
     """
+    _refuse_ephemeral_target_without_claim(agent_profile)
+
     provider = DEFAULT_PROVIDER
     parent_allowed_tools = None
 
@@ -556,6 +627,8 @@ def _create_terminal(
             params["use_worktree"] = "true"
         if idempotency_key:
             params["idempotency_key"] = idempotency_key
+        if lookup_only:
+            params["lookup_only"] = "true"
         # The message payload goes in the JSON body, not the query string, so
         # prompt content isn't exposed in HTTP access logs and isn't subject to
         # URL-length limits. Only routing flags stay in params.
@@ -629,6 +702,8 @@ def _create_terminal(
             params["use_worktree"] = "true"
         if idempotency_key:
             params["idempotency_key"] = idempotency_key
+        if lookup_only:
+            params["lookup_only"] = "true"
 
         json_body = None
         if initial_message is not None:
@@ -754,6 +829,8 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
     the single combined run-step call, while preserving the same-session /
     caller_id / allowed_tools behavior the old six-call path had.
     """
+    _refuse_ephemeral_target_without_claim(agent_profile)
+
     current_terminal_id = _current_terminal_id()
     if not current_terminal_id:
         return HandoffContext(
@@ -859,21 +936,25 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
         base_url = callback_url
 
     params = {"sender_id": sender_id, "message": message}
-    # BOTH header sets, and the union is not a compromise between two merge
-    # sides -- they are disjoint and independently load-bearing.
-    # `_auth_headers()` carries the local `Authorization: Bearer` an
-    # auth-enabled cao-server rejects every call without (haofeif's P2 on PR
-    # #634); `elastic_worker_gateway_headers()` carries the broker's
-    # worker-id/release-token pair an elastic worker's callback hop needs. They
-    # share no key, so neither can shadow the other, and an auth-enabled
-    # elastic deployment genuinely needs both on the same request. Each is
-    # empty when its own feature is off, so the default-off posture is still
-    # byte-for-byte `None`.
-    request_headers = {**_auth_headers(), **elastic_worker_gateway_headers()} or None
+
+    def _inbox_headers(target_base_url: str) -> Optional[Dict[str, str]]:
+        # BOTH header sets, and the union is not a compromise between two merge
+        # sides -- they are disjoint and independently load-bearing.
+        # `_auth_headers_for()` carries the local `Authorization: Bearer` an
+        # auth-enabled cao-server rejects every call without (haofeif's P2 on
+        # PR #634) -- for the LOCAL node only, since the token is this node's
+        # and must not be sent to a callback host; `elastic_worker_gateway_headers()`
+        # carries the broker's worker-id/release-token pair an elastic worker's
+        # callback hop needs. They share no key, so neither can shadow the
+        # other, and an auth-enabled elastic deployment genuinely needs both on
+        # the same request. Each is empty when its own feature is off, so the
+        # default-off posture is still byte-for-byte `None`.
+        return {**_auth_headers_for(target_base_url), **elastic_worker_gateway_headers()} or None
+
     response = requests.post(
         f"{base_url}/terminals/{receiver_id}/inbox/messages",
         params=params,
-        headers=request_headers,
+        headers=_inbox_headers(base_url),
         timeout=_mcp_timeout(),
     )
     if response.status_code == 404 and callback_url and base_url != callback_url:
@@ -883,7 +964,7 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
         response = requests.post(
             f"{callback_url}/terminals/{receiver_id}/inbox/messages",
             params=params,
-            headers=request_headers,
+            headers=_inbox_headers(callback_url),
             timeout=_mcp_timeout(),
         )
     response.raise_for_status()
@@ -913,6 +994,14 @@ def _extract_error_detail(response: requests.Response, fallback: str) -> str:
     if isinstance(detail, str) and detail:
         return detail
     return fallback
+
+
+# Server-side ready-wait (up to 120s) plus slack, added to the caller's step
+# timeout to get the HTTP read budget. Named rather than inlined because the
+# resulting budget (timeout + this) is what decides whether the pending/job_id
+# branch is reachable at all under a given provider's tools/call deadline -- see
+# the Timeout branch in _run_step_and_build_result. No message quotes 180.
+_CLIENT_TIMEOUT_HEADROOM = 180
 
 
 async def _run_step_and_build_result(
@@ -949,6 +1038,12 @@ async def _run_step_and_build_result(
     is the name quoted back to the operator in the remote-cleanup hints below.
     """
     known_terminal_id: Optional[str] = payload.get("reuse_terminal_id")
+    # Read off the payload for the same reason ``reuse_terminal_id`` is: the
+    # caller owns it, and this helper only needs it to describe what it just
+    # POSTed. Present only on the default single-call path (issue #447) --
+    # absent on the early-terminal-id path, which already reported a real
+    # terminal_id to the caller and so needs no separate discovery key.
+    job_id: Optional[str] = payload.get("job_id")
     # Allow the full step time plus the server-side ready-wait (up to 120s)
     # plus headroom; the server enforces the per-step timeout internally.
     #
@@ -956,7 +1051,7 @@ async def _run_step_and_build_result(
     # node would consume the FULL read budget (~timeout+180s) just failing
     # to connect. Local calls keep the plain timeout (localhost connect
     # cannot black-hole meaningfully) so their behavior is unchanged.
-    client_timeout = float(timeout) + 180.0
+    client_timeout = float(timeout) + _CLIENT_TIMEOUT_HEADROOM
     request_timeout: Any = (
         (REMOTE_CONNECT_TIMEOUT, client_timeout) if target_host else client_timeout
     )
@@ -964,11 +1059,42 @@ async def _run_step_and_build_result(
         response = requests.post(
             f"{base_url}/terminals/run-step",
             json=payload,
-            headers=_auth_headers() or None,
+            headers=_auth_headers_for(base_url) or None,
             timeout=request_timeout,
         )
     except requests.Timeout:
         timeout_msg = f"Handoff timed out after {timeout} seconds"
+        if job_id:
+            # The transport died, but the step may still be running (or have
+            # already finished) server-side. The server persists the result in
+            # handoff_results under this job_id BEFORE the terminal is torn
+            # down, so it is retrievable (issue #447 / PR #453 review finding 3 --
+            # naming the tool, not a bare "GET /handoff-results/{job_id}",
+            # because the supervisor LLM has no base URL and no token to build
+            # that request itself).
+            #
+            # THIS BRANCH IS NOT FULL COVERAGE, and the row outliving the
+            # transport is not the same as this message reaching anyone. The HTTP
+            # read budget set above is timeout + _CLIENT_TIMEOUT_HEADROOM (default
+            # 600 + 180 = 780s), while several providers cap a single
+            # tools/call at ~600s (Codex, Kimi, MiniMax). For an MCP-supervisor
+            # caller on those providers the PROVIDER deadline usually fires
+            # first, so ``requests.Timeout`` is never raised here and this
+            # pending/job_id result is never returned -- the supervisor sees its
+            # own tool-call timeout with no job_id in hand. Closing that gap
+            # (surfacing the job_id before the call can be pre-empted) is
+            # tracked separately in #715; it is NOT fixed here.
+            # ``target_host`` is quoted here when set because the row lives in
+            # THAT node's database (PR #453 review, haofeif): the retrieval tool
+            # defaults to the supervisor's own node, so a remote job retrieved
+            # without it answers a false not-found.
+            retrieval_args = f"job_id={job_id}"
+            if target_host:
+                retrieval_args += f", target_host='{target_host}'"
+            timeout_msg += (
+                f". The job may still be running server-side; retrieve the "
+                f"result with the get_handoff_result tool, {retrieval_args}"
+            )
         if target_host and not known_terminal_id:
             # Client-side timeout on a fresh remote create: the step may still
             # be running and its terminal id is unknown here, so it cannot be
@@ -981,6 +1107,8 @@ async def _run_step_and_build_result(
             )
         return HandoffResult(
             success=False,
+            pending=True if job_id else None,
+            job_id=job_id,
             message=timeout_msg,
             output=None,
             terminal_id=known_terminal_id,
@@ -1091,6 +1219,56 @@ def _create_handoff_terminal(
     raise AssertionError("unreachable")  # the loop always returns or raises
 
 
+def _lookup_committed_handoff_terminal(
+    agent_profile: str,
+    working_directory: Optional[str],
+    *,
+    engine: Optional[str],
+    model: Optional[str],
+    use_worktree: bool,
+    idempotency_key: str,
+) -> Optional[str]:
+    """Return the terminal_id cao-server committed for this key, if any.
+
+    Used only after ``_create_handoff_terminal`` has exhausted its bounded
+    attempts (review on PR #773). Every one of those attempts may have been a
+    replay held behind a provider initialization that simply outlasted them
+    (a profile's ``provider_init_timeout`` is not capped by the retry
+    ceiling), in which case the worker exists and will finish starting, but
+    no response ever carried its id. This is the ``lookup_only`` form of the
+    same keyed request: it does not wait and cannot allocate, so it recovers
+    the identity of committed work without starting any. ``None`` means there
+    is nothing to recover (or the lookup itself failed), and the caller
+    reports the original timeout unchanged.
+    """
+    try:
+        terminal_id, _provider = _create_terminal(
+            agent_profile,
+            working_directory,
+            engine=engine,
+            model=model,
+            use_worktree=use_worktree,
+            idempotency_key=idempotency_key,
+            lookup_only=True,
+        )
+    except Exception as exc:  # noqa: BLE001 -- best-effort recovery of an id
+        logger.info("handoff: no committed terminal recovered after create timeout: %s", exc)
+        return None
+    return terminal_id
+
+
+def _notify_terminal_id(on_terminal_id: Optional[Callable[[str], None]], terminal_id: str) -> None:
+    """Report a terminal_id to the caller's callback without letting it break the handoff."""
+    if on_terminal_id is None:
+        return
+    try:
+        on_terminal_id(terminal_id)
+    except Exception as exc:  # noqa: BLE001 -- a UI callback must never break the handoff
+        logger.warning(
+            "handoff: on_terminal_id callback failed for terminal %s: %s", terminal_id, exc
+        )
+
+
 async def _handoff_impl(
     agent_profile: str,
     message: str,
@@ -1187,6 +1365,17 @@ async def _handoff_impl(
     table), so a keyed retry that lands on a different ``target_host`` could
     not dedupe even if the plumbing were threaded.
     """
+    refusal = _remote_ephemeral_refusal(agent_profile, target_host)
+    if refusal:
+        return HandoffResult(
+            success=False,
+            message=refusal,
+            output=None,
+            terminal_id=None,
+            job_id=None,
+            pending=False,
+        )
+
     start_time = time.time()
     terminal_id: Optional[str] = None
 
@@ -1272,6 +1461,15 @@ async def _handoff_impl(
             # and tool inheritance. Byte-for-byte the original single-seam
             # behavior (BR-8) -- this is what the MCP tool always takes.
             shaped_message = _shape_handoff_message(provider, message)
+            # Minted HERE, before the POST, so the key exists on the client even
+            # if the response never arrives (issue #447). The server records the
+            # result under it; client-side generation is what makes it available
+            # to the Timeout branch in ``_run_step_and_build_result``. This does
+            # NOT deduplicate execution -- a retry with the same job_id would
+            # still run a second step. Only the default single-call path needs
+            # it: the early-terminal-id path already hands back a real
+            # terminal_id, which is its own discovery handle.
+            job_id = uuid.uuid4().hex
             payload: Dict[str, Any] = {
                 "provider": provider,
                 "agent": agent_profile,
@@ -1279,6 +1477,7 @@ async def _handoff_impl(
                 "teardown": True,
                 "timeout": float(timeout),
                 "use_worktree": use_worktree,
+                "job_id": job_id,
             }
             if ctx.session_name:
                 payload["session_name"] = ctx.session_name
@@ -1320,21 +1519,43 @@ async def _handoff_impl(
         # below, never forwarded past this function, so it carries none of
         # the cross-call submission-dedup risk that note describes.
         create_key = idempotency_key or uuid.uuid4().hex
-        terminal_id, provider = _create_handoff_terminal(
-            agent_profile,
-            working_directory,
-            engine=engine,
-            model=model,
-            use_worktree=use_worktree,
-            idempotency_key=create_key,
-        )
-        if on_terminal_id is not None:
-            try:
-                on_terminal_id(terminal_id)
-            except Exception as exc:  # noqa: BLE001 -- a UI callback must never break the handoff
-                logger.warning(
-                    "handoff: on_terminal_id callback failed for terminal %s: %s", terminal_id, exc
-                )
+        try:
+            terminal_id, provider = _create_handoff_terminal(
+                agent_profile,
+                working_directory,
+                engine=engine,
+                model=model,
+                use_worktree=use_worktree,
+                idempotency_key=create_key,
+            )
+        except requests.exceptions.Timeout:
+            # The bounded wait expired. That says nothing about whether a
+            # worker was committed, and readiness is a separate question from
+            # identity: recover the id if there is one, report it, and send
+            # NOTHING to a terminal that has not finished initializing.
+            terminal_id = _lookup_committed_handoff_terminal(
+                agent_profile,
+                working_directory,
+                engine=engine,
+                model=model,
+                use_worktree=use_worktree,
+                idempotency_key=create_key,
+            )
+            if terminal_id is None:
+                raise
+            _notify_terminal_id(on_terminal_id, terminal_id)
+            return HandoffResult(
+                success=False,
+                message=(
+                    f"Handoff failed: worker terminal {terminal_id} was created but did "
+                    f"not finish initializing within {_HANDOFF_CREATE_ATTEMPTS} attempts "
+                    f"of {_HANDOFF_CREATE_TIMEOUT_S:g}s, so no task was sent to it. It may "
+                    "still become ready; inspect or delete it using this terminal_id."
+                ),
+                output=None,
+                terminal_id=terminal_id,
+            )
+        _notify_terminal_id(on_terminal_id, terminal_id)
 
         if not wait:
             # --no-wait: send the prompt and return immediately. The terminal
@@ -1596,6 +1817,10 @@ def _assign_impl(
     worker-side ``send_message`` uses to deliver replies to this node.
     Omitting ``target_host`` preserves local behavior byte-for-byte.
     """
+    refusal = _remote_ephemeral_refusal(agent_profile, target_host)
+    if refusal:
+        return {"success": False, "terminal_id": None, "message": refusal}
+
     terminal_id: Optional[str] = None
     try:
         # Fail fast before creating the worker terminal when CAO_TERMINAL_ID is
@@ -1804,7 +2029,7 @@ def _delete_terminal_impl(terminal_id: str, target_host: Optional[str] = None) -
         base_url = _resolve_target_base_url(target_host) if target_host else API_BASE_URL
         response = requests.delete(
             f"{base_url}/terminals/{terminal_id}",
-            headers=_auth_headers() or None,
+            headers=_auth_headers_for(base_url) or None,
             # A remote node that is unreachable must fail on CONNECT rather than
             # hang for the full read timeout; a local delete keeps its single
             # scalar timeout so default-path behavior is unchanged.

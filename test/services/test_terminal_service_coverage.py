@@ -17,6 +17,10 @@ class TestCreateTerminalCleanup:
     """Test error cleanup paths in create_terminal."""
 
     @pytest.mark.asyncio
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+        return_value={"tmux_session": "cao-test-ses"},
+    )
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
@@ -32,7 +36,7 @@ class TestCreateTerminalCleanup:
         "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
         return_value="tid1",
     )
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_cleanup_on_provider_init_failure(
         self,
         mock_load_profile,
@@ -46,6 +50,7 @@ class TestCreateTerminalCleanup:
         mock_fifo_manager,
         mock_status_monitor,
         mock_delete_terminals_by_session,
+        _mock_get_terminal_metadata,  # the ownership witness the rollback reads
     ):
         """When provider.initialize() fails, cleanup should kill session, cleanup
         provider, AND roll back the DB terminal row."""
@@ -78,6 +83,10 @@ class TestCreateTerminalCleanup:
         mock_db_delete.assert_called_once_with("tid1")
 
     @pytest.mark.asyncio
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+        return_value={"tmux_session": "cao-existing"},
+    )
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
@@ -92,7 +101,7 @@ class TestCreateTerminalCleanup:
         "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
         return_value="tid1",
     )
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_cleanup_on_failure_does_not_kill_session_if_not_new(
         self,
         mock_load_profile,
@@ -105,6 +114,7 @@ class TestCreateTerminalCleanup:
         mock_log_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        _mock_get_terminal_metadata,  # the ownership witness the rollback reads
     ):
         """When new_session=False, cleanup rolls back the DB terminal row and kills
         the WINDOW it just created, but must NOT kill the pre-existing session
@@ -117,6 +127,12 @@ class TestCreateTerminalCleanup:
 
         mock_tmux.session_exists.return_value = True
         mock_tmux.create_window.return_value = "w1"
+        # The mocked insert must publish the same incarnation as a real row.
+        mock_db_create.side_effect = lambda *args, **kwargs: (
+            _mock_get_terminal_metadata.return_value.update(
+                session_incarnation_id=kwargs["session_incarnation_id"]
+            )
+        )
         mock_load_profile.return_value = AgentProfile(name="dev", description="Dev")
 
         mock_provider = MagicMock()
@@ -153,7 +169,7 @@ class TestCreateTerminalCleanup:
         "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
         return_value="tid1",
     )
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_cleanup_does_not_kill_window_if_it_was_never_created(
         self,
         mock_load_profile,
@@ -190,6 +206,10 @@ class TestCreateTerminalCleanup:
         mock_tmux.kill_session.assert_not_called()
 
     @pytest.mark.asyncio
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+        return_value={"tmux_session": "cao-existing"},
+    )
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
@@ -204,7 +224,7 @@ class TestCreateTerminalCleanup:
         "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
         return_value="tid1",
     )
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_cleanup_swallows_kill_window_errors(
         self,
         mock_load_profile,
@@ -217,6 +237,7 @@ class TestCreateTerminalCleanup:
         mock_log_dir,
         mock_fifo_manager,
         mock_status_monitor,
+        _mock_get_terminal_metadata,  # the ownership witness the rollback reads
     ):
         """A kill_window failure during cleanup must not mask the original error,
         same "ignore cleanup errors" contract as every other cleanup step here."""
@@ -224,6 +245,12 @@ class TestCreateTerminalCleanup:
 
         mock_tmux.session_exists.return_value = True
         mock_tmux.create_window.return_value = "w1"
+        # The mocked insert must publish the same incarnation as a real row.
+        mock_db_create.side_effect = lambda *args, **kwargs: (
+            _mock_get_terminal_metadata.return_value.update(
+                session_incarnation_id=kwargs["session_incarnation_id"]
+            )
+        )
         mock_tmux.kill_window.side_effect = Exception("kill_window error")
         mock_load_profile.return_value = AgentProfile(name="dev", description="Dev")
 
@@ -258,7 +285,7 @@ class TestCreateTerminalCleanup:
         "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
         return_value="tid1",
     )
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_cleanup_ignores_cleanup_errors(
         self,
         mock_load_profile,
@@ -317,7 +344,7 @@ class TestCreateTerminalCleanup:
         "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
         return_value="tid1",
     )
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_session_prefix_added_for_new_session(
         self,
         mock_load_profile,
@@ -378,7 +405,7 @@ class TestCreateTerminalSessionCleanupGuard:
         "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
         return_value="tid1",
     )
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_no_kill_session_when_session_already_exists(
         self,
         mock_load_profile,
@@ -409,6 +436,10 @@ class TestCreateTerminalSessionCleanupGuard:
         mock_tmux.kill_session.assert_not_called()
 
     @pytest.mark.asyncio
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+        return_value={"tmux_session": "cao-test-ses"},
+    )
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
@@ -424,7 +455,7 @@ class TestCreateTerminalSessionCleanupGuard:
         "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
         return_value="tid1",
     )
-    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
     async def test_kill_session_when_we_created_it_and_later_step_fails(
         self,
         mock_load_profile,
@@ -438,6 +469,7 @@ class TestCreateTerminalSessionCleanupGuard:
         mock_fifo_manager,
         mock_status_monitor,
         mock_delete_terminals_by_session,
+        _mock_get_terminal_metadata,  # the ownership witness the rollback reads
     ):
         """When we successfully created the session but a later step fails, cleanup SHOULD kill it."""
         from cli_agent_orchestrator.services.terminal_service import create_terminal

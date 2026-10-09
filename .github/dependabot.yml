@@ -1,0 +1,14 @@
+# Keeps the commit-SHA pins in .github/workflows current. Every `uses:` is pinned
+# to a full SHA with the tag as a trailing comment (see CI pinning, #820);
+# Dependabot reads that comment to know which release line to follow and opens a
+# PR that moves the SHA. Without this file the pins would never move.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

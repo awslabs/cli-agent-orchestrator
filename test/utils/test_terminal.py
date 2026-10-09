@@ -341,7 +341,7 @@ class TestWaitUntilStatus:
 class TestWaitUntilTerminalStatus:
     """Tests for wait_until_terminal_status function."""
 
-    @patch("cli_agent_orchestrator.utils.terminal.requests.get")
+    @patch("cli_agent_orchestrator.utils.terminal.api_http.get")
     def test_wait_until_terminal_status_success(self, mock_get):
         """Test successful terminal status wait."""
         mock_response = MagicMock()
@@ -355,7 +355,7 @@ class TestWaitUntilTerminalStatus:
 
         assert result is True
 
-    @patch("cli_agent_orchestrator.utils.terminal.requests.get")
+    @patch("cli_agent_orchestrator.utils.terminal.api_http.get")
     def test_wait_until_terminal_status_timeout(self, mock_get):
         """Test terminal status wait timeout."""
         mock_response = MagicMock()
@@ -369,7 +369,7 @@ class TestWaitUntilTerminalStatus:
 
         assert result is False
 
-    @patch("cli_agent_orchestrator.utils.terminal.requests.get")
+    @patch("cli_agent_orchestrator.utils.terminal.api_http.get")
     def test_wait_until_terminal_status_api_error(self, mock_get):
         """Test terminal status wait with API error."""
         mock_get.side_effect = Exception("Connection error")
@@ -380,7 +380,7 @@ class TestWaitUntilTerminalStatus:
 
         assert result is False
 
-    @patch("cli_agent_orchestrator.utils.terminal.requests.get")
+    @patch("cli_agent_orchestrator.utils.terminal.api_http.get")
     def test_wait_until_terminal_status_non_200(self, mock_get):
         """Test terminal status wait with non-200 response."""
         mock_response = MagicMock()
@@ -393,7 +393,7 @@ class TestWaitUntilTerminalStatus:
 
         assert result is False
 
-    @patch("cli_agent_orchestrator.utils.terminal.requests.get")
+    @patch("cli_agent_orchestrator.utils.terminal.api_http.get")
     def test_wait_until_terminal_status_multi_status_set(self, mock_get):
         """Test waiting for multiple target statuses (set)."""
         mock_response = MagicMock()
@@ -410,7 +410,7 @@ class TestWaitUntilTerminalStatus:
 
         assert result is True
 
-    @patch("cli_agent_orchestrator.utils.terminal.requests.get")
+    @patch("cli_agent_orchestrator.utils.terminal.api_http.get")
     def test_wait_until_terminal_status_multi_status_no_match(self, mock_get):
         """Test multi-status wait times out when status doesn't match any target."""
         mock_response = MagicMock()
@@ -441,7 +441,7 @@ class TestSyncBackendFromServer:
         mock_resp.raise_for_status.return_value = None
 
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get", return_value=mock_resp),
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get", return_value=mock_resp),
             patch("cli_agent_orchestrator.backends.factory.BackendFactory.create") as mock_create,
             patch("cli_agent_orchestrator.backends.registry.set_backend") as mock_set,
         ):
@@ -460,7 +460,7 @@ class TestSyncBackendFromServer:
         mock_resp.raise_for_status.return_value = None
 
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get", return_value=mock_resp),
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get", return_value=mock_resp),
             patch("cli_agent_orchestrator.backends.factory.BackendFactory.create") as mock_create,
             patch("cli_agent_orchestrator.backends.registry.set_backend") as mock_set,
         ):
@@ -477,7 +477,7 @@ class TestSyncBackendFromServer:
         import requests as _requests
 
         with patch(
-            "cli_agent_orchestrator.utils.terminal.requests.get",
+            "cli_agent_orchestrator.utils.terminal.api_http.get",
             side_effect=_requests.exceptions.ConnectionError("refused"),
         ):
             # Must not raise
@@ -490,7 +490,7 @@ class TestSyncBackendFromServer:
         mock_resp.raise_for_status.return_value = None
 
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get", return_value=mock_resp),
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get", return_value=mock_resp),
             patch("cli_agent_orchestrator.backends.registry.set_backend") as mock_set,
         ):
             sync_backend_from_server()
@@ -518,7 +518,7 @@ class TestPollUntilDone:
         from cli_agent_orchestrator.utils.terminal import poll_until_done
 
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.return_value = self._resp("completed")
@@ -537,7 +537,7 @@ class TestPollUntilDone:
             self._resp("idle"),  # 3rd stable idle -> return
         ]
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.side_effect = seq
@@ -558,7 +558,7 @@ class TestPollUntilDone:
         # advance to force a timeout after a few polls.
         times = iter([0, 0.5, 1.0, 1.5, 2.0, 2.5, 100.0])
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
             patch(
                 "cli_agent_orchestrator.utils.terminal.time.time", side_effect=lambda: next(times)
@@ -582,7 +582,7 @@ class TestPollUntilDone:
             self._resp("idle"),  # now stable -> return
         ]
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.side_effect = seq
@@ -600,7 +600,7 @@ class TestPollUntilDone:
             self._resp("completed"),  # definitive -> return now
         ]
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.side_effect = seq
@@ -620,7 +620,7 @@ class TestPollUntilDone:
 
         times = iter([0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 100.0])
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
             patch(
                 "cli_agent_orchestrator.utils.terminal.time.time", side_effect=lambda: next(times)
@@ -644,7 +644,7 @@ class TestPollUntilDone:
             self._resp("idle"),  # stable -> return
         ]
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.side_effect = seq
@@ -657,9 +657,120 @@ class TestPollUntilDone:
         from cli_agent_orchestrator.utils.terminal import poll_until_done
 
         with (
-            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.return_value = self._resp("error")
             with pytest.raises(click.ClickException):
                 poll_until_done("abcd1234", timeout=60, polling_interval=0)
+
+
+class TestWaitForInitialDelivery:
+    """PR #566 round 9: the CLI waits on the server's durable delivery verdict."""
+
+    @staticmethod
+    def _resp(payload):
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = payload
+        return resp
+
+    def test_returns_the_payload_once_delivered(self):
+        from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
+
+        delivered = {"status": "processing", "initial_delivery": {"state": "delivered"}}
+        with patch(
+            "cli_agent_orchestrator.utils.terminal.api_http.get",
+            return_value=self._resp(delivered),
+        ) as mock_get:
+            payload = wait_for_initial_delivery("t1", timeout=5)
+        assert payload == delivered
+        assert mock_get.call_args.args[0].endswith("/terminals/t1")
+        assert mock_get.call_args.kwargs["timeout"] == 5.0
+
+    @patch("cli_agent_orchestrator.utils.terminal.time.sleep")
+    def test_keeps_polling_through_pending_and_status_noise(self, mock_sleep):
+        """Neither a pending row nor any status sample (IDLE, COMPLETED, UNKNOWN) counts."""
+        from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
+
+        sequence = [
+            self._resp({"status": "unknown", "initial_delivery": {"state": "pending"}}),
+            self._resp({"status": "idle", "initial_delivery": {"state": "pending"}}),
+            self._resp({"status": "completed", "initial_delivery": {"state": "pending"}}),
+            self._resp({"status": "processing", "initial_delivery": {"state": "delivered"}}),
+        ]
+        with patch("cli_agent_orchestrator.utils.terminal.api_http.get", side_effect=sequence) as g:
+            wait_for_initial_delivery("t1", timeout=60, polling_interval=0.5)
+        assert g.call_count == 4
+        assert mock_sleep.call_count == 3
+        mock_sleep.assert_called_with(0.5)
+
+    def test_failed_delivery_raises_with_kind_and_message(self):
+        import click
+
+        from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
+
+        failed = {
+            "status": "waiting_user_answer",
+            "initial_delivery": {
+                "state": "failed",
+                "kind": "waiting_user_answer",
+                "message": "parked on a prompt",
+            },
+        }
+        with patch(
+            "cli_agent_orchestrator.utils.terminal.api_http.get", return_value=self._resp(failed)
+        ):
+            with pytest.raises(click.ClickException) as excinfo:
+                wait_for_initial_delivery("t1", timeout=5)
+        assert "waiting_user_answer" in str(excinfo.value)
+        assert "parked on a prompt" in str(excinfo.value)
+
+    def test_error_status_before_a_verdict_raises_with_the_failure_detail(self):
+        import click
+
+        from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
+
+        errored = {
+            "status": "error",
+            "initial_delivery": {"state": "pending"},
+            "deferred_init_failure": {"kind": "provider_init_error", "message": "no binary"},
+        }
+        with patch(
+            "cli_agent_orchestrator.utils.terminal.api_http.get", return_value=self._resp(errored)
+        ):
+            with pytest.raises(click.ClickException) as excinfo:
+                wait_for_initial_delivery("t1", timeout=5)
+        assert "ERROR" in str(excinfo.value)
+        assert "no binary" in str(excinfo.value)
+
+    @patch("cli_agent_orchestrator.utils.terminal.time.sleep")
+    def test_times_out_with_a_message_naming_the_terminal(self, mock_sleep):
+        import click
+
+        from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
+
+        pending = self._resp({"status": "unknown", "initial_delivery": {"state": "pending"}})
+        clock = iter([0.0, 0.0, 0.5, 1.5, 2.5])
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get", return_value=pending),
+            patch("cli_agent_orchestrator.utils.terminal.time.time", side_effect=clock),
+        ):
+            with pytest.raises(click.ClickException) as excinfo:
+                wait_for_initial_delivery("t1", timeout=2)
+        assert "t1" in str(excinfo.value)
+        assert "Timed out" in str(excinfo.value)
+
+    def test_transport_failure_raises_click_exception(self):
+        import click
+        import requests
+
+        from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
+
+        with patch(
+            "cli_agent_orchestrator.utils.terminal.api_http.get",
+            side_effect=requests.exceptions.ConnectionError("boom"),
+        ):
+            with pytest.raises(click.ClickException) as excinfo:
+                wait_for_initial_delivery("t1", timeout=5)
+        assert "boom" in str(excinfo.value)

@@ -2,6 +2,30 @@
 
 A single-page dashboard for managing CLI Agent Orchestrator sessions, agents, flows, and settings from the browser.
 
+## Dependency security
+
+Use npm 10+ and `npm ci` with install scripts enabled. All `braces` consumers
+resolve the published guarded fork `@dieub/braces-depth-guard@3.0.3-pn.3` through
+the private local `braces-compat` adapter, which only re-exports the canonical
+dependency. The unchanged fork tarball is [vendored in the repository](../vendor/README.md),
+so its registry availability is not required for a cold install. Keep `.npmrc`'s
+`install-links=false` setting and include `braces-compat/` and `../vendor/`
+when installing the project. Its fail-on-error `postinstall` applies
+[`../patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch`](../patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch), shared
+with the docs and MCP Apps toolchains, to additionally bound acyclic AST
+ancestor traversal. `npm run test:dependencies` checks the installed implementation
+and its consumers; `npm run build` runs these checks automatically.
+
+This replaces the affected original with a reviewed third-party implementation;
+it is not an official fixed release or a scanner exemption. See
+[Dependency Security](../SECURITY.md#full-dependency-gate) for full-graph CI
+coverage, the strict HIGH/CRITICAL gate, and the separate mitigation status.
+
+The lockfile also includes `source-map-js` 1.2.2 and overrides
+`postcss-selector-parser` to `^7.1.6`, since its v6 consumer ranges have no fixed
+release for CVE-2026-104844. Keep the Tailwind/PostCSS build checks when updating
+this override; see [upstream security releases](../SECURITY.md#additional-upstream-security-releases).
+
 ## Architecture
 
 ```
@@ -58,6 +82,28 @@ A single-page dashboard for managing CLI Agent Orchestrator sessions, agents, fl
 | **Production** | `npm run build` (static files emitted into `src/cli_agent_orchestrator/web_ui/`) | `cao-server` serves the bundled UI from the installed package | `http://localhost:9889` |
 
 In development mode, Vite proxies API requests (`/sessions`, `/terminals`, `/agents`, `/flows`, `/settings`, `/health`) to `cao-server` on port 9889 (configured in `vite.config.ts`).
+
+### Serving under a path prefix
+
+By default the UI is served at the root of its origin. To serve it under a
+sub-path instead — behind a reverse proxy that multiplexes several apps onto one
+hostname, for example — build with Vite's `--base`:
+
+```bash
+npm run build -- --base=/cao/
+```
+
+The proxy is expected to strip the prefix before forwarding, so `cao-server`
+needs no configuration and its routes are unchanged. Use an absolute prefix with
+a trailing slash; a relative base such as `./` cannot work, because the app has
+to build absolute API URLs at runtime.
+
+`--base` alone would not be enough: it rewrites the asset references baked into
+`index.html` and the bundle, but not URLs the app assembles at runtime. Those
+are the three transports in `api.ts` — `fetchJSON` for REST, `terminalSocketUrl`
+for the xterm WebSocket, `eventStreamUrl` for the workflow event stream — which
+all read the same `BASE`, derived from `import.meta.env.BASE_URL`. A default
+build leaves `BASE` empty, so those URLs are unchanged.
 
 ## Pages and Components
 

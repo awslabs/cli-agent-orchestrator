@@ -6,12 +6,14 @@ thin HTTP client against the ``/workflows`` endpoints on the running cao-server
 ``workflow_spec_service`` or ``database`` directly (project Forbidden rule).
 
 The run-lifecycle verbs — ``run`` / ``runs`` / ``status`` / ``wait`` / ``result``
-/ ``resume`` / ``cancel`` — are thin HTTP clients over the ``/workflows/runs``
-engine endpoints (N5 + issue #505), mirroring the authoring-verb style. Bare
-``run`` submits asynchronously via ``POST /workflows/runs:submit`` and then FOLLOWS
-the run by polling ``GET /workflows/runs/{id}`` to a terminal state; ``--wait`` is
-the explicit blocking escape hatch over the retained ``POST /workflows/runs`` path
-and ``--detach`` submits without following. This module NEVER imports
+/ ``resume`` / ``step`` / ``cancel`` — are thin HTTP clients over the
+``/workflows/runs`` engine endpoints (N5 + issue #505 + issue #640), mirroring the
+authoring-verb style. Bare ``run`` submits asynchronously via
+``POST /workflows/runs:submit`` and then FOLLOWS the run by polling
+``GET /workflows/runs/{id}`` to a terminal state; ``--wait`` is the explicit
+blocking escape hatch over the retained ``POST /workflows/runs`` path and
+``--detach`` submits without following. ``step`` re-executes ONE step of an
+already-recorded run without re-running the workflow. This module NEVER imports
 ``workflow_service`` / ``script_runner`` / ``workflow_journal`` / ``database``
 directly (project Forbidden rule + issue #505 C-2, CI import guard) — every verb
 reaches its data over the REST surface only.
@@ -20,9 +22,9 @@ reaches its data over the REST surface only.
 import json as _json
 import sys
 import time
+from pathlib import Path
 
 import click
-import requests
 
 from cli_agent_orchestrator.constants import (
     API_BASE_URL,
@@ -32,7 +34,9 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_EVENTS_READ_TIMEOUT,
     WORKFLOW_POLL_INTERVAL_SECONDS,
     WORKFLOW_RUN_REQUEST_TIMEOUT,
+    WORKFLOW_STEP_REQUEST_TIMEOUT,
 )
+from cli_agent_orchestrator.utils import api_http
 from cli_agent_orchestrator.utils.workflow_events import SseFrame, parse_sse_frames
 
 # Whole-run states that end the follow/poll loop (mirror ``RunState``'s terminal
@@ -40,7 +44,7 @@ from cli_agent_orchestrator.utils.workflow_events import SseFrame, parse_sse_fra
 _TERMINAL_RUN_STATES = frozenset({"completed", "failed", "cancelled"})
 
 
-def _extract_detail(response: requests.Response, fallback: str) -> str:
+def _extract_detail(response: api_http.Response, fallback: str) -> str:
     """Pull the FastAPI ``detail`` string out of an error response."""
     try:
         body = response.json()
@@ -69,12 +73,12 @@ def validate_cmd(file, as_json):
       1  spec failed validation, or the request errored
     """
     try:
-        response = requests.post(
+        response = api_http.post(
             f"{API_BASE_URL}/workflows/validate",
             json={"path": file},
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 400:
@@ -110,10 +114,10 @@ def list_cmd(scan_dir, as_json):
     if scan_dir is not None:
         params["dir"] = scan_dir
     try:
-        response = requests.get(
+        response = api_http.get(
             f"{API_BASE_URL}/workflows", params=params, timeout=MCP_REQUEST_TIMEOUT
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 400:
@@ -149,8 +153,8 @@ def list_cmd(scan_dir, as_json):
 def get_cmd(name, as_json):
     """Show the parsed/validated spec for a workflow name or file path."""
     try:
-        response = requests.get(f"{API_BASE_URL}/workflows/{name}", timeout=MCP_REQUEST_TIMEOUT)
-    except requests.exceptions.RequestException as e:
+        response = api_http.get(f"{API_BASE_URL}/workflows/{name}", timeout=MCP_REQUEST_TIMEOUT)
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 404:
@@ -200,14 +204,14 @@ def approve_cmd(plan_id, as_json):
       1  the request was rejected or the server could not be reached
     """
     try:
-        response = requests.post(
+        response = api_http.post(
             f"{API_BASE_URL}/workflows/plans/approve",
             # plan_id rides the BODY, never the path: it contains a ':' and must reach the server
             # verbatim, because a normalisation is how two distinct plans could share one approval.
             json={"plan_id": plan_id},
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 400:
@@ -240,8 +244,8 @@ def delete_cmd(name, yes):
     if not yes:
         click.confirm(f"Delete workflow '{name}'?", abort=True)
     try:
-        response = requests.delete(f"{API_BASE_URL}/workflows/{name}", timeout=MCP_REQUEST_TIMEOUT)
-    except requests.exceptions.RequestException as e:
+        response = api_http.delete(f"{API_BASE_URL}/workflows/{name}", timeout=MCP_REQUEST_TIMEOUT)
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 404:
@@ -421,10 +425,10 @@ def _poll_to_terminal(run_id, as_json):
     last_step = None
     while True:
         try:
-            response = requests.get(
+            response = api_http.get(
                 f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=MCP_REQUEST_TIMEOUT
             )
-        except requests.exceptions.RequestException as e:
+        except api_http.exceptions.RequestException as e:
             transport_failures += 1
             if transport_failures > 1:
                 # One bounded retry exhausted — a lost socket is not a failed run.
@@ -453,7 +457,7 @@ def _poll_to_terminal(run_id, as_json):
         # goes silent until the run finishes — a 10-step, 40-minute workflow looked
         # identical to a hung one. ``current_step_id`` is already in the snapshot and
         # advances per step, so keying on the (state, step) PAIR turns the same poll
-        # into real per-step progress with no extra requests.
+        # into real per-step progress with no extra api_http.
         if not as_json and (state, current) != (last_state, last_step):
             click.echo(f"[{state}] current: {current}")
             last_state = state
@@ -505,12 +509,12 @@ def run_cmd(name_or_path, inputs, run_id, detach, wait, as_json):
     # MCP_REQUEST_TIMEOUT would report a still-running run as a failure.
     if wait:
         try:
-            response = requests.post(
+            response = api_http.post(
                 f"{API_BASE_URL}/workflows/runs",
                 json=payload,
                 timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
             )
-        except requests.exceptions.RequestException as e:
+        except api_http.exceptions.RequestException as e:
             raise click.ClickException(f"could not reach cao-server: {e}")
         if response.status_code == 404:
             raise click.ClickException(
@@ -528,12 +532,12 @@ def run_cmd(name_or_path, inputs, run_id, detach, wait, as_json):
 
     # --- default + --detach: submit asynchronously via the :submit spine. ----
     try:
-        response = requests.post(
+        response = api_http.post(
             f"{API_BASE_URL}/workflows/runs:submit",
             json=payload,
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 404:
@@ -602,12 +606,12 @@ def _resolve_latest_run_id():
     Returns ``None`` when no runs exist (the caller prints "no runs found").
     """
     try:
-        response = requests.get(
+        response = api_http.get(
             f"{API_BASE_URL}/workflows/runs",
             params={"limit": 1},
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
     if response.status_code != 200:
         raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
@@ -633,10 +637,10 @@ def status_cmd(run_id, as_json):
             return
 
     try:
-        response = requests.get(
+        response = api_http.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=MCP_REQUEST_TIMEOUT
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 404:
@@ -668,10 +672,10 @@ def runs_cmd(state, limit, as_json):
     if limit is not None:
         params["limit"] = limit
     try:
-        response = requests.get(
+        response = api_http.get(
             f"{API_BASE_URL}/workflows/runs", params=params, timeout=MCP_REQUEST_TIMEOUT
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 400:
@@ -726,10 +730,10 @@ def wait_cmd(run_id, as_json):
 def result_cmd(run_id, as_json):
     """Show the complete retained result for a (finished or in-flight) run."""
     try:
-        response = requests.get(
+        response = api_http.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}/result", timeout=MCP_REQUEST_TIMEOUT
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 404:
@@ -781,12 +785,12 @@ def resume_cmd(run_id, decide, as_json):
         # worst-case-covering run timeout, not the flat MCP_REQUEST_TIMEOUT.
         # ``json=None`` sends NO body, so a decision-free resume is byte-identical to
         # the pre-#583 request.
-        response = requests.post(
+        response = api_http.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/resume",
             json={"decisions": decisions} if decisions else None,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 404:
@@ -807,15 +811,131 @@ def resume_cmd(run_id, decide, as_json):
         raise click.exceptions.Exit(1)
 
 
+def _render_step_replay(result):
+    """Human-render a single-step replay: identity, the resolved prompt, the output.
+
+    The resolved prompt is printed because it is the thing being iterated on — a
+    replay whose output looks wrong is usually a prompt that resolved differently
+    than the author expected, and that is invisible without showing it.
+    """
+    click.echo(f"Run:      {result.get('run_id')}")
+    click.echo(
+        f"Step:     {result.get('step_id')} ({result.get('provider')}/{result.get('agent')})"
+    )
+    click.echo(f"Terminal: {result.get('terminal_id') or '(none)'}")
+    click.echo("Prompt:")
+    click.echo(result.get("prompt") or "")
+    error = result.get("error")
+    if error:
+        click.echo(f"Error:    {error} (kind: {result.get('error_kind') or 'unknown'})", err=True)
+        return
+    output = result.get("output")
+    if output is None:
+        click.echo("Output:   (no structured output)")
+    else:
+        click.echo(f"Output (validated={result.get('validated')}):")
+        click.echo(_json.dumps(output, indent=2))
+    message = result.get("last_message")
+    if message:
+        click.echo("Message:")
+        click.echo(message)
+
+
+@workflow.command(name="step")
+@click.argument("run_id")
+@click.argument("step_id")
+@click.option(
+    "--prompt-file",
+    "prompt_file",
+    default=None,
+    help="Read the replacement prompt from this file (excludes --prompt-override).",
+)
+@click.option(
+    "--prompt-override",
+    "prompt_override",
+    default=None,
+    help="Replacement prompt text (excludes --prompt-file).",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
+def step_cmd(run_id, step_id, prompt_file, prompt_override, as_json):
+    """Re-execute ONE step of a recorded run, without re-running the workflow.
+
+    Resolves the step's prompt from the RECORDED run (journaled inputs + predecessor
+    outputs), runs it live, and prints the resolved prompt and the output. The source
+    run is left untouched, so a step can be re-probed as many times as it takes to
+    get its prompt right. YAML-tier runs only.
+
+    ``--prompt-file`` / ``--prompt-override`` replace the prompt TEMPLATE for this one
+    execution; ``{{workflow.inputs.*}}`` / ``{{steps.*.output.*}}`` references in the
+    replacement still resolve against the recorded run.
+
+    Exit codes:
+      0  the step ran
+      1  the step failed, or the request errored
+    """
+    if prompt_file is not None and prompt_override is not None:
+        raise click.ClickException("--prompt-file and --prompt-override are mutually exclusive")
+    if prompt_file is not None:
+        try:
+            prompt_override = Path(prompt_file).read_text(encoding="utf-8")
+        except OSError as e:
+            raise click.ClickException(f"could not read --prompt-file '{prompt_file}': {e}")
+    # Caught here as well as server-side so an empty file costs no round trip and the
+    # message can name the flag the operator actually typed.
+    if prompt_override is not None and not prompt_override.strip():
+        source = (
+            f"--prompt-file '{prompt_file}'" if prompt_file is not None else "--prompt-override"
+        )
+        raise click.ClickException(
+            f"{source} is empty; omit it to re-run the step's recorded prompt "
+            f"(a blank prompt would run the step with no instructions)"
+        )
+
+    payload = {}
+    if prompt_override is not None:
+        payload["prompt_override"] = prompt_override
+
+    try:
+        # A single step still runs an agent inline on the server, so this is a
+        # BLOCKING path — never the flat MCP_REQUEST_TIMEOUT (which would report a
+        # still-running step as a failure). But it runs at most ONE step, capped
+        # server-side at WORKFLOW_STEP_TIMEOUT, so it uses the single-step ceiling
+        # rather than the multi-step WORKFLOW_RUN_REQUEST_TIMEOUT: a genuinely hung
+        # server surfaces in minutes, not hours.
+        response = api_http.post(
+            f"{API_BASE_URL}/workflows/runs/{run_id}/steps/{step_id}:replay",
+            json=payload,
+            timeout=WORKFLOW_STEP_REQUEST_TIMEOUT,
+        )
+    except api_http.exceptions.RequestException as e:
+        raise click.ClickException(f"could not reach cao-server: {e}")
+
+    if response.status_code == 404:
+        raise click.ClickException(_extract_detail(response, f"unknown run '{run_id}'"))
+    if response.status_code != 200:
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+
+    result = response.json()
+    if as_json:
+        click.echo(_json.dumps(result, indent=2))
+    else:
+        _render_step_replay(result)
+
+    # A failed step is a 200 with ``error`` set (the server reports it as data), so
+    # the exit code comes from the body, not the status line.
+    if result.get("error"):
+        raise click.exceptions.Exit(1)
+
+
 @workflow.command(name="cancel")
 @click.argument("run_id")
 def cancel_cmd(run_id):
     """Cooperatively cancel a running workflow."""
     try:
-        response = requests.post(
+        response = api_http.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/cancel", timeout=MCP_REQUEST_TIMEOUT
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 404:
@@ -849,7 +969,7 @@ def _open_events_stream(run_id: str, cursor):
     if cursor is not None:
         params["after_seq"] = cursor
         headers["Last-Event-ID"] = str(cursor)
-    return requests.get(
+    return api_http.get(
         f"{API_BASE_URL}/workflows/runs/{run_id}/events",
         params=params,
         headers=headers,
@@ -872,8 +992,8 @@ def _events_route_or_run_missing(run_id: str) -> click.ClickException:
     than asserting a server capability it could not verify.
     """
     try:
-        probe = requests.get(f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=MCP_REQUEST_TIMEOUT)
-    except requests.exceptions.RequestException:
+        probe = api_http.get(f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=MCP_REQUEST_TIMEOUT)
+    except api_http.exceptions.RequestException:
         return click.ClickException(f"unknown run '{run_id}'")
     if probe.status_code == 200:
         return click.ClickException(
@@ -987,10 +1107,14 @@ def _final_events_status(run_id: str):
     socket is never reported as a failed run.
     """
     try:
-        response = requests.get(
+        response = api_http.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=MCP_REQUEST_TIMEOUT
         )
-    except requests.exceptions.RequestException:
+    except api_http.AuthNotConfiguredError as exc:
+        # A missing credential is not a lost socket: surface it (exit 1) rather
+        # than answering "not terminal" and letting the follow end with exit 0.
+        raise click.ClickException(str(exc)) from exc
+    except api_http.exceptions.RequestException:
         return None
     if response.status_code != 200:
         return None
@@ -1009,12 +1133,12 @@ def _events_batch_read(run_id: str, after_seq, as_json: bool) -> None:
     if after_seq is not None:
         params["after_seq"] = after_seq
     try:
-        response = requests.get(
+        response = api_http.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}/events",
             params=params,
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 404:
@@ -1097,7 +1221,13 @@ def events_cmd(run_id, follow, after_seq, as_json):
                         terminal_state = frame.terminal_state
                         saw_terminal = True
                         break
-            except requests.exceptions.RequestException:
+            except api_http.AuthNotConfiguredError as exc:
+                # Not a dropped connection: the server wants a bearer and this
+                # shell has none to send. Retrying cannot change that, and the
+                # final status read would swallow it into ``stream_ended`` with
+                # exit 0. Fail loudly with the actionable message instead.
+                raise click.ClickException(str(exc)) from exc
+            except api_http.exceptions.RequestException:
                 # A dropped connection is not run death — reconnect from the last
                 # seen seq (exact resume), bounded so a flapping stream cannot spin
                 # forever. Budget exhausted -> fall through to the final status read.

@@ -32,7 +32,7 @@ portable and make profile listings useful.
 
 - `provider` (string): provider preference for this profile.
 - `role` (string): named tool-access role, such as `supervisor`, `developer`,
-  or `reviewer`.
+  `reviewer`, or `workflow_scout`.
 - `allowedTools` (array of strings): explicit CAO tool allowlist; when present,
   it overrides the role defaults.
 - `capabilities` (array of strings): profile-discovery statements, with at most
@@ -54,9 +54,11 @@ portable and make profile listings useful.
 - `mcpServers` (object): MCP server definitions. Each entry defines either
   `command` (with optional `args`, `env`, `timeout`) for a server CAO launches,
   or `url` for a remote one, with `type` naming its transport (for example
-  `http` or `sse`). An entry defining neither is invalid. For a worked example
-  of a remote-URL MCP server, see
-  [examples/youcom-search](../examples/youcom-search/README.md).
+  `http` or `sse`) and optional `headers` for a remote server that
+  authenticates. An entry defining neither is invalid. For a worked example
+  of a remote-URL MCP server that authenticates with a header and keeps the
+  key out of the committed profile, see
+  [examples/serply-research](../examples/serply-research/README.md).
 - `tools` (array), `toolAliases` (object), and `toolsSettings` (object):
   provider tool configuration. `tools` is the provider's own tool catalog and
   is passed through to it; it is not the CAO allowlist and does not restrict
@@ -94,7 +96,9 @@ relying on a duplicated compatibility catalog here.
 
 If neither `role` nor `allowedTools` is set, CAO resolves the profile with the
 default developer permissions. An explicit `allowedTools` list overrides role
-defaults. Launch-time options can then alter those resolved restrictions.
+defaults, including when `role` is unrecognized. An unrecognized `role` with
+no `allowedTools` raises `ValueError` instead of falling open to `["*"]`.
+Launch-time options can then alter those resolved restrictions.
 
 See [Tool Restrictions](tool-restrictions.md) for built-in roles, the tool
 vocabulary, launch overrides, provider enforcement, and limitations.
@@ -146,6 +150,29 @@ cao install https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/mai
 
 Packaged examples are available in the
 [agent store](https://github.com/awslabs/cli-agent-orchestrator/tree/main/src/cli_agent_orchestrator/agent_store).
+
+Installing writes a copy of the profile to the shared context directory
+(`agents.dirs.cao_installed`, `~/.aws/cli-agent-orchestrator/agent-context` by
+default). CAO stamps that copy's frontmatter with `x-cao-source-stem`, the
+name the profile was installed under. The key is reserved: it is written by
+CAO, not authored: a source profile that declares it at the top level of its
+frontmatter has that line replaced by CAO's own at install, and the install is
+refused if the result does not read back as the marker CAO wrote (a quoted or
+folded spelling that the YAML parser would resolve to a different value, or the
+key declared inside flow-style `{...}` frontmatter, where CAO cannot replace
+it). Only that top-level entry is CAO's: text inside a `description: |` scalar
+or a nested key spelled the same way is left exactly as written, and
+frontmatter written as one flow mapping gets the marker as an entry inside the
+braces.
+It lets a reinstall recognise its own earlier copy, and lets `cao install`
+refuse -- for every provider -- a different profile whose `name:` would
+overwrite an installed one: the context copy is what the installed agent reads
+at runtime, and for OpenCode the agent file and `opencode.json` section share
+the same id (see [OpenCode CLI](opencode-cli.md)). The check reads the
+destination itself, so it also holds when the installed copy is shadowed in
+profile discovery by a same-named file in another directory. If
+`agents.dirs.cao_installed` is configured away from its default, copies written
+by earlier releases to the default directory still count.
 
 ### Profile discovery
 

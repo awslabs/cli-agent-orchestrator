@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import subprocess
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -558,7 +559,7 @@ Prompt body.
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
-    @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.list_current_session_terminals")
     @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
@@ -612,7 +613,7 @@ Simple prompt without variables.
     @patch("cli_agent_orchestrator.services.flow_service.subprocess.run")
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
-    @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.list_current_session_terminals")
     @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
@@ -812,10 +813,55 @@ Prompt.
                 await execute_flow("bad-json-flow")
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.flow_service.subprocess.run")
+    @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
+    @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
+    async def test_execute_flow_script_dispatches_via_to_thread(
+        self, mock_db_get, mock_update_times, mock_subprocess, tmp_path
+    ):
+        """#874: the flow script can run for up to its 30s timeout, and execute_flow
+        runs on the shared event loop. Pin the asyncio.to_thread dispatch so a slow or
+        hanging script cannot stall every other request to cao-server."""
+        from cli_agent_orchestrator.services import flow_service
+
+        flow_path = tmp_path / "flow.md"
+        flow_path.write_text(
+            "---\nname: pin-script\nschedule: '* * * * *'\nagent_profile: developer\n"
+            "script: ./check.sh\n---\nPrompt.\n"
+        )
+        (tmp_path / "check.sh").write_text("#!/bin/bash\n")
+        mock_db_get.return_value = Flow(
+            name="pin-script",
+            file_path=str(flow_path),
+            schedule="* * * * *",
+            agent_profile="developer",
+            provider="kiro_cli",
+            script="./check.sh",
+            enabled=True,
+            next_run=datetime.now(),
+        )
+        mock_subprocess.return_value = MagicMock(
+            returncode=0, stdout=json.dumps({"execute": False, "output": {}}), stderr=""
+        )
+
+        with patch(
+            "cli_agent_orchestrator.services.flow_service.asyncio.to_thread",
+            wraps=asyncio.to_thread,
+        ) as mock_to_thread:
+            result = await execute_flow("pin-script")
+            script_calls = [
+                c for c in mock_to_thread.call_args_list if c.args[0] is flow_service.subprocess.run
+            ]
+
+        assert result is False
+        assert script_calls, "the flow script was never dispatched via to_thread"
+        assert script_calls[0].args[1] == [str(tmp_path / "check.sh")]
+
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
-    @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.list_current_session_terminals")
     @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
@@ -861,7 +907,7 @@ Prompt.
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
-    @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.list_current_session_terminals")
     @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
@@ -925,7 +971,7 @@ Prompt.
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
-    @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.list_current_session_terminals")
     @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
@@ -982,12 +1028,12 @@ Prompt.
         assert busy_calls[0].args[1] == "t1"
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_ids")
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
     @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
-    @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.list_current_session_terminals")
     @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
@@ -1040,12 +1086,12 @@ Prompt.
         mock_create_terminal.assert_called_once()
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_ids")
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
     @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
-    @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.list_current_session_terminals")
     @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
@@ -1087,12 +1133,12 @@ Prompt.
         mock_create_terminal.assert_not_called()
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_ids")
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
     @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
-    @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.list_current_session_terminals")
     @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
@@ -1134,12 +1180,12 @@ Prompt.
         mock_create_terminal.assert_not_called()
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_ids")
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
     @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
-    @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.list_current_session_terminals")
     @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
@@ -1188,12 +1234,12 @@ Prompt.
         mock_create_terminal.assert_called_once()
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_ids")
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
     @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
-    @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.flow_service.list_current_session_terminals")
     @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
@@ -1239,6 +1285,76 @@ Prompt.
         mock_create_terminal.assert_called_once()
         # No conductor terminal exists, so the busy check never queries status.
         mock_status_monitor.get_status.assert_not_called()
+
+
+class TestExecuteFlowAdvancesScheduleOnFailure:
+    """Regression for #874: a failed run must still move ``next_run`` forward.
+
+    Otherwise the flow stays due and flow_daemon re-runs it on every 60s poll
+    instead of on its cron schedule.
+    """
+
+    @staticmethod
+    def _write_flow(tmp_path, engine_line=""):
+        flow_path = tmp_path / "flow.md"
+        flow_path.write_text(
+            "---\nname: weekly\nschedule: '0 9 * * 1'\nagent_profile: developer\n"
+            f"script: ./check.sh\n{engine_line}---\n\nPrompt.\n"
+        )
+        return flow_path
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "exit_code",
+            "invalid_json",
+            "missing_execute",
+            "timeout",
+            "script_missing",
+            "invalid_engine",
+        ],
+    )
+    @patch("cli_agent_orchestrator.services.flow_service.subprocess.run")
+    @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
+    @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
+    async def test_failed_run_advances_next_run(
+        self, mock_db_get, mock_update_times, mock_subprocess, case, tmp_path
+    ):
+        flow_path = self._write_flow(
+            tmp_path, engine_line="engine: bogus\n" if case == "invalid_engine" else ""
+        )
+        if case != "script_missing":
+            (tmp_path / "check.sh").write_text("#!/bin/bash\n")
+        mock_db_get.return_value = Flow(
+            name="weekly",
+            file_path=str(flow_path),
+            schedule="0 9 * * 1",
+            agent_profile="developer",
+            provider="kiro_cli",
+            script="./check.sh",
+            enabled=True,
+            next_run=datetime.now(),
+        )
+        if case == "timeout":
+            mock_subprocess.side_effect = subprocess.TimeoutExpired(cmd="check.sh", timeout=30)
+        else:
+            stdout = {
+                "exit_code": "",
+                "invalid_json": "not json",
+                "missing_execute": json.dumps({"output": {}}),
+            }.get(case, "")
+            mock_subprocess.return_value = MagicMock(
+                returncode=1 if case == "exit_code" else 0, stdout=stdout, stderr="boom"
+            )
+
+        # _get_next_run_time returns an aware datetime in the local zone.
+        before = datetime.now().astimezone()
+        with pytest.raises((ValueError, subprocess.TimeoutExpired)):
+            await execute_flow("weekly")
+
+        mock_update_times.assert_called_once()
+        assert mock_update_times.call_args.kwargs["next_run"] > before
 
 
 class TestGetFlowsToRun:
