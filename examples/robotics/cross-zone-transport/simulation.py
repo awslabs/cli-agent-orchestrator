@@ -187,12 +187,15 @@ def _add_scene_visuals(root: ET.Element, world: ET.Element, scene: Scene) -> Non
     )
     for index, (name, zone) in enumerate(scene.zones.items()):
         x0, y0, x1, y1 = zone.bounds
+        # A small inset shows a gap between neighbouring tiles. It is at most a
+        # quarter of the tile, so a narrow but valid zone keeps a positive size.
+        inset = min(0.03, (x1 - x0) / 4, (y1 - y0) / 4)
         ET.SubElement(
             world,
             "geom",
             name=f"visual/zone/{name}",
             type="box",
-            size=f"{(x1 - x0) / 2 - 0.03} {(y1 - y0) / 2 - 0.03} 0.005",
+            size=f"{(x1 - x0) / 2 - inset} {(y1 - y0) / 2 - inset} 0.005",
             pos=f"{(x0 + x1) / 2} {(y0 + y1) / 2} -0.015",
             rgba=ZONE_COLORS[index % len(ZONE_COLORS)],
             **no_contact,

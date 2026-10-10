@@ -1,9 +1,11 @@
 """Optional pictures of the shared MuJoCo world, for people who watch a run.
 
 The recorder only reads the world. It renders the ``overview`` camera that
-``simulation.py`` adds. It writes a PNG frame each time the measured state changes (robot or payload positions,
-custody, offers, or command records). When the controller stops, it also
-writes an animated PNG of all frames and a page that steps through them.
+``simulation.py`` adds. It writes a PNG frame each time the measured state
+changes (robot or payload positions, custody, offers, or command records). When
+the controller stops, it also writes a page that steps through all the frames,
+and an animated PNG. The animation holds at most ``MAX_ANIMATION_FRAMES``
+frames: the first ones, and always the last one.
 """
 
 from __future__ import annotations
@@ -79,6 +81,10 @@ def encode_apng(width: int, height: int, frames: list[tuple[bytes, int]]) -> byt
     return b"".join(parts)
 
 
+class RecordingError(RuntimeError):
+    """The recording stopped early, so its files do not show the full run."""
+
+
 def ensure_empty_directory(directory: Path) -> None:
     """Refuse a directory with files in it, so that two runs never mix their frames."""
     directory = Path(directory)
@@ -152,6 +158,7 @@ class Recorder:
         )
         self.frames: list[dict] = []
         self.error: str | None = None
+        self._rendering = False
         self._animation: list[tuple[bytes, int]] = []
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -165,7 +172,9 @@ class Recorder:
     def stop(self, timeout: float = 15) -> list[dict]:
         """Write a last frame if the state changed, write the outputs, and return the frames.
 
-        Raises TimeoutError when the outputs are not complete within ``timeout``.
+        Raises TimeoutError when the outputs are not complete within ``timeout``,
+        and RecordingError when rendering or writing failed after the renderer
+        started. A renderer that cannot start is not an error: it returns no frames.
         """
         self._stop.set()
         if self._thread is not None:
@@ -174,6 +183,8 @@ class Recorder:
                 raise TimeoutError(
                     f"the recorder did not finish writing {self.directory} in {timeout} s"
                 )
+        if self._rendering and self.error is not None:
+            raise RecordingError(f"the recording stopped early ({self.error})")
         return self.frames
 
     def _run(self) -> None:
@@ -187,6 +198,7 @@ class Recorder:
                 self.error,
             )
             return
+        self._rendering = True
         last_key: tuple | None = None
         last_commands: dict = {}
         try:
@@ -214,11 +226,21 @@ class Recorder:
                     last_key = key
                 if stopping:
                     break
+        except Exception as error:  # noqa: BLE001 - report it; the controller keeps running
+            self.error = f"{type(error).__name__}: {error}"
+            LOGGER.error("Recording stopped: %s", self.error, exc_info=True)
         finally:
             close = getattr(renderer, "close", None)
             if callable(close):
-                close()
-            self._write_outputs()
+                try:
+                    close()
+                except Exception:  # noqa: BLE001 - the outputs matter more than the context
+                    LOGGER.warning("The MuJoCo renderer did not close cleanly", exc_info=True)
+            try:
+                self._write_outputs()
+            except Exception as error:  # noqa: BLE001
+                self.error = self.error or f"{type(error).__name__}: {error}"
+                LOGGER.error("Could not write the recording files: %s", error, exc_info=True)
 
     def _write_frame(self, pixels: np.ndarray, state: dict, event: str | None) -> None:
         number = len(self.frames) + 1
@@ -229,8 +251,13 @@ class Recorder:
         (self.directory / name).write_bytes(png)
         (self.directory / "latest.png").write_bytes(png)
         pause = event is not None and not event.endswith(": running")
+        frame = (data, EVENT_FRAME_MS if pause else MOTION_FRAME_MS)
         if len(self._animation) < MAX_ANIMATION_FRAMES:
-            self._animation.append((data, EVENT_FRAME_MS if pause else MOTION_FRAME_MS))
+            self._animation.append(frame)
+        else:
+            # Keep the newest frame in the last place, so that a long animation
+            # still ends on the final state.
+            self._animation[-1] = frame
         self.frames.append(
             {
                 "file": name,
