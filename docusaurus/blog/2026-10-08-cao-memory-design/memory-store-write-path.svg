@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="650" viewBox="0 0 1200 650" role="img" aria-labelledby="title desc">
+  <title id="title">CAO saves memory now and organizes it later</title>
+  <desc id="desc">An agent calls memory_store. CAO immediately validates, locks, and atomically saves the observation as Markdown, with index and SQLite metadata alongside it. For existing topics, an optional background LLM can later merge repetition and add related links. Failed or stale work leaves the saved observation untouched.</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="7" flood-color="#0f172a" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#7c3aed"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#16a34a"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .eyebrow { font-size: 13px; font-weight: 700; letter-spacing: 1.5px; fill: #64748b; }
+      .title { font-size: 30px; font-weight: 750; fill: #0f172a; }
+      .subtitle { font-size: 16px; font-weight: 450; fill: #475569; }
+      .card-title { font-size: 22px; font-weight: 720; fill: #0f172a; }
+      .card-copy { font-size: 15px; font-weight: 450; fill: #475569; }
+      .label { font-size: 12px; font-weight: 700; letter-spacing: 0.8px; fill: #475569; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 15px; font-weight: 650; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="650" fill="#ffffff"/>
+  <text class="eyebrow" x="60" y="54">CAO MEMORY WRITE</text>
+  <text class="title" x="60" y="94">Save the observation first. Organize it later.</text>
+  <text class="subtitle" x="60" y="124">The durable write is immediate. Optional LLM work improves the topic in the background.</text>
+
+  <g filter="url(#shadow)">
+    <rect x="60" y="180" width="300" height="108" rx="20" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+    <circle cx="96" cy="216" r="14" fill="#2563eb"/>
+    <path d="M89 216H103M96 209V223" fill="none" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round"/>
+    <text class="label" x="126" y="209" fill="#1d4ed8">AGENT</text>
+    <text class="card-title" x="126" y="239">Calls <tspan class="mono" fill="#1d4ed8">memory_store</tspan></text>
+    <text class="card-copy" x="96" y="268">Provider-neutral entry point.</text>
+  </g>
+
+  <path d="M360 234H421" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow-blue)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="430" y="166" width="340" height="242" rx="24" fill="#f0fdf4" stroke="#16a34a" stroke-width="2.5"/>
+    <rect x="458" y="191" width="98" height="30" rx="15" fill="#dcfce7"/>
+    <text class="label" x="507" y="211" text-anchor="middle" fill="#166534">SAVE NOW</text>
+    <text class="card-title" x="458" y="256">Observation becomes durable</text>
+    <text class="card-copy" x="458" y="288">Validate → lock → atomic Markdown write</text>
+    <line x1="458" y1="316" x2="742" y2="316" stroke="#bbf7d0" stroke-width="1.5"/>
+    <text class="label" x="458" y="346" fill="#166534">SUPPORTING RECORDS</text>
+    <rect x="458" y="361" width="126" height="28" rx="14" fill="#ffffff" stroke="#86efac"/>
+    <text class="card-copy" x="521" y="381" text-anchor="middle">Markdown index</text>
+    <rect x="596" y="361" width="146" height="28" rx="14" fill="#ffffff" stroke="#86efac"/>
+    <text class="card-copy" x="669" y="381" text-anchor="middle">SQLite metadata</text>
+  </g>
+
+  <path d="M770 234H831" fill="none" stroke="#7c3aed" stroke-width="2.5" stroke-dasharray="8 7" marker-end="url(#arrow-purple)"/>
+  <rect x="775" y="204" width="52" height="20" rx="10" fill="#ffffff"/>
+  <text class="label" x="801" y="219" text-anchor="middle" fill="#6d28d9">UPDATES</text>
+
+  <g filter="url(#shadow)">
+    <rect x="840" y="166" width="300" height="242" rx="24" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2.5"/>
+    <rect x="868" y="191" width="146" height="30" rx="15" fill="#ede9fe"/>
+    <text class="label" x="941" y="211" text-anchor="middle" fill="#6d28d9">ORGANIZE LATER</text>
+    <text class="card-title" x="868" y="256">Background LLM</text>
+    <text class="card-copy" x="868" y="291">Merge repetition</text>
+    <text class="card-copy" x="868" y="319">Reorganize the topic</text>
+    <text class="card-copy" x="868" y="347">Add related links</text>
+    <text class="label" x="868" y="382" fill="#6d28d9">OPTIONAL · NON-BLOCKING</text>
+  </g>
+
+  <path d="M990 408V455H600V416" fill="none" stroke="#16a34a" stroke-width="2.5" stroke-dasharray="8 7" marker-end="url(#arrow-green)"/>
+  <rect x="704" y="438" width="182" height="34" rx="17" fill="#ffffff"/>
+  <text class="label" x="795" y="460" text-anchor="middle" fill="#15803d">UPDATE IF STILL CURRENT</text>
+
+  <rect x="250" y="510" width="700" height="82" rx="18" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+  <circle cx="292" cy="551" r="16" fill="#e2e8f0"/>
+  <path d="M292 542V553M292 561V562" fill="none" stroke="#475569" stroke-width="2.5" stroke-linecap="round"/>
+  <text class="label" x="326" y="544">THE SAFE BASELINE ALWAYS WINS</text>
+  <text class="card-copy" x="326" y="570">If organization fails or becomes stale, the saved observation remains untouched.</text>
+</svg>
