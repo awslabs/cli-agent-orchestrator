@@ -106,7 +106,7 @@ def test_prepare_does_not_overwrite_an_existing_run(tmp_path):
 
 def test_server_cannot_restart_with_lost_command_history_and_old_credentials(tmp_path, monkeypatch):
     run_dir = tmp_path / "run"
-    demo.prepare(run_dir, EXAMPLE / "site.json", port=8766, provider="copilot_cli")
+    demo.prepare(run_dir, EXAMPLE / "site.json", port=_free_port(), provider="copilot_cli")
     calls = []
 
     class Server:
@@ -128,8 +128,10 @@ def _free_port() -> int:
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Ctrl+C is SIGINT on POSIX")
-def test_ctrl_c_stops_the_controller_cleanly(tmp_path):
-    # The README stops the controller with Ctrl+C: no traceback, exit 0, final state.
+@pytest.mark.parametrize("stop", ["SIGINT", "SIGTERM", "SIGHUP"])
+def test_ctrl_c_stops_the_controller_cleanly(tmp_path, stop):
+    # The README stops the controller with Ctrl+C. kill and a closed terminal window
+    # (SIGTERM, SIGHUP) must stop it the same way: no traceback, exit 0, final state.
     run_dir = tmp_path / "run"
     port = _free_port()
     demo.prepare(run_dir, EXAMPLE / "site.json", port=port, provider="copilot_cli")
@@ -149,7 +151,7 @@ def test_ctrl_c_stops_the_controller_cleanly(tmp_path):
                     break
             assert time.monotonic() < deadline, "the controller did not start"
             time.sleep(0.2)
-        process.send_signal(signal.SIGINT)
+        process.send_signal(getattr(signal, stop))
         _, stderr = process.communicate(timeout=60)
     finally:
         if process.poll() is None:
@@ -162,7 +164,7 @@ def test_ctrl_c_stops_the_controller_cleanly(tmp_path):
 
 def test_serve_without_frames_does_not_point_to_a_viewer(tmp_path, monkeypatch, caplog):
     run_dir = tmp_path / "run"
-    demo.prepare(run_dir, EXAMPLE / "site.json", port=8766, provider="copilot_cli")
+    demo.prepare(run_dir, EXAMPLE / "site.json", port=_free_port(), provider="copilot_cli")
 
     class Server:
         def run(self, **kwargs):
@@ -184,6 +186,67 @@ def test_serve_without_frames_does_not_point_to_a_viewer(tmp_path, monkeypatch, 
         demo.serve(run_dir, allow_motion=False, record=tmp_path / "frames")
     assert "Recorded no frames" in caplog.text
     assert "index.html" not in caplog.text
+
+
+def test_serve_refuses_a_busy_port_without_consuming_the_run(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    port = _free_port()
+    demo.prepare(run_dir, EXAMPLE / "site.json", port=port, provider="copilot_cli")
+    monkeypatch.setattr(demo, "make_server", lambda *args: pytest.fail("must not start"))
+    with socket.socket() as other_controller:
+        other_controller.bind(("127.0.0.1", port))
+        other_controller.listen()
+        with pytest.raises(OSError, match=f"port {port} is in use"):
+            demo.serve(run_dir, allow_motion=True)
+    assert not (run_dir / "started.json").exists()
+
+
+def test_serve_refuses_an_unusable_frames_directory_without_consuming_the_run(
+    tmp_path, monkeypatch
+):
+    run_dir = tmp_path / "run"
+    demo.prepare(run_dir, EXAMPLE / "site.json", port=_free_port(), provider="copilot_cli")
+    (tmp_path / "a-file").write_text("not a directory")
+    monkeypatch.setattr(demo, "make_server", lambda *args: pytest.fail("must not start"))
+    with pytest.raises(OSError):
+        demo.serve(run_dir, allow_motion=True, record=tmp_path / "a-file" / "frames")
+    assert not (run_dir / "started.json").exists()
+
+
+def test_glfw_on_macos_turns_recording_off_instead_of_crashing(tmp_path, monkeypatch, caplog):
+    run_dir = tmp_path / "run"
+    demo.prepare(run_dir, EXAMPLE / "site.json", port=_free_port(), provider="copilot_cli")
+
+    class Server:
+        def run(self, **kwargs):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(demo.sys, "platform", "darwin")
+    monkeypatch.setenv("MUJOCO_GL", "glfw")
+    monkeypatch.setattr(demo, "make_server", lambda *args: Server())
+    monkeypatch.setattr(demo, "Recorder", lambda *args: pytest.fail("must not render"))
+    with caplog.at_level("INFO", logger="transport"):
+        demo.serve(run_dir, allow_motion=False, record=tmp_path / "frames")
+    assert "Recording is off: MUJOCO_GL=glfw" in caplog.text
+    assert not (tmp_path / "frames").exists()
+
+
+def test_a_refused_scene_or_profile_leaves_no_run_directory(tmp_path, monkeypatch):
+    data = json.loads((EXAMPLE / "site.json").read_text())
+    data["zones"]["a-b"] = {"bounds": [3, -1, 4, 1]}
+    data["zones"]["a_b"] = {"bounds": [4, -1, 5, 1]}
+    scene = tmp_path / "clash.json"
+    scene.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="both map to ZONE_A_B"):
+        demo.prepare(tmp_path / "clash", scene, port=8766, provider="copilot_cli")
+    assert not (tmp_path / "clash").exists()
+
+    broken = tmp_path / "broken.md"
+    broken.write_text("no frontmatter")
+    monkeypatch.setitem(demo.PROFILE_SOURCES, "checker", broken)
+    with pytest.raises(ValueError, match="frontmatter"):
+        demo.prepare(tmp_path / "broken", EXAMPLE / "site.json", port=8766, provider="copilot_cli")
+    assert not (tmp_path / "broken").exists()
 
 
 def test_additional_zones_get_the_same_shared_operator_prompt(tmp_path):

@@ -1,7 +1,7 @@
 ---
 name: transport_zone_worker
 description: "Simulation-only cross-zone transport zone worker: moves the payload in one zone and offers or accepts custody"
-skills: []  # Show no CAO skill catalog to this agent.
+skills: []  # No CAO skill catalog in the prompt. Copilot CLI and Kiro CLI load skills in their own way.
 allowedTools:
   - "@transport-sim"  # Simulator tools. The credential limits them to one zone.
 mcpServers:
@@ -36,9 +36,9 @@ argument or a prompt cannot give you access to the robots of another zone.
 - **observe**() - returns the current state of the run: `run_id`,
   `observed_at`, the measured `robots` and `payloads` positions in metres, the
   owner and location (`at`) of each payload, any pending custody `offer`, and
-  the `commands` records. The `scene` part shows the start of the run: the
-  zones, the locations, the robot capabilities, and `arrival_tolerance_m`. Use
-  `robots` and `payloads` for the current state.
+  the `commands` records. The `scene` part has the zones, the locations, the
+  robot capabilities, and `arrival_tolerance_m`, but no positions and no
+  owners. Use `robots` and `payloads` for the current state.
 - **move**(command_id, robot, payload, destination) - starts one bounded leg in
   your zone. The robot must already be at the payload. The result is
   `accepted`, not arrival.

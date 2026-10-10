@@ -213,7 +213,7 @@ This is the frontmatter of [`transport_supervisor.md`](transport_supervisor.md):
 ---
 name: transport_supervisor
 description: "Simulation-only cross-zone transport supervisor: plans the legs and delegates each leg with CAO handoff"
-skills: []  # Show no CAO skill catalog to this agent.
+skills: []  # No CAO skill catalog in the prompt. Copilot CLI and Kiro CLI load skills in their own way.
 allowedTools:
   - "@transport-sim"   # Simulator tools. The supervisor credential permits only observe.
   - "@cao-mcp-server"  # CAO handoff. Only the supervisor can delegate.
@@ -469,10 +469,11 @@ the enforcement of each provider, see
 [Tool restrictions](../../../docs/tool-restrictions.md).
 
 > [!WARNING]
-> If the provider does not enforce the allowlist, an agent can use a shell.
-> Then it can read the credential files of the other zones and act for another
-> zone. `prepare` prints a warning for these providers. Use them only for a
-> trusted local demo.
+> If the provider does not enforce the allowlist, every agent, the supervisor
+> included, can use a shell. Then it can read every credential file of the run,
+> act for another zone, or use the operator credential to stop the run.
+> `prepare` prints a warning for these providers. Use them only for a trusted
+> local demo.
 
 For the setup of each provider, see its guide in the
 [CAO documentation](../../../README.md#prerequisites).
@@ -683,7 +684,9 @@ ID, operation, status, and refusal reason.
 - `--record` saves pictures of the MuJoCo world while the robots move. See
   [See the robots move](#see-the-robots-move). The directory must be new or
   empty. To run without pictures, remove `--record` and its directory.
-- The controller listens only on `127.0.0.1`, port 8766 by default.
+- The controller listens only on `127.0.0.1`, port 8766 by default. If another
+  process uses the port, `serve` stops before it marks the run as started.
+  Stop the other controller, or prepare a run with another `--port`.
 
 ### Step 4. Start the CAO server
 
@@ -1166,7 +1169,9 @@ The command prints nothing. Your web browser shows the page.
 
 The pictures need OpenGL, but no separate GPU:
 
-- On macOS, the pictures work with no settings.
+- On macOS, the pictures work with no settings. Do not set `MUJOCO_GL=glfw`:
+  GLFW cannot start on the recorder thread on macOS, so the controller logs
+  `Recording is off:` and records nothing.
 - On Linux, MuJoCo uses GLFW by default, and GLFW needs a display. Without a
   display, set `MUJOCO_GL` in Terminal 2 before Step 3.
   `export MUJOCO_GL=egl` uses an EGL driver. `export MUJOCO_GL=osmesa` uses
@@ -1407,8 +1412,9 @@ This example does not supply these items:
 - If the provider enforces the allowlist, it blocks the shell and file tools
   of the zone workers and the checker.
 - If the provider does not enforce the allowlist, only the instructions forbid
-  the shell and file tools. An agent can then read the credential files of the
-  other zones. See [Providers](#providers).
+  the shell and file tools. An agent, the supervisor included, can then read
+  every credential file of the run, the operator credential included. See
+  [Providers](#providers).
 - The tokens do not appear in output, profile text, or process arguments. Each
   stdio connection reads only its own credential file.
 - The controller uses the FastMCP static-token verifier. Use it only for this
@@ -1429,6 +1435,9 @@ This example does not supply these items:
 - `demo.py stop` marks active commands `interrupted`. It keeps the actual
   positions and custody, and it locks the run permanently. A parcel between
   named locations shows `"at": null`.
+- Ctrl+C, `kill <pid>`, and a closed Terminal 2 window stop the controller
+  cleanly. It writes `last-state.json`, and with `--record` also the animation
+  and the picture viewer.
 - After a crash or a forced stop, `last-state.json` can be old. An old file
   does not prove the current state or a stop.
 - The controller replaces `last-state.json` atomically. A failed write keeps
