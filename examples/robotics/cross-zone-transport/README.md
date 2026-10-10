@@ -127,18 +127,8 @@ its `assign` and `handoff` calls, with this result:
 `'assign' is not permitted: the calling terminal's allowed tools do not include '@cao-mcp-server'`.
 The checker profile also does not grant `@cao-mcp-server`.
 
-The provider decides which MCP servers a worker gets. These are the results
-for the tested providers:
-
-| Provider | MCP servers of a zone worker or the checker | Can call `send_message` |
-| --- | --- | --- |
-| GitHub Copilot CLI | `transport-sim`, plus `cao-mcp-server`. CAO adds `cao-mcp-server` to each Copilot terminal. Copilot also adds its built-in `github-mcp-server`. | Yes. CAO does not gate `send_message`. |
-| Claude Code | `transport-sim` only. CAO starts Claude Code with `--strict-mcp-config` and the servers of the profile. | No |
-| Kiro CLI | `transport-sim` only. The installed Kiro agent has `tools: ["@transport-sim"]`. | No |
-| Codex | `transport-sim` only, given with `-c mcp_servers...` options. | No |
-
 The instructions of the zone workers and the checker tell them to return their
-evidence to the `handoff` caller. They do not tell them to send messages.
+evidence to the `handoff` caller. They do not need any CAO tool for this.
 
 ### Run copies
 
@@ -272,21 +262,10 @@ This example uses only `handoff`, for these reasons:
 - Each step needs the result of the step before it. The east zone worker can
   accept custody only after the west zone worker offers it at the dock. The
   checker can check only after the last leg. Parallel work gives no benefit.
-- With Claude Code, Kiro CLI, or Codex, the zone workers and the checker have
-  no `cao-mcp-server`.
-  Thus they cannot call `send_message`, and `assign` cannot get their results.
-- With Copilot CLI, the workers can call `send_message`. Thus `assign` can
-  work with Copilot CLI. But the run then needs two more steps. Each worker
-  must send its result. Then CAO must deliver the result to the inbox of the
-  supervisor. `handoff` does not need these steps.
-- A known issue affects the inbox step with Copilot CLI. The test used CAO
-  2.5.3 and Copilot CLI 1.0.93. A Copilot terminal stayed `processing` after
-  a turn that CAO delivered from the inbox or with `cao launch`. While a
-  terminal is `processing`, CAO keeps its inbox messages `pending`. In the
-  same test, a Claude Code terminal returned to `completed` and received the
-  next inbox message.
+- With `handoff`, the zone workers and the checker need no CAO tool. Their
+  profiles grant only `@transport-sim`.
 
-To use `assign` with Claude Code, do these changes:
+To use `assign`, do these changes:
 
 1. In `transport_zone_worker.md` and `transport_checker.md`, add
    `cao-mcp-server` to `mcpServers`. CAO does not gate `send_message`, so the
@@ -310,15 +289,15 @@ share a dock. This example has one payload, so it uses only `handoff`.
 
 | Requirement | Version | How to check |
 | --- | --- | --- |
-| CAO | 2.5.3 or later | `cao --version` |
+| CAO | A release that contains this example, or the latest `main` | `cao --version` |
 | tmux | 3.3 or later | `tmux -V` |
 | uv | A recent release | `uv --version` |
 | Python | 3.10 or later | Step 1 finds or installs it with `uv` |
-| Provider CLI | Any CAO provider. GitHub Copilot CLI is the default. | Start the CLI one time and sign in |
+| Provider CLI | Any CAO provider. GitHub Copilot CLI is the default. | Start the CLI one time in this repository, sign in, and accept its first-run prompts |
 
-CAO 2.5.3 is the first release that contains this example. It also contains the
-permission fix for workflow delegation that this example uses. To install or
-update CAO from the latest `main`:
+A CAO release that contains this example also contains the permission fix for
+workflow delegation that this example uses. To install or update CAO from the
+latest `main`:
 
 ```bash
 uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@main --upgrade
@@ -337,39 +316,28 @@ Select the provider with `--provider` in Step 2. `prepare` writes it into each
 run copy, so `cao install` and `cao launch` use the same provider for all the
 agents.
 
-The isolation of the zones depends on how the provider enforces the allowlist
-of a profile. CAO shows the level in the `Enforcement:` line of `cao launch`:
-
-| Enforcement | Providers | Effect on the zone workers and the checker |
-| --- | --- | --- |
-| Native | `copilot_cli` (default), `claude_code`, `kiro_cli`, `opencode_cli`, `grok_cli` | The provider blocks each tool that the profile does not allow, for example the shell. |
-| Prompt only | `codex`, `kimi_cli`, `antigravity_cli`, `omp`, `mcode` | Only the instructions forbid the other tools. |
-| None | `hermes`, `cursor_cli` | CAO does not restrict the tools. |
+The isolation of the zones needs a provider that enforces the tool allowlist
+of each profile. CAO shows this in the `Enforcement:` line of `cao launch`. For
+the enforcement of each provider, see
+[Tool restrictions](../../../docs/tool-restrictions.md).
 
 > [!WARNING]
-> Without native enforcement, an agent can use a shell and read the credential
-> files of the other zones. Then it can act for another zone. `prepare` prints
-> a warning for these providers. Use them only for a trusted local demo.
+> If the provider does not enforce the allowlist, an agent can use a shell and
+> read the credential files of the other zones. Then it can act for another
+> zone. `prepare` prints a warning for these providers. Use them only for a
+> trusted local demo.
 
-Test results of this example with CAO 2.5.3:
-
-| Provider | Result |
-| --- | --- |
-| Copilot CLI 1.0.94 | Complete. Each worker and the checker returned its report. |
-| Claude Code 2.1.294 | Complete. CAO sometimes ended a handoff early; the supervisor then handed off the same leg again. |
-| Kiro CLI 2.28 | The transport was correct. CAO could not read the replies of the workers, so the final report has no evidence from the checker. |
-| Codex 0.154 | The transport was correct. CAO marked the workers as failed while they worked, so the final report has no evidence from the checker. |
-
-The other providers are not tested with this example. For each provider, see
-its guide in the [CAO documentation](../../../README.md#prerequisites) and
-[Tool restrictions](../../../docs/tool-restrictions.md).
+For the setup of each provider, see its guide in the
+[CAO documentation](../../../README.md#prerequisites).
 
 ### Compute and GPU
 
 You do not need a GPU. A laptop is enough:
 
 - The controller moves MuJoCo mocap bodies along straight lines. The world has
-  no gravity and no contacts. The controller does not render images.
+  no gravity and no contacts.
+- With `--record`, MuJoCo renders small pictures with OpenGL. This needs no
+  separate GPU. See [See the robots move](#see-the-robots-move).
 - The agents are provider CLIs. The language models run on the service of the
   provider, not on your computer.
 - The example needs no display and no download of a robot model.
@@ -392,6 +360,11 @@ Use three terminals:
 | Terminal 2 | Run the MuJoCo controller, `demo.py serve` |
 | Terminal 3 | Run `cao-server` |
 
+Each step has an **Expected output** section that you can expand. The outputs
+come from a run of this guide. In them, `<id>` is a random ID, and `<run_id>`
+is the run ID. `<repo>` is the path of the repository, and `<time>` is a time
+stamp. On macOS, `/tmp` can show as `/private/tmp`.
+
 ### Step 1. Install the example dependencies
 
 In Terminal 1, from the repository root:
@@ -400,6 +373,32 @@ In Terminal 1, from the repository root:
 cd examples/robotics/cross-zone-transport
 uv sync --locked
 ```
+
+<details>
+<summary>Expected output</summary>
+
+The first time:
+
+```text
+Using CPython 3.10.18
+Creating virtual environment at: .venv
+Resolved 93 packages in 31ms
+Installed 79 packages in 9.57s
+ + absl-py==2.5.0
+ + aiofile==3.8.8
+ ...
+ + websockets==16.1.1
+ + zipp==4.1.1
+```
+
+Later times:
+
+```text
+Resolved 93 packages in 26ms
+Audited 79 packages in 44ms
+```
+
+</details>
 
 ### Step 2. Prepare a run
 
@@ -412,6 +411,28 @@ export RUN_DIR=/tmp/cao-transport-demo
 REQUEST="Move tote from stock to etch. Coordinate the ownership handoff and have an independent checker verify delivery."
 uv run --locked python demo.py prepare --run-dir "$RUN_DIR" --request "$REQUEST"
 ```
+
+<details>
+<summary>Expected output</summary>
+
+```text
+cao install /tmp/cao-transport-demo/profiles/transport_supervisor_<id>.md
+cao install /tmp/cao-transport-demo/profiles/transport_checker_<id>.md
+cao install /tmp/cao-transport-demo/profiles/transport_zone_worker_<id>.md
+cao install /tmp/cao-transport-demo/profiles/transport_zone_worker_<id>.md
+cao launch --agents transport_supervisor_<id> --headless --async --auto-approve --session-name cao-transport-<run_id> --working-directory <repo>/examples/robotics/cross-zone-transport -- 'Move tote from stock to etch. Coordinate the ownership handoff and have an independent checker verify delivery.'
+```
+
+`demo.py` commands can also print this warning from a dependency. You can
+ignore it:
+
+```text
+.../fastmcp/server/auth/providers/jwt.py:12: AuthlibDeprecationWarning: authlib.jose module is deprecated, please use joserfc instead.
+It will be compatible before version 2.0.0.
+  from authlib.jose import JsonWebKey, JsonWebToken
+```
+
+</details>
 
 `prepare` writes these items to the run directory:
 
@@ -431,8 +452,6 @@ later steps use.
 - Do not move the example directory or its `.venv` until the cleanup. Each
   run copy starts the Python interpreter of `.venv` and `demo.py` by their
   full paths.
-- `demo.py` commands can show an `AuthlibDeprecationWarning`. It comes from a
-  dependency. You can ignore it.
 
 ### Step 3. Start the controller
 
@@ -441,8 +460,42 @@ In Terminal 2, from the repository root:
 ```bash
 cd examples/robotics/cross-zone-transport
 export RUN_DIR=/tmp/cao-transport-demo
-uv run --locked python demo.py serve --run-dir "$RUN_DIR" --allow-motion
+uv run --locked python demo.py serve --run-dir "$RUN_DIR" --allow-motion \
+  --record /tmp/cao-transport-frames
 ```
+
+<details>
+<summary>Expected output</summary>
+
+When the controller starts:
+
+```text
+<time> transport SIMULATION ONLY: kinematic carrying; motion approved for this scene
+<time> transport Recording frames of the world to /tmp/cao-transport-frames
+[<time>] INFO     Starting MCP server 'CAO cross-zone transport simulator' with transport 'http' (stateless) on http://127.0.0.1:8766/mcp
+INFO:     Started server process [<pid>]
+INFO:     Waiting for application startup.
+<time> mcp.server.streamable_http_manager StreamableHTTP session manager started
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8766 (Press CTRL+C to quit)
+```
+
+While the agents work, one line for each command change:
+
+```text
+<time> transport run=<run_id> actor=west command=west-tote-stock-to-dock operation=move status=accepted reason=None
+<time> transport run=<run_id> actor=west command=west-tote-stock-to-dock operation=move status=running reason=None
+<time> transport run=<run_id> actor=west command=west-tote-stock-to-dock operation=move status=finished reason=None
+<time> transport run=<run_id> actor=west command=west-offer-tote-to-east operation=offer status=finished reason=None
+<time> transport run=<run_id> actor=east command=east-accept-tote-at-dock operation=accept status=finished reason=None
+<time> transport run=<run_id> actor=east command=east-tote-dock-to-etch operation=move status=accepted reason=None
+<time> transport run=<run_id> actor=east command=east-tote-dock-to-etch operation=move status=running reason=None
+<time> transport run=<run_id> actor=east command=east-tote-dock-to-etch operation=move status=finished reason=None
+```
+
+The agents choose the command IDs, so your IDs can be different.
+
+</details>
 
 Do not stop the controller until [Stop and clean up](#stop-and-clean-up). The
 controller shows one log line for each command change, with the actor, command
@@ -453,6 +506,9 @@ ID, operation, status, and refusal reason.
 - `--allow-motion` is your approval for bounded motion in this simulation.
   Without it, the controller rejects all `move`, `offer_handoff`, and
   `accept_handoff` calls with `motion_not_approved`.
+- `--record` saves pictures of the MuJoCo world while the robots move. See
+  [See the robots move](#see-the-robots-move). The directory must be new or
+  empty. To run without pictures, remove `--record` and its directory.
 - The controller listens only on `127.0.0.1`, port 8766 by default.
 
 ### Step 4. Start the CAO server
@@ -462,6 +518,20 @@ In Terminal 3:
 ```bash
 cao-server
 ```
+
+<details>
+<summary>Expected output</summary>
+
+```text
+INFO:     Started server process [<pid>]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:9889 (Press CTRL+C to quit)
+Server logs: ~/.aws/cli-agent-orchestrator/logs/cao_<time>.log
+For debug logs: export CAO_LOG_LEVEL=DEBUG && cao-server
+```
+
+</details>
 
 If `cao-server` already runs, skip this step. If it runs an earlier CAO
 version, stop it and start it again.
@@ -475,6 +545,23 @@ for profile in "$RUN_DIR"/profiles/*.md; do
   cao install "$profile"
 done | tee "$RUN_DIR/install.log"
 ```
+
+<details>
+<summary>Expected output</summary>
+
+These lines repeat for each of the four run copies. This output is from a run
+with `--provider claude_code`:
+
+```text
+✓ Copied agent from file to local store
+✓ Agent 'transport_checker_<id>' installed successfully
+✓ Context file: ~/.aws/cli-agent-orchestrator/agent-context/transport_checker_<id>.md
+```
+
+If the provider uses its own agent file, `cao install` also prints a line
+`✓ <provider> agent: <path>`.
+
+</details>
 
 For each run copy, `cao install` prints lines that start with `✓`, for example
 `✓ Agent '<name>' installed successfully`. Some lines give the paths of the
@@ -504,31 +591,37 @@ cao launch --agents "$SUPERVISOR" --headless --async --auto-approve \
   -- "$REQUEST"
 ```
 
+<details>
+<summary>Expected output</summary>
+
+This output is from a run with `--provider claude_code`. The `Blocked:` line
+lists the tools of the provider, so it is different for other providers.
+
+```text
+Agent 'transport_supervisor_<id>' launching on claude_code:
+  Allowed:  @transport-sim, @cao-mcp-server
+  Blocked:  Agent, Bash, BashOutput, Edit, Glob, Grep, KillShell, Monitor, NotebookEdit, Read, Task, WebFetch, WebSearch, Write
+  Enforcement: native (the provider refuses blocked tools)
+  Directory: <repo>/examples/robotics/cross-zone-transport
+
+  To skip this prompt next time, relaunch with --auto-approve
+  To remove all restrictions, relaunch with --yolo
+
+Session created: cao-transport-<run_id>
+Terminal created: transport_supervisor_<id>-<id>
+Message delivered to transport_supervisor_<id>-<id>. Running in background.
+```
+
+The two `To ...` lines are information only.
+
+</details>
+
 - The command prints `Session created: cao-transport-<run_id>`. The launch
   command that `prepare` printed uses the same session name. The later steps
   use `$SESSION`.
-- The command can also print `To skip this prompt next time, relaunch with
-  --auto-approve`. You can ignore this line.
 - `--async` returns when CAO delivers the request. It does not wait for the
   task. The run continues if the client times out. Do not launch the request
   again.
-- If the command prints `Copilot initialization timed out after 60 seconds`,
-  CAO did not deliver the request. A known cause is a pending Copilot CLI
-  update. Copilot then shows `<version> downloaded · next launch or /restart`
-  in its footer, and CAO does not detect the idle prompt. The next start of
-  Copilot uses the update. Do these steps:
-  1. Run `cao shutdown --session "$SESSION"`.
-  2. Run `uv run --locked python demo.py status --run-dir "$RUN_DIR"`.
-  3. If `commands` is empty, do Step 6 again. If `commands` is not empty,
-     stop and clean up this run, and prepare a new run.
-- If the command prints `Initial message was not delivered` and
-  `waiting_user_answer`, the provider shows a first-run prompt that CAO does
-  not answer. For example, Codex 0.154 asks `Trust this folder?` for the
-  repository. Do these steps:
-  1. Run `cao shutdown --session "$SESSION"`.
-  2. Start the provider CLI one time in this directory, accept the prompt, and
-     exit the CLI.
-  3. Do Step 6 again.
 
 ### Step 7. Watch the agents
 
@@ -541,27 +634,46 @@ Use one or more of these views:
   cao session status "$SESSION" --workers
   ```
 
+  <details>
+  <summary>Expected output</summary>
+
+  After the final answer of the supervisor, from a run with
+  `--provider claude_code`:
+
+  ```text
+  Session:  cao-transport-<run_id>
+  Terminal: <id>
+  Agent:    transport_supervisor_<id>
+  Provider: claude_code
+  Model:    provider default
+  Honored:  yes
+  Status:   completed
+
+  Last response:
+  Delivered. tote is at etch, owner east, no pending offer — confirmed by my own observe and independently by the checker.
+  ...
+
+  No worker terminals
+  ```
+
+  While a worker runs, the output ends with a table of the worker terminals.
+  The table has the columns `ID`, `AGENT`, `PROVIDER`, `MODEL`, `HONORED`, and
+  `STATUS`.
+
+  </details>
+
 - **tmux.** Run `tmux attach -t "$SESSION"`. To detach, press Ctrl+b, then d.
   Do not type in an agent window. See the [tmux guide](../../../docs/tmux.md).
 - **Controller log.** Look at Terminal 2.
+- **Simulator picture.** Open `/tmp/cao-transport-frames/latest.png`. The
+  controller replaces it at each change. See
+  [See the robots move](#see-the-robots-move).
 
 CAO can remove a worker window after its handoff finishes. The controller keeps
 the command records of that worker.
 
-The supervisor status in CAO can be wrong during this demo:
-
-- With Copilot CLI, it can stay `processing` after the supervisor gives its
-  final answer.
-- With Claude Code, it can show `completed` while the supervisor still works.
-
-With Claude Code, CAO can also end a handoff too early, while the worker still
-works. Then CAO closes the window of that worker, and the supervisor gets no
-evidence. The supervisor then checks the command records and hands off the
-same leg or the check again. Thus you can see more worker windows than legs.
-The command records in Step 8 show what each worker did.
-
-To know if the transport is complete, use the controller state in Step 8. To
-know if the supervisor finished, read its final answer in its window.
+The controller state in Step 8 is the record of what the robots did. The final
+answer of the supervisor is in its window.
 
 ### Step 8. Check the result
 
@@ -570,6 +682,37 @@ In Terminal 1:
 ```bash
 uv run --locked python demo.py status --run-dir "$RUN_DIR"
 ```
+
+<details>
+<summary>Expected output</summary>
+
+An excerpt. The output also has the `model` and `scene` fields, and more
+fields for each command.
+
+```json
+{
+  "run_id": "<run_id>",
+  "observed_at": "<time>",
+  "position_units": "m",
+  "motion_approved": true,
+  "stopped": false,
+  "robots": {
+    "cart-west": {"xy": [0.0, 0.0], "zone": "west"},
+    "cart-east": {"xy": [2.0, 0.0], "zone": "east"}
+  },
+  "payloads": {
+    "tote": {"xy": [2.0, 0.0], "at": "etch", "owner": "east", "offer": null}
+  },
+  "commands": [
+    {"actor": "west", "command_id": "west-tote-stock-to-dock", "operation": "move", "status": "finished", "reason": null},
+    {"actor": "west", "command_id": "west-offer-tote-to-east", "operation": "offer", "status": "finished", "reason": null},
+    {"actor": "east", "command_id": "east-accept-tote-at-dock", "operation": "accept", "status": "finished", "reason": null},
+    {"actor": "east", "command_id": "east-tote-dock-to-etch", "operation": "move", "status": "finished", "reason": null}
+  ]
+}
+```
+
+</details>
 
 For `site.json`, a successful run shows these values:
 
@@ -582,9 +725,7 @@ For `site.json`, a successful run shows these values:
 | `commands` | The two `move` commands, the `offer`, and the `accept` have `"status": "finished"` |
 
 The final answer of the supervisor names each worker, each leg, the custody
-acceptance, and the evidence of the checker. The answer can report that CAO
-truncated the text from a worker. This does not change the result, because the
-supervisor and the checker use the measured state from `observe`.
+acceptance, and the evidence of the checker.
 
 A successful tool call or test run does not prove a multi-agent run. Make sure
 that each zone worker and the checker did their part.
@@ -599,6 +740,23 @@ Do these steps in this sequence:
    uv run --locked python demo.py stop --run-dir "$RUN_DIR"
    ```
 
+   <details>
+   <summary>Expected output</summary>
+
+   The output is the full state, as in Step 8. An excerpt:
+
+   ```json
+   {
+     "run_id": "<run_id>",
+     "stopped": true,
+     "payloads": {
+       "tote": {"xy": [2.0, 0.0], "at": "etch", "owner": "east", "offer": null}
+     }
+   }
+   ```
+
+   </details>
+
    Make sure that the output shows `"stopped": true`. The controller stays
    available for `observe` until step 3.
 2. Stop the CAO session:
@@ -607,10 +765,37 @@ Do these steps in this sequence:
    cao shutdown --session "$SESSION"
    ```
 
-   The command prints `✓ Shutdown session '<name>'`. If it prints
-   `already removed`, compare `$SESSION` with the output of `cao session list`.
+   <details>
+   <summary>Expected output</summary>
+
+   ```text
+   ✓ Shutdown session 'cao-transport-<run_id>'
+   ```
+
+   </details>
+
+   If the command prints `already removed`, compare `$SESSION` with the
+   output of `cao session list`.
 3. In Terminal 2, press Ctrl+C. The controller stops and writes
-   `last-state.json` to the run directory.
+   `last-state.json` to the run directory. With `--record`, it also writes the
+   animation and the picture viewer. See
+   [See the robots move](#see-the-robots-move).
+
+   <details>
+   <summary>Expected output</summary>
+
+   ```text
+   INFO:     Shutting down
+   INFO:     Waiting for application shutdown.
+   <time> mcp.server.streamable_http_manager StreamableHTTP session manager shutting down
+   INFO:     Application shutdown complete.
+   INFO:     Finished server process [<pid>]
+   <time> transport Recorded 14 frame(s); open /tmp/cao-transport-frames/index.html
+   ```
+
+   The number of frames depends on the run.
+
+   </details>
 4. In Terminal 1, remove the installed files of this run. `cao profile remove`
    removes the copy in the CAO profile store. Then the loop reads
    `install.log` and removes each other path that `cao install` printed in
@@ -624,6 +809,20 @@ Do these steps in this sequence:
      while IFS= read -r path; do rm -f -- "$path"; done
    ```
 
+   <details>
+   <summary>Expected output</summary>
+
+   One line for each of the four run copies. The `sed` loop prints nothing.
+
+   ```text
+   ✓ Removed 'transport_checker_<id>' from ~/.aws/cli-agent-orchestrator/agent-store
+   ✓ Removed 'transport_supervisor_<id>' from ~/.aws/cli-agent-orchestrator/agent-store
+   ✓ Removed 'transport_zone_worker_<id>' from ~/.aws/cli-agent-orchestrator/agent-store
+   ✓ Removed 'transport_zone_worker_<id>' from ~/.aws/cli-agent-orchestrator/agent-store
+   ```
+
+   </details>
+
    Remove only the files of this run.
 5. Keep `last-state.json` if you need it. Then remove the run directory:
 
@@ -631,10 +830,87 @@ Do these steps in this sequence:
    rm -rf -- "${RUN_DIR:?}"
    ```
 
+   The command prints nothing. The pictures are not in the run directory. When
+   you do not need them, remove them with `rm -rf -- /tmp/cao-transport-frames`.
+
 6. If you do not need `cao-server`, press Ctrl+C in Terminal 3.
 
 The credential files are temporary. Do not commit them, and do not attach them
 to an issue or a pull request.
+
+## See the robots move
+
+`demo.py serve --record DIR` saves pictures of the MuJoCo world. Step 3 uses
+this option. The directory must be new or empty. The pictures come from a
+fixed overview camera. They do not change the simulation.
+
+This animation comes from a run of [Run the demo](#run-the-demo) with
+`--provider claude_code`:
+
+![Animation of the run: the blue west cart carries the pink tote from stock to the amber dock. Then the green east cart carries the tote from the dock to etch.](images/run-animation.png)
+
+The controller checks the measured state two times each second. It saves a
+picture after each of these changes:
+
+- A robot or a payload moves to a new position, measured to 1 cm.
+- The owner or the offer of a payload changes.
+- A command changes its status.
+- The operator stops the run.
+
+The pictures do not show the owner and the offer. The captions in
+`index.html` give them.
+
+| Picture | State |
+| --- | --- |
+| ![Start of the run](images/run-1-start.png) | 1. Start. The tote is on `cart-west` at `stock`, owner `west`. `cart-east` waits at the dock. |
+| ![The west leg](images/run-2-west-leg.png) | 2. The west zone worker moves `cart-west` with the tote to the dock. |
+| ![The tote at the dock](images/run-3-dock.png) | 3. The tote is at the dock, above the two carts. West offers custody to east, and east accepts. The owner changes from `west` to `east`. |
+| ![The east leg](images/run-4-east-leg.png) | 4. The east zone worker moves `cart-east` with the tote to `etch`. `cart-west` stays at the dock. |
+| ![The tote delivered at etch](images/run-5-delivered.png) | 5. Delivered. The tote is at `etch`, owner `east`. |
+
+| In the picture | Item |
+| --- | --- |
+| Light blue area, light green area | Zone `west`, zone `east` |
+| Strong blue box, strong green box | `cart-west`, `cart-east`. A robot has the strong color of its zone. |
+| Pink box | `tote` |
+| Amber disc | `dock`, the shared dock of the two zones |
+| Dark grey discs | `stock` and `etch` |
+
+The controller writes these files to the directory:
+
+| File | Written | Contents |
+| --- | --- | --- |
+| `latest.png` | At each change | The last picture |
+| `frame-0001.png`, `frame-0002.png`, ... | At each change | One picture for each change |
+| `animation.png` | At Ctrl+C | An animated PNG of all the pictures. Open it in a web browser. |
+| `frames.json` | At Ctrl+C | The file, time, caption, and measured positions of each picture |
+| `index.html` | At Ctrl+C | A page that shows each picture with its caption. Use **Previous**, **Play**, **Next**, or the slider. |
+
+To open the page on macOS, run this command. On Linux, use `xdg-open`
+instead of `open`.
+
+```bash
+open /tmp/cao-transport-frames/index.html
+```
+
+<details>
+<summary>Expected output</summary>
+
+The command prints nothing. Your web browser shows the page.
+
+</details>
+
+The pictures need OpenGL, but no separate GPU:
+
+- On macOS, the pictures work with no settings.
+- On Linux, MuJoCo uses GLFW by default, and GLFW needs a display. Without a
+  display, set `MUJOCO_GL` in Terminal 2 before Step 3.
+  `export MUJOCO_GL=egl` uses an EGL driver. `export MUJOCO_GL=osmesa` uses
+  OSMesa, a software renderer on the CPU. Install the OSMesa library of your
+  Linux distribution first.
+- If the renderer does not start, the controller logs `Recording is off:` and
+  continues without pictures. At Ctrl+C, it logs `Recorded no frames`. The
+  simulation and the agents work as usual.
 
 ## Demo scenarios
 
@@ -685,6 +961,14 @@ json.dump(scene, open("/tmp/slow-site.json", "w"), indent=2)
 EOF
 ```
 
+<details>
+<summary>Expected output</summary>
+
+The commands print nothing. They write `/tmp/heavy-site.json` and
+`/tmp/slow-site.json`.
+
+</details>
+
 To stop the run during a move:
 
 1. Look at Terminal 2. Wait for a log line with `operation=move status=running`.
@@ -693,6 +977,25 @@ To stop the run during a move:
    ```bash
    uv run --locked python demo.py stop --run-dir "$RUN_DIR"
    ```
+
+   <details>
+   <summary>Expected output</summary>
+
+   An excerpt. The position of the tote depends on the time of the stop.
+
+   ```json
+   {
+     "stopped": true,
+     "payloads": {
+       "tote": {"xy": [-1.862, 0.0], "at": null, "owner": "west", "offer": null}
+     },
+     "commands": [
+       {"actor": "west", "command_id": "west-tote-stock-to-dock", "operation": "move", "status": "interrupted", "reason": "operator_stop"}
+     ]
+   }
+   ```
+
+   </details>
 
 3. Make sure that the output shows `"stopped": true` and a move with
    `"status": "interrupted"`.
@@ -726,11 +1029,9 @@ transport. Prepare a new run and try again.
 - Only the supervisor can delegate. CAO checks the profile grant of the
   caller. It refuses `assign`, `handoff`, and workflow runs from the zone
   workers and the checker.
-- With a provider that has native enforcement, the provider blocks the shell
-  and file tools of the zone workers and the checker. With Copilot CLI, they
-  can still call `send_message`. CAO adds `cao-mcp-server` to each Copilot
-  terminal, and CAO does not gate `send_message`.
-- With a provider that has no native enforcement, only the instructions forbid
+- If the provider enforces the allowlist, it blocks the shell and file tools
+  of the zone workers and the checker.
+- If the provider does not enforce the allowlist, only the instructions forbid
   the shell and file tools. An agent can then read the credential files of the
   other zones. See [Providers](#providers).
 - The tokens do not appear in output, profile text, or process arguments. Each
@@ -777,12 +1078,14 @@ transport. Prepare a new run and try again.
 | `demo.py` | The operator commands `prepare`, `serve`, `status`, and `stop`, and the `connect` stdio relay that the profiles start |
 | `simulation.py` | The shared MuJoCo world: ownership and capability checks, bounded motion, command history, and custody changes |
 | `transport_mcp.py` | The authenticated FastMCP server and its scoped tools. It does no planning and no language interpretation. |
+| `recorder.py` | The optional pictures of `serve --record`: PNG frames, the animated PNG, `frames.json`, and `index.html` |
 | `transport_supervisor.md` | Agent profile of the supervisor |
 | `transport_zone_worker.md` | Agent profile of the zone workers. All zones use this profile. |
 | `transport_checker.md` | Agent profile of the checker |
 | `site.json` | Default scene: zones `west` and `east`, tote from `stock` to `etch` |
 | `return-site.json` | Alternative scene: zones `stores` and `assembly`, tray from `rack` to `inspection` |
-| `tests/` | Simulator, MCP, and setup tests |
+| `images/` | The pictures in [See the robots move](#see-the-robots-move), from a run of this guide |
+| `tests/` | Simulator, MCP, recorder, and setup tests |
 
 To run the tests:
 

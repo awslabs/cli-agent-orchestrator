@@ -3,8 +3,12 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import signal
+import socket
 import stat
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import demo
@@ -115,6 +119,71 @@ def test_server_cannot_restart_with_lost_command_history_and_old_credentials(tmp
     with pytest.raises(FileExistsError):
         demo.serve(run_dir, allow_motion=True)
     assert len(calls) == 1
+
+
+def _free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Ctrl+C is SIGINT on POSIX")
+def test_ctrl_c_stops_the_controller_cleanly(tmp_path):
+    # The README stops the controller with Ctrl+C: no traceback, exit 0, final state.
+    run_dir = tmp_path / "run"
+    port = _free_port()
+    demo.prepare(run_dir, EXAMPLE / "site.json", port=port, provider="copilot_cli")
+    process = subprocess.Popen(
+        [sys.executable, str(EXAMPLE / "demo.py"), "serve", "--run-dir", str(run_dir)],
+        cwd=EXAMPLE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while True:
+            assert process.poll() is None, process.communicate()[1]
+            with socket.socket() as probe:
+                if probe.connect_ex(("127.0.0.1", port)) == 0:
+                    break
+            assert time.monotonic() < deadline, "the controller did not start"
+            time.sleep(0.2)
+        process.send_signal(signal.SIGINT)
+        _, stderr = process.communicate(timeout=60)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+    assert process.returncode == 0, stderr
+    assert "Traceback" not in stderr
+    assert json.loads((run_dir / "last-state.json").read_text())["run_id"]
+
+
+def test_serve_without_frames_does_not_point_to_a_viewer(tmp_path, monkeypatch, caplog):
+    run_dir = tmp_path / "run"
+    demo.prepare(run_dir, EXAMPLE / "site.json", port=8766, provider="copilot_cli")
+
+    class Server:
+        def run(self, **kwargs):
+            raise KeyboardInterrupt
+
+    class Recorder:
+        def __init__(self, world, directory):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            return []
+
+    monkeypatch.setattr(demo, "make_server", lambda *args: Server())
+    monkeypatch.setattr(demo, "Recorder", Recorder)
+    with caplog.at_level("INFO", logger="transport"):
+        demo.serve(run_dir, allow_motion=False, record=tmp_path / "frames")
+    assert "Recorded no frames" in caplog.text
+    assert "index.html" not in caplog.text
 
 
 def test_additional_zones_get_the_same_shared_operator_prompt(tmp_path):

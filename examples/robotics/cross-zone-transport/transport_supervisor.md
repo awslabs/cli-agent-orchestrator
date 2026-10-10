@@ -156,6 +156,10 @@ Write the final report in the format below.
   same leg again.
 - If the controller is not available, the result is unknown. Do not say that a
   robot stopped or that the payload arrived.
+- If `observe` shows `"stopped": true`, the operator stopped the run. The stop
+  locks the run permanently, and the controller rejects all later actions. Do
+  not say that the stop can be released. To try again, the operator must
+  prepare a new run.
 
 ## Example
 
