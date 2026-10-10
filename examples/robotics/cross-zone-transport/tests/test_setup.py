@@ -325,11 +325,15 @@ def test_prepare_refuses_an_unknown_provider_before_creating_a_run(tmp_path):
     assert not run_dir.exists()
 
 
-@pytest.mark.parametrize("provider", ["hermes", "opencode_cli"])
+@pytest.mark.parametrize("provider", ["cursor_cli", "hermes", "opencode_cli"])
 def test_a_provider_without_per_agent_mcp_servers_is_refused(
     tmp_path, monkeypatch, capsys, provider
 ):
-    if provider == "opencode_cli":
+    if provider == "cursor_cli":
+        # The Cursor provider leaves the profile body out of a direct launch.
+        source = (CAO_SOURCE / "providers/cursor_cli.py").read_text()
+        assert "System prompt injection is intentionally omitted" in source
+    elif provider == "opencode_cli":
         # cao install writes the servers of every OpenCode profile into one shared
         # configuration keyed by server name; the last install replaces the others.
         source = (CAO_SOURCE / "utils/opencode_config.py").read_text()
@@ -337,7 +341,7 @@ def test_a_provider_without_per_agent_mcp_servers_is_refused(
     else:
         # The Hermes provider never reads the mcpServers of the CAO profile.
         assert "mcpServers" not in (CAO_SOURCE / "providers/hermes.py").read_text()
-    assert demo.SUPPORTED_PROVIDERS == demo.CAO_PROVIDERS - {"hermes", "opencode_cli"}
+    assert demo.SUPPORTED_PROVIDERS == demo.CAO_PROVIDERS - {"cursor_cli", "hermes", "opencode_cli"}
     run_dir = tmp_path / "run"
     with pytest.raises(ValueError, match=f"{provider} is not supported"):
         demo.prepare(run_dir, EXAMPLE / "site.json", port=8766, provider=provider)

@@ -437,6 +437,7 @@ own credential. `prepare` refuses a provider that cannot do this:
 
 | Provider | Reason |
 | --- | --- |
+| `cursor_cli` | CAO starts Cursor CLI without the instructions of the agent profile. The CAO supervisor would get neither its workflow nor its run bindings. |
 | `opencode_cli` | OpenCode keeps the MCP servers of all agents in one shared configuration. All the agents would then use the same credential. |
 | `hermes` | Hermes reads MCP servers only from its own Hermes profile, not from the CAO agent profile. The agents would get no simulator server. |
 
