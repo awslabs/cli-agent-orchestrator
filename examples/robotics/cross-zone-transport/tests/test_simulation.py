@@ -241,3 +241,11 @@ def test_invalid_or_hardware_configuration_fails_closed(mutate):
     mutate(data)
     with pytest.raises(ValidationError):
         Scene.model_validate(data)
+
+
+def test_a_narrow_zone_still_builds_a_world(scene):
+    # A valid zone 4 cm wide. The render inset must not make its tile negative.
+    data = scene.model_dump(mode="json")
+    data["zones"]["strip"] = {"bounds": [3.0, -1.0, 3.04, 1.0]}
+    narrow = World(Scene.model_validate(data))
+    assert all(size > 0 for size in narrow.model.geom("visual/zone/strip").size)

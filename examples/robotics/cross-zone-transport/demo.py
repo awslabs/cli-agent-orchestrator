@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 import yaml
 from fastmcp.server import create_proxy
-from recorder import Recorder, ensure_empty_directory
+from recorder import Recorder, RecordingError, ensure_empty_directory
 from simulation import Scene, World
 from transport_mcp import controller_client, make_server
 
@@ -252,7 +252,7 @@ def serve(run_dir: Path, *, allow_motion: bool, record: Path | None = None) -> N
         if recorder is not None:
             try:
                 frames = recorder.stop()
-            except TimeoutError as error:
+            except (TimeoutError, RecordingError) as error:
                 logging.getLogger("transport").error(
                     "Recording is not complete: %s. The files in %s can be incomplete.",
                     error,

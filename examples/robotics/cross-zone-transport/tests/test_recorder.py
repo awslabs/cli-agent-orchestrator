@@ -13,7 +13,14 @@ import demo
 import mujoco
 import numpy as np
 import pytest
-from recorder import Recorder, encode_apng, encode_png, ensure_empty_directory
+from recorder import (
+    Recorder,
+    RecordingError,
+    compress_pixels,
+    encode_apng,
+    encode_png,
+    ensure_empty_directory,
+)
 from simulation import Scene, World
 
 EXAMPLE = Path(__file__).resolve().parents[1]
@@ -175,7 +182,51 @@ def test_stop_reports_a_writer_that_does_not_finish(tmp_path):
         recorder._thread.join(5)
 
 
-def test_serve_does_not_claim_a_recording_that_timed_out(tmp_path, monkeypatch, caplog):
+def test_a_render_failure_after_start_is_reported_not_hidden(tmp_path, caplog):
+    class FailingRenderer(FakeRenderer):
+        def render(self):
+            if len(self.cameras) > 1:
+                raise OSError("the disk is full")
+            return super().render()
+
+    w = world()
+    recorder = Recorder(
+        w, tmp_path, interval=0.02, width=8, height=8, renderer_factory=FailingRenderer
+    )
+    recorder.start()
+    assert wait_for(lambda: len(recorder.frames) == 1)
+    w.stop()  # A state change: the recorder renders again, and the render fails.
+    with pytest.raises(RecordingError, match="the disk is full"):
+        recorder.stop()
+    assert len(recorder.frames) == 1
+    assert "Recording stopped" in caplog.text
+    assert (tmp_path / "frames.json").exists(), "the frames before the failure stay readable"
+
+
+def test_a_long_animation_still_ends_on_the_last_frame(tmp_path, monkeypatch):
+    monkeypatch.setattr("recorder.MAX_ANIMATION_FRAMES", 3)
+    w = world()
+    recorder = Recorder(w, tmp_path, width=4, height=2)
+    state = w.observe()
+    for value in range(5):
+        recorder._write_frame(np.full((2, 4, 3), value, dtype=np.uint8), state, None)
+    recorder._write_outputs()
+
+    assert len(recorder.frames) == 5, "frames.json and index.html keep every frame"
+    chunks = png_chunks((tmp_path / "animation.png").read_bytes())
+    assert struct.unpack(">II", chunks[b"acTL"][0]) == (3, 0)
+    last = compress_pixels(np.full((2, 4, 3), 4, dtype=np.uint8))
+    assert chunks[b"fdAT"][-1][4:] == last
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TimeoutError("the recorder did not finish writing frames in 15 s"),
+        RecordingError("the recording stopped early (OSError: the disk is full)"),
+    ],
+)
+def test_serve_does_not_claim_an_incomplete_recording(tmp_path, monkeypatch, caplog, error):
     run_dir = tmp_path / "run"
     demo.prepare(run_dir, EXAMPLE / "site.json", port=8766, provider="copilot_cli")
 
@@ -191,7 +242,7 @@ def test_serve_does_not_claim_a_recording_that_timed_out(tmp_path, monkeypatch, 
             pass
 
         def stop(self):
-            raise TimeoutError("the recorder did not finish writing frames in 15 s")
+            raise error
 
     monkeypatch.setattr(demo, "make_server", lambda *args: Server())
     monkeypatch.setattr(demo, "Recorder", StuckRecorder)
