@@ -163,10 +163,17 @@ class Recorder:
         self._thread.start()
 
     def stop(self, timeout: float = 15) -> list[dict]:
-        """Write a last frame if the state changed, write the outputs, and return the frames."""
+        """Write a last frame if the state changed, write the outputs, and return the frames.
+
+        Raises TimeoutError when the outputs are not complete within ``timeout``.
+        """
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
+            if self._thread.is_alive():
+                raise TimeoutError(
+                    f"the recorder did not finish writing {self.directory} in {timeout} s"
+                )
         return self.frames
 
     def _run(self) -> None:

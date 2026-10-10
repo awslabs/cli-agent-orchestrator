@@ -61,6 +61,10 @@ NATIVE_ENFORCEMENT = frozenset(
 # For hermes, CAO writes no MCP configuration: Hermes reads MCP servers only
 # from its own Hermes profile (docs/hermes.md, "MCP Configuration").
 UNSUPPORTED_PROVIDERS = {
+    "cursor_cli": (
+        "CAO launches Cursor CLI without the instructions of the agent profile, so the "
+        "CAO supervisor would get neither its workflow nor its run bindings"
+    ),
     "hermes": (
         "Hermes reads MCP servers only from its own Hermes profile, not from the CAO "
         "agent profile, so the agents would get no simulator server"
@@ -246,15 +250,23 @@ def serve(run_dir: Path, *, allow_motion: bool, record: Path | None = None) -> N
         pass
     finally:
         if recorder is not None:
-            frames = recorder.stop()
-            if frames:
-                logging.getLogger("transport").info(
-                    "Recorded %d frame(s); open %s", len(frames), Path(record) / "index.html"
+            try:
+                frames = recorder.stop()
+            except TimeoutError as error:
+                logging.getLogger("transport").error(
+                    "Recording is not complete: %s. The files in %s can be incomplete.",
+                    error,
+                    record,
                 )
             else:
-                logging.getLogger("transport").warning(
-                    "Recorded no frames. See the README section 'See the robots move'."
-                )
+                if frames:
+                    logging.getLogger("transport").info(
+                        "Recorded %d frame(s); open %s", len(frames), Path(record) / "index.html"
+                    )
+                else:
+                    logging.getLogger("transport").warning(
+                        "Recorded no frames. See the README section 'See the robots move'."
+                    )
 
 
 async def operator_call(run_dir: Path, tool: str) -> dict:

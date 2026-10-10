@@ -154,6 +154,53 @@ def test_a_renderer_that_cannot_start_disables_recording_only(tmp_path, caplog):
     assert w.observe()["stopped"] is False
 
 
+def test_stop_reports_a_writer_that_does_not_finish(tmp_path):
+    release = threading.Event()
+
+    class SlowRenderer(FakeRenderer):
+        def render(self):
+            release.wait(5)
+            return super().render()
+
+    w = world()
+    recorder = Recorder(
+        w, tmp_path, interval=0.02, width=8, height=8, renderer_factory=SlowRenderer
+    )
+    recorder.start()
+    try:
+        with pytest.raises(TimeoutError, match="did not finish"):
+            recorder.stop(timeout=0.1)
+    finally:
+        release.set()
+        recorder._thread.join(5)
+
+
+def test_serve_does_not_claim_a_recording_that_timed_out(tmp_path, monkeypatch, caplog):
+    run_dir = tmp_path / "run"
+    demo.prepare(run_dir, EXAMPLE / "site.json", port=8766, provider="copilot_cli")
+
+    class Server:
+        def run(self, **kwargs):
+            raise KeyboardInterrupt
+
+    class StuckRecorder:
+        def __init__(self, world, directory):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            raise TimeoutError("the recorder did not finish writing frames in 15 s")
+
+    monkeypatch.setattr(demo, "make_server", lambda *args: Server())
+    monkeypatch.setattr(demo, "Recorder", StuckRecorder)
+    with caplog.at_level("INFO", logger="transport"):
+        demo.serve(run_dir, allow_motion=False, record=tmp_path / "frames")
+    assert "Recording is not complete" in caplog.text
+    assert "Recorded" not in caplog.text
+
+
 def test_real_renderer_draws_the_overview_camera(tmp_path):
     """Runs only where MuJoCo can create an OpenGL context (macOS, or MUJOCO_GL set)."""
     if sys.platform != "darwin" and not os.environ.get("MUJOCO_GL"):
@@ -170,7 +217,8 @@ def test_real_renderer_draws_the_overview_camera(tmp_path):
         except Exception as error:  # noqa: BLE001
             result["error"] = error
 
-    thread = threading.Thread(target=attempt)
+    # A daemon thread: if the renderer hangs, the skip below still lets pytest exit.
+    thread = threading.Thread(target=attempt, daemon=True)
     thread.start()
     thread.join(timeout=60)
     if "pixels" not in result:
