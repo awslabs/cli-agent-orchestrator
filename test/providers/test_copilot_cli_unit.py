@@ -20,13 +20,13 @@ class TestCopilotDownloadedUpdateFooter:
     )
     model = "reviewer · Claude Haiku 5.5"
 
+    @pytest.mark.parametrize("version", ["v1.0.94", "v1.0.96-2", "v1.0.95-0"])
     @pytest.mark.parametrize("shared_row", [True, False])
     @pytest.mark.parametrize("reply", ["", "❯ review the change\n● FINDINGS: NO\n"])
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
-    def test_downloaded_update_footer_is_ready(self, mock_backend, shared_row, reply):
-        footer = (
-            f"{self.hint}            {self.model}" if shared_row else f"{self.hint}\n{self.model}"
-        )
+    def test_downloaded_update_footer_is_ready(self, mock_backend, shared_row, reply, version):
+        hint = self.hint.replace("v1.0.94", version)
+        footer = f"{hint}            {self.model}" if shared_row else f"{hint}\n{self.model}"
         rule = "─" * 160
         output = f"{reply}{rule}\n❯\n{rule}\n {footer}\n"
         mock_backend.return_value.get_native_status.return_value = None

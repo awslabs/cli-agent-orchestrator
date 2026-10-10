@@ -83,7 +83,8 @@ COPILOT_STATUS_BAR_PATTERN = r"^\s*(?:autopilot|plan|interactive)\s*[·•]"
 # Path can be tilde-prefixed (home) or absolute (e.g. /tmp/...), so allow both.
 COPILOT_CWD_BREADCRUMB_PATTERN = r"^\s+(?:~|/)[^\[]*\["
 COPILOT_HINT_BAR_PATTERN = (
-    r"^(?:v\d+\.\d+\.\d+ downloaded\s*[·•]\s*next launch or /restart\s*[·•]\s*)?"
+    r"^(?:v\d+\.\d+\.\d+(?:-[0-9a-z.-]+)? downloaded\s*[·•]\s*"
+    r"next launch or /restart\s*[·•]\s*)?"
     r"←.*[·•]\s*/ commands\b"
 )
 COPILOT_AGENT_MODEL_BAR_PATTERN = r"^(?:[\w.-]+\s*[·•]\s*)?github copilot\s*[·•]"
