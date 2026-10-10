@@ -1651,3 +1651,100 @@ class TestStatusObservationIsStampedWhenEarned:
         sm._status_generation["t1"] = 5
         sm.reset_buffer("t1")
         assert "t1" not in sm._status_generation
+
+
+class TestPollRederivesOnRegisteredDetector:
+    """GH #865: while the cached status is PROCESSING, ``get_status`` re-derives
+    on every poll. A screen-path provider must be re-read from its composited
+    screen, not the raw rolling window: Ink repaints only changed cells, so the
+    window holds glyph fragments and, once a long answer has pushed the input box
+    past the size cap, no box at all. Read from there, the raw detector called a
+    streaming turn ready and ``run_step`` tore the worker down mid-answer."""
+
+    class _Screen:
+        def __init__(self, rows):
+            self.display = rows
+
+    def _monitor(self, provider, rows):
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = "✢\n 3\n· thinking\n⏺\n❯\xa0\n"  # raw window: fragments, no box
+        sm._buffer_changed_at["t1"] = time.monotonic()  # still streaming: not quiet
+        sm._screens["t1"] = (self._Screen(rows), MagicMock())
+        return sm
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_screen_provider_is_polled_from_the_composite(self, mock_pm, mock_get_backend):
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.supports_screen_status_poll = True
+        provider.get_status_from_screen.return_value = TerminalStatus.PROCESSING
+        provider.get_status.return_value = TerminalStatus.COMPLETED  # what the raw window would say
+        mock_pm.get_provider.return_value = provider
+        mock_get_backend.return_value = _backend(event_inbox=False)
+
+        sm = self._monitor(provider, ["⏺ BEGIN", "  1 Hydrogen …", "────", "❯", "────"])
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        provider.get_status_from_screen.assert_called_once()
+        provider.get_status.assert_not_called()
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_screen_provider_ready_verdict_from_the_composite_is_applied(
+        self, mock_pm, mock_get_backend
+    ):
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.supports_screen_status_poll = True
+        provider.get_status_from_screen.return_value = TerminalStatus.COMPLETED
+        mock_pm.get_provider.return_value = provider
+        mock_get_backend.return_value = _backend(event_inbox=False)
+
+        sm = self._monitor(provider, ["⏺ done", "✻ Worked for 4s", "────", "❯", "────"])
+
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        provider.get_status.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_raw_provider_keeps_the_raw_rederivation(self, mock_pm, mock_get_backend):
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        provider.supports_screen_status_poll = False
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        mock_pm.get_provider.return_value = provider
+        mock_get_backend.return_value = _backend(event_inbox=False)
+
+        sm = self._monitor(provider, [])
+
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        provider.get_status.assert_called_once_with(sm._buffers["t1"])
+        provider.get_status_from_screen.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_screen_provider_without_the_opt_in_keeps_the_raw_rederivation(
+        self, mock_pm, mock_get_backend
+    ):
+        """A screen-path provider that has not opted in (kimi_cli) is re-read
+        from the raw window as before; its turn bookkeeping lives there."""
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.supports_screen_status_poll = False
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        mock_pm.get_provider.return_value = provider
+        mock_get_backend.return_value = _backend(event_inbox=False)
+
+        sm = self._monitor(provider, ["> "])
+
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        provider.get_status.assert_called_once_with(sm._buffers["t1"])
+        provider.get_status_from_screen.assert_not_called()
