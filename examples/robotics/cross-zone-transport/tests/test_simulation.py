@@ -159,7 +159,7 @@ def test_duplicate_command_is_not_executed_twice(world):
     )
 
 
-def test_concurrent_commands_cannot_take_a_busy_robot_or_tote(world):
+def test_concurrent_commands_cannot_take_a_busy_robot_or_parcel(world):
     world.move("west", "first", "cart-west", "parcel", "dock")
     assert world.move("west", "second", "cart-west", "parcel", "stock")["reason"] == "busy"
     assert world.offer("west", "offer", "parcel", "east")["reason"] == "busy"
@@ -197,7 +197,7 @@ def test_timeout_is_not_a_completed_transport(world):
     assert world.observe()["payloads"]["parcel"]["at"] == "stock"
 
 
-def test_sender_cannot_move_an_offered_tote(world):
+def test_sender_cannot_move_an_offered_parcel(world):
     world.move("west", "dock", "cart-west", "parcel", "dock")
     finish(world, "west", "dock")
     world.offer("west", "offer", "parcel", "east")
