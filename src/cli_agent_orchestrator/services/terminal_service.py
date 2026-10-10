@@ -153,6 +153,15 @@ _DEFERRED_INIT_COMPLETE_FALLBACK_SUFFIX = ".deferred-init-complete"
 _DEFERRED_INIT_SIDECAR_LOCK = threading.RLock()
 
 
+class IdempotencyKeyNotFound(Exception):
+    """A ``lookup_only`` create found no live terminal for its idempotency key.
+
+    Review on PR #773. Surfaced as HTTP 404 by both create endpoints. Not a
+    ``ValueError`` for the same reason as ``IdempotencyKeyConflict`` below: the
+    endpoints already give ``ValueError`` other meanings.
+    """
+
+
 class IdempotencyKeyConflict(Exception):
     """An idempotency key was reused for a DIFFERENT request.
 
@@ -320,6 +329,35 @@ def _clear_deferred_init_external_owner_active(terminal_id: str) -> None:
 def _is_deferred_init_external_owner_active(terminal_id: str) -> bool:
     with _active_deferred_init_external_owner_lock:
         return terminal_id in _active_deferred_init_external_owner_ids
+
+
+class _SyncInitWaiter:
+    """Settles when a synchronous create's ``provider.initialize()`` finishes.
+
+    Review on PR #773: an idempotent replay used to return the moment the key's
+    terminal row existed, which a keyed synchronous create commits BEFORE it
+    awaits ``provider.initialize()``. A caller recovering from its own client
+    timeout therefore got the terminal back while the provider was still
+    starting, and then sent input into it. The original request only ever
+    returns a READY terminal, so a replay of it must not return anything
+    earlier: it waits on this until the original initialization settles.
+    """
+
+    def __init__(self) -> None:
+        self.settled = asyncio.Event()
+        self.error: Optional[BaseException] = None
+
+    def settle(self, error: Optional[BaseException] = None) -> None:
+        if not self.settled.is_set():
+            self.error = error
+            self.settled.set()
+
+
+# terminal_id -> waiter, only for keyed synchronous creates whose row is
+# committed but whose initialization has not settled yet. Entries remove
+# themselves on settle; a replay that arrives afterwards sees either a ready
+# terminal (success) or no row at all (failed create, rolled back).
+_pending_sync_inits: Dict[str, _SyncInitWaiter] = {}
 
 
 def inject_memory_context(
@@ -1045,6 +1083,7 @@ async def create_terminal(
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
+    lookup_only: bool = False,
     claim_id: Optional[str] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
@@ -1097,6 +1136,14 @@ async def create_terminal(
         metadata: Free-form JSON describing what this terminal is doing.
             Also updatable later by the running agent via the
             ``update_metadata`` MCP tool.
+        lookup_only: Review on PR #773. Resolve ``idempotency_key`` to the
+            terminal a prior call committed and return it at once -- without
+            waiting for that call's provider initialization and without ever
+            allocating. Raises ``IdempotencyKeyNotFound`` when the key maps to
+            no live terminal. The same fingerprint check as any other replay
+            applies, so this is not a fingerprint-blind lookup. The returned
+            terminal may still be initializing: it is an identity for
+            inspection and cleanup, not permission to send input.
         idempotency_key: Review on PR #634, issue #616. When given and a PRIOR
             call already created a terminal for the SAME KEY **and the same
             request**, that terminal is returned as-is and nothing else in
@@ -1300,6 +1347,7 @@ async def create_terminal(
             group=group,
             metadata=metadata,
             idempotency_key=idempotency_key,
+            lookup_only=lookup_only,
             claim_id=claim_id,
             ephemeral_state=state,
         )
@@ -1333,6 +1381,7 @@ async def _create_terminal_unguarded(
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
+    lookup_only: bool = False,
     claim_id: Optional[str] = None,
     *,
     ephemeral_state: _EphemeralLaunchState,
@@ -1344,6 +1393,8 @@ async def _create_terminal_unguarded(
     # retry on a full node -- the one case this feature exists to make safe.
     # The cap still precedes every actual allocation (worktree, tmux window, DB
     # row, provider process), which is all its own placement-guard needs.
+    if lookup_only and not idempotency_key:
+        raise ValueError("lookup_only requires an idempotency_key")
     request_fingerprint: Optional[str] = None
     if idempotency_key:
         request_fingerprint = _request_fingerprint(
@@ -1427,6 +1478,25 @@ async def _create_terminal_unguarded(
                 # A genuine retry: same key, same request. Return the terminal
                 # the first call produced without doing any real work -- the
                 # property haofeif signed off on, unchanged by the check above.
+                #
+                # If that first call is a synchronous create still inside
+                # provider.initialize(), wait for it first: the replay must
+                # give back what the original would, a READY terminal, not one
+                # whose provider is still starting (review on PR #773). The
+                # replay's own defer_init does not matter here: it is not part
+                # of the request fingerprint, and only a synchronous original
+                # registers a waiter, so a waiter means the original promised
+                # a ready terminal. lookup_only is the one explicit way to get
+                # the identity without waiting.
+                waiter = _pending_sync_inits.get(existing_terminal_id)
+                if waiter is not None and not lookup_only:
+                    await waiter.settled.wait()
+                    if waiter.error is not None:
+                        raise RuntimeError(
+                            f"terminal {existing_terminal_id!r} for idempotency_key "
+                            f"{idempotency_key!r} failed to initialize: {waiter.error}"
+                        ) from waiter.error
+                    row = get_terminal(existing_terminal_id)
                 try:
                     return Terminal(**row)
                 except ValidationError as exc:
@@ -1438,6 +1508,14 @@ async def _create_terminal_unguarded(
                         f"idempotency_key {idempotency_key!r} but its stored row does "
                         f"not satisfy the Terminal model: {exc}"
                     ) from exc
+
+    if lookup_only:
+        # The key maps to no live terminal. A lookup never allocates: it exists
+        # so a caller whose bounded wait expired can recover the identity of
+        # work that IS committed, not start new work (review on PR #773).
+        raise IdempotencyKeyNotFound(
+            f"no terminal is recorded for idempotency_key {idempotency_key!r}"
+        )
 
     # Per-node terminal cap (one-agent-per-pod k8s topology; worker pods set
     # CAO_MAX_TERMINALS=1). Checked FIRST, before any resource (worktree, tmux
@@ -1456,6 +1534,7 @@ async def _create_terminal_unguarded(
             )
 
     terminal_id: Optional[str] = None
+    sync_init_waiter: Optional[_SyncInitWaiter] = None
     created_terminal_facts: Optional[Dict[str, Any]] = None
     # The window name the failure handler rolls back. ``window_name`` itself is
     # first bound inside the try, so a failure before that point (capability
@@ -1551,6 +1630,11 @@ async def _create_terminal_unguarded(
 
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
+        # Registered BEFORE the row (and this key's mapping) can be committed,
+        # so there is no window in which a replay finds the row but no waiter.
+        if idempotency_key and not defer_init:
+            sync_init_waiter = _SyncInitWaiter()
+            _pending_sync_inits[terminal_id] = sync_init_waiter
         if source is agent_profiles.ProfileSource.EPHEMERAL:
             ephemeral_service.bind_ephemeral_agent(
                 agent_profile,
@@ -2037,9 +2121,13 @@ async def _create_terminal_unguarded(
                 svc.register_terminal(terminal_id, pane_id, is_kiro)
             except Exception as e:
                 logger.warning(f"Failed to register terminal {terminal_id} with herdr inbox: {e}")
+        if sync_init_waiter is not None:
+            sync_init_waiter.settle()
         return terminal
 
     except Exception as e:
+        if sync_init_waiter is not None:
+            sync_init_waiter.settle(e)
         if not isinstance(e, ephemeral_service.EphemeralPolicyError):
             logger.error(f"Failed to create terminal: {e}")
         # Everything this call built is torn down by ONE owned operation
@@ -2060,6 +2148,12 @@ async def _create_terminal_unguarded(
             worktree_repo_root=worktree_repo_root,
         )
         raise
+    finally:
+        # Every exit, including cancellation, settles the waiter so no replay
+        # can wait forever on a create that is no longer running.
+        if sync_init_waiter is not None and terminal_id is not None:
+            sync_init_waiter.settle(RuntimeError("terminal creation did not complete"))
+            _pending_sync_inits.pop(terminal_id, None)
 
 
 def _notify_cross_node_caller(terminal_id: str, session_name: str, message: str) -> bool:

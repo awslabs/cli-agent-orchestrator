@@ -73,6 +73,7 @@ async def create_session(
     model: str | None = None,
     use_worktree: bool = False,
     idempotency_key: str | None = None,
+    lookup_only: bool = False,
     resume_session_id: str | None = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
@@ -116,6 +117,9 @@ async def create_session(
     else:
         resolved_provider = provider
 
+    # Passed only when set, so the ordinary create call stays
+    # byte-identical for every existing caller (review on PR #773).
+    lookup_kwargs: Dict[str, Any] = {"lookup_only": True} if lookup_only else {}
     terminal = await create_terminal(
         provider=resolved_provider,
         agent_profile=agent_profile,
@@ -132,10 +136,15 @@ async def create_session(
         model=model,
         use_worktree=use_worktree,
         idempotency_key=idempotency_key,
+        **lookup_kwargs,
         resume_session_id=resume_session_id,
         group=group,
         metadata=metadata,
     )
+    if lookup_only:
+        # A lookup resolved a terminal that an earlier call created; no session
+        # was created here, so there is no creation event to publish.
+        return terminal
     dispatch_plugin_event(
         registry,
         "post_create_session",

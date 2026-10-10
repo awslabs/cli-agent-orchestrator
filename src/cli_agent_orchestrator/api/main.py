@@ -169,6 +169,7 @@ from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
     IdempotencyKeyConflict,
+    IdempotencyKeyNotFound,
     OutputMode,
     TerminalInputBlockedError,
     _notify_elastic_terminal_ended,
@@ -3334,6 +3335,7 @@ async def create_session(
     model: Optional[str] = None,
     use_worktree: bool = False,
     idempotency_key: Optional[str] = None,
+    lookup_only: bool = False,
     resume_session_id: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
@@ -3432,6 +3434,11 @@ async def create_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
+        if lookup_only and not idempotency_key:
+            raise ValueError("lookup_only requires an idempotency_key")
+        # Passed only when set, so the ordinary create call stays
+        # byte-identical for every existing caller (review on PR #773).
+        lookup_kwargs: Dict[str, Any] = {"lookup_only": True} if lookup_only else {}
         result = await session_service.create_session(
             provider=provider,
             agent_profile=agent_profile,
@@ -3446,12 +3453,17 @@ async def create_session(
             model=model,
             use_worktree=use_worktree,
             idempotency_key=idempotency_key,
+            **lookup_kwargs,
             resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
         )
 
-        if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
+        if (
+            not lookup_only
+            and memory_manager
+            and str(memory_manager).lower() in ("true", "1", "yes")
+        ):
             registry = get_plugin_registry(request)
             sidecar_provider = provider or DEFAULT_PROVIDER
             sidecar_session = result.session_name
@@ -3499,6 +3511,9 @@ async def create_session(
 
         return result
 
+    except IdempotencyKeyNotFound as e:
+        # lookup_only found nothing committed for this key (review on PR #773).
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except IdempotencyKeyConflict as e:
         # The key was already used for a DIFFERENT request (review on PR #634,
         # issue #616). 409, matching Stripe/AWS IdempotentParameterMismatch,
@@ -3638,6 +3653,7 @@ async def create_terminal_in_session(
     model: Optional[str] = None,
     use_worktree: bool = False,
     idempotency_key: Optional[str] = None,
+    lookup_only: bool = False,
     claim_id: Optional[str] = Query(default=None, pattern=r"^[0-9a-f]{32}$"),
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
@@ -3737,6 +3753,16 @@ async def create_terminal_in_session(
                     ),
                 )
 
+        if lookup_only and not idempotency_key:
+            # A malformed request, not a missing resource: this endpoint maps
+            # ValueError to 404, so reject it here as a 400.
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="lookup_only requires an idempotency_key",
+            )
+        # Passed only when set, so the ordinary create call stays
+        # byte-identical for every existing caller (review on PR #773).
+        lookup_kwargs: Dict[str, Any] = {"lookup_only": True} if lookup_only else {}
         result = await terminal_service.create_terminal(
             provider=resolved_provider,
             agent_profile=agent_profile,
@@ -3753,6 +3779,7 @@ async def create_terminal_in_session(
             model=model,
             use_worktree=use_worktree,
             idempotency_key=idempotency_key,
+            **lookup_kwargs,
             claim_id=claim_id,
         )
         return result
@@ -3760,6 +3787,9 @@ async def create_terminal_in_session(
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
         # orchestration_type) — propagate as-is instead of masking as a 500.
         raise
+    except IdempotencyKeyNotFound as e:
+        # lookup_only found nothing committed for this key (review on PR #773).
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except IdempotencyKeyConflict as e:
         # The key was already used for a DIFFERENT request (review on PR #634,
         # issue #616) — 409, not the 404 the generic ValueError arm below would

@@ -824,3 +824,396 @@ class TestHandoffEarlyTerminalId:
         assert result.success is False
         assert "CAO_TERMINAL_ID not set" in result.message
         mock_create.assert_not_called()
+
+
+class TestHandoffCreateTimeoutCoversProviderFloors:
+    """_HANDOFF_CREATE_TIMEOUT_S must exceed every provider's own unconditional
+    ready-timeout floor (antigravity_cli.py's max(180.0, init_timeout) is the
+    highest known one), or a legitimately-slow-but-successful init gets killed
+    client-side here -- with no exception handling around this specific call,
+    the operator gets a clean-looking failure and no terminal_id to clean up
+    the orphaned worker with."""
+
+    def test_constant_exceeds_known_provider_floors(self):
+        """This is the test that actually pins the regression: 150.0 (the old
+        value) is LESS than antigravity's 180.0 floor; 240.0 is not. Fails
+        against the pre-fix constant, passes after."""
+        assert _HANDOFF_CREATE_TIMEOUT_S > 180.0
+
+    def test_slow_but_successful_create_is_not_killed_client_side(self):
+        """Companion end-to-end sanity check, independent of the constant's
+        actual value: a real HTTP round trip (no `requests` mocking) against a
+        stand-in server that sleeps past a client timeout before answering
+        successfully must still surface the terminal_id, not just a clean
+        failure. Zero existing test exercised this path against a real
+        timeout window before this. Uses its own stand-in timeout/delay
+        values (not the real constant) purely so the test runs in
+        milliseconds -- the mechanism being verified is identical at the real
+        240.0s scale."""
+        import http.server
+        import json
+        import threading
+        import time
+
+        from cli_agent_orchestrator.utils import orchestration
+
+        created_terminal_ids = []
+
+        class SlowServerHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):  # noqa: A002 -- matches base signature
+                pass
+
+            def do_POST(self):
+                if self.path.split("?", 1)[0] == "/sessions":
+                    # Stand-in for cao-server actually finishing provider.initialize()
+                    # after longer than the OLD client timeout would have allowed,
+                    # but still comfortably under the fixed (current) one.
+                    time.sleep(1.2)
+                    terminal_id = "term-0001"
+                    created_terminal_ids.append(terminal_id)
+                    body = json.dumps({"id": terminal_id, "provider": "antigravity_cli"}).encode()
+                    self.send_response(201)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                # The --no-wait path also sends the message directly via
+                # POST /terminals/{id}/input -- not the create call under test,
+                # so just ack it.
+                self.send_response(200)
+                self.end_headers()
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SlowServerHandler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        old_base_url = orchestration.API_BASE_URL
+        old_timeout = orchestration._HANDOFF_CREATE_TIMEOUT_S
+        # Scale both the client timeout and server delay down 150:1 from the
+        # real 240.0s constant, preserving the same "server takes longer than
+        # the OLD 150.0s value but well within the fixed value" relationship.
+        orchestration.API_BASE_URL = f"http://127.0.0.1:{port}"
+        orchestration._HANDOFF_CREATE_TIMEOUT_S = 1.6  # stand-in for 240.0
+        os.environ.pop("CAO_TERMINAL_ID", None)
+
+        try:
+            reported = []
+            result = asyncio.run(
+                orchestration._handoff_impl(
+                    "some-agent-profile",
+                    "do the thing",
+                    on_terminal_id=reported.append,
+                    wait=False,
+                )
+            )
+        finally:
+            orchestration.API_BASE_URL = old_base_url
+            orchestration._HANDOFF_CREATE_TIMEOUT_S = old_timeout
+            server.shutdown()
+            thread.join(timeout=2)
+
+        assert result.success is True
+        assert result.terminal_id == "term-0001"
+        assert reported == ["term-0001"]
+        assert created_terminal_ids == ["term-0001"]
+
+
+class TestHandoffCreateTimeoutRecovery:
+    """Review on PR #773: a fixed create timeout can never cover every
+    provider's real init time, so handoff's synchronous create retries under
+    the SAME idempotency key with the full budget each time. The server holds a
+    replay until the original provider.initialize() settles, so a recovered
+    terminal is also a ready one, and an attempt that never reached the server
+    is simply performed again with the full budget."""
+
+    def test_timed_out_create_recovers_the_terminal_only_once_it_is_ready(self):
+        """Real HTTP round trip: the first attempt's client timeout fires while
+        the stand-in server is still "initializing"; the keyed retry must
+        return the same terminal, and only after initialization finished."""
+        import http.server
+        import json
+        import threading
+        import time
+        from urllib.parse import parse_qs
+
+        from cli_agent_orchestrator.utils import orchestration
+
+        committed = {}
+        init_done = {}
+        request_count = {"n": 0}
+        lock = threading.Lock()
+
+        class ReplayWaitsForInitHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):  # noqa: A002 -- matches base signature
+                pass
+
+            def do_POST(self):  # noqa: N802 -- stdlib handler naming
+                path, _, query = self.path.partition("?")
+                if path == "/sessions":
+                    key = parse_qs(query).get("idempotency_key", [None])[0]
+                    with lock:
+                        request_count["n"] += 1
+                        existing = committed.get(key)
+                    if existing is None:
+                        # Original create: commit first (as terminal_service
+                        # does), then "initialize".
+                        terminal_id = "term-recovered"
+                        event = threading.Event()
+                        with lock:
+                            committed[key] = terminal_id
+                            init_done[terminal_id] = event
+                        time.sleep(0.6)
+                        event.set()
+                    else:
+                        # Replay: held until the original init settles.
+                        terminal_id = existing
+                        init_done[terminal_id].wait()
+                    ready = init_done[terminal_id].is_set()
+                    body = json.dumps(
+                        {"id": terminal_id, "provider": "antigravity_cli", "ready": ready}
+                    ).encode()
+                    self.send_response(201)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                # --no-wait direct input: record whether init had finished.
+                with lock:
+                    self.server.sent_when_ready = all(e.is_set() for e in init_done.values())
+                self.send_response(200)
+                self.end_headers()
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ReplayWaitsForInitHandler)
+        server.sent_when_ready = None
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        old_base_url = orchestration.API_BASE_URL
+        old_timeout = orchestration._HANDOFF_CREATE_TIMEOUT_S
+        orchestration.API_BASE_URL = f"http://127.0.0.1:{server.server_address[1]}"
+        orchestration._HANDOFF_CREATE_TIMEOUT_S = 0.3  # shorter than the 0.6s init
+        try:
+            reported = []
+            result = asyncio.run(
+                orchestration._handoff_impl(
+                    "some-agent-profile",
+                    "do the thing",
+                    on_terminal_id=reported.append,
+                    wait=False,
+                )
+            )
+        finally:
+            orchestration.API_BASE_URL = old_base_url
+            orchestration._HANDOFF_CREATE_TIMEOUT_S = old_timeout
+            server.shutdown()
+            thread.join(timeout=2)
+
+        assert result.success is True
+        assert result.terminal_id == "term-recovered"
+        assert reported == ["term-recovered"]
+        # The timed-out original plus one replay: no second worker.
+        assert request_count["n"] == 2
+        # Input went in only after initialization had finished.
+        assert server.sent_when_ready is True
+
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_connect_timeout_retry_keeps_the_full_budget_and_key(
+        self, mock_create, mock_provider, _nudge
+    ):
+        """A ConnectTimeout means nothing reached the server, so the retry is a
+        fresh create. It must get the same full budget as a first attempt, not
+        a shorter recovery budget, and reuse the same idempotency key."""
+        import requests
+
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.side_effect = [
+            requests.exceptions.ConnectTimeout("connect timed out"),
+            ("dev-t1", "kiro_cli"),
+        ]
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.exceptions = requests.exceptions
+            mock_requests.post.return_value = _ok_run_step_response(terminal_id="dev-t1")
+            mock_requests.Timeout = requests.Timeout
+            result = asyncio.run(
+                _handoff_impl("developer", "Do task", on_terminal_id=lambda _t: None)
+            )
+
+        assert result.success is True
+        assert mock_create.call_count == 2
+        timeouts = [c.kwargs["create_timeout"] for c in mock_create.call_args_list]
+        keys = {c.kwargs["idempotency_key"] for c in mock_create.call_args_list}
+        assert timeouts == [_HANDOFF_CREATE_TIMEOUT_S, _HANDOFF_CREATE_TIMEOUT_S]
+        assert len(keys) == 1 and None not in keys
+
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_retries_are_bounded_and_nothing_committed_reports_no_id(
+        self, mock_create, mock_provider, _nudge
+    ):
+        """Every attempt and the final lookup time out or miss: the handoff
+        fails as before, with no terminal_id to report."""
+        import requests
+
+        from cli_agent_orchestrator.utils.orchestration import _HANDOFF_CREATE_ATTEMPTS
+
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.side_effect = requests.exceptions.ReadTimeout("read timed out")
+        seen = []
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.exceptions = requests.exceptions
+            mock_requests.Timeout = requests.Timeout
+            result = asyncio.run(_handoff_impl("developer", "Do task", on_terminal_id=seen.append))
+
+        assert result.success is False
+        assert result.terminal_id is None
+        assert seen == []
+        # The bounded attempts, then exactly one non-allocating lookup.
+        assert mock_create.call_count == _HANDOFF_CREATE_ATTEMPTS + 1
+        flags = [c.kwargs.get("lookup_only", False) for c in mock_create.call_args_list]
+        assert flags == [False] * _HANDOFF_CREATE_ATTEMPTS + [True]
+
+    @pytest.mark.parametrize("wait", [True, False])
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_exhausted_wait_still_reports_the_committed_terminal_id(
+        self, mock_create, mock_provider, _nudge, wait
+    ):
+        """Review on PR #773: an initialization that outlasts every bounded
+        attempt must not cost the caller the worker's identity. The id is
+        reported for inspection and cleanup, and NO input is sent, because the
+        terminal has not finished initializing."""
+        import requests
+
+        from cli_agent_orchestrator.utils.orchestration import _HANDOFF_CREATE_ATTEMPTS
+
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.side_effect = [
+            requests.exceptions.ReadTimeout("read timed out")
+        ] * _HANDOFF_CREATE_ATTEMPTS + [("dev-t9", "kiro_cli")]
+        seen = []
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.exceptions = requests.exceptions
+            mock_requests.Timeout = requests.Timeout
+            result = asyncio.run(
+                _handoff_impl("developer", "Do task", on_terminal_id=seen.append, wait=wait)
+            )
+
+        assert result.success is False
+        assert result.terminal_id == "dev-t9"
+        assert "dev-t9" in result.message
+        assert seen == ["dev-t9"]
+        lookup = mock_create.call_args_list[-1]
+        assert lookup.kwargs["lookup_only"] is True
+        keys = {c.kwargs["idempotency_key"] for c in mock_create.call_args_list}
+        assert len(keys) == 1
+        # Neither the direct-input send nor the run-step call happened.
+        mock_requests.post.assert_not_called()
+
+    @staticmethod
+    def _http_error(status_code):
+        import requests
+
+        response = requests.Response()
+        response.status_code = status_code
+        return requests.exceptions.HTTPError(f"{status_code} error", response=response)
+
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_server_error_after_a_timeout_is_retried_as_a_replay(
+        self, mock_create, mock_provider, _nudge
+    ):
+        """A retry can collide with the timed-out attempt before its row is
+        committed; the loser gets a server error. The key is committed by then,
+        so the next attempt is an ordinary replay and the handoff succeeds."""
+        import requests
+
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.side_effect = [
+            requests.exceptions.ReadTimeout("read timed out"),
+            self._http_error(500),
+            ("dev-t1", "kiro_cli"),
+        ]
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.exceptions = requests.exceptions
+            mock_requests.Timeout = requests.Timeout
+            mock_requests.post.return_value = _ok_run_step_response(terminal_id="dev-t1")
+            result = asyncio.run(
+                _handoff_impl("developer", "Do task", on_terminal_id=lambda _t: None)
+            )
+
+        assert result.success is True
+        assert result.terminal_id == "dev-t1"
+        assert mock_create.call_count == 3
+
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_collision_on_the_last_attempt_still_reports_the_committed_id(
+        self, mock_create, mock_provider, _nudge
+    ):
+        import requests
+
+        from cli_agent_orchestrator.utils.orchestration import _HANDOFF_CREATE_ATTEMPTS
+
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.side_effect = (
+            [requests.exceptions.ReadTimeout("read timed out")]
+            + [self._http_error(500)] * (_HANDOFF_CREATE_ATTEMPTS - 1)
+            + [("dev-t9", "kiro_cli")]
+        )
+        seen = []
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.exceptions = requests.exceptions
+            mock_requests.Timeout = requests.Timeout
+            result = asyncio.run(_handoff_impl("developer", "Do task", on_terminal_id=seen.append))
+
+        assert result.success is False
+        assert result.terminal_id == "dev-t9"
+        assert seen == ["dev-t9"]
+        assert mock_create.call_args_list[-1].kwargs["lookup_only"] is True
+        mock_requests.post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("errors", "expected_calls"),
+        [
+            # No earlier timeout: a server error is a plain failure, not retried.
+            ([500], 1),
+            # After a timeout, a client error is still a plain failure.
+            (["timeout", 409], 2),
+        ],
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_other_http_errors_are_not_retried(
+        self, mock_create, mock_provider, _nudge, errors, expected_calls
+    ):
+        import requests
+
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.side_effect = [
+            (
+                requests.exceptions.ReadTimeout("read timed out")
+                if error == "timeout"
+                else self._http_error(error)
+            )
+            for error in errors
+        ]
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.exceptions = requests.exceptions
+            mock_requests.Timeout = requests.Timeout
+            result = asyncio.run(
+                _handoff_impl("developer", "Do task", on_terminal_id=lambda _t: None)
+            )
+
+        assert result.success is False
+        assert result.terminal_id is None
+        assert mock_create.call_count == expected_calls
