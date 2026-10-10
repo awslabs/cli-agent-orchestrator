@@ -296,6 +296,8 @@ def release(worker_id):
     The lease's own expiry is the safety net, not the plan: a worker that finished
     without saying so squats a node's worth of memory until the broker's
     completion deadline. This is how you take it back now.
+
+    Acts immediately; there is no confirmation prompt.
     """
     FleetClient.from_env().release(worker_id)
     click.echo(f"✓ Released worker {worker_id}")

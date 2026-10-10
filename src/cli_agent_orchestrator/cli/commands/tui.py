@@ -98,7 +98,10 @@ def _missing_binary_message(expected: Path) -> str:
 )
 @click.argument("tui_args", nargs=-1, type=click.UNPROCESSED)
 def tui(tui_args):
-    """Launch the terminal UI (bundled Rust binary)."""
+    """Launch the terminal UI (bundled Rust binary).
+
+    Requires a running cao-server.
+    """
     try:
         binary = _locate_binary()
         if binary is None:
