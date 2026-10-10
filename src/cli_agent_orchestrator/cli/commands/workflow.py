@@ -68,6 +68,9 @@ def workflow():
 def validate_cmd(file, as_json):
     """Validate a workflow spec file WITHOUT running it.
 
+    Requires a running cao-server.
+
+    \b
     Exit codes:
       0  spec is valid (pass or pass_reserved)
       1  spec failed validation, or the request errored
@@ -109,7 +112,10 @@ def validate_cmd(file, as_json):
 @click.option("--dir", "scan_dir", default=None, help="Directory to scan for spec files.")
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the rows as JSON.")
 def list_cmd(scan_dir, as_json):
-    """List indexed workflows (rebuilt from the spec files on disk)."""
+    """List indexed workflows (rebuilt from the spec files on disk).
+
+    Requires a running cao-server.
+    """
     params = {}
     if scan_dir is not None:
         params["dir"] = scan_dir
@@ -151,7 +157,10 @@ def list_cmd(scan_dir, as_json):
 @click.argument("name")
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the spec as JSON.")
 def get_cmd(name, as_json):
-    """Show the parsed/validated spec for a workflow name or file path."""
+    """Show the parsed/validated spec for a workflow name or file path.
+
+    Requires a running cao-server.
+    """
     try:
         response = api_http.get(f"{API_BASE_URL}/workflows/{name}", timeout=MCP_REQUEST_TIMEOUT)
     except api_http.exceptions.RequestException as e:
@@ -182,12 +191,12 @@ def get_cmd(name, as_json):
     "--json", "as_json", is_flag=True, default=False, help="Emit the approval record as JSON."
 )
 def approve_cmd(plan_id, as_json):
-    """Approve a PLAN_ID so runs of that plan may start (issue #583 FR-8).
+    """Approve PLAN_ID so its runs may start.
 
     A plan identifier is computed at RUN START from the workflow's execution-affecting fields, so a
     NEW OR CHANGED PLAN IS REFUSED ONCE before it can be approved: run it, copy the plan_id from the
     refusal, approve it here, run again. Approval enforcement is off by default — this command is
-    only consequential once ``workflow.require_approval`` is enabled.
+    only consequential once `workflow.require_approval` is enabled.
 
     Approving twice is harmless and changes nothing: the original approver and timestamp are kept and
     reported back, so "already approved" is distinguishable from "just approved by me".
@@ -199,6 +208,9 @@ def approve_cmd(plan_id, as_json):
     The recorded approver is the local OS account. It is PROVENANCE, NOT IDENTITY — nothing verifies
     it, and CAO runs as the invoking user.
 
+    Requires a running cao-server.
+
+    \b
     Exit codes:
       0  the plan is approved (whether this call approved it or found it already approved)
       1  the request was rejected or the server could not be reached
@@ -240,7 +252,10 @@ def approve_cmd(plan_id, as_json):
 @click.argument("name")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
 def delete_cmd(name, yes):
-    """Delete a workflow's spec file and its index row."""
+    """Delete a workflow's spec file and its index row.
+
+    Requires a running cao-server.
+    """
     if not yes:
         click.confirm(f"Delete workflow '{name}'?", abort=True)
     try:
@@ -488,14 +503,17 @@ def _poll_to_terminal(run_id, as_json):
 def run_cmd(name_or_path, inputs, run_id, detach, wait, as_json):
     """Run a workflow.
 
-    By default (FR-4, issue #505) ``run`` SUBMITS the run asynchronously, prints
-    the run id immediately, then FOLLOWS it — polling status to a terminal state.
+    By default `run` SUBMITS the run asynchronously, prints the run id
+    immediately, then FOLLOWS it — polling status to a terminal state.
     Ctrl-C during the follow DETACHES (the run keeps running server-side; it is
-    never cancelled). ``--detach`` submits and returns the id without following.
-    ``--wait`` is the explicit blocking escape hatch (the retained inline path).
+    never cancelled). `--detach` submits and returns the id without following.
+    `--wait` is the explicit blocking escape hatch (the retained inline path).
 
-    Exit codes (identical on a TTY, a non-TTY, and under ``--json``):
-      0  run reached COMPLETED (or ``--detach`` submitted, or Ctrl-C detached)
+    Requires a running cao-server.
+
+    \b
+    Exit codes (identical on a TTY, a non-TTY, and under `--json`):
+      0  run reached COMPLETED (or `--detach` submitted, or Ctrl-C detached)
       1  run reached FAILED / CANCELLED, or the request errored
     """
     parsed = _parse_inputs(inputs)
@@ -627,8 +645,10 @@ def _resolve_latest_run_id():
 def status_cmd(run_id, as_json):
     """Show a point-in-time status snapshot for a run.
 
-    With no RUN_ID (VR-4, FR-4.8) resolves the most-recently-started run and shows
-    that one; an empty run list prints "no runs found" and exits 0.
+    With no RUN_ID, resolves the most-recently-started run and shows that one;
+    an empty run list prints "no runs found" and exits 0.
+
+    Requires a running cao-server.
     """
     if run_id is None:
         run_id = _resolve_latest_run_id()
@@ -660,11 +680,13 @@ def status_cmd(run_id, as_json):
 @click.option("--limit", "limit", type=int, default=None, help="Max rows to return (server caps).")
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the rows as JSON.")
 def runs_cmd(state, limit, as_json):
-    """List workflow RUNS newest-first (distinct from ``list``, which lists specs).
+    """List workflow runs, newest first.
 
-    ``cao workflow runs`` shows submitted/finished runs and their state;
-    ``cao workflow list`` shows the indexed workflow SPECS on disk. Optional
-    ``--state`` filters by run state and ``--limit`` caps the row count.
+    `cao workflow runs` shows submitted/finished runs and their state;
+    `cao workflow list` shows the indexed workflow SPECS on disk. Optional
+    `--state` filters by run state and `--limit` caps the row count.
+
+    Requires a running cao-server.
     """
     params = {}
     if state is not None:
@@ -706,9 +728,14 @@ def runs_cmd(state, limit, as_json):
     "--json", "as_json", is_flag=True, default=False, help="Emit the terminal state as JSON."
 )
 def wait_cmd(run_id, as_json):
-    """Follow an existing run by polling its status until it reaches a terminal state.
+    """Wait for an existing run to finish.
 
-    Exit codes (identical on a TTY, a non-TTY, and under ``--json``):
+    Polls the run's status until it reaches a terminal state.
+
+    Requires a running cao-server.
+
+    \b
+    Exit codes (identical on a TTY, a non-TTY, and under `--json`):
       0  run reached COMPLETED (or contact with the server was lost mid-follow)
       1  run reached FAILED / CANCELLED, or the request errored
     """
@@ -728,7 +755,12 @@ def wait_cmd(run_id, as_json):
 @click.argument("run_id")
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
 def result_cmd(run_id, as_json):
-    """Show the complete retained result for a (finished or in-flight) run."""
+    """Show the retained result for a run.
+
+    Shows the complete retained result of a finished or in-flight run.
+
+    Requires a running cao-server.
+    """
     try:
         response = api_http.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}/result", timeout=MCP_REQUEST_TIMEOUT
@@ -763,7 +795,9 @@ def result_cmd(run_id, as_json):
 )
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
 def resume_cmd(run_id, decide, as_json):
-    """Resume a crashed/failed run from its durable journal (blocks until done).
+    """Resume a crashed or failed run.
+
+    Re-drives the run from its durable journal and blocks until it is done.
 
     A script-tier resume RE-EXECUTES THE SCRIPT TOP-TO-BOTTOM; completed steps are
     NOT skipped. Each step is decided as it arrives and is either REPLAYED (its
@@ -771,13 +805,16 @@ def resume_cmd(run_id, decide, as_json):
     (CAO will not decide alone, so the run stops there and waits for a --decide).
     A step whose script changed at the same key DIVERGES and fails the run instead.
 
+    `--decide` carries a decision for a step the run halted on.
+    Each decision authorises exactly ONE attempt: if that attempt crashes before it
+    settles, the next resume asks again rather than re-executing on old consent.
+
+    Requires a running cao-server.
+
+    \b
     Exit codes:
       0  run reached COMPLETED
       1  run reached FAILED / CANCELLED, or the request errored
-
-    ``--decide`` carries a decision for a step the run halted on (issue #583, FR-7).
-    Each decision authorises exactly ONE attempt: if that attempt crashes before it
-    settles, the next resume asks again rather than re-executing on old consent.
     """
     decisions = _parse_decisions(decide)
     try:
@@ -858,17 +895,21 @@ def _render_step_replay(result):
 )
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
 def step_cmd(run_id, step_id, prompt_file, prompt_override, as_json):
-    """Re-execute ONE step of a recorded run, without re-running the workflow.
+    """Re-execute one step of a recorded run.
 
-    Resolves the step's prompt from the RECORDED run (journaled inputs + predecessor
-    outputs), runs it live, and prints the resolved prompt and the output. The source
-    run is left untouched, so a step can be re-probed as many times as it takes to
-    get its prompt right. YAML-tier runs only.
+    Does not re-run the workflow. Resolves the step's prompt from the RECORDED
+    run (journaled inputs + predecessor outputs), runs it live, and prints the
+    resolved prompt and the output. The source run is left untouched, so a step
+    can be re-probed as many times as it takes to get its prompt right.
+    YAML-tier runs only.
 
-    ``--prompt-file`` / ``--prompt-override`` replace the prompt TEMPLATE for this one
-    execution; ``{{workflow.inputs.*}}`` / ``{{steps.*.output.*}}`` references in the
+    `--prompt-file` / `--prompt-override` replace the prompt TEMPLATE for this one
+    execution; `{{workflow.inputs.*}}` / `{{steps.*.output.*}}` references in the
     replacement still resolve against the recorded run.
 
+    Requires a running cao-server.
+
+    \b
     Exit codes:
       0  the step ran
       1  the step failed, or the request errored
@@ -930,7 +971,10 @@ def step_cmd(run_id, step_id, prompt_file, prompt_override, as_json):
 @workflow.command(name="cancel")
 @click.argument("run_id")
 def cancel_cmd(run_id):
-    """Cooperatively cancel a running workflow."""
+    """Cooperatively cancel a running workflow.
+
+    Requires a running cao-server.
+    """
     try:
         response = api_http.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/cancel", timeout=MCP_REQUEST_TIMEOUT
@@ -1177,17 +1221,21 @@ def _events_batch_read(run_id: str, after_seq, as_json: bool) -> None:
 )
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit each frame as JSON.")
 def events_cmd(run_id, follow, after_seq, as_json):
-    """Follow a run's live event stream, rendering per-run ordered progress.
+    """Follow a run's live event stream.
 
-    Consumes #504's events-follow SSE route (``Accept: text/event-stream``). Each
-    normal frame renders as a progress line (or a JSON line under ``--json`` /
-    non-TTY); a server-DECLARED ``event: gap`` frame is rendered verbatim (the gap
-    is DATA the server sends — the follower never computes one from seq numbering).
-    On a dropped connection the follow reconnects, resuming exactly via
-    ``?after_seq=<last-seen seq>`` so no event is re-delivered. Ctrl-C DETACHES
-    (prints the handle + a hint, exits 0, never cancels).
+    Renders per-run ordered progress from the server's events-follow SSE route
+    (`Accept: text/event-stream`). Each normal frame renders as a progress line
+    (or a JSON line under `--json` / non-TTY); a server-DECLARED `event: gap`
+    frame is rendered verbatim (the gap is DATA the server sends — the follower
+    never computes one from seq numbering). On a dropped connection the follow
+    reconnects, resuming exactly via `?after_seq=<last-seen seq>` so no event is
+    re-delivered. Ctrl-C DETACHES (prints the handle + a hint, exits 0, never
+    cancels).
 
-    Exit codes (identical on a TTY, a non-TTY, and under ``--json``):
+    Requires a running cao-server.
+
+    \b
+    Exit codes (identical on a TTY, a non-TTY, and under `--json`):
       0  run reached COMPLETED — or Ctrl-C detached, or the stream ended without a
          terminal (a final status check confirms the run is not yet terminal)
       1  run reached FAILED / CANCELLED
