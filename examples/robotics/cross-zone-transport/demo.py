@@ -53,6 +53,24 @@ CAO_PROVIDERS = frozenset(
 NATIVE_ENFORCEMENT = frozenset(
     {"claude_code", "copilot_cli", "grok_cli", "kiro_cli", "opencode_cli"}
 )
+# Each agent must get its own transport-sim server with its own credential.
+# For opencode_cli, cao install writes the MCP servers of every profile into one
+# shared OpenCode configuration, keyed by server name, and a name collision
+# replaces the earlier entry (utils/opencode_config.upsert_mcp_server). All the
+# agents would then use the credential of the last installed profile.
+# For hermes, CAO writes no MCP configuration: Hermes reads MCP servers only
+# from its own Hermes profile (docs/hermes.md, "MCP Configuration").
+UNSUPPORTED_PROVIDERS = {
+    "hermes": (
+        "Hermes reads MCP servers only from its own Hermes profile, not from the CAO "
+        "agent profile, so the agents would get no simulator server"
+    ),
+    "opencode_cli": (
+        "OpenCode keeps the MCP servers of all agents in one shared configuration, "
+        "so each agent cannot have its own simulator credential"
+    ),
+}
+SUPPORTED_PROVIDERS = CAO_PROVIDERS - frozenset(UNSUPPORTED_PROVIDERS)
 
 
 def read_profile(path: Path) -> tuple[dict, str]:
@@ -82,6 +100,8 @@ def prepare(run_dir: Path, scene_file: Path, *, port: int, provider: str) -> dic
         raise ValueError(
             f"unknown CAO provider {provider!r}; use one of: {', '.join(sorted(CAO_PROVIDERS))}"
         )
+    if provider in UNSUPPORTED_PROVIDERS:
+        raise ValueError(f"{provider} is not supported: {UNSUPPORTED_PROVIDERS[provider]}")
     run_dir = run_dir.resolve()
     run_dir.mkdir(mode=0o700)
     (run_dir / "credentials").mkdir(mode=0o700)
@@ -257,6 +277,11 @@ def main() -> None:
     if args.command == "prepare":
         if not args.request.strip():
             setup.error("--request must not be blank")
+        if args.provider in UNSUPPORTED_PROVIDERS:
+            setup.error(
+                f"--provider {args.provider} is not supported: "
+                f"{UNSUPPORTED_PROVIDERS[args.provider]}"
+            )
         manifest = prepare(args.run_dir, args.scene, port=args.port, provider=args.provider)
         if args.provider not in NATIVE_ENFORCEMENT:
             print(
