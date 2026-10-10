@@ -7,9 +7,8 @@ import asyncio
 import logging
 import threading
 from itertools import groupby
-from typing import Dict
+from typing import Dict, List, Optional
 
-from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
     get_pending_messages,
     list_pending_receiver_ids_by_provider,
@@ -20,7 +19,7 @@ from cli_agent_orchestrator.constants import (
     EAGER_INBOX_DELIVERY,
     INBOX_RECONCILE_GRACE_SECONDS,
 )
-from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
@@ -31,6 +30,27 @@ from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
+
+# A queued message that cannot be delivered is retried indefinitely; every
+# multiple of this many cumulative failed attempts escalates the log to a LOUD
+# error so a genuinely-unreachable terminal is observable instead of silently
+# spinning forever. This is pure observability -- a failed delivery is NEVER
+# moved to a non-retriable state (harness-control#921): a coordination message
+# leaves the inbox only on successful delivery or when its receiver terminal is
+# deleted (which already drops it out of `list_pending_receiver_ids_older_than`'s
+# join), never because a paste-buffer into a stale/renamed tmux window returned
+# a non-zero exit.
+_LOUD_ERROR_EVERY_N_ATTEMPTS = 10
+
+# In-cycle delivery attempts before falling back to the reconcile sweep. The
+# second attempt re-resolves the target implicitly: send_input() re-reads
+# terminal metadata fresh on every call, so a cached/stale window suffix is
+# never reused on the retry. Deliberately no sleep between attempts -- the
+# immediate (on-POST) delivery path calls deliver_pending() inline rather than
+# on a worker thread in some callers, so a blocking sleep here could stall it;
+# the reconcile sweep (INBOX_RECONCILE_GRACE_SECONDS later) already provides
+# the time-spaced retry for anything a same-cycle re-resolve cannot recover.
+_IN_CYCLE_DELIVERY_ATTEMPTS = 2
 
 
 class InboxService:
@@ -49,6 +69,20 @@ class InboxService:
         # reaped — terminal ids are bounded by session lifecycle.
         self._delivery_locks_guard = threading.Lock()
         self._delivery_locks: Dict[str, threading.Lock] = {}
+
+        # message_id -> cumulative failed delivery attempts across reconcile
+        # cycles (harness-control#921). Best-effort and in-memory: a process
+        # restart clears it, which simply re-arms the loud-error counter -- the
+        # message itself stays PENDING in the database regardless, so nothing is
+        # lost by the reset. Pruned on successful delivery so healthy traffic
+        # never accumulates entries. An entry for a message whose terminal was
+        # later deleted lingers until the next process restart (a bounded, tiny
+        # leak). No separate lock is taken: mutation of a given key only ever
+        # happens while holding that terminal's `_delivery_lock`, and distinct
+        # keys (different message ids) are never mutated by the same call, so
+        # there is no read-modify-write race to guard against beyond what the
+        # per-terminal lock already serializes.
+        self._delivery_attempts: Dict[int, int] = {}
 
     def _delivery_lock(self, terminal_id: str) -> threading.Lock:
         with self._delivery_locks_guard:
@@ -133,8 +167,9 @@ class InboxService:
         # pane; that output flows back through the FIFO/StatusMonitor pipeline and
         # can re-emit an IDLE/COMPLETED status event, re-entering deliver_pending.
         # If the messages were still PENDING then, they would be delivered twice.
-        # Marking them DELIVERED first closes that window; the except path resets
-        # them to FAILED.
+        # Marking them DELIVERED first closes that window; a failed send resets
+        # them to PENDING (never FAILED) so they are retried, not lost
+        # (harness-control#921).
         for message in messages:
             update_message_status(message.id, MessageStatus.DELIVERED)
 
@@ -146,6 +181,40 @@ class InboxService:
         for sender_id, group in groupby(messages, key=lambda m: m.sender_id):
             batch = list(group)
             combined = "\n".join(m.message for m in batch)
+            error = self._deliver_batch(terminal_id, combined, sender_id, registry)
+            if error is None:
+                # Delivered. Clear the retry counters so a later, unrelated
+                # failure for a reused message id starts fresh.
+                for message in batch:
+                    self._delivery_attempts.pop(message.id, None)
+                logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
+            else:
+                self._requeue_for_retry(terminal_id, batch, error)
+
+    def _deliver_batch(
+        self,
+        terminal_id: str,
+        combined: str,
+        sender_id: str,
+        registry: PluginRegistry | None,
+    ) -> Optional[Exception]:
+        """Type a batch into the terminal, with a bounded in-cycle retry that
+        re-resolves the target each try. Returns ``None`` on success, or the last
+        exception if every attempt failed (the caller re-queues; a message is
+        never dropped here).
+
+        Every failure kind funnels into the retry on purpose and is treated as
+        transient/retriable: a stale or renamed tmux window (paste-buffer exit
+        != 0 -> ``CalledProcessError``), a pane not yet mapped
+        (``TerminalNotFoundError``), a provider briefly in ERROR
+        (``TerminalInputBlockedError`` -- may recover once the provider settles),
+        or a terminal transiently absent mid-reissue (``ValueError``). None of
+        these justify losing a coordination message; the reconcile sweep keeps
+        retrying until the terminal is reachable again or is deleted
+        (harness-control#921).
+        """
+        last_error: Optional[Exception] = None
+        for _attempt in range(_IN_CYCLE_DELIVERY_ATTEMPTS):
             try:
                 if registry is None:
                     terminal_service.send_input(terminal_id, combined)
@@ -157,22 +226,42 @@ class InboxService:
                         sender_id=sender_id,
                         orchestration_type=OrchestrationType.SEND_MESSAGE,
                     )
-                logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
-            except TerminalNotFoundError as e:
-                # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
-                # for this window). Treat as transient: reset to PENDING so the
-                # reconcile sweep retries rather than marking FAILED. These were
-                # optimistically set to DELIVERED above. (#271 semantic.)
-                for message in batch:
-                    update_message_status(message.id, MessageStatus.PENDING)
-                logger.warning(
-                    f"Pane not resolvable for terminal {terminal_id}; leaving "
-                    f"{len(batch)} message(s) pending for retry: {e}"
+                return None
+            except Exception as e:  # noqa: BLE001 -- re-queued by the caller, never dropped
+                # The next iteration re-resolves the target: send_input re-reads
+                # terminal metadata fresh, so a cached/stale window is not reused.
+                last_error = e
+        return last_error
+
+    def _requeue_for_retry(
+        self, terminal_id: str, batch: List[InboxMessage], error: Exception
+    ) -> None:
+        """Leave an undeliverable batch PENDING so the reconcile sweep retries it.
+
+        The messages were optimistically flipped to DELIVERED before the send;
+        reset them to PENDING (never FAILED) so ``get_pending_messages`` and the
+        reconcile sweep pick them up again — a coordination message is never
+        dropped on a failed delivery (harness-control#921). Escalate to a LOUD
+        error every ``_LOUD_ERROR_EVERY_N_ATTEMPTS`` cumulative failures so a
+        genuinely unreachable terminal is observable rather than silently
+        spinning; the message stays retriable regardless.
+        """
+        for message in batch:
+            attempts = self._delivery_attempts.get(message.id, 0) + 1
+            self._delivery_attempts[message.id] = attempts
+            update_message_status(message.id, MessageStatus.PENDING)
+            if attempts % _LOUD_ERROR_EVERY_N_ATTEMPTS == 0:
+                logger.error(
+                    f"Inbox message {message.id} to terminal {terminal_id} STILL "
+                    f"undelivered after {attempts} attempts; kept PENDING for retry "
+                    "(a coordination message is never dropped on a failed delivery). "
+                    f"Terminal may have a stale tmux window or be unreachable: {error}"
                 )
-            except Exception as e:
-                for message in batch:
-                    logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
-                    update_message_status(message.id, MessageStatus.FAILED)
+            else:
+                logger.warning(
+                    f"Delivery to terminal {terminal_id} failed (attempt {attempts}); "
+                    f"leaving message {message.id} PENDING for retry: {error}"
+                )
 
     def poll_opencode_pending_messages(self, registry: PluginRegistry | None = None) -> None:
         """Poll OpenCode terminals for pending inbox messages.
