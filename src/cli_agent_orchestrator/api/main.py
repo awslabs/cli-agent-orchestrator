@@ -164,6 +164,7 @@ from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.profile_search import (
     DEFAULT_LIMIT as PROFILE_SEARCH_DEFAULT_LIMIT,
 )
+from cli_agent_orchestrator.services.provider_error_classifier import KIND_PROVIDER_ERROR
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import (
@@ -4257,10 +4258,13 @@ async def _record_job_state(job_id: Optional[str], state: str, **fields: Any) ->
         "Failure contract: a non-2xx body is a structured object "
         "`{message, kind, terminal_id}`. **`kind` is authoritative** — "
         '`kind="error"` means the worker CRASHED (terminal reached ERROR), '
-        '`kind="timeout"` means it RAN LONG. The HTTP status mirrors `kind` '
-        "(502 = crashed, 504 = ran long) for transport-layer consumers, but a "
-        "caller MUST branch on `kind`, not the status code. `terminal_id` names "
-        "the live terminal (read it as a field; never regex-scrape `message`)."
+        '`kind="timeout"` means it RAN LONG, and `kind="provider_error"` means '
+        "the provider refused in band (the CLI exited cleanly with an error "
+        "payload sitting where the answer belongs). The HTTP status mirrors "
+        "`kind` (502 = crashed or provider refusal, 504 = ran long) for "
+        "transport-layer consumers, but a caller MUST branch on `kind`, not the "
+        "status code. `terminal_id` names the live terminal (read it as a field; "
+        "never regex-scrape `message`)."
     ),
 )
 async def run_step(
@@ -4284,13 +4288,17 @@ async def run_step(
     out, not just inferable from the handler):
 
     - A failed step returns a STRUCTURED detail object
-      ``{"message": str, "kind": "timeout"|"error", "terminal_id": str|None}``.
+      ``{"message": str, "kind": "timeout"|"error"|"provider_error",
+      "terminal_id": str|None}``.
     - ``kind`` is the AUTHORITATIVE discriminator. ``kind="error"`` => the worker
       CRASHED (the terminal reached ``TerminalStatus.ERROR``); ``kind="timeout"``
-      => the worker RAN LONG (readiness/completion wait elapsed). The HTTP status
-      is derived FROM ``kind`` (``error`` -> 502 Bad Gateway, ``timeout`` -> 504
-      Gateway Timeout) as a convenience for transport-layer consumers — a client
-      that can read the body MUST branch on ``kind``, not the status code.
+      => the worker RAN LONG (readiness/completion wait elapsed);
+      ``kind="provider_error"`` => the provider refused in band (issue #638: a
+      model/API error printed where the model's answer belongs). The HTTP status
+      is derived FROM ``kind`` (``error``/``provider_error`` -> 502 Bad Gateway,
+      ``timeout`` -> 504 Gateway Timeout) as a convenience for transport-layer
+      consumers — a client that can read the body MUST branch on ``kind``, not the
+      status code.
     - ``terminal_id`` names the live terminal the step ran on (when known) so a
       caller can report/clean it up without regex-scraping ``message``.
     - A bad terminal reference -> 404; any other failure -> 500 (plain-string
@@ -4350,6 +4358,7 @@ async def run_step(
         error: Optional[str],
         last_message: Optional[str] = None,
         response_status: Optional[str] = None,
+        error_kind: Optional[str] = None,
     ) -> None:
         # ``last_message`` is the step's own text result and defaults to None because
         # every FAILURE arm below has none to give: the step never produced one. Only
@@ -4360,7 +4369,7 @@ async def run_step(
         if on_step_settled is None:
             return
         try:
-            on_step_settled(terminal_id, error, last_message, response_status)
+            on_step_settled(terminal_id, error, last_message, response_status, error_kind)
         except Exception:  # noqa: BLE001 — step bookkeeping is best-effort; never fail the step
             logger.warning("run_step: script step completion bookkeeping failed", exc_info=True)
 
@@ -4659,9 +4668,18 @@ async def run_step(
         # structured object carrying terminal_id, so callers read it as a field
         # rather than regex-scraping the message (the future engine reads it too).
         # Transition the script step RUNNING->FAILED (no-op for non-script callers).
-        _settle_step(e.terminal_id, str(e))
+        _settle_step(e.terminal_id, str(e), error_kind=e.kind)
         await _record_job_state(job_id, "error", terminal_id=e.terminal_id, error_message=str(e))
-        code = status.HTTP_502_BAD_GATEWAY if e.kind == "error" else status.HTTP_504_GATEWAY_TIMEOUT
+        # issue #638: kind="provider_error" (the upstream refused the call in
+        # band) is an UPSTREAM failure — 502, the same class as a crashed worker.
+        # Leaving it on the else arm would have reported a provider refusal as
+        # 504 Gateway Timeout, which tells the caller to wait longer for a step
+        # that will never answer.
+        code = (
+            status.HTTP_502_BAD_GATEWAY
+            if e.kind in ("error", KIND_PROVIDER_ERROR)
+            else status.HTTP_504_GATEWAY_TIMEOUT
+        )
         raise HTTPException(
             status_code=code,
             detail={"message": str(e), "kind": e.kind, "terminal_id": e.terminal_id},
@@ -6620,31 +6638,26 @@ def _durable_error_kind(steps: List[Any]) -> Optional[str]:
 def _resolve_error_kind(row: Any, steps: List[Any]) -> Optional[str]:
     """Resolve the terminal ``kind`` for an assembled ``WorkflowRunResult`` (U4 seam).
 
-    U4 shipped the CALL SITE plus the ADR-5 inference FLOOR; U9 enriches this SAME
+    U4 shipped the CALL SITE plus the ADR-5 inference FLOOR; U9 enriched this SAME
     function with column-first precedence (kept a single module-level function so
-    the swap is confined, RP-5). Precedence:
+    the swap is confined, RP-5). Run state is now the OUTER decision, because a
+    completed script may retain a failed step it caught deliberately:
 
-    1. Column-first (RP-1): a durable ``error_kind`` on the step projection wins
-       authoritatively — the inference is NOT consulted. INERT until #504's column
-       lands (``_durable_error_kind`` returns ``None`` for pre-migration rows).
-    2. Inference fallback (RP-2, pre-migration rows only) — the RR-4 floor:
-
-       - CANCELLED run                                 -> ``"cancelled"``
-       - FAILED run with a step error matching /timeout/i -> ``"timeout"``
-       - FAILED run otherwise                          -> ``"error"``
-       - COMPLETED / RUNNING / anything else           -> ``None``
+    1. State-first (RP-4): COMPLETED or non-terminal -> ``None``; CANCELLED ->
+       ``"cancelled"``. A retained step kind never changes the run-level verdict.
+    2. FAILED, run-level column-first (PR #849 review): the terminal ``kind``
+       persisted by the finalizer is authoritative, so a later unrelated exit is
+       not misattributed to a caught provider_error/timeout step.
+    3. FAILED, step fallback (RP-1) for pre-kind rows: a durable ``error_kind`` on
+       the step projection wins authoritatively — the inference is NOT consulted.
+    4. FAILED, inference fallback (RP-2, pre-migration rows only) — the RR-4 floor:
+       a step error matching /timeout/i -> ``"timeout"``; otherwise ``"error"``.
 
     The timeout branch is a conservative case-insensitive substring match, never a
     parse, and no kind is ever fabricated for a completed/non-terminal run (RP-4).
     """
     from cli_agent_orchestrator.models.workflow_runtime import RunState
 
-    # Column-first (RP-1): authoritative when present; inert (None) pre-migration.
-    durable = _durable_error_kind(steps)
-    if durable is not None:
-        return durable
-
-    # Inference fallback (RP-2) — the ADR-5 floor for pre-migration rows.
     try:
         run_state = RunState(row.state)
     except ValueError:
@@ -6652,12 +6665,24 @@ def _resolve_error_kind(row: Any, steps: List[Any]) -> Optional[str]:
 
     if run_state == RunState.CANCELLED:
         return "cancelled"
-    if run_state == RunState.FAILED:
-        for s in steps:
-            if s.error and re.search(r"timeout", s.error, re.IGNORECASE):
-                return "timeout"
-        return "error"
-    return None
+    if run_state != RunState.FAILED:
+        return None
+
+    # FAILED only: the run-level terminal kind is authoritative when present.
+    run_kind = getattr(row, "kind", None)
+    if run_kind:
+        return str(run_kind)
+
+    # Legacy rows only: fall back to the durable step kind.
+    durable = _durable_error_kind(steps)
+    if durable is not None:
+        return durable
+
+    # Inference fallback (RP-2) — the ADR-5 floor for pre-migration rows.
+    for s in steps:
+        if s.error and re.search(r"timeout", s.error, re.IGNORECASE):
+            return "timeout"
+    return "error"
 
 
 def _build_failure_envelope(
@@ -6752,6 +6777,10 @@ async def get_workflow_run_result_endpoint(
             attempts=s.attempts,
             output=_json_or_none(s.output_json),
             error=s.error,
+            # Issue #638: carry the durable structured kind onto the RESULT too, so
+            # a cold read distinguishes a provider refusal from a crash or a
+            # timeout exactly as the live run and the failure envelope do.
+            error_kind=getattr(s, "error_kind", None),
         )
         for s in steps
     ]

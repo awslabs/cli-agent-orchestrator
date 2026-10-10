@@ -1089,6 +1089,92 @@ def test_completion_creates_step_state_when_missing(_patched_journal):
     assert record.step_states["s1"].attempts == 1
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caught_kind", "caught_error"),
+    (
+        ("provider_error", "provider error (api_error)"),
+        ("timeout", "readiness timeout while waiting for terminal"),
+    ),
+)
+async def test_caught_step_kind_does_not_override_unrelated_run_failure(
+    _patched_journal, caught_kind, caught_error
+):
+    """A script may catch a typed step failure and later exit for another reason.
+
+    The live terminal kind is ``error`` because the subprocess failed; the cold
+    result must retain that run-level verdict even though the durable step still
+    carries the kind it caught as diagnostic data.
+    """
+    from cli_agent_orchestrator.api.main import _resolve_error_kind
+    from cli_agent_orchestrator.services import workflow_service
+
+    run_id = f"run-caught-{caught_kind}"
+    workflow_journal.insert_run(
+        run_id=run_id,
+        workflow_name="wf",
+        spec_snapshot="{}",
+        inputs_json="{}",
+        state=RunState.RUNNING.value,
+        started_at="2026-07-08T00:00:00Z",
+        tier="script",
+    )
+    record = _make_record(run_id, process=None, generation="1")
+    record.step_states["s1"] = StepRunState(step_id="s1", state=StepState.RUNNING)
+    workflow_service.run_registry[run_id] = record
+
+    settle = record_step_completion(_kw(run_id, "s1"))
+    assert settle is not None
+    settle("term-caught", caught_error, None, None, caught_kind)
+
+    result = await script_runner._finalize(
+        record,
+        state=RunState.FAILED,
+        kind="error",
+        error="unrelated author-side failure",
+    )
+
+    assert result.kind == "error"
+    row = workflow_journal.get_run(run_id)
+    assert row is not None and row.kind == "error"
+    steps = workflow_journal.get_steps(run_id)
+    assert steps[0].error_kind == caught_kind
+    assert _resolve_error_kind(row, steps) == "error"
+
+
+@pytest.mark.asyncio
+async def test_script_result_preserves_provider_error_kind(_patched_journal):
+    """The final script ``WorkflowRunResult`` carries the settled structured kind."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    run_id = "run-provider-result"
+    workflow_journal.insert_run(
+        run_id=run_id,
+        workflow_name="wf",
+        spec_snapshot="{}",
+        inputs_json="{}",
+        state=RunState.RUNNING.value,
+        started_at="2026-07-08T00:00:00Z",
+        tier="script",
+    )
+    record = _make_record(run_id, process=None, generation="1")
+    record.step_states["s1"] = StepRunState(step_id="s1", state=StepState.RUNNING)
+    workflow_service.run_registry[run_id] = record
+
+    settle = record_step_completion(_kw(run_id, "s1"))
+    assert settle is not None
+    settle("term-provider", "provider error (api_error)", None, None, "provider_error")
+
+    result = await script_runner._finalize(
+        record, state=RunState.FAILED, kind="provider_error", error="provider error"
+    )
+
+    assert len(result.steps) == 1
+    assert result.steps[0].state == StepState.FAILED
+    assert result.steps[0].error_kind == "provider_error"
+    assert record.step_states["s1"].attempts == 1
+
+
 def test_completion_journal_failure_never_raises(monkeypatch, _patched_journal):
     """INV-4: a journal write failure during settle is swallowed — the in-memory
     transition still lands, the call never raises."""

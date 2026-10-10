@@ -1455,6 +1455,7 @@ def _seed_run(
             updated_at=started_at,
             output_json=s.get("output_json"),
             error=s.get("error"),
+            error_kind=s.get("error_kind"),
         )
     if state != RunState.RUNNING.value or finished_at is not None:
         workflow_journal.update_run_state(run_id, state, finished_at)
@@ -1580,6 +1581,31 @@ def test_result_answerable_from_journal_with_empty_registry(client, read_surface
     assert step["attempts"] == 2
     assert step["output"] == {"answer": 42}
     assert body["kind"] is None
+
+
+def test_completed_script_result_ignores_caught_step_failure_kind(client, read_surface_db):
+    """A caught script step failure does not turn the completed run into a failure."""
+    _seed_run(
+        "script-caught",
+        RunState.COMPLETED.value,
+        "2026-10-01T00:00:00Z",
+        finished_at="2026-10-01T00:00:01Z",
+        tier="script",
+        steps=[
+            {
+                "id": "s1",
+                "state": StepState.FAILED.value,
+                "error": "provider error (api_error)",
+                "error_kind": "provider_error",
+            }
+        ],
+    )
+    body = client.get("/workflows/runs/script-caught/result").json()
+    assert body["state"] == "completed"
+    assert body["kind"] is None
+    assert "failure_envelope" not in body
+    # The per-step diagnostic remains available on the same response.
+    assert body["steps"][0]["error_kind"] == "provider_error"
 
 
 def test_result_body_has_no_run_level_output_key(client, read_surface_db):
@@ -1749,6 +1775,16 @@ def test_resolve_error_kind_error_branch():
     assert _resolve_error_kind(_FakeRow(RunState.FAILED.value), steps) == "error"
 
 
+def test_resolve_error_kind_ignores_empty_run_kind():
+    """Legacy/empty run kinds fall through to the step kind instead of winning."""
+    from cli_agent_orchestrator.api.main import _resolve_error_kind
+
+    row = _FakeRow(RunState.FAILED.value)
+    row.kind = ""
+    steps = [_FakeStep(state="failed", error_kind="provider_error")]
+    assert _resolve_error_kind(row, steps) == "provider_error"
+
+
 def test_resolve_error_kind_completed_is_none():
     """U9-T1 (RP-3): a COMPLETED run resolves to None (no kind)."""
     from cli_agent_orchestrator.api.main import _resolve_error_kind
@@ -1766,6 +1802,27 @@ def test_resolve_error_kind_never_fabricates_on_completed_with_stray_error():
     assert _resolve_error_kind(_FakeRow(RunState.COMPLETED.value), steps) is None
     # A non-terminal (unknown) state is also None.
     assert _resolve_error_kind(_FakeRow(RunState.RUNNING.value), steps) is None
+
+
+def test_resolve_error_kind_completed_ignores_durable_failure_kind():
+    """RP-4 has precedence over a retained failed step on a successful run.
+
+    A Python workflow may catch a step failure and still exit successfully. The
+    failed step keeps its per-step ``error_kind`` for diagnostics, but the RUN is
+    completed and must not acquire a run-level failure kind from that row.
+    """
+    from cli_agent_orchestrator.api.main import _resolve_error_kind
+
+    steps = [_FakeStep(state="failed", error_kind="provider_error")]
+    assert _resolve_error_kind(_FakeRow(RunState.COMPLETED.value), steps) is None
+
+
+def test_resolve_error_kind_cancelled_ignores_durable_failure_kind():
+    """Cancellation is the run-level verdict even when an earlier step failed."""
+    from cli_agent_orchestrator.api.main import _resolve_error_kind
+
+    steps = [_FakeStep(state="failed", error_kind="provider_error")]
+    assert _resolve_error_kind(_FakeRow(RunState.CANCELLED.value), steps) == "cancelled"
 
 
 def test_resolve_error_kind_column_first_precedence_when_present():

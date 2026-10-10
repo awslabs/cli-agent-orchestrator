@@ -161,6 +161,11 @@ class StepRunState:
     output: Optional[StepOutputRecord] = None
     terminal_id: Optional[str] = None
     error: Optional[str] = None
+    # Structured failure kind, mirrored from ``StepExecutionError.kind`` on a
+    # failed attempt and cleared when the step later settles (issue #638). Carried
+    # in memory so ``_build_result`` can surface it on the run's result envelope;
+    # the DURABLE copy is the ``workflow_run_step.error_kind`` column.
+    error_kind: Optional[str] = None
     # In-memory carrier for the step's ``v2`` call fingerprint (issue #583, unit
     # ``settlement-rewire``, BR-2/TD-3). ``run_agent_step`` COMPUTES the value in the one
     # window BR-5 permits — after working-directory resolution, before terminal creation —
@@ -791,6 +796,9 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
             if exc.terminal_id is not None:
                 st.terminal_id = exc.terminal_id
             st.state = StepState.SKIPPED
+            # A cancelled step settled SKIPPED, not failed — never report a kind
+            # carried over from an earlier failed attempt of the same step.
+            st.error_kind = None
             await _ajournal(_journal_step, record, step.id)
             # U2 emission (BR-7): a cancellation settles the step SKIPPED — NEVER a
             # failure event. The run converges CANCELLED at the drive-loop finalize.
@@ -812,6 +820,7 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
         except StepExecutionError as exc:
             st.error = str(exc)
             last_error_kind = exc.kind
+            st.error_kind = exc.kind
             if exc.terminal_id is not None:
                 st.terminal_id = exc.terminal_id
             # BR-6: persist the structured error kind onto the step projection now
@@ -834,6 +843,9 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
             continue  # consume an attempt, retry the same prompt
         # Settled (COMPLETED or COMPLETED_UNVALIDATED) — neither is a run-failure.
         st.state = outcome
+        # A retried step that finally settled is not failed any more; clear the
+        # carried kind so the result envelope cannot report a stale failure.
+        st.error_kind = None
         # §1: persist settled state + output + attempts (error_kind cleared to NULL).
         await _ajournal(_journal_step, record, step.id)
         # U2 emission: a validated/collected output was received (validation_result
@@ -935,6 +947,7 @@ def _build_result(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRe
                 attempts=st.attempts,
                 output=st.output.output if st.output is not None else None,
                 error=st.error,
+                error_kind=st.error_kind,
             )
         )
     return WorkflowRunResult(

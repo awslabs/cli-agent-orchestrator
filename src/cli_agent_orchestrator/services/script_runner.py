@@ -726,7 +726,9 @@ def _sanitise_output_json(output_json: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 def record_step_completion(
     env_vars: Optional[Dict[str, str]],
-) -> Optional[Callable[[Optional[str], Optional[str], Optional[str], Optional[str]], None]]:
+) -> Optional[
+    Callable[[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]], None]
+]:
     """Build the RUNNING->COMPLETED/FAILED transition for a script-tier step.
 
     Mirrors ``make_step_terminal_recorder``'s guard exactly (BR-31 pattern):
@@ -747,7 +749,8 @@ def record_step_completion(
     - ``StepExecutionError`` (a crashed/timed-out step) -> ``FAILED`` with the
       error string recorded.
 
-    THE CALLBACK TAKES ``(terminal_id, error, last_message, response_status=None)``.
+    THE CALLBACK TAKES
+    ``(terminal_id, error, last_message, response_status=None, error_kind=None)``.
     ``last_message`` is the step's raw text result, needed for the durable result
     envelope: a settled row with no envelope is precisely what FR-4 guard 1 exists
     to prevent, and an envelope built without the step's own output would satisfy
@@ -759,7 +762,9 @@ def record_step_completion(
     ``last_message`` and ``response_status`` are both ``None`` on every failure arm,
     where the step produced no message — a FAILED step still gets an envelope (unit
     2 BR-1), because envelope ABSENCE must keep meaning *a crash between the
-    writes* and never *the step failed*.
+    writes* and never *the step failed*. ``error_kind`` is an additive trailing
+    optional argument carrying ``StepExecutionError.kind`` onto a failed step; its
+    default preserves every existing four-argument callback call.
 
     ``provider``/``agent``/``prompt`` WERE PARAMETERS AND ARE GONE (TD-5). They
     existed only to compute the call fingerprint here, and the fingerprint no longer
@@ -800,6 +805,7 @@ def record_step_completion(
         error: Optional[str],
         last_message: Optional[str],
         response_status: Optional[str] = None,
+        error_kind: Optional[str] = None,
     ) -> None:
         st = record.step_states.get(step_id)
         if st is None:
@@ -814,6 +820,7 @@ def record_step_completion(
         if error is not None:
             st.state = StepState.FAILED
             st.error = error
+            st.error_kind = error_kind
         else:
             # Adopt any structured output the worker returned via
             # ``workflow_return`` (keyed by the same run/step ids). A present but
@@ -826,6 +833,7 @@ def record_step_completion(
             else:
                 st.state = StepState.COMPLETED
             st.error = None
+            st.error_kind = None
 
         # ONE best-effort durable write (BR-6): state, attempts, envelope, output and
         # error settle atomically, so the row can never read settled with no result.
@@ -861,6 +869,7 @@ def record_step_completion(
                 ),
                 output_json=_sanitise_output_json(raw_output_json),
                 error=_sanitise_error(st.error),
+                error_kind=st.error_kind,
             )
             if not existed:
                 # AN OBSERVATION, NEVER A CONCLUSION (BR-7/SR-8, unit 6 TD-2a). The
@@ -949,7 +958,7 @@ def _delete_temp_file(path: Optional[str]) -> None:
 # ---------------------------------------------------------------------------
 # _finalize (INV-5) — construct the tier-neutral WorkflowRunResult
 # ---------------------------------------------------------------------------
-def _journal_run_state(record: ScriptRunRecord, error: Optional[str]) -> None:
+def _journal_run_state(record: ScriptRunRecord, error: Optional[str], kind: Optional[str]) -> None:
     """Best-effort terminal-state write-through (INV-4/INV-5). Never raises."""
     try:
         workflow_journal.update_run_state(
@@ -957,6 +966,7 @@ def _journal_run_state(record: ScriptRunRecord, error: Optional[str]) -> None:
             record.state.value,
             record.finished_at,
             error,
+            kind,
         )
     except (
         Exception
@@ -979,6 +989,7 @@ def _build_steps(record: ScriptRunRecord) -> List[StepResult]:
                 attempts=st.attempts,
                 output=st.output.output if st.output is not None else None,
                 error=st.error,
+                error_kind=st.error_kind,
             )
         )
     return steps
@@ -1004,7 +1015,7 @@ async def _finalize(
     record.state = state
     record.current_step_id = None
     record.finished_at = _now()
-    await asyncio.to_thread(_journal_run_state, record, _sanitise_error(error))
+    await asyncio.to_thread(_journal_run_state, record, _sanitise_error(error), kind)
     # ``WorkflowRunResult`` has no top-level ``error`` field (per-step only), so a
     # run-level error (stderr tail on crash/timeout) is surfaced in ``warnings`` —
     # the FAILED state + ``kind`` already carry the failure semantics; the tail is
