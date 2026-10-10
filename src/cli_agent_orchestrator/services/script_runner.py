@@ -302,6 +302,8 @@ async def _terminate(process: asyncio.subprocess.Process, grace: float) -> None:
     SIGTERM first, then a hard SIGKILL if the child does not exit within ``grace``.
     Used identically by the timeout reaper and cancel, so the observable total
     bound stays the single value ``WORKFLOW_SCRIPT_TIMEOUT + TERM_GRACE``.
+    Both waits use ``_wait_for_exit``: a process the script started can hold its
+    pipes, and a plain ``wait()`` would then block until that process exits.
     """
     if process.returncode is not None:
         return  # already exited — nothing to signal or reap
@@ -310,13 +312,15 @@ async def _terminate(process: asyncio.subprocess.Process, grace: float) -> None:
     except ProcessLookupError:
         return  # raced to exit between the check and the signal
     try:
-        await asyncio.wait_for(process.wait(), timeout=grace)
+        await asyncio.wait_for(_wait_for_exit(process), timeout=grace)
     except asyncio.TimeoutError:
+        if process.returncode is not None:
+            return  # exited on SIGTERM between two returncode polls
         try:
             process.kill()  # SIGKILL — hard stop
         except ProcessLookupError:
             return
-        await process.wait()  # reap the zombie
+        await _wait_for_exit(process)  # reap the zombie
 
 
 async def _wait_for_exit(process: asyncio.subprocess.Process) -> None:
@@ -1122,6 +1126,7 @@ async def _drive_process(
         for task in drain:
             task.cancel()
         await asyncio.gather(*drain, return_exceptions=True)
+        _close_pipes(process)
         await _reconcile_orphans(record.run_id)
         record.generation = _bump(record.generation)
         await _persist_generation_best_effort(record)

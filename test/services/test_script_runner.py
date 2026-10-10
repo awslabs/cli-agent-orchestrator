@@ -193,7 +193,8 @@ class _HeldPipesProcess:
     ``wait()``. ``wait_holds_for_pipes`` picks the ``wait()`` behaviour: on
     Python 3.10 it returns at the exit, and from 3.11 a ``wait()`` started
     before the exit does not return until the pipes reach EOF, which here is
-    never.
+    never. With ``exit_after=None`` the script runs until it is signalled:
+    SIGKILL ends it at once, SIGTERM 0.02s later and only when ``honours_sigterm``.
     """
 
     def __init__(
@@ -203,33 +204,38 @@ class _HeldPipesProcess:
         stderr: bytes = b"",
         wait_holds_for_pipes: bool,
         exit_rc: int = 0,
-        exit_after: float = 0.05,
+        exit_after: Optional[float] = 0.05,
+        honours_sigterm: bool = True,
     ):
         self.returncode: Optional[int] = None
         self.stdout = _HeldOpenStream(stdout)
         self.stderr = _HeldOpenStream(stderr)
         self._wait_holds_for_pipes = wait_holds_for_pipes
-        self._exit_rc = exit_rc
+        self._honours_sigterm = honours_sigterm
         self._exited = asyncio.Event()
         self._transport = _FakeTransport()
         self.signals: List[str] = []
-        asyncio.get_running_loop().call_later(exit_after, self._exit)
+        if exit_after is not None:
+            asyncio.get_running_loop().call_later(exit_after, self._exit, exit_rc)
 
-    def _exit(self) -> None:
-        self.returncode = self._exit_rc
+    def _exit(self, rc: int) -> None:
+        self.returncode = rc
         self._exited.set()
 
     async def wait(self) -> int:
         if self._wait_holds_for_pipes:
             await asyncio.Event().wait()
         await self._exited.wait()
-        return self._exit_rc
+        return self.returncode
 
     def terminate(self) -> None:
         self.signals.append("SIGTERM")
+        if self._honours_sigterm:
+            asyncio.get_running_loop().call_later(0.02, self._exit, -15)
 
     def kill(self) -> None:
         self.signals.append("SIGKILL")
+        self._exit(-9)
 
 
 def _install_fake_spawn(monkeypatch: pytest.MonkeyPatch, process) -> dict:
@@ -442,6 +448,30 @@ async def test_hang_timeout_reap_bumps_generation(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.asyncio
+async def test_timeout_with_pipes_held_open_settles_and_closes_them(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A timed-out script whose pipes a process it started still holds settles as a timeout.
+
+    The timeout arm cancels the readers, so it has to close the pipes as well,
+    or that process blocks on its next write once the buffer fills.
+    """
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 0.1)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.05)
+    proc = _HeldPipesProcess(wait_holds_for_pipes=True, exit_after=None)
+    _install_fake_spawn(monkeypatch, proc)
+
+    result = await asyncio.wait_for(
+        run_script_workflow(_FakeScriptSpec(), {}, "run-timeout-held-pipes"), timeout=5.0
+    )
+    assert result.state == RunState.FAILED
+    assert result.kind == "timeout"
+    assert proc.signals == ["SIGTERM"]
+    assert proc._transport.closed
+
+
+@pytest.mark.asyncio
 async def test_timeout_bound_helper_raises():
     """_await_exit_within_bound converts the elapsed bound into TimeoutBound."""
     proc = _FakeProcess(exit_rc=0, hang=True)
@@ -468,6 +498,40 @@ async def test_terminate_cooperative_never_escalates():
     await script_runner._terminate(proc, grace=0.05)
     assert proc.signals == ["SIGTERM"]
     assert proc.returncode == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("honours_sigterm", "signals", "rc"),
+    [(True, ["SIGTERM"], -15), (False, ["SIGTERM", "SIGKILL"], -9)],
+    ids=["honours-sigterm", "ignores-sigterm"],
+)
+async def test_terminate_settles_on_exit_while_pipes_are_held(
+    monkeypatch: pytest.MonkeyPatch, honours_sigterm: bool, signals: List[str], rc: int
+):
+    """_terminate returns once the script exits, even if a process it started holds the pipes.
+
+    From 3.11 ``wait()`` waits for pipe EOF too, so a ``wait()`` after SIGKILL
+    could block for as long as that process lived, and so could cancel. The
+    poll interval is stretched past the grace so a SIGTERM exit is only seen
+    after the grace elapses, and must still not be followed by SIGKILL.
+    """
+    monkeypatch.setattr(script_runner, "_EXIT_POLL_INTERVAL", 10.0)
+    proc = _HeldPipesProcess(
+        wait_holds_for_pipes=True, exit_after=None, honours_sigterm=honours_sigterm
+    )
+    await asyncio.wait_for(script_runner._terminate(proc, grace=0.05), timeout=2.0)
+    assert proc.signals == signals
+    assert proc.returncode == rc
+
+
+@pytest.mark.asyncio
+async def test_terminate_does_not_spend_the_grace_after_a_sigterm_exit():
+    """A script that exits on SIGTERM is reaped then, not when the grace runs out."""
+    proc = _HeldPipesProcess(wait_holds_for_pipes=True, exit_after=None)
+    await asyncio.wait_for(script_runner._terminate(proc, grace=5.0), timeout=1.0)
+    assert proc.signals == ["SIGTERM"]
+    assert proc.returncode == -15
 
 
 @pytest.mark.asyncio

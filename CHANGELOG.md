@@ -106,6 +106,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   used to wait out the whole wall-clock bound and be recorded as a timeout with
   its output dropped, and on 3.10 it did not settle until that process exited.
   The pipes now get the reap grace to drain, and a warning names the case (#894).
+  Timeout and cancel likewise settle once the script itself is gone, instead of
+  waiting for that process, and a timed-out run closes the pipes too.
 - Audit all tracked npm, Bun, uv, and Cargo dependency graphs in every CI run
   and weekly, including development dependencies and unfixed advisories. Block
   every HIGH/CRITICAL finding and scan error, and publish complete inventory and
