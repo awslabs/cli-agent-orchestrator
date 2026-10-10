@@ -1,40 +1,51 @@
 # Transport across ownership zones
 
-In this exercise, a team of AI agents moves a box between two areas of a
-simulated factory floor. Each area has a different owner. You start the
-simulator and the agents on your laptop. Then you watch the agents plan the
-job, divide it, hand it over between them, and check the result.
+In this exercise, a team of AI agents moves a parcel across a simulated
+factory floor. The floor has two areas, and a different robot team works in
+each area. You start the simulator and the agents on your laptop. Then you
+watch the agents plan the job and divide the work. The agents pass the parcel
+from one team to the other, and they check the result.
 
 ## What the exercise is about
 
-### Transport across ownership zones
+### Areas, owners, and the job
 
-Large sites, for example factories, warehouses, and laboratories, divide their
-floor into **ownership zones**. A zone is an area. A team or a robot fleet
-owns each zone. The owner of a zone controls the robots of that zone. It
-also controls each item while the item is in the zone.
+In a large factory, warehouse, or laboratory, different robot teams often work
+in different areas of the floor. In this example, each area is a **zone**.
 
-In a **transport across ownership zones**, an item goes from a location in one
-zone to a location in a different zone. No robot can do the complete
-trip, because each robot works only in its own zone. Thus the transport has
-these parts:
+Each zone has one **owner**. The owner is the robot team of that zone. Two
+rules apply:
 
-1. A robot of the first zone carries the item to a **shared dock**. A shared
-   dock is a location that belongs to the two zones.
-2. The first zone offers **custody** of the item to the second zone. Custody
-   is the responsibility for the item. The first zone stays responsible until
-   the second zone accepts.
-3. The second zone accepts custody. It accepts only when its robot and the
-   item are at the dock.
-4. A robot of the second zone carries the item to the destination.
+- Only the robots of a zone can move items in that zone.
+- The owner of a zone is responsible for each item in that zone.
 
-In this exercise, the item is a `tote`, a box for parts. It goes from `stock`
-in the `west` zone to `etch` in the `east` zone, through the shared `dock`:
+The example calls these zones **ownership zones**. The term is not a standard
+industry term. It is the name of the example. It comes from the Strands Robots
+example that this example follows.
+
+The job of the agents is a **transport across ownership zones**. A transport
+across ownership zones is one transport job. It is not a zone. In this job,
+the parcel must go from a location in one zone to a location in a different
+zone. No robot can do the full trip, because each robot stays in its own zone.
+Thus the job has four parts:
+
+1. A robot of the first zone moves the parcel to a **shared dock**. The shared
+   dock is a location in the two zones.
+2. The first zone offers **custody** of the parcel to the second zone. Custody
+   is the responsibility for the parcel. The first zone keeps custody until
+   the second zone accepts it.
+3. The second zone accepts custody. It can accept only when its robot and the
+   parcel are at the dock.
+4. A robot of the second zone moves the parcel to the destination.
+
+In the default scene, the parcel goes from `stock` to `etch`. `stock` is in the
+`west` zone, and `etch` is in the `east` zone. The parcel goes through the
+shared `dock`:
 
 ```mermaid
 flowchart LR
-    stock["stock<br/>west zone"] -->|"1. cart-west carries the tote"| dock["dock<br/>shared by west and east<br/>2. custody goes from west to east"]
-    dock -->|"3. cart-east carries the tote"| etch["etch<br/>east zone"]
+    stock["stock<br/>west zone"] -->|"1. cart-west carries the parcel"| dock["dock<br/>shared by west and east<br/>2. custody goes from west to east"]
+    dock -->|"3. cart-east carries the parcel"| etch["etch<br/>east zone"]
 ```
 
 ### The agents
@@ -45,8 +56,8 @@ Copilot CLI or Claude Code, in its own CAO terminal:
 - A **supervisor** reads your request, plans the job, and delegates each step
   with the CAO `handoff` tool. It cannot move a robot.
 - One **zone worker** for each zone controls only the robots of its zone. The
-  west zone worker carries the tote to the dock and offers custody. The east
-  zone worker accepts custody and carries the tote to `etch`.
+  west zone worker carries the parcel to the dock and offers custody. The east
+  zone worker accepts custody and carries the parcel to `etch`.
 - An independent **checker** reads the final state and verifies the result.
   It cannot move a robot.
 
@@ -63,9 +74,9 @@ simulate robots and their environment. Step 1 installs it as a Python package.
 No robot hardware is necessary.
 
 This exercise uses MuJoCo in a simple way. The robots are carts that move
-along straight lines. The tote moves with its cart. The simulator measures the
-positions of the carts and the tote. A zone can change custody only when the
-measured positions show the cart and the tote at the dock.
+along straight lines. The parcel moves with its cart. The simulator measures the
+positions of the carts and the parcel. A zone can change custody only when the
+measured positions show the cart and the parcel at the dock.
 
 A local process, the **controller** (`demo.py serve`), runs the MuJoCo world.
 The agents use the world only through the MCP tools of the controller.
@@ -74,6 +85,10 @@ The agents use the world only through the MCP tools of the controller.
 
 - You see a CAO supervisor delegate sequential steps to workers with
   `handoff`, and get evidence back from each worker.
+- You see the agents make decisions. The controller does no planning. The
+  CAO supervisor finds the parcel, selects the route, and selects the zone
+  worker for each leg. Two [demo scenarios](#demo-scenarios) show this: a
+  parcel that starts in the east zone, and a route through three zones.
 - You see how CAO agent profiles, tool allowlists, and credentials keep each
   agent in its role.
 - You see a handover between two agents that depends on a measured state, not
@@ -85,7 +100,7 @@ The agents need approximately 3 to 5 minutes for a run. The exercise needs
 no GPU, no display, and no robot hardware. See
 [Compute and GPU](#compute-and-gpu).
 
-![The simulated floor: the west zone in blue and the east zone in green. The pink tote is on the blue west cart at stock. The green east cart waits at the amber shared dock.](images/run-1-start.png)
+![The simulated floor: the west zone in blue and the east zone in green. The pink parcel is on the blue west cart at stock. The green east cart waits at the amber shared dock.](images/run-1-start.png)
 
 ## Background
 
@@ -295,34 +310,34 @@ sequenceDiagram
     participant C as Checker
     participant M as MuJoCo controller
 
-    User->>S: Move tote from stock to etch
+    User->>S: Move parcel from stock to etch
     S->>M: observe
-    S->>+W: handoff 1: carry the tote to the dock, then offer custody to east
-    W->>M: move cart-west with tote to dock
+    S->>+W: handoff 1: carry the parcel to the dock, then offer custody to east
+    W->>M: move cart-west with parcel to dock
     W->>M: observe until the move is finished at the dock
-    W->>M: offer_handoff tote to east
+    W->>M: offer_handoff parcel to east
     W-->>-S: command ID, offer ID, measured pose, owner west
     S->>M: observe
-    S->>+E: handoff 2: accept the offer, then carry the tote to etch
-    E->>M: observe the tote and cart-east at the dock
+    S->>+E: handoff 2: accept the offer, then carry the parcel to etch
+    E->>M: observe the parcel and cart-east at the dock
     E->>M: accept_handoff, owner becomes east
-    E->>M: move cart-east with tote to etch
+    E->>M: move cart-east with parcel to etch
     E->>M: observe until the move is finished at etch
     E-->>-S: command IDs, measured pose, owner east
     S->>+C: handoff 3: check the original request
     C->>M: observe
-    C-->>-S: tote at [2, 0] m, owner east, no pending offer
+    C-->>-S: parcel at [2, 0] m, owner east, no pending offer
     S->>User: Final report with the evidence of each worker
 ```
 
 For `site.json`, a successful run has this sequence:
 
-1. The west zone worker selects `cart-west`. It moves `tote` from `stock` to
+1. The west zone worker selects `cart-west`. It moves `parcel` from `stock` to
    `dock`. It confirms the finished command and the measured dock position.
 2. The west zone worker offers custody to `east`. West stays the owner until
    east accepts.
-3. The east zone worker confirms that the tote and `cart-east` are at the dock.
-   It accepts the exact offer. Then it moves the tote to `etch`.
+3. The east zone worker confirms that the parcel and `cart-east` are at the dock.
+   It accepts the exact offer. Then it moves the parcel to `etch`.
 4. The checker reads fresh state and compares it with the original request.
 
 ### Why handoff and not assign
@@ -443,7 +458,7 @@ For the setup of each provider, see its guide in the
 
 You do not need a GPU. A laptop is enough:
 
-- The controller sets the positions of the carts and the tote directly, along
+- The controller sets the positions of the carts and the parcel directly, along
   straight lines. The world has no gravity and no contacts.
 - With `--record`, MuJoCo renders small pictures with OpenGL. This needs no
   separate GPU. See [See the robots move](#see-the-robots-move).
@@ -451,13 +466,13 @@ You do not need a GPU. A laptop is enough:
   provider, not on your computer.
 - The example needs no display and no download of a robot model.
 
-If you extend the example, use this table to decide if you need a GPU:
+If you change the example to do more than move carts, you can need a GPU. Use this table:
 
-| Extension | GPU necessary | Notes |
+| Change to the example | GPU necessary | Why |
 | --- | --- | --- |
-| Arm motion with the Strands Robots [motion primitives](https://github.com/strands-labs/robots/blob/c377fe121a915ca17420c5fa2ef9b431372511b6/strands_robots/simulation/mujoco/motion_primitives.py) `move_to`, `set_gripper`, and `rotate_wrist`, as in [example 18](https://github.com/strands-labs/robots/blob/ed1544d73e3bf2c7ebc599987df759e14193c96d/examples/18_so101_pick_and_lift.py) | No | `move_to` solves inverse kinematics with mink on the CPU. The `strands-robots[sim-mujoco]` extra installs no CUDA packages. Example 18 reports a run time of approximately 3 seconds on a CPU. It holds the cube with a weld constraint, not a friction grasp. Strands Robots needs Python 3.12 or later. |
-| A learned action policy that runs on your computer, for example Cosmos 3 with the in-process diffusers backend, or FLUX 3 Action | Yes | Use an NVIDIA GPU with CUDA. For example, `g6e.2xlarge` has 1 NVIDIA L40S GPU (48 GB), 8 vCPUs, and 64 GiB of memory. Check the model card for the GPU memory that the policy needs. |
-| cuRobo collision-aware motion planning | Yes | cuRobo is a CUDA library. |
+| Simulate a robot arm that picks up an item. The arm moves its hand above the item, closes its gripper, lifts the item, and puts it down again. [Strands Robots example 18](https://github.com/strands-labs/robots/blob/ed1544d73e3bf2c7ebc599987df759e14193c96d/examples/18_so101_pick_and_lift.py) does this with a small arm. | No | The arm does not look for the item. The script puts the item at a known position, and it reads the position of the item from the simulator. Thus the arm needs no camera. The example uses a camera only to record an optional video. The CPU calculates the arm motion to that position. Example 18 reports a run time of approximately 3 seconds on a CPU. Strands Robots needs Python 3.12 or later. On a real robot, a camera or another sensor must find the item first. |
+| Use a trained robot model on your computer. A trained robot model is a neural network. It reads camera images and an instruction. Then it sends motor commands to the robot many times each second. This example has no such model. | Yes | The model needs an NVIDIA GPU. For example, the AWS instance type `g6e.2xlarge` has 1 NVIDIA L40S GPU with 48 GB of memory. The model card of the model gives the GPU memory that it needs. |
+| Plan arm motions that do not hit objects, with the NVIDIA library cuRobo. | Yes | cuRobo uses CUDA, so it needs an NVIDIA GPU. |
 
 ## Run the demo
 
@@ -517,7 +532,7 @@ add `--provider <provider>` to the `prepare` command, for example
 
 ```bash
 export RUN_DIR=/tmp/cao-transport-demo
-REQUEST="Move tote from stock to etch. Coordinate the ownership handoff and have an independent checker verify delivery."
+REQUEST="Move parcel from stock to etch. Coordinate the ownership handoff and have an independent checker verify delivery."
 uv run --locked python demo.py prepare --run-dir "$RUN_DIR" --request "$REQUEST"
 ```
 
@@ -529,7 +544,7 @@ cao install /tmp/cao-transport-demo/profiles/transport_supervisor_<id>.md
 cao install /tmp/cao-transport-demo/profiles/transport_checker_<id>.md
 cao install /tmp/cao-transport-demo/profiles/transport_zone_worker_<id>.md
 cao install /tmp/cao-transport-demo/profiles/transport_zone_worker_<id>.md
-cao launch --agents transport_supervisor_<id> --headless --async --auto-approve --session-name cao-transport-<run_id> --working-directory <repo>/examples/robotics/cross-zone-transport -- 'Move tote from stock to etch. Coordinate the ownership handoff and have an independent checker verify delivery.'
+cao launch --agents transport_supervisor_<id> --headless --async --auto-approve --session-name cao-transport-<run_id> --working-directory <repo>/examples/robotics/cross-zone-transport -- 'Move parcel from stock to etch. Coordinate the ownership handoff and have an independent checker verify delivery.'
 ```
 
 `demo.py` commands can also print this warning from a dependency. You can
@@ -550,19 +565,28 @@ It will be compatible before version 2.0.0.
 | `profiles/` | One run copy of a profile for each agent. See [Run copies](#run-copies). |
 | `credentials/` | One private credential file for each actor, readable only by you |
 | `run.json` | The run ID, the profile names, and the controller URL |
+| `run.env` | Shell variables for Steps 5 and 6: the profile name of each agent, the run ID, and the session name |
 | `scene.json` | A copy of the scene |
 
 `prepare` also prints the `cao install` and `cao launch` commands for this run.
 Steps 5 and 6 run the same commands. They also set the variables that the
 later steps use.
 
+- `/tmp` is the folder for temporary files of macOS and Linux. It is not in
+  this repository. The run directory `/tmp/cao-transport-demo` and the
+  pictures of Step 3, `/tmp/cao-transport-frames`, are in `/tmp`. On macOS,
+  `/tmp` is a link to `/private/tmp`, so some outputs show `/private/tmp`.
 - If the run directory exists, `prepare` stops with an error. Use a new
   directory for each run.
 - Do not move the example directory or its `.venv` until the cleanup. Each
   run copy starts the Python interpreter of `.venv` and `demo.py` by their
   full paths.
 
-### Step 3. Start the controller
+### Step 3. Start the MuJoCo controller
+
+The MuJoCo controller is the simulator of this example. It holds the MuJoCo
+world: the zones, the carts, and the parcel. The agents use the world only
+through its MCP tools.
 
 In Terminal 2, from the repository root:
 
@@ -589,20 +613,38 @@ INFO:     Application startup complete.
 INFO:     Uvicorn running on http://127.0.0.1:8766 (Press CTRL+C to quit)
 ```
 
-While the agents work, one line for each command change:
+While the agents work, the controller writes one line for each tool call of
+an agent. It also writes one line for each status change of a command. The line of a
+tool call starts with the agent, for example `west zone worker`. These lines
+come from a run with `--provider claude_code`:
 
 ```text
-<time> transport run=<run_id> actor=west command=west-tote-stock-to-dock operation=move status=accepted reason=None
-<time> transport run=<run_id> actor=west command=west-tote-stock-to-dock operation=move status=running reason=None
-<time> transport run=<run_id> actor=west command=west-tote-stock-to-dock operation=move status=finished reason=None
-<time> transport run=<run_id> actor=west command=west-offer-tote-to-east operation=offer status=finished reason=None
-<time> transport run=<run_id> actor=east command=east-accept-tote-at-dock operation=accept status=finished reason=None
-<time> transport run=<run_id> actor=east command=east-tote-dock-to-etch operation=move status=accepted reason=None
-<time> transport run=<run_id> actor=east command=east-tote-dock-to-etch operation=move status=running reason=None
-<time> transport run=<run_id> actor=east command=east-tote-dock-to-etch operation=move status=finished reason=None
+<time> transport supervisor called observe()
+<time> transport west zone worker called observe()
+<time> transport west zone worker called move(command_id=west-parcel-stock-to-dock, robot=cart-west, payload=parcel, destination=dock)
+<time> transport run=<run_id> actor=west command=west-parcel-stock-to-dock operation=move status=accepted reason=None
+<time> transport run=<run_id> actor=west command=west-parcel-stock-to-dock operation=move status=running reason=None
+<time> transport run=<run_id> actor=west command=west-parcel-stock-to-dock operation=move status=finished reason=None
+<time> transport west zone worker called observe()
+<time> transport west zone worker called offer_handoff(command_id=west-offer-parcel-to-east, payload=parcel, receiver_zone=east)
+<time> transport run=<run_id> actor=west command=west-offer-parcel-to-east operation=offer status=finished reason=None
+<time> transport west zone worker called observe()
+<time> transport supervisor called observe()
+<time> transport east zone worker called observe()
+<time> transport east zone worker called accept_handoff(command_id=east-accept-parcel-from-west, payload=parcel, robot=cart-east, offer_id=west-offer-parcel-to-east)
+<time> transport run=<run_id> actor=east command=east-accept-parcel-from-west operation=accept status=finished reason=None
+<time> transport east zone worker called move(command_id=east-parcel-dock-to-etch, robot=cart-east, payload=parcel, destination=etch)
+<time> transport run=<run_id> actor=east command=east-parcel-dock-to-etch operation=move status=accepted reason=None
+<time> transport run=<run_id> actor=east command=east-parcel-dock-to-etch operation=move status=running reason=None
+<time> transport run=<run_id> actor=east command=east-parcel-dock-to-etch operation=move status=finished reason=None
+<time> transport east zone worker called observe()
+<time> transport supervisor called observe()
+<time> transport checker called observe()
+<time> transport checker called observe()
 ```
 
-The agents choose the command IDs, so your IDs can be different.
+The agents choose the command IDs and the number of `observe` calls, so your
+lines can be different.
 
 </details>
 
@@ -647,21 +689,46 @@ version, stop it and start it again.
 
 ### Step 5. Install the agent profiles
 
-In Terminal 1, install the run copies, not the profiles in this directory:
+The three profiles of this directory give four agents: one supervisor, two
+zone workers, and one checker. `prepare` wrote one run copy for each agent.
+It also wrote `run.env`, which gives the name of each run copy. Install the run
+copies, not the profiles of this directory.
+
+- `source` sets the variables `SUPERVISOR`, `ZONE_WEST`, `ZONE_EAST`,
+  `CHECKER`, `RUN_ID`, and `SESSION`. To see them, run
+  `cat "$RUN_DIR/run.env"`.
+- A scene with other zones has other zone variables. For example,
+  `return-site.json` gives `ZONE_STORES` and `ZONE_ASSEMBLY`. Install one zone
+  worker for each `ZONE_` variable in `run.env`.
+- `tee -a` also writes the output to `install.log`. The cleanup uses the
+  paths in that file.
+
+In Terminal 1, run these commands one at a time:
 
 ```bash
-for profile in "$RUN_DIR"/profiles/*.md; do
-  cao install "$profile"
-done | tee "$RUN_DIR/install.log"
+source "$RUN_DIR/run.env"
+cao install "$RUN_DIR/profiles/$SUPERVISOR.md" | tee -a "$RUN_DIR/install.log"
+cao install "$RUN_DIR/profiles/$ZONE_WEST.md" | tee -a "$RUN_DIR/install.log"
+cao install "$RUN_DIR/profiles/$ZONE_EAST.md" | tee -a "$RUN_DIR/install.log"
+cao install "$RUN_DIR/profiles/$CHECKER.md" | tee -a "$RUN_DIR/install.log"
 ```
 
 <details>
 <summary>Expected output</summary>
 
-These lines repeat for each of the four run copies. This output is from a run
-with `--provider claude_code`:
+Three lines for each agent, in the order of the commands. This output is from
+a run with `--provider claude_code`:
 
 ```text
+✓ Copied agent from file to local store
+✓ Agent 'transport_supervisor_<id>' installed successfully
+✓ Context file: ~/.aws/cli-agent-orchestrator/agent-context/transport_supervisor_<id>.md
+✓ Copied agent from file to local store
+✓ Agent 'transport_zone_worker_<id>' installed successfully
+✓ Context file: ~/.aws/cli-agent-orchestrator/agent-context/transport_zone_worker_<id>.md
+✓ Copied agent from file to local store
+✓ Agent 'transport_zone_worker_<id>' installed successfully
+✓ Context file: ~/.aws/cli-agent-orchestrator/agent-context/transport_zone_worker_<id>.md
 ✓ Copied agent from file to local store
 ✓ Agent 'transport_checker_<id>' installed successfully
 ✓ Context file: ~/.aws/cli-agent-orchestrator/agent-context/transport_checker_<id>.md
@@ -672,29 +739,17 @@ If the provider uses its own agent file, `cao install` also prints a line
 
 </details>
 
-For each run copy, `cao install` prints lines that start with `✓`, for example
-`✓ Agent '<name>' installed successfully`. Some lines give the paths of the
-files that it writes. `tee` also writes this output to `install.log`. The
-cleanup uses these paths.
-
-### Step 6. Launch the supervisor
+### Step 6. Launch the CAO supervisor
 
 > [!CAUTION]
 > Use `--auto-approve`. Do not use `--yolo`. `--yolo` removes the tool
 > restrictions that keep each agent in its role. Do not change the generated
 > allowlists, and do not add other MCP servers.
 
-In Terminal 1:
+In Terminal 1, launch the CAO supervisor. `$SUPERVISOR` and `$SESSION` come
+from `run.env`, which Step 5 sourced:
 
 ```bash
-SUPERVISOR=$(uv run --locked python -c \
-  'import json,sys; print(json.load(open(sys.argv[1]))["profiles"]["supervisor"])' \
-  "$RUN_DIR/run.json")
-RUN_ID=$(uv run --locked python -c \
-  'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' \
-  "$RUN_DIR/run.json")
-SESSION="cao-transport-$RUN_ID"
-
 cao launch --agents "$SUPERVISOR" --headless --async --auto-approve \
   --session-name "$SESSION" --working-directory "$(pwd)" \
   -- "$REQUEST"
@@ -759,7 +814,7 @@ Use one or more of these views:
   Status:   completed
 
   Last response:
-  Delivered. tote is at etch, owner east, no pending offer — confirmed by my own observe and independently by the checker.
+  The parcel was delivered from stock to etch, and custody passed from west to east at dock. The independent checker confirmed the result. ...
   ...
 
   No worker terminals
@@ -785,6 +840,24 @@ the command records of that worker.
 
 The controller state in Step 8 is the record of what the robots did. The final
 answer of the supervisor is in its window.
+
+#### What each agent does
+
+Each agent has its own CAO terminal and its own credential. The controller
+writes one line in Terminal 2 for each tool call. The line starts with the
+name of the agent, for example `west zone worker called move(...)`. Thus
+Terminal 2 shows which agent does each step.
+
+| Agent | CAO terminal (tmux window) | What it does | Lines in Terminal 2 |
+| --- | --- | --- | --- |
+| CAO supervisor | `transport_supervisor_<id>-<4hex>` | Reads the scene and the state. Plans the legs. Hands off each leg to a zone worker, and the check to the checker. Reports the result. | `supervisor called observe()` |
+| West zone worker | `transport_zone_worker_<id>-<4hex>` | Moves the parcel from `stock` to the dock with `cart-west`. Offers custody to `east`. | `west zone worker called move(...)`, `west zone worker called offer_handoff(...)` |
+| East zone worker | `transport_zone_worker_<id>-<4hex>` | Accepts the custody offer at the dock. Moves the parcel from the dock to `etch` with `cart-east`. | `east zone worker called accept_handoff(...)`, `east zone worker called move(...)` |
+| Checker | `transport_checker_<id>-<4hex>` | Reads the final state and compares it with the request. Moves nothing. | `checker called observe()` |
+
+The lines with `actor=` come from the simulator. They show each status change
+of a command. The tmux window of a worker closes when its handoff ends, but
+its lines stay in Terminal 2.
 
 ### Step 8. Check the result
 
@@ -812,13 +885,13 @@ fields for each command.
     "cart-east": {"xy": [2.0, 0.0], "zone": "east"}
   },
   "payloads": {
-    "tote": {"xy": [2.0, 0.0], "at": "etch", "owner": "east", "offer": null}
+    "parcel": {"xy": [2.0, 0.0], "at": "etch", "owner": "east", "offer": null}
   },
   "commands": [
-    {"actor": "west", "command_id": "west-tote-stock-to-dock", "operation": "move", "status": "finished", "reason": null},
-    {"actor": "west", "command_id": "west-offer-tote-to-east", "operation": "offer", "status": "finished", "reason": null},
-    {"actor": "east", "command_id": "east-accept-tote-at-dock", "operation": "accept", "status": "finished", "reason": null},
-    {"actor": "east", "command_id": "east-tote-dock-to-etch", "operation": "move", "status": "finished", "reason": null}
+    {"actor": "west", "command_id": "west-parcel-stock-to-dock", "operation": "move", "status": "finished", "reason": null},
+    {"actor": "west", "command_id": "west-offer-parcel-to-east", "operation": "offer", "status": "finished", "reason": null},
+    {"actor": "east", "command_id": "east-accept-parcel-from-west", "operation": "accept", "status": "finished", "reason": null},
+    {"actor": "east", "command_id": "east-parcel-dock-to-etch", "operation": "move", "status": "finished", "reason": null}
   ]
 }
 ```
@@ -829,14 +902,51 @@ For `site.json`, a successful run shows these values:
 
 | Field | Expected value |
 | --- | --- |
-| `payloads.tote.xy` | `[2.0, 0.0]`, within `arrival_tolerance_m` (0.01 m) |
-| `payloads.tote.at` | `etch` |
-| `payloads.tote.owner` | `east` |
-| `payloads.tote.offer` | `null` |
+| `payloads.parcel.xy` | `[2.0, 0.0]`, within `arrival_tolerance_m` (0.01 m) |
+| `payloads.parcel.at` | `etch` |
+| `payloads.parcel.owner` | `east` |
+| `payloads.parcel.offer` | `null` |
 | `commands` | The two `move` commands, the `offer`, and the `accept` have `"status": "finished"` |
 
 The final answer of the supervisor names each worker, each leg, the custody
 acceptance, and the evidence of the checker.
+
+<details>
+<summary>Example final answer of the CAO supervisor</summary>
+
+An excerpt from a run with `--provider claude_code`. The words and the layout
+are different in each run.
+
+```text
+The parcel was delivered from stock to etch, and custody passed from west to
+east at dock. The independent checker confirmed the result.
+
+Workers
+- West zone: transport_zone_worker_<id> (cart-west)
+- East zone: transport_zone_worker_<id> (cart-east)
+- Checker: transport_checker_<id>
+
+Legs
+┌──────┬────────────────────────────────────────────────────────┬─────────────────────┬──────────┐
+│ Leg  │                        Commands                        │ Start → destination │  Status  │
+├──────┼────────────────────────────────────────────────────────┼─────────────────────┼──────────┤
+│ West │ west-parcel-stock-to-dock, west-offer-parcel-to-east   │ stock → dock        │ finished │
+├──────┼────────────────────────────────────────────────────────┼─────────────────────┼──────────┤
+│ East │ east-accept-parcel-from-west, east-parcel-dock-to-etch │ dock → etch         │ finished │
+└──────┴────────────────────────────────────────────────────────┴─────────────────────┴──────────┘
+
+Custody: West made offer west-offer-parcel-to-east at dock. Before the east leg
+started, my own observe showed the parcel at dock, still owned by west, with
+that offer pending. The east worker confirmed the parcel at dock, then accepted
+the offer (east-accept-parcel-from-west) before moving it.
+
+Checker evidence: The parcel is measured at [2, 0] m, which is 0.000 m from
+etch (tolerance 0.01 m). The owner is east, no offer is pending, and all four
+commands are finished.
+...
+```
+
+</details>
 
 A successful tool call or test run does not prove a multi-agent run. Make sure
 that each zone worker and the checker did their part.
@@ -861,7 +971,7 @@ Do these steps in this sequence:
      "run_id": "<run_id>",
      "stopped": true,
      "payloads": {
-       "tote": {"xy": [2.0, 0.0], "at": "etch", "owner": "east", "offer": null}
+       "parcel": {"xy": [2.0, 0.0], "at": "etch", "owner": "east", "offer": null}
      }
    }
    ```
@@ -908,28 +1018,29 @@ Do these steps in this sequence:
 
    </details>
 4. In Terminal 1, remove the installed files of this run. `cao profile remove`
-   removes the copy in the CAO profile store. Then the loop reads
-   `install.log` and removes each other path that `cao install` printed in
-   Step 5. These paths depend on the provider and on your CAO settings.
+   removes the copy of a profile in the CAO profile store. The last command
+   removes the other files that `cao install` wrote in Step 5. It reads their
+   paths from `install.log`. These paths depend on the provider and on your
+   CAO settings.
 
    ```bash
-   for profile in "$RUN_DIR"/profiles/*.md; do
-     cao profile remove --yes "$(basename "$profile" .md)"
-   done
-   sed -n -E 's/^✓ (Context file|[a-z_]+ agent): //p' "$RUN_DIR/install.log" |
-     while IFS= read -r path; do rm -f -- "$path"; done
+   cao profile remove --yes "$SUPERVISOR"
+   cao profile remove --yes "$ZONE_WEST"
+   cao profile remove --yes "$ZONE_EAST"
+   cao profile remove --yes "$CHECKER"
+   sed -n -E 's/^✓ (Context file|[a-z_]+ agent): //p' "$RUN_DIR/install.log" | tr '\n' '\0' | xargs -0 rm -f --
    ```
 
    <details>
    <summary>Expected output</summary>
 
-   One line for each of the four run copies. The `sed` loop prints nothing.
+   One line for each agent. The last command prints nothing.
 
    ```text
-   ✓ Removed 'transport_checker_<id>' from ~/.aws/cli-agent-orchestrator/agent-store
    ✓ Removed 'transport_supervisor_<id>' from ~/.aws/cli-agent-orchestrator/agent-store
    ✓ Removed 'transport_zone_worker_<id>' from ~/.aws/cli-agent-orchestrator/agent-store
    ✓ Removed 'transport_zone_worker_<id>' from ~/.aws/cli-agent-orchestrator/agent-store
+   ✓ Removed 'transport_checker_<id>' from ~/.aws/cli-agent-orchestrator/agent-store
    ```
 
    </details>
@@ -977,7 +1088,7 @@ fixed overview camera. They do not change the simulation.
 This animation comes from a run of [Run the demo](#run-the-demo) with
 `--provider claude_code`:
 
-![Animation of the run: the blue west cart carries the pink tote from stock to the amber dock. Then the green east cart carries the tote from the dock to etch.](images/run-animation.png)
+![Animation of the run: the blue west cart carries the pink parcel from stock to the amber dock. Then the green east cart carries the parcel from the dock to etch.](images/run-animation.png)
 
 The controller checks the measured state two times each second. It saves a
 picture after each of these changes:
@@ -992,17 +1103,17 @@ The pictures do not show the owner and the offer. The captions in
 
 | Picture | State |
 | --- | --- |
-| ![Start of the run](images/run-1-start.png) | 1. Start. The tote is on `cart-west` at `stock`, owner `west`. `cart-east` waits at the dock. |
-| ![The west leg](images/run-2-west-leg.png) | 2. The west zone worker moves `cart-west` with the tote to the dock. |
-| ![The tote at the dock](images/run-3-dock.png) | 3. The tote is at the dock, above the two carts. West offers custody to east, and east accepts. The owner changes from `west` to `east`. |
-| ![The east leg](images/run-4-east-leg.png) | 4. The east zone worker moves `cart-east` with the tote to `etch`. `cart-west` stays at the dock. |
-| ![The tote delivered at etch](images/run-5-delivered.png) | 5. Delivered. The tote is at `etch`, owner `east`. |
+| ![Start of the run](images/run-1-start.png) | 1. Start. The parcel is on `cart-west` at `stock`, owner `west`. `cart-east` waits at the dock. |
+| ![The west leg](images/run-2-west-leg.png) | 2. The west zone worker moves `cart-west` with the parcel to the dock. |
+| ![The parcel at the dock](images/run-3-dock.png) | 3. The parcel is at the dock, above the two carts. West offers custody to east, and east accepts. The owner changes from `west` to `east`. |
+| ![The east leg](images/run-4-east-leg.png) | 4. The east zone worker moves `cart-east` with the parcel to `etch`. `cart-west` stays at the dock. |
+| ![The parcel delivered at etch](images/run-5-delivered.png) | 5. Delivered. The parcel is at `etch`, owner `east`. |
 
 | In the picture | Item |
 | --- | --- |
 | Light blue area, light green area | Zone `west`, zone `east` |
 | Strong blue box, strong green box | `cart-west`, `cart-east`. A robot has the strong color of its zone. |
-| Pink box | `tote` |
+| Pink box | `parcel` |
 | Amber disc | `dock`, the shared dock of the two zones |
 | Dark grey discs | `stock` and `etch` |
 
@@ -1064,22 +1175,24 @@ Also add a different `--port <port>` to each `prepare` command, and give each
 
 | Scenario | `prepare` options | Request | Expected result |
 | --- | --- | --- | --- |
-| Cross-zone delivery | None | `Move tote from stock to etch. Coordinate the ownership handoff and have an independent checker verify delivery.` | Both zone workers contribute. The tote arrives at the dock before east accepts custody. The checker confirms the tote at `etch`, owner `east`. |
-| Same-zone leg | None | `Move tote from stock to dock only. Have an independent checker verify the result.` | One west leg and no custody offer. The owner stays `west`. |
-| Unavailable destination | None | `Move tote from stock to cleanroom. Have an independent checker verify the result.` | The agents report that `cleanroom` is not available. They do not invent a location or deliver to a different one. The tote stays at `stock`, owner `west`. |
-| Robot of another zone | None | `Use cart-east to move tote from stock to dock. Have an independent checker verify the result.` | The agents refuse, or the controller rejects the call, for example with `not_robot_owner`. The tote does not move. |
-| Receiving robot too weak | `--scene /tmp/heavy-site.json` | Same as cross-zone delivery | `cart-east` (5 kg limit) cannot carry the 6 kg tote. The agents refuse before motion, or the controller rejects `accept_handoff` with `payload_too_heavy`. A rejected acceptance keeps the offer pending, so the tote stays at `dock`, owner `west`, until the run ends. |
+| Cross-zone delivery | None | `Move parcel from stock to etch. Coordinate the ownership handoff and have an independent checker verify delivery.` | Both zone workers contribute. The parcel arrives at the dock before east accepts custody. The checker confirms the parcel at `etch`, owner `east`. |
+| Same-zone leg | None | `Move parcel from stock to dock only. Have an independent checker verify the result.` | One west leg and no custody offer. The owner stays `west`. |
+| Unavailable destination | None | `Move parcel from stock to cleanroom. Have an independent checker verify the result.` | The agents report that `cleanroom` is not available. They do not invent a location or deliver to a different one. The parcel stays at `stock`, owner `west`. |
+| Robot of another zone | None | `Use cart-east to move parcel from stock to dock. Have an independent checker verify the result.` | The agents refuse, or the controller rejects the call, for example with `not_robot_owner`. The parcel does not move. |
+| Receiving robot too weak | `--scene /tmp/heavy-site.json` | Same as cross-zone delivery | `cart-east` (5 kg limit) cannot carry the 6 kg parcel. The agents refuse before motion, or the controller rejects `accept_handoff` with `payload_too_heavy`. A rejected acceptance keeps the offer pending, so the parcel stays at `dock`, owner `west`, until the run ends. |
 | Different scene | `--scene return-site.json` | `Return sample-tray from rack to inspection. Coordinate the ownership handoff and have an independent checker verify delivery.` | The `stores` and `assembly` zone workers contribute. The tray stops within 0.01 m of `[1, -1]`, owner `assembly`. |
-| Operator stop | `--scene /tmp/slow-site.json` | Same as cross-zone delivery | Stop the run while the first move is `running`. The move becomes `interrupted`, reason `operator_stop`. The tote stays between locations (`"at": null`), owner `west`. The controller rejects all later actions. |
+| Operator stop | `--scene /tmp/slow-site.json` | Same as cross-zone delivery | Stop the run while the first move is `running`. The move becomes `interrupted`, reason `operator_stop`. The parcel stays between locations (`"at": null`), owner `west`. The controller rejects all later actions. |
+| Parcel starts in the east zone | `--scene /tmp/east-start-site.json` | `Move parcel to stock. Coordinate the ownership handoff and have an independent checker verify delivery.` | The request does not give the start. The CAO supervisor finds the parcel at `etch` with `observe`, and it plans the job from east to west. The east zone worker moves the parcel to the dock and offers custody to `west`. The west zone worker accepts custody and moves the parcel to `stock`. The checker confirms the parcel at `stock`, owner `west`. |
+| Three zones | `--scene /tmp/three-zone-site.json` | `Move parcel from stock to warehouse. Coordinate the ownership handoffs and have an independent checker verify delivery.` | The request does not give the route. The CAO supervisor finds a route through two shared docks: `dock` (zones `west` and `east`) and `north-dock` (zones `east` and `north`). Three zone workers move the parcel. Custody changes two times: from `west` to `east`, then from `east` to `north`. The checker confirms the parcel at `warehouse`, owner `north`. |
 
-In Terminal 1, create the scene files for the last scenarios:
+In Terminal 1, create the scene files of the scenarios that use `/tmp/...-site.json`:
 
 ```bash
-# Receiving robot too weak: cart-east carries 5 kg, and the tote is 6 kg.
+# Receiving robot too weak: cart-east carries 5 kg, and the parcel is 6 kg.
 uv run --locked python - <<'EOF'
 import json
 scene = json.load(open("site.json"))
-scene["payloads"]["tote"]["mass_kg"] = 6
+scene["payloads"]["parcel"]["mass_kg"] = 6
 json.dump(scene, open("/tmp/heavy-site.json", "w"), indent=2)
 EOF
 
@@ -1091,15 +1204,52 @@ scene["robots"]["cart-west"]["speed_m_s"] = 0.1
 scene["action_timeout_seconds"] = 30
 json.dump(scene, open("/tmp/slow-site.json", "w"), indent=2)
 EOF
+
+# Parcel starts in the east zone: the parcel and cart-east are at etch, and
+# cart-west waits at the dock.
+uv run --locked python - <<'EOF'
+import json
+scene = json.load(open("site.json"))
+scene["robots"]["cart-east"]["at"] = "etch"
+scene["robots"]["cart-west"]["at"] = "dock"
+scene["payloads"]["parcel"].update({"at": "etch", "owner": "east"})
+json.dump(scene, open("/tmp/east-start-site.json", "w"), indent=2)
+EOF
+
+# Three zones: zone north, with north-dock (shared with east) and warehouse.
+uv run --locked python - <<'EOF'
+import json
+scene = json.load(open("site.json"))
+scene["zones"]["north"] = {"bounds": [0, 1, 3, 3]}
+scene["locations"]["north-dock"] = {"xy": [2, 1], "zones": ["east", "north"], "handoff": True}
+scene["locations"]["warehouse"] = {"xy": [2, 2.5], "zones": ["north"]}
+scene["robots"]["cart-east"]["locations"].append("north-dock")
+scene["robots"]["cart-north"] = {
+    "zone": "north", "at": "north-dock", "locations": ["north-dock", "warehouse"],
+    "payload_kg": 8, "fixtures": ["parcel_clamp"], "speed_m_s": 1,
+}
+json.dump(scene, open("/tmp/three-zone-site.json", "w"), indent=2)
+EOF
 ```
 
 <details>
 <summary>Expected output</summary>
 
-The commands print nothing. They write `/tmp/heavy-site.json` and
-`/tmp/slow-site.json`.
+The commands print nothing. They write `/tmp/heavy-site.json`,
+`/tmp/slow-site.json`, `/tmp/east-start-site.json`, and
+`/tmp/three-zone-site.json`.
 
 </details>
+
+These pictures come from a run of the three-zone scenario with
+`--provider claude_code`. The orange area is zone `north`, and the orange box
+is `cart-north`. The agents moved the parcel through the two amber docks:
+
+| Start | Delivered |
+| --- | --- |
+| ![Three zones at the start: the pink parcel on the blue west cart at stock. The green east cart waits at the dock, and the orange north cart waits at north-dock.](images/three-zones-start.png) | ![Three zones at the end: the pink parcel on the orange north cart at warehouse. The blue west cart is at the dock, and the green east cart is at north-dock.](images/three-zones-delivered.png) |
+
+![Animation of the three-zone run: the west cart, the east cart, and the north cart carry the parcel in turn, from stock to warehouse.](images/three-zones-animation.png)
 
 To stop the run during a move:
 
@@ -1113,16 +1263,16 @@ To stop the run during a move:
    <details>
    <summary>Expected output</summary>
 
-   An excerpt. The position of the tote depends on the time of the stop.
+   An excerpt. The position of the parcel depends on the time of the stop.
 
    ```json
    {
      "stopped": true,
      "payloads": {
-       "tote": {"xy": [-1.862, 0.0], "at": null, "owner": "west", "offer": null}
+       "parcel": {"xy": [-1.862, 0.0], "at": null, "owner": "west", "offer": null}
      },
      "commands": [
-       {"actor": "west", "command_id": "west-tote-stock-to-dock", "operation": "move", "status": "interrupted", "reason": "operator_stop"}
+       {"actor": "west", "command_id": "west-parcel-stock-to-dock", "operation": "move", "status": "interrupted", "reason": "operator_stop"}
      ]
    }
    ```
@@ -1135,12 +1285,82 @@ To stop the run during a move:
 If the move finished before the stop, the result is not an interrupted
 transport. Prepare a new run and try again.
 
+## From the simulation to real robots
+
+This example does not control real robots. It has no robot driver and no
+connection to robot hardware. It simulates the **coordination layer** above
+the robots. In this layer, the agents plan the job and divide it between the
+robot teams. Then they check the custody handoff and the result.
+
+### What the simulation stands for
+
+Real sites have the same problem. Different transport systems serve different
+areas. An item must pass from one system to the next. These are three
+examples:
+
+- **Semiconductor factory.** In a wafer factory, one transport system can move
+  wafer carriers between production bays (interbay transport). A different
+  system moves them in a bay, between a stocker and the tools (intrabay
+  transport). The stocker of a bay is the place where the systems pass the
+  carriers. See
+  [US patent application 2005/0191162](https://patents.google.com/patent/US20050191162A1/en).
+  At a tool, the transport vehicle and the tool exchange signals that confirm
+  that the tool is ready. Then the signals follow the handoff until it is
+  complete. The standard for these signals is
+  [SEMI E84](https://www.peergroup.com/definition-of-standard/semi-e84/).
+- **Robot fleets from different vendors in one building.**
+  [Open-RMF](https://www.open-rmf.org/) is free, open-source software. It lets
+  fleets of robots from different vendors share one building, with its doors
+  and elevators.
+- **Factory transport vehicles.** [VDA 5050](https://github.com/VDA5050/VDA5050)
+  is a standard interface between a central fleet control and mobile robots.
+  The fleet control sends orders to the robots, and the robots report their
+  state.
+
+In each example, a handoff is complete only when the systems confirm it. A
+message alone is not sufficient. This example uses the same rule. Custody
+changes only when the measured positions show the parcel and the receiving
+robot at the dock.
+
+### How the parts of the example map to a real site
+
+| In this example | On a real site |
+| --- | --- |
+| The MuJoCo world in the controller | The real floor. The robots and the sensors measure the positions. |
+| A zone and its zone worker | An area and the fleet control of the robots in that area |
+| `move` | A transport order to the fleet control of the zone, for example a VDA 5050 order |
+| `observe` | The state that the fleet controls report: robot positions, item locations, and order status |
+| `offer_handoff` and `accept_handoff` at the dock | The handoff at the transfer point, for example the SEMI E84 signals between a vehicle and a tool |
+| The credential of each agent | A separate access key for the fleet control of each area |
+| `demo.py stop` | A stop request in software. It does not replace the emergency stop and the safety system of the robots. |
+
+The CAO parts can stay the same. These parts are the CAO supervisor, the zone
+workers, the checker, `handoff`, the agent profiles, and the tool allowlists. Only the MCP
+server behind `transport-sim` changes. Instead of the MuJoCo world, it calls
+the fleet control of each area. MCP servers that connect AI agents to robots
+exist, for example
+[ROS-MCP-Server](https://github.com/robotmcp/ros-mcp-server) for robots that
+use ROS. This example does not include such a server.
+
+### What real robots need in addition
+
+This example does not supply these items:
+
+- A connection from the MCP server to the fleet control of each area.
+- A safety system on the robots. The agents do not make the robots safe. The
+  robots and their fleet controls must stop for people and obstacles without
+  the agents. For example, ISO 3691-4 gives the safety requirements for
+  [driverless industrial trucks](https://www.iso.org/standard/88615.html).
+  Automated guided vehicles and autonomous mobile robots are examples of these
+  trucks.
+- Tests on the real site, with people who monitor the robots.
+
 ## Safety and limits
 
 ### Simulation only
 
 - The robots are kinematic cart proxies. MuJoCo mocap positions move along
-  straight segments. The tote moves with its cart (idealized rigid carry).
+  straight segments. The parcel moves with its cart (idealized rigid carry).
 - There are no wheel dynamics, grasps, collision avoidance, physical docking,
   or real-world safety claims.
 - Custody changes only on measured MuJoCo positions. A message from an agent
@@ -1184,7 +1404,7 @@ transport. Prepare a new run and try again.
 - On a timeout, an interruption, or a failure, the agents report the state.
   They do not try again automatically.
 - `demo.py stop` marks active commands `interrupted`. It keeps the actual
-  positions and custody, and it locks the run permanently. A tote between
+  positions and custody, and it locks the run permanently. A parcel between
   named locations shows `"at": null`.
 - After a crash or a forced stop, `last-state.json` can be old. An old file
   does not prove the current state or a stop.
@@ -1207,16 +1427,16 @@ transport. Prepare a new run and try again.
 
 | File | Contents |
 | --- | --- |
-| `demo.py` | The operator commands `prepare`, `serve`, `status`, and `stop`, and the `connect` stdio relay that the profiles start |
+| `demo.py` | The operator commands `prepare`, `serve`, `status`, and `stop`, and the `connect` stdio relay that the profiles start. `prepare` also writes `run.env`. |
 | `simulation.py` | The shared MuJoCo world: ownership and capability checks, bounded motion, command history, and custody changes |
-| `transport_mcp.py` | The authenticated FastMCP server and its scoped tools. It does no planning and no language interpretation. |
+| `transport_mcp.py` | The authenticated FastMCP server and its scoped tools. It writes one log line for each tool call, with the agent that made the call. It does no planning and no language interpretation. |
 | `recorder.py` | The optional pictures of `serve --record`: PNG frames, the animated PNG, `frames.json`, and `index.html` |
 | `transport_supervisor.md` | Agent profile of the supervisor |
 | `transport_zone_worker.md` | Agent profile of the zone workers. All zones use this profile. |
 | `transport_checker.md` | Agent profile of the checker |
-| `site.json` | Default scene: zones `west` and `east`, tote from `stock` to `etch` |
+| `site.json` | Default scene: zones `west` and `east`, parcel from `stock` to `etch` |
 | `return-site.json` | Alternative scene: zones `stores` and `assembly`, tray from `rack` to `inspection` |
-| `images/` | The pictures in [See the robots move](#see-the-robots-move), from a run of this guide |
+| `images/` | The pictures in [See the robots move](#see-the-robots-move) and [Demo scenarios](#demo-scenarios), from runs of this guide |
 | `tests/` | Simulator, MCP, recorder, and setup tests |
 
 To run the tests:

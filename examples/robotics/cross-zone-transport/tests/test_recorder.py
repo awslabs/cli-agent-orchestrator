@@ -103,15 +103,15 @@ def test_recorder_writes_a_frame_only_when_the_measured_state_changes(tmp_path):
     time.sleep(0.2)
     assert len(recorder.frames) == 1, "an unchanged world must not produce new frames"
 
-    assert w.move("west", "leg-1", "cart-west", "tote", "dock")["status"] == "accepted"
+    assert w.move("west", "leg-1", "cart-west", "parcel", "dock")["status"] == "accepted"
     for _ in range(200):
         w.tick()
     assert w.command("west", "leg-1")["status"] == "finished"
     assert wait_for(lambda: any("finished" in (f["event"] or "") for f in recorder.frames))
     frames = recorder.stop()
 
-    assert frames[0]["payloads"]["tote"]["at"] == "stock"
-    assert frames[-1]["payloads"]["tote"]["at"] == "dock"
+    assert frames[0]["payloads"]["parcel"]["at"] == "stock"
+    assert frames[-1]["payloads"]["parcel"]["at"] == "dock"
     assert renderers[0].cameras and set(renderers[0].cameras) == {"overview"}
     assert renderers[0].closed
     directory = tmp_path / "frames"
