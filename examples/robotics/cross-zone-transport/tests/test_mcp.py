@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import secrets
 import socket
 import threading
@@ -9,6 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import demo
 import httpx
 import pytest
 import uvicorn
@@ -68,6 +70,36 @@ def controller(tmp_path):
     assert json.loads(snapshot.read_text())["stopped"] is True
 
 
+def documented_tools(role):
+    """Return the transport-sim tools, with parameters, that a committed profile documents."""
+    _, body = demo.read_profile(demo.PROFILE_SOURCES[role])
+    section = body.split("### transport-sim", 1)[1]
+    section = section.split("\n### ", 1)[0].split("\n## ", 1)[0]
+    return {
+        name: [parameter.strip() for parameter in parameters.split(",") if parameter.strip()]
+        for name, parameters in re.findall(r"\*\*(\w+)\*\*\(([^)]*)\)", section)
+    }
+
+
+def test_profiles_document_exactly_the_tools_of_their_credential(controller):
+    url, credentials, _, _ = controller
+
+    async def exercise():
+        for role, credential in (
+            ("supervisor", "observer"),
+            ("checker", "observer"),
+            ("zone", "west"),
+        ):
+            async with controller_client(url, credentials[credential].get_secret_value()) as client:
+                tools = {
+                    tool.name: list(tool.inputSchema.get("properties", {}))
+                    for tool in await client.list_tools()
+                }
+            assert documented_tools(role) == tools, role
+
+    asyncio.run(exercise())
+
+
 def test_observer_cannot_gain_actions_by_asking_or_naming_a_robot(controller):
     url, credentials, world, _ = controller
 
@@ -82,19 +114,19 @@ def test_observer_cannot_gain_actions_by_asking_or_naming_a_robot(controller):
                     {
                         "command_id": "impersonate",
                         "robot": "cart-west",
-                        "payload": "tote",
+                        "payload": "parcel",
                         "destination": "dock",
                     },
                 ),
                 (
                     "offer_handoff",
-                    {"command_id": "offer", "payload": "tote", "receiver_zone": "east"},
+                    {"command_id": "offer", "payload": "parcel", "receiver_zone": "east"},
                 ),
                 (
                     "accept_handoff",
                     {
                         "command_id": "accept",
-                        "payload": "tote",
+                        "payload": "parcel",
                         "robot": "cart-east",
                         "offer_id": "imaginary",
                     },
@@ -125,7 +157,7 @@ def test_zone_ownership_is_bound_to_authentication_not_an_argument(controller):
                 {
                     "command_id": "other-zone",
                     "robot": "cart-west",
-                    "payload": "tote",
+                    "payload": "parcel",
                     "destination": "dock",
                 },
             )
@@ -133,7 +165,7 @@ def test_zone_ownership_is_bound_to_authentication_not_an_argument(controller):
             assert result.data["reason"] == "not_robot_owner"
             with pytest.raises(ToolError):
                 await client.call_tool("stop_simulation")
-        assert world.observe()["payloads"]["tote"]["at"] == "stock"
+        assert world.observe()["payloads"]["parcel"]["at"] == "stock"
 
     asyncio.run(exercise())
 
@@ -143,7 +175,7 @@ def test_controller_outlives_a_worker_and_a_reconnect_does_not_replay(controller
     arguments = {
         "command_id": "persistent",
         "robot": "cart-west",
-        "payload": "tote",
+        "payload": "parcel",
         "destination": "dock",
     }
 
@@ -158,12 +190,37 @@ def test_controller_outlives_a_worker_and_a_reconnect_does_not_replay(controller
                     break
                 assert time.monotonic() < deadline, "the actual bounded leg did not finish"
                 await asyncio.sleep(0.05)
-            assert state["payloads"]["tote"]["xy"] == pytest.approx([0, 0], abs=0.01)
+            assert state["payloads"]["parcel"]["xy"] == pytest.approx([0, 0], abs=0.01)
         async with controller_client(url, credentials["west"].get_secret_value()) as replacement:
             assert (await replacement.call_tool("move", arguments)).data["status"] == "finished"
         assert len(world.observe()["commands"]) == 1
 
     asyncio.run(exercise())
+
+
+def test_each_tool_call_is_logged_with_its_calling_agent(controller, caplog):
+    # The README guide shows what each agent does from these controller lines.
+    url, credentials, _, _ = controller
+    arguments = {
+        "command_id": "logged-move",
+        "robot": "cart-west",
+        "payload": "parcel",
+        "destination": "dock",
+    }
+
+    async def exercise():
+        async with controller_client(url, credentials["west"].get_secret_value()) as worker:
+            await worker.call_tool("move", arguments)
+        async with controller_client(url, credentials["observer"].get_secret_value()) as checker:
+            await checker.call_tool("observe")
+
+    with caplog.at_level("INFO", logger="transport"):
+        asyncio.run(exercise())
+    assert (
+        "west zone worker called move(command_id=logged-move, robot=cart-west, "
+        "payload=parcel, destination=dock)" in caplog.text
+    )
+    assert "observer called observe()" in caplog.text
 
 
 def test_operator_stops_without_a_worker_or_supervisor_inbox(controller):
@@ -176,7 +233,7 @@ def test_operator_stops_without_a_worker_or_supervisor_inbox(controller):
                 {
                     "command_id": "interrupt",
                     "robot": "cart-west",
-                    "payload": "tote",
+                    "payload": "parcel",
                     "destination": "dock",
                 },
             )
@@ -184,11 +241,11 @@ def test_operator_stops_without_a_worker_or_supervisor_inbox(controller):
             stopped = (await operator.call_tool("stop_simulation")).data
             assert stopped["stopped"] is True
             assert stopped["commands"][0]["status"] == "interrupted"
-            pose = stopped["payloads"]["tote"]["xy"]
+            pose = stopped["payloads"]["parcel"]["xy"]
             await asyncio.sleep(0.1)
-            assert (await operator.call_tool("observe")).data["payloads"]["tote"]["xy"] == pose
-        assert json.loads(snapshot.read_text())["payloads"]["tote"]["xy"] == pose
-        assert world.observe()["payloads"]["tote"]["owner"] == "west"
+            assert (await operator.call_tool("observe")).data["payloads"]["parcel"]["xy"] == pose
+        assert json.loads(snapshot.read_text())["payloads"]["parcel"]["xy"] == pose
+        assert world.observe()["payloads"]["parcel"]["owner"] == "west"
 
     asyncio.run(exercise())
 

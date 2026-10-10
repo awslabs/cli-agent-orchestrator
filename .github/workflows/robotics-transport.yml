@@ -6,12 +6,22 @@ on:
     paths:
       - 'examples/robotics/cross-zone-transport/**'
       - 'src/cli_agent_orchestrator/schemas/agent_profile.schema.json'
+      # The setup tests read these CAO sources to check the provider lists.
+      - 'src/cli_agent_orchestrator/models/provider.py'
+      - 'src/cli_agent_orchestrator/utils/enforcement.py'
+      - 'src/cli_agent_orchestrator/utils/opencode_config.py'
+      - 'src/cli_agent_orchestrator/providers/**'
       - '.github/workflows/robotics-transport.yml'
   push:
     branches: [main]
     paths:
       - 'examples/robotics/cross-zone-transport/**'
       - 'src/cli_agent_orchestrator/schemas/agent_profile.schema.json'
+      # The setup tests read these CAO sources to check the provider lists.
+      - 'src/cli_agent_orchestrator/models/provider.py'
+      - 'src/cli_agent_orchestrator/utils/enforcement.py'
+      - 'src/cli_agent_orchestrator/utils/opencode_config.py'
+      - 'src/cli_agent_orchestrator/providers/**'
       - '.github/workflows/robotics-transport.yml'
 
 permissions:

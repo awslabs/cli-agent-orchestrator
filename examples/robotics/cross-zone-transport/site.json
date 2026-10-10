@@ -14,7 +14,7 @@
       "at": "stock",
       "locations": ["stock", "dock"],
       "payload_kg": 8,
-      "fixtures": ["tote_clamp"],
+      "fixtures": ["parcel_clamp"],
       "speed_m_s": 1
     },
     "cart-east": {
@@ -22,12 +22,12 @@
       "at": "dock",
       "locations": ["dock", "etch"],
       "payload_kg": 5,
-      "fixtures": ["tote_clamp"],
+      "fixtures": ["parcel_clamp"],
       "speed_m_s": 1
     }
   },
   "payloads": {
-    "tote": {"at": "stock", "owner": "west", "mass_kg": 3, "fixture": "tote_clamp"}
+    "parcel": {"at": "stock", "owner": "west", "mass_kg": 3, "fixture": "parcel_clamp"}
   },
   "step_seconds": 0.02,
   "arrival_tolerance_m": 0.01,
