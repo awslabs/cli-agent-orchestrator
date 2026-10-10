@@ -514,6 +514,22 @@ class TestCreateSession:
         assert response.status_code == 201
         assert mock_create.call_args.kwargs["idempotency_key"] is None
 
+    def test_lookup_only_without_a_key_is_400(self, client):
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock()
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "lookup_only": "true",
+                },
+            )
+
+        assert response.status_code == 400
+        assert "lookup_only requires" in response.json()["detail"]
+        mock_svc.create_session.assert_not_called()
+
     def test_lookup_only_is_forwarded_and_a_miss_is_404(self, client):
         """Review on PR #773: ``lookup_only`` reaches the service, and a key
         with nothing committed is a 404 -- not the 400 this endpoint gives a
@@ -1214,6 +1230,24 @@ class TestCreateTerminalInSession:
 
         assert response.status_code == 500
         assert "Failed to create terminal" in response.json()["detail"]
+
+    def test_lookup_only_without_a_key_is_400_not_404(self, client):
+        """This endpoint maps ValueError to 404, which would read as a missing
+        session; a lookup with no key is a bad request."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.create_terminal = AsyncMock()
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "lookup_only": "true",
+                },
+            )
+
+        assert response.status_code == 400
+        assert "lookup_only requires" in response.json()["detail"]
+        mock_svc.create_terminal.assert_not_called()
 
     def test_lookup_only_is_forwarded_and_a_miss_is_404(self, client):
         """Review on PR #773: same contract as POST /sessions."""

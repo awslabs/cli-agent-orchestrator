@@ -3434,6 +3434,8 @@ async def create_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
+        if lookup_only and not idempotency_key:
+            raise ValueError("lookup_only requires an idempotency_key")
         # Passed only when set, so the ordinary create call stays
         # byte-identical for every existing caller (review on PR #773).
         lookup_kwargs: Dict[str, Any] = {"lookup_only": True} if lookup_only else {}
@@ -3751,6 +3753,13 @@ async def create_terminal_in_session(
                     ),
                 )
 
+        if lookup_only and not idempotency_key:
+            # A malformed request, not a missing resource: this endpoint maps
+            # ValueError to 404, so reject it here as a 400.
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="lookup_only requires an idempotency_key",
+            )
         # Passed only when set, so the ordinary create call stays
         # byte-identical for every existing caller (review on PR #773).
         lookup_kwargs: Dict[str, Any] = {"lookup_only": True} if lookup_only else {}

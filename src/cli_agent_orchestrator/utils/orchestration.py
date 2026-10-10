@@ -1176,6 +1176,14 @@ async def _run_step_and_build_result(
 # Implementation functions
 
 
+class _HandoffCreateCollision(Exception):
+    """The last create attempt failed server-side after an earlier one timed out.
+
+    The earlier attempt may still have committed a worker under the same key,
+    so the caller recovers its identity exactly as it does after a timeout.
+    """
+
+
 def _create_handoff_terminal(
     agent_profile: str,
     working_directory: Optional[str],
@@ -1195,7 +1203,9 @@ def _create_handoff_terminal(
     never arrived is simply performed. The worker is never duplicated, and a
     single timeout no longer loses its terminal_id or skips its readiness.
     """
+    saw_timeout = False
     for attempt in range(1, _HANDOFF_CREATE_ATTEMPTS + 1):
+        last_attempt = attempt == _HANDOFF_CREATE_ATTEMPTS
         try:
             return _create_terminal(
                 agent_profile,
@@ -1207,7 +1217,8 @@ def _create_handoff_terminal(
                 idempotency_key=idempotency_key,
             )
         except requests.exceptions.Timeout:
-            if attempt == _HANDOFF_CREATE_ATTEMPTS:
+            saw_timeout = True
+            if last_attempt:
                 raise
             logger.warning(
                 "handoff: create attempt %d/%d timed out after %ss; retrying with "
@@ -1215,6 +1226,24 @@ def _create_handoff_terminal(
                 attempt,
                 _HANDOFF_CREATE_ATTEMPTS,
                 _HANDOFF_CREATE_TIMEOUT_S,
+            )
+        except requests.exceptions.HTTPError as exc:
+            # A retry can reach cao-server while the timed-out attempt is still
+            # running but has not committed its row yet. Both then allocate, and
+            # the one that commits second fails on the key (a server error) while
+            # the other carries on. That is not a failed create: the key is now
+            # committed, so the next attempt is an ordinary replay.
+            status_code = exc.response.status_code if exc.response is not None else None
+            if not saw_timeout or status_code is None or status_code < 500:
+                raise
+            if last_attempt:
+                raise _HandoffCreateCollision(str(exc)) from exc
+            logger.warning(
+                "handoff: create attempt %d/%d failed with HTTP %s after an earlier "
+                "timeout; retrying with the same idempotency key",
+                attempt,
+                _HANDOFF_CREATE_ATTEMPTS,
+                status_code,
             )
     raise AssertionError("unreachable")  # the loop always returns or raises
 
@@ -1528,7 +1557,7 @@ async def _handoff_impl(
                 use_worktree=use_worktree,
                 idempotency_key=create_key,
             )
-        except requests.exceptions.Timeout:
+        except (requests.exceptions.Timeout, _HandoffCreateCollision):
             # The bounded wait expired. That says nothing about whether a
             # worker was committed, and readiness is a separate question from
             # identity: recover the id if there is one, report it, and send

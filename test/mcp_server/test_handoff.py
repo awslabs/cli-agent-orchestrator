@@ -1115,3 +1115,105 @@ class TestHandoffCreateTimeoutRecovery:
         assert len(keys) == 1
         # Neither the direct-input send nor the run-step call happened.
         mock_requests.post.assert_not_called()
+
+    @staticmethod
+    def _http_error(status_code):
+        import requests
+
+        response = requests.Response()
+        response.status_code = status_code
+        return requests.exceptions.HTTPError(f"{status_code} error", response=response)
+
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_server_error_after_a_timeout_is_retried_as_a_replay(
+        self, mock_create, mock_provider, _nudge
+    ):
+        """A retry can collide with the timed-out attempt before its row is
+        committed; the loser gets a server error. The key is committed by then,
+        so the next attempt is an ordinary replay and the handoff succeeds."""
+        import requests
+
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.side_effect = [
+            requests.exceptions.ReadTimeout("read timed out"),
+            self._http_error(500),
+            ("dev-t1", "kiro_cli"),
+        ]
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.exceptions = requests.exceptions
+            mock_requests.Timeout = requests.Timeout
+            mock_requests.post.return_value = _ok_run_step_response(terminal_id="dev-t1")
+            result = asyncio.run(
+                _handoff_impl("developer", "Do task", on_terminal_id=lambda _t: None)
+            )
+
+        assert result.success is True
+        assert result.terminal_id == "dev-t1"
+        assert mock_create.call_count == 3
+
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_collision_on_the_last_attempt_still_reports_the_committed_id(
+        self, mock_create, mock_provider, _nudge
+    ):
+        import requests
+
+        from cli_agent_orchestrator.utils.orchestration import _HANDOFF_CREATE_ATTEMPTS
+
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.side_effect = (
+            [requests.exceptions.ReadTimeout("read timed out")]
+            + [self._http_error(500)] * (_HANDOFF_CREATE_ATTEMPTS - 1)
+            + [("dev-t9", "kiro_cli")]
+        )
+        seen = []
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.exceptions = requests.exceptions
+            mock_requests.Timeout = requests.Timeout
+            result = asyncio.run(_handoff_impl("developer", "Do task", on_terminal_id=seen.append))
+
+        assert result.success is False
+        assert result.terminal_id == "dev-t9"
+        assert seen == ["dev-t9"]
+        assert mock_create.call_args_list[-1].kwargs["lookup_only"] is True
+        mock_requests.post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("errors", "expected_calls"),
+        [
+            # No earlier timeout: a server error is a plain failure, not retried.
+            ([500], 1),
+            # After a timeout, a client error is still a plain failure.
+            (["timeout", 409], 2),
+        ],
+    )
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_other_http_errors_are_not_retried(
+        self, mock_create, mock_provider, _nudge, errors, expected_calls
+    ):
+        import requests
+
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.side_effect = [
+            (
+                requests.exceptions.ReadTimeout("read timed out")
+                if error == "timeout"
+                else self._http_error(error)
+            )
+            for error in errors
+        ]
+        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+            mock_requests.exceptions = requests.exceptions
+            mock_requests.Timeout = requests.Timeout
+            result = asyncio.run(
+                _handoff_impl("developer", "Do task", on_terminal_id=lambda _t: None)
+            )
+
+        assert result.success is False
+        assert result.terminal_id is None
+        assert mock_create.call_count == expected_calls

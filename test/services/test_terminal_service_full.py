@@ -1602,18 +1602,28 @@ class TestIdempotentReplayWaitsForInitialization:
         terminal_service._pending_sync_inits.clear()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("replay_defer_init", [False, True])
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
     async def test_replay_waits_until_original_initialization_settles(
-        self, mock_lookup, mock_get_terminal
+        self, mock_lookup, mock_get_terminal, replay_defer_init
     ):
+        """The replay's own defer_init does not get it past the wait: it is not
+        part of the request fingerprint, and a waiter exists only when the
+        original was synchronous and so owes a ready terminal."""
         mock_lookup.return_value = _record(terminal_id="prior-terminal")
         mock_get_terminal.return_value = dict(_PRIOR_ROW)
         waiter = terminal_service._SyncInitWaiter()
         terminal_service._pending_sync_inits["prior-terminal"] = waiter
 
         replay = asyncio.ensure_future(
-            create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
+            create_terminal(
+                "kiro_cli",
+                "developer",
+                new_session=True,
+                idempotency_key="k",
+                defer_init=replay_defer_init,
+            )
         )
         await asyncio.sleep(0.05)
         assert not replay.done(), "replay returned while the original was still initializing"
@@ -1683,26 +1693,6 @@ class TestIdempotentReplayWaitsForInitialization:
     async def test_lookup_only_requires_a_key(self):
         with pytest.raises(ValueError, match="lookup_only requires"):
             await create_terminal("kiro_cli", "developer", new_session=True, lookup_only=True)
-
-    @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
-    async def test_deferred_init_replay_still_returns_immediately(
-        self, mock_lookup, mock_get_terminal
-    ):
-        """A deferred-init original returned before initializing, so its replay
-        does too; only synchronous replays wait."""
-        mock_lookup.return_value = _record(terminal_id="prior-terminal")
-        mock_get_terminal.return_value = dict(_PRIOR_ROW)
-        terminal_service._pending_sync_inits["prior-terminal"] = terminal_service._SyncInitWaiter()
-
-        result = await asyncio.wait_for(
-            create_terminal(
-                "kiro_cli", "developer", new_session=True, idempotency_key="k", defer_init=True
-            ),
-            timeout=1,
-        )
-        assert result.id == "prior-terminal"
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")

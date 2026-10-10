@@ -1482,10 +1482,14 @@ async def _create_terminal_unguarded(
                 # If that first call is a synchronous create still inside
                 # provider.initialize(), wait for it first: the replay must
                 # give back what the original would, a READY terminal, not one
-                # whose provider is still starting (review on PR #773). A
-                # deferred-init replay returns at once, as its original did.
+                # whose provider is still starting (review on PR #773). The
+                # replay's own defer_init does not matter here: it is not part
+                # of the request fingerprint, and only a synchronous original
+                # registers a waiter, so a waiter means the original promised
+                # a ready terminal. lookup_only is the one explicit way to get
+                # the identity without waiting.
                 waiter = _pending_sync_inits.get(existing_terminal_id)
-                if waiter is not None and not defer_init and not lookup_only:
+                if waiter is not None and not lookup_only:
                     await waiter.settled.wait()
                     if waiter.error is not None:
                         raise RuntimeError(
