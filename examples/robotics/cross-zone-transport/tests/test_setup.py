@@ -63,7 +63,7 @@ def test_prepare_requires_a_nonblank_request_before_creating_run(
 
 
 @pytest.mark.parametrize("scene_file", ["site.json", "return-site.json"])
-@pytest.mark.parametrize("provider", sorted(demo.CAO_PROVIDERS))
+@pytest.mark.parametrize("provider", sorted(demo.SUPPORTED_PROVIDERS))
 def test_profiles_bind_only_their_own_credential_and_no_builtin_tools(
     tmp_path, scene_file, provider
 ):
@@ -250,7 +250,7 @@ def test_committed_profiles_are_valid_cao_profiles(role):
     assert ("cao-mcp-server" in profile["mcpServers"]) == (role == "supervisor")
 
 
-@pytest.mark.parametrize("provider", sorted(demo.CAO_PROVIDERS))
+@pytest.mark.parametrize("provider", sorted(demo.SUPPORTED_PROVIDERS))
 def test_run_copies_are_the_committed_profiles_with_run_values(tmp_path, provider):
     run_dir = tmp_path / "run"
     manifest = demo.prepare(run_dir, EXAMPLE / "site.json", port=8766, provider=provider)
@@ -300,7 +300,36 @@ def test_prepare_refuses_an_unknown_provider_before_creating_a_run(tmp_path):
     assert not run_dir.exists()
 
 
-@pytest.mark.parametrize("provider", sorted(demo.CAO_PROVIDERS))
+@pytest.mark.parametrize("provider", ["hermes", "opencode_cli"])
+def test_a_provider_without_per_agent_mcp_servers_is_refused(
+    tmp_path, monkeypatch, capsys, provider
+):
+    if provider == "opencode_cli":
+        # cao install writes the servers of every OpenCode profile into one shared
+        # configuration keyed by server name; the last install replaces the others.
+        source = (CAO_SOURCE / "utils/opencode_config.py").read_text()
+        assert 'data.setdefault("mcp", {})[name] = config' in source
+    else:
+        # The Hermes provider never reads the mcpServers of the CAO profile.
+        assert "mcpServers" not in (CAO_SOURCE / "providers/hermes.py").read_text()
+    assert demo.SUPPORTED_PROVIDERS == demo.CAO_PROVIDERS - {"hermes", "opencode_cli"}
+    run_dir = tmp_path / "run"
+    with pytest.raises(ValueError, match=f"{provider} is not supported"):
+        demo.prepare(run_dir, EXAMPLE / "site.json", port=8766, provider=provider)
+    assert not run_dir.exists()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["demo.py", "prepare", "--run-dir", str(run_dir), "--request=x", f"--provider={provider}"],
+    )
+    with pytest.raises(SystemExit) as exit_info:
+        demo.main()
+    assert exit_info.value.code == 2
+    assert f"--provider {provider} is not supported" in capsys.readouterr().err
+    assert not run_dir.exists()
+
+
+@pytest.mark.parametrize("provider", sorted(demo.SUPPORTED_PROVIDERS))
 def test_prepare_warns_only_when_the_provider_does_not_enforce_the_allowlist(
     tmp_path, monkeypatch, capsys, provider
 ):

@@ -1,15 +1,93 @@
 # Transport across ownership zones
 
-This example shows a multi-agent CAO workflow in a simulation. Four CAO agents
-move a tote between two ownership zones in one shared MuJoCo world:
+In this exercise, a team of AI agents moves a box between two areas of a
+simulated factory floor. Each area has a different owner. You start the
+simulator and the agents on your laptop. Then you watch the agents plan the
+job, divide it, hand it over between them, and check the result.
 
-- A **supervisor** plans the job and delegates each step with `handoff`.
-- One **zone worker** for each zone moves the tote in its zone. The two zone
-  workers transfer custody at a shared dock.
+## What the exercise is about
+
+### Transport across ownership zones
+
+Large sites, for example factories, warehouses, and laboratories, divide their
+floor into **ownership zones**. A zone is an area. A team or a robot fleet
+owns each zone. The owner of a zone controls the robots of that zone. It
+also controls each item while the item is in the zone.
+
+In a **transport across ownership zones**, an item goes from a location in one
+zone to a location in a different zone. No robot can do the complete
+trip, because each robot works only in its own zone. Thus the transport has
+these parts:
+
+1. A robot of the first zone carries the item to a **shared dock**. A shared
+   dock is a location that belongs to the two zones.
+2. The first zone offers **custody** of the item to the second zone. Custody
+   is the responsibility for the item. The first zone stays responsible until
+   the second zone accepts.
+3. The second zone accepts custody. It accepts only when its robot and the
+   item are at the dock.
+4. A robot of the second zone carries the item to the destination.
+
+In this exercise, the item is a `tote`, a box for parts. It goes from `stock`
+in the `west` zone to `etch` in the `east` zone, through the shared `dock`:
+
+```mermaid
+flowchart LR
+    stock["stock<br/>west zone"] -->|"1. cart-west carries the tote"| dock["dock<br/>shared by west and east<br/>2. custody goes from west to east"]
+    dock -->|"3. cart-east carries the tote"| etch["etch<br/>east zone"]
+```
+
+### The agents
+
+Four CAO agents do the work. Each agent is a provider CLI, for example GitHub
+Copilot CLI or Claude Code, in its own CAO terminal:
+
+- A **supervisor** reads your request, plans the job, and delegates each step
+  with the CAO `handoff` tool. It cannot move a robot.
+- One **zone worker** for each zone controls only the robots of its zone. The
+  west zone worker carries the tote to the dock and offers custody. The east
+  zone worker accepts custody and carries the tote to `etch`.
 - An independent **checker** reads the final state and verifies the result.
+  It cannot move a robot.
 
-The demo runs on a laptop. It needs no GPU, no display, and no robot hardware.
-See [Compute and GPU](#compute-and-gpu).
+Each agent has a credential. The credential gives access only to the
+simulator tools of the role and the zone of the agent. The simulator, not a
+prompt, enforces these limits.
+
+### The simulator: MuJoCo
+
+[MuJoCo](https://mujoco.readthedocs.io/en/stable/overview.html) means
+Multi-Joint dynamics with Contact. It is a free, open-source physics engine.
+Google DeepMind maintains it. Robotics research and development use it to
+simulate robots and their environment. Step 1 installs it as a Python package.
+No robot hardware is necessary.
+
+This exercise uses MuJoCo in a simple way. The robots are carts that move
+along straight lines. The tote moves with its cart. The simulator measures the
+positions of the carts and the tote. A zone can change custody only when the
+measured positions show the cart and the tote at the dock.
+
+A local process, the **controller** (`demo.py serve`), runs the MuJoCo world.
+The agents use the world only through the MCP tools of the controller.
+
+### What you get from the exercise
+
+- You see a CAO supervisor delegate sequential steps to workers with
+  `handoff`, and get evidence back from each worker.
+- You see how CAO agent profiles, tool allowlists, and credentials keep each
+  agent in its role.
+- You see a handover between two agents that depends on a measured state, not
+  on the text of a message.
+- You see the robots move, in pictures from the simulator. See
+  [See the robots move](#see-the-robots-move).
+
+The agents need approximately 3 to 5 minutes for a run. The exercise needs
+no GPU, no display, and no robot hardware. See
+[Compute and GPU](#compute-and-gpu).
+
+![The simulated floor: the west zone in blue and the east zone in green. The pink tote is on the blue west cart at stock. The green east cart waits at the amber shared dock.](images/run-1-start.png)
+
+## Background
 
 This is the first example for
 [#845](https://github.com/awslabs/cli-agent-orchestrator/issues/845). Its
@@ -66,8 +144,8 @@ What each agent does:
   Reports the evidence of each worker. It cannot move a robot.
 - **Zone worker.** Operates only its own zone. Selects a capable robot. Moves
   the payload and measures the arrival. Offers custody at the dock, or accepts
-  an offer. The provider blocks its shell and file tools. CAO refuses its
-  `assign` and `handoff` calls.
+  an offer. A provider that enforces the allowlist blocks its shell and file
+  tools. CAO refuses its `assign` and `handoff` calls.
 - **Checker.** Reads fresh state. Compares the measured poses, the owner, and
   the command records with the original request. Its credential cannot move a
   robot, change custody, or stop the run. CAO refuses its `assign` and
@@ -293,7 +371,9 @@ share a dock. This example has one payload, so it uses only `handoff`.
 | tmux | 3.3 or later | `tmux -V` |
 | uv | A recent release | `uv --version` |
 | Python | 3.10 or later | Step 1 finds or installs it with `uv` |
-| Provider CLI | Any CAO provider. GitHub Copilot CLI is the default. | Start the CLI one time in this repository, sign in, and accept its first-run prompts |
+| MuJoCo | The version in `uv.lock` | Step 1 installs it as the Python package `mujoco`. You do not install it separately. |
+| OpenGL | Only for the pictures of `--record`. No separate GPU is necessary. | On macOS, OpenGL is part of the system. On Linux without a display, see [See the robots move](#see-the-robots-move). |
+| Provider CLI | A CAO provider that `prepare` accepts. GitHub Copilot CLI is the default. See [Providers](#providers). | Start the CLI one time in this repository, sign in, and accept its first-run prompts |
 
 A CAO release that contains this example also contains the permission fix for
 workflow delegation that this example uses. To install or update CAO from the
@@ -303,9 +383,30 @@ latest `main`:
 uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@main --upgrade
 ```
 
-For other installation methods, see [Install CAO](../../../README.md#install-cao).
+<details>
+<summary>Expected output</summary>
 
-The example works with every CAO provider. See [Providers](#providers).
+An update of an existing installation. The packages, versions, and the commit
+can be different. The last line is the important one.
+
+```text
+Resolved 91 packages in 496ms
+   Updating https://github.com/awslabs/cli-agent-orchestrator.git (main)
+    Updated https://github.com/awslabs/cli-agent-orchestrator.git (<commit>)
+   Building cli-agent-orchestrator @ git+https://github.com/awslabs/cli-agent-orchestrator.git@<commit>
+      Built cli-agent-orchestrator @ git+https://github.com/awslabs/cli-agent-orchestrator.git@<commit>
+Prepared 3 packages in 4.97s
+Uninstalled 3 packages in 474ms
+Installed 3 packages in 395ms
+ - cli-agent-orchestrator==<version> (from git+https://github.com/awslabs/cli-agent-orchestrator.git@<commit>)
+ + cli-agent-orchestrator==<version> (from git+https://github.com/awslabs/cli-agent-orchestrator.git@<commit>)
+ ...
+Installed 4 executables: cao, cao-mcp-server, cao-ops-mcp-server, cao-server
+```
+
+</details>
+
+For other installation methods, see [Install CAO](../../../README.md#install-cao).
 
 The example has its own Python project and lockfile. It does not change the CAO
 installation.
@@ -316,14 +417,22 @@ Select the provider with `--provider` in Step 2. `prepare` writes it into each
 run copy, so `cao install` and `cao launch` use the same provider for all the
 agents.
 
+Each agent must get the `transport-sim` server of its own run copy, with its
+own credential. `prepare` refuses a provider that cannot do this:
+
+| Provider | Reason |
+| --- | --- |
+| `opencode_cli` | OpenCode keeps the MCP servers of all agents in one shared configuration. All the agents would then use the same credential. |
+| `hermes` | Hermes reads MCP servers only from its own Hermes profile, not from the CAO agent profile. The agents would get no simulator server. |
+
 The isolation of the zones needs a provider that enforces the tool allowlist
 of each profile. CAO shows this in the `Enforcement:` line of `cao launch`. For
 the enforcement of each provider, see
 [Tool restrictions](../../../docs/tool-restrictions.md).
 
 > [!WARNING]
-> If the provider does not enforce the allowlist, an agent can use a shell and
-> read the credential files of the other zones. Then it can act for another
+> If the provider does not enforce the allowlist, an agent can use a shell.
+> Then it can read the credential files of the other zones and act for another
 > zone. `prepare` prints a warning for these providers. Use them only for a
 > trusted local demo.
 
@@ -334,8 +443,8 @@ For the setup of each provider, see its guide in the
 
 You do not need a GPU. A laptop is enough:
 
-- The controller moves MuJoCo mocap bodies along straight lines. The world has
-  no gravity and no contacts.
+- The controller sets the positions of the carts and the tote directly, along
+  straight lines. The world has no gravity and no contacts.
 - With `--record`, MuJoCo renders small pictures with OpenGL. This needs no
   separate GPU. See [See the robots move](#see-the-robots-move).
 - The agents are provider CLIs. The language models run on the service of the
@@ -656,6 +765,8 @@ Use one or more of these views:
   No worker terminals
   ```
 
+  The text after `Last response:` depends on the run.
+
   While a worker runs, the output ends with a table of the worker terminals.
   The table has the columns `ID`, `AGENT`, `PROVIDER`, `MODEL`, `HONORED`, and
   `STATUS`.
@@ -830,10 +941,29 @@ Do these steps in this sequence:
    rm -rf -- "${RUN_DIR:?}"
    ```
 
-   The command prints nothing. The pictures are not in the run directory. When
-   you do not need them, remove them with `rm -rf -- /tmp/cao-transport-frames`.
+   <details>
+   <summary>Expected output</summary>
+
+   The command prints nothing.
+
+   </details>
+
+   The pictures are not in the run directory. When you do not need them,
+   remove them with `rm -rf -- /tmp/cao-transport-frames`.
 
 6. If you do not need `cao-server`, press Ctrl+C in Terminal 3.
+
+   <details>
+   <summary>Expected output</summary>
+
+   ```text
+   INFO:     Shutting down
+   INFO:     Waiting for application shutdown.
+   INFO:     Application shutdown complete.
+   INFO:     Finished server process [<pid>]
+   ```
+
+   </details>
 
 The credential files are temporary. Do not commit them, and do not attach them
 to an issue or a pull request.
@@ -925,10 +1055,12 @@ To run a scenario:
    create the scene file. Use the commands after the table.
 3. Do Steps 2 to 8 of [Run the demo](#run-the-demo). In Step 2, set
    `REQUEST` to the request of the scenario. If the table gives `prepare`
-   options, add them to the `prepare` command.
+   options, add them to the `prepare` command. In Step 3, give `--record` a
+   new directory, or remove the directory of the previous run first.
 
 To run two scenarios at the same time, give each run a different `RUN_DIR`.
-Also add a different `--port <port>` to each `prepare` command.
+Also add a different `--port <port>` to each `prepare` command, and give each
+`serve` a different `--record` directory.
 
 | Scenario | `prepare` options | Request | Expected result |
 | --- | --- | --- | --- |
@@ -1092,6 +1224,22 @@ To run the tests:
 ```bash
 uv run --locked pytest
 ```
+
+<details>
+<summary>Expected output</summary>
+
+The dots show the tests that pass. The warning is the `AuthlibDeprecationWarning`
+of Step 2. The number of tests and the time can be different.
+
+```text
+........................................................................ [ 63%]
+.........................................                                [100%]
+=============================== warnings summary ===============================
+...
+113 passed, 1 warning in 11.39s
+```
+
+</details>
 
 - The tests use real headless MuJoCo and authenticated loopback MCP. They need
   no provider credentials.
