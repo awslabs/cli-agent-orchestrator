@@ -1958,6 +1958,7 @@ def install_agent(
                 f"skill://{SKILLS_DIR}/**/SKILL.md",
                 f"skill://{SKILLS_DIR}/*/SKILL.md",
             ]
+            kiro_resources.extend(profile.resources or [])
             raw_prompt = (
                 profile.prompt.strip() if profile.prompt and profile.prompt.strip() else None
             )
