@@ -107,6 +107,124 @@ class Scene(Model):
         return self
 
 
+# Render colors, in scene order of the zones. Robots use the strong shade of
+# their zone; the payload is pink; a shared dock is amber.
+ZONE_COLORS = ("0.56 0.7 0.95 1", "0.6 0.84 0.6 1", "0.95 0.74 0.55 1", "0.78 0.64 0.95 1")
+ROBOT_COLORS = ("0.12 0.32 0.9 1", "0.08 0.55 0.2 1", "0.88 0.42 0.08 1", "0.5 0.25 0.85 1")
+HANDOFF_COLOR = "1 0.72 0.1 1"
+PAYLOAD_COLOR = "0.9 0.12 0.5 1"
+LOCATION_COLOR = "0.3 0.3 0.34 1"
+CAMERA_TILT_DEGREES = 32.0
+CAMERA_FOVY_DEGREES = 45.0
+CAMERA_ASPECT = 16 / 9
+
+
+def _robot_color(zone_index: int) -> str:
+    """A strong shade of the tile color of the zone, so a robot shows its owner."""
+    return ROBOT_COLORS[zone_index % len(ROBOT_COLORS)]
+
+
+def _add_scene_visuals(root: ET.Element, world: ET.Element, scene: Scene) -> None:
+    """Add a floor, zone tiles, location markers, a light, and an overview camera.
+
+    These elements exist only so that the world can be rendered (see
+    recorder.py). Every geom has contype=0 and conaffinity=0, and gravity is
+    off, so they cannot change the simulated motion or the measured poses.
+    """
+    xs = [edge for zone in scene.zones.values() for edge in (zone.bounds[0], zone.bounds[2])]
+    ys = [edge for zone in scene.zones.values() for edge in (zone.bounds[1], zone.bounds[3])]
+    cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+    half_w, half_h = (max(xs) - min(xs)) / 2, (max(ys) - min(ys)) / 2
+    no_contact = {"contype": "0", "conaffinity": "0"}
+
+    visual = ET.SubElement(root, "visual")
+    ET.SubElement(visual, "global", offwidth="1280", offheight="720")
+    ET.SubElement(
+        visual, "headlight", ambient="0.3 0.3 0.3", diffuse="0.35 0.35 0.35", specular="0 0 0"
+    )
+    asset = ET.SubElement(root, "asset")
+    ET.SubElement(
+        asset,
+        "texture",
+        type="skybox",
+        builtin="gradient",
+        rgb1="0.97 0.98 1",
+        rgb2="0.82 0.86 0.92",
+        width="64",
+        height="64",
+    )
+    ET.SubElement(
+        asset,
+        "texture",
+        name="floor",
+        type="2d",
+        builtin="checker",
+        rgb1="0.86 0.86 0.86",
+        rgb2="0.8 0.8 0.8",
+        width="256",
+        height="256",
+    )
+    ET.SubElement(asset, "material", name="floor", texture="floor", texrepeat="12 12")
+
+    ET.SubElement(
+        world,
+        "light",
+        name="visual/sun",
+        directional="true",
+        dir="0 0.4 -1",
+        diffuse="0.45 0.45 0.45",
+        specular="0 0 0",
+    )
+    ET.SubElement(
+        world,
+        "geom",
+        name="visual/floor",
+        type="plane",
+        size=f"{half_w + 0.8} {half_h + 0.8} 0.1",
+        pos=f"{cx} {cy} -0.03",
+        material="floor",
+        **no_contact,
+    )
+    for index, (name, zone) in enumerate(scene.zones.items()):
+        x0, y0, x1, y1 = zone.bounds
+        ET.SubElement(
+            world,
+            "geom",
+            name=f"visual/zone/{name}",
+            type="box",
+            size=f"{(x1 - x0) / 2 - 0.03} {(y1 - y0) / 2 - 0.03} 0.005",
+            pos=f"{(x0 + x1) / 2} {(y0 + y1) / 2} -0.015",
+            rgba=ZONE_COLORS[index % len(ZONE_COLORS)],
+            **no_contact,
+        )
+    for name, location in scene.locations.items():
+        x, y = location.xy
+        ET.SubElement(
+            world,
+            "geom",
+            name=f"visual/location/{name}",
+            type="cylinder",
+            size="0.22 0.004",
+            pos=f"{x} {y} -0.005",
+            rgba=HANDOFF_COLOR if location.handoff else LOCATION_COLOR,
+            **no_contact,
+        )
+
+    # Look at the centre of the zones from the -y side, tilted from vertical,
+    # far enough back that every zone fits a 16:9 frame with a margin.
+    tilt = math.radians(CAMERA_TILT_DEGREES)
+    tan_v = math.tan(math.radians(CAMERA_FOVY_DEGREES) / 2)
+    distance = 1.05 * max((half_w + 0.3) / (tan_v * CAMERA_ASPECT), (half_h + 0.3) / tan_v)
+    ET.SubElement(
+        world,
+        "camera",
+        name="overview",
+        fovy=str(CAMERA_FOVY_DEGREES),
+        pos=f"{cx} {cy - distance * math.sin(tilt)} {distance * math.cos(tilt)}",
+        xyaxes=f"1 0 0 0 {math.cos(tilt)} {math.sin(tilt)}",
+    )
+
+
 @dataclass
 class Command:
     actor: str
@@ -147,12 +265,16 @@ class World:
         root = ET.Element("mujoco", model="cao-kinematic-transport")
         ET.SubElement(root, "option", timestep=str(scene.step_seconds), gravity="0 0 0")
         bodies = ET.SubElement(root, "worldbody")
-        for kind, entities, height, color in (
-            ("robot", scene.robots, 0.15, "0.2 0.4 0.8 1"),
-            ("payload", scene.payloads, 0.4, "0.9 0.6 0.1 1"),
+        _add_scene_visuals(root, bodies, scene)
+        zone_index = {zone: index for index, zone in enumerate(scene.zones)}
+        for kind, entities, height in (
+            ("robot", scene.robots, 0.15),
+            ("payload", scene.payloads, 0.4),
         ):
             for name, entity in entities.items():
                 x, y = scene.locations[entity.at].xy
+                # Render color only: a robot has a dark shade of its zone color.
+                color = _robot_color(zone_index[entity.zone]) if kind == "robot" else PAYLOAD_COLOR
                 body = ET.SubElement(
                     bodies, "body", name=f"{kind}/{name}", mocap="true", pos=f"{x} {y} {height}"
                 )

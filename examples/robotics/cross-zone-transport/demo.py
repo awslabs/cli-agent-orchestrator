@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 import yaml
 from fastmcp.server import create_proxy
+from recorder import Recorder, ensure_empty_directory
 from simulation import Scene, World
 from transport_mcp import controller_client, make_server
 
@@ -163,7 +164,7 @@ def prepare(run_dir: Path, scene_file: Path, *, port: int, provider: str) -> dic
     return manifest
 
 
-def serve(run_dir: Path, *, allow_motion: bool) -> None:
+def serve(run_dir: Path, *, allow_motion: bool, record: Path | None = None) -> None:
     manifest = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     scene = Scene.model_validate_json((run_dir / "scene.json").read_text(encoding="utf-8"))
     tokens = {}
@@ -175,6 +176,9 @@ def serve(run_dir: Path, *, allow_motion: bool) -> None:
             raise ValueError("all credentials must address this run's controller")
         controller_client(credentials["url"], credentials["token"])
         tokens[credentials["token"]] = {"client_id": actor, **metadata}
+    if record is not None:
+        # Before started.json: a refused frames directory must not consume the run.
+        ensure_empty_directory(record)
     # Restarting would lose command history while old workers still hold credentials.
     write_private(run_dir / "started.json", {"pid": os.getpid(), "run_id": manifest["run_id"]})
     world = World(scene, allow_motion=allow_motion, run_id=manifest["run_id"])
@@ -184,13 +188,33 @@ def serve(run_dir: Path, *, allow_motion: bool) -> None:
         "approved for this scene" if allow_motion else "DISABLED (no --allow-motion)",
     )
     server = make_server(world, tokens, run_dir / "last-state.json")
-    server.run(
-        transport="http",
-        host="127.0.0.1",
-        port=urlsplit(manifest["url"]).port,
-        stateless_http=True,
-        show_banner=False,
-    )
+    recorder = Recorder(world, record) if record is not None else None
+    if recorder is not None:
+        recorder.start()
+        logging.getLogger("transport").info("Recording frames of the world to %s", record)
+    try:
+        server.run(
+            transport="http",
+            host="127.0.0.1",
+            port=urlsplit(manifest["url"]).port,
+            stateless_http=True,
+            show_banner=False,
+        )
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # Ctrl+C is the documented stop. Uvicorn has already shut down cleanly and
+        # re-raises the signal; under anyio it can arrive as CancelledError.
+        pass
+    finally:
+        if recorder is not None:
+            frames = recorder.stop()
+            if frames:
+                logging.getLogger("transport").info(
+                    "Recorded %d frame(s); open %s", len(frames), Path(record) / "index.html"
+                )
+            else:
+                logging.getLogger("transport").warning(
+                    "Recorded no frames. See the README section 'See the robots move'."
+                )
 
 
 async def operator_call(run_dir: Path, tool: str) -> dict:
@@ -218,6 +242,12 @@ def main() -> None:
     serve_parser = sub.add_parser("serve", help="own the persistent simulator outside CAO workers")
     serve_parser.add_argument("--run-dir", type=Path, required=True)
     serve_parser.add_argument("--allow-motion", action="store_true")
+    serve_parser.add_argument(
+        "--record",
+        type=Path,
+        metavar="DIR",
+        help="write PNG frames of the MuJoCo world to DIR (needs an OpenGL backend)",
+    )
     for command in ("status", "stop"):
         sub.add_parser(command).add_argument("--run-dir", type=Path, required=True)
     sub.add_parser("connect", help="stdio MCP relay; used by generated profiles").add_argument(
@@ -259,7 +289,11 @@ def main() -> None:
             )
         )
     elif args.command == "serve":
-        serve(args.run_dir.resolve(), allow_motion=args.allow_motion)
+        serve(
+            args.run_dir.resolve(),
+            allow_motion=args.allow_motion,
+            record=args.record.resolve() if args.record else None,
+        )
     elif args.command == "connect":
         credentials = json.loads(args.credential.read_text(encoding="utf-8"))
         proxy = create_proxy(
