@@ -161,7 +161,78 @@ class _FakeStream:
         return chunk
 
 
-def _install_fake_spawn(monkeypatch: pytest.MonkeyPatch, process: _FakeProcess) -> dict:
+class _HeldOpenStream(_FakeStream):
+    """A stream that yields its payload and then never reaches EOF.
+
+    This is what the script's pipes look like when a background process it
+    started inherited them and is still running.
+    """
+
+    async def read(self, n: int = -1) -> bytes:
+        chunk = await super().read(n)
+        if chunk:
+            return chunk
+        await asyncio.Event().wait()
+
+
+class _FakeTransport:
+    """Records whether the drive closed the subprocess pipes."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _HeldPipesProcess:
+    """A script that exits while its stdout/stderr stay open.
+
+    ``returncode`` flips from None to ``exit_rc`` after ``exit_after`` seconds,
+    as asyncio sets it when the process exits, whether or not anything is in
+    ``wait()``. ``wait_holds_for_pipes`` picks the ``wait()`` behaviour: on
+    Python 3.10 it returns at the exit, and from 3.11 a ``wait()`` started
+    before the exit does not return until the pipes reach EOF, which here is
+    never.
+    """
+
+    def __init__(
+        self,
+        *,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+        wait_holds_for_pipes: bool,
+        exit_rc: int = 0,
+        exit_after: float = 0.05,
+    ):
+        self.returncode: Optional[int] = None
+        self.stdout = _HeldOpenStream(stdout)
+        self.stderr = _HeldOpenStream(stderr)
+        self._wait_holds_for_pipes = wait_holds_for_pipes
+        self._exit_rc = exit_rc
+        self._exited = asyncio.Event()
+        self._transport = _FakeTransport()
+        self.signals: List[str] = []
+        asyncio.get_running_loop().call_later(exit_after, self._exit)
+
+    def _exit(self) -> None:
+        self.returncode = self._exit_rc
+        self._exited.set()
+
+    async def wait(self) -> int:
+        if self._wait_holds_for_pipes:
+            await asyncio.Event().wait()
+        await self._exited.wait()
+        return self._exit_rc
+
+    def terminate(self) -> None:
+        self.signals.append("SIGTERM")
+
+    def kill(self) -> None:
+        self.signals.append("SIGKILL")
+
+
+def _install_fake_spawn(monkeypatch: pytest.MonkeyPatch, process) -> dict:
     """Patch ``asyncio.create_subprocess_exec`` to return ``process``; capture args."""
     captured: dict = {}
 
@@ -434,6 +505,77 @@ async def test_chatty_child_no_deadlock(monkeypatch: pytest.MonkeyPatch):
     assert result.state == RunState.COMPLETED
     # The sentinel is in the tail, so it survives the ring-buffer cap.
     assert result.output == {"done": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wait_holds_for_pipes", [False, True], ids=["wait-returns-at-exit", "wait-holds-for-pipes"]
+)
+async def test_exit_with_pipes_held_open_completes(
+    monkeypatch: pytest.MonkeyPatch, wait_holds_for_pipes: bool
+):
+    """A script that exits 0 while a process it started keeps stdout open completes.
+
+    Before the fix, the 3.11+ ``wait()`` shape ran out the wall-clock bound and
+    settled FAILED,kind=timeout with the output dropped, and the 3.10 shape
+    blocked in the unbounded drain for as long as the pipes stayed open.
+    """
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 1.0)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.05)
+    proc = _HeldPipesProcess(
+        stdout=b'CAO_WORKFLOW_OUTPUT:{"ok": true}\n', wait_holds_for_pipes=wait_holds_for_pipes
+    )
+    _install_fake_spawn(monkeypatch, proc)
+
+    result = await asyncio.wait_for(
+        run_script_workflow(_FakeScriptSpec(), {}, "run-held-pipes"), timeout=5.0
+    )
+    assert result.state == RunState.COMPLETED
+    assert result.kind is None
+    assert result.output == {"ok": True}
+    assert any("still open" in w for w in result.warnings)
+    assert proc.signals == []  # an exited script is never signalled
+    assert proc._transport.closed  # the held pipes are not left open in the server
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wait_holds_for_pipes", [False, True], ids=["wait-returns-at-exit", "wait-holds-for-pipes"]
+)
+async def test_nonzero_exit_with_pipes_held_open_fails_with_warning(
+    monkeypatch: pytest.MonkeyPatch, wait_holds_for_pipes: bool
+):
+    """A nonzero exit with the pipes held open settles FAILED,kind=error, not timeout."""
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 1.0)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.05)
+    proc = _HeldPipesProcess(stderr=b"boom\n", wait_holds_for_pipes=wait_holds_for_pipes, exit_rc=3)
+    _install_fake_spawn(monkeypatch, proc)
+
+    result = await asyncio.wait_for(
+        run_script_workflow(_FakeScriptSpec(), {}, "run-held-pipes-rc3"), timeout=5.0
+    )
+    assert result.state == RunState.FAILED
+    assert result.kind == "error"
+    assert any("boom" in w for w in result.warnings)  # stderr tail surfaced
+    assert any("still open" in w for w in result.warnings)
+    assert proc.signals == []
+    assert proc._transport.closed
+
+
+@pytest.mark.asyncio
+async def test_exit_just_before_the_bound_is_not_a_timeout(monkeypatch: pytest.MonkeyPatch):
+    """An exit asyncio recorded before the bound elapsed is not reported as a timeout.
+
+    The poll interval is stretched past the bound so the exit lands while
+    ``_wait_for_exit`` is between two ``returncode`` checks.
+    """
+    monkeypatch.setattr(script_runner, "_EXIT_POLL_INTERVAL", 10.0)
+    proc = _HeldPipesProcess(wait_holds_for_pipes=True, exit_after=0.05)
+
+    await script_runner._await_exit_within_bound(proc, timeout=0.3)
+    assert proc.returncode == 0
 
 
 # ---------------------------------------------------------------------------
