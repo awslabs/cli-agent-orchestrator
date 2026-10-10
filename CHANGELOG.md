@@ -94,6 +94,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Copilot CLI readiness detection recognizes the downloaded-update notice prepended
+  to the hint bar, avoiding initialization timeouts after a background update.
+  Busy, waiting, error, and unrecognized rows still prevent readiness (#870).
 - Audit all tracked npm, Bun, uv, and Cargo dependency graphs in every CI run
   and weekly, including development dependencies and unfixed advisories. Block
   every HIGH/CRITICAL finding and scan error, and publish complete inventory and
