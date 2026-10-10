@@ -94,6 +94,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Inbox messages are no longer pasted into a terminal that is waiting on a user
+  answer, such as an open Claude Code AskUserQuestion or approval dialog. The
+  dialog consumed the text, so the message was marked delivered but lost, and
+  the trailing Enter could select an option for the user. While the terminal
+  reports WAITING_USER_ANSWER, the message now stays pending and is delivered
+  after the dialog closes. On the herdr backend, Claude Code 2.1.281+ sessions
+  started with `--agent` can report `idle`/`done` for an open dialog because of
+  an upstream detection bug (herdrdev/herdr#4573); see
+  `docs/inbox-delivery.md` for a workaround (#896).
 - Audit all tracked npm, Bun, uv, and Cargo dependency graphs in every CI run
   and weekly, including development dependencies and unfixed advisories. Block
   every HIGH/CRITICAL finding and scan error, and publish complete inventory and
@@ -562,6 +571,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Eager inbox delivery is always on for providers that buffer input mid-turn
+  (Claude Code, MiniMax Code), and `CAO_EAGER_INBOX_DELIVERY` is removed. A
+  leftover setting is ignored, including `false` (#896).
 - The MCP server now requires fastmcp 3.2.0 or newer (was 2.14.0), the
   version CI tests. fastmcp 2.x does not export `ToolResult` from
   `fastmcp.tools`, so `cao-mcp-server` would not start on it. Upgrading
