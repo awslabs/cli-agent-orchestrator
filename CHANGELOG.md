@@ -94,6 +94,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Kiro profile installation now preserves profile-defined `resources` alongside
+  CAO's default context and skill resources. Reinstall existing profiles to
+  include their configured resources in the generated Kiro agent configuration
+  (#904).
 - Audit all tracked npm, Bun, uv, and Cargo dependency graphs in every CI run
   and weekly, including development dependencies and unfixed advisories. Block
   every HIGH/CRITICAL finding and scan error, and publish complete inventory and
