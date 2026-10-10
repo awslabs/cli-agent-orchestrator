@@ -1,7 +1,7 @@
 ---
 name: transport_supervisor
 description: "Simulation-only cross-zone transport supervisor: plans the legs and delegates each leg with CAO handoff"
-skills: []  # Show no CAO skill catalog to this agent.
+skills: []  # No CAO skill catalog in the prompt. Copilot CLI and Kiro CLI load skills in their own way.
 allowedTools:
   - "@transport-sim"   # Simulator tools. The supervisor credential permits only observe.
   - "@cao-mcp-server"  # CAO handoff. Only the supervisor can delegate.
@@ -50,9 +50,8 @@ refuses all other simulator tools for your credential.
     each payload, its location (`at`), and any pending custody `offer`.
   - `commands`: the record of each command, with its `status` and `reason`.
   - `scene`: the zones, the locations, the robot capabilities, and
-    `arrival_tolerance_m`. The scene shows the start of the run, and the
-    controller does not update it. Use `robots` and `payloads` for the current
-    state.
+    `arrival_tolerance_m`. It has no positions and no owners. Use `robots` and
+    `payloads` for the current state.
 
 ### cao-mcp-server
 
@@ -147,10 +146,14 @@ Write the final report in the format below.
   report the last confirmed position of the payload, its owner, and the
   observation time.
 - If a worker loses contact, find the state of its command with `observe`.
-- If a handoff returns no usable evidence, for example an empty or cut
-  response, call `observe`. If the leg has no command record, hand off the
-  same leg again. If the leg has a command record, use that record, and do not
-  start the leg again. For the checker, hand off the check again.
+- If a handoff succeeds but returns no usable evidence, for example an empty
+  or cut response, the worker has finished. Call `observe`. If the leg has a
+  command record, use that record, and do not start the leg again. If the leg
+  has no command record, hand off the same leg again. For the checker, hand off
+  the check again.
+- If a handoff fails or times out, the worker can still be running. Do not
+  hand off the same leg again. Call `observe`. If the leg has a command record,
+  use that record. If it has none, report the leg as uncertain, and stop.
 - If `handoff` returns `pending: true` with a `job_id`, the worker can still be
   running. Call `get_handoff_result` with that `job_id`. Do not hand off the
   same leg again.

@@ -243,6 +243,20 @@ def test_invalid_or_hardware_configuration_fails_closed(mutate):
         Scene.model_validate(data)
 
 
+def test_observe_reports_custody_and_positions_only_in_the_live_blocks(world):
+    # The scene of a run keeps capabilities and geometry, not its start state:
+    # an agent that reads the scene cannot take an old owner for the current one.
+    world.move("west", "leg", "cart-west", "parcel", "dock")
+    assert finish(world, "west", "leg")["status"] == "finished"
+    state = world.observe()
+    assert state["payloads"]["parcel"]["at"] == "dock"
+    assert state["payloads"]["parcel"]["owner"] == "west"
+    assert "at" not in state["scene"]["robots"]["cart-west"]
+    assert {"at", "owner"}.isdisjoint(state["scene"]["payloads"]["parcel"])
+    assert set(state["scene"]["robots"]["cart-west"]["locations"]) == {"stock", "dock"}
+    assert world.scene.payloads["parcel"].owner == "west", "the World keeps its own copy intact"
+
+
 def test_a_narrow_zone_still_builds_a_world(scene):
     # A valid zone 4 cm wide. The render inset must not make its tile negative.
     data = scene.model_dump(mode="json")

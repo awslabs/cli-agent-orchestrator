@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import struct
 import sys
 import threading
@@ -24,6 +25,12 @@ from recorder import (
 from simulation import Scene, World
 
 EXAMPLE = Path(__file__).resolve().parents[1]
+
+
+def free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
 
 
 def world(scene_file: str = "site.json", **kwargs) -> World:
@@ -228,7 +235,7 @@ def test_a_long_animation_still_ends_on_the_last_frame(tmp_path, monkeypatch):
 )
 def test_serve_does_not_claim_an_incomplete_recording(tmp_path, monkeypatch, caplog, error):
     run_dir = tmp_path / "run"
-    demo.prepare(run_dir, EXAMPLE / "site.json", port=8766, provider="copilot_cli")
+    demo.prepare(run_dir, EXAMPLE / "site.json", port=free_port(), provider="copilot_cli")
 
     class Server:
         def run(self, **kwargs):
@@ -314,7 +321,7 @@ def test_a_frames_directory_with_files_is_refused(tmp_path):
 
 def test_serve_refuses_a_used_frames_directory_without_consuming_the_run(tmp_path, monkeypatch):
     run_dir = tmp_path / "run"
-    demo.prepare(run_dir, EXAMPLE / "site.json", port=8766, provider="copilot_cli")
+    demo.prepare(run_dir, EXAMPLE / "site.json", port=free_port(), provider="copilot_cli")
     frames = tmp_path / "frames"
     frames.mkdir()
     (frames / "frame-0001.png").write_bytes(b"old")

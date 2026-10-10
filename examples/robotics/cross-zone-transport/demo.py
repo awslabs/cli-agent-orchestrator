@@ -10,7 +10,10 @@ import logging
 import os
 import secrets
 import shlex
+import signal
+import socket
 import sys
+import threading
 import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -115,6 +118,10 @@ def prepare(run_dir: Path, scene_file: Path, *, port: int, provider: str) -> dic
         )
     if provider in UNSUPPORTED_PROVIDERS:
         raise ValueError(f"{provider} is not supported: {UNSUPPORTED_PROVIDERS[provider]}")
+    # Check everything that can refuse the run before the run directory exists,
+    # so that a refusal leaves nothing behind that blocks a retry.
+    sources = {role: read_profile(path) for role, path in PROFILE_SOURCES.items()}
+    zone_variables(scene)
     run_dir = run_dir.resolve()
     run_dir.mkdir(mode=0o700)
     (run_dir / "credentials").mkdir(mode=0o700)
@@ -133,7 +140,6 @@ def prepare(run_dir: Path, scene_file: Path, *, port: int, provider: str) -> dic
             for zone in scene.zones
         }
     )
-    sources = {role: read_profile(path) for role, path in PROFILE_SOURCES.items()}
     # A random suffix gives each run its own installed profile names. handoff
     # starts each worker from its installed profile when the supervisor calls
     # it, so a later run must not replace the profiles of a running run.
@@ -198,6 +204,17 @@ def prepare(run_dir: Path, scene_file: Path, *, port: int, provider: str) -> dic
     return manifest
 
 
+def zone_variables(scene: Scene) -> dict[str, str]:
+    """Return the run.env variable of each zone, for example ZONE_WEST for west."""
+    variables: dict[str, str] = {}
+    for zone in scene.zones:
+        variable = "ZONE_" + zone.upper().replace("-", "_")
+        if variable in variables:
+            raise ValueError(f"zones {zone!r} and {variables[variable]!r} both map to {variable}")
+        variables[variable] = zone
+    return variables
+
+
 def write_run_env(path: Path, manifest: dict, scene: Scene) -> None:
     """Write shell variables for the README commands: one profile name per agent."""
     variables = {
@@ -206,15 +223,32 @@ def write_run_env(path: Path, manifest: dict, scene: Scene) -> None:
         "SUPERVISOR": manifest["profiles"]["supervisor"],
         "CHECKER": manifest["profiles"]["checker"],
     }
-    for zone in scene.zones:
-        variable = "ZONE_" + zone.upper().replace("-", "_")
-        if variable in variables:
-            raise ValueError(f"zones {zone!r} and another zone both map to {variable}")
+    for variable, zone in zone_variables(scene).items():
         variables[variable] = manifest["profiles"][f"zone_{zone}"]
     text = "".join(f"{name}={shlex.quote(value)}\n" for name, value in variables.items())
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as stream:
         stream.write(text)
+
+
+def ensure_port_free(port: int) -> None:
+    """Refuse a port that another process listens on, before the run is marked started."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError as error:
+            raise OSError(
+                f"port {port} is in use, for example by the controller of another run: {error}"
+            ) from error
+
+
+def _interrupt(signum, frame) -> None:
+    raise KeyboardInterrupt
+
+
+def _hang_up(signum, frame) -> None:
+    signal.raise_signal(signal.SIGINT)
 
 
 def serve(run_dir: Path, *, allow_motion: bool, record: Path | None = None) -> None:
@@ -229,13 +263,28 @@ def serve(run_dir: Path, *, allow_motion: bool, record: Path | None = None) -> N
             raise ValueError("all credentials must address this run's controller")
         controller_client(credentials["url"], credentials["token"])
         tokens[credentials["token"]] = {"client_id": actor, **metadata}
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    if (
+        record is not None
+        and sys.platform == "darwin"
+        and os.environ.get("MUJOCO_GL", "").strip().lower() == "glfw"
+    ):
+        # GLFW must start on the main thread on macOS, and the recorder renders on
+        # its own thread: the process would abort with a trap, not an exception.
+        logging.getLogger("transport").warning(
+            "Recording is off: MUJOCO_GL=glfw does not work on the recorder thread on macOS. "
+            "Unset MUJOCO_GL to use the default renderer."
+        )
+        record = None
+    # Before started.json: a refused port or frames directory must not consume the run.
+    port = urlsplit(manifest["url"]).port
+    ensure_port_free(port)
     if record is not None:
-        # Before started.json: a refused frames directory must not consume the run.
         ensure_empty_directory(record)
+        record.mkdir(parents=True, exist_ok=True)
     # Restarting would lose command history while old workers still hold credentials.
     write_private(run_dir / "started.json", {"pid": os.getpid(), "run_id": manifest["run_id"]})
     world = World(scene, allow_motion=allow_motion, run_id=manifest["run_id"])
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     logging.getLogger("transport").warning(
         "SIMULATION ONLY: kinematic carrying; motion %s",
         "approved for this scene" if allow_motion else "DISABLED (no --allow-motion)",
@@ -245,17 +294,25 @@ def serve(run_dir: Path, *, allow_motion: bool, record: Path | None = None) -> N
     if recorder is not None:
         recorder.start()
         logging.getLogger("transport").info("Recording frames of the world to %s", record)
+    # Ctrl+C is the documented stop. kill (SIGTERM) and a closed terminal window
+    # (SIGHUP) take the same path: uvicorn shuts down and saves last-state.json,
+    # then the finally below writes the recording.
+    previous = {}
+    if threading.current_thread() is threading.main_thread():
+        previous[signal.SIGTERM] = signal.signal(signal.SIGTERM, _interrupt)
+        if hasattr(signal, "SIGHUP"):
+            previous[signal.SIGHUP] = signal.signal(signal.SIGHUP, _hang_up)
     try:
         server.run(
             transport="http",
             host="127.0.0.1",
-            port=urlsplit(manifest["url"]).port,
+            port=port,
             stateless_http=True,
             show_banner=False,
         )
     except (KeyboardInterrupt, asyncio.CancelledError):
-        # Ctrl+C is the documented stop. Uvicorn has already shut down cleanly and
-        # re-raises the signal; under anyio it can arrive as CancelledError.
+        # Uvicorn has already shut down cleanly and re-raises the signal; under
+        # anyio it can arrive as CancelledError.
         pass
     finally:
         if recorder is not None:
@@ -276,6 +333,8 @@ def serve(run_dir: Path, *, allow_motion: bool, record: Path | None = None) -> N
                     logging.getLogger("transport").warning(
                         "Recorded no frames. See the README section 'See the robots move'."
                     )
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 async def operator_call(run_dir: Path, tool: str) -> dict:
@@ -327,9 +386,10 @@ def main() -> None:
         if args.provider not in NATIVE_ENFORCEMENT:
             print(
                 f"warning: {args.provider} does not enforce the tool allowlist of a profile. "
-                "The zone workers and the checker can then use tools that their profile does "
-                "not allow, for example a shell, and read the credential files of other "
-                f"zones. Use {args.provider} only for a trusted local demo.",
+                "Every agent, the supervisor included, can then use tools that its profile "
+                "does not allow, for example a shell. It can read every credential file of "
+                "the run, act for another zone, or use the operator credential to stop the "
+                f"run. Use {args.provider} only for a trusted local demo.",
                 file=sys.stderr,
             )
         run_dir = args.run_dir.resolve()

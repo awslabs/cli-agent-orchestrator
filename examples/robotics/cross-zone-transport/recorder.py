@@ -343,6 +343,7 @@ document.getElementById("next").onclick = () => show(index + 1);
 slider.oninput = () => show(Number(slider.value));
 play.onclick = () => {
   if (timer) { clearInterval(timer); timer = null; play.textContent = "Play"; return; }
+  if (index === frames.length - 1) { show(0); }
   play.textContent = "Pause";
   timer = setInterval(() => { if (index === frames.length - 1) { play.onclick(); } else { show(index + 1); } }, 500);
 };

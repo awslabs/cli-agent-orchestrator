@@ -531,6 +531,14 @@ class World:
 
     def observe(self) -> dict:
         with self.lock:
+            # The scene keeps capabilities and geometry. Its start positions and
+            # owners are dropped, so that only the live blocks below say where
+            # things are and who owns them.
+            scene = self.scene.model_dump(mode="json")
+            for robot in scene["robots"].values():
+                del robot["at"]
+            for payload in scene["payloads"].values():
+                del payload["at"], payload["owner"]
             return {
                 "run_id": self.run_id,
                 "observed_at": utc_now(),
@@ -539,7 +547,7 @@ class World:
                 "position_units": "m",
                 "motion_approved": self.allow_motion,
                 "stopped": self.stopped,
-                "scene": self.scene.model_dump(mode="json"),
+                "scene": scene,
                 "robots": {
                     name: {"xy": list(self._xy("robot", name)), "zone": robot.zone}
                     for name, robot in self.scene.robots.items()
