@@ -20,8 +20,9 @@ rules apply:
 - The owner of a zone is responsible for each item in that zone.
 
 The example calls these zones **ownership zones**. The term is not a standard
-industry term. It is the name of the example. It comes from the Strands Robots
-example that this example follows.
+industry term. It is the name of the example. It comes from an example of
+[Strands Robots](https://github.com/strands-labs/robots). See
+[Background](#background).
 
 The job of the agents is a **transport across ownership zones**. A transport
 across ownership zones is one transport job. It is not a zone. In this job,
@@ -104,15 +105,35 @@ no GPU, no display, and no robot hardware. See
 
 ## Background
 
-This is the first example for
-[#845](https://github.com/awslabs/cli-agent-orchestrator/issues/845). Its
-design comes from the Strands Robots example
+This is the first physical AI example of CAO. Physical AI is AI that controls
+machines in the physical world, for example robots.
+
+The idea of the example comes from
+[Strands Robots](https://github.com/strands-labs/robots). Strands Robots is an
+open-source project with the Apache-2.0 license. It is a project of
+[Strands Labs](https://aws.amazon.com/blogs/opensource/introducing-strands-labs-get-hands-on-today-with-state-of-the-art-experimental-approaches-to-agentic-development/),
+the GitHub organization of AWS for experimental AI agent projects. With
+Strands Robots, a [Strands Agents](https://aws.amazon.com/blogs/opensource/introducing-strands-agents-an-open-source-ai-agents-sdk/)
+agent can control, simulate, and train robots with natural language. Strands
+Agents is the open-source AI agent SDK of AWS.
+
+This example follows the Strands Robots example
 [Transport across ownership zones](https://github.com/strands-labs/robots/blob/5180ecc43eb478d84aabf9451bec742b4c2febc6/examples/fleet/02_cross_zone_transport.py).
-It keeps explicit zone ownership, a shared dock, one transport operation, and
-custody acceptance by the receiving zone. It does **not** import Strands,
-LangGraph, Zenoh, a mock robot policy, or a different agent loop. The code and
-scene geometry are original. The example contains no upstream robot assets or
-code.
+The two examples have the same job. Each zone has an owner, and the zones have
+a shared dock. The receiving zone must accept the custody handoff. The two
+examples do the job in different ways:
+
+| | Strands Robots example | This example |
+| --- | --- | --- |
+| Who plans the job | Python code. A coordinator function splits the request into legs with fixed rules. | A CAO agent. The CAO supervisor reads the request and the scene, and it plans the legs. |
+| Who does each leg | A zone orchestrator in the same Python process, over a Zenoh mesh | A separate provider CLI agent for each zone, in its own CAO terminal |
+| How the work is delegated | `mesh.send`, after a person approves each leg | CAO `handoff`. Each worker returns its evidence to the CAO supervisor. |
+| Who checks the result | The coordinator code. It sends a leg only after the success reply of the leg before it. | A separate checker agent. It reads the measured state after the last leg. |
+
+Thus this example uses CAO, a multi-agent orchestration system, to do the job.
+It does not import Strands, LangGraph, Zenoh, or a robot policy. The code and
+the scene are original. The example contains no robot assets or code from
+Strands Robots.
 
 ## Agents
 
