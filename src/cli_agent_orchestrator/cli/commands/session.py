@@ -159,6 +159,10 @@ def status(session_name, terminal_id, workers, as_json):
         else:
             conductor_raw, all_terminals = _resolve_conductor(session_name)
             target = _get_terminal(conductor_raw["id"])
+            if workers:
+                # The session list contains stored metadata, not live status.
+                # Read workers through the same detail endpoint as the conductor.
+                all_terminals[1:] = [_get_terminal(t["id"]) for t in all_terminals[1:]]
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {e}")
 
