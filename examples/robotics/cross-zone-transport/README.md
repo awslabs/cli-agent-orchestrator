@@ -461,6 +461,7 @@ own credential. `prepare` refuses a provider that cannot do this:
 | `cursor_cli` | CAO starts Cursor CLI without the instructions of the agent profile. The CAO supervisor would get neither its workflow nor its run bindings. |
 | `opencode_cli` | OpenCode keeps the MCP servers of all agents in one shared configuration. All the agents would then use the same credential. |
 | `hermes` | Hermes reads MCP servers only from its own Hermes profile, not from the CAO agent profile. The agents would get no simulator server. |
+| `antigravity_cli` | Antigravity CLI reads the MCP servers of all CAO terminals from one shared file. An agent could then use the simulator credential and the CAO tools of another agent. |
 
 The isolation of the zones needs a provider that enforces the tool allowlist
 of each profile. CAO shows this in the `Enforcement:` line of `cao launch`. For

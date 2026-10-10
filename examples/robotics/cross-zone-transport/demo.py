@@ -60,7 +60,16 @@ NATIVE_ENFORCEMENT = frozenset(
 # agents would then use the credential of the last installed profile.
 # For hermes, CAO writes no MCP configuration: Hermes reads MCP servers only
 # from its own Hermes profile (docs/hermes.md, "MCP Configuration").
+# For antigravity_cli, CAO writes the MCP servers of every terminal into one
+# shared ~/.gemini/config/mcp_config.json, keyed "<server>-<terminal id>", and
+# each agy process reads the whole file (providers/antigravity_cli.py). A worker
+# would also start the servers of the supervisor and of other zones.
 UNSUPPORTED_PROVIDERS = {
+    "antigravity_cli": (
+        "Antigravity CLI reads the MCP servers of all CAO terminals from one shared "
+        "file, so an agent could use the simulator credential and the CAO terminal "
+        "of another agent"
+    ),
     "cursor_cli": (
         "CAO launches Cursor CLI without the instructions of the agent profile, so the "
         "CAO supervisor would get neither its workflow nor its run bindings"
