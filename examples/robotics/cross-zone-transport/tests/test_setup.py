@@ -22,9 +22,9 @@ EXAMPLE = Path(__file__).resolve().parents[1]
 @pytest.mark.parametrize(
     "transport_request",
     [
-        "Move tote from stock to etch and have an independent checker verify delivery.",
+        "Move parcel from stock to etch and have an independent checker verify delivery.",
         "Return sample-tray from rack to inspection without changing its custody early.",
-        '--inspect "operator\'s tote"; preserve $STATUS\nwithout moving it.',
+        '--inspect "operator\'s parcel"; preserve $STATUS\nwithout moving it.',
     ],
 )
 def test_prepare_prints_a_nonblocking_launch_with_the_request(
@@ -197,7 +197,7 @@ def test_additional_zones_get_the_same_shared_operator_prompt(tmp_path):
         "at": "north-dock",
         "locations": ["north-dock", "warehouse"],
         "payload_kg": 4,
-        "fixtures": ["tote_clamp"],
+        "fixtures": ["parcel_clamp"],
         "speed_m_s": 1,
     }
     scene_file = tmp_path / "three-zones.json"
@@ -211,6 +211,31 @@ def test_additional_zones_get_the_same_shared_operator_prompt(tmp_path):
         assert shared in (run_dir / "profiles" / f"{name}.md").read_text()
 
 
+@pytest.mark.parametrize("scene_name", ["site.json", "return-site.json"])
+def test_run_env_names_the_profile_of_each_agent(tmp_path, scene_name):
+    # The README sources run.env and installs each agent with its own command.
+    run_dir = tmp_path / "run"
+    manifest = demo.prepare(run_dir, EXAMPLE / scene_name, port=8766, provider="copilot_cli")
+    assert stat.S_IMODE((run_dir / "run.env").stat().st_mode) == 0o600
+    names = ["RUN_ID", "SESSION", "SUPERVISOR", "CHECKER"] + [
+        f"ZONE_{zone.upper()}" for zone in json.loads((EXAMPLE / scene_name).read_text())["zones"]
+    ]
+    script = f'set -eu; . "{run_dir}/run.env"; ' + "; ".join(
+        f'echo "{name}=${name}"' for name in names
+    )
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
+    values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    profiles = manifest["profiles"]
+    assert values["RUN_ID"] == manifest["run_id"]
+    assert values["SESSION"] == f"cao-transport-{manifest['run_id']}"
+    assert values["SUPERVISOR"] == profiles["supervisor"]
+    assert values["CHECKER"] == profiles["checker"]
+    zones = json.loads((EXAMPLE / scene_name).read_text())["zones"]
+    for zone in zones:
+        assert values[f"ZONE_{zone.upper()}"] == profiles[f"zone_{zone}"]
+        assert (run_dir / "profiles" / f"{values[f'ZONE_{zone.upper()}']}.md").is_file()
+
+
 def test_long_zone_identifiers_do_not_overflow_cao_profile_names(tmp_path):
     data = json.loads((EXAMPLE / "site.json").read_text())
     zone_name = "z" * 64
@@ -218,7 +243,7 @@ def test_long_zone_identifiers_do_not_overflow_cao_profile_names(tmp_path):
     for location in data["locations"].values():
         location["zones"] = [zone_name if zone == "west" else zone for zone in location["zones"]]
     data["robots"]["cart-west"]["zone"] = zone_name
-    data["payloads"]["tote"]["owner"] = zone_name
+    data["payloads"]["parcel"]["owner"] = zone_name
     scene = tmp_path / "long-zone.json"
     scene.write_text(json.dumps(data))
     run_dir = tmp_path / "run"

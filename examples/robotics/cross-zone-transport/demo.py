@@ -181,7 +181,27 @@ def prepare(run_dir: Path, scene_file: Path, *, port: int, provider: str) -> dic
     }
     write_private(run_dir / "run.json", manifest)
     write_private(run_dir / "scene.json", scene.model_dump(mode="json"))
+    write_run_env(run_dir / "run.env", manifest, scene)
     return manifest
+
+
+def write_run_env(path: Path, manifest: dict, scene: Scene) -> None:
+    """Write shell variables for the README commands: one profile name per agent."""
+    variables = {
+        "RUN_ID": manifest["run_id"],
+        "SESSION": f"cao-transport-{manifest['run_id']}",
+        "SUPERVISOR": manifest["profiles"]["supervisor"],
+        "CHECKER": manifest["profiles"]["checker"],
+    }
+    for zone in scene.zones:
+        variable = "ZONE_" + zone.upper().replace("-", "_")
+        if variable in variables:
+            raise ValueError(f"zones {zone!r} and another zone both map to {variable}")
+        variables[variable] = manifest["profiles"][f"zone_{zone}"]
+    text = "".join(f"{name}={shlex.quote(value)}\n" for name, value in variables.items())
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(text)
 
 
 def serve(run_dir: Path, *, allow_motion: bool, record: Path | None = None) -> None:
