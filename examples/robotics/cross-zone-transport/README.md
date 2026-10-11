@@ -320,27 +320,29 @@ The supervisor delegates every step with `handoff`. The workflow is sequential:
 each `handoff` blocks until the worker returns its evidence. Between steps, the
 supervisor reads the state with `observe`. In the diagram, the solid arrows from
 the supervisor are CAO handoffs. The dotted arrows are calls to the simulator.
+The operator is not an agent. It is you: you start the controller, approve
+motion, read the state, and stop the run with `demo.py`.
 
 ```mermaid
 flowchart TD
-    U(["User request"]) --> S[["Supervisor"]]
-    S -->|"handoff 1"| W[["West zone worker"]]
-    S -->|"handoff 2"| E[["East zone worker"]]
-    S -->|"handoff 3"| C[["Checker"]]
+    U(["User request"]) --> S[["Supervisor agent"]]
+    S -->|"handoff 1"| W[["West zone worker agent"]]
+    S -->|"handoff 2"| E[["East zone worker agent"]]
+    S -->|"handoff 3"| C[["Checker agent"]]
     S -.->|"observe"| M[("MuJoCo controller<br/>demo.py serve")]
     W -.->|"observe, move, offer_handoff"| M
     E -.->|"observe, accept_handoff, move"| M
     C -.->|"observe"| M
-    O(["Operator"]) -.->|"status, stop"| M
+    O(["Operator: you, not an agent"]) -.->|"status, stop"| M
 ```
 
 ```mermaid
 sequenceDiagram
     actor User
-    participant S as Supervisor
-    participant W as West zone worker
-    participant E as East zone worker
-    participant C as Checker
+    participant S as Supervisor agent
+    participant W as West zone worker agent
+    participant E as East zone worker agent
+    participant C as Checker agent
     participant M as MuJoCo controller
 
     User->>S: Move parcel from stock to etch

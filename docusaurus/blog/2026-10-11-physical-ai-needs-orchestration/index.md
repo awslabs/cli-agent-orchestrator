@@ -11,7 +11,7 @@ Agentic AI can take on this coordination. Agentic AI is AI that works toward a g
 
 Multi-agent orchestration is the coordination of several AI agents, each with its own role, so that together they do a job that no single agent should do alone. CLI Agent Orchestrator (CAO) is an open-source tool for multi-agent orchestration. It runs a team of CLI agents: AI assistants that work in a terminal, for example Claude Code, Kiro CLI, or Codex. Each agent has its own role, its own tools, and its own credential, the key that sets what the agent can do.
 
-In this post, you learn why physical AI needs agentic AI, and why agentic AI that moves machines needs orchestration. The first physical AI example of CAO, [cross-zone transport](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/robotics/cross-zone-transport), applies CAO to a parcel on a simulated factory floor. A supervisor agent plans the job. Two zone workers each move only the robots of their own zone, and an independent checker verifies the result. In 10 live runs on 2026-10-11, every run ended in the expected state. Custody, the responsibility for the parcel, changed 6 times, each time after a measured arrival at the dock. The 3 requests that were not possible ended with no command to any robot. You also see the five criteria that a team of agents must meet on a shared floor, and how the example meets each one with CAO. Then you see what a run looks like, and how the example maps to a real site.
+In this post, you learn why physical AI needs agentic AI, and why agentic AI that moves machines needs orchestration. The first physical AI example of CAO, [cross-zone transport](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/robotics/cross-zone-transport), applies CAO to a parcel on a simulated factory floor. A supervisor agent plans the job. Two zone worker agents each move only the robots of their own zone, and an independent checker agent verifies the result. In 10 live runs on 2026-10-11, every run ended in the expected state. Custody, the responsibility for the parcel, changed 6 times, each time after a measured arrival at the dock. The 3 requests that were not possible ended with no command to any robot. You also see the five criteria that a team of agents must meet on a shared floor, and how the example meets each one with CAO. Then you see what a run looks like, and how the example maps to a real site.
 
 ![Animation of the cross-zone transport in MuJoCo. The blue west cart carries the pink parcel from stock to the amber dock. West offers custody to east, and east accepts it. Then the green east cart carries the parcel to etch, and the checker confirms the parcel at etch, owner east.](../../../examples/robotics/cross-zone-transport/images/cross-zone-transport.gif)
 
@@ -108,10 +108,10 @@ These benefits come from structure. The same study of failures found that "many 
 
 The example puts four CAO agents on the floor. Each agent is a provider CLI in its own CAO terminal:
 
-- The **supervisor** reads the request and the scene, plans the legs, and delegates each leg with `handoff`. Its simulator credential can only observe.
-- The **west zone worker** carries the parcel to the dock with `cart-west`, and offers custody to the east zone.
-- The **east zone worker** accepts custody at the dock, and carries the parcel to `etch` with `cart-east`.
-- The **checker** reads the final state and compares it with the request. Its credential can only observe.
+- The **supervisor agent** reads the request and the scene, plans the legs, and delegates each leg with `handoff`. Its simulator credential can only observe.
+- The **west zone worker agent** carries the parcel to the dock with `cart-west`, and offers custody to the east zone.
+- The **east zone worker agent** accepts custody at the dock, and carries the parcel to `etch` with `cart-east`.
+- The **checker agent** reads the final state and compares it with the request. Its credential can only observe.
 
 A run has these steps:
 
@@ -123,7 +123,9 @@ A run has these steps:
 6. The supervisor hands off the check to the checker, which reads fresh state and compares it with the request.
 7. The supervisor reports the result, with the evidence of each worker and of the checker.
 
-![The orchestration of the example. A user request goes to the supervisor. The supervisor hands off to the west zone worker, then to the east zone worker, then to the checker, and it calls observe on the MuJoCo controller between the steps. The west zone worker calls observe, move, and offer_handoff. The east zone worker calls observe, accept_handoff, and move. The checker calls observe. The operator calls status and stop.](./orchestration.svg)
+![The orchestration of the example. A user request goes to the supervisor agent. The supervisor agent hands off to the west zone worker agent, then to the east zone worker agent, then to the checker agent, and it calls observe on the MuJoCo controller between the steps. The west zone worker agent calls observe, move, and offer_handoff. The east zone worker agent calls observe, accept_handoff, and move. The checker agent calls observe. The operator, which is you and not an agent, calls status and stop.](./orchestration.svg)
+
+The solid arrows from the supervisor agent are CAO handoffs, and the dotted arrows are calls to the simulator. The operator is not an agent. It is you, the person who runs the example: you start the controller, approve motion, read the state with `demo.py status`, and can stop all motion with `demo.py stop`.
 
 ### Key benefits
 
