@@ -349,4 +349,4 @@ Haofei is a Senior Cloud Architect at AWS with over 20 years of expertise in Dev
 
 ### Yin Song
 
-[Placeholder: add the bio of Yin Song here, in one paragraph: role at AWS, location, expertise, and a personal touch.]
+Yin Song is a Senior Applied Scientist at AWS Prototyping and Scaling with over ten years of industry experience in machine learning and AI since completing his PhD in 2014, and over five years building tailored prototypes and scaling solutions for complex AWS use cases. He is an open-source advocate whose models, including FalconLite, MistralLite and MegaBeam, have passed 900,000 downloads on HuggingFace, and he is a main contributor to strands-robots, bringing agentic AI to robotics, with a growing interest in world models and Gaussian Splatting for 3D reconstruction from real capture. Based in Sydney, Australia, when not prototyping for customers he spends time with his family and his cat.
