@@ -93,7 +93,9 @@ refused; it does not mean unlimited. Values outside these ranges in
 `CAO_DECISION_CONFIDENCE_THRESHOLD` are clamped, with a warning. The fixed table
 looks up profile first, then role, and returns probability 1.0; a miss gives no
 answer. It is a decider, never part of fallback resolution. Shadow defaults to
-four concurrent and 64 pending tasks. Overflow is recorded as `shadow_dropped`;
+four concurrent and 64 pending tasks, with a 10000 ms decider timeout. These have
+no CLI setter; values in `settings.json` are clamped, with a warning, to 1–1024
+concurrent, 0–100000 pending and 50–60000 ms. Overflow is recorded as `shadow_dropped`;
 shutdown and crash recovery mark unfinished decisions interrupted.
 
 ## Operator controls
