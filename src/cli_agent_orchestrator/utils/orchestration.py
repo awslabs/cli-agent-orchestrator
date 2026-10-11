@@ -1389,6 +1389,7 @@ async def _handoff_impl(
             terminal_id=None,
         )
 
+    claim: Optional[EphemeralClaim] = None
     try:
         claim = _claim_ephemeral(
             agent_profile,
@@ -1595,6 +1596,17 @@ async def _handoff_impl(
         )
 
     except Exception as e:
+        if claim is not None and terminal_id is None:
+            logger.warning("ephemeral launch failed after claim: %s", type(e).__name__)
+            return HandoffResult(
+                success=False,
+                rule="unexpected_failure",
+                message="ephemeral launch failed",
+                output=None,
+                terminal_id=None,
+                job_id=None,
+                pending=None,
+            )
         # Surface terminal_id when known. With the single-call design the server
         # owns the terminal lifecycle, so on a client-side failure (e.g. the
         # provider resolution) there is usually no terminal to surface.
@@ -1791,6 +1803,7 @@ def _assign_impl(
         return {"success": False, "terminal_id": None, "message": refusal}
 
     terminal_id: Optional[str] = None
+    claim: Optional[EphemeralClaim] = None
     try:
         # Fail fast before creating the worker terminal when CAO_TERMINAL_ID is
         # unset — REGARDLESS of the sender-ID-injection flag. The deferred-init
@@ -1876,6 +1889,14 @@ def _assign_impl(
         return {"success": False, "terminal_id": terminal_id, "rule": exc.rule, "message": str(exc)}
 
     except Exception as e:
+        if claim is not None and terminal_id is None:
+            logger.warning("ephemeral launch failed after claim: %s", type(e).__name__)
+            return {
+                "success": False,
+                "terminal_id": None,
+                "rule": "unexpected_failure",
+                "message": "ephemeral launch failed",
+            }
         # Surface the terminal_id when creation succeeded before the failure
         # (e.g. the send POST failed) so the orphaned terminal can be
         # inspected or deleted — matching the ready-timeout path above.

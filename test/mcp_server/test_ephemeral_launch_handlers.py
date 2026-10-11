@@ -421,3 +421,115 @@ async def test_nonpolicy_bind_error_after_claim_is_generic(launch_http, monkeypa
     assert database.get_terminal_metadata(CHILD) is None
     runtime[2].create_window.assert_not_called()
     runtime[3].assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default", "nowait", "early"])
+@pytest.mark.parametrize("failure", ["post", "metadata"])
+async def test_postclaim_exception_is_generic_before_terminal_exists(
+    launch_http, monkeypatch, caplog, path, failure
+):
+    from datetime import timedelta
+    from test.services.test_ephemeral_claim import NOW
+
+    import requests
+
+    runtime, _, _, _, _ = launch_http
+    env, name, backend, factory = runtime
+    monkeypatch.setattr(env[0].secrets, "token_hex", lambda n: "c" * (2 * n))
+    original_post = orchestration.requests.post
+    original_get = orchestration.requests.get
+    leak = (
+        "http://127.0.0.1:54321 url: /sessions/s/terminals?caller_id="
+        + CALLER
+        + "&claim_id="
+        + "c" * 32
+        + "&working_directory=%2Fworkspace&allowed_tools=fs_read"
+    )
+
+    def reject_post(url, **kwargs):
+        if url.endswith("/claim"):
+            return original_post(url, **kwargs)
+        raise requests.ConnectionError(leak)
+
+    def reject_metadata(url, **kwargs):
+        response = requests.Response()
+        response.status_code = 500
+        response.url = url
+        return response
+
+    if failure == "post":
+        monkeypatch.setattr(orchestration.requests, "post", reject_post)
+    else:
+        monkeypatch.setattr(orchestration.requests, "get", reject_metadata)
+    result = await invoke(path, name)
+    assert not result["success"]
+    assert result["rule"] == "unexpected_failure"
+    assert result["message"] == "ephemeral launch failed"
+    for forbidden in [
+        "http://",
+        "claim_id",
+        "caller_id",
+        "working_directory",
+        "allowed_tools",
+        "/workspace",
+        CALLER,
+    ]:
+        assert forbidden not in str(result)
+    expected_class = "ConnectionError" if failure == "post" else "HTTPError"
+    warnings = [r.getMessage() for r in caplog.records if r.name == orchestration.logger.name]
+    assert warnings == ["ephemeral launch failed after claim: " + expected_class]
+    backend.create_window.assert_not_called()
+    factory.assert_not_called()
+    assert database.get_terminal_metadata(CHILD) is None
+    row = database.get_ephemeral_agent(name)
+    assert row["state"] == "claimed" and row["claim_id"] == "c" * 32
+    assert row["claim_expires_at"] == NOW + timedelta(seconds=60)
+    # Production makes no compensation call: a later claim lapses the lease.
+    monkeypatch.setattr(orchestration.requests, "post", original_post)
+    monkeypatch.setattr(orchestration.requests, "get", original_get)
+    monkeypatch.setattr(database, "_utcnow", lambda: NOW + timedelta(seconds=61))
+    monkeypatch.setattr(env[0].secrets, "token_hex", lambda n: "d" * (2 * n))
+    retry = orchestration._claim_ephemeral(name, None)
+    assert retry.claim_id == "d" * 32
+
+
+@pytest.mark.asyncio
+async def test_postclaim_failure_after_terminal_exists_keeps_existing_text(
+    launch_http, monkeypatch
+):
+    import requests
+
+    post = orchestration.requests.post
+
+    def fail_submission(url, **kwargs):
+        if url.endswith("/input"):
+            raise requests.ConnectionError("submission failed")
+        return post(url, **kwargs)
+
+    monkeypatch.setattr(orchestration.requests, "post", fail_submission)
+    result = await invoke("nowait", launch_http[0][1])
+    assert not result["success"] and result["terminal_id"] == CHILD
+    assert result["rule"] is None
+    assert result["message"] == "Handoff failed: submission failed"
+    assert database.get_ephemeral_agent(launch_http[0][1])["state"] == "launched"
+    assert orchestration._delete_terminal_impl(CHILD)["success"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default"])
+async def test_failure_without_claim_keeps_existing_text(launch_http, monkeypatch, path):
+    import requests
+
+    def fail_metadata(url, **kwargs):
+        response = requests.Response()
+        response.status_code = 500
+        response.url = url
+        return response
+
+    monkeypatch.setattr(orchestration.requests, "get", fail_metadata)
+    result = await invoke(path, "developer")
+    assert not result["success"]
+    assert result.get("rule") is None
+    assert "500 Server Error" in result["message"] and CALLER in result["message"]
+    launch_http[0][2].create_window.assert_not_called()
