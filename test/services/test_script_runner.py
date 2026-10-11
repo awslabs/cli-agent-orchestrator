@@ -2,8 +2,11 @@
 
 The subprocess is MOCKED throughout (fast, hermetic, default matrix) — the
 OS-touching proofs live under the ``e2e`` marker in
-``test/e2e/test_script_runner_e2e.py``. Coverage maps to the code-generation
-test plan:
+``test/e2e/test_script_runner_e2e.py``. The one exception is
+``test_close_pipes_closes_a_real_process_transport``, which spawns a short-lived
+real child because ``_close_pipes`` depends on a private attribute of
+``asyncio.subprocess.Process`` that the fakes cannot vouch for. Coverage maps
+to the code-generation test plan:
 
 - M1 result-shape contract: a script COMPLETED result has the same base fields
   as a YAML run + ``kind=None``/``output``/``warnings=[]`` (INV-5).
@@ -29,6 +32,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
+import signal
+import sys
 from pathlib import Path
 from typing import List, Optional
 
@@ -626,6 +633,66 @@ async def test_nonzero_exit_with_pipes_held_open_fails_with_warning(
     assert any("still open" in w for w in result.warnings)
     assert proc.signals == []
     assert proc._transport.closed
+
+
+@pytest.mark.asyncio
+async def test_missing_transport_is_logged_and_not_reported_as_closed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """Without ``_transport`` the run still settles, and nothing claims the pipes were closed."""
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 1.0)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.05)
+    proc = _HeldPipesProcess(
+        stdout=b'CAO_WORKFLOW_OUTPUT:{"ok": true}\n', wait_holds_for_pipes=True
+    )
+    del proc._transport
+    _install_fake_spawn(monkeypatch, proc)
+
+    with caplog.at_level(logging.WARNING, logger=script_runner.__name__):
+        result = await asyncio.wait_for(
+            run_script_workflow(_FakeScriptSpec(), {}, "run-held-pipes-no-transport"), timeout=5.0
+        )
+    assert result.state == RunState.COMPLETED
+    assert result.output == {"ok": True}
+    assert any("could not be closed" in w for w in result.warnings)
+    assert not any("were closed" in w for w in result.warnings)
+    assert any("has no _transport" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_close_pipes_closes_a_real_process_transport():
+    """``_close_pipes`` reaches the transport of a real ``asyncio.subprocess.Process``.
+
+    Every other test here hands the drive a fake with a ``_FakeTransport``, so
+    they would keep passing if a Python release renamed the private attribute.
+    asyncio closes the transport on its own once the child has exited and both
+    pipes reach EOF, so the child starts a process that holds them, as a script
+    that backgrounds something does.
+    """
+    holder_code = "import time; time.sleep(30)"
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import subprocess, sys; "
+        f"p = subprocess.Popen([sys.executable, '-c', {holder_code!r}]); "
+        "print(p.pid, flush=True)",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    holder_pid = int(await asyncio.wait_for(proc.stdout.readline(), timeout=10.0))
+    try:
+        for _ in range(500):
+            if proc.returncode is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert proc.returncode == 0
+        assert not proc._transport.is_closing()  # the holder keeps both pipes open
+
+        assert script_runner._close_pipes(proc) is True
+        assert proc._transport.is_closing()
+    finally:
+        os.kill(holder_pid, signal.SIGTERM)
 
 
 @pytest.mark.asyncio

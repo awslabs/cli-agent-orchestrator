@@ -1057,7 +1057,7 @@ async def _finalize(
     )
 
 
-def _close_pipes(process: asyncio.subprocess.Process) -> None:
+def _close_pipes(process: asyncio.subprocess.Process) -> bool:
     """Close the parent's end of both pipes once their readers are cancelled.
 
     Cancelling ``_pump`` stops the reads but leaves the pipe transports open. A
@@ -1065,12 +1065,22 @@ def _close_pipes(process: asyncio.subprocess.Process) -> None:
     drains, blocks on the write and never exits, and the two read fds stay open
     in the server for good. ``asyncio.subprocess.Process`` has no public close,
     so this goes through its transport. The script has already exited on every
-    caller, and ``close()`` only kills a child that ``poll()`` still reports as
-    running, so here it closes the pipes without signalling.
+    caller, and ``close()`` only kills a child whose exit has not been recorded
+    (on both the stdlib loop and uvloop), so here it closes the pipes without
+    signalling.
+
+    Returns whether the pipes were closed. If the private ``_transport`` is
+    missing, this logs a warning and returns False instead of raising.
     """
     transport = getattr(process, "_transport", None)
-    if transport is not None:
-        transport.close()
+    if transport is None:
+        logger.warning(
+            "script process %r has no _transport, so its stdout/stderr pipes were left open",
+            process,
+        )
+        return False
+    transport.close()
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1149,11 +1159,11 @@ async def _drive_process(
             asyncio.gather(*drain, return_exceptions=True), timeout=WORKFLOW_SCRIPT_TERM_GRACE
         )
     except asyncio.TimeoutError:
-        _close_pipes(process)
+        closed = _close_pipes(process)
         drain_warnings.append(
             f"stdout/stderr were still open {WORKFLOW_SCRIPT_TERM_GRACE}s after the script "
             "exited, most likely held by a process it started; output read up to then was "
-            "kept and the pipes were closed"
+            "kept and the pipes " + ("were closed" if closed else "could not be closed")
         )
 
     if record.cancelled or record.state == RunState.CANCELLED:
