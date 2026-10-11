@@ -1477,10 +1477,24 @@ class TestCopilotCompletionChromeExtraction:
         )
 
     @pytest.mark.parametrize("layout", ["prompt", "box"])
+    @pytest.mark.parametrize("ansi", [False, True])
+    def test_trailing_task_complete_finding_is_preserved(self, layout, ansi):
+        reply = (
+            "● Review results:\n"
+            " ● Task complete\n"
+            "   └ Blocking finding: candidate accepts age 18 incorrectly."
+        )
+        output = self.screen(reply, layout=layout)
+        if ansi:
+            output = "\x1b[32m" + output + "\x1b[0m"
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.extract_last_message_from_script(output) == reply
+
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
     @pytest.mark.parametrize("cwd", ["/tmp/example", "~/example", "/tmp/example with spaces"])
     @pytest.mark.parametrize("wrapped", [False, True])
     @pytest.mark.parametrize("ansi", [False, True])
-    def test_completion_summary_and_cwd_are_excluded(self, layout, cwd, wrapped, ansi):
+    def test_completion_summary_is_preserved_and_cwd_excluded(self, layout, cwd, wrapped, ansi):
         reply = "● CAO_READY_V1095"
         summary = " ● Task complete\n   └ Returned the readiness token.\n"
         if wrapped:
@@ -1489,8 +1503,8 @@ class TestCopilotCompletionChromeExtraction:
         if ansi:
             output = "\x1b[32m" + output + "\x1b[0m"
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
-        # Preserve the existing response marker convention.
-        assert provider.extract_last_message_from_script(output) == reply
+        # UI-shaped summaries can also contain legitimate review evidence.
+        assert provider.extract_last_message_from_script(output) == reply + "\n" + summary.rstrip()
         with patch.object(provider, "_resolve_native_status", return_value=None):
             assert provider.get_status(output) == TerminalStatus.COMPLETED
             assert provider.probe_stale_processing_capture(output) == TerminalStatus.COMPLETED
@@ -1528,7 +1542,7 @@ class TestCopilotCompletionChromeExtraction:
             provider.extract_last_message_from_script(
                 self.screen(reply, layout=layout, summary=summary)
             )
-            == "● CAO_READY_V1095"
+            == "● CAO_READY_V1095\n" + summary.rstrip()
         )
 
     def test_thought_heading_mentioned_in_a_response_is_preserved(self):

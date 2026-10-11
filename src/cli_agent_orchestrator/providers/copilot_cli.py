@@ -759,9 +759,9 @@ class CopilotCliProvider(BaseProvider):
     def _without_completion_chrome(cls, lines: list[str]) -> list[str]:
         """Remove observed v1.0.95 completion chrome at the composer boundary.
 
-        Keep path-like response rows and ordinary mentions of Task complete.
-        The summary is removable only as a trailing tree block after a reply,
-        anchored by the cwd/session row and a complete idle composer/footer.
+        Keep path-like response rows and all Task complete blocks: their
+        rendered shape cannot distinguish UI summaries from review findings.
+        Remove only the anchored cwd/session row and leading thought heading.
         """
         span = cls._last_composer_span(lines)
         if (
@@ -786,22 +786,6 @@ class CopilotCliProvider(BaseProvider):
         while end and not lines[end - 1].strip():
             end -= 1
         last_user = cls._find_last_user_line(lines[:end])
-        for idx in range(end - 1, last_user, -1):
-            if lines[idx].strip() != "● Task complete":
-                continue
-            children = lines[idx + 1 : end]
-            has_reply = any(
-                re.match(ASSISTANT_PREFIX_PATTERN, row.strip(), re.IGNORECASE)
-                for row in lines[last_user + 1 : idx]
-            )
-            if children and has_reply and re.match(r"^\s{3,}└\s+\S", children[0]):
-                continuation_indent = len(children[0]) - len(children[0].lstrip()) + 2
-                if all(
-                    not row.strip() or row.startswith(" " * continuation_indent)
-                    for row in children[1:]
-                ):
-                    omitted.update(range(idx, end))
-            break
         first_reply = next(
             (
                 idx
