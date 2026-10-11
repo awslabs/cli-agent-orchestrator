@@ -315,6 +315,41 @@ async def test_mcp_caller_sees_normal_claim_result(launch_http, tool, enabled):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default"])
+async def test_ephemeral_launch_does_not_ask_decider(launch_http, path):
+    import sys
+    import threading
+    from pathlib import Path
+
+    targets = Path(__file__).parents[2] / "src/cli_agent_orchestrator/decisions/targets.py"
+    if not targets.exists():
+        pytest.skip("decision module absent: delegation decision sites have not landed")
+    # Until the delegation sites exist this check is deliberately vacuous.
+    # Observe calls in the route thread as well as the handler thread so a future
+    # decision call cannot hide behind asyncio.to_thread or the TestClient portal.
+    previous = sys.getprofile()
+    previous_thread = threading.getprofile()
+
+    def no_decider(frame, event, arg):
+        if event == "call":
+            module = frame.f_globals.get("__name__", "")
+            function = frame.f_code.co_name
+            if module.startswith("cli_agent_orchestrator.decisions.") and (
+                function.startswith("decide") or "decider" in function
+            ):
+                raise AssertionError("ephemeral launch must not ask a decider")
+
+    sys.setprofile(no_decider)
+    threading.setprofile(no_decider)
+    try:
+        result = await invoke(path, launch_http[0][1])
+        assert result["success"], result
+    finally:
+        sys.setprofile(previous)
+        threading.setprofile(previous_thread)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["assign", "default", "nowait", "early"])
 async def test_bind_refusal_relays_rule_without_launch_parameters(launch_http, monkeypatch, path):
     from test.services.test_ephemeral_claim import NOW
