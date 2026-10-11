@@ -8,9 +8,11 @@ from one team to the other, and they check the result.
 
 ![Animation of the cross-zone transport in MuJoCo. The blue west cart carries the pink parcel from stock to the amber dock. West offers custody to east, and east accepts it. Then the green east cart carries the parcel to etch, and the checker confirms the parcel at etch, owner east.](images/cross-zone-transport.gif)
 
-The animation replays the commands of a live run of this guide in the MuJoCo
-world of the example: the same robots, commands, and order. It leaves out the
-time that the agents use between the steps.
+**The demo: two zones.** This is the delivery that [Run the demo](#run-the-demo)
+runs. The animation replays the commands of a live run of this guide in the
+MuJoCo world of the example: the same robots, commands, and order. It leaves out
+the time that the agents use between the steps. An extended demo with three
+zones is in [Demo scenarios](#demo-scenarios).
 
 ## What the exercise is about
 
@@ -1244,7 +1246,7 @@ Also add a different `--port <port>` to each `prepare` command, and give each
 | Different scene | `--scene return-site.json` | `Return sample-tray from rack to inspection. Coordinate the ownership handoff and have an independent checker verify delivery.` | The `stores` and `assembly` zone workers contribute. The tray stops within 0.01 m of `[1, -1]`, owner `assembly`. |
 | Operator stop | `--scene /tmp/slow-site.json` | Same as cross-zone delivery | Stop the run while the first move is `running`. The move becomes `interrupted`, reason `operator_stop`. The parcel stays between locations (`"at": null`), owner `west`. The controller rejects all later actions. |
 | Parcel starts in the east zone | `--scene /tmp/east-start-site.json` | `Move parcel to stock. Coordinate the ownership handoff and have an independent checker verify delivery.` | The request does not give the start. The CAO supervisor finds the parcel at `etch` with `observe`, and it plans the job from east to west. The east zone worker moves the parcel to the dock and offers custody to `west`. The west zone worker accepts custody and moves the parcel to `stock`. The checker confirms the parcel at `stock`, owner `west`. |
-| Three zones | `--scene /tmp/three-zone-site.json` | `Move parcel from stock to warehouse. Coordinate the ownership handoffs and have an independent checker verify delivery.` | The request does not give the route. The CAO supervisor finds a route through two shared docks: `dock` (zones `west` and `east`) and `north-dock` (zones `east` and `north`). Three zone workers move the parcel. Custody changes two times: from `west` to `east`, then from `east` to `north`. The checker confirms the parcel at `warehouse`, owner `north`. |
+| Three zones (extended demo) | `--scene /tmp/three-zone-site.json` | `Move parcel from stock to warehouse. Coordinate the ownership handoffs and have an independent checker verify delivery.` | The request does not give the route. The CAO supervisor finds a route through two shared docks: `dock` (zones `west` and `east`) and `north-dock` (zones `east` and `north`). Three zone workers move the parcel. Custody changes two times: from `west` to `east`, then from `east` to `north`. The checker confirms the parcel at `warehouse`, owner `north`. |
 
 In Terminal 1, create the scene files of the scenarios that use `/tmp/...-site.json`:
 
@@ -1302,20 +1304,22 @@ The commands print nothing. They write `/tmp/heavy-site.json`,
 
 </details>
 
-These pictures come from a run of the three-zone scenario with
-`--provider claude_code`. The orange area is zone `north`, and the orange box
-is `cart-north`. The agents moved the parcel through the two amber docks:
+**Extended demo: three zones.** The three-zone scenario adds zone `north` and
+the destination `warehouse`. The request gives no route, so the supervisor
+finds a route through two shared docks. These pictures come from a run of the
+scenario with `--provider claude_code`. The orange area is zone `north`, and the
+orange box is `cart-north`. The agents moved the parcel through the two amber
+docks:
 
 | Start | Delivered |
 | --- | --- |
 | ![Three zones at the start: the pink parcel on the blue west cart at stock. The green east cart waits at the dock, and the orange north cart waits at north-dock.](images/three-zones-start.png) | ![Three zones at the end: the pink parcel on the orange north cart at warehouse. The blue west cart is at the dock, and the green east cart is at north-dock.](images/three-zones-delivered.png) |
 
-<details>
-<summary>Animation of the three-zone run</summary>
+![Animation of the three-zone route in MuJoCo. West moves the parcel to the dock, and east accepts custody. East moves the parcel to north-dock, and north accepts custody. North moves the parcel to the warehouse, and the checker confirms the parcel at the warehouse, owner north.](images/three-zones.gif)
 
-![Animation of the three-zone run: the west cart, the east cart, and the north cart carry the parcel in turn, from stock to warehouse.](images/three-zones-animation.png)
-
-</details>
+The animation replays the commands of that run in the MuJoCo world of the
+example: the same robots, commands, and order, without the time that the agents
+use between the steps.
 
 To stop the run during a move:
 

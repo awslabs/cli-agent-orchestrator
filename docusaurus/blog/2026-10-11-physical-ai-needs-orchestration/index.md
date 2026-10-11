@@ -15,7 +15,7 @@ In this post, you learn why physical AI needs agentic AI, and why agentic AI tha
 
 ![Animation of the cross-zone transport in MuJoCo. The blue west cart carries the pink parcel from stock to the amber dock. West offers custody to east, and east accepts it. Then the green east cart carries the parcel to etch, and the checker confirms the parcel at etch, owner east.](../../../examples/robotics/cross-zone-transport/images/cross-zone-transport.gif)
 
-*The animation replays the commands of a live run in the MuJoCo world of the example: the same robots, commands, and order. It leaves out the time that the agents use between the steps.*
+*The demo: two zones. The animation replays the commands of a live run in the MuJoCo world of the example: the same robots, commands, and order. It leaves out the time that the agents use between the steps. The Results section shows an extended demo with three zones.*
 
 {/* truncate */}
 
@@ -218,7 +218,7 @@ The controller only checks rules. The agents decide what to do. On 2026-10-11, w
 | --- | --- | --- |
 | The cross-zone delivery from `stock` to `etch` | 2 | Delivered to `etch`, owner `east`, with one custody handoff each |
 | `Move parcel to stock.`, with the parcel in the east zone | 1 | The supervisor found the parcel with `observe`, because the request gives no start. Delivered to `stock`, owner `west`. |
-| A third zone, `north`, and a destination in it | 1 | The supervisor found a route through two shared docks. Seven commands, two custody handoffs, delivered to `warehouse`, owner `north`. |
+| Extended demo: a third zone, `north`, and a destination in it | 1 | The supervisor found a route through two shared docks. Seven commands, two custody handoffs, delivered to `warehouse`, owner `north`. |
 | A different scene, with the zones `stores` and `assembly` | 1 | Delivered 0.004 m from `inspection`, owner `assembly` |
 | From `stock` to `dock` only | 1 | One west leg, and no custody offer. The owner stayed `west`. |
 | A destination that is not in the scene | 1 | Refused. No command to any robot. |
@@ -230,7 +230,7 @@ Across the 10 runs, custody changed 6 times, and each change followed a finished
 
 ![Animation of the three-zone route in MuJoCo. West moves the parcel to the dock, and east accepts custody. East moves the parcel to north-dock, and north accepts custody. North moves the parcel to the warehouse, and the checker confirms the parcel at the warehouse, owner north.](../../../examples/robotics/cross-zone-transport/images/three-zones.gif)
 
-*The animation replays the commands of the three-zone run in the MuJoCo world of the example: the same robots, commands, and order, without the time that the agents use between the steps.*
+*Extended demo: three zones. The request gives no route, so the supervisor finds one through two shared docks. The animation replays the commands of the three-zone run in the MuJoCo world of the example: the same robots, commands, and order, without the time that the agents use between the steps.*
 
 ## What did not go smoothly
 
