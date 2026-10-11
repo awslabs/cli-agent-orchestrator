@@ -228,17 +228,13 @@ The controller only checks rules. The agents decide what to do. On 2026-10-11, w
 
 Across the 10 runs, custody changed 6 times, and each change followed a finished move to the dock. The 3 requests that were not possible ended with no command to any robot.
 
+### Extended demo: three zones
+
+The third row of the table is the extended demo, and it shows best how the agents decide. The request names only the start and the destination. The supervisor reads the scene, and finds a route through two shared docks. Then it gives one leg to each of three zone workers, and custody changes two times:
+
 ![Animation of the three-zone route in MuJoCo. West moves the parcel to the dock, and east accepts custody. East moves the parcel to north-dock, and north accepts custody. North moves the parcel to the warehouse, and the checker confirms the parcel at the warehouse, owner north.](../../../examples/robotics/cross-zone-transport/images/three-zones.gif)
 
-*Extended demo: three zones. The request gives no route, so the supervisor finds one through two shared docks. The animation replays the commands of the three-zone run in the MuJoCo world of the example: the same robots, commands, and order, without the time that the agents use between the steps.*
-
-## What did not go smoothly
-
-The test runs found problems, and some of them are still open.
-
-- **CAO delivered the first request more than once.** In the runs of 2026-10-11, CAO logged `Delivery to <terminal> not accepted (paste dropped); re-delivering message` while Claude Code started. But the first paste had arrived, so some supervisors received the request two or three times. Each one found the command records of the first request with `observe`, and did not move the parcel again. That is criterion 5 in practice. The re-delivery itself is a CAO issue to fix.
-- **Some providers cannot keep the agents apart.** Reviews found that OpenCode keeps the MCP servers of all agents in one shared configuration. Antigravity CLI reads the MCP servers of all CAO terminals from one shared file. With these providers, an agent could use the credential of another agent. Hermes gets no MCP servers from the CAO profile, and CAO starts Cursor CLI without the instructions of the profile. `prepare` refuses these four providers.
-- **The status of an agent is not a record of the work.** `cao session status` reads the status from the terminal screen. In one run, it showed no last response after the supervisor had written its final report, because a repeated request had started a new turn. The example uses the controller state, not the status of an agent, as the record of what the robots did.
+*The animation replays the commands of this run in the MuJoCo world of the example: the same robots, commands, and order, without the time that the agents use between the steps.*
 
 ## From the simulation to real robots
 
