@@ -9,9 +9,9 @@ Robots now work in large numbers, and in mixed teams. A factory, a warehouse, or
 
 Agentic AI can take on this coordination. Agentic AI is AI that works toward a goal on its own. An AI agent uses a large language model (LLM), the type of model behind chat assistants, to read a goal in natural language. Then it plans the steps, and calls software tools that carry them out. But an agent that moves machines needs limits that a chat assistant does not need. It must act only within the authority of its team. And the proof that a step is done must come from the physical world, not from the text of another agent.
 
-Multi-agent orchestration is the coordination of several AI agents, each with its own role, so that together they do a job that no single agent should do alone. CLI Agent Orchestrator (CAO) is an open-source tool for multi-agent orchestration. It runs a team of CLI agents: AI assistants that work in a terminal, for example Claude Code or GitHub Copilot CLI. Each agent has its own role, its own tools, and its own credential, the key that sets what the agent can do. The first physical AI example of CAO, [cross-zone transport](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/robotics/cross-zone-transport), applies this model to a parcel on a simulated factory floor. A supervisor agent plans the job. Two zone workers each move only the robots of their own zone, and an independent checker verifies the result. In 10 live runs on 2026-10-11, every run ended in the expected state. Custody, the responsibility for the parcel, changed 6 times, each time after a measured arrival at the dock. The 3 requests that were not possible ended with no command to any robot.
+Multi-agent orchestration is the coordination of several AI agents, each with its own role, so that together they do a job that no single agent should do alone. CLI Agent Orchestrator (CAO) is an open-source tool for multi-agent orchestration. It runs a team of CLI agents: AI assistants that work in a terminal, for example Claude Code, Kiro CLI, or Codex. Each agent has its own role, its own tools, and its own credential, the key that sets what the agent can do.
 
-In this post, you learn why physical AI needs agentic AI, and why agentic AI that moves machines needs orchestration. You also see the five criteria that a team of agents must meet on a shared floor, and how the example meets each one with CAO. Then you see what a run looks like, and how the example maps to a real site.
+In this post, you learn why physical AI needs agentic AI, and why agentic AI that moves machines needs orchestration. The first physical AI example of CAO, [cross-zone transport](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/robotics/cross-zone-transport), applies CAO to a parcel on a simulated factory floor. A supervisor agent plans the job. Two zone workers each move only the robots of their own zone, and an independent checker verifies the result. In 10 live runs on 2026-10-11, every run ended in the expected state. Custody, the responsibility for the parcel, changed 6 times, each time after a measured arrival at the dock. The 3 requests that were not possible ended with no command to any robot. You also see the five criteria that a team of agents must meet on a shared floor, and how the example meets each one with CAO. Then you see what a run looks like, and how the example maps to a real site.
 
 {/* truncate */}
 
@@ -53,7 +53,7 @@ A local process, the **controller** (`demo.py serve`), runs the MuJoCo world. Th
 
 ### What is CAO
 
-[CLI Agent Orchestrator](https://github.com/awslabs/cli-agent-orchestrator) (CAO) is an open-source project of AWS Labs. It turns CLI agents, for example Claude Code, GitHub Copilot CLI, Kiro CLI, and Codex, into a team. CAO calls each of these CLIs a provider. Each agent runs in its own terminal, in [tmux](https://github.com/tmux/tmux/wiki), a tool that keeps many terminal sessions open side by side. Each agent also has an [agent profile](/docs/features/profiles): a file that sets its instructions, its MCP servers, and its tool allowlist, which is the list of tools that the agent can use.
+[CLI Agent Orchestrator](https://github.com/awslabs/cli-agent-orchestrator) (CAO) is an open-source project of AWS Labs. It turns CLI agents, for example Claude Code, Kiro CLI, and Codex, into a team. CAO calls each of these CLIs a provider. Each agent runs in its own terminal, in [tmux](https://github.com/tmux/tmux/wiki), a tool that keeps many terminal sessions open side by side. Each agent also has an [agent profile](/docs/features/profiles): a file that sets its instructions, its MCP servers, and its tool allowlist, which is the list of tools that the agent can use.
 
 A supervisor is an agent that divides a job and gives the parts to other agents, the workers. It uses three CAO tools:
 
@@ -283,7 +283,7 @@ The AWS Physical AI Toolchain announcement makes a similar point about the cloud
 
 - CAO 2.5.3 or later. The latest `main` is better.
 - tmux 3.3 or later, and [uv](https://docs.astral.sh/uv/), a Python package manager, on macOS or Linux.
-- A provider CLI that you have signed in to, for example Claude Code or GitHub Copilot CLI.
+- A provider CLI that you have signed in to, for example Claude Code, Kiro CLI, or Codex. Claude Code and Kiro CLI enforce the tool allowlist of each agent. Codex does not, so `prepare` prints a warning for it: use it only for a trusted local demo.
 - No GPU, no display, and no robot hardware.
 - **Time to complete:** approximately 20 minutes. The agents work for 3 to 5 of them.
 - **Estimated cost:** the example creates no AWS resources. The cost is the model usage of your provider CLI, for four agents during a few minutes.
