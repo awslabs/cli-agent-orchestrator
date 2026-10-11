@@ -11,7 +11,7 @@ Agentic AI can take on this coordination. Agentic AI is AI that works toward a g
 
 Multi-agent orchestration is the coordination of several AI agents, each with its own role, so that together they do a job that no single agent should do alone. CLI Agent Orchestrator (CAO) is an open-source tool for multi-agent orchestration. It runs a team of CLI agents: AI assistants that work in a terminal, for example Claude Code, Kiro CLI, or Codex. Each agent has its own role, its own tools, and its own credential, the key that sets what the agent can do.
 
-In this post, you learn why physical AI needs agentic AI, and why agentic AI that moves machines needs orchestration. The first physical AI example of CAO, [cross-zone transport](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/robotics/cross-zone-transport), applies CAO to a parcel on a simulated factory floor. A supervisor agent plans the job. Two zone worker agents each move only the robots of their own zone, and an independent checker agent verifies the result. In 10 live runs on 2026-10-11, every run ended in the expected state. Custody, the responsibility for the parcel, changed 6 times, each time after a measured arrival at the dock. The 3 requests that were not possible ended with no command to any robot. You also see the five criteria that a team of agents must meet on a shared floor, and how the example meets each one with CAO. Then you see what a run looks like, and how the example maps to a real site.
+In this post, you learn why physical AI needs agentic AI, and why agentic AI that moves machines needs orchestration. The first physical AI example of CAO, [cross-zone transport](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/robotics/cross-zone-transport), applies CAO to a parcel on a simulated factory floor. A supervisor agent plans the job. Two zone worker agents each move only the robots of their own zone, and an independent checker agent verifies the result. In 10 live runs, every run ended in the expected state. Custody is the responsibility for the parcel. Exactly one zone has custody at a time, so it is always clear which team must act on the parcel, and no item is lost between two teams. Custody changed 6 times, and each time only after the simulator measured the parcel at the dock. The 3 requests that were not possible ended with no command to any robot. You also see the five criteria that a team of agents must meet on a shared floor, and how the example meets each one with CAO. Then you see what a run looks like, and how the example maps to a real site.
 
 ![Animation of the cross-zone transport in MuJoCo. The blue west cart carries the pink parcel from stock to the amber dock. West offers custody to east, and east accepts it. Then the green east cart carries the parcel to etch, and the checker confirms the parcel at etch, owner east.](../../../examples/robotics/cross-zone-transport/images/cross-zone-transport.gif)
 
@@ -19,7 +19,7 @@ In this post, you learn why physical AI needs agentic AI, and why agentic AI tha
 
 {/* truncate */}
 
-The runs in this post used CAO `2.5.3` from `main` (commit `88f3af0c`) with the `claude_code` provider, on 2026-10-11. CAO 2.5.3 is the first release with the permission fix for workflow delegation that the example uses.
+The runs in this post used CAO `2.5.3` from `main` (commit `88f3af0c`) with the `claude_code` provider. CAO 2.5.3 is the first release with the permission fix for workflow delegation that the example uses.
 
 ## Background
 
@@ -27,7 +27,7 @@ The runs in this post used CAO `2.5.3` from `main` (commit `88f3af0c`) with the 
 
 Physical AI is AI that acts in the physical world. It does not stop at text or images. It senses its surroundings, decides what to do, and moves a machine: for example, a robot arm, a mobile cart, or a self-driving car. AWS [defines](https://aws.amazon.com/blogs/physical-ai/physical-ai-building-the-next-foundation-in-autonomous-intelligence/) physical AI as "a system of hardware and software that integrates perceiving, understanding, reasoning, and learning to interact with the physical world."
 
-Two reports from 2026 show the trend. First, the machines are already in place. The International Federation of Robotics (IFR) [reports](https://ifr.org/ifr-press-releases/news/five-million-robots-now-operate-in-factories-globally) that "the global operational stock of industrial robots surged 9% to a record 5 million units in 2025." Factories installed more than 600,000 new units in that year. Second, interest is high, but operation at scale is rare. A [Capgemini Research Institute survey](https://www.capgemini.com/us-en/news/press-releases/two-thirds-of-organizations-rate-physical-ai-as-a-high-priority-for-the-next-three-to-five-years/) of 1,678 executives found that "79% of organizations are already engaging with physical AI", but "only 4% say they are already operating at scale." Most organizations have the robots and the interest. What they do not have yet is a way to run physical AI at scale.
+Today, industry already uses robots at a large scale, and physical AI is becoming a top priority, but few organizations run it at scale yet. Two reports from 2026 show this status and trend. The International Federation of Robotics (IFR) [reports](https://ifr.org/ifr-press-releases/news/five-million-robots-now-operate-in-factories-globally) that "the global operational stock of industrial robots surged 9% to a record 5 million units in 2025." Factories installed more than 600,000 new units in that year. A [Capgemini Research Institute survey](https://www.capgemini.com/us-en/news/press-releases/two-thirds-of-organizations-rate-physical-ai-as-a-high-priority-for-the-next-three-to-five-years/) of 1,678 executives found that "two-thirds of organizations now rank physical AI as a high priority in their automation agenda." The same survey found that "79% of organizations are already engaging with physical AI", but "only 4% say they are already operating at scale." So the robots and the interest are in place. The next step for the industry is to run physical AI at scale.
 
 ### Why physical AI needs agentic AI
 
@@ -41,7 +41,9 @@ Agentic AI adds reasoning at the level of the goal, above the policies. IFR name
 - **Feedback from the floor.** After each step, the agent reads the state of the robots. If the state is not as expected, the agent changes the plan or stops.
 - **Work split across teams.** An agent can split a job into tasks and give each task to the team that owns the robots for that task.
 
-But an agent that moves machines raises the stakes. A language model alone does not know the physical state, and a wrong step moves real equipment. So the question is not only whether an agent can plan a robot job. The question is how a team of agents can share the job safely. Who plans, and who acts? What can each agent touch, and what counts as proof? That is the work of orchestration.
+An agent that moves machines must also be safe. A language model does not see the physical world by itself, and a wrong step moves real equipment. So each agent needs clear limits on what it can do, and proof from the physical world that a step is done. [Understanding the challenge](#understanding-the-challenge) explains these limits, and how orchestration sets them.
+
+**In conclusion:** policies give robots their skills, and agentic AI decides how to use these skills for a goal. With agentic AI, a site can take on a new job without new code for each job. That is why physical AI needs agentic AI.
 
 ### What is MuJoCo
 
@@ -79,16 +81,20 @@ Moving a parcel from one zone to another looks like one task. On a real site, it
 4. **Independent verification.** A party that did not do the work must check the result, from fresh measurements.
 5. **Fail safe.** When a step fails, or when its result is not certain, the team must stop and report the last confirmed state. It must not guess, and it must not repeat the step blindly.
 
-On a real site, each area has a fleet control: the software that sends orders to the robots of the area and tracks their state. Real sites meet the same criteria today, mostly with integration work and people:
+These criteria are not new. Real sites already need them, but today they meet them mostly with custom integration work and with people. Each area of a site has a fleet control: the software that sends orders to the robots of the area and tracks their state. Standards connect a fleet control to its robots, but they leave the work between areas to the site:
 
-- **Planning and authority stay with the site.** [VDA 5050](https://github.com/VDA5050/VDA5050), a standard of the German automotive and machinery associations VDA and VDMA, defines the interface between a fleet control and its mobile robots, "to enable the coordinated operation of heterogeneous mobile robot fleets from different manufacturers within a shared physical environment." But it "does not allocate responsibilities among operators, system integrators, vehicle manufacturers, or fleet control providers", and it does not include traffic management logic. MassRobotics, a non-profit robotics hub, also [notes](https://www.massrobotics.org/what-is-the-massrobotics-amr-interoperability-standard/) that its interoperability standard for autonomous mobile robots (AMRs) is not a fleet management, vehicle navigation, or safety system. The [book of Open-RMF](https://osrf.github.io/ros2multirobotbook/intro.html), the Open Robotics Middleware Framework, sums it up: "multi-vendor, multi-robot systems remain an open problem, and we expect that multi-vendor robot deployments will be the norm in all large buildings in the future."
-- **Transfers depend on confirmation.** In a semiconductor factory, a transport vehicle and a production tool use the signals of [SEMI E84](https://www.peergroup.com/definition-of-standard/semi-e84/), a standard of the semiconductor industry association SEMI: "a series of optical signals are exchanged to confirm the tool is ready for carrier delivery or removal, then to track handoff progress and completion."
-- **Checks are separate from the work.** The [AI Risk Management Framework](https://doi.org/10.6028/NIST.AI.100-1) of the US National Institute of Standards and Technology (NIST) recommends a similar split for the people who work on AI systems, with "those building and using the models separated from those verifying and validating the models."
-- **Failures leave a changed world.** The [AWS Physical AI Toolchain](https://aws.amazon.com/blogs/physical-ai/introducing-aws-physical-ai-toolchain/) announcement says it directly: "A failed robot restarts into a physical world that has already changed."
+- **Plan across owners, and least authority.** [VDA 5050](https://github.com/VDA5050/VDA5050) connects a fleet control to mobile robots of different makers. But it "does not allocate responsibilities among operators, system integrators, vehicle manufacturers, or fleet control providers." Each site must decide who plans and who controls each robot.
+- **Custody on evidence.** In a semiconductor factory, the [SEMI E84](https://www.peergroup.com/definition-of-standard/semi-e84/) signals confirm that a production tool is ready before a vehicle hands over a carrier. They also confirm when the handoff is complete.
+- **Independent verification.** The [AI Risk Management Framework](https://doi.org/10.6028/NIST.AI.100-1) of the US National Institute of Standards and Technology (NIST) recommends that the people who verify a model are not the people who build it.
+- **Fail safe.** The [AWS Physical AI Toolchain](https://aws.amazon.com/blogs/physical-ai/introducing-aws-physical-ai-toolchain/) announcement notes: "A failed robot restarts into a physical world that has already changed."
+
+**In summary:** the hard part of moving an item across zones is not the motion. It is the coordination between the owners of the zones. The job needs one plan across the zones, a strict limit on what each team can do, a handoff only on physical evidence, a check by a party that did not do the work, and a safe stop when a step fails. Today, each site builds this coordination with custom integration work and with people. A team of AI agents can do this work, but only if the team meets the same five criteria.
 
 ### Why a multi-agent architecture is needed
 
-A shared floor already works as a team of specialists. Each robot team knows its own area. A supervisor plans the work across the areas, and an inspector checks the result. A multi-agent architecture brings the same organization to AI agents. Each agent has one role, its own instructions and tools, and its own credential. Security guidance and research point to five benefits.
+One agent with all the roles and all the credentials cannot meet the five criteria: it can move any robot, and it checks its own work. A multi-agent architecture gives each role to its own agent, so each agent has only the authority of its role, and a different agent checks the result.
+
+A shared floor already works this way, as a team of specialists. Each robot team knows its own area. A supervisor plans the work across the areas, and an inspector checks the result. A multi-agent architecture brings the same organization to AI agents. Each agent has one role, its own instructions and tools, and its own credential. Security guidance and research point to five benefits.
 
 **Each agent specializes in its own task.** A person who does one job every day becomes good at it. An agent with one role works the same way: it gets the instructions, the tools, and the context for that role, and nothing else. In the example, the zone worker profile is about one zone and its robots, and the checker profile is about verification only.
 
@@ -127,7 +133,7 @@ The solid arrows from the supervisor agent are CAO handoffs, and the dotted arro
 
 ### Key benefits
 
-Each criterion maps to one mechanism, and each mechanism has one enforcer:
+The solution meets each of the five criteria from [Understanding the challenge](#understanding-the-challenge). For each criterion, the table shows how the example meets it, and which part enforces it. The enforcer matters. Most rules are enforced outside the agents: the controller and CAO reject a call that breaks a rule, whatever the prompt says. Only the plan and part of the fail-safe behavior depend on the instructions in the agent profiles.
 
 | Criterion | How the example meets it | Enforced by |
 | --- | --- | --- |
@@ -155,11 +161,16 @@ The scope of a credential is the set of tools that it can call. The controller c
 | `move`, `offer_handoff`, `accept_handoff` | `act`, in the zone of the caller | Zone workers |
 | `stop_simulation` | `operate` | The operator, with `demo.py stop` |
 
-If the west zone worker asks to move `cart-east`, the controller rejects the call with `not_robot_owner`. The worker and checker profiles grant only `@transport-sim`, not `@cao-mcp-server`. CAO checks the grant of the caller before it runs a delegation tool, so a worker that tries `assign` gets this result:
+Two layers enforce least authority outside the model, so a prompt cannot talk an agent past its limits:
 
-```text
+- **Robots.** The controller checks the zone of the caller. If the west zone worker asks to move `cart-east`, the controller rejects the call with `not_robot_owner`.
+- **Delegation.** Only the supervisor can start other agents. The worker and checker profiles grant only `@transport-sim`, not `@cao-mcp-server`, which holds the CAO delegation tools. CAO checks this grant before it runs a delegation tool, so a worker that tries `assign` gets this result:
+
+```bash
 'assign' is not permitted: the calling terminal's allowed tools do not include '@cao-mcp-server'
 ```
+
+Without the second layer, a worker could start an agent outside the plan of the supervisor, or the checker could give its check to another agent.
 
 The supervisor uses `handoff`, not `assign`. In this job, the east zone worker can accept custody only after the west zone worker offers it at the dock. The checker can check only after the last leg. Parallel work gives no benefit here.
 
@@ -167,7 +178,7 @@ The supervisor uses `handoff`, not `assign`. In this job, the east zone worker c
 
 ## What a run looks like
 
-A run takes approximately 3 to 5 minutes. The controller writes one line for each tool call, with the agent that made the call. A call to `move`, `offer_handoff`, or `accept_handoff` creates a command with an ID that the agent chooses. The controller also writes one line for each status change of a command: `accepted`, `running`, and then `finished`, or `rejected` with a reason. This excerpt shows the agent and command lines of the log of a run on 2026-10-11, without the times and the run ID. The controller also writes HTTP lines and MCP library lines between them:
+A run takes approximately 3 to 5 minutes. The controller writes one line for each tool call, with the agent that made the call. A call to `move`, `offer_handoff`, or `accept_handoff` creates a command with an ID that the agent chooses. The controller also writes one line for each status change of a command: `accepted`, `running`, and then `finished`, or `rejected` with a reason. This excerpt shows the agent and command lines of the log of one run, without the times and the run ID. The controller also writes HTTP lines and MCP library lines between them:
 
 ```bash
 transport supervisor called observe()
@@ -218,7 +229,7 @@ The supervisor profile asks for that last sentence in every report. Kinematic me
 
 ## Results
 
-The controller only checks rules. The agents decide what to do. On 2026-10-11, we ran the example 10 times with Claude Code agents, with nine different requests and scenes. Every run ended in the expected state:
+The controller only checks rules. The agents decide what to do. We ran the example 10 times with Claude Code agents, with nine different requests and scenes. Every run ended in the expected state:
 
 | Request or scene | Runs | What the agents did |
 | --- | --- | --- |
@@ -258,6 +269,12 @@ In each example, a handoff is complete only when the systems confirm it. A messa
 
 ### How the parts of the example map to a real site
 
+The CAO agents and their tools stay the same. Only the MCP server behind `transport-sim` changes, and the parts below it:
+
+![The parts of the example and of a real site. At the top, the CAO agents, the same on both sides: the supervisor agent, the zone worker agents, and the checker agent, with one credential for each agent. In this example, the agents call observe, move, offer_handoff, and accept_handoff on the transport-sim MCP server, the MuJoCo controller, which runs the simulated floor with the zones, the carts, and the shared dock. On a real site, the agents call the same tools on a new transport-sim MCP server. It sends transport orders, with one access key for each area, to the fleet control of each area, for example with VDA 5050 orders. The fleet control drives the real floor: robots, sensors, and transfer points, for example with SEMI E84 signals.](./real-site.svg)
+
+The table shows each part in detail:
+
 | In this example | On a real site |
 | --- | --- |
 | The MuJoCo world in the controller | The real floor. The robots and the sensors measure the positions. |
@@ -268,7 +285,7 @@ In each example, a handoff is complete only when the systems confirm it. A messa
 | The credential of each agent | A separate access key for the fleet control of each area |
 | `demo.py stop` | A stop request in software. It does not replace the emergency stop and the safety system of the robots. |
 
-The CAO parts can stay the same. These parts are the supervisor, the zone workers, the checker, `handoff`, the agent profiles, and the tool allowlists. Only the MCP server behind `transport-sim` changes. Instead of the MuJoCo world, it calls the fleet control of each area. MCP servers that connect agents to robots exist. For example, [ROS-MCP-Server](https://github.com/robotmcp/ros-mcp-server), for robots that use the Robot Operating System (ROS), "connects large language models (such as Claude, GPT, and Gemini) to robots, enabling bidirectional communication with no changes to existing robot source code." The example does not include such a server.
+On the CAO side, the agent profiles, the tool allowlists, and `handoff` stay the same too. To build the new MCP server, you do not start from nothing: MCP servers that connect agents to robots exist. For example, [ROS-MCP-Server](https://github.com/robotmcp/ros-mcp-server), for robots that use the Robot Operating System (ROS), "connects large language models (such as Claude, GPT, and Gemini) to robots, enabling bidirectional communication with no changes to existing robot source code." The example does not include such a server.
 
 ### What real robots need in addition
 

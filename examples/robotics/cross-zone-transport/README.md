@@ -1396,6 +1396,29 @@ robot at the dock.
 
 ### How the parts of the example map to a real site
 
+The CAO agents and their tools stay the same. Only the MCP server behind `transport-sim` changes, and the parts below it:
+
+```mermaid
+flowchart TB
+    A[["CAO agents: the same on both sides<br/>supervisor agent, zone worker agents, checker agent<br/>one credential for each agent"]]
+    subgraph REAL["On a real site"]
+        RM[("transport-sim MCP server<br/>new: calls the fleet controls")]
+        FC["Fleet control of each area<br/>for example, VDA 5050 orders"]
+        RF["Real floor: robots, sensors,<br/>and transfer points, for example<br/>SEMI E84 signals"]
+        RM -->|"transport orders,<br/>one access key for each area"| FC
+        FC -->|"orders,<br/>reported state"| RF
+    end
+    subgraph SIM["In this example"]
+        SM[("transport-sim MCP server<br/>MuJoCo controller, demo.py serve")]
+        SF["Simulated floor<br/>zones, carts, and the shared dock"]
+        SM -->|"simulated moves,<br/>measured positions"| SF
+    end
+    A -->|"observe, move,<br/>offer_handoff, accept_handoff"| SM
+    A -->|"the same tools"| RM
+```
+
+The table shows each part in detail:
+
 | In this example | On a real site |
 | --- | --- |
 | The MuJoCo world in the controller | The real floor. The robots and the sensors measure the positions. |
@@ -1406,11 +1429,9 @@ robot at the dock.
 | The credential of each agent | A separate access key for the fleet control of each area |
 | `demo.py stop` | A stop request in software. It does not replace the emergency stop and the safety system of the robots. |
 
-The CAO parts can stay the same. These parts are the CAO supervisor, the zone
-workers, the checker, `handoff`, the agent profiles, and the tool allowlists. Only the MCP
-server behind `transport-sim` changes. Instead of the MuJoCo world, it calls
-the fleet control of each area. MCP servers that connect AI agents to robots
-exist, for example
+On the CAO side, the agent profiles, the tool allowlists, and `handoff` stay
+the same too. To build the new MCP server, you do not start from nothing: MCP
+servers that connect AI agents to robots exist, for example
 [ROS-MCP-Server](https://github.com/robotmcp/ros-mcp-server) for robots that
 use ROS. This example does not include such a server.
 
