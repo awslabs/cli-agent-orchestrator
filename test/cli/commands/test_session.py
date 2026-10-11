@@ -256,7 +256,9 @@ class TestStatus:
         }
         output_resp = MagicMock(status_code=200)
         output_resp.json.return_value = {"output": None}
-        mock_get.side_effect = [terminals_resp, terminal_resp, output_resp]
+        worker_resp = MagicMock(status_code=200)
+        worker_resp.json.return_value = terminals_resp.json.return_value[1]
+        mock_get.side_effect = [terminals_resp, terminal_resp, worker_resp, output_resp]
 
         result = runner.invoke(session, ["status", "cao-test", "--workers"])
 
@@ -288,7 +290,9 @@ class TestStatus:
         terminal_resp.json.return_value = terminals_resp.json.return_value[0]
         output_resp = MagicMock(status_code=200)
         output_resp.json.return_value = {"output": None}
-        mock_get.side_effect = [terminals_resp, terminal_resp, output_resp]
+        worker_resp = MagicMock(status_code=200)
+        worker_resp.json.return_value = terminals_resp.json.return_value[1]
+        mock_get.side_effect = [terminals_resp, terminal_resp, worker_resp, output_resp]
 
         result = runner.invoke(session, ["status", "cao-test", "--workers"])
 
@@ -378,7 +382,9 @@ class TestStatus:
         }
         output_resp = MagicMock(status_code=200)
         output_resp.json.return_value = {"output": None}
-        mock_get.side_effect = [terminals_resp, terminal_resp, output_resp]
+        worker_resp = MagicMock(status_code=200)
+        worker_resp.json.return_value = terminals_resp.json.return_value[1]
+        mock_get.side_effect = [terminals_resp, terminal_resp, worker_resp, output_resp]
 
         result = runner.invoke(session, ["status", "cao-test", "--workers", "--json"])
 
@@ -386,6 +392,24 @@ class TestStatus:
         data = __import__("json").loads(result.output)
         assert "workers" in data
         assert data["workers"][0]["id"] == "work5678"
+
+    @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
+    @pytest.mark.parametrize("status_code", [404, 503])
+    def test_status_worker_detail_error(self, mock_get, runner, status_code):
+        """Missing/unavailable worker details must not look like a successful read."""
+        terminals_resp = MagicMock()
+        terminals_resp.json.return_value = [{"id": "cond1234"}, {"id": "work5678"}]
+        conductor_resp = MagicMock()
+        conductor_resp.json.return_value = {"id": "cond1234", "status": "idle"}
+        worker_resp = MagicMock()
+        worker_resp.raise_for_status.side_effect = requests.exceptions.HTTPError(str(status_code))
+        mock_get.side_effect = [terminals_resp, conductor_resp, worker_resp]
+
+        result = runner.invoke(session, ["status", "cao-test", "--workers", "--json"])
+
+        assert result.exit_code != 0
+        assert str(status_code) in result.output
+        assert '"workers"' not in result.output
 
     @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
     def test_status_no_workers(self, mock_get, runner):

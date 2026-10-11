@@ -82,7 +82,11 @@ COPILOT_STATUS_BAR_PATTERN = r"^\s*(?:autopilot|plan|interactive)\s*[·•]"
 # token/model info moved to the status bar in v1.0.31, leaving only the path.
 # Path can be tilde-prefixed (home) or absolute (e.g. /tmp/...), so allow both.
 COPILOT_CWD_BREADCRUMB_PATTERN = r"^\s+(?:~|/)[^\[]*\["
-COPILOT_HINT_BAR_PATTERN = r"^←.*[·•]\s*/ commands\b"
+COPILOT_HINT_BAR_PATTERN = (
+    r"^(?:v\d+\.\d+\.\d+(?:-[0-9a-z.-]+)? downloaded\s*[·•]\s*"
+    r"next launch or /restart\s*[·•]\s*)?"
+    r"←.*[·•]\s*/ commands\b"
+)
 COPILOT_AGENT_MODEL_BAR_PATTERN = r"^(?:[\w.-]+\s*[·•]\s*)?github copilot\s*[·•]"
 COPILOT_BUSY_ROW_PATTERN = r"\besc (?:to cancel|interrupt)\b"
 COPILOT_COLUMN_GAP_PATTERN = r"\S\s{3,}\S"
