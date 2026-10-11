@@ -139,6 +139,9 @@ class StatusMonitor:
         # sentinel is indistinguishable from a genuine reading and could rate-limit the
         # very first check before it ever runs.
         self._last_stale_capture_check: Dict[str, Optional[float]] = {}
+        # A quiet ready candidate needs a second read within its TTL even
+        # when the only caller is the slower inbox reconciliation sweep.
+        self._stale_capture_handle: Dict[str, asyncio.TimerHandle] = {}
         # Per-terminal monotonic timestamp of the last time _process_chunk actually
         # appended a chunk (i.e. the buffer changed) — the STALE_PROCESSING_BUFFER_QUIET_S
         # quiet gate reads this. Same None-vs-0.0 sentinel rule as above.
@@ -310,9 +313,11 @@ class StatusMonitor:
             self._output_generation[terminal_id] = self._output_generation.get(terminal_id, 0) + 1
             self._pending_stale_capture.pop(terminal_id, None)
             self._confirmed_stale_capture_commit.pop(terminal_id, None)
+            capture_handle = self._stale_capture_handle.pop(terminal_id, None)
             if use_screen:
                 self._feed_screen_locked(terminal_id, chunk)
 
+        self._cancel_quiesce_handle(capture_handle)
         if not use_screen:
             # Debounced raw detection: same rising-edge + quiescence pattern as
             # the pyte path.  Detects immediately on the first chunk after quiet
@@ -908,6 +913,7 @@ class StatusMonitor:
             self._pending_stale_capture.pop(terminal_id, None)
             self._confirmed_stale_capture_commit.pop(terminal_id, None)
             self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
+            capture_handle = self._stale_capture_handle.pop(terminal_id, None)
             # ``_idle_from_completed`` is deliberately NOT cleared here. The marker
             # says the current IDLE is a previous COMPLETED with its box scrolled
             # off, and arming does not change what is on screen. Clearing it on
@@ -918,6 +924,7 @@ class StatusMonitor:
             # confirmed a task that never ran. Any stamped transition still
             # clears it, and a post-init IDLE never carries it, so a fresh
             # worker's first IDLE -> COMPLETED is still earned.
+        self._cancel_quiesce_handle(capture_handle)
         if assume_processing:
             # Optimistic dispatch latch only; this is not provider evidence and
             # must not authorize stale-pane recovery for the new generation.
@@ -984,7 +991,9 @@ class StatusMonitor:
             self._status_generation.pop(terminal_id, None)
             self._idle_from_completed.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
+            capture_handle = self._stale_capture_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
+        self._cancel_quiesce_handle(capture_handle)
 
     def reset_buffer(self, terminal_id: str) -> None:
         """Clear the rolling buffer + last-known status WITHOUT forgetting the
@@ -1015,7 +1024,9 @@ class StatusMonitor:
             self._status_generation.pop(terminal_id, None)
             self._idle_from_completed.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
+            capture_handle = self._stale_capture_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
+        self._cancel_quiesce_handle(capture_handle)
 
     def get_status(self, terminal_id: str) -> TerminalStatus:
         """Get current terminal status — the single source of truth for both backends.
@@ -1414,8 +1425,77 @@ class StatusMonitor:
                 f"_fresh_capture_pane_status [{terminal_id}]: candidate {detected.value} "
                 "recorded, awaiting a second confirming read before honoring it"
             )
+            if detected in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
+                self._schedule_stale_capture_confirmation(terminal_id, generation)
             return None
         return detected
+
+    def _schedule_stale_capture_confirmation(self, terminal_id: str, generation: int) -> None:
+        """Arrange one normal status re-check, without relying on poll cadence.
+
+        The follow-up uses get_status's quiet, rate, evidence, two-read and
+        apply-time generation gates. Never hold a worker or the loop asleep.
+        """
+        loop = self._loop or self._running_loop()
+        if loop is None:
+            return
+
+        def arm() -> None:
+            with self._lock:
+                pending = self._pending_stale_capture.get(terminal_id)
+                if (
+                    self._capture_generation.get(terminal_id, 0) != generation
+                    or pending is None
+                    or pending[2] != generation
+                    or pending[0] not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
+                    or self._last_status.get(terminal_id)
+                    not in (TerminalStatus.PROCESSING, TerminalStatus.WAITING_USER_ANSWER)
+                    or terminal_id in self._stale_capture_handle
+                ):
+                    return
+                self._loop = loop
+                handle = loop.call_later(
+                    STALE_PROCESSING_CAPTURE_INTERVAL_S,
+                    lambda: self._on_stale_capture_confirmation(terminal_id, generation, handle),
+                )
+                self._stale_capture_handle[terminal_id] = handle
+
+        try:
+            loop.call_soon_threadsafe(arm)
+        except RuntimeError:
+            pass  # The server loop is shutting down.
+
+    def _on_stale_capture_confirmation(
+        self, terminal_id: str, generation: int, handle: asyncio.TimerHandle
+    ) -> None:
+        with self._lock:
+            if self._stale_capture_handle.get(terminal_id) is not handle:
+                return
+            self._stale_capture_handle.pop(terminal_id, None)
+
+        async def confirm() -> None:
+            # An already queued callback can outlive cancellation. Check again
+            # before forking; get_status also validates any in-flight capture.
+            with self._lock:
+                pending = self._pending_stale_capture.get(terminal_id)
+                if (
+                    self._capture_generation.get(terminal_id, 0) != generation
+                    or pending is None
+                    or pending[2] != generation
+                ):
+                    return
+            try:
+                await asyncio.to_thread(self.get_status, terminal_id)
+                # A concurrent poll can consume the rate-limit slot just
+                # before this callback. Keep one follow-up while a current
+                # ready candidate still awaits confirmation.
+                self._schedule_stale_capture_confirmation(terminal_id, generation)
+            except Exception:
+                logger.exception("Stale capture confirmation failed for %s", terminal_id)
+
+        loop = self._loop or self._running_loop()
+        if loop is not None:
+            self._spawn_tracked(loop, confirm())
 
     def get_buffer(self, terminal_id: str) -> str:
         """Get accumulated output buffer for a terminal."""

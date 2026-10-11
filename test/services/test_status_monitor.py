@@ -1656,6 +1656,40 @@ class TestStatusObservationIsStampedWhenEarned:
 
 
 class TestCopilotBoxedComposerRecovery:
+    def test_cancelled_confirmation_cannot_remove_a_new_turn_timer(self):
+        sm = StatusMonitor()
+        old_handle = MagicMock()
+        current_handle = MagicMock()
+        sm._stale_capture_handle["t1"] = current_handle
+        sm._capture_generation["t1"] = 2
+        sm._pending_stale_capture["t1"] = (TerminalStatus.IDLE, 100.0, 2)
+        sm._on_stale_capture_confirmation("t1", 1, old_handle)
+        assert sm._stale_capture_handle["t1"] is current_handle
+        assert not sm._detect_tasks
+
+    @pytest.mark.parametrize(
+        "cached", [TerminalStatus.PROCESSING, TerminalStatus.WAITING_USER_ANSWER]
+    )
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_unearned_new_turn_never_schedules_a_capture(self, mock_pm, mock_backend, cached):
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+
+        provider = CopilotCliProvider("t1", "s", "w")
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        mock_backend.return_value = backend
+        sm = StatusMonitor()
+        sm._last_status["t1"] = cached
+        sm._processing_generation["t1"] = 0
+        sm._waiting_generation["t1"] = 0
+        sm._buffer_changed_at["t1"] = -1000
+        sm.notify_input_sent("t1")
+        with patch.object(sm, "_schedule_stale_capture_confirmation") as schedule:
+            assert sm.get_status("t1") == cached
+        backend.get_history.assert_not_called()
+        schedule.assert_not_called()
+
     @pytest.mark.parametrize("layout", ["prompt", "box"])
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
