@@ -7,6 +7,10 @@ description: "Robot fleets now span many owners and vendors. This post explains 
 
 Robots now work in mixed teams: each area of a factory, a warehouse, or a laboratory has its own robot team. When an item crosses from one area to the next, the hard part is the coordination, not the motion. Someone must plan the route, pass the responsibility for the item to the next team, and confirm that the job is done. Each site builds this coordination itself, and the work grows with the fleets.
 
+![Animation of the cross-zone transport in MuJoCo. The blue west cart carries the pink parcel from stock to the amber dock. West offers custody to east, and east accepts it. Then the green east cart carries the parcel to etch, and the checker confirms the parcel at etch, owner east.](../../../examples/robotics/cross-zone-transport/images/cross-zone-transport.gif)
+
+*The animation replays the commands of a live run in the MuJoCo world of the example: the same robots, commands, and order. It leaves out the time that the agents use between the steps.*
+
 Agentic AI can take on this coordination. Agentic AI is AI that works toward a goal on its own. An AI agent uses a large language model (LLM), the type of model behind chat assistants, to read a goal in natural language. Then it plans the steps, and calls software tools that carry them out. But an agent that moves machines needs limits that a chat assistant does not need. It must act only within the authority of its team. And the proof that a step is done must come from the physical world, not from the text of another agent.
 
 Multi-agent orchestration is the coordination of several AI agents, each with its own role, so that together they do a job that no single agent should do alone. CLI Agent Orchestrator (CAO) is an open-source tool for multi-agent orchestration. It runs a team of CLI agents: AI assistants that work in a terminal, for example Claude Code, Kiro CLI, or Codex. Each agent has its own role, its own tools, and its own credential, the key that sets what the agent can do.
@@ -185,13 +189,6 @@ The controller can also save pictures of the MuJoCo world, with `demo.py serve -
 | --- | --- | --- |
 | ![The blue west cart carries the pink parcel from stock toward the amber dock.](../../../examples/robotics/cross-zone-transport/images/run-2-west-leg.png) | ![The parcel is at the dock, above the two carts. West offers custody to east, and east accepts.](../../../examples/robotics/cross-zone-transport/images/run-3-dock.png) | ![The green east cart has carried the parcel to etch. The blue west cart stays at the dock.](../../../examples/robotics/cross-zone-transport/images/run-5-delivered.png) |
 
-<details>
-<summary>Animation of the run (it repeats until you close it)</summary>
-
-![Animation of the run: the blue west cart carries the pink parcel from stock to the amber dock. Then the green east cart carries the parcel from the dock to etch.](../../../examples/robotics/cross-zone-transport/images/run-animation.png)
-
-</details>
-
 The final answer of the supervisor names each worker, each leg, the custody handoff, and the evidence of the checker. This excerpt comes from the same run as the log, with the lines wrapped:
 
 ```text
@@ -231,7 +228,9 @@ The controller only checks rules. The agents decide what to do. On 2026-10-11, w
 
 Across the 10 runs, custody changed 6 times, and each change followed a finished move to the dock. The 3 requests that were not possible ended with no command to any robot.
 
-![The end of the three-zone run. The pink parcel is on the orange north cart at warehouse. The blue west cart is at the dock, and the green east cart is at north-dock.](../../../examples/robotics/cross-zone-transport/images/three-zones-delivered.png)
+![Animation of the three-zone route in MuJoCo. West moves the parcel to the dock, and east accepts custody. East moves the parcel to north-dock, and north accepts custody. North moves the parcel to the warehouse, and the checker confirms the parcel at the warehouse, owner north.](../../../examples/robotics/cross-zone-transport/images/three-zones.gif)
+
+*The animation replays the commands of the three-zone run in the MuJoCo world of the example: the same robots, commands, and order, without the time that the agents use between the steps.*
 
 ## What did not go smoothly
 

@@ -6,6 +6,12 @@ each area. You start the simulator and the agents on your laptop. Then you
 watch the agents plan the job and divide the work. The agents pass the parcel
 from one team to the other, and they check the result.
 
+![Animation of the cross-zone transport in MuJoCo. The blue west cart carries the pink parcel from stock to the amber dock. West offers custody to east, and east accepts it. Then the green east cart carries the parcel to etch, and the checker confirms the parcel at etch, owner east.](images/cross-zone-transport.gif)
+
+The animation replays the commands of a live run of this guide in the MuJoCo
+world of the example: the same robots, commands, and order. It leaves out the
+time that the agents use between the steps.
+
 ## What the exercise is about
 
 ### Areas, owners, and the job
@@ -1503,7 +1509,7 @@ This example does not supply these items:
 | `transport_checker.md` | Agent profile of the checker |
 | `site.json` | Default scene: zones `west` and `east`, parcel from `stock` to `etch` |
 | `return-site.json` | Alternative scene: zones `stores` and `assembly`, tray from `rack` to `inspection` |
-| `images/` | The pictures in [See the robots move](#see-the-robots-move) and [Demo scenarios](#demo-scenarios), from runs of this guide |
+| `images/` | The pictures in [See the robots move](#see-the-robots-move) and [Demo scenarios](#demo-scenarios), from runs of this guide. The two GIF animations replay the commands of runs of this guide. |
 | `tests/` | Simulator, MCP, recorder, and setup tests |
 
 To run the tests:
