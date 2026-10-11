@@ -755,9 +755,79 @@ class CopilotCliProvider(BaseProvider):
     def get_idle_pattern_for_log(self) -> str:
         return IDLE_PROMPT_PATTERN_LOG
 
+    @classmethod
+    def _without_completion_chrome(cls, lines: list[str]) -> list[str]:
+        """Remove observed v1.0.95 completion chrome at the composer boundary.
+
+        Keep path-like response rows and ordinary mentions of Task complete.
+        The summary is removable only as a trailing tree block after a reply,
+        anchored by the cwd/session row and a complete idle composer/footer.
+        """
+        span = cls._last_composer_span(lines)
+        if (
+            span is None
+            or not cls._has_idle_prompt_near_end(lines)
+            or not any(cls._is_hint_row(row) for row in lines[span[1] :])
+        ):
+            return lines
+        end = span[0]
+        while end and (
+            not lines[end - 1].strip() or re.fullmatch(r"[─-]{8,}", lines[end - 1].strip())
+        ):
+            end -= 1
+        if not end or not re.fullmatch(
+            r"\s+(?:/|~/).+\s{3,}Session:\s+\d+(?:\.\d+)?\s+AIC used\s*",
+            lines[end - 1],
+        ):
+            return lines
+        cwd_index = end - 1
+        omitted = {cwd_index}
+        end = cwd_index
+        while end and not lines[end - 1].strip():
+            end -= 1
+        last_user = cls._find_last_user_line(lines[:end])
+        for idx in range(end - 1, last_user, -1):
+            if lines[idx].strip() != "● Task complete":
+                continue
+            children = lines[idx + 1 : end]
+            has_reply = any(
+                re.match(ASSISTANT_PREFIX_PATTERN, row.strip(), re.IGNORECASE)
+                for row in lines[last_user + 1 : idx]
+            )
+            if children and has_reply and re.match(r"^\s{3,}└\s+\S", children[0]):
+                continuation_indent = len(children[0]) - len(children[0].lstrip()) + 2
+                if all(
+                    not row.strip() or row.startswith(" " * continuation_indent)
+                    for row in children[1:]
+                ):
+                    omitted.update(range(idx, end))
+            break
+        first_reply = next(
+            (
+                idx
+                for idx in range(last_user + 1, end)
+                if re.match(ASSISTANT_PREFIX_PATTERN, lines[idx].strip(), re.IGNORECASE)
+            ),
+            end,
+        )
+        for idx in range(last_user + 1, first_reply):
+            if not re.fullmatch(r"\s*⌄ Thought for \d+(?:\.\d+)?s\s*", lines[idx]):
+                continue
+            thought_rows = lines[idx + 1 : first_reply]
+            if (
+                first_reply < end
+                and any(row.lstrip().startswith("│") for row in thought_rows)
+                and all(not row.strip() or row.lstrip().startswith("│") for row in thought_rows)
+            ):
+                # The existing footer filter already excludes the │ thought
+                # body; exclude its heading only in this leading UI context.
+                omitted.add(idx)
+        return [row for idx, row in enumerate(lines) if idx not in omitted]
+
     def extract_last_message_from_script(self, script_output: str) -> str:
         clean_output = self._clean(script_output)
-        lines = clean_output.splitlines()
+        lines = self._without_completion_chrome(clean_output.splitlines())
+        clean_output = "\n".join(lines)
         last_user = self._find_last_user_line(lines)
 
         if last_user >= 0:

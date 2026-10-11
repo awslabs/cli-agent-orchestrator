@@ -1456,3 +1456,90 @@ class TestCopilotInitializationAfterTrustRedraw:
         ]
         assert len(captures) == 2
         assert clock["now"] < 1060
+
+
+class TestCopilotCompletionChromeExtraction:
+    hint = "← open sidebar · Autopilot · Allow All · / commands · tab next tab"
+
+    @classmethod
+    def screen(cls, reply, *, layout="prompt", summary="", cwd="/tmp/example"):
+        rule = "─" * 80
+        composer = f"{rule}\n❯\n{rule}\n" if layout == "prompt" else "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀▀▀▀▀\n"
+        return (
+            "❯ return the readiness token\n"
+            + reply
+            + "\n\n"
+            + summary
+            + f"\n {cwd}            Session: 0.51 AIC used\n"
+            + composer
+            + cls.hint
+            + "\n"
+        )
+
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
+    @pytest.mark.parametrize("cwd", ["/tmp/example", "~/example", "/tmp/example with spaces"])
+    @pytest.mark.parametrize("wrapped", [False, True])
+    @pytest.mark.parametrize("ansi", [False, True])
+    def test_completion_summary_and_cwd_are_excluded(self, layout, cwd, wrapped, ansi):
+        reply = "● CAO_READY_V1095"
+        summary = " ● Task complete\n   └ Returned the readiness token.\n"
+        if wrapped:
+            summary += "     No other work was performed.\n"
+        output = self.screen(reply, layout=layout, summary=summary, cwd=cwd)
+        if ansi:
+            output = "\x1b[32m" + output + "\x1b[0m"
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        # Preserve the existing response marker convention.
+        assert provider.extract_last_message_from_script(output) == reply
+        with patch.object(provider, "_resolve_native_status", return_value=None):
+            assert provider.get_status(output) == TerminalStatus.COMPLETED
+            assert provider.probe_stale_processing_capture(output) == TerminalStatus.COMPLETED
+
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            "● Task complete",
+            "● Task complete\n   └ This is the requested answer.",
+            "● Explain the UI:\n ● Task complete\n   └ Example summary.\nMore response content.",
+            "● Example:\n /tmp/example            Session: 0.51 AIC used\nThis is response content.",
+            "● /tmp/example            Session: 0.51 AIC used",
+            "● Answer\n ● Task complete\n   └ A detail\nAn unindented continuation.",
+        ],
+    )
+    def test_response_content_resembling_chrome_is_preserved(self, reply):
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.extract_last_message_from_script(self.screen(reply)) == reply
+
+    def test_cwd_row_is_excluded_without_a_summary(self):
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.extract_last_message_from_script(self.screen("● Answer")) == "● Answer"
+
+    def test_only_the_cwd_row_next_to_composer_is_removed(self):
+        reply = "● Directory example:\n /tmp/example            Session: 0.51 AIC used"
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.extract_last_message_from_script(self.screen(reply)) == reply
+
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
+    def test_leading_thought_heading_is_excluded_with_its_ui_block(self, layout):
+        reply = " ⌄ Thought for 1s\n │ Internal note.\n\n ● CAO_READY_V1095"
+        summary = " ● Task complete\n   └ Returned the readiness token.\n"
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert (
+            provider.extract_last_message_from_script(
+                self.screen(reply, layout=layout, summary=summary)
+            )
+            == "● CAO_READY_V1095"
+        )
+
+    def test_thought_heading_mentioned_in_a_response_is_preserved(self):
+        reply = "● UI labels:\n ⌄ Thought for 1s\nThis label reports elapsed time."
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.extract_last_message_from_script(self.screen(reply)) == reply
+
+    def test_unanchored_summary_is_preserved(self):
+        output = "❯ explain\n● Answer\n ● Task complete\n   └ Keep this text.\n"
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert (
+            provider.extract_last_message_from_script(output)
+            == "● Answer\n ● Task complete\n   └ Keep this text."
+        )
