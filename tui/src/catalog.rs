@@ -1014,7 +1014,7 @@ fn entry(id: CommandId) -> Command {
             id: CommandId::DecisionsStatus,
             parent: Some("decisions"),
             leaf_name: "status",
-            summary: "Show effective local settings; running server flags are not visible.",
+            summary: "Show effective local settings.",
             policy: Policy::Hidden, // Local operator controls have no HTTP route.
             params: &[],
             handoff_reason: None,

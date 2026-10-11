@@ -25,7 +25,10 @@ def decisions() -> None:
 
 @decisions.command()
 def status() -> None:
-    """Show effective local settings; running server flags are not visible."""
+    """Show effective local settings.
+
+    A running server's flags are not visible here; the server logs its effective states at startup.
+    """
     _run(operator.status)
 
 
