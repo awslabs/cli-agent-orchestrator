@@ -1064,8 +1064,9 @@ def _close_pipes(process: asyncio.subprocess.Process) -> None:
     process the script started that keeps writing then fills a buffer nobody
     drains, blocks on the write and never exits, and the two read fds stay open
     in the server for good. ``asyncio.subprocess.Process`` has no public close,
-    so this goes through its transport. ``returncode`` is already set on every
-    caller, and with it set ``close()`` closes the pipes without signalling.
+    so this goes through its transport. The script has already exited on every
+    caller, and ``close()`` only kills a child that ``poll()`` still reports as
+    running, so here it closes the pipes without signalling.
     """
     transport = getattr(process, "_transport", None)
     if transport is not None:
@@ -1222,9 +1223,9 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
     give the drain ``WORKFLOW_SCRIPT_TERM_GRACE`` after the exit and close pipes a
     background process still holds; (4) interpret the exit + sentinel scan. Only
     the lint gate raises, and it raises exactly one type — ``ScriptLintError`` —
-    while a run failure/timeout returns a FAILED result instead. Naming the type matters: it is the only exception a
-    caller of this function must handle, so an ``except Exception`` here would be
-    both too broad and a silent way to swallow it.
+    while a run failure/timeout returns a FAILED result instead. Naming the type
+    matters: it is the only exception a caller of this function must handle, so an
+    ``except Exception`` here would be both too broad and a silent way to swallow it.
     """
     # --- Step -1: validate the run_id key BEFORE any journal/registry/path use
     # (shared validator, mirrors base start_run at workflow_service.py:713). A
