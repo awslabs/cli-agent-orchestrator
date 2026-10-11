@@ -2253,6 +2253,66 @@ class TestKiroCli225Tui:
         with pytest.raises(ValueError):
             provider.extract_last_message_from_script(output)
 
+    # kiro-cli 2.29.0 rows, captured live on 2026-10-11: the reply bullet is
+    # orange, not the blue of 2.25. A color-anchored extractor found no reply and
+    # every handoff to a 2.29 worker failed with "No Kiro CLI assistant reply
+    # found in colored 2.25 TUI output".
+    KIRO_229_TURN = (
+        "▸ Credits: turn 0.39 • session 1.97 | Time: 4s\n"
+        "\x1b[38;2;128;128;128m•\x1b[39m \x1b[38;2;128;128;128mThought for 2s...\x1b[39m\n"
+        "    \x1b[38;2;128;128;128m╰ All three results are in, so I can clean up.\x1b[39m\n"
+        "\x1b[38;2;175;95;0m•\x1b[39m All three analyst results are in. Cleaning up.\n"
+        "\x1b[38;2;0;135;95m•\x1b[39m delete_terminal\n"
+        "    \x1b[38;2;98;98;98m╰ terminal_id=05c4d1fb\x1b[39m\n"
+        "    \x1b[38;2;98;98;98m╰ output:\x1b[39m\n"
+        '        {"success":true}\n'
+        "\x1b[38;2;128;128;128m•\x1b[39m \x1b[38;2;128;128;128mThought for 1s...\x1b[39m\n"
+        "    \x1b[38;2;128;128;128m╰ Now I can present the report.\x1b[39m\n"
+        "\x1b[38;2;175;95;0m•\x1b[39m Here is the assembled report.\n"
+        "\n"
+        "  Statistical Analysis Report\n"
+        "\n"
+        "  - Mean: 3.0\n"
+        "  - Median: 3.0\n"
+        "\x1b[38;2;128;128;128m▸\x1b[39m \x1b[38;2;128;128;128m"
+        "Credits: turn 1.01 • session 2.99 | Time: 22s\x1b[39m\n"
+    )
+
+    def test_229_reply_is_the_last_bullet_that_is_not_a_tool_or_thought_row(self):
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+
+        message = provider.extract_last_message_from_script(self.KIRO_229_TURN)
+
+        assert message.startswith("Here is the assembled report.")
+        assert "delete_terminal" not in message
+        assert "Thought for" not in message
+
+    def test_229_reply_keeps_its_lines(self):
+        """The reply of a handoff (a report template) must keep its layout."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+
+        message = provider.extract_last_message_from_script(self.KIRO_229_TURN)
+
+        assert message.splitlines() == [
+            "Here is the assembled report.",
+            "",
+            "  Statistical Analysis Report",
+            "",
+            "  - Mean: 3.0",
+            "  - Median: 3.0",
+        ]
+
+    def test_229_collapsed_thought_row_is_not_the_reply(self):
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        lines = [
+            "▸ Credits: turn 0.08 • session 0.08 | Time: 1s",
+            "• done",
+            "• Thought for 1s...",
+            "▸ Credits: turn 0.12 • session 0.20 | Time: 2s",
+        ]
+
+        assert provider._extract_tui_225_message(lines, 3) == "done"
+
     @pytest.mark.parametrize(
         "line",
         [
