@@ -7,15 +7,15 @@ description: "Robot fleets now span many owners and vendors. This post explains 
 
 Robots now work in mixed teams: each area of a factory, a warehouse, or a laboratory has its own robot team. When an item crosses from one area to the next, the hard part is the coordination, not the motion. Someone must plan the route, pass the responsibility for the item to the next team, and confirm that the job is done. Each site builds this coordination itself, and the work grows with the fleets.
 
-![Animation of the cross-zone transport in MuJoCo. The blue west cart carries the pink parcel from stock to the amber dock. West offers custody to east, and east accepts it. Then the green east cart carries the parcel to etch, and the checker confirms the parcel at etch, owner east.](../../../examples/robotics/cross-zone-transport/images/cross-zone-transport.gif)
-
-*The animation replays the commands of a live run in the MuJoCo world of the example: the same robots, commands, and order. It leaves out the time that the agents use between the steps.*
-
 Agentic AI can take on this coordination. Agentic AI is AI that works toward a goal on its own. An AI agent uses a large language model (LLM), the type of model behind chat assistants, to read a goal in natural language. Then it plans the steps, and calls software tools that carry them out. But an agent that moves machines needs limits that a chat assistant does not need. It must act only within the authority of its team. And the proof that a step is done must come from the physical world, not from the text of another agent.
 
 Multi-agent orchestration is the coordination of several AI agents, each with its own role, so that together they do a job that no single agent should do alone. CLI Agent Orchestrator (CAO) is an open-source tool for multi-agent orchestration. It runs a team of CLI agents: AI assistants that work in a terminal, for example Claude Code, Kiro CLI, or Codex. Each agent has its own role, its own tools, and its own credential, the key that sets what the agent can do.
 
 In this post, you learn why physical AI needs agentic AI, and why agentic AI that moves machines needs orchestration. The first physical AI example of CAO, [cross-zone transport](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/robotics/cross-zone-transport), applies CAO to a parcel on a simulated factory floor. A supervisor agent plans the job. Two zone workers each move only the robots of their own zone, and an independent checker verifies the result. In 10 live runs on 2026-10-11, every run ended in the expected state. Custody, the responsibility for the parcel, changed 6 times, each time after a measured arrival at the dock. The 3 requests that were not possible ended with no command to any robot. You also see the five criteria that a team of agents must meet on a shared floor, and how the example meets each one with CAO. Then you see what a run looks like, and how the example maps to a real site.
+
+![Animation of the cross-zone transport in MuJoCo. The blue west cart carries the pink parcel from stock to the amber dock. West offers custody to east, and east accepts it. Then the green east cart carries the parcel to etch, and the checker confirms the parcel at etch, owner east.](../../../examples/robotics/cross-zone-transport/images/cross-zone-transport.gif)
+
+*The animation replays the commands of a live run in the MuJoCo world of the example: the same robots, commands, and order. It leaves out the time that the agents use between the steps.*
 
 {/* truncate */}
 
