@@ -119,6 +119,10 @@ class StatusMonitor:
         # notify_input_sent() into the next turn, so the status value alone is
         # not enough to authorize stale-pane self-heal for that new turn.
         self._processing_generation: Dict[str, int] = {}
+        # Waiting evidence is also generation-bound: Copilot can dismiss trust
+        # without a raw FIFO redraw that parses ready. A new input invalidates
+        # this evidence, just as it invalidates stale PROCESSING evidence.
+        self._waiting_generation: Dict[str, int] = {}
         # Per-terminal flag: when True, the next provider-detected PROCESSING
         # is honored and stickiness reset. Set by notify_input_sent() whenever
         # external input is sent to the terminal (paste-bombed by send_input
@@ -347,6 +351,8 @@ class StatusMonitor:
                 self._processing_generation[terminal_id] = self._capture_generation.get(
                     terminal_id, 0
                 )
+            if detected == TerminalStatus.WAITING_USER_ANSWER:
+                self._waiting_generation[terminal_id] = self._capture_generation.get(terminal_id, 0)
             changed = self._apply_detection_locked(terminal_id, detected)
             if (
                 not changed
@@ -964,6 +970,7 @@ class StatusMonitor:
             self._buffer_epochs.pop(terminal_id, None)
             self._last_status.pop(terminal_id, None)
             self._processing_generation.pop(terminal_id, None)
+            self._waiting_generation.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
             self._midburst_probe_at.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
@@ -992,6 +999,7 @@ class StatusMonitor:
             self._buffers[terminal_id] = ""
             self._last_status.pop(terminal_id, None)
             self._processing_generation.pop(terminal_id, None)
+            self._waiting_generation.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
             self._midburst_probe_at.pop(terminal_id, None)
             # Drop the rendered screen too so the relaunched CLI mode is
@@ -1080,7 +1088,11 @@ class StatusMonitor:
                 self._apply_detection(terminal_id, fresh)
                 return fresh
 
-        if cached == TerminalStatus.PROCESSING:
+        if cached in (TerminalStatus.PROCESSING, TerminalStatus.WAITING_USER_ANSWER):
+            # Copilot can retain a stale waiting latch after trust is dismissed:
+            # cursor-addressed FIFO redraws are not logical text rows, and a
+            # PROCESSING raw verdict cannot revoke the sticky waiting state.
+            # _fresh_capture_pane_status requires an explicit waiting opt-in.
             # The cheap re-check above re-derives from the SAME rolling buffer the FIFO
             # pipeline feeds — once the process stops emitting output, that buffer stops
             # changing too, so the re-check can return PROCESSING/UNKNOWN forever while
@@ -1102,8 +1114,8 @@ class StatusMonitor:
                 fresh_capture = self._fresh_capture_pane_status(terminal_id, generation)
                 if fresh_capture is not None:
                     logger.debug(
-                        f"get_status [{terminal_id}]: cached=PROCESSING stale-buffer re-check "
-                        f"still PROCESSING/UNKNOWN, fresh capture-pane={fresh_capture.value}"
+                        f"get_status [{terminal_id}]: cached={cached.value} stale-buffer re-check, "
+                        f"fresh capture-pane={fresh_capture.value}"
                     )
                     if (
                         fresh_capture != TerminalStatus.PROCESSING
@@ -1125,10 +1137,7 @@ class StatusMonitor:
                             generation_current = (
                                 self._capture_generation.get(terminal_id, 0) == generation
                             )
-                            apply_ok = (
-                                generation_current
-                                and current_last_status == TerminalStatus.PROCESSING
-                            )
+                            apply_ok = generation_current and current_last_status == cached
                             if apply_ok:
                                 commit_payload = self._confirmed_stale_capture_commit.pop(
                                     terminal_id, None
@@ -1184,7 +1193,12 @@ class StatusMonitor:
     def _fresh_capture_pane_status(
         self, terminal_id: str, generation: int
     ) -> Optional[TerminalStatus]:
-        """Re-detect a stuck-PROCESSING terminal from a fresh pane capture (#558).
+        """Re-detect a stuck terminal from a confirmed fresh pane capture (#558).
+
+        Cached WAITING_USER_ANSWER is recoverable only with the provider's
+        additional narrow waiting opt-in, and current-generation waiting or
+        processing evidence. A live dialog remains waiting; no status is
+        inferred merely from having sent an acceptance key.
 
         ``generation`` is the turn/output generation the caller pinned BEFORE
         deciding to capture. The pane read below runs unlocked, so
@@ -1240,9 +1254,8 @@ class StatusMonitor:
 
         Returns ``None`` when skipped (rate-limited, no provider, unroutable detector,
         unconfirmed candidate, or any read/detection failure) — the caller treats that
-        identically to "still PROCESSING", never as a signal to change status. Only ever
-        called when cached status is already PROCESSING, so every failure path degrades
-        to today's behavior, never past it.
+        identically to retaining the cached status. It is called for PROCESSING
+        or explicitly opted-in waiting recovery; every failure path stays blocked.
         """
         now = time.monotonic()
         with self._lock:
@@ -1281,10 +1294,22 @@ class StatusMonitor:
         # Without this, a new turn whose paste was dropped can inherit turn 1's
         # PROCESSING latch and then "heal" from turn 1's still-rendered
         # completion pane.
-        if stale_capture:
-            with self._lock:
-                if self._processing_generation.get(terminal_id) != generation:
+        with self._lock:
+            recovering_waiting = (
+                self._last_status.get(terminal_id) == TerminalStatus.WAITING_USER_ANSWER
+            )
+            if recovering_waiting:
+                if (
+                    not stale_capture
+                    or getattr(provider, "supports_stale_waiting_capture", False) is not True
+                    or (
+                        self._waiting_generation.get(terminal_id) != generation
+                        and self._processing_generation.get(terminal_id) != generation
+                    )
+                ):
                     return None
+            elif stale_capture and self._processing_generation.get(terminal_id) != generation:
+                return None
 
         try:
             from cli_agent_orchestrator.backends.registry import get_backend
@@ -1306,6 +1331,12 @@ class StatusMonitor:
             )
             return None
         if not fresh_output:
+            # A blank mid-redraw sample breaks consecutive confirmation; it
+            # must not let the next ready read confirm a pre-blank candidate.
+            with self._lock:
+                if self._capture_generation.get(terminal_id, 0) == generation:
+                    self._pending_stale_capture.pop(terminal_id, None)
+                    self._confirmed_stale_capture_commit.pop(terminal_id, None)
             return None
 
         try:

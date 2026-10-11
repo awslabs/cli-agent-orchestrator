@@ -98,6 +98,7 @@ class CopilotCliProvider(BaseProvider):
     """Provider for GitHub Copilot CLI."""
 
     supports_stale_processing_capture = True
+    supports_stale_waiting_capture = True
 
     @classmethod
     def honors_model(
@@ -529,24 +530,52 @@ class CopilotCliProvider(BaseProvider):
         return cls._unrecognized_rows_after_prompt(lines) == []
 
     @classmethod
+    def _last_composer_span(cls, lines: list[str]) -> Optional[tuple[int, int]]:
+        """Return the last composer bounds, with the end exclusive.
+
+        Retained v1.0.95 tmux frames can use an empty heavy box instead of a
+        prompt glyph. Both layouts occur; the mode footer does not select the
+        detector. Require matching borders, an empty interior, and the hint
+        immediately below it; border characters alone are response content.
+        """
+        span = None
+        for idx, line in enumerate(lines):
+            if re.match(IDLE_PROMPT_LINE_PATTERN, line):
+                span = (idx, idx + 1)
+            if idx + 3 >= len(lines):
+                continue
+            top = line.strip()
+            bottom = lines[idx + 2].strip()
+            if (
+                re.fullmatch(r"╻▄{8,}", top)
+                and re.fullmatch(r"┃\s*", lines[idx + 1].strip())
+                and bottom == "╹" + "▀" * (len(top) - 1)
+                and re.search(COPILOT_HINT_BAR_PATTERN, lines[idx + 3].strip().lower())
+            ):
+                span = (idx, idx + 3)
+        return span
+
+    @classmethod
     def _unrecognized_rows_after_prompt(cls, lines: list[str]) -> Optional[list[str]]:
-        # Strip trailing empty lines — TUI providers (like Copilot) render in
-        # a fixed viewport at the top of the pane, leaving the bottom blank.
+        # TUI viewports can leave trailing blank rows below the composer.
         stripped = list(lines)
         while stripped and not stripped[-1].strip():
             stripped.pop()
-        if not stripped:
-            return None
-
         tail = stripped[-25:]
-        last_prompt_idx = -1
-        for idx, line in enumerate(tail):
-            if re.match(IDLE_PROMPT_LINE_PATTERN, line):
-                last_prompt_idx = idx
-        if last_prompt_idx < 0:
+        span = cls._last_composer_span(tail)
+        if span is None:
             return None
-
-        return cls._rows_outside_idle_chrome(tail[last_prompt_idx + 1 :])
+        start, end = span
+        unrecognized = cls._rows_outside_idle_chrome(tail[end:])
+        if end - start > 1:
+            # An always-drawn empty box is not proof that execution stopped.
+            # Do not let it conceal active or approval rows above the composer.
+            last_user = cls._find_last_user_line(stripped[: len(stripped) - len(tail) + start])
+            before = stripped[
+                max(last_user + 1, len(stripped) - 40) : len(stripped) - len(tail) + start
+            ]
+            unrecognized.extend(row for row in before if cls._is_busy_or_waiting_row(row))
+        return unrecognized
 
     @classmethod
     def _rows_outside_idle_chrome(cls, rows: list[str]) -> list[str]:
@@ -582,15 +611,14 @@ class CopilotCliProvider(BaseProvider):
     def _normalize_post_user_lines(
         cls, lines: list[str], *, after_idle_prompt: bool = False
     ) -> list[str]:
-        last_prompt = max(
-            (idx for idx, line in enumerate(lines) if re.match(IDLE_PROMPT_LINE_PATTERN, line)),
-            default=-1,
-        )
+        span = cls._last_composer_span(lines)
+        last_prompt = span[0] if span is not None else -1
+        composer_end = span[1] if span is not None else 0
         if last_prompt < 0 and after_idle_prompt:
             return cls._rows_outside_idle_chrome(lines)
         body = [
             line
-            for line in lines[: last_prompt + 1 if last_prompt >= 0 else len(lines)]
+            for line in lines[: last_prompt if last_prompt >= 0 else len(lines)]
             if line.strip()
             and not cls._is_footer_line(line)
             and not re.match(IDLE_PROMPT_LINE_PATTERN, line)
@@ -598,7 +626,7 @@ class CopilotCliProvider(BaseProvider):
         trailing = (
             [
                 line
-                for line in cls._rows_outside_idle_chrome(lines[last_prompt + 1 :])
+                for line in cls._rows_outside_idle_chrome(lines[composer_end:])
                 if not cls._is_footer_line(line)
             ]
             if last_prompt >= 0
@@ -677,9 +705,9 @@ class CopilotCliProvider(BaseProvider):
                     return TerminalStatus.ERROR
             return TerminalStatus.PROCESSING
 
-        composer_index = max(
-            idx for idx, line in enumerate(lines) if re.match(IDLE_PROMPT_LINE_PATTERN, line)
-        )
+        composer_span = self._last_composer_span(lines)
+        assert composer_span is not None
+        composer_index = composer_span[0]
         before_composer = self._trim_tail_prompts(lines[:composer_index])
         if before_composer and self._is_processing_line(before_composer[-1]):
             return TerminalStatus.PROCESSING
@@ -708,8 +736,17 @@ class CopilotCliProvider(BaseProvider):
         return TerminalStatus.COMPLETED
 
     def probe_stale_processing_capture(self, output: str) -> TerminalStatus:
-        if not self._clean(output).strip():
+        cleaned = self._clean(output)
+        if not cleaned.strip():
             return TerminalStatus.UNKNOWN
+        lines = cleaned.splitlines()
+        span = self._last_composer_span(lines)
+        last_user = self._find_last_user_line(lines[: span[0]] if span else lines)
+        post_user = lines[last_user + 1 :]
+        # A viewport can draw a composer (including an unsent draft) below a
+        # live dialog. Stream ordering cannot prove the approval was dismissed.
+        if re.search(WAITING_PROMPT_PATTERN, "\n".join(post_user), re.IGNORECASE):
+            return TerminalStatus.WAITING_USER_ANSWER
         return self.get_status(output)
 
     def commit_stale_processing_capture(self, output: str, expected: TerminalStatus) -> bool:
@@ -737,6 +774,9 @@ class CopilotCliProvider(BaseProvider):
                 return message
             raise ValueError("No provider response content found in terminal output")
 
+        span = self._last_composer_span(lines)
+        if span is not None and span[1] - span[0] > 1:
+            clean_output = "\n".join(lines[: span[0]])
         matches = list(
             re.finditer(ASSISTANT_PREFIX_PATTERN, clean_output, re.IGNORECASE | re.MULTILINE)
         )

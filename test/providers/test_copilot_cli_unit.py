@@ -13,6 +13,107 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 
 
+class TestCopilotBoxedComposer:
+    # Synthetic v1.0.95 viewports; layout is independent of the mode footer.
+    box = "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀▀▀▀▀\n"
+    hint = "← open sidebar · Autopilot · Allow All · / commands · tab next tab"
+
+    @pytest.mark.parametrize("update", ["", "v1.0.96-2 downloaded · next launch or /restart · "])
+    @pytest.mark.parametrize(
+        "model", ["", "            reviewer · Claude Sonnet 5", "\nreviewer · Claude Sonnet 5"]
+    )
+    @pytest.mark.parametrize("reply", ["", "❯ review\n● Done.\n"])
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
+    @pytest.mark.parametrize("mode", ["Autopilot · Allow All", "Interactive · Manual Approval"])
+    @pytest.mark.parametrize("width", [80, 220, 239])
+    @pytest.mark.parametrize("ansi", [False, True])
+    def test_captured_layouts_are_ready(self, update, model, reply, layout, mode, width, ansi):
+        if layout == "box":
+            composer = "╻" + "▄" * (width - 1) + "\n┃\n╹" + "▀" * (width - 1) + "\n"
+        else:
+            rule = "─" * width
+            composer = f"{rule}\n❯\n{rule}\n"
+        hint = self.hint.replace("Autopilot · Allow All", mode)
+        output = reply + composer + update + hint + model + "\n\n"
+        if ansi:
+            # capture-pane -e can include SGR; plain captures omit it.
+            output = "\x1b[38;2;120;120;120m" + output + "\x1b[0m"
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        expected = TerminalStatus.COMPLETED if reply else TerminalStatus.IDLE
+        with patch.object(provider, "_resolve_native_status", return_value=None):
+            assert provider.get_status(output) == expected
+            assert provider.probe_stale_processing_capture(output) == expected
+            assert provider.commit_stale_processing_capture(output, expected)
+        assert provider._unrecognized_rows_after_prompt(provider._clean(output).splitlines()) == []
+        if reply:
+            assert provider.extract_last_message_from_script(output) == "● Done."
+        else:
+            with pytest.raises(ValueError):
+                provider.extract_last_message_from_script(output)
+
+    @pytest.mark.parametrize(
+        "row, expected",
+        [
+            ("∙ Thinking (Esc to cancel)", TerminalStatus.PROCESSING),
+            ("⠋ Working · esc interrupt · enqueue", TerminalStatus.PROCESSING),
+            ("Allow this tool? [y/n]", TerminalStatus.WAITING_USER_ANSWER),
+            ("Confirm folder trust", TerminalStatus.WAITING_USER_ANSWER),
+        ],
+    )
+    @pytest.mark.parametrize("placement", ["before", "after"])
+    def test_box_does_not_hide_active_or_waiting_rows(self, row, expected, placement):
+        frame = self.box + self.hint + "\n"
+        output = "❯ review\n● Partial reply\n" + (
+            row + "\n" + frame if placement == "before" else frame + row + "\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        with patch.object(provider, "_resolve_native_status", return_value=None):
+            assert provider.get_status(output) == expected
+            assert not provider.commit_stale_processing_capture(output, TerminalStatus.COMPLETED)
+
+    @pytest.mark.parametrize(
+        "frame",
+        [
+            "╻▄▄▄▄▄▄▄▄\n┃\n",  # missing bottom
+            "┃\n╹▀▀▀▀▀▀▀▀\n",  # missing top
+            "╻▄▄▄▄▄▄▄▄\n╹▀▀▀▀▀▀▀▀\n",  # missing interior
+            "╻▄▄▄▄▄▄▄▄\n┃ draft\n╹▀▀▀▀▀▀▀▀\n",  # nonempty
+            "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀\n",  # torn widths
+            "╭────────╮\n│        │\n╰────────╯\n",  # ordinary box
+        ],
+    )
+    def test_incomplete_or_other_boxes_are_not_ready(self, frame):
+        output = "❯ review\n● Partial reply\n" + frame + self.hint + "\n"
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        with patch.object(provider, "_resolve_native_status", return_value=None):
+            assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_box_requires_hint_and_preserves_boxed_reply(self):
+        reply = "● Example:\n" + self.box + "ordinary boxed output"
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        with patch.object(provider, "_resolve_native_status", return_value=None):
+            assert provider.get_status(self.box) == TerminalStatus.PROCESSING
+        output = "❯ explain\n" + reply + "\n" + self.box + self.hint
+        assert provider.extract_last_message_from_script(output) == reply
+
+    @pytest.mark.asyncio
+    async def test_trust_handler_returns_without_sending_keys_for_ready_box(self):
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        with (
+            patch.object(provider, "_history", return_value=self.box + self.hint),
+            patch.object(provider, "_send_enter") as enter,
+            patch.object(provider, "_send_key") as key,
+        ):
+            await provider._accept_trust_prompts(timeout=1)
+        enter.assert_not_called()
+        key.assert_not_called()
+
+    def test_assistant_fallback_excludes_boxed_composer(self):
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        output = "assistant: Done.\n" + self.box + self.hint
+        assert provider.extract_last_message_from_script(output) == "Done."
+
+
 class TestCopilotDownloadedUpdateFooter:
     hint = (
         "v1.0.94 downloaded · next launch or /restart · "
@@ -1281,3 +1382,77 @@ class TestCopilotCliServerSettings:
             await provider.initialize()
 
         mock_wait_shell.assert_called_once_with("test1234", timeout=45)
+
+
+class TestCopilotInitializationAfterTrustRedraw:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
+    async def test_initialize_recovers_stale_waiting_after_real_trust_handler(self, layout):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        sm = StatusMonitor()
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        backend.get_native_status.return_value = None
+        trust = "Confirm folder trust\n1. Yes\n2. Yes, and remember\n"
+        hint = "← open sidebar · Autopilot · Allow All · / commands · tab next tab"
+        composer = "❯\n" if layout == "prompt" else "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀▀▀▀▀\n"
+        pane = {"text": trust}
+        clock = {"now": 1000.0}
+        fake_time = SimpleNamespace(time=lambda: clock["now"], monotonic=lambda: clock["now"])
+
+        async def advance(seconds):
+            clock["now"] += seconds
+
+        def accept_trust(session, window, key):
+            assert key == "Enter"
+            pane["text"] = composer + hint
+            # The rendered pane is ready, but its FIFO redraw is cursor-addressed.
+            sm._process_chunk(provider.terminal_id, "\x1b[2J\x1b[H❯\x1b[2;1H" + hint)
+
+        backend.get_history.side_effect = lambda *args, **kwargs: pane["text"]
+        backend.send_special_key.side_effect = accept_trust
+        with (
+            patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+            patch("cli_agent_orchestrator.providers.copilot_cli.get_backend", return_value=backend),
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
+                return_value=provider,
+            ),
+            patch("cli_agent_orchestrator.services.status_monitor.status_monitor", sm),
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.get_server_settings",
+                return_value={"state_buffer_max": 32768},
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.copilot_cli.wait_for_shell",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.copilot_cli.get_server_settings",
+                return_value={"provider_init_timeout": 30},
+            ),
+            patch("cli_agent_orchestrator.providers.copilot_cli.time", fake_time),
+            patch("cli_agent_orchestrator.services.status_monitor.time", fake_time),
+            patch(
+                "cli_agent_orchestrator.providers.copilot_cli.asyncio.sleep",
+                new=AsyncMock(side_effect=advance),
+            ),
+            patch.object(provider, "_command", return_value="copilot"),
+            patch.object(sm, "_running_loop", return_value=None),
+        ):
+            sm._process_chunk(provider.terminal_id, trust)
+            assert sm.get_status(provider.terminal_id) == TerminalStatus.WAITING_USER_ANSWER
+            assert await provider.initialize() is True
+            assert sm.get_status(provider.terminal_id) == TerminalStatus.IDLE
+        assert provider._initialized is True
+        backend.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
+        captures = [
+            call for call in backend.get_history.call_args_list if call.kwargs.get("visible_only")
+        ]
+        assert len(captures) == 2
+        assert clock["now"] < 1060
