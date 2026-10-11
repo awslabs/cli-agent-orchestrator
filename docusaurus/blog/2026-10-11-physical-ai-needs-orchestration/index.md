@@ -25,25 +25,23 @@ The runs in this post used CAO `2.5.3` from `main` (commit `88f3af0c`) with the 
 
 ### What is physical AI
 
-AWS [defines](https://aws.amazon.com/blogs/physical-ai/physical-ai-building-the-next-foundation-in-autonomous-intelligence/) physical AI as "a system of hardware and software that integrates perceiving, understanding, reasoning, and learning to interact with the physical world." The NVIDIA [glossary](https://www.nvidia.com/en-us/glossary/generative-physical-ai/) says that physical AI "lets autonomous systems like cameras, robots, and self-driving cars perceive, understand, reason, and perform or orchestrate complex actions in the physical world."
+Physical AI is AI that acts in the physical world. It does not stop at text or images. It senses its surroundings, decides what to do, and moves a machine: for example, a robot arm, a mobile cart, or a self-driving car. AWS [defines](https://aws.amazon.com/blogs/physical-ai/physical-ai-building-the-next-foundation-in-autonomous-intelligence/) physical AI as "a system of hardware and software that integrates perceiving, understanding, reasoning, and learning to interact with the physical world."
 
-The machines are already on the floor. The International Federation of Robotics (IFR) [reports](https://ifr.org/ifr-press-releases/news/five-million-robots-now-operate-in-factories-globally) that "the global operational stock of industrial robots surged 9% to a record 5 million units in 2025." Factories installed more than 600,000 new industrial robots in that year. Mobile robots grow fast too. IFR [counts](https://ifr.org/ifr-press-releases/news/global-sales-of-professional-service-robots-surge-24-percent) almost 250,000 professional service robots shipped in 2025, and transportation and logistics is the largest application, with 117,500 units. Amazon [reports](https://www.aboutamazon.com/news/operations/amazon-million-robots-ai-foundation-model) its one millionth robot, in more than 300 facilities. Its fleet grew from a single type of robot in 2012 to many types today.
-
-Adoption at scale is still rare. A [Capgemini Research Institute survey](https://www.capgemini.com/us-en/news/press-releases/two-thirds-of-organizations-rate-physical-ai-as-a-high-priority-for-the-next-three-to-five-years/) of 1,678 executives found that "79% of organizations are already engaging with physical AI", but "only 4% say they are already operating at scale." Gartner lists both physical AI and multiagent systems in its [top strategic technology trends for 2026](https://www.gartner.com/en/newsroom/press-releases/2025-10-20-gartner-identifies-the-top-strategic-technology-trends-for-2026).
+Two reports from 2026 show the trend. First, the machines are already in place. The International Federation of Robotics (IFR) [reports](https://ifr.org/ifr-press-releases/news/five-million-robots-now-operate-in-factories-globally) that "the global operational stock of industrial robots surged 9% to a record 5 million units in 2025." Factories installed more than 600,000 new units in that year. Second, interest is high, but operation at scale is rare. A [Capgemini Research Institute survey](https://www.capgemini.com/us-en/news/press-releases/two-thirds-of-organizations-rate-physical-ai-as-a-high-priority-for-the-next-three-to-five-years/) of 1,678 executives found that "79% of organizations are already engaging with physical AI", but "only 4% say they are already operating at scale." Most organizations have the robots and the interest. What they do not have yet is a way to run physical AI at scale.
 
 ### Why physical AI needs agentic AI
 
-Classic automation follows programs that engineers write in advance: fixed paths, fixed rules, and fixed transfers between systems. This works well for a task that repeats. It works less well when the request, the layout, or the fleet changes, because each change needs new code and a new test.
+A robot moves with a policy. In physical AI, a policy is the program or the trained model that turns what a robot senses into its next action: for example, how a cart drives to a point, or how an arm grips a box. A policy is good at one skill. It does not decide which job to do, in which order, or with which robot.
 
-Agentic AI adds reasoning at the level of the goal. The [Strands Labs announcement](https://aws.amazon.com/blogs/opensource/introducing-strands-labs-get-hands-on-today-with-state-of-the-art-experimental-approaches-to-agentic-development/) describes the shift: "Agentic AI systems are rapidly expanding beyond the digital world and into the physical domain, where AI agents perceive, reason, and act in real environments." IFR names it in its [robotics trends for 2026](https://ifr.org/ifr-press-releases/news/top-5-global-robotics-trends-2026): "A key trend to further develop autonomy in robotics is Agentic AI." Research systems show what agents add to robots:
+Today, engineers write that decision logic in advance: fixed paths, fixed rules, and fixed transfers between systems. This works well for a task that repeats. It works less well when the request, the layout, or the fleet changes, because each change needs new code and a new test.
 
-- **Plans from language.** [Code as Policies](https://arxiv.org/abs/2209.07753) shows that "these code-writing LLMs can be re-purposed to write robot policy code, given natural language commands."
-- **Feedback from the environment.** [Inner Monologue](https://arxiv.org/abs/2207.05608) reports that "closed-loop language feedback significantly improves high-level instruction completion".
-- **Work split across robots.** In the [COHERENT](https://arxiv.org/abs/2409.15146) system, "a centralized task assigner makes a task planning proposal to decompose the complex task into subtasks, and then assigns subtasks to robot executors."
+Agentic AI adds reasoning at the level of the goal, above the policies. IFR names it in its [robotics trends for 2026](https://ifr.org/ifr-press-releases/news/top-5-global-robotics-trends-2026): "A key trend to further develop autonomy in robotics is Agentic AI." An agent gives a robot system three things:
 
-But an agent that moves machines raises the stakes. A language model alone does not know the physical state. The [SayCan](https://arxiv.org/abs/2204.01691) authors note that language models "lack real-world experience, which makes it difficult to leverage them for decision making within a given embodiment." IFR warns that "the AI-driven autonomy fundamentally changes the safety landscape, which makes testing, validation, and human oversight much more complex—but also more necessary." And the [AWS Physical AI Toolchain](https://aws.amazon.com/blogs/physical-ai/introducing-aws-physical-ai-toolchain/) announcement notes that "getting a robot from a working lab prototype to a reliable production system requires more than a single model."
+- **Plans from a goal.** An operator states the job in natural language, for example "move the parcel from stock to etch." The agent turns the goal into steps and calls the robot skills in the correct order. A new request does not need a new program.
+- **Feedback from the floor.** After each step, the agent reads the state of the robots. If the state is not as expected, the agent changes the plan or stops.
+- **Work split across teams.** An agent can split a job into tasks and give each task to the team that owns the robots for that task.
 
-So the question is not only whether an agent can plan a robot job. The question is how a team of agents can share the job safely. Who plans, and who acts? What can each agent touch, and what counts as proof? That is the work of orchestration.
+But an agent that moves machines raises the stakes. A language model alone does not know the physical state, and a wrong step moves real equipment. So the question is not only whether an agent can plan a robot job. The question is how a team of agents can share the job safely. Who plans, and who acts? What can each agent touch, and what counts as proof? That is the work of orchestration.
 
 ### What is MuJoCo
 
@@ -53,7 +51,7 @@ The example uses only a small part of MuJoCo. The robots are carts that move alo
 
 ![The simulated floor at the start of a run. The west zone is light blue and the east zone is light green. The pink parcel is on the blue west cart at stock. The green east cart waits at the amber shared dock.](../../../examples/robotics/cross-zone-transport/images/run-1-start.png)
 
-A local process, the **controller** (`demo.py serve`), runs the MuJoCo world. The agents use the world only through the tools of the controller. The controller offers them over the [Model Context Protocol](https://modelcontextprotocol.io/docs/getting-started/intro) (MCP), "an open-source standard for connecting AI applications to external systems."
+A local process, the **controller** (`demo.py serve`), runs the MuJoCo world. The agents use the world only through the tools of the controller. The controller is an MCP server: it offers its tools over the [Model Context Protocol](https://modelcontextprotocol.io/docs/getting-started/intro) (MCP), an open standard that connects AI agents to tools. Each agent connects to the controller as the `transport-sim` MCP server.
 
 ### What is CAO
 
@@ -86,7 +84,7 @@ On a real site, each area has a fleet control: the software that sends orders to
 - **Planning and authority stay with the site.** [VDA 5050](https://github.com/VDA5050/VDA5050), a standard of the German automotive and machinery associations VDA and VDMA, defines the interface between a fleet control and its mobile robots, "to enable the coordinated operation of heterogeneous mobile robot fleets from different manufacturers within a shared physical environment." But it "does not allocate responsibilities among operators, system integrators, vehicle manufacturers, or fleet control providers", and it does not include traffic management logic. MassRobotics, a non-profit robotics hub, also [notes](https://www.massrobotics.org/what-is-the-massrobotics-amr-interoperability-standard/) that its interoperability standard for autonomous mobile robots (AMRs) is not a fleet management, vehicle navigation, or safety system. The [book of Open-RMF](https://osrf.github.io/ros2multirobotbook/intro.html), the Open Robotics Middleware Framework, sums it up: "multi-vendor, multi-robot systems remain an open problem, and we expect that multi-vendor robot deployments will be the norm in all large buildings in the future."
 - **Transfers depend on confirmation.** In a semiconductor factory, a transport vehicle and a production tool use the signals of [SEMI E84](https://www.peergroup.com/definition-of-standard/semi-e84/), a standard of the semiconductor industry association SEMI: "a series of optical signals are exchanged to confirm the tool is ready for carrier delivery or removal, then to track handoff progress and completion."
 - **Checks are separate from the work.** The [AI Risk Management Framework](https://doi.org/10.6028/NIST.AI.100-1) of the US National Institute of Standards and Technology (NIST) recommends a similar split for the people who work on AI systems, with "those building and using the models separated from those verifying and validating the models."
-- **Failures leave a changed world.** The AWS Physical AI Toolchain announcement says it directly: "A failed robot restarts into a physical world that has already changed."
+- **Failures leave a changed world.** The [AWS Physical AI Toolchain](https://aws.amazon.com/blogs/physical-ai/introducing-aws-physical-ai-toolchain/) announcement says it directly: "A failed robot restarts into a physical world that has already changed."
 
 ### Why a multi-agent architecture is needed
 
@@ -171,7 +169,7 @@ The supervisor uses `handoff`, not `assign`. In this job, the east zone worker c
 
 A run takes approximately 3 to 5 minutes. The controller writes one line for each tool call, with the agent that made the call. A call to `move`, `offer_handoff`, or `accept_handoff` creates a command with an ID that the agent chooses. The controller also writes one line for each status change of a command: `accepted`, `running`, and then `finished`, or `rejected` with a reason. This excerpt shows the agent and command lines of the log of a run on 2026-10-11, without the times and the run ID. The controller also writes HTTP lines and MCP library lines between them:
 
-```text
+```bash
 transport supervisor called observe()
 transport west zone worker called observe()
 transport west zone worker called move(command_id=west-parcel-stock-to-dock, robot=cart-west, payload=parcel, destination=dock)
@@ -199,7 +197,7 @@ The controller can also save pictures of the MuJoCo world, with `demo.py serve -
 
 The final answer of the supervisor names each worker, each leg, the custody handoff, and the evidence of the checker. This excerpt comes from the same run as the log, with the lines wrapped:
 
-```text
+```bash
 The parcel was delivered to etch, and east now owns it. The independent checker
 confirmed this, and its result matches my own observation.
 [... the three worker profiles, and a table of the two legs and their four
