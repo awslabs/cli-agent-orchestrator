@@ -297,10 +297,6 @@ uv run --locked python demo.py prepare --run-dir "$RUN_DIR" --request "$REQUEST"
 
 Then follow the [README of the example](https://github.com/awslabs/cli-agent-orchestrator/blob/main/examples/robotics/cross-zone-transport/README.md). It starts the controller, installs one run copy of a profile for each agent, launches the supervisor, and shows what to watch. When you finish, follow its [Stop and clean up](https://github.com/awslabs/cli-agent-orchestrator/blob/main/examples/robotics/cross-zone-transport/README.md#stop-and-clean-up) steps. They stop the simulation and the CAO session, and they remove the profiles and the run directory.
 
-## Where the idea comes from
-
-The job comes from the [cross-zone transport example](https://github.com/strands-labs/robots/blob/main/examples/fleet/README.md) of [Strands Robots](https://github.com/strands-labs/robots). Strands Robots is an open-source project of Strands Labs, the GitHub organization of AWS for experimental AI agent projects. In that example, a fleet coordinator in Python splits the request into legs with fixed rules. Zone orchestrators run the legs over a mesh, after a person approves each leg. The CAO example keeps the job, the zones, the shared dock, and the gated custody handoff. It gives the planning and the check to CAO agents, so you can see a CAO supervisor decide and delegate.
-
 ## Conclusion
 
 Physical AI is moving from single robots to fleets with many owners, and agentic AI can take on the coordination between them. But agents that move machines need structure: a clear role for each agent, the least authority that the role needs, custody on evidence, an independent check, and a safe failure. The cross-zone transport example shows how CAO gives a team of CLI agents that structure, on a laptop, with no robot hardware.
