@@ -91,6 +91,10 @@ resolution or tool inheritance. A per-call `model` override refuses before any c
 delete it if it is unwanted, and create a new agent. This check-and-delete step is required:
 a failed or lost response does not prove that no worker exists.
 
+If a `handoff` times out or the worker errors, the worker was launched, its terminal id
+is in the result and the name stays launched; inspect or delete that terminal rather
+than creating a new agent while it may still be running.
+
 A retried `handoff` within the claim lease gets `already_claimed`; retry after
 `claim_lease_seconds` or create a new agent. A matching key on the early path can reattach
 to an already launched terminal, but does not deduplicate task delivery. The default
