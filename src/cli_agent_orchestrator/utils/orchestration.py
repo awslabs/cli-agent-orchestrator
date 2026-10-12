@@ -511,6 +511,8 @@ def _claim_ephemeral(
         raise
     except requests.exceptions.JSONDecodeError:
         raise _local_claim_refusal("unexpected_failure") from None
+    except requests.HTTPError:
+        raise _local_claim_refusal("unexpected_failure") from None
     except requests.RequestException:
         raise _local_claim_refusal(
             "creator_unresolved", "cao-server could not be reached"
@@ -1187,7 +1189,9 @@ async def _run_step_and_build_result(
         # (504 -> timeout, 502 -> error).
         if kind == "ephemeral_policy":
             msg = structured_detail
-        elif payload.get("claim_id") is not None:
+        elif (
+            payload.get("claim_id") is not None and kind not in ("error", "timeout") and tid is None
+        ):
             msg = f"ephemeral launch failed ({response.status_code})"
             rule = "unexpected_failure"
         elif kind == "error" or (kind is None and response.status_code == 502):
