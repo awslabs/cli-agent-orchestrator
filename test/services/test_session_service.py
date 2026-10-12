@@ -173,6 +173,29 @@ class TestCreateSession:
         mock_dispatch.assert_not_called()
 
     @pytest.mark.asyncio
+    @patch(
+        "cli_agent_orchestrator.services.session_service.last_create_was_replay",
+        return_value=True,
+    )
+    @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    async def test_keyed_replay_publishes_no_second_creation_event(
+        self, mock_create_terminal, mock_dispatch, _was_replay
+    ):
+        """A retry that replays an earlier create returns the same terminal;
+        the event log must not record a second launch for that session."""
+        mock_terminal = MagicMock()
+        mock_terminal.session_name = "cao-test"
+        mock_create_terminal.return_value = mock_terminal
+
+        result = await create_session(
+            provider="kiro_cli", agent_profile="my_agent", idempotency_key="retry-1"
+        )
+
+        assert result is mock_terminal
+        mock_dispatch.assert_not_called()
+
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
     @patch("cli_agent_orchestrator.services.session_service.create_terminal")
     async def test_ordinary_create_still_publishes_the_creation_event(

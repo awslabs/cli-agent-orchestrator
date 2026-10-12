@@ -1176,12 +1176,24 @@ async def _run_step_and_build_result(
 # Implementation functions
 
 
-class _HandoffCreateCollision(Exception):
-    """The last create attempt failed server-side after an earlier one timed out.
+class _HandoffCreateUnresolved(Exception):
+    """The create ended without telling the caller whether a worker exists.
 
-    The earlier attempt may still have committed a worker under the same key,
-    so the caller recovers its identity exactly as it does after a timeout.
+    Raised when the bounded attempts all time out, or when an attempt that
+    follows a timeout fails for a reason other than a failed original create.
+    In both cases an earlier attempt may have committed a worker under the same
+    key, so the caller looks its identity up before reporting the failure. The
+    original error is the ``__cause__``.
     """
+
+
+def _http_error_detail(exc: requests.exceptions.HTTPError) -> str:
+    """Return the ``detail`` cao-server sent with an error response, if any."""
+    try:
+        detail = exc.response.json().get("detail")
+    except (AttributeError, ValueError):
+        detail = None
+    return detail if isinstance(detail, str) and detail else str(exc)
 
 
 def _create_handoff_terminal(
@@ -1196,16 +1208,21 @@ def _create_handoff_terminal(
     """Synchronously create handoff's worker, retrying a client timeout.
 
     Every attempt carries the SAME idempotency key and the full
-    ``_HANDOFF_CREATE_TIMEOUT_S`` budget (review on PR #773). Whether or not a
-    timed-out attempt reached cao-server, the next one is safe: a replay is held
-    server-side until the original provider.initialize() settles and then
-    returns the ready terminal (or the original failure), and an attempt that
-    never arrived is simply performed. The worker is never duplicated, and a
-    single timeout no longer loses its terminal_id or skips its readiness.
+    ``_HANDOFF_CREATE_TIMEOUT_S`` budget (review on PR #773). Only a timeout is
+    retried. Whether or not the timed-out attempt reached cao-server, the next
+    one is safe: a replay is held server-side until the original
+    provider.initialize() settles, and an attempt that never arrived is simply
+    performed.
+
+    A replay of a create whose initialization FAILED comes back as HTTP 424
+    with the cause. That is the original failure, so it is raised with that
+    cause and never retried: retrying would start a second worker for a key
+    whose first one already failed. Any other error after a timeout is not
+    retried either; it raises ``_HandoffCreateUnresolved`` so the caller can
+    still look up a worker an earlier attempt may have committed.
     """
     saw_timeout = False
     for attempt in range(1, _HANDOFF_CREATE_ATTEMPTS + 1):
-        last_attempt = attempt == _HANDOFF_CREATE_ATTEMPTS
         try:
             return _create_terminal(
                 agent_profile,
@@ -1216,10 +1233,10 @@ def _create_handoff_terminal(
                 create_timeout=_HANDOFF_CREATE_TIMEOUT_S,
                 idempotency_key=idempotency_key,
             )
-        except requests.exceptions.Timeout:
+        except requests.exceptions.Timeout as exc:
             saw_timeout = True
-            if last_attempt:
-                raise
+            if attempt == _HANDOFF_CREATE_ATTEMPTS:
+                raise _HandoffCreateUnresolved(str(exc)) from exc
             logger.warning(
                 "handoff: create attempt %d/%d timed out after %ss; retrying with "
                 "the same idempotency key",
@@ -1228,23 +1245,12 @@ def _create_handoff_terminal(
                 _HANDOFF_CREATE_TIMEOUT_S,
             )
         except requests.exceptions.HTTPError as exc:
-            # A retry can reach cao-server while the timed-out attempt is still
-            # running but has not committed its row yet. Both then allocate, and
-            # the one that commits second fails on the key (a server error) while
-            # the other carries on. That is not a failed create: the key is now
-            # committed, so the next attempt is an ordinary replay.
             status_code = exc.response.status_code if exc.response is not None else None
-            if not saw_timeout or status_code is None or status_code < 500:
-                raise
-            if last_attempt:
-                raise _HandoffCreateCollision(str(exc)) from exc
-            logger.warning(
-                "handoff: create attempt %d/%d failed with HTTP %s after an earlier "
-                "timeout; retrying with the same idempotency key",
-                attempt,
-                _HANDOFF_CREATE_ATTEMPTS,
-                status_code,
-            )
+            if status_code == 424:
+                raise RuntimeError(_http_error_detail(exc)) from exc
+            if saw_timeout:
+                raise _HandoffCreateUnresolved(str(exc)) from exc
+            raise
     raise AssertionError("unreachable")  # the loop always returns or raises
 
 
@@ -1557,11 +1563,11 @@ async def _handoff_impl(
                 use_worktree=use_worktree,
                 idempotency_key=create_key,
             )
-        except (requests.exceptions.Timeout, _HandoffCreateCollision):
-            # The bounded wait expired. That says nothing about whether a
-            # worker was committed, and readiness is a separate question from
-            # identity: recover the id if there is one, report it, and send
-            # NOTHING to a terminal that has not finished initializing.
+        except _HandoffCreateUnresolved as unresolved:
+            # The create ended without an answer. That says nothing about
+            # whether a worker was committed, and readiness is a separate
+            # question from identity: recover the id if there is one, report it,
+            # and send NOTHING to a terminal that is not known to be ready.
             terminal_id = _lookup_committed_handoff_terminal(
                 agent_profile,
                 working_directory,
@@ -1571,15 +1577,16 @@ async def _handoff_impl(
                 idempotency_key=create_key,
             )
             if terminal_id is None:
-                raise
+                # Nothing is committed for this key: report the original error.
+                raise unresolved.__cause__ or unresolved
             _notify_terminal_id(on_terminal_id, terminal_id)
             return HandoffResult(
                 success=False,
                 message=(
-                    f"Handoff failed: worker terminal {terminal_id} was created but did "
-                    f"not finish initializing within {_HANDOFF_CREATE_ATTEMPTS} attempts "
-                    f"of {_HANDOFF_CREATE_TIMEOUT_S:g}s, so no task was sent to it. It may "
-                    "still become ready; inspect or delete it using this terminal_id."
+                    f"Handoff failed: worker terminal {terminal_id} was created, but "
+                    f"the create call did not complete ({unresolved}), so no task was "
+                    "sent to it. It may still become ready; inspect or delete it using "
+                    "this terminal_id."
                 ),
                 output=None,
                 terminal_id=terminal_id,

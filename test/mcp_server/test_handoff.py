@@ -11,6 +11,7 @@ contract; the caller is deliberately rewritten.)
 """
 
 import asyncio
+import json
 import os
 from unittest.mock import MagicMock, patch
 
@@ -829,10 +830,9 @@ class TestHandoffEarlyTerminalId:
 class TestHandoffCreateTimeoutCoversProviderFloors:
     """_HANDOFF_CREATE_TIMEOUT_S must exceed every provider's own unconditional
     ready-timeout floor (antigravity_cli.py's max(180.0, init_timeout) is the
-    highest known one), or a legitimately-slow-but-successful init gets killed
-    client-side here -- with no exception handling around this specific call,
-    the operator gets a clean-looking failure and no terminal_id to clean up
-    the orphaned worker with."""
+    highest known one), so an ordinary slow start finishes inside a single
+    attempt. Starts slower than that are covered by the keyed retry and the
+    lookup in TestHandoffCreateTimeoutRecovery, not by this constant."""
 
     def test_constant_exceeds_known_provider_floors(self):
         """This is the test that actually pins the regression: 150.0 (the old
@@ -1124,96 +1124,116 @@ class TestHandoffCreateTimeoutRecovery:
         response.status_code = status_code
         return requests.exceptions.HTTPError(f"{status_code} error", response=response)
 
-    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
-    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
-    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
-    def test_server_error_after_a_timeout_is_retried_as_a_replay(
-        self, mock_create, mock_provider, _nudge
-    ):
-        """A retry can collide with the timed-out attempt before its row is
-        committed; the loser gets a server error. The key is committed by then,
-        so the next attempt is an ordinary replay and the handoff succeeds."""
+    @staticmethod
+    def _http_error(status_code, detail=None):
+        import requests
+
+        response = requests.Response()
+        response.status_code = status_code
+        if detail is not None:
+            response._content = json.dumps({"detail": detail}).encode()
+        return requests.exceptions.HTTPError(f"{status_code} error", response=response)
+
+    @staticmethod
+    def _run(mock_create, mock_provider, seen=None):
         import requests
 
         mock_provider.return_value = _ctx("kiro_cli")
-        mock_create.side_effect = [
-            requests.exceptions.ReadTimeout("read timed out"),
-            self._http_error(500),
-            ("dev-t1", "kiro_cli"),
-        ]
         with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
             mock_requests.exceptions = requests.exceptions
             mock_requests.Timeout = requests.Timeout
-            mock_requests.post.return_value = _ok_run_step_response(terminal_id="dev-t1")
-            result = asyncio.run(
-                _handoff_impl("developer", "Do task", on_terminal_id=lambda _t: None)
-            )
+            callback = seen.append if seen is not None else (lambda _t: None)
+            result = asyncio.run(_handoff_impl("developer", "Do task", on_terminal_id=callback))
+        return result, mock_requests
 
-        assert result.success is True
-        assert result.terminal_id == "dev-t1"
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_failed_original_is_reported_with_its_cause_and_not_retried(
+        self, mock_create, mock_provider, _nudge
+    ):
+        """Review on PR #773: the original create outlives the client timeout
+        and then FAILS. The replay answers 424 with the cause. Handoff must
+        report that cause and stop: a retry would start a second worker for a
+        key whose first one already failed."""
+        import requests
+
+        cause = "terminal 'abc12345' for idempotency_key 'k' failed to initialize: boom"
+        mock_create.side_effect = [
+            requests.exceptions.ReadTimeout("read timed out"),
+            self._http_error(424, cause),
+        ]
+        seen = []
+        result, mock_requests = self._run(mock_create, mock_provider, seen)
+
+        assert result.success is False
+        assert result.terminal_id is None
+        assert "failed to initialize: boom" in result.message
+        assert seen == []
+        # The timed-out attempt and its replay: no further create, no lookup.
+        assert mock_create.call_count == 2
+        assert all(not c.kwargs.get("lookup_only") for c in mock_create.call_args_list)
+        mock_requests.post.assert_not_called()
+
+    @pytest.mark.parametrize("status_code", [500, 400])
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_other_error_after_a_timeout_is_not_retried_but_id_is_recovered(
+        self, mock_create, mock_provider, _nudge, status_code
+    ):
+        """A retry that collides with the still-running original fails (500 on
+        the key, or 400 on the key-derived session name). It is not retried,
+        because the same statuses can mean a real failure; one non-allocating
+        lookup still recovers the worker the original committed."""
+        import requests
+
+        mock_create.side_effect = [
+            requests.exceptions.ReadTimeout("read timed out"),
+            self._http_error(status_code),
+            ("dev-t9", "kiro_cli"),
+        ]
+        seen = []
+        result, mock_requests = self._run(mock_create, mock_provider, seen)
+
+        assert result.success is False
+        assert result.terminal_id == "dev-t9"
+        assert seen == ["dev-t9"]
+        assert mock_create.call_count == 3
+        flags = [c.kwargs.get("lookup_only", False) for c in mock_create.call_args_list]
+        assert flags == [False, False, True]
+        mock_requests.post.assert_not_called()
+
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_error_after_a_timeout_with_nothing_committed_reports_that_error(
+        self, mock_create, mock_provider, _nudge
+    ):
+        import requests
+
+        mock_create.side_effect = [
+            requests.exceptions.ReadTimeout("read timed out"),
+            self._http_error(500),
+            self._http_error(404),  # the lookup finds nothing
+        ]
+        result, _ = self._run(mock_create, mock_provider)
+
+        assert result.success is False
+        assert result.terminal_id is None
+        assert "500 error" in result.message
         assert mock_create.call_count == 3
 
     @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
     @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
-    def test_collision_on_the_last_attempt_still_reports_the_committed_id(
+    def test_error_on_the_first_attempt_is_a_plain_failure(
         self, mock_create, mock_provider, _nudge
     ):
-        import requests
-
-        from cli_agent_orchestrator.utils.orchestration import _HANDOFF_CREATE_ATTEMPTS
-
-        mock_provider.return_value = _ctx("kiro_cli")
-        mock_create.side_effect = (
-            [requests.exceptions.ReadTimeout("read timed out")]
-            + [self._http_error(500)] * (_HANDOFF_CREATE_ATTEMPTS - 1)
-            + [("dev-t9", "kiro_cli")]
-        )
-        seen = []
-        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
-            mock_requests.exceptions = requests.exceptions
-            mock_requests.Timeout = requests.Timeout
-            result = asyncio.run(_handoff_impl("developer", "Do task", on_terminal_id=seen.append))
-
-        assert result.success is False
-        assert result.terminal_id == "dev-t9"
-        assert seen == ["dev-t9"]
-        assert mock_create.call_args_list[-1].kwargs["lookup_only"] is True
-        mock_requests.post.assert_not_called()
-
-    @pytest.mark.parametrize(
-        ("errors", "expected_calls"),
-        [
-            # No earlier timeout: a server error is a plain failure, not retried.
-            ([500], 1),
-            # After a timeout, a client error is still a plain failure.
-            (["timeout", 409], 2),
-        ],
-    )
-    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
-    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
-    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
-    def test_other_http_errors_are_not_retried(
-        self, mock_create, mock_provider, _nudge, errors, expected_calls
-    ):
-        import requests
-
-        mock_provider.return_value = _ctx("kiro_cli")
-        mock_create.side_effect = [
-            (
-                requests.exceptions.ReadTimeout("read timed out")
-                if error == "timeout"
-                else self._http_error(error)
-            )
-            for error in errors
-        ]
-        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
-            mock_requests.exceptions = requests.exceptions
-            mock_requests.Timeout = requests.Timeout
-            result = asyncio.run(
-                _handoff_impl("developer", "Do task", on_terminal_id=lambda _t: None)
-            )
+        """No earlier timeout means nothing can be committed: no lookup."""
+        mock_create.side_effect = [self._http_error(500)]
+        result, _ = self._run(mock_create, mock_provider)
 
         assert result.success is False
         assert result.terminal_id is None
-        assert mock_create.call_count == expected_calls
+        assert mock_create.call_count == 1

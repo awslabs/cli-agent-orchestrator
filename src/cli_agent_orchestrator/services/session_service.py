@@ -53,6 +53,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     TerminalRecordCorruptError,
     create_terminal,
     get_deferred_init_failure,
+    last_create_was_replay,
 )
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 
@@ -141,9 +142,10 @@ async def create_session(
         group=group,
         metadata=metadata,
     )
-    if lookup_only:
-        # A lookup resolved a terminal that an earlier call created; no session
-        # was created here, so there is no creation event to publish.
+    if lookup_only or last_create_was_replay():
+        # A lookup, or a replay of an earlier keyed request, returned a terminal
+        # that already existed: no session was created by THIS call, so there
+        # is no creation event to publish a second time.
         return terminal
     dispatch_plugin_event(
         registry,

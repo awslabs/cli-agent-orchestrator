@@ -27,6 +27,7 @@ import re
 import threading
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -159,6 +160,16 @@ class IdempotencyKeyNotFound(Exception):
     Review on PR #773. Surfaced as HTTP 404 by both create endpoints. Not a
     ``ValueError`` for the same reason as ``IdempotencyKeyConflict`` below: the
     endpoints already give ``ValueError`` other meanings.
+    """
+
+
+class IdempotentCreateFailed(Exception):
+    """A replay found that the original create for its key failed to initialize.
+
+    Review on PR #773. Surfaced as HTTP 424 by both create endpoints, so a
+    caller can tell "the create you are replaying failed, here is why" from an
+    ordinary server error and report that cause instead of retrying. The failed
+    create has already been rolled back; this allocates nothing.
     """
 
 
@@ -358,6 +369,16 @@ class _SyncInitWaiter:
 # themselves on settle; a replay that arrives afterwards sees either a ready
 # terminal (success) or no row at all (failed create, rolled back).
 _pending_sync_inits: Dict[str, _SyncInitWaiter] = {}
+
+# True when the most recent create_terminal call in this context returned a
+# terminal that an EARLIER call created (an idempotent replay or a lookup),
+# so a caller that publishes "created" events can skip them for it.
+_last_create_was_replay: ContextVar[bool] = ContextVar("_last_create_was_replay", default=False)
+
+
+def last_create_was_replay() -> bool:
+    """Whether the latest ``create_terminal`` here returned an existing terminal."""
+    return _last_create_was_replay.get()
 
 
 def inject_memory_context(
@@ -1393,6 +1414,7 @@ async def _create_terminal_unguarded(
     # retry on a full node -- the one case this feature exists to make safe.
     # The cap still precedes every actual allocation (worktree, tmux window, DB
     # row, provider process), which is all its own placement-guard needs.
+    _last_create_was_replay.set(False)
     if lookup_only and not idempotency_key:
         raise ValueError("lookup_only requires an idempotency_key")
     request_fingerprint: Optional[str] = None
@@ -1492,13 +1514,13 @@ async def _create_terminal_unguarded(
                 if waiter is not None and not lookup_only:
                     await waiter.settled.wait()
                     if waiter.error is not None:
-                        raise RuntimeError(
+                        raise IdempotentCreateFailed(
                             f"terminal {existing_terminal_id!r} for idempotency_key "
                             f"{idempotency_key!r} failed to initialize: {waiter.error}"
                         ) from waiter.error
                     row = get_terminal(existing_terminal_id)
                 try:
-                    return Terminal(**row)
+                    terminal = Terminal(**row)
                 except ValidationError as exc:
                     # Re-raised as a non-ValueError so a corrupt STORED row is
                     # reported as a 500 rather than being blamed on the caller
@@ -1508,6 +1530,8 @@ async def _create_terminal_unguarded(
                         f"idempotency_key {idempotency_key!r} but its stored row does "
                         f"not satisfy the Terminal model: {exc}"
                     ) from exc
+                _last_create_was_replay.set(True)
+                return terminal
 
     if lookup_only:
         # The key maps to no live terminal. A lookup never allocates: it exists

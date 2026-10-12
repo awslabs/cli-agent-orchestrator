@@ -28,6 +28,7 @@ from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.terminal_service import (
     IdempotencyKeyConflict,
     IdempotencyKeyNotFound,
+    IdempotentCreateFailed,
     TerminalRecordCorruptError,
 )
 from cli_agent_orchestrator.utils.skills import SkillNameError
@@ -513,6 +514,25 @@ class TestCreateSession:
 
         assert response.status_code == 201
         assert mock_create.call_args.kwargs["idempotency_key"] is None
+
+    def test_replay_of_a_failed_create_is_424_with_the_cause(self, client):
+        """Review on PR #773: distinct from a plain 500, so the caller reports
+        the original failure instead of retrying it."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(
+                side_effect=IdempotentCreateFailed("terminal 'a' failed to initialize: boom")
+            )
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                },
+            )
+
+        assert response.status_code == 424
+        assert "failed to initialize: boom" in response.json()["detail"]
 
     def test_lookup_only_without_a_key_is_400(self, client):
         with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
@@ -1230,6 +1250,25 @@ class TestCreateTerminalInSession:
 
         assert response.status_code == 500
         assert "Failed to create terminal" in response.json()["detail"]
+
+    def test_replay_of_a_failed_create_is_424_with_the_cause(self, client):
+        """Review on PR #773: distinct from a plain 500, so the caller reports
+        the original failure instead of retrying it."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=IdempotentCreateFailed("terminal 'a' failed to initialize: boom")
+            )
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "idempotency_key": "job-1",
+                },
+            )
+
+        assert response.status_code == 424
+        assert "failed to initialize: boom" in response.json()["detail"]
 
     def test_lookup_only_without_a_key_is_400_not_404(self, client):
         """This endpoint maps ValueError to 404, which would read as a missing

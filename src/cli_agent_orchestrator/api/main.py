@@ -170,6 +170,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
     IdempotencyKeyConflict,
     IdempotencyKeyNotFound,
+    IdempotentCreateFailed,
     OutputMode,
     TerminalInputBlockedError,
     _notify_elastic_terminal_ended,
@@ -3514,6 +3515,11 @@ async def create_session(
     except IdempotencyKeyNotFound as e:
         # lookup_only found nothing committed for this key (review on PR #773).
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except IdempotentCreateFailed as e:
+        # A replay of a create whose initialization failed (review on PR #773).
+        # A distinct status, so the caller reports that cause and does not
+        # mistake it for a retryable server error.
+        raise HTTPException(status_code=status.HTTP_424_FAILED_DEPENDENCY, detail=str(e))
     except IdempotencyKeyConflict as e:
         # The key was already used for a DIFFERENT request (review on PR #634,
         # issue #616). 409, matching Stripe/AWS IdempotentParameterMismatch,
@@ -3790,6 +3796,11 @@ async def create_terminal_in_session(
     except IdempotencyKeyNotFound as e:
         # lookup_only found nothing committed for this key (review on PR #773).
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except IdempotentCreateFailed as e:
+        # A replay of a create whose initialization failed (review on PR #773).
+        # A distinct status, so the caller reports that cause and does not
+        # mistake it for a retryable server error.
+        raise HTTPException(status_code=status.HTTP_424_FAILED_DEPENDENCY, detail=str(e))
     except IdempotencyKeyConflict as e:
         # The key was already used for a DIFFERENT request (review on PR #634,
         # issue #616) — 409, not the 404 the generic ValueError arm below would
