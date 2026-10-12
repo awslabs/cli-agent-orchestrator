@@ -844,7 +844,8 @@ class TestReferencedPathsExist:
 
     @pytest.mark.parametrize("quoted", re.findall(EXAMPLE_PATH_PATTERN, SKILL.read_text()))
     def test_every_referenced_example_path_exists(self, quoted: str):
-        path = REPO_ROOT / quoted.rstrip("/")
+        # A workflow path filter such as `examples/x/images/**` names its folder.
+        path = REPO_ROOT / quoted.removesuffix("**").rstrip("/")
         assert path.exists(), (
             f"The skill references {quoted}, which does not exist. "
             "Paths in a skill are instructions an agent will follow literally."
