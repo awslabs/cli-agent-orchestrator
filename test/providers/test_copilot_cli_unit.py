@@ -14,7 +14,6 @@ from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 
 
 class TestCopilotBoxedComposer:
-    # Synthetic v1.0.95 viewports; layout is independent of the mode footer.
     box = "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀▀▀▀▀\n"
     hint = "← open sidebar · Autopilot · Allow All · / commands · tab next tab"
 
@@ -36,7 +35,6 @@ class TestCopilotBoxedComposer:
         hint = self.hint.replace("Autopilot · Allow All", mode)
         output = reply + composer + update + hint + model + "\n\n"
         if ansi:
-            # capture-pane -e can include SGR; plain captures omit it.
             output = "\x1b[38;2;120;120;120m" + output + "\x1b[0m"
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         expected = TerminalStatus.COMPLETED if reply else TerminalStatus.IDLE
@@ -1503,7 +1501,6 @@ class TestCopilotCompletionChromeExtraction:
         if ansi:
             output = "\x1b[32m" + output + "\x1b[0m"
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
-        # UI-shaped summaries can also contain legitimate review evidence.
         assert provider.extract_last_message_from_script(output) == reply + "\n" + summary.rstrip()
         with patch.object(provider, "_resolve_native_status", return_value=None):
             assert provider.get_status(output) == TerminalStatus.COMPLETED

@@ -238,9 +238,7 @@ class BaseProvider(ABC):
     # rendered viewport without being safe as delivery evidence.
     supports_stale_processing_capture: bool = False
 
-    # Additional opt-in for confirmed quiet-pane recovery from a cached
-    # WAITING_USER_ANSWER. Requires the narrow stale-processing probe/commit
-    # contract above; active approval dialogs must remain waiting in snapshots.
+    # Uses the stale-processing probe/commit contract; active dialogs must stay waiting.
     supports_stale_waiting_capture: bool = False
 
     # Opt-in for the mid-burst PROCESSING probe (StatusMonitor._midburst_processing_probe).

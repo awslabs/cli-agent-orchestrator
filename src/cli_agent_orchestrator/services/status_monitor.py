@@ -119,9 +119,7 @@ class StatusMonitor:
         # notify_input_sent() into the next turn, so the status value alone is
         # not enough to authorize stale-pane self-heal for that new turn.
         self._processing_generation: Dict[str, int] = {}
-        # Waiting evidence is also generation-bound: Copilot can dismiss trust
-        # without a raw FIFO redraw that parses ready. A new input invalidates
-        # this evidence, just as it invalidates stale PROCESSING evidence.
+        # Waiting evidence cannot authorize recovery in a later input generation.
         self._waiting_generation: Dict[str, int] = {}
         # Per-terminal flag: when True, the next provider-detected PROCESSING
         # is honored and stickiness reset. Set by notify_input_sent() whenever
@@ -139,8 +137,7 @@ class StatusMonitor:
         # sentinel is indistinguishable from a genuine reading and could rate-limit the
         # very first check before it ever runs.
         self._last_stale_capture_check: Dict[str, Optional[float]] = {}
-        # A quiet ready candidate needs a second read within its TTL even
-        # when the only caller is the slower inbox reconciliation sweep.
+        # Inbox reconciliation alone polls too slowly to confirm within the TTL.
         self._stale_capture_handle: Dict[str, asyncio.TimerHandle] = {}
         # Per-terminal monotonic timestamp of the last time _process_chunk actually
         # appended a chunk (i.e. the buffer changed) — the STALE_PROCESSING_BUFFER_QUIET_S
@@ -1100,10 +1097,7 @@ class StatusMonitor:
                 return fresh
 
         if cached in (TerminalStatus.PROCESSING, TerminalStatus.WAITING_USER_ANSWER):
-            # Copilot can retain a stale waiting latch after trust is dismissed:
-            # cursor-addressed FIFO redraws are not logical text rows, and a
-            # PROCESSING raw verdict cannot revoke the sticky waiting state.
-            # _fresh_capture_pane_status requires an explicit waiting opt-in.
+            # Waiting recovery requires a provider opt-in and a confirmed pane capture.
             # The cheap re-check above re-derives from the SAME rolling buffer the FIFO
             # pipeline feeds — once the process stops emitting output, that buffer stops
             # changing too, so the re-check can return PROCESSING/UNKNOWN forever while
@@ -1206,10 +1200,7 @@ class StatusMonitor:
     ) -> Optional[TerminalStatus]:
         """Re-detect a stuck terminal from a confirmed fresh pane capture (#558).
 
-        Cached WAITING_USER_ANSWER is recoverable only with the provider's
-        additional narrow waiting opt-in, and current-generation waiting or
-        processing evidence. A live dialog remains waiting; no status is
-        inferred merely from having sent an acceptance key.
+        Waiting recovery also requires an opt-in and current-generation evidence.
 
         ``generation`` is the turn/output generation the caller pinned BEFORE
         deciding to capture. The pane read below runs unlocked, so
@@ -1342,8 +1333,7 @@ class StatusMonitor:
             )
             return None
         if not fresh_output:
-            # A blank mid-redraw sample breaks consecutive confirmation; it
-            # must not let the next ready read confirm a pre-blank candidate.
+            # A blank redraw breaks consecutive confirmation.
             with self._lock:
                 if self._capture_generation.get(terminal_id, 0) == generation:
                     self._pending_stale_capture.pop(terminal_id, None)
@@ -1431,11 +1421,7 @@ class StatusMonitor:
         return detected
 
     def _schedule_stale_capture_confirmation(self, terminal_id: str, generation: int) -> None:
-        """Arrange one normal status re-check, without relying on poll cadence.
-
-        The follow-up uses get_status's quiet, rate, evidence, two-read and
-        apply-time generation gates. Never hold a worker or the loop asleep.
-        """
+        """Schedule a confirming read through the normal status gates."""
         loop = self._loop or self._running_loop()
         if loop is None:
             return
@@ -1474,8 +1460,7 @@ class StatusMonitor:
             self._stale_capture_handle.pop(terminal_id, None)
 
         async def confirm() -> None:
-            # An already queued callback can outlive cancellation. Check again
-            # before forking; get_status also validates any in-flight capture.
+            # A queued callback can outlive cancellation.
             with self._lock:
                 pending = self._pending_stale_capture.get(terminal_id)
                 if (
@@ -1486,9 +1471,7 @@ class StatusMonitor:
                     return
             try:
                 await asyncio.to_thread(self.get_status, terminal_id)
-                # A concurrent poll can consume the rate-limit slot just
-                # before this callback. Keep one follow-up while a current
-                # ready candidate still awaits confirmation.
+                # A concurrent poll may have consumed this capture's rate-limit slot.
                 self._schedule_stale_capture_confirmation(terminal_id, generation)
             except Exception:
                 logger.exception("Stale capture confirmation failed for %s", terminal_id)

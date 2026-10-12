@@ -531,13 +531,7 @@ class CopilotCliProvider(BaseProvider):
 
     @classmethod
     def _last_composer_span(cls, lines: list[str]) -> Optional[tuple[int, int]]:
-        """Return the last composer bounds, with the end exclusive.
-
-        Retained v1.0.95 tmux frames can use an empty heavy box instead of a
-        prompt glyph. Both layouts occur; the mode footer does not select the
-        detector. Require matching borders, an empty interior, and the hint
-        immediately below it; border characters alone are response content.
-        """
+        """Return the last prompt or empty boxed composer bounds (end exclusive)."""
         span = None
         for idx, line in enumerate(lines):
             if re.match(IDLE_PROMPT_LINE_PATTERN, line):
@@ -568,8 +562,7 @@ class CopilotCliProvider(BaseProvider):
         start, end = span
         unrecognized = cls._rows_outside_idle_chrome(tail[end:])
         if end - start > 1:
-            # An always-drawn empty box is not proof that execution stopped.
-            # Do not let it conceal active or approval rows above the composer.
+            # Copilot can keep the composer visible during execution or approval.
             last_user = cls._find_last_user_line(stripped[: len(stripped) - len(tail) + start])
             before = stripped[
                 max(last_user + 1, len(stripped) - 40) : len(stripped) - len(tail) + start
@@ -743,8 +736,7 @@ class CopilotCliProvider(BaseProvider):
         span = self._last_composer_span(lines)
         last_user = self._find_last_user_line(lines[: span[0]] if span else lines)
         post_user = lines[last_user + 1 :]
-        # A viewport can draw a composer (including an unsent draft) below a
-        # live dialog. Stream ordering cannot prove the approval was dismissed.
+        # A composer below a dialog does not prove the dialog was dismissed.
         if re.search(WAITING_PROMPT_PATTERN, "\n".join(post_user), re.IGNORECASE):
             return TerminalStatus.WAITING_USER_ANSWER
         return self.get_status(output)
@@ -756,13 +748,8 @@ class CopilotCliProvider(BaseProvider):
         return IDLE_PROMPT_PATTERN_LOG
 
     @classmethod
-    def _without_completion_chrome(cls, lines: list[str]) -> list[str]:
-        """Remove observed v1.0.95 completion chrome at the composer boundary.
-
-        Keep path-like response rows and all Task complete blocks: their
-        rendered shape cannot distinguish UI summaries from review findings.
-        Remove only the anchored cwd/session row and leading thought heading.
-        """
+    def _without_composer_metadata(cls, lines: list[str]) -> list[str]:
+        """Remove anchored directory/session and leading thought metadata."""
         span = cls._last_composer_span(lines)
         if (
             span is None
@@ -803,14 +790,12 @@ class CopilotCliProvider(BaseProvider):
                 and any(row.lstrip().startswith("│") for row in thought_rows)
                 and all(not row.strip() or row.lstrip().startswith("│") for row in thought_rows)
             ):
-                # The existing footer filter already excludes the │ thought
-                # body; exclude its heading only in this leading UI context.
                 omitted.add(idx)
         return [row for idx, row in enumerate(lines) if idx not in omitted]
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         clean_output = self._clean(script_output)
-        lines = self._without_completion_chrome(clean_output.splitlines())
+        lines = self._without_composer_metadata(clean_output.splitlines())
         clean_output = "\n".join(lines)
         last_user = self._find_last_user_line(lines)
 

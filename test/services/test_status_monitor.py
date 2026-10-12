@@ -1689,8 +1689,7 @@ class TestCopilotBoxedComposerRecovery:
             patch("cli_agent_orchestrator.services.status_monitor.bus.publish") as publish,
         ):
             sm._on_stale_capture_confirmation("t1", 3, handle)
-            # The timer fired, but its coroutine has not yet run. An input or
-            # candidate invalidation in this gap must prevent even a capture.
+            # Invalidate after the timer fires but before its coroutine runs.
             if boundary == "input":
                 sm.notify_input_sent("t1")
             elif boundary == "candidate_cleared":
@@ -1819,15 +1818,13 @@ class TestCopilotStaleWaitingCapture:
         composer = "❯\n" if layout == "prompt" else "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀▀▀▀▀\n"
         ready = composer + self.hint + "\n"
         sm = StatusMonitor()
-        # Exercise FIFO ingestion and the real provider; no background timers.
         with patch.object(sm, "_running_loop", return_value=None):
             sm._process_chunk("t1", self.trust)
             assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
             if redraw != "lost":
                 if redraw == "evicted":
                     mock_settings.return_value = {"state_buffer_max": 40}
-                # Cursor-addressed redraws need not contain newline-delimited
-                # logical rows. Stripping CSI cannot reconstruct the viewport.
+                # Stripping CSI does not reconstruct cursor-addressed rows.
                 sm._process_chunk("t1", "\x1b[2J\x1b[H❯\x1b[2;1H" + self.hint)
         assert sm._last_status["t1"] == TerminalStatus.WAITING_USER_ANSWER
         assert provider.get_status(ready) == TerminalStatus.IDLE
@@ -1951,7 +1948,6 @@ class TestCopilotStaleWaitingCapture:
         backend.get_history.side_effect = None
         sm._last_stale_capture_check["t1"] = None
         assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
-        # New provider evidence is required before the new generation can recover.
         sm._process_chunk("t1", "\nConfirm folder trust\n")
         sm._buffer_changed_at["t1"] = -1000
         sm._last_stale_capture_check["t1"] = None

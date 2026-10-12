@@ -88,8 +88,7 @@ class TestCopilotQuietInboxRecovery:
             patch("cli_agent_orchestrator.services.status_monitor.bus.publish") as publish,
         ):
             svc = InboxService()
-            # Thirty-second reconciliation polls always outlive the six-second
-            # candidate TTL. The monitor must arrange its own confirming read.
+            # Reconciliation polls arrive after the confirmation TTL expires.
             svc.reconcile_orphaned_messages()
             send.assert_not_called()
             assert timers, "a quiet ready candidate needs a follow-up within its TTL"
@@ -136,7 +135,6 @@ class TestCopilotQuietInboxRecovery:
             if interruption in (None, "rate_limit"):
                 assert sm._last_status["term-1"] == TerminalStatus.IDLE
                 publish.assert_called_with("terminal.term-1.status", {"status": "idle"})
-                # Exercise the event-driven inbox consumer's normal delivery gate.
                 svc.deliver_pending("term-1")
                 send.assert_called_once_with("term-1", "hello")
                 update.assert_called_once_with(1, MessageStatus.DELIVERED)
