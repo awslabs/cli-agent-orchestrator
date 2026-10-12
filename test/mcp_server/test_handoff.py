@@ -1117,14 +1117,6 @@ class TestHandoffCreateTimeoutRecovery:
         mock_requests.post.assert_not_called()
 
     @staticmethod
-    def _http_error(status_code):
-        import requests
-
-        response = requests.Response()
-        response.status_code = status_code
-        return requests.exceptions.HTTPError(f"{status_code} error", response=response)
-
-    @staticmethod
     def _http_error(status_code, detail=None):
         import requests
 
