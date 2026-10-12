@@ -6,6 +6,7 @@ backends (tmux) it returns the pushed pipeline status; for event-inbox backends
 provider's native status. These tests pin both paths.
 """
 
+import asyncio
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -1656,6 +1657,75 @@ class TestStatusObservationIsStampedWhenEarned:
 
 
 class TestCopilotBoxedComposerRecovery:
+    def test_confirmation_scheduling_during_shutdown_keeps_processing(self):
+        sm = StatusMonitor()
+        sm._loop = MagicMock()
+        sm._loop.call_soon_threadsafe.side_effect = RuntimeError("Event loop is closed")
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._capture_generation["t1"] = 3
+        candidate = (TerminalStatus.IDLE, 100.0, 3)
+        sm._pending_stale_capture["t1"] = candidate
+        with patch("cli_agent_orchestrator.services.status_monitor.bus.publish") as publish:
+            sm._schedule_stale_capture_confirmation("t1", 3)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert sm._pending_stale_capture["t1"] == candidate
+        assert not sm._stale_capture_handle
+        assert not sm._detect_tasks
+        sm._loop.call_later.assert_not_called()
+        publish.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("boundary", ["input", "candidate_cleared", "candidate_replaced"])
+    async def test_queued_confirmation_revalidates_before_capture(self, boundary):
+        sm = StatusMonitor()
+        sm._loop = asyncio.get_running_loop()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._capture_generation["t1"] = 3
+        sm._pending_stale_capture["t1"] = (TerminalStatus.IDLE, 100.0, 3)
+        handle = MagicMock()
+        sm._stale_capture_handle["t1"] = handle
+        with (
+            patch.object(sm, "get_status") as capture,
+            patch("cli_agent_orchestrator.services.status_monitor.bus.publish") as publish,
+        ):
+            sm._on_stale_capture_confirmation("t1", 3, handle)
+            # The timer fired, but its coroutine has not yet run. An input or
+            # candidate invalidation in this gap must prevent even a capture.
+            if boundary == "input":
+                sm.notify_input_sent("t1")
+            elif boundary == "candidate_cleared":
+                sm._pending_stale_capture.pop("t1")
+            else:
+                sm._pending_stale_capture["t1"] = (TerminalStatus.IDLE, 101.0, 4)
+            await asyncio.gather(*list(sm._detect_tasks))
+        capture.assert_not_called()
+        publish.assert_not_called()
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert not sm._stale_capture_handle
+
+    @pytest.mark.asyncio
+    async def test_confirmation_read_failure_keeps_processing_and_is_reported(self):
+        sm = StatusMonitor()
+        sm._loop = asyncio.get_running_loop()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._capture_generation["t1"] = 3
+        sm._pending_stale_capture["t1"] = (TerminalStatus.IDLE, 100.0, 3)
+        handle = MagicMock()
+        sm._stale_capture_handle["t1"] = handle
+        with (
+            patch.object(sm, "get_status", side_effect=RuntimeError("capture unavailable")),
+            patch.object(sm, "_schedule_stale_capture_confirmation") as reschedule,
+            patch("cli_agent_orchestrator.services.status_monitor.logger") as logger,
+            patch("cli_agent_orchestrator.services.status_monitor.bus.publish") as publish,
+        ):
+            sm._on_stale_capture_confirmation("t1", 3, handle)
+            await asyncio.gather(*list(sm._detect_tasks))
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert not sm._stale_capture_handle
+        logger.exception.assert_called_once_with("Stale capture confirmation failed for %s", "t1")
+        reschedule.assert_not_called()
+        publish.assert_not_called()
+
     def test_cancelled_confirmation_cannot_remove_a_new_turn_timer(self):
         sm = StatusMonitor()
         old_handle = MagicMock()
