@@ -1012,3 +1012,38 @@ def test_cwd_reaches_the_shared_mcp_config(tmp_path):
     entry = json.loads(cfg.read_text())["mcpServers"]["demo-tools-test-tid"]
     assert entry["cwd"] == "/plugins/demo"
     assert entry["command"] == "demo-server", "must NOT be shimmed: the format has a cwd field"
+
+
+# --------------------------------------------------------------------------- #
+# Mid-burst PROCESSING probe
+# --------------------------------------------------------------------------- #
+
+
+def test_provider_opts_into_midburst_probe():
+    """agy animates its spinner for the whole turn, so only the probe sees the
+    turn: without it the terminal read IDLE until the turn ended, and the
+    delivery check re-sent a task that the worker was already running (live,
+    agy 1.3.3, 2026-10-11)."""
+    assert make_provider().supports_midburst_processing_probe is True
+
+
+def test_probe_sees_the_processing_footer():
+    screen = ["> analyze this", "⣽  Working...", "─" * 80, "esc to cancel   Gemini 3.1 Pro"]
+    assert make_provider().probe_processing_from_screen(screen) is True
+
+
+def test_probe_needs_positive_evidence():
+    screen = ["> analyze this", "─" * 80, "? for shortcuts   Gemini 3.1 Pro"]
+    assert make_provider().probe_processing_from_screen(screen) is False
+
+
+def test_probe_leaves_an_approval_prompt_to_the_detector():
+    screen = ["Do you want to allow this action? [y/n]", "esc to cancel   Gemini 3.1 Pro"]
+    assert make_provider().probe_processing_from_screen(screen) is False
+
+
+def test_probe_changes_no_turn_state():
+    provider = make_provider()
+    turns = provider._turns
+    provider.probe_processing_from_screen(["esc to cancel   Gemini 3.1 Pro"])
+    assert provider._turns == turns

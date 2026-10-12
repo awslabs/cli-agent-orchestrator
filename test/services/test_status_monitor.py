@@ -43,6 +43,154 @@ class TestGetStatusTmux:
         assert sm.get_status("missing") == TerminalStatus.UNKNOWN
 
 
+class TestPollerRecheckInput:
+    """The cheap re-check that get_status() runs for a poller while a terminal
+    reads PROCESSING parses the raw buffer, unless the provider opts in to the
+    screen with ``status_recheck_uses_screen``. A Codex raw buffer of a working
+    turn parsed as IDLE; applied, it ended PROCESSING right after it began, and
+    the latch then refused the turn's real PROCESSING (live, 2026-10-11)."""
+
+    @staticmethod
+    def _provider(screen_recheck):
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.supports_direct_status_probe = False
+        provider.supports_stale_processing_capture = False
+        provider.status_recheck_uses_screen = screen_recheck
+        provider.get_status.return_value = TerminalStatus.IDLE  # the raw buffer
+        provider.get_status_from_screen.return_value = TerminalStatus.PROCESSING
+        return provider
+
+    @staticmethod
+    def _monitor():
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = "raw redraw fragments"
+        sm._buffer_changed_at["t1"] = time.monotonic()
+        with sm._lock:
+            sm._feed_screen_locked("t1", "• Working (3s • esc to interrupt)")
+        return sm
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_opted_in_provider_rechecks_the_screen(self, mock_pm, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = self._provider(screen_recheck=True)
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        provider.get_status.assert_not_called()
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_polls_on_unchanged_output_reuse_the_verdict(self, mock_pm, mock_get_backend):
+        """The render holds the lock that the output consumer needs."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = self._provider(screen_recheck=True)
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+
+        for _ in range(3):
+            assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert provider.get_status_from_screen.call_count == 1
+
+        sm._output_generation["t1"] = sm._output_generation.get("t1", 0) + 1
+        sm.get_status("t1")
+        assert provider.get_status_from_screen.call_count == 2
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_codex_recheck_reads_its_screen(self, mock_pm, mock_get_backend, mock_codex_backend):
+        """A real Codex provider: its raw buffer parses IDLE, its screen shows
+        a reply that is still streaming."""
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+
+        provider = CodexProvider("t1", "s", "w")
+        provider._codex_version = (0, 160, 0)
+        provider._ends_turns_with_footer = True
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        mock_get_backend.return_value = backend
+        mock_codex_backend.return_value = backend
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = "› Ask Codex to do anything\n  gpt-6 · /tmp/project\n"
+        sm._buffer_changed_at["t1"] = time.monotonic()
+        with sm._lock:
+            sm._feed_screen_locked(
+                "t1",
+                "\r\n".join(
+                    [
+                        "› Analyze Dataset A.",
+                        "• The mean is 3, because the values are",
+                        "› Ask Codex to do anything",
+                        "  gpt-6 · /tmp/project",
+                    ]
+                ),
+            )
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_ready_verdict_from_output_that_changed_during_the_read_is_not_applied(
+        self, mock_pm, mock_get_backend
+    ):
+        """The read releases the lock. A chunk that lands meanwhile can show a
+        new turn, and the old ready verdict would let the inbox type into it."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = self._provider(screen_recheck=True)
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+
+        def read_while_a_chunk_lands(_lines):
+            with sm._lock:
+                sm._output_generation["t1"] = sm._output_generation.get("t1", 0) + 1
+            return TerminalStatus.COMPLETED
+
+        provider.get_status_from_screen.side_effect = read_while_a_chunk_lands
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert "t1" not in sm._recheck_cache
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_ready_verdict_is_not_applied_after_newer_output(self, mock_pm, mock_get_backend):
+        """Output can also land between the read and the apply."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = self._provider(screen_recheck=True)
+        provider.get_status_from_screen.return_value = TerminalStatus.COMPLETED
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+        generation = sm._output_generation.get("t1", 0)
+
+        assert (
+            sm._apply_detection("t1", TerminalStatus.COMPLETED, output_generation=generation + 1)
+            is False
+        )
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert (
+            sm._apply_detection("t1", TerminalStatus.COMPLETED, output_generation=generation)
+            is True
+        )
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_other_providers_keep_the_raw_recheck(self, mock_pm, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = self._provider(screen_recheck=False)
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+
+        assert sm.get_status("t1") == TerminalStatus.IDLE
+        provider.get_status.assert_called_once_with("raw redraw fragments")
+
+
 class TestGetStatusEventInbox:
     """Event-inbox backend (herdr): derive status on demand from the provider."""
 

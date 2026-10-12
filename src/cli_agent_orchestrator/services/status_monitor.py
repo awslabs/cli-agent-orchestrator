@@ -211,6 +211,10 @@ class StatusMonitor:
         # keeps status flap-free.
         self._screens: Dict[str, Tuple["pyte.Screen", "pyte.Stream"]] = {}
         self._bursting: Dict[str, bool] = {}
+        # The last screen re-check of a poller, per terminal: (output generation,
+        # verdict). A poll on the same output reuses the verdict instead of
+        # rendering the screen again under the lock (see _redetect).
+        self._recheck_cache: Dict[str, Tuple[int, TerminalStatus]] = {}
         # Pending quiescence-detect timer handle per terminal (loop.call_later).
         self._quiesce_handle: Dict[str, asyncio.TimerHandle] = {}
         # The event loop that owns the quiescence timers. Captured when the
@@ -326,9 +330,14 @@ class StatusMonitor:
         detected: TerminalStatus,
         *,
         processing_evidence: bool = True,
-    ) -> None:
+        output_generation: Optional[int] = None,
+    ) -> bool:
         """Apply the sticky-latch rules to a freshly detected status and publish
         on change. Shared by the raw and pyte detection paths.
+
+        ``output_generation`` is the output generation that the verdict was
+        read from. When newer output has landed since, the verdict is stale and
+        is not applied; the return value is False. Otherwise it is True.
 
         Stickiness: once a ready status is latched, refuse downgrades unless
         notify_input_sent() armed a revert. Two kinds of downgrade are blocked:
@@ -340,6 +349,11 @@ class StatusMonitor:
         paste into a busy agent).
         """
         with self._lock:
+            if (
+                output_generation is not None
+                and self._output_generation.get(terminal_id, 0) != output_generation
+            ):
+                return False
             # Refresh even if PROCESSING is already cached: after a new input
             # generation, seeing real PROCESSING again is what makes a later
             # quiet-buffer capture eligible for recovery.
@@ -366,6 +380,7 @@ class StatusMonitor:
             # re-enter StatusMonitor while the latch state is mid-update.
             bus.publish(f"terminal.{terminal_id}.status", {"status": detected.value})
             logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
+        return True
 
     def _apply_detection_locked(self, terminal_id: str, detected: TerminalStatus) -> bool:
         """Sticky-latch core of _apply_detection. Caller MUST hold self._lock.
@@ -945,6 +960,41 @@ class StatusMonitor:
             if provider is not None:
                 provider.notify_status_buffer_reset(epoch)
 
+    def _redetect(self, terminal_id: str, buffer: str) -> Tuple[TerminalStatus, Optional[int]]:
+        """Detect status again for a poller, from the input that the provider reads.
+
+        A provider that sets ``status_recheck_uses_screen`` reads the
+        composited screen here too, not the raw buffer (see that flag). The
+        render holds the lock that the output consumer needs, so a poll on
+        output that has not changed reuses the last verdict.
+
+        Returns the verdict and, for the screen, the output generation that it
+        was read from, so that the caller applies it only while that output is
+        current. A chunk that lands during the read makes the sample stale:
+        UNKNOWN, which keeps the cached status. (The raw re-check keeps its
+        older behavior: a TUI that keeps sending escape sequences while idle,
+        such as kiro-cli, never stops advancing the generation.)
+        """
+        provider = provider_manager.get_provider(terminal_id)
+        if not (
+            CAO_PYTE_STATUS
+            and provider is not None
+            and getattr(provider, "supports_screen_detection", False)
+            and getattr(provider, "status_recheck_uses_screen", False) is True
+        ):
+            return self._detect_status(terminal_id, buffer), None
+        with self._lock:
+            generation = self._output_generation.get(terminal_id, 0)
+            cached = self._recheck_cache.get(terminal_id)
+        if cached is not None and cached[0] == generation:
+            return cached[1], generation
+        verdict = self._detect_screen(terminal_id, provider)
+        with self._lock:
+            if self._output_generation.get(terminal_id, 0) != generation:
+                return TerminalStatus.UNKNOWN, generation
+            self._recheck_cache[terminal_id] = (generation, verdict)
+        return verdict, generation
+
     def _detect_status(self, terminal_id: str, buffer: str) -> TerminalStatus:
         """Detect status: provider-specific patterns or UNKNOWN if no provider."""
         provider = provider_manager.get_provider(terminal_id)
@@ -968,6 +1018,7 @@ class StatusMonitor:
             self._midburst_probe_at.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
+            self._recheck_cache.pop(terminal_id, None)
             self._last_stale_capture_check.pop(terminal_id, None)
             self._buffer_changed_at.pop(terminal_id, None)
             self._pending_stale_capture.pop(terminal_id, None)
@@ -998,6 +1049,7 @@ class StatusMonitor:
             # detected against a fresh viewport, not the failed attempt's.
             self._screens.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
+            self._recheck_cache.pop(terminal_id, None)
             self._last_stale_capture_check.pop(terminal_id, None)
             self._buffer_changed_at.pop(terminal_id, None)
             self._pending_stale_capture.pop(terminal_id, None)
@@ -1071,14 +1123,17 @@ class StatusMonitor:
             )
 
         if cached == TerminalStatus.PROCESSING and buffer:
-            fresh = self._detect_status(terminal_id, buffer)
+            fresh, generation = self._redetect(terminal_id, buffer)
             logger.debug(
                 f"get_status [{terminal_id}]: cached=PROCESSING, "
                 f"fresh={fresh.value}, buffer_len={len(buffer)}"
             )
             if fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
-                self._apply_detection(terminal_id, fresh)
-                return fresh
+                if self._apply_detection(terminal_id, fresh, output_generation=generation):
+                    return fresh
+                # Newer output landed after the read: the verdict is stale.
+                with self._lock:
+                    return self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
 
         if cached == TerminalStatus.PROCESSING:
             # The cheap re-check above re-derives from the SAME rolling buffer the FIFO

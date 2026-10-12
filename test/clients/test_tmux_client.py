@@ -1000,19 +1000,58 @@ class TestStopPipePane:
 
 
 class TestGetPaneCurrentCommand:
-    def test_get_pane_current_command_success(self, tmux):
+    @staticmethod
+    def _pane_reports(tmux, line):
         mock_session = MagicMock()
         mock_window = MagicMock()
         mock_pane = MagicMock()
-        mock_pane.cmd.return_value.stdout = ["bash"]
+        mock_pane.cmd.return_value.stdout = [line]
         mock_window.active_pane = mock_pane
         mock_session.windows.get.return_value = mock_window
         tmux.server.sessions.get.return_value = mock_session
+        return mock_pane
 
-        result = tmux.get_pane_current_command("ses", "win")
+    def test_get_pane_current_command_success(self, tmux):
+        mock_pane = self._pane_reports(tmux, "node\t4242")
+
+        with patch("cli_agent_orchestrator.clients.tmux._command_inside_pty_proxy") as inside:
+            result = tmux.get_pane_current_command("ses", "win")
+
+        assert result == "node"
+        mock_pane.cmd.assert_called_once_with(
+            "display-message", "-p", "#{pane_current_command}\t#{pane_pid}"
+        )
+        inside.assert_not_called()
+
+    def test_shell_outside_a_proxy_keeps_the_tmux_name(self, tmux):
+        self._pane_reports(tmux, "bash\t4242")
+
+        with patch(
+            "cli_agent_orchestrator.clients.tmux._command_inside_pty_proxy", return_value=None
+        ) as inside:
+            result = tmux.get_pane_current_command("ses", "win")
 
         assert result == "bash"
-        mock_pane.cmd.assert_called_once_with("display-message", "-p", "#{pane_current_command}")
+        inside.assert_called_once_with(4242)
+
+    def test_shell_that_is_a_pty_proxy_reports_the_inner_program(self, tmux):
+        """Kiro CLI's shell integration makes the pane process ``zsh
+        (kiro-cli-term)``, so tmux reports ``zsh`` while kiro-cli runs inside."""
+        self._pane_reports(tmux, "zsh\t4242")
+
+        with patch(
+            "cli_agent_orchestrator.clients.tmux._command_inside_pty_proxy",
+            return_value="kiro-cli",
+        ):
+            assert tmux.get_pane_current_command("ses", "win") == "kiro-cli"
+
+    def test_shell_without_a_pane_pid_keeps_the_tmux_name(self, tmux):
+        self._pane_reports(tmux, "zsh")
+
+        with patch("cli_agent_orchestrator.clients.tmux._command_inside_pty_proxy") as inside:
+            assert tmux.get_pane_current_command("ses", "win") == "zsh"
+
+        inside.assert_not_called()
 
     def test_get_pane_current_command_session_not_found(self, tmux):
         tmux.server.sessions.get.return_value = None
@@ -1036,6 +1075,159 @@ class TestGetPaneCurrentCommand:
         result = tmux.get_pane_current_command("ses", "win")
 
         assert result is None
+
+
+def _fake_process(pid, name, session, started, parent, group=None):
+    process = MagicMock()
+    process.pid = pid
+    process.session = session
+    process.group = pid if group is None else group
+    process.name.return_value = name
+    process.create_time.return_value = started
+    process.ppid.return_value = parent
+    return process
+
+
+class TestCommandInsidePtyProxy:
+    """The process tree under the pane process, read with psutil."""
+
+    def _inside(self, pane_pid, processes, foreground=None):
+        from cli_agent_orchestrator.clients.tmux import _command_inside_pty_proxy
+
+        by_pid = {p.pid: p for p in processes}
+        pane = MagicMock()
+        pane.children.return_value = [p for p in processes if p.pid != pane_pid]
+        sessions = {p.pid: p.session for p in processes}
+        groups = {p.pid: p.group for p in processes}
+        assert pane_pid in by_pid
+        with (
+            patch("cli_agent_orchestrator.clients.tmux.psutil.Process", return_value=pane),
+            patch(
+                "cli_agent_orchestrator.clients.tmux.os.getsid", side_effect=sessions.__getitem__
+            ),
+            patch("cli_agent_orchestrator.clients.tmux.os.getpgid", side_effect=groups.__getitem__),
+            patch(
+                "cli_agent_orchestrator.clients.tmux._foreground_process_group",
+                return_value=foreground,
+            ),
+        ):
+            return _command_inside_pty_proxy(pane_pid)
+
+    def test_a_shell_and_its_program_in_one_session_are_not_a_proxy(self):
+        shell = _fake_process(10, "zsh", 10, 1.0, 1)
+        program = _fake_process(11, "vim", 10, 2.0, 10)
+
+        assert self._inside(10, [shell, program], foreground=11) is None
+
+    def test_the_foreground_program_of_the_inner_shell_is_reported(self):
+        proxy = _fake_process(10, "zsh (kiro-cli-term)", 10, 1.0, 1)
+        shell = _fake_process(11, "zsh", 11, 2.0, 10)
+        program = _fake_process(12, "kiro-cli", 11, 3.0, 11)
+
+        assert self._inside(10, [proxy, shell, program], foreground=12) == "kiro-cli"
+
+    def test_an_inner_shell_at_its_prompt_reports_the_shell(self):
+        """A background child of the shell, such as p10k's gitstatusd, is not
+        the program in the foreground."""
+        proxy = _fake_process(10, "zsh (kiro-cli-term)", 10, 1.0, 1)
+        shell = _fake_process(11, "zsh", 11, 2.0, 10)
+        helper = _fake_process(12, "gitstatusd", 11, 3.0, 11)
+
+        assert self._inside(10, [proxy, shell, helper], foreground=11) == "zsh"
+
+    def test_unknown_foreground_group_reports_the_newest_job(self):
+        proxy = _fake_process(10, "zsh (kiro-cli-term)", 10, 1.0, 1)
+        shell = _fake_process(11, "zsh", 11, 2.0, 10)
+        older = _fake_process(12, "sleep", 11, 3.0, 11)
+        newer = _fake_process(13, "codex", 11, 4.0, 11)
+
+        assert self._inside(10, [proxy, shell, older, newer], foreground=None) == "codex"
+
+    def test_a_child_in_another_session_that_is_not_a_shell_is_not_a_proxy(self):
+        """A daemon that the pane's shell started with setsid."""
+        shell = _fake_process(10, "zsh", 10, 1.0, 1)
+        daemon = _fake_process(11, "gitstatusd", 11, 2.0, 10)
+
+        assert self._inside(10, [shell, daemon], foreground=10) is None
+
+    def test_a_process_that_exits_during_the_scan_is_skipped(self):
+        import psutil
+
+        proxy = _fake_process(10, "zsh (kiro-cli-term)", 10, 1.0, 1)
+        shell = _fake_process(11, "zsh", 11, 2.0, 10)
+        gone = _fake_process(12, "sh", 11, 3.0, 11)
+        gone.ppid.side_effect = psutil.NoSuchProcess(12)
+        program = _fake_process(13, "codex", 11, 4.0, 11)
+
+        assert self._inside(10, [proxy, shell, gone, program], foreground=13) == "codex"
+
+    def test_an_unreadable_process_table_returns_none(self):
+        import psutil
+
+        from cli_agent_orchestrator.clients.tmux import _command_inside_pty_proxy
+
+        with patch(
+            "cli_agent_orchestrator.clients.tmux.psutil.Process",
+            side_effect=psutil.NoSuchProcess(4242),
+        ):
+            assert _command_inside_pty_proxy(4242) is None
+
+    @staticmethod
+    def _run_real_proxy(inner_command):
+        """A process that forks a shell onto a new pty is a proxy, as
+        kiro-cli-term is. Return what the look-through reports for it."""
+        import sys
+        import time
+
+        import psutil
+
+        from cli_agent_orchestrator.clients.tmux import _command_inside_pty_proxy
+
+        proxy = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import os, pty, sys\n"
+                "pid, fd = pty.fork()\n"
+                "if pid == 0:\n"
+                "    os.execvp('sh', ['sh', '-c', sys.argv[1]])\n"
+                "os.waitpid(pid, 0)\n",
+                inner_command,
+            ],
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            names = []
+            while time.monotonic() < deadline:
+                name = _command_inside_pty_proxy(proxy.pid)
+                if name not in (None, "python3", "python"):
+                    names.append(name)
+                    if len(names) >= 3 and names[-1] == names[-2] == names[-3]:
+                        return name
+                time.sleep(0.2)
+            return names[-1] if names else None
+        finally:
+            try:
+                for child in psutil.Process(proxy.pid).children(recursive=True):
+                    child.kill()
+            except psutil.Error:
+                pass
+            proxy.kill()
+            proxy.wait(timeout=10)
+
+    def test_a_real_pty_proxy_reports_the_foreground_job(self):
+        # "set -m" turns on job control, as in the interactive shell of a pane.
+        assert self._run_real_proxy("set -m; sleep 30; :") == "sleep"
+
+    def test_a_real_pty_proxy_with_a_background_job_reports_the_shell(self):
+        from cli_agent_orchestrator.constants import BRACKETED_PASTE_INCOMPATIBLE_SHELLS
+
+        # /bin/sh is dash on Debian and bash on macOS.
+        assert self._run_real_proxy("set -m; sleep 30 & wait") in (
+            BRACKETED_PASTE_INCOMPATIBLE_SHELLS
+        )
 
 
 class TestPaneIsBracketedPasteIncompatible:

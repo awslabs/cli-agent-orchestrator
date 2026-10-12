@@ -141,21 +141,31 @@ Announce the run-id before you start so the user can cancel it:
 Choose the invocation by how the run is triggered, because the two paths have very
 different client-side ceilings:
 
-- **`cao workflow run` (CLI)** uses a client socket timeout of **~8820s (~2.45h)** — the CLI
-  itself won't give up early.
-- **`workflow_run` MCP tool** is bounded by the **MCP host's own per-tool-call timeout** — a
-  host-dependent, much-shorter limit that can **drop a long blocking call and lose its return
+- **`cao workflow run` (CLI)** submits the run, prints the run id, then follows it by
+  polling until it finishes. It exits 0 on `completed` and 1 on `failed` or `cancelled`.
+  No single request has to last the whole run. **Ctrl-C detaches and never cancels**: the
+  run keeps going server-side, and `cao workflow wait <id>` picks it up again.
+  - `--detach` submits, prints the id, and exits 0 without following.
+  - `--wait` is the fully blocking path. It holds one request open until the run finishes,
+    with a client socket timeout of **~8820s (~2.45h)**, and is the only `run` form whose
+    `--json` returns the full `WorkflowRunResult`.
+- **`workflow_run` MCP tool** blocks, and is bounded by the **MCP host's own per-tool-call
+  timeout** — a host-dependent, much-shorter limit that can **drop a long blocking call and lose its return
   value even though the server run keeps going**.
 
 So:
 
 - **Short runs**: call the `workflow_run` MCP tool (blocking) and read the result directly.
-- **Long runs**: background the run and poll, rather than blocking on it —
+- **Long runs from an agent**: submit without blocking, then poll. Over MCP, call
+  `workflow_start` with the pre-announced run id, then `workflow_status` or
+  `workflow_wait`, then `workflow_result`. From a shell:
   ```
-  cao workflow run <name> --run-id <id> --json &
+  cao workflow run <name> --run-id <id> --detach
+  cao workflow status <id>
+  cao workflow result <id> --json
   ```
-  Backgrounding keeps the run alive server-side without a short MCP host timeout silently
-  dropping the return.
+- **Long runs from a user's terminal**: plain `cao workflow run <name> --run-id <id>` is
+  fine; it follows the run and Ctrl-C only detaches.
 
 ### e. RESUME
 
@@ -357,5 +367,6 @@ Validate it, ask the user, then run with a pre-announced run-id:
 ```
 cao workflow validate ~/.aws/cli-agent-orchestrator/workflows/summarize_dir.py
 # fix findings, then — after the user approves:
-cao workflow run summarize_dir --run-id sum-1 --json &
+cao workflow run summarize_dir --run-id sum-1 --detach
+cao workflow wait sum-1
 ```

@@ -13,6 +13,77 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 
 
+class TestCopilotDownloadedUpdateFooter:
+    hint = (
+        "v1.0.94 downloaded · next launch or /restart · "
+        "← open sidebar · Autopilot · Allow All · / commands · tab next tab"
+    )
+    model = "reviewer · Claude Haiku 5.5"
+
+    @pytest.mark.parametrize("version", ["v1.0.94", "v1.0.96-2", "v1.0.95-0"])
+    @pytest.mark.parametrize("shared_row", [True, False])
+    @pytest.mark.parametrize("reply", ["", "❯ review the change\n● FINDINGS: NO\n"])
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    def test_downloaded_update_footer_is_ready(self, mock_backend, shared_row, reply, version):
+        hint = self.hint.replace("v1.0.94", version)
+        footer = f"{hint}            {self.model}" if shared_row else f"{hint}\n{self.model}"
+        rule = "─" * 160
+        output = f"{reply}{rule}\n❯\n{rule}\n {footer}\n"
+        mock_backend.return_value.get_native_status.return_value = None
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        expected = TerminalStatus.COMPLETED if reply else TerminalStatus.IDLE
+        assert provider.get_status(output) == expected
+        assert provider.probe_stale_processing_capture(output) == expected
+        assert provider.commit_stale_processing_capture(output, expected) is True
+        if reply:
+            assert provider.extract_last_message_from_script(output) == "● FINDINGS: NO"
+        else:
+            with pytest.raises(ValueError, match="No provider response content found"):
+                provider.extract_last_message_from_script(output)
+
+    @pytest.mark.parametrize(
+        "row, expected",
+        [
+            ("∙ Thinking (Esc to cancel)", TerminalStatus.PROCESSING),
+            ("⠋ Working · esc interrupt · enqueue", TerminalStatus.PROCESSING),
+            ("Allow this tool to run? [y/n]", TerminalStatus.WAITING_USER_ANSWER),
+            ("Error: connection failed", TerminalStatus.ERROR),
+            ("Queued", TerminalStatus.PROCESSING),
+        ],
+    )
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    def test_downloaded_update_does_not_hide_blocking_rows(self, mock_backend, row, expected):
+        output = f"❯ review\n● Partial reply\n❯\n{self.hint}\n{self.model}\n{row}\n"
+        mock_backend.return_value.get_native_status.return_value = None
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(output) == expected
+        assert provider.probe_stale_processing_capture(output) == expected
+        assert provider.commit_stale_processing_capture(output, TerminalStatus.IDLE) is False
+        assert provider.commit_stale_processing_capture(output, TerminalStatus.COMPLETED) is False
+
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            "v1.0.94 downloading · next launch or /restart · ",
+            "v1.0.94 downloaded · restart failed · ",
+            "unknown notification · ",
+        ],
+    )
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    def test_unknown_update_notice_is_not_idle_chrome(self, mock_backend, prefix):
+        hint = "← open sidebar · Autopilot · Allow All · / commands · tab next tab"
+        output = f"❯\n{prefix}{hint}            {self.model}\n"
+        mock_backend.return_value.get_native_status.return_value = None
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_downloaded_update_text_in_reply_is_preserved(self):
+        reply = f"● Footer example:\n{self.hint}\nDo not restart this session."
+        output = f"❯ explain the footer\n{reply}\n❯\n{self.hint}            {self.model}\n"
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.extract_last_message_from_script(output) == reply
+
+
 class TestCopilotCliProviderCommand:
     @patch("cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._supports_flag")
     @patch(

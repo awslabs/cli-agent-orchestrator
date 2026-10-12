@@ -183,6 +183,8 @@ def update():
     unpinned to the latest. A local directory/path/editable install can't be
     advanced remotely, so the command prints the exact steps instead. Requires
     that CAO was installed as a uv tool.
+
+    Acts immediately; there is no confirmation prompt.
     """
     if shutil.which("uv") is None:
         raise click.ClickException(
