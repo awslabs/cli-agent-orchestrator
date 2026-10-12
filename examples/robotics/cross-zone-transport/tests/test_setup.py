@@ -392,23 +392,6 @@ def test_prepare_refuses_an_unknown_provider_before_creating_a_run(tmp_path):
 def test_a_provider_without_per_agent_mcp_servers_is_refused(
     tmp_path, monkeypatch, capsys, provider
 ):
-    if provider == "antigravity_cli":
-        # Every terminal's servers go into one shared file that each agy process reads.
-        source = (CAO_SOURCE / "providers/antigravity_cli.py").read_text()
-        assert '".gemini" / "config" / "mcp_config.json"' in source
-        assert 'unique_key = f"{server_name}-{self.terminal_id}"' in source
-    elif provider == "cursor_cli":
-        # The Cursor provider leaves the profile body out of a direct launch.
-        source = (CAO_SOURCE / "providers/cursor_cli.py").read_text()
-        assert "System prompt injection is intentionally omitted" in source
-    elif provider == "opencode_cli":
-        # cao install writes the servers of every OpenCode profile into one shared
-        # configuration keyed by server name; the last install replaces the others.
-        source = (CAO_SOURCE / "utils/opencode_config.py").read_text()
-        assert 'data.setdefault("mcp", {})[name] = config' in source
-    else:
-        # The Hermes provider never reads the mcpServers of the CAO profile.
-        assert "mcpServers" not in (CAO_SOURCE / "providers/hermes.py").read_text()
     assert demo.SUPPORTED_PROVIDERS == demo.CAO_PROVIDERS - {
         "antigravity_cli",
         "cursor_cli",

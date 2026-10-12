@@ -6,7 +6,14 @@ each area. You start the simulator and the agents on your laptop. Then you
 watch the agents plan the job and divide the work. The agents pass the parcel
 from one team to the other, and they check the result.
 
+![The simulated floor at the end of the demo. The pink parcel is on the green east cart at etch, in the east zone. The blue west cart waits at the amber dock.](images/run-5-delivered.png)
+
+<details>
+<summary>Play the animation of the demo (13 seconds, repeats)</summary>
+
 ![Animation of the cross-zone transport in MuJoCo. The blue west cart carries the pink parcel from stock to the amber dock. West offers custody to east, and east accepts it. Then the green east cart carries the parcel to etch, and the checker confirms the parcel at etch, owner east.](images/cross-zone-transport.gif)
+
+</details>
 
 **The demo: two zones.** This is the delivery that [Run the demo](#run-the-demo)
 runs. The animation replays the commands of a live run of this guide in the
@@ -1317,7 +1324,12 @@ docks:
 | --- | --- |
 | ![Three zones at the start: the pink parcel on the blue west cart at stock. The green east cart waits at the dock, and the orange north cart waits at north-dock.](images/three-zones-start.png) | ![Three zones at the end: the pink parcel on the orange north cart at warehouse. The blue west cart is at the dock, and the green east cart is at north-dock.](images/three-zones-delivered.png) |
 
+<details>
+<summary>Play the animation of the three-zone run (15 seconds, repeats)</summary>
+
 ![Animation of the three-zone route in MuJoCo. West moves the parcel to the dock, and east accepts custody. East moves the parcel to north-dock, and north accepts custody. North moves the parcel to the warehouse, and the checker confirms the parcel at the warehouse, owner north.](images/three-zones.gif)
+
+</details>
 
 The animation replays the commands of that run in the MuJoCo world of the
 example: the same robots, commands, and order, without the time that the agents

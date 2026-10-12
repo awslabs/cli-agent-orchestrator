@@ -11,9 +11,16 @@ Agentic AI can take on this coordination. Agentic AI is AI that works toward a g
 
 Multi-agent orchestration is the coordination of several AI agents, each with its own role, so that together they do a job that no single agent should do alone. CLI Agent Orchestrator (CAO) is an open-source tool for multi-agent orchestration. It runs a team of CLI agents: AI assistants that work in a terminal, for example Claude Code, Kiro CLI, or Codex. Each agent has its own role, its own tools, and its own credential, the key that sets what the agent can do.
 
-In this post, you learn why physical AI needs agentic AI, and why agentic AI that moves machines needs orchestration. The first physical AI example of CAO, [cross-zone transport](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/robotics/cross-zone-transport), applies CAO to a parcel on a simulated factory floor. A supervisor agent plans the job. Two zone worker agents each move only the robots of their own zone, and an independent checker agent verifies the result. In 10 live runs, every run ended in the expected state. Custody is the responsibility for the parcel. Exactly one zone has custody at a time, so it is always clear which team must act on the parcel, and no item is lost between two teams. Custody changed 6 times, and each time only after the simulator measured the parcel at the dock. The 3 requests that were not possible ended with no command to any robot. You also see the five criteria that a team of agents must meet on a shared floor, and how the example meets each one with CAO. Then you see what a run looks like, and how the example maps to a real site.
+In this post, you learn why physical AI needs agentic AI, and why agentic AI that moves machines needs orchestration. The first physical AI example of CAO, [cross-zone transport](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/robotics/cross-zone-transport), applies CAO to a parcel on a simulated factory floor. A supervisor agent plans the job. Two zone worker agents each move only the robots of their own zone, and an independent checker agent verifies the result. In 10 live runs, every run ended in the expected state. Custody is the responsibility for the parcel. Exactly one zone has custody at a time, so one team at a time is responsible for the parcel. Custody changed 6 times, and each time only after the simulator measured the parcel at the dock. The 3 requests that were not possible ended with no command to any robot. You also see the five criteria that a team of agents must meet on a shared floor, and how the example meets each one with CAO. Then you see what a run looks like, and how the example maps to a real site.
+
+![The simulated floor at the end of the demo. The pink parcel is on the green east cart at etch, in the east zone. The blue west cart waits at the amber dock.](../../../examples/robotics/cross-zone-transport/images/run-5-delivered.png)
+
+<details>
+<summary>Play the animation of the demo (13 seconds, repeats)</summary>
 
 ![Animation of the cross-zone transport in MuJoCo. The blue west cart carries the pink parcel from stock to the amber dock. West offers custody to east, and east accepts it. Then the green east cart carries the parcel to etch, and the checker confirms the parcel at etch, owner east.](../../../examples/robotics/cross-zone-transport/images/cross-zone-transport.gif)
+
+</details>
 
 *The demo: two zones. The animation replays the commands of a live run in the MuJoCo world of the example: the same robots, commands, and order. It leaves out the time that the agents use between the steps. The Results section shows an extended demo with three zones.*
 
@@ -133,7 +140,7 @@ The solid arrows from the supervisor agent are CAO handoffs, and the dotted arro
 
 ### Key benefits
 
-The solution meets each of the five criteria from [Understanding the challenge](#understanding-the-challenge). For each criterion, the table shows how the example meets it, and which part enforces it. The enforcer matters. Most rules are enforced outside the agents: the controller and CAO reject a call that breaks a rule, whatever the prompt says. Only the plan and part of the fail-safe behavior depend on the instructions in the agent profiles.
+The solution meets each of the five criteria from [Understanding the challenge](#understanding-the-challenge). For each criterion, the table shows how the example meets it, and which part enforces it. The enforcer matters. With a provider that enforces the tool allowlist, most rules are enforced outside the agents: the controller and CAO reject a call that breaks a rule, whatever the prompt says. Only the plan and part of the fail-safe behavior depend on the instructions in the agent profiles.
 
 | Criterion | How the example meets it | Enforced by |
 | --- | --- | --- |
@@ -161,7 +168,7 @@ The scope of a credential is the set of tools that it can call. The controller c
 | `move`, `offer_handoff`, `accept_handoff` | `act`, in the zone of the caller | Zone workers |
 | `stop_simulation` | `operate` | The operator, with `demo.py stop` |
 
-Two layers enforce least authority outside the model, so a prompt cannot talk an agent past its limits:
+With a provider that enforces the tool allowlist, such as Claude Code or Kiro CLI, two layers enforce least authority outside the model. A prompt alone then cannot take an agent past its limits:
 
 - **Robots.** The controller checks the zone of the caller. If the west zone worker asks to move `cart-east`, the controller rejects the call with `not_robot_owner`.
 - **Delegation.** Only the supervisor can start other agents. The worker and checker profiles grant only `@transport-sim`, not `@cao-mcp-server`, which holds the CAO delegation tools. CAO checks this grant before it runs a delegation tool, so a worker that tries `assign` gets this result:
@@ -249,7 +256,14 @@ Across the 10 runs, custody changed 6 times, and each change followed a finished
 
 The third row of the table is the extended demo, and it shows best how the agents decide. The request names only the start and the destination. The supervisor reads the scene, and finds a route through two shared docks. Then it gives one leg to each of three zone workers, and custody changes two times:
 
+![Three zones at the end: the pink parcel on the orange north cart at warehouse. The blue west cart is at the dock, and the green east cart is at north-dock.](../../../examples/robotics/cross-zone-transport/images/three-zones-delivered.png)
+
+<details>
+<summary>Play the animation of the three-zone run (15 seconds, repeats)</summary>
+
 ![Animation of the three-zone route in MuJoCo. West moves the parcel to the dock, and east accepts custody. East moves the parcel to north-dock, and north accepts custody. North moves the parcel to the warehouse, and the checker confirms the parcel at the warehouse, owner north.](../../../examples/robotics/cross-zone-transport/images/three-zones.gif)
+
+</details>
 
 *The animation replays the commands of this run in the MuJoCo world of the example: the same robots, commands, and order, without the time that the agents use between the steps.*
 
