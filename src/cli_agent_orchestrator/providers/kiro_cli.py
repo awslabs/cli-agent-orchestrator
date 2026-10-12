@@ -121,6 +121,10 @@ TUI_225_CHILD_ROW_PATTERN = r"^\s+╰"
 # A reasoning row with its thought collapsed has no child row.
 TUI_225_THOUGHT_ROW_PATTERN = r"^•\s+Thought for \d"
 
+# Reading the pane command costs about 0.1 s of tmux calls; the exit check reads
+# it at most this often (see KiroCliProvider._exited_to_shell).
+EXIT_CHECK_INTERVAL_S = 2.0
+
 # TUI processing indicator: ghost text shown while agent is working.
 # kiro-cli 2.11+ replaced "Kiro is working" with "Thinking..." (with an
 # optional "(esc to cancel)" suffix). Match either variant.
@@ -236,6 +240,9 @@ class KiroCliProvider(BaseProvider):
         super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
         self._input_received = False
+        # The cached result of the exit check (see _exited_to_shell).
+        self._exit_checked_at: Optional[float] = None
+        self._exited = False
         self._agent_profile = agent_profile
         self._engine = resolve_kiro_engine(persisted=engine)
         self._model = model
@@ -269,6 +276,23 @@ class KiroCliProvider(BaseProvider):
         """Kiro 2.11's TUI needs a longer delay after bracketed paste before
         the Enter key registers as submit rather than being swallowed."""
         return 1.0
+
+    def _exited_to_shell(self) -> bool:
+        """Return True when the pane is back at the shell that ran before kiro-cli.
+
+        Read at most every EXIT_CHECK_INTERVAL_S: the lookup costs about 0.1 s
+        of tmux calls (more inside a PTY proxy), and get_status() reaches it on
+        every read of a busy frame. A stale "still running" only keeps the
+        terminal PROCESSING for up to that long after kiro-cli exits.
+        """
+        now = time.monotonic()
+        if self._exit_checked_at is None or now - self._exit_checked_at >= EXIT_CHECK_INTERVAL_S:
+            current_cmd = get_backend().get_pane_current_command(
+                self.session_name, self.window_name
+            )
+            self._exited = current_cmd == self.shell_baseline
+            self._exit_checked_at = now
+        return self._exited
 
     def mark_input_received(self) -> None:
         """Track that input was sent, enabling separator-free completion detection."""
@@ -616,12 +640,8 @@ class KiroCliProvider(BaseProvider):
         # immediately after launch, which lets pre-init pastes get absorbed
         # by Kiro's boot screen and silently dropped.
         if not has_idle_prompt and not has_new_tui_idle:
-            if self._initialized and self.shell_baseline:
-                current_cmd = get_backend().get_pane_current_command(
-                    self.session_name, self.window_name
-                )
-                if current_cmd == self.shell_baseline:
-                    return TerminalStatus.IDLE
+            if self._initialized and self.shell_baseline and self._exited_to_shell():
+                return TerminalStatus.IDLE
             return TerminalStatus.PROCESSING
 
         # Check 2: Look for known error messages in the output

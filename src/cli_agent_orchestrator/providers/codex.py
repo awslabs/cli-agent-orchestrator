@@ -118,9 +118,11 @@ _FOOTER_CLOCK = (
     r"(?:done\s+)?(?:[A-Z][a-z]{2}\s+\d{1,2}(?:,\s+\d{4})?(?:\s+at)?\s+)?"
     r"\d{1,2}:\d{2}(?:\s*[AP]M)?"
 )
+# The time is never left out: for a live turn without a saved time, Codex uses
+# the current time. So "Worked for 2s" with no time is reply text, not a footer.
 COMPLETION_FOOTER_PATTERN = (
-    rf"^[^\S\n]*(?:Worked for {_FOOTER_DURATION}(?:[^\S\n]*[•·][^\S\n]*{_FOOTER_CLOCK})?"
-    rf"|{_FOOTER_CLOCK})(?:[^\S\n]*[•·][^\n]*)?[^\S\n]*$"
+    rf"^[^\S\n]*(?:Worked for {_FOOTER_DURATION}[^\S\n]*[•·][^\S\n]*)?{_FOOTER_CLOCK}"
+    rf"(?:[^\S\n]*[•·][^\n]*)?[^\S\n]*$"
 )
 # The first release that draws the completion footer.
 COMPLETION_FOOTER_MIN_VERSION = (0, 155, 0)

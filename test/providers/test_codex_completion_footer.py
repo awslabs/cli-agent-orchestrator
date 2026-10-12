@@ -58,7 +58,6 @@ class TestCompletionFooterPattern:
             "  Worked for 1h 2m 3s • Oct 3 4:19 PM",
             "  Worked for 5s • 4:19 PM • 3 tool calls (2s)",
             "  Worked for 1m 5s · done 4:19 PM",
-            "  Worked for 1m 5s",
             "  done 4:19 PM",
             "  done Oct 3 at 4:19 PM",
             "  4:19 PM",
@@ -75,6 +74,9 @@ class TestCompletionFooterPattern:
             "─ Worked for 1m 5s ────────────────────────────",
             "  The meeting is at 4:19 PM today.",
             "  12:30 and 13:00",
+            # A live footer always has the time; without it, this is reply text.
+            "  Worked for 1m 5s",
+            "  Worked for 2s",
             STATUS_BAR,
             "",
         ],
@@ -114,6 +116,14 @@ class TestStatusWithCompletionFooter:
     def test_footer_after_the_reply_is_completed(self):
         frame = screen(*BANNER, *TASK, "• Mean 3, median 3.", "", "  Worked for 32s • 4:19 PM")
         assert footer_provider().get_status_from_screen(frame) == TerminalStatus.COMPLETED
+
+    def test_streaming_reply_whose_newest_row_reads_worked_for_is_processing(self):
+        """A reply row such as "Worked for 2s" is not the footer (no time)."""
+        frame = screen(*TASK, "• Summary:", "  Worked for 2s")
+        assert footer_provider().get_status_from_screen(frame) == TerminalStatus.PROCESSING
+        assert footer_provider()._strip_completion_footer("• Summary:\n  Worked for 2s") == (
+            "• Summary:\n  Worked for 2s"
+        )
 
     def test_streaming_reply_whose_newest_row_is_a_time_is_processing(self):
         frame = screen(*TASK, "• Agenda:", "  09:00 · Standup")

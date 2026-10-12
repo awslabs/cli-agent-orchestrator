@@ -136,6 +136,51 @@ class TestPollerRecheckInput:
 
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_ready_verdict_from_output_that_changed_during_the_read_is_not_applied(
+        self, mock_pm, mock_get_backend
+    ):
+        """The read releases the lock. A chunk that lands meanwhile can show a
+        new turn, and the old ready verdict would let the inbox type into it."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = self._provider(screen_recheck=True)
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+
+        def read_while_a_chunk_lands(_lines):
+            with sm._lock:
+                sm._output_generation["t1"] = sm._output_generation.get("t1", 0) + 1
+            return TerminalStatus.COMPLETED
+
+        provider.get_status_from_screen.side_effect = read_while_a_chunk_lands
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert "t1" not in sm._recheck_cache
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_ready_verdict_is_not_applied_after_newer_output(self, mock_pm, mock_get_backend):
+        """Output can also land between the read and the apply."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = self._provider(screen_recheck=True)
+        provider.get_status_from_screen.return_value = TerminalStatus.COMPLETED
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+        generation = sm._output_generation.get("t1", 0)
+
+        assert (
+            sm._apply_detection("t1", TerminalStatus.COMPLETED, output_generation=generation + 1)
+            is False
+        )
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert (
+            sm._apply_detection("t1", TerminalStatus.COMPLETED, output_generation=generation)
+            is True
+        )
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     def test_other_providers_keep_the_raw_recheck(self, mock_pm, mock_get_backend):
         mock_get_backend.return_value = _backend(event_inbox=False)
         provider = self._provider(screen_recheck=False)

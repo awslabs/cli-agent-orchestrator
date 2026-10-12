@@ -2327,3 +2327,39 @@ class TestKiroCli225Tui:
     def test_credits_marker_still_needs_the_arrow_and_a_number(self):
         assert not re.search(TUI_CREDITS_PATTERN, "Credits: turn 0.20")
         assert not re.search(TUI_CREDITS_PATTERN, "▸ Credits: turn")
+
+
+class TestKiroExitCheckInterval:
+    """The exit check reads the pane command, about 0.1 s of tmux calls (more
+    inside a PTY proxy). A busy frame reads it at most every
+    EXIT_CHECK_INTERVAL_S."""
+
+    @staticmethod
+    def _provider(mock_backend, pane_command):
+        mock_backend.return_value.get_native_status.return_value = None
+        mock_backend.return_value.get_pane_current_command.return_value = pane_command
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        provider._initialized = True
+        provider.shell_baseline = "zsh"
+        return provider
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_busy_reads_look_up_the_pane_once_per_interval(self, mock_backend):
+        provider = self._provider(mock_backend, "kiro-cli")
+
+        for _ in range(4):
+            assert provider.get_status("● Reading files\n") == TerminalStatus.PROCESSING
+
+        assert mock_backend.return_value.get_pane_current_command.call_count == 1
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.time")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_exit_is_seen_after_the_interval(self, mock_backend, mock_time):
+        from cli_agent_orchestrator.providers.kiro_cli import EXIT_CHECK_INTERVAL_S
+
+        provider = self._provider(mock_backend, "kiro-cli")
+        mock_time.monotonic.side_effect = [100.0, 100.0 + EXIT_CHECK_INTERVAL_S]
+
+        assert provider.get_status("● Reading files\n") == TerminalStatus.PROCESSING
+        mock_backend.return_value.get_pane_current_command.return_value = "zsh"
+        assert provider.get_status("% \n") == TerminalStatus.IDLE
