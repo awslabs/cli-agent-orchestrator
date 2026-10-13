@@ -1,14 +1,87 @@
-# Keeps the commit-SHA pins in .github/workflows current. Every `uses:` is pinned
-# to a full SHA with the tag as a trailing comment (see CI pinning, #820);
-# Dependabot reads that comment to know which release line to follow and opens a
-# PR that moves the SHA. Without this file the pins would never move.
+# Dependabot watches every dependency graph CAO ships, not just the Actions pins.
+#
+# github-actions: keeps the commit-SHA pins in .github/workflows current. Every
+#   `uses:` is pinned to a full SHA with the tag as a trailing comment (see CI
+#   pinning, #820); Dependabot reads that comment to know which release line to
+#   follow and opens a PR that moves the SHA. Without this the pins never move.
+# uv / npm / cargo / bun: one entry per lockfile format, listing every tracked
+#   lockfile directory, so a Trivy or Dependency Security finding arrives with a
+#   bump PR instead of a maintainer hand-rolling one (#839, #848). The weekly
+#   Dependency Security gate still decides what is blocking; these PRs are how
+#   it gets fixed. Security updates for a vulnerable package open regardless of
+#   the schedule.
+#
+# cooldown: wait a week after a release before proposing it, so a package that
+#   is yanked or hijacked within days of publishing never reaches a PR here.
+# groups: one PR per ecosystem per week for minor/patch bumps. Majors stay as
+#   separate PRs so a breaking change is never hidden inside a routine group.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     groups:
       github-actions:
         patterns:
           - "*"
+
+  - package-ecosystem: "uv"
+    directories:
+      - "/"
+      - "/examples/fleet/panel"
+      - "/examples/robotics/cross-zone-transport"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      uv-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "npm"
+    directories:
+      - "/web"
+      - "/cao_mcp_apps"
+      - "/docusaurus"
+      - "/examples/ag-ui/ag-ui-construct-demos/tools"
+      - "/examples/ag-ui/ag-ui-eventsource-viewer/tools"
+      - "/examples/ag-ui/ag-ui-stock-client-live"
+      - "/examples/agent-plugins/agent-plugins-dogfood/tools"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    # The guarded `braces` fork is installed from a vendored tarball through a
+    # local adapter (SECURITY.md, "Local dependency mitigations"); Dependabot
+    # cannot and must not propose a registry replacement for it.
+    ignore:
+      - dependency-name: "braces"
+      - dependency-name: "@dieub/braces-depth-guard"
+    groups:
+      npm-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "cargo"
+    directory: "/tui"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "bun"
+    directories:
+      - "/examples/aidlc-portfolio"
+      - "/examples/aidlc-portfolio/skills/aidlc-portfolio"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      bun-minor-patch:
+        update-types: ["minor", "patch"]
