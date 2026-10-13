@@ -10,7 +10,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `assign` and `handoff` now launch ephemeral agents (#801) from their creator terminal: Claude Code by default, Codex when an operator allows it.
-
 - Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `ephemeral.enabled` stays off by default.
 - Simulation-only cross-zone robot transport example (#845): existing CAO CLI
   supervisor, zone-operation, and checker agents share a persistent MuJoCo
