@@ -160,8 +160,10 @@ tree. A terminal identified by `CAO_TERMINAL_ID` can answer its own prompt or a
 prompt on a terminal it created via `assign` or `handoff`; any other target is
 refused before the answer is sent. An external MCP client with no
 `CAO_TERMINAL_ID` (the operator's own shell) is not bound. The same rule covers
-`delete_terminal`, and `send_message` with an explicit `receiver_id` (which may
-also name the caller's own creator). The check runs in the MCP server next to
+`delete_terminal` (locally or on a `target_host` node, which recognises the
+creator through the callback id it recorded) and `send_message` with an explicit
+`receiver_id`, which may also name the caller's own creator or, when the profile
+grants `discovery`, a sibling that `list_siblings` returns. The check runs in the MCP server next to
 the agent; the HTTP API still authorises by scope only, so profile authors
 should still expose the MCP server only to agents trusted to coordinate the
 session.

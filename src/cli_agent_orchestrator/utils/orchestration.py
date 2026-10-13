@@ -37,6 +37,7 @@ from cli_agent_orchestrator.constants import (
     CALLBACK_TERMINAL_ID_ENV,
     CALLBACK_URL_ENV,
     DEFAULT_PROVIDER,
+    DISCOVERY_TOOL_MARKER,
 )
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.inbox import OrchestrationType
@@ -235,12 +236,27 @@ def _callback_route() -> Tuple[Optional[str], Optional[str]]:
     return (url.rstrip("/") if url else None, terminal_id or None)
 
 
+def has_discovery_grant(allowed_tools: Optional[Any]) -> bool:
+    """Whether a terminal's resolved ``allowed_tools`` carries the ``discovery`` grant.
+
+    One definition shared by ``_require_discovery_marker`` (the gate on
+    ``list_siblings`` / ``update_metadata``) and the ``send_message`` sibling
+    allowance below, so the two can never disagree about who holds the grant.
+    ``None`` (no role/allowedTools resolved at all) and ``"*"`` both mean
+    unrestricted, matching ``resolve_allowed_tools``' own semantics.
+    """
+    if allowed_tools is None:
+        return True
+    return "*" in allowed_tools or DISCOVERY_TOOL_MARKER in allowed_tools
+
+
 def _target_binding_denial(
     target_id: str,
     *,
     base_url: Optional[str] = None,
     target_meta: Optional[Dict[str, Any]] = None,
     allow_parent: bool = False,
+    allow_discovered_sibling: bool = False,
 ) -> Optional[str]:
     """Return a refusal message if the calling terminal may not act on ``target_id``.
 
@@ -256,11 +272,25 @@ def _target_binding_denial(
       supervisor answer or delete its own workers, including a remote worker
       addressed by ``target_host``, whose row on that node records the
       supervisor as ``caller_id``.
+    * A target on a REMOTE node (``base_url`` differs from the local server)
+      whose row reports this caller as ``callback_terminal_id``: allowed. A
+      remote node never records the supervisor as ``caller_id`` (it has no row
+      for the supervisor); it does keep the ``CAO_CALLBACK_TERMINAL_ID`` the
+      supervisor injected, and ``GET /terminals/{id}`` publishes it in that
+      field. A remote node too old to return the field refuses, fail closed.
     * With ``allow_parent``: the caller's own creator, found through the
       caller's ``caller_id`` row or ``CAO_CALLBACK_TERMINAL_ID`` for a remote
       worker: allowed. Only ``send_message`` wants this (a worker replying up).
-    * Anything else (a sibling, another supervisor's worker, an unrelated
-      session): refused before any state-changing HTTP call is made.
+    * With ``allow_discovered_sibling``: when the caller holds the
+      ``discovery`` grant (same test as ``_require_discovery_marker``), a
+      target that ``GET /terminals/{own}/siblings`` returns (widest scope the
+      caller may see: full own group, ``cross_session=true``): allowed. This
+      keeps the documented peer flow of issue #432, "find siblings with
+      list_siblings, then message them with send_message", with exact
+      membership. Only ``send_message`` wants this.
+    * Anything else (a sibling without the grant, another supervisor's worker,
+      an unrelated session): refused before any state-changing HTTP call is
+      made.
 
     A target the server does not know (404) is NOT refused here, so the tool's
     own request still produces its usual not-found result. Any other lookup
@@ -305,7 +335,12 @@ def _target_binding_denial(
     if target_meta.get("caller_id") == own_id:
         return None
 
-    if allow_parent and not is_remote:
+    # Only a REMOTE row is read this way: a local row's callback_terminal_id
+    # names a supervisor on some other node, which this caller cannot be.
+    if is_remote and target_meta.get("callback_terminal_id") == own_id:
+        return None
+
+    if (allow_parent or allow_discovered_sibling) and not is_remote:
         try:
             own_response = requests.get(
                 f"{API_BASE_URL}/terminals/{own_id}",
@@ -313,8 +348,26 @@ def _target_binding_denial(
                 timeout=_mcp_timeout(),
             )
             own_response.raise_for_status()
-            if own_response.json().get("caller_id") == target_id:
+            own_meta = own_response.json()
+            if allow_parent and own_meta.get("caller_id") == target_id:
                 return None
+            if allow_discovered_sibling and has_discovery_grant(own_meta.get("allowed_tools")):
+                # The server compares against the caller's OWN persisted group
+                # and clamps depth to it, so this is exactly what list_siblings
+                # could ever return; cross_session=true is that tool's widest
+                # explicit opt-in. A group-less caller gets [] and is refused.
+                siblings_response = requests.get(
+                    f"{API_BASE_URL}/terminals/{own_id}/siblings",
+                    params={"cross_session": "true"},
+                    headers=_auth_headers() or None,
+                    timeout=_mcp_timeout(),
+                )
+                siblings_response.raise_for_status()
+                siblings = siblings_response.json()
+                if not isinstance(siblings, list):
+                    raise ValueError("siblings response is not a list")
+                if any(isinstance(s, dict) and s.get("id") == target_id for s in siblings):
+                    return None
         except (requests.RequestException, ValueError) as exc:
             # ValueError covers a 200 with a non-JSON body: fail closed, not loud.
             return (
@@ -325,6 +378,8 @@ def _target_binding_denial(
     relation = "itself or terminals it created via assign or handoff"
     if allow_parent:
         relation += ", or the terminal that created it"
+    if allow_discovered_sibling:
+        relation += ", or a sibling it can discover with list_siblings"
     return (
         f"Terminal {own_id} may only act on {relation}. " f"Terminal {target_id} is none of those."
     )
@@ -1910,7 +1965,9 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
         # resolved above from trusted DB/env fields, so only an ID the agent
         # typed needs checking (self was already refused).
         if own_terminal_id and explicit_receiver:
-            denial = _target_binding_denial(receiver_id, allow_parent=True)
+            denial = _target_binding_denial(
+                receiver_id, allow_parent=True, allow_discovered_sibling=True
+            )
             if denial:
                 return {"success": False, "error": denial}
 
@@ -2119,6 +2176,12 @@ def _cancel_impl(terminal_id: str, delete: bool = False) -> Dict[str, Any]:
         return _delete_terminal_impl(terminal_id)
 
     try:
+        # Same binding as --delete: a caller with CAO_TERMINAL_ID (a shell
+        # inside a CAO pane) may interrupt itself or its own workers only. An
+        # operator shell with no identity is unchanged.
+        denial = _target_binding_denial(terminal_id)
+        if denial:
+            return {"success": False, "terminal_id": terminal_id, "error": denial}
         response = requests.post(
             f"{API_BASE_URL}/terminals/{terminal_id}/key",
             params={"key": "C-c"},

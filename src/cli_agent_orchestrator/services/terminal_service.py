@@ -3642,6 +3642,28 @@ def _schedule_deferred_init(
     return task
 
 
+def callback_terminal_id_for_session(session_name: Optional[str]) -> Optional[str]:
+    """Return the cross-node creator recorded for ``session_name``, if any.
+
+    A worker placed here from another node (``assign``/``handoff`` with
+    ``target_host``) has ``caller_id`` None, because its supervisor has no row
+    on this node. What it does have is ``CAO_CALLBACK_TERMINAL_ID`` in the
+    session env the supervisor injected at creation (persisted via
+    ``set_session_env``). ``get_terminal`` publishes it as
+    ``callback_terminal_id`` so the supervisor's own MCP server can recognise
+    its worker when it deletes it through ``target_host``. The store is
+    process-local, so after a cao-server restart this is None again; the
+    ``caller_id`` branch of the same check is unaffected by that.
+    """
+    if not session_name:
+        return None
+    try:
+        return get_session_env(str(session_name)).get(CALLBACK_TERMINAL_ID_ENV) or None
+    except Exception as exc:  # noqa: BLE001 — a missing creator must not break reads
+        logger.warning(f"Failed to read callback terminal id for session {session_name}: {exc}")
+        return None
+
+
 def get_terminal(terminal_id: str) -> Dict:
     """Get terminal data."""
     try:
@@ -3691,6 +3713,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "model_honored": metadata.get("model_honored"),
             "ephemeral": metadata.get("ephemeral", False),
             "caller_id": metadata.get("caller_id"),
+            "callback_terminal_id": callback_terminal_id_for_session(metadata["tmux_session"]),
             "allowed_tools": metadata.get("allowed_tools"),
             "engine": metadata.get("engine"),
             "group": metadata.get("group"),
