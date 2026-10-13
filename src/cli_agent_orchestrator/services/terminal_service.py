@@ -38,17 +38,17 @@ from pydantic import ValidationError
 
 from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam: creation no longer bulk-deletes with this helper,; but older integrations/tests patch the imported symbol while exercising; create_terminal. Keep the name exported from this module until that seam; can be retired separately.
+from cli_agent_orchestrator.clients.database import (
+    delete_terminals_by_session,  # Compatibility/test seam: creation no longer bulk-deletes with this helper, but older integrations/tests patch the imported symbol while exercising create_terminal. Keep the name exported from this module until that seam can be retired separately.
+)
+from cli_agent_orchestrator.clients.database import (
     count_runtime_allocated_terminals,
     create_inbox_message,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
-from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam: creation no longer bulk-deletes with this helper,; but older integrations/tests patch the imported symbol while exercising; create_terminal. Keep the name exported from this module until that seam; can be retired separately.
-    delete_idempotency_key,
-)
+from cli_agent_orchestrator.clients.database import delete_idempotency_key
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
-from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam: creation no longer bulk-deletes with this helper,; but older integrations/tests patch the imported symbol while exercising; create_terminal. Keep the name exported from this module until that seam; can be retired separately.
-    delete_terminals_by_session,
+from cli_agent_orchestrator.clients.database import (
     get_idempotency_record,
     get_session_incarnation,
     get_terminal_metadata,

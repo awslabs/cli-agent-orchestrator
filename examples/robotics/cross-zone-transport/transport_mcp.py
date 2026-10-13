@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
-import httpx
+import httpx2
 from fastmcp import Client, FastMCP
 from fastmcp.client.transports import StreamableHttpTransport
 from fastmcp.exceptions import AuthorizationError
@@ -46,15 +46,15 @@ def controller_client(url: str, token: str) -> Client:
 
     def local_http_client(
         headers: dict[str, str] | None = None,
-        timeout: httpx.Timeout | None = None,
-        auth: httpx.Auth | None = None,
+        timeout: httpx2.Timeout | None = None,
+        auth: httpx2.Auth | None = None,
         *,
         follow_redirects: bool = False,
-    ) -> httpx.AsyncClient:
+    ) -> httpx2.AsyncClient:
         # FastMCP requests redirects by default; this connection must remain local.
-        return httpx.AsyncClient(
+        return httpx2.AsyncClient(
             headers=headers,
-            timeout=timeout if timeout is not None else httpx.Timeout(20),
+            timeout=timeout if timeout is not None else httpx2.Timeout(20),
             auth=auth,
             trust_env=False,
             follow_redirects=False,

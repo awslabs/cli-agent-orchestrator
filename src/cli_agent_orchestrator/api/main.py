@@ -176,11 +176,7 @@ from cli_agent_orchestrator.services.terminal_service import (
 from cli_agent_orchestrator.services.workflow_journal import (
     _TERMINAL_RUN_STATES as _JOURNAL_TERMINAL_RUN_STATES,
 )
-from cli_agent_orchestrator.services.workflow_journal import (
-    EventRow,
-    GapMarker,
-    StepRow,
-)
+from cli_agent_orchestrator.services.workflow_journal import EventRow, GapMarker, StepRow
 from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
