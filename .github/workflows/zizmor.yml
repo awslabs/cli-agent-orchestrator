@@ -1,0 +1,47 @@
+name: Actions Security
+
+# zizmor audits the workflow and action files themselves: template injection
+# via `${{ }}` in `run:` blocks, dangerous triggers (pull_request_target,
+# workflow_run), over-broad permissions, cache poisoning in release builds,
+# unpinned or impostor action refs, and Dependabot hygiene. It is the one gate
+# in this repo that looks at .github/ rather than at the code it builds.
+#
+# Policy: fail on Medium or higher. Accepted findings live in .github/zizmor.yml
+# with a reason each; nothing is silenced inline. The job runs offline-capable
+# audits only (`online-audits: false`) so a fork PR with the read-only token
+# gets the same verdict as a branch PR and never needs a secret. SARIF upload
+# is off for the same reason: fork PRs cannot upload to code scanning, and a
+# failing upload would read as a failing audit.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Audit workflows, actions and Dependabot config
+        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        with:
+          # Exact release, not `latest`, so the gate's verdict does not change
+          # under a PR because the auditor moved.
+          version: "1.30.1"
+          collect: all
+          persona: regular
+          min-severity: medium
+          config: .github/zizmor.yml
+          online-audits: false
+          advanced-security: false
+          annotations: true

@@ -602,6 +602,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- New `Actions Security` CI job runs zizmor 1.30.1 over `.github/` on every PR
+  and push to `main`, failing on Medium-or-higher findings. Accepted findings
+  are listed with reasons in `.github/zizmor.yml` (checkout credential
+  persistence, the workflow-level `security-events: write` in `ci.yml`, and
+  the npm cache in the release build), each a tracked follow-up rather than a
+  silenced result.
+
 - Require `shell-quote ^1.11.0` in the documentation toolchain to fix
   CVE-2026-102422, with comment-boundary and ordinary-argument regressions.
   No runtime agent dependency or security-gate policy changes.
