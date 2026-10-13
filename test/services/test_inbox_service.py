@@ -10,6 +10,7 @@ from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS, INBOX_RECONCILE_INTERVAL
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.services.event_bus import EventBus
 from cli_agent_orchestrator.services.inbox_service import InboxService
 from cli_agent_orchestrator.services.status_monitor import (
     STALE_PROCESSING_CAPTURE_INTERVAL_S,
@@ -18,6 +19,81 @@ from cli_agent_orchestrator.services.status_monitor import (
 
 
 class TestCopilotQuietInboxRecovery:
+    @pytest.mark.asyncio
+    async def test_scheduled_confirmation_reaches_inbox_subscriber(self):
+        from types import SimpleNamespace
+
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+
+        loop = asyncio.get_running_loop()
+        clock = {"now": 100.0}
+        timers = []
+        sm = StatusMonitor()
+        sm._loop = SimpleNamespace(
+            call_soon_threadsafe=lambda fn, *args: fn(*args),
+            call_later=lambda delay, fn, *args: timers.append((delay, fn, args)) or MagicMock(),
+            create_task=loop.create_task,
+        )
+        sm._apply_detection("term-1", TerminalStatus.PROCESSING)
+        sm._buffers["term-1"] = "cursor-addressed redraw"
+        sm._buffer_changed_at["term-1"] = 0.0
+        provider = CopilotCliProvider("term-1", "s", "w")
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        backend.get_native_status.return_value = None
+        backend.get_history.return_value = (
+            "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀▀▀▀▀\n"
+            "← open sidebar · Autopilot · Allow All · / commands · tab next tab"
+        )
+        event_bus = EventBus()
+        event_bus.set_loop(loop)
+        delivered = asyncio.Event()
+        message = _make_message()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.time",
+                SimpleNamespace(monotonic=lambda: clock["now"]),
+            ),
+            patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
+                return_value=provider,
+            ),
+            patch("cli_agent_orchestrator.services.status_monitor.bus", event_bus),
+            patch("cli_agent_orchestrator.services.inbox_service.bus", event_bus),
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", sm),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+                return_value=[message],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_older_than",
+                return_value=["term-1"],
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.update_message_status") as update,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.terminal_service.send_input"
+            ) as send,
+        ):
+            send.side_effect = lambda *args: loop.call_soon_threadsafe(delivered.set)
+            svc = InboxService()
+            subscriber = asyncio.create_task(svc.run())
+            try:
+                await asyncio.sleep(0)
+                svc.reconcile_orphaned_messages()
+                send.assert_not_called()
+                delay, confirm, args = timers[-1]
+                clock["now"] = sm._pending_stale_capture["term-1"][1] + delay
+                confirm(*args)
+                await asyncio.wait_for(delivered.wait(), timeout=2)
+                send.assert_called_once_with("term-1", "hello")
+                update.assert_called_once_with(1, MessageStatus.DELIVERED)
+            finally:
+                subscriber.cancel()
+                await asyncio.gather(subscriber, return_exceptions=True)
+                event_bus.set_loop(None)
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("layout", ["prompt", "box"])
     @pytest.mark.parametrize(

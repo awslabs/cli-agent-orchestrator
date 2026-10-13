@@ -505,13 +505,7 @@ class CopilotCliProvider(BaseProvider):
     def _is_waiting_dialog_row(text: str) -> bool:
         stripped = text.strip().lower()
         if re.match(ASSISTANT_PREFIX_PATTERN, stripped, re.IGNORECASE):
-            stripped = re.sub(r"^(?:assistant\s*:|[●◐◑◒◓◉])\s*", "", stripped)
-            if not re.match(
-                r"(?:allow|approve|confirm|continue|proceed|trust|run|execute|"
-                r"do you trust|press enter)\b",
-                stripped,
-            ):
-                return False
+            return False
         return bool(
             re.match(WAITING_PROMPT_PATTERN, stripped)
             or re.search(r"\[\s*y\s*/\s*n\s*\]\s*$", stripped)
@@ -777,8 +771,9 @@ class CopilotCliProvider(BaseProvider):
         ):
             end -= 1
         if (
-            end < 2
+            end < 3
             or lines[end - 2].strip()
+            or lines[end - 3].strip()
             or not re.fullmatch(
                 r"\s+(?:/|~/).+\s{3,}Session:\s+\d+(?:\.\d+)?\s+AIC used\s*",
                 lines[end - 1],

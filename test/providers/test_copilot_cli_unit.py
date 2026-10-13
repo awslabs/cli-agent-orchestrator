@@ -56,10 +56,8 @@ class TestCopilotBoxedComposer:
             ("⠋ Working · esc interrupt · enqueue", TerminalStatus.PROCESSING),
             ("Allow this tool? [y/n]", TerminalStatus.WAITING_USER_ANSWER),
             ("Allow this tool [y/n]", TerminalStatus.WAITING_USER_ANSWER),
-            ("● Allow this tool? [y/n]", TerminalStatus.WAITING_USER_ANSWER),
             ("Confirm folder trust", TerminalStatus.WAITING_USER_ANSWER),
-            ("● Confirm folder trust", TerminalStatus.WAITING_USER_ANSWER),
-            ("● Do you trust the files in this folder? [y/n]", TerminalStatus.WAITING_USER_ANSWER),
+            ("Do you trust the files in this folder? [y/n]", TerminalStatus.WAITING_USER_ANSWER),
         ],
     )
     @pytest.mark.parametrize("placement", ["before", "after"])
@@ -102,6 +100,19 @@ class TestCopilotBoxedComposer:
             assert provider.get_status(output) == TerminalStatus.COMPLETED
             assert provider.probe_stale_processing_capture(output) == TerminalStatus.COMPLETED
             assert provider.commit_stale_processing_capture(output, TerminalStatus.COMPLETED)
+
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
+    @pytest.mark.parametrize(
+        "answer",
+        ["● Confirm folder trust is the UI label to look for.", "● Allow this tool? [y/n]"],
+    )
+    def test_assistant_dialog_description_is_a_response(self, layout, answer):
+        composer = "❯\n" if layout == "prompt" else self.box
+        output = "❯ describe the dialog\n" + answer + "\n" + composer + self.hint
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        with patch.object(provider, "_resolve_native_status", return_value=None):
+            assert provider.get_status(output) == TerminalStatus.COMPLETED
+            assert provider.probe_stale_processing_capture(output) == TerminalStatus.COMPLETED
 
     @pytest.mark.parametrize(
         "frame",
@@ -1502,7 +1513,7 @@ class TestCopilotCompletionChromeExtraction:
             + reply
             + "\n\n"
             + summary
-            + f"\n {cwd}            Session: 0.51 AIC used\n"
+            + f"\n\n {cwd}            Session: 0.51 AIC used\n"
             + composer
             + cls.hint
             + "\n"
@@ -1558,6 +1569,22 @@ class TestCopilotCompletionChromeExtraction:
     def test_cwd_row_is_excluded_without_a_summary(self):
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         assert provider.extract_last_message_from_script(self.screen("● Answer")) == "● Answer"
+
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
+    def test_paragraph_ending_in_session_shaped_finding_is_preserved(self, layout):
+        reply = "● Review results:\n\n /tmp/candidate            Session: 0.51 AIC used"
+        rule = "─" * 80
+        composer = (
+            f"{rule}\n❯\n{rule}\n"
+            if layout == "prompt"
+            else "╻" + "▄" * 79 + "\n┃\n╹" + "▀" * 79 + "\n"
+        )
+        output = "❯ review\n" + reply + "\n" + composer + self.hint
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.extract_last_message_from_script(output).splitlines() == [
+            "● Review results:",
+            " /tmp/candidate            Session: 0.51 AIC used",
+        ]
 
     def test_only_the_cwd_row_next_to_composer_is_removed(self):
         reply = "● Directory example:\n /tmp/example            Session: 0.51 AIC used"

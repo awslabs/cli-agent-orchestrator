@@ -337,6 +337,9 @@ class StatusMonitor:
         *,
         processing_evidence: bool = True,
         output_generation: Optional[int] = None,
+        capture_generation: Optional[int] = None,
+        expected_status: Optional[TerminalStatus] = None,
+        check_status: bool = False,
     ) -> bool:
         """Apply the sticky-latch rules to a freshly detected status and publish
         on change. Shared by the raw and pyte detection paths.
@@ -359,6 +362,13 @@ class StatusMonitor:
                 output_generation is not None
                 and self._output_generation.get(terminal_id, 0) != output_generation
             ):
+                return False
+            if (
+                capture_generation is not None
+                and self._capture_generation.get(terminal_id, 0) != capture_generation
+            ):
+                return False
+            if check_status and self._last_status.get(terminal_id) != expected_status:
                 return False
             # Refresh even if PROCESSING is already cached: after a new input
             # generation, seeing real PROCESSING again is what makes a later
@@ -774,14 +784,25 @@ class StatusMonitor:
             self._bursting[terminal_id] = False
             self._quiesce_handle.pop(terminal_id, None)
             buffer = self._buffers.get(terminal_id, "")
+            capture_generation = self._capture_generation.get(terminal_id, 0)
+            status = self._last_status.get(terminal_id)
+
+        def apply(detected: TerminalStatus) -> None:
+            self._apply_detection(
+                terminal_id,
+                detected,
+                capture_generation=capture_generation,
+                expected_status=status,
+                check_status=True,
+            )
 
         async def _detect_and_apply() -> None:
             detected = await asyncio.to_thread(self._detect_status, terminal_id, buffer)
-            self._apply_detection(terminal_id, detected)
+            apply(detected)
 
         loop = self._loop or self._running_loop()
         if loop is None:
-            self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
+            apply(self._detect_status(terminal_id, buffer))
         else:
             self._spawn_tracked(loop, _detect_and_apply())
 

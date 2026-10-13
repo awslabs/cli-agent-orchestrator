@@ -1977,6 +1977,43 @@ class TestCopilotStaleWaitingCapture:
     trust = "Confirm folder trust\n1. Yes\n2. Yes, and remember\n"
     hint = "← open sidebar · Autopilot · Allow All · / commands · tab next tab"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("interruption", ["input", "idle", "reset"])
+    async def test_old_raw_dialog_verdict_cannot_cross_a_new_state(self, interruption):
+        sm = StatusMonitor()
+        sm._loop = asyncio.get_running_loop()
+        sm._buffers["t1"] = self.trust
+        sm._last_status["t1"] = TerminalStatus.WAITING_USER_ANSWER
+        sm._waiting_generation["t1"] = 0
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def deferred_detection(*args):
+            started.set()
+            await release.wait()
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        with patch(
+            "cli_agent_orchestrator.services.status_monitor.asyncio.to_thread", deferred_detection
+        ):
+            sm._on_raw_quiescent("t1")
+            await started.wait()
+            if interruption == "input":
+                sm.notify_input_sent("t1")
+            elif interruption == "idle":
+                sm._apply_detection("t1", TerminalStatus.IDLE)
+            else:
+                sm.reset_buffer("t1")
+            release.set()
+            await asyncio.gather(*list(sm._detect_tasks))
+
+        if interruption == "input":
+            assert sm._waiting_generation["t1"] == 0
+        elif interruption == "idle":
+            assert sm._last_status["t1"] == TerminalStatus.IDLE
+        else:
+            assert "t1" not in sm._last_status
+
     @pytest.mark.parametrize("layout", ["prompt", "box"])
     @pytest.mark.parametrize("redraw", ["lost", "cursor", "evicted"])
     @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
