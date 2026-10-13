@@ -139,6 +139,7 @@ pins this table to the workflow files.
 | **Test Kiro CLI Provider** (`test-kiro-cli-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test or fixtures, `pyproject.toml`, or the workflow | **Yes** |
 | **Robotics transport example** (`robotics-transport.yml`) | `Transport simulator` | only PRs touching the cross-zone transport example, agent-profile schema, CAO provider list, or the workflow | **Yes** — real MuJoCo and authenticated MCP tests; locally, `uv --directory examples/robotics/cross-zone-transport run --locked pytest` |
 | **Docs site** (`gh-pages.yml`) | `build` | only PRs touching `docusaurus/**`, `patches/**`, `vendor/**`, `scripts/test-braces-security.cjs`, `examples/robotics/cross-zone-transport/images/**`, or the workflow | **Yes** — `deploy` is push-only and never runs on a PR |
+| **Actions Security** (`zizmor.yml`) | `zizmor` | every PR to `main` | **Yes** — zizmor 1.30.1 over `.github/` at Medium or higher; locally, `uvx zizmor==1.30.1 --collect=all --min-severity medium --offline --config .github/zizmor.yml .github/`. Accepted findings and their reasons live in `.github/zizmor.yml`; fix the workflow or add a reasoned entry there, never an inline ignore |
 
 > **Two checks can share a name.** Each provider workflow has its own `Unit Tests` and
 > `Code Quality`, so a PR that touches `pyproject.toml` shows those names more than once.
