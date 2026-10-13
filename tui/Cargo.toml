@@ -147,7 +147,7 @@ crossterm = "0.29.0"
 # Hand-rolling was rejected: a naive `\x1b[` scanner misses OSC (`\x1b]…\x07`), DCS
 # (`\x1bP…\x1b\\`), single-character escapes (`\x1bc`), and the C1 control bytes — all four
 # verified stripped by `vte` and all four plausible in real command output. (#321)
-vte = { version = "0.14", default-features = false }
+vte = { version = "0.15", default-features = false }
 
 [dev-dependencies]
 
