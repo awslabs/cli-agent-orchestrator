@@ -569,6 +569,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Dependabot now watches every tracked lockfile, not only the Actions pins:
+  `uv.lock` (root and the two example projects), the seven npm lockfiles, the
+  TUI `Cargo.lock`, and the two `bun.lock` files, with a seven-day release
+  cooldown and weekly minor/patch groups per ecosystem. The guarded `braces`
+  fork is excluded so Dependabot cannot propose a registry replacement for it.
+
 - The MCP server now requires fastmcp 3.2.0 or newer (was 2.14.0), the
   version CI tests. fastmcp 2.x does not export `ToolResult` from
   `fastmcp.tools`, so `cao-mcp-server` would not start on it. Upgrading
