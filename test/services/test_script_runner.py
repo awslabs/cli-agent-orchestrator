@@ -2,7 +2,7 @@
 
 The subprocess is MOCKED throughout (fast, hermetic, default matrix) — the
 OS-touching proofs live under the ``e2e`` marker in
-``test/e2e/test_script_runner_e2e.py``. The one exception is
+``test/e2e/script_runner/test_script_runner_e2e.py``. The one exception is
 ``test_close_pipes_closes_a_real_process_transport``, which spawns a short-lived
 real child because ``_close_pipes`` depends on a private attribute of
 ``asyncio.subprocess.Process`` that the fakes cannot vouch for. Coverage maps
@@ -245,7 +245,7 @@ class _HeldPipesProcess:
         self._exit(-9)
 
 
-def _install_fake_spawn(monkeypatch: pytest.MonkeyPatch, process) -> dict:
+def _install_fake_spawn(monkeypatch: pytest.MonkeyPatch, process: object) -> dict:
     """Patch ``asyncio.create_subprocess_exec`` to return ``process``; capture args."""
     captured: dict = {}
 
@@ -692,7 +692,10 @@ async def test_close_pipes_closes_a_real_process_transport():
         assert script_runner._close_pipes(proc) is True
         assert proc._transport.is_closing()
     finally:
-        os.kill(holder_pid, signal.SIGTERM)
+        try:
+            os.kill(holder_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 @pytest.mark.asyncio

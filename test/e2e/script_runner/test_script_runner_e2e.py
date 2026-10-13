@@ -157,7 +157,7 @@ async def test_real_background_child_holding_stdout_does_not_hold_the_run(tmp_pa
         result = await run_script_workflow(spec, {}, "e2e-held-stdout")
         # The helper outlives this bound on purpose: on 3.10 the old unbounded
         # drain only returned once the helper exited.
-        assert time.monotonic() - started < 5.0
+        assert time.monotonic() - started < 3.0
         assert result.state == RunState.COMPLETED
         assert result.output == {"ok": True}
     finally:
@@ -223,7 +223,7 @@ async def test_real_timeout_with_background_child_writing_settles_and_frees_it(
         result = await asyncio.wait_for(
             run_script_workflow(spec, {}, "e2e-timeout-chatty-helper"), timeout=10.0
         )
-        assert time.monotonic() - started < 5.0
+        assert time.monotonic() - started < 3.0
         assert result.state == RunState.FAILED
         assert result.kind == "timeout"
         await _wait_for_marker(marker)
