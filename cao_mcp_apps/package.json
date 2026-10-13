@@ -53,7 +53,7 @@
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^6.0.3",
     "@vitest/coverage-v8": "^4.1.11",
-    "fast-check": "^3.23.1",
+    "fast-check": "^4.10.2",
     "happy-dom": "^20.10.6",
     "husky": "^9.1.6",
     "lint-staged": "^15.2.10",
