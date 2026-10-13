@@ -59,31 +59,43 @@ Generated AI-DLC questions are immutable, human-owned decision points.
    packets are rejected and the session becomes `waiting`.
 2. The supervisor offers Guide, Edit Markdown, or Chat.
 3. The supervisor writes human answers verbatim without changing question text.
-4. `question answer` verifies question integrity and complete answers, records
-   the interaction mode and human decision maker, then returns the session to
-   `active`.
-5. The runner resumes only after observing the answered packet.
+4. The human actions CAO's human-approval surface. That surface — and only that
+   surface — mints an approval record bound to the packet, carrying the
+   VERIFIED human identity. No agent-facing command can write such a record.
+5. `question answer --approval-id <id>` verifies question integrity and complete
+   answers, then binds the resolution to that human-surface approval: the
+   answerer identity comes FROM the approval record, not from a caller-supplied
+   argument. A packet with no matching, unconsumed, human-surface approval is
+   refused, so an agent cannot self-answer by asserting an identity. The
+   approval is single-use.
+6. The runner resumes only after observing the answered packet.
 
-Neither permission bypass nor runner autonomy authorizes self-answering.
+The real enforcement is this binding, not prompt text. The "never answer on the
+human's behalf" rule remains in the profiles as defense-in-depth, but even an
+agent that ignored it cannot resolve a packet without a human-surface approval.
 
 ## Shared Memory
 
-The supervisor is the sole approval authority for durable project and team
-memory. The utility is the sole physical writer to canonical memory.
+Durable portfolio knowledge lives in CAO native memory, written and read
+through the `memory_store` / `memory_recall` MCP tools. The supervisor is the
+sole authority that promotes a learning into that memory.
 
-1. `dispatch check` captures the canonical SHA-256 baseline.
-2. Runners treat worktree memory writes as temporary and submit structured
-   proposals with evidence and the supplied baseline.
-3. `learning approve` serializes writes under the portfolio lock.
-4. A stale proposal cannot apply until the supervisor reviews current memory
-   and records a `learning reconcile` note.
-5. Equivalent rules are idempotent and do not append duplicate text.
-6. The runner cleans worktree memory back to Git `HEAD` using its exact
-   inspected revision.
-7. Session completion is blocked while project or team memory remains in the
-   feature diff.
+1. Runners treat worktree `project.md`/`team.md` as LOCAL scratch and submit
+   durable learnings as structured proposals with evidence (`learning propose`).
+   There is no dispatch SHA-256 baseline and no canonical-file compare-and-swap.
+2. The supervisor reviews proposals (`learning list`) for duplication,
+   contradiction, and scope.
+3. To accept, the supervisor writes the rule into CAO memory with `memory_store`
+   (scope project, memory_type feedback), then records that promotion with
+   `learning promote --promoted-by <supervisor>`. To decline, use
+   `learning reject`.
+4. A proposal is reviewed once; a promoted or rejected proposal cannot be
+   re-promoted.
+5. Integration completion blocks while any proposal is still `pending`.
 
-Do not merge shared-memory changes opportunistically from feature branches.
+Per-space worktree memory files no longer block session completion and are not
+merged from feature branches. Durable knowledge is inspected with
+`memory_recall`, not a git diff.
 
 ## Contract Changes
 
