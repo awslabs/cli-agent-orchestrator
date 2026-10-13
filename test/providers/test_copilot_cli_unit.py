@@ -55,7 +55,11 @@ class TestCopilotBoxedComposer:
             ("∙ Thinking (Esc to cancel)", TerminalStatus.PROCESSING),
             ("⠋ Working · esc interrupt · enqueue", TerminalStatus.PROCESSING),
             ("Allow this tool? [y/n]", TerminalStatus.WAITING_USER_ANSWER),
+            ("Allow this tool [y/n]", TerminalStatus.WAITING_USER_ANSWER),
+            ("● Allow this tool? [y/n]", TerminalStatus.WAITING_USER_ANSWER),
             ("Confirm folder trust", TerminalStatus.WAITING_USER_ANSWER),
+            ("● Confirm folder trust", TerminalStatus.WAITING_USER_ANSWER),
+            ("● Do you trust the files in this folder? [y/n]", TerminalStatus.WAITING_USER_ANSWER),
         ],
     )
     @pytest.mark.parametrize("placement", ["before", "after"])
@@ -68,6 +72,36 @@ class TestCopilotBoxedComposer:
         with patch.object(provider, "_resolve_native_status", return_value=None):
             assert provider.get_status(output) == expected
             assert not provider.commit_stale_processing_capture(output, TerminalStatus.COMPLETED)
+
+    def test_box_does_not_hide_busy_row_in_tall_pane(self):
+        output = (
+            "❯ review\n● Partial reply\n∙ Thinking (Esc to cancel)\n"
+            + "detail\n" * 45
+            + self.box
+            + self.hint
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        with patch.object(provider, "_resolve_native_status", return_value=None):
+            assert provider.get_status(output) == TerminalStatus.PROCESSING
+            assert provider.probe_stale_processing_capture(output) == TerminalStatus.PROCESSING
+
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            "● The utility asks before deleting: [y/n].",
+            "● The utility asks before deleting: [y/n]",
+            "● The utility asks before deleting:\n  Continue? [y/n] is the prompt it shows.",
+        ],
+    )
+    def test_reported_choice_is_not_a_live_dialog(self, layout, answer):
+        composer = "❯\n" if layout == "prompt" else self.box
+        output = "❯ explain the confirmation prompt\n" + answer + "\n" + composer + self.hint
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        with patch.object(provider, "_resolve_native_status", return_value=None):
+            assert provider.get_status(output) == TerminalStatus.COMPLETED
+            assert provider.probe_stale_processing_capture(output) == TerminalStatus.COMPLETED
+            assert provider.commit_stale_processing_capture(output, TerminalStatus.COMPLETED)
 
     @pytest.mark.parametrize(
         "frame",
@@ -1529,6 +1563,14 @@ class TestCopilotCompletionChromeExtraction:
         reply = "● Directory example:\n /tmp/example            Session: 0.51 AIC used"
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         assert provider.extract_last_message_from_script(self.screen(reply)) == reply
+
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
+    def test_final_answer_row_resembling_cwd_is_preserved_without_separation(self, layout):
+        reply = "● Finding: the stale cwd row was rendered as\n /tmp/example            Session: 0.51 AIC used"
+        composer = "❯\n" if layout == "prompt" else "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀▀▀▀▀\n"
+        output = "❯ inspect\n" + reply + "\n" + composer + self.hint
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.extract_last_message_from_script(output) == reply
 
     @pytest.mark.parametrize("layout", ["prompt", "box"])
     def test_leading_thought_heading_is_excluded_with_its_ui_block(self, layout):

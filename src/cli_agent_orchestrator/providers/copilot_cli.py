@@ -502,11 +502,26 @@ class CopilotCliProvider(BaseProvider):
         return False
 
     @staticmethod
-    def _is_busy_or_waiting_row(text: str) -> bool:
+    def _is_waiting_dialog_row(text: str) -> bool:
         stripped = text.strip().lower()
+        if re.match(ASSISTANT_PREFIX_PATTERN, stripped, re.IGNORECASE):
+            stripped = re.sub(r"^(?:assistant\s*:|[●◐◑◒◓◉])\s*", "", stripped)
+            if not re.match(
+                r"(?:allow|approve|confirm|continue|proceed|trust|run|execute|"
+                r"do you trust|press enter)\b",
+                stripped,
+            ):
+                return False
         return bool(
-            re.search(COPILOT_BUSY_ROW_PATTERN, stripped)
-            or re.search(WAITING_PROMPT_PATTERN, stripped)
+            re.match(WAITING_PROMPT_PATTERN, stripped)
+            or re.search(r"\[\s*y\s*/\s*n\s*\]\s*$", stripped)
+        )
+
+    @classmethod
+    def _is_busy_or_waiting_row(cls, text: str) -> bool:
+        return bool(
+            re.search(COPILOT_BUSY_ROW_PATTERN, text.strip(), re.IGNORECASE)
+            or cls._is_waiting_dialog_row(text)
         )
 
     @staticmethod
@@ -563,10 +578,9 @@ class CopilotCliProvider(BaseProvider):
         unrecognized = cls._rows_outside_idle_chrome(tail[end:])
         if end - start > 1:
             # Copilot can keep the composer visible during execution or approval.
-            last_user = cls._find_last_user_line(stripped[: len(stripped) - len(tail) + start])
-            before = stripped[
-                max(last_user + 1, len(stripped) - 40) : len(stripped) - len(tail) + start
-            ]
+            composer_start = len(stripped) - len(tail) + start
+            last_user = cls._find_last_user_line(stripped[:composer_start])
+            before = stripped[last_user + 1 : composer_start]
             unrecognized.extend(row for row in before if cls._is_busy_or_waiting_row(row))
         return unrecognized
 
@@ -737,7 +751,7 @@ class CopilotCliProvider(BaseProvider):
         last_user = self._find_last_user_line(lines[: span[0]] if span else lines)
         post_user = lines[last_user + 1 :]
         # A composer below a dialog does not prove the dialog was dismissed.
-        if re.search(WAITING_PROMPT_PATTERN, "\n".join(post_user), re.IGNORECASE):
+        if any(self._is_waiting_dialog_row(row) for row in post_user):
             return TerminalStatus.WAITING_USER_ANSWER
         return self.get_status(output)
 
@@ -762,9 +776,13 @@ class CopilotCliProvider(BaseProvider):
             not lines[end - 1].strip() or re.fullmatch(r"[─-]{8,}", lines[end - 1].strip())
         ):
             end -= 1
-        if not end or not re.fullmatch(
-            r"\s+(?:/|~/).+\s{3,}Session:\s+\d+(?:\.\d+)?\s+AIC used\s*",
-            lines[end - 1],
+        if (
+            end < 2
+            or lines[end - 2].strip()
+            or not re.fullmatch(
+                r"\s+(?:/|~/).+\s{3,}Session:\s+\d+(?:\.\d+)?\s+AIC used\s*",
+                lines[end - 1],
+            )
         ):
             return lines
         cwd_index = end - 1

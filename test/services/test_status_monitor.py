@@ -1805,6 +1805,36 @@ class TestStatusObservationIsStampedWhenEarned:
 
 
 class TestCopilotBoxedComposerRecovery:
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_reported_choice_in_completed_reply_does_not_block_recovery(
+        self, mock_pm, mock_backend, layout
+    ):
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+
+        provider = CopilotCliProvider("t1", "s", "w")
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        mock_backend.return_value = backend
+        composer = "❯\n" if layout == "prompt" else "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀▀▀▀▀\n"
+        backend.get_history.return_value = (
+            "❯ explain the confirmation prompt\n"
+            "● The utility asks before deleting: [y/n].\n"
+            + composer
+            + "← open sidebar · Autopilot · Allow All · / commands · tab next tab\n"
+        )
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffer_changed_at["t1"] = time.monotonic() - STALE_PROCESSING_BUFFER_QUIET_S - 1
+        sm._processing_generation["t1"] = 0
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm._pending_stale_capture["t1"][0] == TerminalStatus.COMPLETED
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+
     def test_confirmation_scheduling_during_shutdown_keeps_processing(self):
         sm = StatusMonitor()
         sm._loop = MagicMock()
