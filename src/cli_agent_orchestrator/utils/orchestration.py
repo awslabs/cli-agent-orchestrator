@@ -1189,8 +1189,13 @@ async def _run_step_and_build_result(
         # (504 -> timeout, 502 -> error).
         if kind == "ephemeral_policy":
             msg = structured_detail
+        # Generic text is only for failures before any worker is known; a launched
+        # worker's timeout, error or extraction failure keeps its handoff result.
         elif (
-            payload.get("claim_id") is not None and kind not in ("error", "timeout") and tid is None
+            payload.get("claim_id") is not None
+            and kind not in ("error", "timeout")
+            and response.status_code not in (502, 504)
+            and tid is None
         ):
             msg = f"ephemeral launch failed ({response.status_code})"
             rule = "unexpected_failure"

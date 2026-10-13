@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.mcp_server import server
 from cli_agent_orchestrator.services import agent_step, terminal_service
+from cli_agent_orchestrator.services.terminal_service import get_output as _real_get_output
 from cli_agent_orchestrator.utils import orchestration
 
 
@@ -536,29 +537,20 @@ async def test_failure_without_claim_keeps_existing_text(launch_http, monkeypatc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["timeout", "error", "extraction"])
+@pytest.mark.parametrize("outcome", ["timeout", "error"])
 async def test_claimed_default_handoff_preserves_real_worker_outcome(
     launch_http, monkeypatch, outcome
 ):
-    from cli_agent_orchestrator.providers.base import OutputExtractionError
-
     runtime, _, _, _, _ = launch_http
     name = runtime[1]
-    if outcome == "extraction":
-
-        def fail_output(*args):
-            raise OutputExtractionError(f"terminal {CHILD} has no final message")
-
-        monkeypatch.setattr(terminal_service, "get_output", fail_output)
-    else:
-        message = f"terminal {CHILD} reached ERROR status" if outcome == "error" else "step timeout"
-        monkeypatch.setattr(
-            agent_step,
-            "_wait_for_completion",
-            AsyncMock(
-                side_effect=agent_step.StepExecutionError(message, kind=outcome, terminal_id=CHILD)
-            ),
-        )
+    message = f"terminal {CHILD} reached ERROR status" if outcome == "error" else "step timeout"
+    monkeypatch.setattr(
+        agent_step,
+        "_wait_for_completion",
+        AsyncMock(
+            side_effect=agent_step.StepExecutionError(message, kind=outcome, terminal_id=CHILD)
+        ),
+    )
     original_post = orchestration.requests.post
     responses = []
 
@@ -570,7 +562,7 @@ async def test_claimed_default_handoff_preserves_real_worker_outcome(
 
     monkeypatch.setattr(orchestration.requests, "post", record_run_step)
     result = await invoke("default", name)
-    assert responses[-1].status_code == {"timeout": 504, "error": 502, "extraction": 500}[outcome]
+    assert responses[-1].status_code == {"timeout": 504, "error": 502}[outcome]
     monkeypatch.setattr(orchestration.requests, "post", lambda *a, **k: responses[-1])
     legacy = await orchestration._run_step_and_build_result({}, name, "claude_code", 600, 0)
     assert not result["success"] and result["rule"] is None
@@ -579,7 +571,6 @@ async def test_claimed_default_handoff_preserves_real_worker_outcome(
     expected = {
         "timeout": "Handoff timed out after 600 seconds",
         "error": f"Handoff failed: worker errored (terminal {CHILD} reached ERROR status)",
-        "extraction": f"Handoff failed: terminal {CHILD} has no final message",
     }
     assert result["message"] == expected[outcome]
     for forbidden in [
@@ -594,12 +585,9 @@ async def test_claimed_default_handoff_preserves_real_worker_outcome(
     ]:
         assert forbidden not in str(result)
     row = database.get_ephemeral_agent(name)
-    if outcome == "extraction":
-        assert row["state"] == "gc" and database.get_terminal_metadata(CHILD) is None
-    else:
-        assert row["state"] == "launched" and database.get_terminal_metadata(CHILD) is not None
-        monkeypatch.setattr(orchestration.requests, "post", original_post)
-        assert orchestration._delete_terminal_impl(CHILD)["success"]
+    assert row["state"] == "launched" and database.get_terminal_metadata(CHILD) is not None
+    monkeypatch.setattr(orchestration.requests, "post", original_post)
+    assert orchestration._delete_terminal_impl(CHILD)["success"]
 
 
 @pytest.mark.asyncio
@@ -670,3 +658,110 @@ async def test_replay_lookup_distinguishes_http_response_from_transport(
     finally:
         monkeypatch.setattr(orchestration.requests, "get", original_get)
         assert orchestration._delete_terminal_impl(CHILD)["success"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fixed_tail", [False, True])
+@pytest.mark.parametrize("delete_fails", [False, True])
+async def test_real_extraction_failure_identifies_worker_and_cleanup_state(
+    launch_http, monkeypatch, fixed_tail, delete_fails
+):
+    from cli_agent_orchestrator.providers.base import OutputExtractionError
+
+    runtime, _, calls, _, _ = launch_http
+    env, name, backend, factory = runtime
+    provider = factory.return_value
+    provider.extraction_tail_lines = 200 if fixed_tail else None
+    provider.extraction_retries = 0
+    provider.allow_raw_transcript_fallback = False
+    provider.extract_last_message_from_script.side_effect = ValueError("no completion marker")
+    monkeypatch.setattr(terminal_service.provider_manager, "get_provider", lambda _: provider)
+    monkeypatch.setattr(terminal_service.status_monitor, "get_buffer", lambda _: "screen contents")
+    backend.get_history.return_value = "screen contents"
+    originals = []
+
+    def real_failure(*args, **kwargs):
+        try:
+            return _real_get_output(*args, **kwargs)
+        except OutputExtractionError as exc:
+            originals.append(exc)
+            raise
+
+    monkeypatch.setattr(terminal_service, "get_output", real_failure)
+    delete = terminal_service.delete_terminal
+    if delete_fails:
+        monkeypatch.setattr(
+            terminal_service, "delete_terminal", Mock(side_effect=RuntimeError("cleanup failed"))
+        )
+    original_post = orchestration.requests.post
+    responses = []
+
+    def record_response(url, **kwargs):
+        response = original_post(url, **kwargs)
+        if url.endswith("/run-step"):
+            responses.append(response)
+        return response
+
+    monkeypatch.setattr(orchestration.requests, "post", record_response)
+    result = await invoke("default", name)
+    assert len(originals) == 1
+    assert orchestration._terminal_id_from_detail(str(originals[0])) is None
+    response = responses[-1]
+    assert response.status_code == 500 and isinstance(response.json()["detail"], str)
+    expected = f"terminal {CHILD}: {originals[0]}"
+    assert response.json()["detail"] == expected
+    assert result["rule"] is None and result["terminal_id"] == CHILD
+    assert result["message"] == "Handoff failed: " + expected
+    monkeypatch.setattr(orchestration.requests, "post", lambda *a, **k: response)
+    legacy = await orchestration._run_step_and_build_result({}, name, "claude_code", 600, 0)
+    assert (legacy.message, legacy.terminal_id, legacy.rule) == (result["message"], CHILD, None)
+    job_id = next(c[2]["json"]["job_id"] for c in calls if c[1].endswith("/run-step"))
+    job = database.get_handoff_result(job_id)
+    assert job["state"] == "error" and job["error_message"] == expected
+    for forbidden in [
+        "http://",
+        "https://",
+        "claim_id",
+        "caller_id",
+        "working_directory",
+        "allowed_tools",
+        "/workspace",
+        CALLER,
+    ]:
+        assert forbidden not in str(result)
+    if delete_fails:
+        assert database.get_ephemeral_agent(name)["state"] == "launched"
+        assert database.get_terminal_metadata(CHILD) is not None
+        monkeypatch.setattr(terminal_service, "delete_terminal", delete)
+        monkeypatch.setattr(orchestration.requests, "post", original_post)
+        assert orchestration._delete_terminal_impl(CHILD)["success"]
+    else:
+        assert database.get_ephemeral_agent(name)["state"] == "gc"
+        assert database.get_terminal_metadata(CHILD) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [502, 504])
+async def test_claimed_handoff_legacy_worker_status_is_not_launch_failure(
+    launch_http, monkeypatch, status
+):
+    import requests
+
+    original_post = orchestration.requests.post
+
+    def legacy_response(url, **kwargs):
+        if url.endswith("/claim"):
+            return original_post(url, **kwargs)
+        response = requests.Response()
+        response.status_code = status
+        response._content = json.dumps({"detail": "legacy worker failure"}).encode()
+        return response
+
+    monkeypatch.setattr(orchestration.requests, "post", legacy_response)
+    result = await invoke("default", launch_http[0][1])
+    assert not result["success"] and result["rule"] is None
+    assert result["message"] == (
+        "Handoff timed out after 600 seconds"
+        if status == 504
+        else "Handoff failed: worker errored (legacy worker failure)"
+    )
