@@ -2,8 +2,11 @@
 
 The subprocess is MOCKED throughout (fast, hermetic, default matrix) — the
 OS-touching proofs live under the ``e2e`` marker in
-``test/e2e/test_script_runner_e2e.py``. Coverage maps to the code-generation
-test plan:
+``test/e2e/script_runner/test_script_runner_e2e.py``. The one exception is
+``test_close_pipes_closes_a_real_process_transport``, which spawns a short-lived
+real child because ``_close_pipes`` depends on a private attribute of
+``asyncio.subprocess.Process`` that the fakes cannot vouch for. Coverage maps
+to the code-generation test plan:
 
 - M1 result-shape contract: a script COMPLETED result has the same base fields
   as a YAML run + ``kind=None``/``output``/``warnings=[]`` (INV-5).
@@ -29,6 +32,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
+import signal
+import sys
 from pathlib import Path
 from typing import List, Optional
 
@@ -161,7 +168,84 @@ class _FakeStream:
         return chunk
 
 
-def _install_fake_spawn(monkeypatch: pytest.MonkeyPatch, process: _FakeProcess) -> dict:
+class _HeldOpenStream(_FakeStream):
+    """A stream that yields its payload and then never reaches EOF.
+
+    This is what the script's pipes look like when a background process it
+    started inherited them and is still running.
+    """
+
+    async def read(self, n: int = -1) -> bytes:
+        chunk = await super().read(n)
+        if chunk:
+            return chunk
+        await asyncio.Event().wait()
+
+
+class _FakeTransport:
+    """Records whether the drive closed the subprocess pipes."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _HeldPipesProcess:
+    """A script that exits while its stdout/stderr stay open.
+
+    ``returncode`` flips from None to ``exit_rc`` after ``exit_after`` seconds,
+    as asyncio sets it when the process exits, whether or not anything is in
+    ``wait()``. ``wait_holds_for_pipes`` picks the ``wait()`` behaviour: on
+    Python 3.10 it returns at the exit, and from 3.11 a ``wait()`` started
+    before the exit does not return until the pipes reach EOF, which here is
+    never. With ``exit_after=None`` the script runs until it is signalled:
+    SIGKILL ends it at once, SIGTERM 0.02s later and only when ``honours_sigterm``.
+    """
+
+    def __init__(
+        self,
+        *,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+        wait_holds_for_pipes: bool,
+        exit_rc: int = 0,
+        exit_after: Optional[float] = 0.05,
+        honours_sigterm: bool = True,
+    ):
+        self.returncode: Optional[int] = None
+        self.stdout = _HeldOpenStream(stdout)
+        self.stderr = _HeldOpenStream(stderr)
+        self._wait_holds_for_pipes = wait_holds_for_pipes
+        self._honours_sigterm = honours_sigterm
+        self._exited = asyncio.Event()
+        self._transport = _FakeTransport()
+        self.signals: List[str] = []
+        if exit_after is not None:
+            asyncio.get_running_loop().call_later(exit_after, self._exit, exit_rc)
+
+    def _exit(self, rc: int) -> None:
+        self.returncode = rc
+        self._exited.set()
+
+    async def wait(self) -> int:
+        if self._wait_holds_for_pipes:
+            await asyncio.Event().wait()
+        await self._exited.wait()
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.signals.append("SIGTERM")
+        if self._honours_sigterm:
+            asyncio.get_running_loop().call_later(0.02, self._exit, -15)
+
+    def kill(self) -> None:
+        self.signals.append("SIGKILL")
+        self._exit(-9)
+
+
+def _install_fake_spawn(monkeypatch: pytest.MonkeyPatch, process: object) -> dict:
     """Patch ``asyncio.create_subprocess_exec`` to return ``process``; capture args."""
     captured: dict = {}
 
@@ -371,6 +455,30 @@ async def test_hang_timeout_reap_bumps_generation(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.asyncio
+async def test_timeout_with_pipes_held_open_settles_and_closes_them(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A timed-out script whose pipes a process it started still holds settles as a timeout.
+
+    The timeout arm cancels the readers, so it has to close the pipes as well,
+    or that process blocks on its next write once the buffer fills.
+    """
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 0.1)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.05)
+    proc = _HeldPipesProcess(wait_holds_for_pipes=True, exit_after=None)
+    _install_fake_spawn(monkeypatch, proc)
+
+    result = await asyncio.wait_for(
+        run_script_workflow(_FakeScriptSpec(), {}, "run-timeout-held-pipes"), timeout=5.0
+    )
+    assert result.state == RunState.FAILED
+    assert result.kind == "timeout"
+    assert proc.signals == ["SIGTERM"]
+    assert proc._transport.closed
+
+
+@pytest.mark.asyncio
 async def test_timeout_bound_helper_raises():
     """_await_exit_within_bound converts the elapsed bound into TimeoutBound."""
     proc = _FakeProcess(exit_rc=0, hang=True)
@@ -397,6 +505,40 @@ async def test_terminate_cooperative_never_escalates():
     await script_runner._terminate(proc, grace=0.05)
     assert proc.signals == ["SIGTERM"]
     assert proc.returncode == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("honours_sigterm", "signals", "rc"),
+    [(True, ["SIGTERM"], -15), (False, ["SIGTERM", "SIGKILL"], -9)],
+    ids=["honours-sigterm", "ignores-sigterm"],
+)
+async def test_terminate_settles_on_exit_while_pipes_are_held(
+    monkeypatch: pytest.MonkeyPatch, honours_sigterm: bool, signals: List[str], rc: int
+):
+    """_terminate returns once the script exits, even if a process it started holds the pipes.
+
+    From 3.11 ``wait()`` waits for pipe EOF too, so a ``wait()`` after SIGKILL
+    could block for as long as that process lived, and so could cancel. The
+    poll interval is stretched past the grace so a SIGTERM exit is only seen
+    after the grace elapses, and must still not be followed by SIGKILL.
+    """
+    monkeypatch.setattr(script_runner, "_EXIT_POLL_INTERVAL", 10.0)
+    proc = _HeldPipesProcess(
+        wait_holds_for_pipes=True, exit_after=None, honours_sigterm=honours_sigterm
+    )
+    await asyncio.wait_for(script_runner._terminate(proc, grace=0.05), timeout=2.0)
+    assert proc.signals == signals
+    assert proc.returncode == rc
+
+
+@pytest.mark.asyncio
+async def test_terminate_does_not_spend_the_grace_after_a_sigterm_exit():
+    """A script that exits on SIGTERM is reaped then, not when the grace runs out."""
+    proc = _HeldPipesProcess(wait_holds_for_pipes=True, exit_after=None)
+    await asyncio.wait_for(script_runner._terminate(proc, grace=5.0), timeout=1.0)
+    assert proc.signals == ["SIGTERM"]
+    assert proc.returncode == -15
 
 
 @pytest.mark.asyncio
@@ -434,6 +576,140 @@ async def test_chatty_child_no_deadlock(monkeypatch: pytest.MonkeyPatch):
     assert result.state == RunState.COMPLETED
     # The sentinel is in the tail, so it survives the ring-buffer cap.
     assert result.output == {"done": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wait_holds_for_pipes", [False, True], ids=["wait-returns-at-exit", "wait-holds-for-pipes"]
+)
+async def test_exit_with_pipes_held_open_completes(
+    monkeypatch: pytest.MonkeyPatch, wait_holds_for_pipes: bool
+):
+    """A script that exits 0 while a process it started keeps stdout open completes.
+
+    Before the fix, the 3.11+ ``wait()`` shape ran out the wall-clock bound and
+    settled FAILED,kind=timeout with the output dropped, and the 3.10 shape
+    blocked in the unbounded drain for as long as the pipes stayed open.
+    """
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 1.0)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.05)
+    proc = _HeldPipesProcess(
+        stdout=b'CAO_WORKFLOW_OUTPUT:{"ok": true}\n', wait_holds_for_pipes=wait_holds_for_pipes
+    )
+    _install_fake_spawn(monkeypatch, proc)
+
+    result = await asyncio.wait_for(
+        run_script_workflow(_FakeScriptSpec(), {}, "run-held-pipes"), timeout=5.0
+    )
+    assert result.state == RunState.COMPLETED
+    assert result.kind is None
+    assert result.output == {"ok": True}
+    assert any("still open" in w for w in result.warnings)
+    assert proc.signals == []  # an exited script is never signalled
+    assert proc._transport.closed  # the held pipes are not left open in the server
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wait_holds_for_pipes", [False, True], ids=["wait-returns-at-exit", "wait-holds-for-pipes"]
+)
+async def test_nonzero_exit_with_pipes_held_open_fails_with_warning(
+    monkeypatch: pytest.MonkeyPatch, wait_holds_for_pipes: bool
+):
+    """A nonzero exit with the pipes held open settles FAILED,kind=error, not timeout."""
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 1.0)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.05)
+    proc = _HeldPipesProcess(stderr=b"boom\n", wait_holds_for_pipes=wait_holds_for_pipes, exit_rc=3)
+    _install_fake_spawn(monkeypatch, proc)
+
+    result = await asyncio.wait_for(
+        run_script_workflow(_FakeScriptSpec(), {}, "run-held-pipes-rc3"), timeout=5.0
+    )
+    assert result.state == RunState.FAILED
+    assert result.kind == "error"
+    assert any("boom" in w for w in result.warnings)  # stderr tail surfaced
+    assert any("still open" in w for w in result.warnings)
+    assert proc.signals == []
+    assert proc._transport.closed
+
+
+@pytest.mark.asyncio
+async def test_missing_transport_is_logged_and_not_reported_as_closed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """Without ``_transport`` the run still settles, and nothing claims the pipes were closed."""
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 1.0)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.05)
+    proc = _HeldPipesProcess(
+        stdout=b'CAO_WORKFLOW_OUTPUT:{"ok": true}\n', wait_holds_for_pipes=True
+    )
+    del proc._transport
+    _install_fake_spawn(monkeypatch, proc)
+
+    with caplog.at_level(logging.WARNING, logger=script_runner.__name__):
+        result = await asyncio.wait_for(
+            run_script_workflow(_FakeScriptSpec(), {}, "run-held-pipes-no-transport"), timeout=5.0
+        )
+    assert result.state == RunState.COMPLETED
+    assert result.output == {"ok": True}
+    assert any("could not be closed" in w for w in result.warnings)
+    assert not any("were closed" in w for w in result.warnings)
+    assert any("has no _transport" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_close_pipes_closes_a_real_process_transport():
+    """``_close_pipes`` reaches the transport of a real ``asyncio.subprocess.Process``.
+
+    Every other test here hands the drive a fake with a ``_FakeTransport``, so
+    they would keep passing if a Python release renamed the private attribute.
+    asyncio closes the transport on its own once the child has exited and both
+    pipes reach EOF, so the child starts a process that holds them, as a script
+    that backgrounds something does.
+    """
+    holder_code = "import time; time.sleep(30)"
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import subprocess, sys; "
+        f"p = subprocess.Popen([sys.executable, '-c', {holder_code!r}]); "
+        "print(p.pid, flush=True)",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    holder_pid = int(await asyncio.wait_for(proc.stdout.readline(), timeout=10.0))
+    try:
+        for _ in range(500):
+            if proc.returncode is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert proc.returncode == 0
+        assert not proc._transport.is_closing()  # the holder keeps both pipes open
+
+        assert script_runner._close_pipes(proc) is True
+        assert proc._transport.is_closing()
+    finally:
+        try:
+            os.kill(holder_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_exit_just_before_the_bound_is_not_a_timeout(monkeypatch: pytest.MonkeyPatch):
+    """An exit asyncio recorded before the bound elapsed is not reported as a timeout.
+
+    The poll interval is stretched past the bound so the exit lands while
+    ``_wait_for_exit`` is between two ``returncode`` checks.
+    """
+    monkeypatch.setattr(script_runner, "_EXIT_POLL_INTERVAL", 10.0)
+    proc = _HeldPipesProcess(wait_holds_for_pipes=True, exit_after=0.05)
+
+    await script_runner._await_exit_within_bound(proc, timeout=0.3)
+    assert proc.returncode == 0
 
 
 # ---------------------------------------------------------------------------
