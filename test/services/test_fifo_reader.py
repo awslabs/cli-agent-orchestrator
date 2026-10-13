@@ -534,13 +534,52 @@ class TestFrameNormalization:
         assert _fifo_reached_frame(None, pane, buffer) is True
 
     def test_reached_frame_fold_trusts_exactly_32_folded_chars(self):
-        # the floor guards short prompt-shaped tails that end plenty of
-        # stale content; 31 folded characters refuse, 32 trust
-        pane31 = "$ " + "a" * 30  # folds to 31
-        pane32 = "$ " + "a" * 30 + "!"  # folds to 32
-        side = "zz $\n" + "a" * 30 + "!"  # different row split of the same text
-        assert _fifo_reached_frame(side, pane31) is False
-        assert _fifo_reached_frame(side, pane32) is True
+        # a single anchored row is refused by the row floor, so the folded
+        # suffix decides; 31 folded characters refuse, 32 trust. Each side
+        # ends with the pane's own last row, so only the floor separates
+        # them — a suffix mismatch must not be what refuses the 31 case.
+        pane31 = "$\n" + "a" * 31  # window folds to 31
+        pane32 = "$\n" + "a" * 31 + "!"  # folds to 32
+        side31 = "a" * 31
+        side32 = "a" * 31 + "!"
+        assert _fifo_reached_frame(side31, pane31) is False
+        assert _fifo_reached_frame(side32, pane32) is True
+
+    def test_one_row_side_cannot_latch_a_many_row_pane(self):
+        # clear + mid-interval stall: the FIFO side collapses to the prompt
+        # row while never-piped output sits above the pane's identical
+        # trailing prompt — a k=1 anchor is a coincidence, not proof (#717
+        # review: the exact-match branch had no floor)
+        pane = (
+            "sh-4.2$\nsh-4.2$ cmd\nOUT-NEVER-PIPED-1\n"
+            "OUT-NEVER-PIPED-2\nOUT-NEVER-PIPED-3\nsh-4.2$"
+        )
+        assert _fifo_reached_frame("sh-4.2$", pane) is False
+        assert _fifo_reached_frame(None, pane, "sh-4.2$ ") is False
+        assert _fifo_reached_frame(None, pane, "\r\nsh-4.2$ ") is False
+        assert _fifo_reached_frame(None, pane, "\n" * 22 + "sh-4.2$") is False
+
+    def test_a_window_covering_the_whole_pane_needs_no_row_floor(self):
+        # after clear both sides legitimately collapse to the same single
+        # prompt row: covering every pane row proves reach at any length
+        assert _fifo_reached_frame("sh-4.2$", "sh-4.2$") is True
+        assert _fifo_reached_frame(None, "sh-4.2$", "sh-4.2$ \r\n") is True
+
+    def test_every_blank_leading_row_is_dropped_before_anchoring(self):
+        # stacked nudge echoes can leave several blank leading rows; a
+        # single-row drop would grow the window to include one of them and
+        # misread the pane's scrollback row as unreached
+        pane = "old scroll\nrow a\nrow b\nrow c"
+        screen = "\n\nrow a\nrow b\nrow c"
+        assert _fifo_reached_frame(screen, pane) is True
+
+    def test_csi_private_parameter_escapes_are_stripped(self):
+        # kiro-cli emits xterm modifyOtherKeys ("\x1b[>4;1m") around its
+        # banner; unstripped it glues ">4;1m" onto a text row and a healthy
+        # pipe reads as unreached
+        stream = "\x1b[>4;1minitializing\r\n\x1b[>4;1mready\r\nsh-4.2$ \r\n"
+        pane = "initializing\nready\nsh-4.2$"
+        assert _fifo_reached_frame(None, pane, stream) is True
 
     def test_reached_frame_empty_sides(self):
         assert _fifo_reached_frame(None, "") is True  # nothing to reach
@@ -1089,8 +1128,6 @@ class TestPipeLivenessWatchdog:
         fixed-width padded rows, trailing blank rows, wide grid — not just
         pre-collapsed one-line strings (#717 review: the two existing
         'match' tests passed regardless of what _screen_lines produced)."""
-        import pyte
-
         monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 2)
         manager = self._manager(tmp_path, monkeypatch)
         screen = pyte.Screen(80, 24)
@@ -1128,8 +1165,9 @@ class TestPipeLivenessWatchdog:
         per-row trailing whitespace while the stream keeps it, a soft-wrapped
         row splits across pane rows but stays one line in the stream, a
         trailing blank viewport row — must accumulate ZERO strikes while
-        bytes keep arriving. At the reviewed head this shape re-armed a
-        delivering pipe on a cadence."""
+        bytes keep arriving. Without the split between the bytes-arrived
+        signal and the frame check this shape re-armed a delivering pipe
+        on a cadence."""
         monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 2)
         manager = self._manager(tmp_path, monkeypatch)
         wrap = "y" * 120
@@ -1265,8 +1303,8 @@ class TestPipeLivenessWatchdog:
         row at its width while the stream holds the same bytes unwrapped, so
         rows can never align. The folded comparison must reach the frame, the
         baseline must advance during delivery, and the activity->idle
-        transition that re-armed healthy terminals at the fifth head must
-        produce zero strikes and zero re-arms."""
+        transition that re-armed healthy terminals before the bytes-arrived
+        contract was restored must produce zero strikes and zero re-arms."""
         manager = self._manager(tmp_path, monkeypatch)
         wrap = "y" * 120
         pane = {"content": "sh-4.2$"}

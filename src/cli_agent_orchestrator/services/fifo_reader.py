@@ -63,10 +63,11 @@ FifoBufferProbe = Callable[[], str]  # returns the FIFO-fed StatusMonitor buffer
 FifoScreenProbe = Callable[[], Optional[str]]
 
 # CSI/OSC/other escape sequences as tmux pipe-pane emits them (SGR runs,
-# cursor movement, erase-line redraws, window-title changes)
-_ANSI_ESCAPE_RE = re.compile(
-    r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]"
-)
+# cursor movement, erase-line redraws, window-title changes). The CSI
+# parameter range is the full ECMA-48 parameter-byte class 0x30-0x3F, so
+# private-parameter prefixes like xterm modifyOtherKeys ("\x1b[>4;1m",
+# emitted by kiro-cli) are stripped too.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]")
 # EL (erase-in-line) sequences: a bare CR directly before one of these is a
 # same-line redraw, not a wrap continuation.
 _EL_AFTER_CR = re.compile(r"\x1b\[[0-9;]*K")
@@ -97,8 +98,10 @@ def _normalize_stream_text(text: str) -> str:
             if cr == -1:
                 rows.append(line[start:])
                 break
-            after = line[cr + 1 :]
-            if _EL_AFTER_CR.match(after):
+            # match(line, pos) instead of slicing: a CR-dense line (progress
+            # bars, spinners) would otherwise copy the whole tail per CR,
+            # O(N^2) on the single watchdog thread serving every terminal.
+            if _EL_AFTER_CR.match(line, cr + 1):
                 # Redraw: the row starts at the redrawn text.
                 start = cr + 1
             else:
@@ -145,12 +148,16 @@ def _fifo_reached_frame(screen_text: Optional[str], pane_text: str, fifo_buffer:
     When the two sides wrap the same content differently — tmux soft-wraps
     the pane at its width while the raw stream line and the wider pyte grid
     stay unwrapped — a whitespace-folded suffix match decides instead,
-    trusted only above ``PIPE_LIVENESS_FRAME_MATCH_MIN_FOLDED``. Trade-off:
-    above the floor the fold ignores row structure, so a stale side whose
-    folded text ends with the pane's re-wrapped trailing rows can still
-    match. Accepted because the comparison is scoped to the pane's trailing
-    rows — the text must be the pane's newest output — and the floor already
-    refuses short coincidences.
+    trusted only above ``PIPE_LIVENESS_FRAME_MATCH_MIN_FOLDED``.
+
+    The exact-row match is trusted only when its window carries real
+    evidence: either it covers the pane's every row (after a ``clear`` both
+    sides legitimately collapse to the same single prompt row), or it
+    anchors at least two non-blank rows. A one-row window anchored on the
+    pane's last row alone is no proof at all — a redrawn bottom prompt row
+    coincides with a stalled side no matter how much never-piped output
+    sits above it, and latching that frame would hide the exact stall this
+    watchdog exists to catch.
 
     A False here never strikes a delivering pipe: the caller only uses it to
     decide whether a byte-arrived interval may re-baseline.
@@ -164,21 +171,24 @@ def _fifo_reached_frame(screen_text: Optional[str], pane_text: str, fifo_buffer:
         side_rows = _normalize_stream_text(fifo_buffer).split("\n")
         while side_rows and not side_rows[-1]:
             side_rows.pop()
-    # The attach nudge's Enter echo renders a blank leading row on the FIFO
+    # The attach nudge's Enter echo renders blank leading rows on the FIFO
     # side whichever form it is read in — the raw buffer's head, or the
-    # pyte grid's first row — and no pane row corresponds to it. With
-    # equal row counts it would occupy the anchor window and mask the match.
-    while side_rows and not side_rows[0]:
-        side_rows.pop(0)
+    # pyte grid's first rows — and no pane row corresponds to them. With
+    # equal row counts one blank row would occupy the anchor window and
+    # mask the match, and several would shift it entirely.
+    first_non_blank = next((i for i, row in enumerate(side_rows) if row), len(side_rows))
+    side_rows = side_rows[first_non_blank:]
     if not side_rows:
         return False
     k = min(len(pane_rows), len(side_rows))
-    if side_rows[-k:] == pane_rows[-k:]:
+    window = pane_rows[-k:]
+    anchored = sum(1 for row in window if row)
+    if side_rows[-k:] == window and (k == len(pane_rows) or anchored >= 2):
         return True
-    folded_pane = _strip_ws("\n".join(pane_rows[-k:]))
-    if len(folded_pane) < PIPE_LIVENESS_FRAME_MATCH_MIN_FOLDED:
+    folded_window = _strip_ws("\n".join(window))
+    if len(folded_window) < PIPE_LIVENESS_FRAME_MATCH_MIN_FOLDED:
         return False
-    return _strip_ws("\n".join(side_rows)).endswith(folded_pane)
+    return _strip_ws("\n".join(side_rows)).endswith(folded_window)
 
 
 def _ensure_fifo(fifo_path) -> None:
@@ -639,7 +649,10 @@ class FifoManager:
         live pane content, which keeps rendering through the stall. So:
 
         - FIFO delivered bytes since the last check AND its side reached the
-          live pane frame            -> healthy: re-baseline to the live frame.
+          live pane frame AND the capture is not blank
+                                    -> healthy: re-baseline to the live
+          frame (a blank capture mid-``clear`` would seed a baseline the
+          next silent check diverges from).
         - FIFO delivered bytes but its side has NOT reached the live frame
                                       -> delivering: never a strike (a
           normalization mismatch on a busy pane must not re-arm a healthy

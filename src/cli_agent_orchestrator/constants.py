@@ -46,6 +46,22 @@ def _env_positive_float(name: str, default: float) -> float:
     return value if value > 0 else default
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    """Read an int env var, falling back when the value is invalid OR non-positive.
+
+    Same contract as ``_env_positive_float`` for integer knobs: a zero or
+    negative value is invalid for the parameter's meaning, not just atypical
+    (``CAO_PIPE_LIVENESS_FRAME_MATCH_MIN_FOLDED=0`` would disable the
+    coincidence floor entirely and let a bare prompt row latch a
+    never-delivered frame).
+    """
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 # =============================================================================
 # Session Configuration
 # =============================================================================
@@ -216,7 +232,9 @@ PIPE_LIVENESS_TAIL_LINES = _env_int("CAO_PIPE_LIVENESS_TAIL_LINES", 80)
 # FIFO side reached the frame: below it a bare prompt row ("$" after a
 # clear) is a suffix of far too much stale content, and latching such a
 # frame would hide the stall this watchdog exists to catch.
-PIPE_LIVENESS_FRAME_MATCH_MIN_FOLDED = _env_int("CAO_PIPE_LIVENESS_FRAME_MATCH_MIN_FOLDED", 32)
+PIPE_LIVENESS_FRAME_MATCH_MIN_FOLDED = _env_positive_int(
+    "CAO_PIPE_LIVENESS_FRAME_MATCH_MIN_FOLDED", 32
+)
 # Consecutive diverging checks (pane advanced, FIFO delivered nothing) before
 # re-arming. Default 2, not 1: a single diverging check can be a false
 # positive on a healthy-but-bursty pipe (a burst lands just before the check
