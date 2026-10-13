@@ -577,6 +577,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through Amazon's CNA rather than GitHub's request button, release before
   publishing with an affected/fixed statement, reporter credit, and a
   regression test for the class.
+- Dependabot now watches every tracked lockfile, not only the Actions pins:
+  `uv.lock` (root and the two example projects), the seven npm lockfiles, the
+  TUI `Cargo.lock`, and the two `bun.lock` files, with a seven-day release
+  cooldown and weekly minor/patch groups per ecosystem. The guarded `braces`
+  fork is excluded so Dependabot cannot propose a registry replacement for it.
 
 - The MCP server now requires fastmcp 3.2.0 or newer (was 2.14.0), the
   version CI tests. fastmcp 2.x does not export `ToolResult` from
@@ -604,6 +609,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently, so `limit=500` keeps working rather than becoming a 422.
 
 ### Security
+
+- New `Actions Security` CI job runs zizmor 1.30.1 over `.github/` on every PR
+  and push to `main`, failing on Medium-or-higher findings. Accepted findings
+  are listed with reasons in `.github/zizmor.yml` (checkout credential
+  persistence, the workflow-level `security-events: write` in `ci.yml`, and
+  the npm cache in the release build), each a tracked follow-up rather than a
+  silenced result.
 
 - Require `shell-quote ^1.11.0` in the documentation toolchain to fix
   CVE-2026-102422, with comment-boundary and ordinary-argument regressions.
