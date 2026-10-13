@@ -596,6 +596,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `delete_terminal`, `answer_user_prompt` and `send_message` (explicit
+  `receiver_id`) now refuse a target outside the caller's assign/handoff tree:
+  a terminal may act on itself, on terminals it created, and (for
+  `send_message`) on the terminal that created it. Operators and external MCP
+  clients without `CAO_TERMINAL_ID` are unchanged; a shell opened inside a CAO
+  pane inherits that pane's identity and is bound the same way. Supersedes #607 (shpalac),
+  whose own-terminal-only rule would have blocked in-terminal supervisors.
+
 - Require `shell-quote ^1.11.0` in the documentation toolchain to fix
   CVE-2026-102422, with comment-boundary and ordinary-argument regressions.
   No runtime agent dependency or security-gate policy changes.

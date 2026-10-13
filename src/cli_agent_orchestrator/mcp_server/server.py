@@ -56,6 +56,7 @@ from cli_agent_orchestrator.utils.orchestration import (
     _mcp_timeout,
     _resolve_target_base_url,
     _send_message_impl,
+    _target_binding_denial,
 )
 from cli_agent_orchestrator.utils.workflow_events import parse_sse_frames
 
@@ -117,6 +118,11 @@ def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
         )
         status_response.raise_for_status()
         terminal = status_response.json()
+        # The row we just fetched carries caller_id, so the binding check costs
+        # no extra request. Refuse before revealing the target's prompt state.
+        denial = _target_binding_denial(terminal_id, target_meta=terminal)
+        if denial:
+            return {"success": False, "terminal_id": terminal_id, "error": denial}
         current_status = terminal.get("status")
         if current_status != TerminalStatus.WAITING_USER_ANSWER.value:
             return {

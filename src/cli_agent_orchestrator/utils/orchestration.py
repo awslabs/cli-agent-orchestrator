@@ -235,6 +235,101 @@ def _callback_route() -> Tuple[Optional[str], Optional[str]]:
     return (url.rstrip("/") if url else None, terminal_id or None)
 
 
+def _target_binding_denial(
+    target_id: str,
+    *,
+    base_url: Optional[str] = None,
+    target_meta: Optional[Dict[str, Any]] = None,
+    allow_parent: bool = False,
+) -> Optional[str]:
+    """Return a refusal message if the calling terminal may not act on ``target_id``.
+
+    Binds the terminal-targeting MCP tools (``delete_terminal``,
+    ``answer_user_prompt``, ``send_message`` with an explicit receiver) to the
+    caller's own place in the assign/handoff tree. ``None`` means allowed.
+
+    * No ``CAO_TERMINAL_ID`` (operator shell, external MCP client, ``cao`` CLI
+      outside a CAO pane): unchanged, there is no caller to bind to.
+    * The caller's own terminal: allowed.
+    * A terminal the caller created via assign/handoff (the target's recorded
+      ``caller_id`` is the caller): allowed. This is what lets an in-terminal
+      supervisor answer or delete its own workers, including a remote worker
+      addressed by ``target_host``, whose row on that node records the
+      supervisor as ``caller_id``.
+    * With ``allow_parent``: the caller's own creator, found through the
+      caller's ``caller_id`` row or ``CAO_CALLBACK_TERMINAL_ID`` for a remote
+      worker: allowed. Only ``send_message`` wants this (a worker replying up).
+    * Anything else (a sibling, another supervisor's worker, an unrelated
+      session): refused before any state-changing HTTP call is made.
+
+    A target the server does not know (404) is NOT refused here, so the tool's
+    own request still produces its usual not-found result. Any other lookup
+    failure refuses, fail closed, with the detail attached.
+
+    This runs in the MCP server process next to the agent. It stops a confused
+    or prompt-injected agent from steering a tool at another terminal through
+    the tool interface. It is not server-side identity: the HTTP API still
+    authorises by scope only.
+    """
+    own_id = _current_terminal_id()
+    if not own_id or target_id == own_id:
+        return None
+
+    base = (base_url or API_BASE_URL).rstrip("/")
+    is_remote = base != API_BASE_URL.rstrip("/")
+    timeout = (REMOTE_CONNECT_TIMEOUT, _mcp_timeout()) if is_remote else _mcp_timeout()
+
+    if allow_parent:
+        _, callback_terminal_id = _callback_route()
+        if callback_terminal_id and target_id == callback_terminal_id:
+            return None
+
+    if target_meta is None:
+        try:
+            response = requests.get(
+                f"{base}/terminals/{target_id}",
+                headers=_auth_headers_for(base) or None,
+                timeout=timeout,
+            )
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            target_meta = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            # ValueError covers a 200 with a non-JSON body: fail closed, not loud.
+            return (
+                f"Could not verify that terminal {own_id} may act on terminal "
+                f"{target_id} ({exc}); refusing."
+            )
+
+    if target_meta.get("caller_id") == own_id:
+        return None
+
+    if allow_parent and not is_remote:
+        try:
+            own_response = requests.get(
+                f"{API_BASE_URL}/terminals/{own_id}",
+                headers=_auth_headers() or None,
+                timeout=_mcp_timeout(),
+            )
+            own_response.raise_for_status()
+            if own_response.json().get("caller_id") == target_id:
+                return None
+        except (requests.RequestException, ValueError) as exc:
+            # ValueError covers a 200 with a non-JSON body: fail closed, not loud.
+            return (
+                f"Could not verify that terminal {own_id} may act on terminal "
+                f"{target_id} ({exc}); refusing."
+            )
+
+    relation = "itself or terminals it created via assign or handoff"
+    if allow_parent:
+        relation += ", or the terminal that created it"
+    return (
+        f"Terminal {own_id} may only act on {relation}. " f"Terminal {target_id} is none of those."
+    )
+
+
 def _resolve_target_base_url(target_host: str) -> str:
     """Normalize a ``target_host`` value into a cao-server base URL.
 
@@ -1442,7 +1537,7 @@ async def _handoff_impl(
             # errored, or timed-out wait leaves the terminal alive on purpose,
             # so the operator can inspect/recover it via status/result/cancel,
             # which is the entire point of surfacing terminal_id early.
-            cleanup = _delete_terminal_impl(terminal_id)
+            cleanup = _delete_terminal_impl(terminal_id, check_binding=False)
             if not cleanup.get("success"):
                 logger.warning(
                     "handoff: post-success teardown of terminal %s failed: %s",
@@ -1742,6 +1837,7 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
     """Implementation of send_message logic."""
     try:
         own_terminal_id = _current_terminal_id()
+        explicit_receiver = bool(receiver_id)
 
         # A REMOTE worker has no local caller row; its cross-node supervisor is
         # recorded in CAO_CALLBACK_TERMINAL_ID instead (injected at creation) —
@@ -1809,6 +1905,15 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
                 ),
             }
 
+        # An explicitly named receiver must be in the caller's assign/handoff
+        # tree: the recorded caller and the cross-node callback supervisor were
+        # resolved above from trusted DB/env fields, so only an ID the agent
+        # typed needs checking (self was already refused).
+        if own_terminal_id and explicit_receiver:
+            denial = _target_binding_denial(receiver_id, allow_parent=True)
+            if denial:
+                return {"success": False, "error": denial}
+
         # Auto-inject sender terminal ID suffix when enabled. Skipped when
         # CAO_TERMINAL_ID is unset — never inject 'unknown' as a routable
         # address (issue #284); _send_to_inbox raises a clear error for that
@@ -1835,7 +1940,9 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
         return {"success": False, "error": str(e)}
 
 
-def _delete_terminal_impl(terminal_id: str, target_host: Optional[str] = None) -> Dict[str, Any]:
+def _delete_terminal_impl(
+    terminal_id: str, target_host: Optional[str] = None, *, check_binding: bool = True
+) -> Dict[str, Any]:
     """Implementation of delete_terminal logic.
 
     Kills the tmux window and removes the terminal record. Used both by the
@@ -1846,6 +1953,11 @@ def _delete_terminal_impl(terminal_id: str, target_host: Optional[str] = None) -
     the local cao-server exactly as before. The MCP tool wrapper launders
     pydantic's ``FieldInfo`` default into ``None`` before calling; the CLI
     passes a real ``Optional[str]``, so no laundering happens here.
+
+    ``check_binding``: refuse a target outside the caller's assign/handoff tree
+    (see ``_target_binding_denial``). Internal callers that are tearing down a
+    terminal they created in the same call pass ``False``; the tool and CLI
+    paths keep the default.
     """
     # Hoisted above the try because the HTTPError arm below interpolates it: if
     # it were assigned inside, a raise before that line would turn a reportable
@@ -1853,6 +1965,10 @@ def _delete_terminal_impl(terminal_id: str, target_host: Optional[str] = None) -
     location = f" on node {target_host}" if target_host else ""
     try:
         base_url = _resolve_target_base_url(target_host) if target_host else API_BASE_URL
+        if check_binding:
+            denial = _target_binding_denial(terminal_id, base_url=base_url)
+            if denial:
+                return {"success": False, "message": denial}
         response = requests.delete(
             f"{base_url}/terminals/{terminal_id}",
             headers=_auth_headers_for(base_url) or None,
