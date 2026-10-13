@@ -4438,8 +4438,13 @@ def capture_terminal_snapshot(terminal_id: str) -> Optional[Dict]:
             strip_escapes=True,
             full_history=True,
         )
+        # Scrollback is raw terminal history and can hold anything the agent
+        # printed, so both sidecars are published 0600 through the atomic
+        # writer: a symlink planted at either path is replaced, not followed.
+        from cli_agent_orchestrator.utils.atomic_file import locked_atomic_write
+
         scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
-        scrollback_path.write_text(scrollback, encoding="utf-8")
+        locked_atomic_write(scrollback_path, scrollback, mode=0o600)
 
         import json as _json
 
@@ -4454,7 +4459,7 @@ def capture_terminal_snapshot(terminal_id: str) -> Optional[Dict]:
             "caller_id": metadata.get("caller_id"),
         }
         snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
-        snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
+        locked_atomic_write(snapshot_path, _json.dumps(snapshot, indent=2), mode=0o600)
     except Exception as e:
         logger.warning(f"Failed to snapshot terminal {terminal_id}: {e}")
 

@@ -596,6 +596,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `settings.json` is now written atomically at mode 0600 through the shared
+  atomic writer, so a symlink planted at that path is replaced rather than
+  followed and the file is private like `.env` and the database. Under
+  `logs/terminal/`, the per-terminal `.log` is created 0600 and opened with
+  `O_NOFOLLOW`, so a symlinked log path is refused instead of appended
+  through, and the `.scrollback` and `.snapshot.json` sidecars written at
+  teardown go through the same 0600 atomic writer. Existing 0644 copies are
+  tightened on the next write.
+
 - Require `shell-quote ^1.11.0` in the documentation toolchain to fix
   CVE-2026-102422, with comment-boundary and ordinary-argument regressions.
   No runtime agent dependency or security-gate policy changes.

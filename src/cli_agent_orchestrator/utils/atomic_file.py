@@ -268,6 +268,7 @@ def locked_atomic_write(
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
     overwrite: bool = True,
     must_exist: bool = False,
+    mode: Optional[int] = None,
 ) -> None:
     """Replace ``target``'s entire contents atomically and safely across processes.
 
@@ -300,6 +301,12 @@ def locked_atomic_write(
             a concurrent delete slip between the check and the write, turning an
             intended update back into a create. ``overwrite=False`` with
             ``must_exist=True`` is contradictory and raises ``ValueError``.
+        mode: When given, the published file carries exactly these permission
+            bits whether or not ``target`` already existed, instead of
+            preserving the existing mode or taking the umask default. For files
+            CAO owns outright and that may hold credentials (``settings.json``),
+            pass ``0o600``. Leave ``None`` for user-authored files such as
+            ``CLAUDE.md`` whose mode belongs to the user.
 
     Raises:
         FileExistsError: If ``target`` exists and ``overwrite`` is False.
@@ -328,7 +335,12 @@ def locked_atomic_write(
             raise FileExistsError(f"{target} already exists")
         if must_exist and not target.exists():
             raise FileNotFoundError(f"{target} does not exist")
-        _atomic_publish(target, content, encoding)
+        if mode is None:
+            # Positional call kept for callers (and tests) that wrap or stub
+            # _atomic_publish with the original three-argument signature.
+            _atomic_publish(target, content, encoding)
+        else:
+            _atomic_publish(target, content, encoding, mode=mode)
 
 
 def locked_atomic_delete(
@@ -386,20 +398,28 @@ def locked_atomic_delete(
         target.unlink()
 
 
-def _atomic_publish(target: Path, content: str, encoding: str) -> None:
+def _atomic_publish(
+    target: Path, content: str, encoding: str, *, mode: Optional[int] = None
+) -> None:
     """Write ``content`` to ``target`` via a unique temp file + ``os.replace``.
 
     Shared by :func:`locked_atomic_rewrite` and :func:`locked_atomic_write`.
     The caller MUST already hold the target's lock; this helper does no locking
     of its own.
+
+    ``os.replace`` swaps the directory entry, so a ``target`` that is a symlink
+    is replaced by the new regular file; the link's destination is never
+    opened or written. That is the property the settings writer relies on.
     """
     # Capture the existing target's mode BEFORE we write — tempfile.mkstemp
     # creates the temp at 0600, so without this fixup the os.replace below
     # would downgrade a user-authored 0644 file to 0600. A missing target
     # yields None and the temp file is created with the umask applied by the
     # kernel instead (see _existing_target_mode for why the umask is never
-    # touched here).
-    mode = _existing_target_mode(target)
+    # touched here). An explicit ``mode`` overrides both: the caller owns the
+    # file and wants a fixed set of bits.
+    if mode is None:
+        mode = _existing_target_mode(target)
 
     # Unique temp file in the SAME directory as target (same filesystem,
     # so the final os.replace stays atomic) rather than a fixed
