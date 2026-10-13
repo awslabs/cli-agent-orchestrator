@@ -569,6 +569,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- SECURITY.md now states the supported release line as 2.x (it said 1.x while
+  2.5.x was on PyPI), guarded by `test/test_security_policy.py` against the
+  version in `pyproject.toml`, and documents how maintainers handle a report:
+  triage in the advisory draft, fix in its private fork unless the finding is
+  already public, no draft advisory identifiers in public commits or PRs, CVE
+  through Amazon's CNA rather than GitHub's request button, release before
+  publishing with an affected/fixed statement, reporter credit, and a
+  regression test for the class.
+
 - The MCP server now requires fastmcp 3.2.0 or newer (was 2.14.0), the
   version CI tests. fastmcp 2.x does not export `ToolResult` from
   `fastmcp.tools`, so `cao-mcp-server` would not start on it. Upgrading
