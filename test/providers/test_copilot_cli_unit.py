@@ -114,6 +114,72 @@ class TestCopilotBoxedComposer:
             assert provider.get_status(output) == TerminalStatus.COMPLETED
             assert provider.probe_stale_processing_capture(output) == TerminalStatus.COMPLETED
 
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
+    @pytest.mark.parametrize("final_line", ["● Done.\n", ""])
+    def test_assistant_description_of_busy_hint_is_a_response(self, layout, final_line):
+        composer = "❯\n" if layout == "prompt" else self.box
+        output = (
+            "❯ explain the UI\n"
+            "● The UI says Esc to cancel while working.\n" + final_line + composer + self.hint
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        with patch.object(provider, "_resolve_native_status", return_value=None):
+            assert provider.get_status(output) == TerminalStatus.COMPLETED
+            assert provider.probe_stale_processing_capture(output) == TerminalStatus.COMPLETED
+        assert (
+            provider.extract_last_message_from_script(output)
+            == ("● The UI says Esc to cancel while working.\n" + final_line).strip()
+        )
+
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
+    def test_indented_dialog_example_is_a_response(self, layout):
+        composer = "❯\n" if layout == "prompt" else self.box
+        output = (
+            "❯ explain the dialog\n"
+            "● Example prompt:\n"
+            "  Continue? [y/n]\n" + composer + self.hint
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        with patch.object(provider, "_resolve_native_status", return_value=None):
+            assert provider.get_status(output) == TerminalStatus.COMPLETED
+            assert provider.probe_stale_processing_capture(output) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script(output) == (
+            "● Example prompt:\n  Continue? [y/n]"
+        )
+
+    @pytest.mark.parametrize("reply", ["● Partial reply", "● Approval required:"])
+    def test_indented_live_dialog_after_answer_stays_waiting(self, reply):
+        output = "❯ review\n" + reply + "\n  Allow this tool? [y/n]\n" + self.box + self.hint
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        with patch.object(provider, "_resolve_native_status", return_value=None):
+            assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+            assert (
+                provider.probe_stale_processing_capture(output)
+                == TerminalStatus.WAITING_USER_ANSWER
+            )
+
+    def test_indented_busy_row_after_example_heading_stays_processing(self):
+        output = (
+            "❯ review\n● Example:\n  ∙ Thinking (Esc to cancel)\nMore output\n"
+            + self.box
+            + self.hint
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        with patch.object(provider, "_resolve_native_status", return_value=None):
+            assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    @pytest.mark.parametrize("reply", ["", "❯ previous\n● Old reply\n"])
+    def test_nonempty_box_does_not_extract_draft_or_footer(self, reply):
+        output = reply + "╻▄▄▄▄▄▄▄▄\n┃ draft\n╹▀▀▀▀▀▀▀▀\n" + self.hint
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        with patch.object(provider, "_resolve_native_status", return_value=None):
+            assert provider.get_status(output) == TerminalStatus.PROCESSING
+        if reply:
+            assert provider.extract_last_message_from_script(output) == "● Old reply"
+        else:
+            with pytest.raises(ValueError, match="No provider response content found"):
+                provider.extract_last_message_from_script(output)
+
     @pytest.mark.parametrize(
         "frame",
         [
