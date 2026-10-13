@@ -398,14 +398,58 @@ def locked_atomic_delete(
         target.unlink()
 
 
+def unlocked_atomic_write(
+    target: Path,
+    content: str,
+    *,
+    encoding: str = "utf-8",
+    mode: Optional[int] = None,
+) -> None:
+    """Replace ``target`` atomically WITHOUT taking the cross-process lock.
+
+    Same unique-temp-file + ``fsync`` + ``os.replace`` publish as
+    :func:`locked_atomic_write`, so a partially written file is never visible,
+    two concurrent writers cannot tear each other's output (each publishes its
+    own complete temp file; the last ``os.replace`` wins whole), and a symlink
+    planted at ``target`` is swapped out rather than followed. What it gives up
+    is the lock, and with it the ``overwrite``/``must_exist`` checks, which only
+    mean something inside a critical section.
+
+    Use it for files whose NAMES are unique per writer and unbounded in number,
+    such as the per-terminal ``.scrollback`` / ``.snapshot.json`` sidecars
+    written at teardown. :func:`locked_atomic_write` keeps one lock file per
+    target in ``LOCK_DIR`` for the life of the installation (see
+    :func:`_lock_path_for`), so routing an ever-growing set of one-shot targets
+    through it would leave ``LOCK_DIR`` growing by one file per target with
+    nothing to reap them. Keep using the locked writer for the bounded set of
+    shared files (``settings.json``, ``AGENTS.md``, ...) where two processes may
+    really race on the SAME path.
+
+    Args:
+        target: The file to replace. Parent directory is created if missing.
+        content: The full new content to write.
+        encoding: Text encoding for the write.
+        mode: As for :func:`locked_atomic_write`: when given, the published
+            file carries exactly these bits; when ``None`` the existing mode is
+            preserved or the umask default applies.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if mode is None:
+        _atomic_publish(target, content, encoding)
+    else:
+        _atomic_publish(target, content, encoding, mode=mode)
+
+
 def _atomic_publish(
     target: Path, content: str, encoding: str, *, mode: Optional[int] = None
 ) -> None:
     """Write ``content`` to ``target`` via a unique temp file + ``os.replace``.
 
-    Shared by :func:`locked_atomic_rewrite` and :func:`locked_atomic_write`.
-    The caller MUST already hold the target's lock; this helper does no locking
-    of its own.
+    Shared by :func:`locked_atomic_rewrite`, :func:`locked_atomic_write` and
+    :func:`unlocked_atomic_write`. This helper does no locking of its own: the
+    locked callers hold the target's lock around it, the unlocked one relies on
+    the unique temp name plus ``os.replace`` alone (see its docstring for when
+    that is enough).
 
     ``os.replace`` swaps the directory entry, so a ``target`` that is a symlink
     is replaced by the new regular file; the link's destination is never

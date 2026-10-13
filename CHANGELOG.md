@@ -597,13 +597,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - `settings.json` is now written atomically at mode 0600 through the shared
-  atomic writer, so a symlink planted at that path is replaced rather than
-  followed and the file is private like `.env` and the database. Under
-  `logs/terminal/`, the per-terminal `.log` is created 0600 and opened with
-  `O_NOFOLLOW`, so a symlinked log path is refused instead of appended
-  through, and the `.scrollback` and `.snapshot.json` sidecars written at
-  teardown go through the same 0600 atomic writer. Existing 0644 copies are
-  tightened on the next write.
+  locked atomic writer by both of its writers (the settings service and
+  `cao config set`), so a symlink planted at that path is replaced rather than
+  followed, the file is private like `.env` and the database, and the two
+  writers serialize on one lock. Under `logs/terminal/`, the per-terminal
+  `.log` is created 0600 and opened with `O_NOFOLLOW`, so a symlinked log path
+  is refused instead of appended through, and every write re-applies 0600 to
+  the open descriptor so a log left at 0644 by a terminal running across the
+  upgrade is tightened on its next write. The `.scrollback` and
+  `.snapshot.json` sidecars written at teardown are published 0600 through
+  the new lock-free `unlocked_atomic_write` (unique temp file plus
+  `os.replace`, a planted symlink is replaced); they deliberately skip the
+  cross-process lock because each terminal gets fresh sidecar names and the
+  locked writer keeps one lock file per target for good, which would have
+  grown `locks/` by two files per teardown with nothing to reap them.
+  Existing 0644 `settings.json` and `.log` files are tightened on the next
+  write; sidecars are rewritten whole at 0600.
 
 - Require `shell-quote ^1.11.0` in the documentation toolchain to fix
   CVE-2026-102422, with comment-boundary and ordinary-argument regressions.

@@ -103,6 +103,13 @@ class LogWriter:
         # (e.g. POSIX/C locale), and a single unencodable chunk would raise
         # UnicodeEncodeError and stop log persistence for the terminal.
         with os.fdopen(fd, "a", encoding="utf-8", errors="replace") as f:
+            # O_CREAT's mode applies only when the open CREATES the file. A
+            # log that already existed at 0644 (written before this change, by
+            # a terminal still running across the upgrade) keeps its old bits
+            # unless tightened here, on the fd we just opened, so the chmod
+            # cannot race a path swap. Windows has os.fchmod only from 3.13.
+            if hasattr(os, "fchmod"):
+                os.fchmod(f.fileno(), 0o600)
             f.write(data)
 
 
