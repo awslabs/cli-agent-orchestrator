@@ -168,7 +168,7 @@ portable-pty = "0.9"
 # SIGTERM/SIGKILL escalation (BR-7) and the `kill(pid, 0)` -> ESRCH absence probe that proves
 # a kill actually worked rather than merely returning Ok (VR-4). (#321)
 filedescriptor = "0.8.3"
-nix = { version = "0.28", features = ["signal"] }
+nix = { version = "0.31", features = ["signal"] }
 # The drain thread's bounded reads surface pty-allocation failures as `anyhow::Error` from
 # `portable-pty`; `HarnessError` wraps them as `#[source]`. Affirmed practice: `anyhow` at
 # integration boundaries, `thiserror` for the crate-internal type. (#321)
