@@ -57,7 +57,7 @@ dependencies = [
     # "session not found" — this bound is the belt to that suspenders, keeping
     # the broken releases from arriving silently on another machine. Raise it
     # once upstream zips non-strict or pads short rows.
-    "libtmux>=0.51.0,<0.53.1",
+    "libtmux>=0.51.0,<0.62.1",
     "click>=8.2.0",
     "python-dotenv>=1.2.2",
     "python-frontmatter>=1.1.0",

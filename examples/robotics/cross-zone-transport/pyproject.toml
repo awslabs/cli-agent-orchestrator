@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["jsonschema==4.26.0", "pytest==9.0.3", "uvicorn==0.54.0"]
+dev = ["jsonschema==4.26.0", "pytest==9.1.1", "uvicorn==0.54.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
