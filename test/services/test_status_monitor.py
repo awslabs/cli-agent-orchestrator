@@ -1806,10 +1806,18 @@ class TestStatusObservationIsStampedWhenEarned:
 
 class TestCopilotBoxedComposerRecovery:
     @pytest.mark.parametrize("layout", ["prompt", "box"])
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            "● The utility asks before deleting: [y/n].",
+            "● For instance:\n  Continue? [y/n]",
+            "● The installer shows:\n  The prompt reads\n  Press enter to continue",
+        ],
+    )
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     def test_reported_choice_in_completed_reply_does_not_block_recovery(
-        self, mock_pm, mock_backend, layout
+        self, mock_pm, mock_backend, layout, answer
     ):
         from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 
@@ -1821,7 +1829,8 @@ class TestCopilotBoxedComposerRecovery:
         composer = "❯\n" if layout == "prompt" else "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀▀▀▀▀\n"
         backend.get_history.return_value = (
             "❯ explain the confirmation prompt\n"
-            "● The utility asks before deleting: [y/n].\n"
+            + answer
+            + "\n"
             + composer
             + "← open sidebar · Autopilot · Allow All · / commands · tab next tab\n"
         )

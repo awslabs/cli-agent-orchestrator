@@ -523,19 +523,22 @@ class CopilotCliProvider(BaseProvider):
     @classmethod
     def _active_rows(cls, rows: list[str]) -> list[str]:
         active = []
-        quoted_answer = False
+        in_answer = False
         for row in rows:
             stripped = row.strip()
             if re.match(ASSISTANT_PREFIX_PATTERN, stripped, re.IGNORECASE):
-                quoted_answer = stripped.endswith(":") and bool(
-                    re.search(r"\b(?:example|sample|quoted)\b", stripped, re.IGNORECASE)
-                )
+                in_answer = True
                 continue
             if not stripped:
+                in_answer = False
                 continue
-            if quoted_answer and row[0].isspace() and cls._is_waiting_dialog_row(row):
+            if (
+                in_answer
+                and row[0].isspace()
+                and not re.search(COPILOT_BUSY_ROW_PATTERN, stripped, re.IGNORECASE)
+            ):
                 continue
-            quoted_answer = False
+            in_answer = False
             if cls._is_busy_or_waiting_row(row):
                 active.append(row)
         return active

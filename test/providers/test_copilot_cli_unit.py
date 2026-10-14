@@ -132,24 +132,29 @@ class TestCopilotBoxedComposer:
         )
 
     @pytest.mark.parametrize("layout", ["prompt", "box"])
-    def test_indented_dialog_example_is_a_response(self, layout):
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            "● Example prompt:\n  Continue? [y/n]",
+            "● For instance:\n  Continue? [y/n]",
+            "● apt then asks:\n  Do you want to continue? [Y/n]",
+            "● The installer shows:\n  Press enter to continue",
+            "● Example prompt:\n  The tool shows\n  Continue? [y/n]",
+        ],
+    )
+    def test_indented_dialog_in_answer_is_a_response(self, layout, answer):
         composer = "❯\n" if layout == "prompt" else self.box
-        output = (
-            "❯ explain the dialog\n"
-            "● Example prompt:\n"
-            "  Continue? [y/n]\n" + composer + self.hint
-        )
+        output = "❯ explain the dialog\n" + answer + "\n" + composer + self.hint
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         with patch.object(provider, "_resolve_native_status", return_value=None):
             assert provider.get_status(output) == TerminalStatus.COMPLETED
             assert provider.probe_stale_processing_capture(output) == TerminalStatus.COMPLETED
-        assert provider.extract_last_message_from_script(output) == (
-            "● Example prompt:\n  Continue? [y/n]"
-        )
+            assert provider.commit_stale_processing_capture(output, TerminalStatus.COMPLETED)
+        assert provider.extract_last_message_from_script(output) == answer
 
     @pytest.mark.parametrize("reply", ["● Partial reply", "● Approval required:"])
-    def test_indented_live_dialog_after_answer_stays_waiting(self, reply):
-        output = "❯ review\n" + reply + "\n  Allow this tool? [y/n]\n" + self.box + self.hint
+    def test_separate_live_dialog_after_answer_stays_waiting(self, reply):
+        output = "❯ review\n" + reply + "\n\n  Allow this tool? [y/n]\n" + self.box + self.hint
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         with patch.object(provider, "_resolve_native_status", return_value=None):
             assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER

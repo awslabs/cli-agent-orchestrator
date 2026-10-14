@@ -1516,6 +1516,7 @@ class StatusMonitor:
                 ):
                     return
                 self._loop = loop
+                handle: asyncio.TimerHandle
                 handle = loop.call_later(
                     STALE_PROCESSING_CAPTURE_INTERVAL_S,
                     lambda: self._on_stale_capture_confirmation(terminal_id, generation, handle),
