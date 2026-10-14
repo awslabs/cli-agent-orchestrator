@@ -488,7 +488,7 @@ class CopilotCliProvider(BaseProvider):
         # "❯ ... or ? for" + "shortcuts"
         if re.match(PROMPT_HELPER_CONTINUATION_PATTERN, stripped):
             return True
-        if stripped.startswith("╭") or stripped.startswith("╰") or stripped.startswith("│"):
+        if stripped.startswith("╭") or stripped.startswith("╰") or line.startswith("│"):
             return True
         # Copilot v1.0.31+ status bar: " autopilot · / commands    Claude Sonnet 4.6 · (0%)"
         if re.match(COPILOT_STATUS_BAR_PATTERN, stripped):
@@ -529,10 +529,6 @@ class CopilotCliProvider(BaseProvider):
         continuation_indent = None
         for row in rows:
             stripped = row.strip()
-            if re.fullmatch(r"│\s*.*?\s*│", stripped) and cls._is_waiting_dialog_row(row):
-                active.append(row)
-                continuation_indent = None
-                continue
             if re.match(USER_PROMPT_LINE_PATTERN, row):
                 continuation_indent = len(row) - len(row.lstrip())
                 continue
@@ -566,9 +562,12 @@ class CopilotCliProvider(BaseProvider):
 
     @staticmethod
     def _is_processing_line(line: str) -> bool:
-        if re.match(ASSISTANT_PREFIX_PATTERN, line.strip(), re.IGNORECASE):
+        stripped = line.strip()
+        if re.match(ASSISTANT_PREFIX_PATTERN, stripped, re.IGNORECASE) and not re.match(
+            r"^[●◐◑◒◓◉]\s*(?:thinking|working)\b", stripped, re.IGNORECASE
+        ):
             return False
-        return bool(re.match(PROCESSING_LINE_PATTERN, line.strip(), re.IGNORECASE))
+        return bool(re.match(PROCESSING_LINE_PATTERN, stripped, re.IGNORECASE))
 
     @classmethod
     def _has_idle_prompt_near_end(cls, lines: list[str]) -> bool:
@@ -838,7 +837,7 @@ class CopilotCliProvider(BaseProvider):
                 and any(row.lstrip().startswith("│") for row in thought_rows)
                 and all(not row.strip() or row.lstrip().startswith("│") for row in thought_rows)
             ):
-                omitted.add(idx)
+                omitted.update(range(idx, first_reply))
         return [row for idx, row in enumerate(lines) if idx not in omitted]
 
     def extract_last_message_from_script(self, script_output: str) -> str:

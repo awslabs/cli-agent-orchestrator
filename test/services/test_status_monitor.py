@@ -1813,6 +1813,11 @@ class TestCopilotBoxedComposerRecovery:
             "● For instance:\n  Continue? [y/n]",
             "● The installer shows:\n  The prompt reads\n  Press enter to continue",
             " ● APT asks for confirmation.\n\n   Do you want to continue? [Y/n]\n\n ● Task complete",
+            " ● ┌──────┬────────────────────────────────┐\n"
+            "   │ Tool │ Question                       │\n"
+            "   ├──────┼────────────────────────────────┤\n"
+            "   │ apt  │ Do you want to continue? [Y/n] │\n"
+            "   └──────┴────────────────────────────────┘",
         ],
     )
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
@@ -2118,6 +2123,22 @@ class TestCopilotStaleWaitingCapture:
             sm._buffer_changed_at["t1"] = -1000
             backend.get_history.return_value = "❯\n" + self.hint
             yield sm, provider, backend
+
+    def test_completed_table_recovers_cached_waiting(self, waiting_monitor):
+        sm, _, backend = waiting_monitor
+        backend.get_history.return_value = (
+            "❯ show the confirmation table\n"
+            " ● ┌──────┬────────────────────────────────┐\n"
+            "   │ Tool │ Question                       │\n"
+            "   ├──────┼────────────────────────────────┤\n"
+            "   │ apt  │ Do you want to continue? [Y/n] │\n"
+            "   └──────┴────────────────────────────────┘\n"
+            "────────\n❯\n────────\n" + self.hint
+        )
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        assert sm._pending_stale_capture["t1"][0] == TerminalStatus.COMPLETED
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
 
     @pytest.mark.parametrize("layout", ["prompt", "draft", "box"])
     @pytest.mark.parametrize("placement", ["before", "after"])

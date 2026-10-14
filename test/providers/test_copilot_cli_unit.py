@@ -197,6 +197,27 @@ class TestCopilotBoxedComposer:
                 == TerminalStatus.WAITING_USER_ANSWER
             )
 
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
+    @pytest.mark.parametrize(
+        "question", ["Do you want to continue? [Y/n]", "Press Enter to continue"]
+    )
+    def test_answer_table_is_not_a_framed_dialog(self, layout, question):
+        composer = "────────\n❯\n────────\n" if layout == "prompt" else self.box
+        answer = (
+            " ● ┌──────┬────────────────────────────────┐\n"
+            "   │ Tool │ Question                       │\n"
+            "   ├──────┼────────────────────────────────┤\n"
+            f"   │ apt  │ {question:<30} │\n"
+            "   └──────┴────────────────────────────────┘"
+        )
+        output = "❯ show the confirmation table\n" + answer + "\n" + composer + self.hint
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        with patch.object(provider, "_resolve_native_status", return_value=None):
+            assert provider.get_status(output) == TerminalStatus.COMPLETED
+            assert provider.probe_stale_processing_capture(output) == TerminalStatus.COMPLETED
+            assert provider.commit_stale_processing_capture(output, TerminalStatus.COMPLETED)
+        assert provider.extract_last_message_from_script(output) == answer.strip()
+
     def test_indented_busy_row_after_example_heading_stays_processing(self):
         output = (
             "❯ review\n● Example:\n  ∙ Thinking (Esc to cancel)\nMore output\n"
@@ -879,7 +900,12 @@ class TestCopilotCliProviderTrustPrompts:
 
 class TestCopilotCliProviderStatusDetection:
     @pytest.mark.parametrize(
-        "busy_row", ["∙ Thinking (Esc to cancel)", "⠋ Working · esc interrupt · enqueue"]
+        "busy_row",
+        [
+            "∙ Thinking (Esc to cancel)",
+            "● Thinking (Esc to cancel)",
+            "⠋ Working · esc interrupt · enqueue",
+        ],
     )
     @pytest.mark.parametrize("composer", ["❯", "❯ unsent text"])
     @pytest.mark.parametrize("submitted_prompt", ["", "❯ do the task\n"])
@@ -900,6 +926,19 @@ class TestCopilotCliProviderStatusDetection:
         assert provider.probe_stale_processing_capture(output) == TerminalStatus.PROCESSING
         assert provider.commit_stale_processing_capture(output, TerminalStatus.IDLE) is False
         assert provider.commit_stale_processing_capture(output, TerminalStatus.COMPLETED) is False
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
+    def test_assistant_prose_mentioning_cancel_remains_completed(self, mock_tmux):
+        mock_tmux.return_value.get_native_status.return_value = None
+        output = (
+            "❯ explain the status text\n"
+            "● The status text says Esc to cancel.\n"
+            "────────\n❯\n────────\n"
+            "← open sidebar · Autopilot · Allow All · / commands · tab next tab\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+        assert provider.probe_stale_processing_capture(output) == TerminalStatus.COMPLETED
 
     @pytest.mark.parametrize(
         "busy_row", ["∙ Thinking (Esc to cancel)", "⠋ Working · esc interrupt · enqueue"]
