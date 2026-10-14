@@ -1759,6 +1759,39 @@ class TestSiblings:
         assert [(s["id"], s["status"]) for s in siblings] == [("abcd0002", "processing")]
 
 
+class TestDropCancellation:
+    @pytest.mark.asyncio
+    async def test_a_second_cancel_holds_the_drop_lock_until_the_row_write_lands(self, monkeypatch):
+        import threading
+
+        registry = server_mod.runtime_registry
+        started, land = threading.Event(), threading.Event()
+
+        def slow_drop(runtime_id, terminal_id):
+            started.set()
+            land.wait(5)
+            return True
+
+        async def send_text(text):
+            pass
+
+        monkeypatch.setattr(server_mod, "_drop_lost_row", slow_drop)
+        conn = registry.register("rt-1", send_text)
+        task = asyncio.ensure_future(server_mod._drop_lost("rt-1", ["t1"], conn))
+        await asyncio.to_thread(started.wait, 5)
+        task.cancel()  # the server is stopping
+        await asyncio.sleep(0.05)
+        task.cancel()  # and is cancelled again while it waits for the write
+        await asyncio.sleep(0.05)
+        try:
+            assert registry.drop_lock("rt-1").locked(), "released before the row write landed"
+        finally:
+            land.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not registry.drop_lock("rt-1").locked()
+
+
 class TestLaunchCancellation:
     @pytest.mark.asyncio
     async def test_a_launch_cancelled_before_it_is_sent_never_starts(self):
@@ -2345,11 +2378,16 @@ class TestLaunchMetadata:
         row = database.get_terminal_metadata("beef0001")
         assert row["working_directory"] == "/home/cao/workspace/repo"
 
+    @pytest.mark.parametrize("reported", ["not sent", None, "", "repo", "/work/\x00x"])
     def test_a_runtime_that_reports_no_working_directory_keeps_the_requested_one(
-        self, http, start_runtime
+        self, http, start_runtime, reported
     ):
-        # A cao-bridge from before this field: the request's, as before.
-        start_runtime(script=lambda command: {"terminal": dict(LAUNCHED)})
+        # A cao-bridge from before this field: the request's, as before. So
+        # too for an empty, relative or NUL-holding path, which is not recorded.
+        launched = dict(LAUNCHED)
+        if reported != "not sent":
+            launched["working_directory"] = reported
+        start_runtime(script=lambda command: {"terminal": dict(launched)})
         response = http.post(
             "/runtimes/rt-1/terminals",
             json={"agent_profile": "developer", "working_directory": "/work/repo"},

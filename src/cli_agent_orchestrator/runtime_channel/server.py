@@ -157,8 +157,12 @@ async def _drop_lost(
             except asyncio.CancelledError:
                 # The server is stopping: hold the lock until the row write
                 # has landed, so it cannot land after a newer registration.
-                with contextlib.suppress(BaseException):
-                    await write
+                # Shielded and looped, so a second cancellation cannot release
+                # the lock early. No `unknown` is published for a record
+                # dropped here: the server's consumers are stopping too.
+                while not write.done():
+                    with contextlib.suppress(BaseException):
+                        await asyncio.shield(write)
                 raise
             except Exception:  # noqa: BLE001 - kept for the next hello; the channel goes on
                 logger.warning(
@@ -452,6 +456,15 @@ class _Launched(BaseModel):
         # The allowlist local creation uses: the session APIs refuse any other
         # name, so a row under one could not be addressed through them.
         return validate_tmux_name(value, info.field_name or "name")
+
+    @field_validator("working_directory")
+    @classmethod
+    def _plausible_directory(cls, value: Optional[str]) -> Optional[str]:
+        # Runtime-asserted and only recorded, never used as a path here. One
+        # that is not absolute, or holds a NUL, is not recorded: the request's is.
+        if value and (not value.startswith("/") or "\x00" in value):
+            return None
+        return value
 
 
 async def _undo_launch(
