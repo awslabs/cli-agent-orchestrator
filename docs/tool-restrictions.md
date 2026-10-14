@@ -119,7 +119,7 @@ CAO translates these to each provider's native tool names automatically. You wri
 
 #### `discovery` is a separate opt-in, not part of `@cao-mcp-server`
 
-`discovery` gates `list_siblings`/`update_metadata` independently of `@cao-mcp-server`. A profile with `@cao-mcp-server` (handoff/assign/send_message) does **not** automatically get sibling discovery, and vice versa — none of the built-in roles (`supervisor`, `developer`, `reviewer`, `workflow_scout`) include `discovery`; add it explicitly if a profile needs peer-to-peer discovery.
+`discovery` gates `list_siblings`/`update_metadata` independently of `@cao-mcp-server`. A profile with `@cao-mcp-server` (handoff/assign/send_message) does **not** automatically get sibling discovery, and vice versa — none of the built-in roles (`supervisor`, `developer`, `reviewer`, `workflow_scout`) include `discovery`; add it explicitly if a profile needs peer-to-peer discovery. The same grant is what lets `send_message` name a discovered sibling as `receiver_id`: without it, an explicit receiver must be a terminal the caller created or the caller's own creator (see [Discovery Tool Coexistence](discovery-tool-coexistence.md), "How the two topologies meet").
 
 This is deliberate (see the design discussion on [issue #432](https://github.com/awslabs/cli-agent-orchestrator/issues/432)): the supervisor/worker hierarchy `handoff`/`assign`/`send_message` are built around, and the flat peer layer `group`/`list_siblings`/`update_metadata` introduce, are two different communication topologies. A profile should be able to keep one without the other. See [Discovery Tool Coexistence](discovery-tool-coexistence.md) for the full rationale, the enforcement mechanism, and open follow-ups.
 

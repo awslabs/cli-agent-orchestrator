@@ -38,17 +38,17 @@ from pydantic import ValidationError
 
 from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam: creation no longer bulk-deletes with this helper,; but older integrations/tests patch the imported symbol while exercising; create_terminal. Keep the name exported from this module until that seam; can be retired separately.
+from cli_agent_orchestrator.clients.database import (
+    delete_terminals_by_session,  # Compatibility/test seam: creation no longer bulk-deletes with this helper, but older integrations/tests patch the imported symbol while exercising create_terminal. Keep the name exported from this module until that seam can be retired separately.
+)
+from cli_agent_orchestrator.clients.database import (
     count_runtime_allocated_terminals,
     create_inbox_message,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
-from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam: creation no longer bulk-deletes with this helper,; but older integrations/tests patch the imported symbol while exercising; create_terminal. Keep the name exported from this module until that seam; can be retired separately.
-    delete_idempotency_key,
-)
+from cli_agent_orchestrator.clients.database import delete_idempotency_key
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
-from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam: creation no longer bulk-deletes with this helper,; but older integrations/tests patch the imported symbol while exercising; create_terminal. Keep the name exported from this module until that seam; can be retired separately.
-    delete_terminals_by_session,
+from cli_agent_orchestrator.clients.database import (
     get_idempotency_record,
     get_session_incarnation,
     get_terminal_metadata,
@@ -3642,6 +3642,28 @@ def _schedule_deferred_init(
     return task
 
 
+def callback_terminal_id_for_session(session_name: Optional[str]) -> Optional[str]:
+    """Return the cross-node creator recorded for ``session_name``, if any.
+
+    A worker placed here from another node (``assign``/``handoff`` with
+    ``target_host``) has ``caller_id`` None, because its supervisor has no row
+    on this node. What it does have is ``CAO_CALLBACK_TERMINAL_ID`` in the
+    session env the supervisor injected at creation (persisted via
+    ``set_session_env``). ``get_terminal`` publishes it as
+    ``callback_terminal_id`` so the supervisor's own MCP server can recognise
+    its worker when it deletes it through ``target_host``. The store is
+    process-local, so after a cao-server restart this is None again; the
+    ``caller_id`` branch of the same check is unaffected by that.
+    """
+    if not session_name:
+        return None
+    try:
+        return get_session_env(str(session_name)).get(CALLBACK_TERMINAL_ID_ENV) or None
+    except Exception as exc:  # noqa: BLE001 — a missing creator must not break reads
+        logger.warning(f"Failed to read callback terminal id for session {session_name}: {exc}")
+        return None
+
+
 def get_terminal(terminal_id: str) -> Dict:
     """Get terminal data."""
     try:
@@ -3691,6 +3713,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "model_honored": metadata.get("model_honored"),
             "ephemeral": metadata.get("ephemeral", False),
             "caller_id": metadata.get("caller_id"),
+            "callback_terminal_id": callback_terminal_id_for_session(metadata["tmux_session"]),
             "allowed_tools": metadata.get("allowed_tools"),
             "engine": metadata.get("engine"),
             "group": metadata.get("group"),

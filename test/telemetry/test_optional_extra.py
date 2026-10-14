@@ -7,6 +7,8 @@ imports it, e.g. ``api.main``) without the SDK present.
 The missing-SDK condition is simulated in a subprocess with a meta-path hook
 that blocks ``opentelemetry`` imports — the SDK *is* installed in the dev
 environment, so an in-process test could not exercise the fallback branch.
+The ``api.main`` probe blocks only the extra's packages, because FastAPI
+imports ``opentelemetry-api`` in every install.
 """
 
 from __future__ import annotations
@@ -75,6 +77,40 @@ t.init_telemetry("cao")
 print("OK")
 """
 
+# A base install still has opentelemetry-api: FastAPI >= 0.142 imports it at
+# module load. Block only the packages that the [otel] extra adds; the helpers
+# then use the API's non-recording tracer and must stay inert.
+_API_MAIN_BASE_INSTALL_PROBE = """
+import sys
+from importlib.abc import MetaPathFinder
+
+_EXTRA_ONLY = (
+    "opentelemetry.sdk",
+    "opentelemetry.exporter",
+    "opentelemetry.proto",
+    "opentelemetry.semconv",
+)
+
+class _BlockOtelExtra(MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name.startswith(_EXTRA_ONLY):
+            raise ImportError(f"blocked for test: {name}", name=name)
+        return None
+
+sys.meta_path.insert(0, _BlockOtelExtra())
+
+import cli_agent_orchestrator.api.main  # noqa: F401
+import cli_agent_orchestrator.telemetry as t
+
+t.init_telemetry("cao")
+t.shutdown_telemetry()
+assert t.inject_traceparent() is None
+with t.invoke_agent_span("agent-1", conversation_id="c1", tier=2) as span:
+    assert not span.is_recording()
+
+print("OK")
+"""
+
 
 def test_telemetry_package_noops_without_otel_sdk() -> None:
     proc = subprocess.run(
@@ -89,13 +125,8 @@ def test_telemetry_package_noops_without_otel_sdk() -> None:
 
 def test_api_main_imports_without_otel_sdk() -> None:
     """cao-server's module import path survives a base (no-extra) install."""
-    probe = _BLOCK_OTEL_AND_PROBE.replace(
-        "import cli_agent_orchestrator.telemetry as t",
-        "import cli_agent_orchestrator.api.main  # noqa: F401\n"
-        "import cli_agent_orchestrator.telemetry as t",
-    )
     proc = subprocess.run(
-        [sys.executable, "-c", probe],
+        [sys.executable, "-c", _API_MAIN_BASE_INSTALL_PROBE],
         capture_output=True,
         text=True,
         timeout=120,
