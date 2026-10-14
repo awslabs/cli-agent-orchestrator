@@ -504,6 +504,9 @@ class CopilotCliProvider(BaseProvider):
     @staticmethod
     def _is_waiting_dialog_row(text: str) -> bool:
         stripped = text.strip().lower()
+        framed = re.fullmatch(r"│\s*(.*?)\s*│", stripped)
+        if framed:
+            stripped = framed.group(1).strip()
         if re.match(ASSISTANT_PREFIX_PATTERN, stripped, re.IGNORECASE):
             return False
         return bool(
@@ -523,22 +526,28 @@ class CopilotCliProvider(BaseProvider):
     @classmethod
     def _active_rows(cls, rows: list[str]) -> list[str]:
         active = []
-        in_answer = False
+        continuation_indent = None
         for row in rows:
             stripped = row.strip()
+            if re.fullmatch(r"│\s*.*?\s*│", stripped) and cls._is_waiting_dialog_row(row):
+                active.append(row)
+                continuation_indent = None
+                continue
+            if re.match(USER_PROMPT_LINE_PATTERN, row):
+                continuation_indent = len(row) - len(row.lstrip())
+                continue
             if re.match(ASSISTANT_PREFIX_PATTERN, stripped, re.IGNORECASE):
-                in_answer = True
+                continuation_indent = len(row) - len(row.lstrip())
                 continue
             if not stripped:
-                in_answer = False
                 continue
             if (
-                in_answer
-                and row[0].isspace()
+                continuation_indent is not None
+                and len(row) - len(row.lstrip()) > continuation_indent
                 and not re.search(COPILOT_BUSY_ROW_PATTERN, stripped, re.IGNORECASE)
             ):
                 continue
-            in_answer = False
+            continuation_indent = None
             if cls._is_busy_or_waiting_row(row):
                 active.append(row)
         return active
@@ -606,7 +615,7 @@ class CopilotCliProvider(BaseProvider):
             # Copilot can keep the composer visible during execution or approval.
             composer_start = len(stripped) - len(tail) + start
             last_user = cls._find_last_user_line(stripped[:composer_start])
-            before = stripped[last_user + 1 : composer_start]
+            before = stripped[max(last_user, 0) : composer_start]
             unrecognized.extend(cls._active_rows(before))
         return unrecognized
 
@@ -718,11 +727,11 @@ class CopilotCliProvider(BaseProvider):
         lines = output.splitlines()
         has_idle_prompt_at_end = self._has_idle_prompt_near_end(lines)
         last_user = self._find_last_user_line(lines)
-        recent_rows = lines[max(last_user + 1, len(lines) - 40) :]
+        recent_rows = lines[last_user if last_user >= 0 else max(0, len(lines) - 40) :]
         waiting_now = any(
             self._is_waiting_dialog_row(row) for row in self._active_rows(recent_rows)
         )
-        if waiting_now and not has_idle_prompt_at_end:
+        if waiting_now:
             return TerminalStatus.WAITING_USER_ANSWER
 
         if not has_idle_prompt_at_end:
@@ -769,7 +778,7 @@ class CopilotCliProvider(BaseProvider):
         lines = cleaned.splitlines()
         span = self._last_composer_span(lines)
         last_user = self._find_last_user_line(lines[: span[0]] if span else lines)
-        post_user = lines[last_user + 1 :]
+        post_user = lines[max(last_user, 0) :]
         # A composer below a dialog does not prove the dialog was dismissed.
         if any(self._is_waiting_dialog_row(row) for row in self._active_rows(post_user)):
             return TerminalStatus.WAITING_USER_ANSWER

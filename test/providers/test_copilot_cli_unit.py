@@ -152,14 +152,48 @@ class TestCopilotBoxedComposer:
             assert provider.commit_stale_processing_capture(output, TerminalStatus.COMPLETED)
         assert provider.extract_last_message_from_script(output) == answer
 
-    @pytest.mark.parametrize("reply", ["● Partial reply", "● Approval required:"])
-    def test_separate_live_dialog_after_answer_stays_waiting(self, reply):
-        output = "❯ review\n" + reply + "\n\n  Allow this tool? [y/n]\n" + self.box + self.hint
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
+    def test_answer_paragraph_and_wrapped_user_prompt_are_not_dialogs(self, layout):
+        composer = "❯\n" if layout == "prompt" else self.box
+        output = (
+            "❯ Quote the APT prompt\n"
+            "   and include [y/n]\n"
+            " ● APT asks for confirmation.\n\n"
+            "   Do you want to continue? [Y/n]\n\n"
+            " ● Task complete\n"
+            "   └ Quoted the requested prompt.\n" + composer + self.hint
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        with patch.object(provider, "_resolve_native_status", return_value=None):
+            assert provider.get_status(output) == TerminalStatus.COMPLETED
+            assert provider.probe_stale_processing_capture(output) == TerminalStatus.COMPLETED
+            assert provider.commit_stale_processing_capture(output, TerminalStatus.COMPLETED)
+
+    @pytest.mark.parametrize("layout", ["none", "prompt", "box"])
+    def test_framed_folder_trust_stays_waiting(self, layout):
+        frame = (
+            "╭────────────╮\n"
+            "│ Confirm folder trust │\n"
+            "│ Do you trust the files in this folder? │\n"
+            "│ ❯ 1. Yes │\n"
+            "╰────────────╯\n"
+        )
+        composer = self.box if layout == "box" else "❯\n" if layout == "prompt" else ""
+        output = "❯ review\n● Partial reply\n" + frame + composer + self.hint
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         with patch.object(provider, "_resolve_native_status", return_value=None):
             assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
             assert (
                 provider.probe_stale_processing_capture(output)
+                == TerminalStatus.WAITING_USER_ANSWER
+            )
+            assert not provider.commit_stale_processing_capture(output, TerminalStatus.COMPLETED)
+
+    def test_raw_framed_folder_trust_row_is_waiting(self):
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        with patch.object(provider, "_resolve_native_status", return_value=None):
+            assert (
+                provider.get_status("│ Do you trust the files in this folder?│")
                 == TerminalStatus.WAITING_USER_ANSWER
             )
 

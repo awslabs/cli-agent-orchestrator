@@ -1812,6 +1812,7 @@ class TestCopilotBoxedComposerRecovery:
             "● The utility asks before deleting: [y/n].",
             "● For instance:\n  Continue? [y/n]",
             "● The installer shows:\n  The prompt reads\n  Press enter to continue",
+            " ● APT asks for confirmation.\n\n   Do you want to continue? [Y/n]\n\n ● Task complete",
         ],
     )
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
@@ -1829,6 +1830,7 @@ class TestCopilotBoxedComposerRecovery:
         composer = "❯\n" if layout == "prompt" else "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀▀▀▀▀\n"
         backend.get_history.return_value = (
             "❯ explain the confirmation prompt\n"
+            "   including [y/n]\n"
             + answer
             + "\n"
             + composer
@@ -1985,6 +1987,36 @@ class TestCopilotBoxedComposerRecovery:
 class TestCopilotStaleWaitingCapture:
     trust = "Confirm folder trust\n1. Yes\n2. Yes, and remember\n"
     hint = "← open sidebar · Autopilot · Allow All · / commands · tab next tab"
+
+    @pytest.mark.parametrize("source", ["raw", "pane"])
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_framed_trust_is_waiting(self, mock_pm, mock_backend, source):
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+
+        provider = CopilotCliProvider("t1", "s", "w")
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        mock_backend.return_value = backend
+        trust = (
+            "╭────────────╮\n"
+            "│ Confirm folder trust │\n"
+            "│ Do you trust the files in this folder? │\n"
+            "│ ❯ 1. Yes │\n"
+            "╰────────────╯\n"
+        )
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = trust if source == "raw" else ""
+        sm._buffer_changed_at["t1"] = time.monotonic() - STALE_PROCESSING_BUFFER_QUIET_S - 1
+        sm._processing_generation["t1"] = 0
+        backend.get_history.return_value = trust
+        if source == "pane":
+            assert sm.get_status("t1") == TerminalStatus.PROCESSING
+            assert sm._pending_stale_capture["t1"][0] == TerminalStatus.WAITING_USER_ANSWER
+            sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("interruption", ["input", "idle", "reset"])
