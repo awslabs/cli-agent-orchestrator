@@ -532,6 +532,10 @@ class CopilotCliProvider(BaseProvider):
             if re.match(USER_PROMPT_LINE_PATTERN, row):
                 continuation_indent = len(row) - len(row.lstrip())
                 continue
+            if cls._is_processing_line(row):
+                active.append(row)
+                continuation_indent = None
+                continue
             if re.match(ASSISTANT_PREFIX_PATTERN, stripped, re.IGNORECASE):
                 continuation_indent = len(row) - len(row.lstrip())
                 continue

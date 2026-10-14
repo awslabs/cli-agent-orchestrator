@@ -71,10 +71,20 @@ class TestCopilotBoxedComposer:
             assert provider.get_status(output) == expected
             assert not provider.commit_stale_processing_capture(output, TerminalStatus.COMPLETED)
 
-    def test_box_does_not_hide_busy_row_in_tall_pane(self):
+    @pytest.mark.parametrize(
+        "busy_row",
+        [
+            "∙ Thinking (Esc to cancel)",
+            "● Thinking (Esc to cancel)",
+            "◉ Working · esc interrupt · enqueue",
+            "◐ Thinking (Esc to cancel)",
+        ],
+    )
+    @pytest.mark.parametrize("detail_count", [0, 1, 45])
+    def test_box_does_not_hide_busy_row_in_tall_pane(self, busy_row, detail_count):
         output = (
-            "❯ review\n● Partial reply\n∙ Thinking (Esc to cancel)\n"
-            + "detail\n" * 45
+            f"❯ review\n● Partial reply\n{busy_row}\n"
+            + "detail\n" * detail_count
             + self.box
             + self.hint
         )
@@ -82,6 +92,7 @@ class TestCopilotBoxedComposer:
         with patch.object(provider, "_resolve_native_status", return_value=None):
             assert provider.get_status(output) == TerminalStatus.PROCESSING
             assert provider.probe_stale_processing_capture(output) == TerminalStatus.PROCESSING
+            assert not provider.commit_stale_processing_capture(output, TerminalStatus.COMPLETED)
 
     @pytest.mark.parametrize("layout", ["prompt", "box"])
     @pytest.mark.parametrize(
