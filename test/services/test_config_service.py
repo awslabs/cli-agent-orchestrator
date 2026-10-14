@@ -231,3 +231,35 @@ class TestListAll:
         assert "memory.compile_mode" in result
         assert "server.mcp_request_timeout" in result
         assert result["terminal.backend"] == "tmux"
+
+
+class TestSavePrivateAndSymlinkSafe:
+    """``cao config set`` is the second writer of settings.json and must match the
+    first: 0600, atomic, never through a symlink. ``ConfigService.set`` reaches
+    ``_save_raw`` for every key settings_service does not own (``terminal.backend``
+    here), so this pins that path rather than the settings_service one."""
+
+    def test_set_creates_file_private(self, _isolated_settings):
+        settings = _isolated_settings["settings"]
+        ConfigService.set("terminal.backend", "tmux")
+        assert oct(settings.stat().st_mode & 0o777) == oct(0o600)
+        assert json.loads(settings.read_text())["terminal"]["backend"] == "tmux"
+
+    def test_set_tightens_an_existing_world_readable_file(self, _isolated_settings):
+        settings = _isolated_settings["settings"]
+        settings.write_text(json.dumps({"terminal": {"backend": "herdr"}}))
+        settings.chmod(0o644)
+        ConfigService.set("terminal.backend", "tmux")
+        assert oct(settings.stat().st_mode & 0o777) == oct(0o600)
+        assert json.loads(settings.read_text())["terminal"]["backend"] == "tmux"
+
+    def test_set_does_not_follow_a_symlink(self, _isolated_settings, tmp_path):
+        settings = _isolated_settings["settings"]
+        victim = tmp_path / "victim.txt"
+        victim.write_text("do not touch")
+        settings.symlink_to(victim)
+        ConfigService.set("terminal.backend", "tmux")
+        assert victim.read_text() == "do not touch"
+        assert not settings.is_symlink()
+        assert oct(settings.stat().st_mode & 0o777) == oct(0o600)
+        assert json.loads(settings.read_text())["terminal"]["backend"] == "tmux"

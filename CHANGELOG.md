@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Security regression tests derived from the review harnesses Augusto Santos
+  (@gutosantos82) wrote while assessing CAO's CI security gates: a route-by-scope
+  authorization matrix with auth enabled (every HTTP route x no/read/write/admin
+  token, handlers stubbed, admin-only and read-tier routes pinned as literals), a
+  browser-boundary matrix for the Host (#124), WebSocket Origin (#533), CSRF
+  (#605), malformed-Origin (#656) and scheme-aware same-origin (#658) guards, and
+  filesystem invariants for the per-terminal FIFO path (#823) and atomic-file
+  modes under a concurrent writer (#821). `test/security/`. (#938)
 - Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `assign` and `handoff` still refuse them. `ephemeral.enabled` stays off by default.
 - Simulation-only cross-zone robot transport example (#845): existing CAO CLI
   supervisor, zone-operation, and checker agents share a persistent MuJoCo
@@ -623,6 +631,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   persistence, the workflow-level `security-events: write` in `ci.yml`, and
   the npm cache in the release build), each a tracked follow-up rather than a
   silenced result.
+
+- `settings.json` is now written atomically at mode 0600 through the shared
+  locked atomic writer by both of its writers (the settings service and
+  `cao config set`), so a symlink planted at that path is replaced rather than
+  followed, the file is private like `.env` and the database, and the two
+  writers serialize on one lock. Under `logs/terminal/`, the per-terminal
+  `.log` is created 0600 and opened with `O_NOFOLLOW`, so a symlinked log path
+  is refused instead of appended through, and every write re-applies 0600 to
+  the open descriptor so a log left at 0644 by a terminal running across the
+  upgrade is tightened on its next write. The `.scrollback` and
+  `.snapshot.json` sidecars written at teardown are published 0600 through
+  the new lock-free `unlocked_atomic_write` (unique temp file plus
+  `os.replace`, a planted symlink is replaced); they deliberately skip the
+  cross-process lock because each terminal gets fresh sidecar names and the
+  locked writer keeps one lock file per target for good, which would have
+  grown `locks/` by two files per teardown with nothing to reap them.
+  Existing 0644 `settings.json` and `.log` files are tightened on the next
+  write; sidecars are rewritten whole at 0600.
+- `delete_terminal`, `answer_user_prompt` and `send_message` (explicit
+  `receiver_id`) now refuse a target outside the caller's assign/handoff tree:
+  a terminal may act on itself, on terminals it created (locally or on a
+  `target_host` node), and (for `send_message`) on the terminal that created
+  it. The documented peer flow of issue #432 is kept: when the caller's
+  profile grants `discovery`, `send_message` also accepts a sibling that
+  `list_siblings` returns for the caller, checked by exact membership at send
+  time. `GET /terminals/{id}` gains `callback_terminal_id`, the cross-node
+  creator read from the `CAO_CALLBACK_TERMINAL_ID` the supervisor injected,
+  which is how a remote node recognises the supervisor deleting its worker
+  (`caller_id` is `null` on such rows); a remote node that does not report
+  the field, or has restarted since the worker was created, refuses the
+  delete. Operators and external MCP clients without `CAO_TERMINAL_ID` are
+  unchanged. The `cao` CLI commands that reach these paths are bound the same
+  way when run from a shell inside a CAO pane: `cao agent cancel <id>` (both
+  the interrupt and `--delete`). Supersedes #607 (shpalac), whose
+  own-terminal-only rule would have blocked in-terminal supervisors.
 
 - Require `shell-quote ^1.11.0` in the documentation toolchain to fix
   CVE-2026-102422, with comment-boundary and ordinary-argument regressions.
