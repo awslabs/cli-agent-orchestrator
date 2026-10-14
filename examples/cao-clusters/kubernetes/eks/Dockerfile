@@ -20,16 +20,34 @@
 # The runtime base image, and the reason this file is not Claude-Code-only.
 # Declared before the first FROM so it is in scope for stage 2's.
 #
-# Default builds a self-contained Claude Code image from public npm — no second
-# image to produce, and reproducible from this repository alone. Point it at a
-# base image that already carries a different provider CLI, together with
+# Default builds a self-contained Claude Code image from public packages — no
+# second image to produce, and reproducible from this repository alone. Point it
+# at a base image that already carries a different provider CLI, together with
 # INSTALL_CLAUDE_CODE=0 below, to build that provider's node instead:
 #
 #   docker build -f examples/cao-clusters/kubernetes/eks/Dockerfile \
 #     --build-arg BASE_PROVIDER_IMAGE=<image-with-kiro-cli> \
 #     --build-arg INSTALL_CLAUDE_CODE=0 \
 #     --build-arg CAO_PROFILE_PROVIDER=<provider-name> .
-ARG BASE_PROVIDER_IMAGE=python:3.12-slim
+#
+# The default base is Wolfi (Chainguard's glibc-based, rolling distribution),
+# not Debian. Amazon Inspector, which scans the image in ECR, reports a package
+# vulnerability until the distribution ships a fixed build of that package, and
+# Debian 13 had none for curl (two critical, one high), expat or zlib: every
+# rebuild of a python:3.12-slim image still reported two critical and five high
+# findings, and zlib cannot be removed from a Debian image because dpkg and apt
+# need it. Wolfi carries the fixed builds, and Inspector supports it.
+#
+# Pinned by digest: Chainguard's free tier serves `latest` and digests only, and
+# a mutable tag is treated as a defect everywhere else here (see
+# kustomization.yaml). The packages are not pinned: the first apk step below
+# upgrades them, so each build takes Wolfi's current fixes. To move the base
+# itself, replace the digest with the current one of
+# cgr.dev/chainguard/wolfi-base:latest.
+#
+# A Debian-family provider base still works: each package step below uses
+# apt-get when the base has no apk. It carries its own distribution's findings.
+ARG BASE_PROVIDER_IMAGE=cgr.dev/chainguard/wolfi-base@sha256:05d24163df148be377275af8374c16523a1dc7e19bf4f1c689784791553c5e45
 
 # --- Stage 1: build the pure-Python wheel -----------------------------------
 # The TUI wheel-tag hook (scripts/hatch_build_tui_tag.py) is inert when no Rust
@@ -52,21 +70,38 @@ FROM ${BASE_PROVIDER_IMAGE}
 # A provider base image may run as its own user; the layers below need root.
 USER root
 
-# tmux >= 3.3 required by CAO (bookworm ships 3.3a). git for agent workspaces,
-# curl for healthchecks, procps for provider process detection.
+# UTF-8, as the Debian python image set it: tmux decides from the locale
+# whether panes speak UTF-8, and provider TUIs draw with it. glibc has C.UTF-8
+# built in.
+ENV LANG=C.UTF-8
+
+# What CAO needs on any base: tmux >= 3.3, git for agent workspaces, curl for
+# the healthcheck, procps for provider process detection, and bash for the
+# entrypoint.
 #
-# Unconditional, unlike the provider layer below: CAO needs all five whatever
-# provider runs. That does assume a Debian-family base — an apt-less
-# BASE_PROVIDER_IMAGE fails here, loudly, which is better than a node that
-# starts and then cannot open a tmux session.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        tmux \
-        git \
-        curl \
-        ca-certificates \
-        procps \
-    && rm -rf /var/lib/apt/lists/*
+# On Wolfi (apk), also Python 3.12 with pip, which a Debian provider base such
+# as python:3.12-slim brings itself; shadow, for the useradd below; and the GNU
+# userland a Debian image has, for the shell commands agents run (Wolfi's base
+# has only busybox). `apk upgrade` first: the base is pinned, its packages are
+# not, so every build takes Wolfi's current fixes.
+#
+# Either way an unsupported base fails here, loudly, which is better than a node
+# that starts and then cannot open a tmux session.
+RUN set -eux; \
+    if command -v apk >/dev/null 2>&1; then \
+      apk upgrade --no-cache; \
+      apk add --no-cache \
+        bash ca-certificates-bundle coreutils curl diffutils findutils gawk git \
+        gnutar grep gzip procps py3.12-pip python-3.12 sed shadow tmux; \
+    elif command -v apt-get >/dev/null 2>&1; then \
+      apt-get update; \
+      apt-get install -y --no-install-recommends \
+        tmux git curl ca-certificates procps; \
+      rm -rf /var/lib/apt/lists/*; \
+    else \
+      echo "BASE_PROVIDER_IMAGE has neither apk nor apt-get" >&2; \
+      exit 1; \
+    fi
 
 # --- Provider CLI: Claude Code (default; opt out for another provider) --------
 #
@@ -84,7 +119,16 @@ RUN apt-get update \
 # whose only login path is an interactive device flow cannot run in this
 # topology, however the credential reaches the pod.
 #
-# Node 22+ is required. bookworm's nodejs is too old, so install from NodeSource.
+# Node 22+ is required. On Wolfi it comes from the distribution (nodejs-24 and
+# npm), so no third-party apt repository, and none of the gnupg it needs, is in
+# the image. A Debian base, whose own nodejs is too old, installs it from
+# NodeSource as before.
+#
+# npm runs the package's install script only when allowed by name
+# (--allow-scripts; npm 12 runs none by default, and older npm ignores the
+# flag): that script fetches Claude Code's native binary, without which `claude`
+# fails with "native binary not installed".
+#
 # Pin Claude Code because this image is rebuilt for every CAO release and a
 # mutable provider version can break an otherwise unchanged cluster. Version
 # 2.1.250 fails before its first Bedrock request with `O is not defined`;
@@ -94,13 +138,20 @@ ARG CLAUDE_CODE_VERSION=2.1.235
 RUN if [ "${INSTALL_CLAUDE_CODE}" != "1" ]; then \
       echo "skipping Claude Code install; provider comes from BASE_PROVIDER_IMAGE"; \
     else \
-    curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
-    && npm cache clean --force \
-    && rm -rf /var/lib/apt/lists/* \
-    # Fail the build here rather than at pod startup if the CLI is unusable.
-    && claude --version; \
+      set -eux; \
+      if command -v apk >/dev/null 2>&1; then \
+        apk add --no-cache nodejs-24 npm; \
+      else \
+        curl -fsSL https://deb.nodesource.com/setup_24.x | bash -; \
+        apt-get install -y --no-install-recommends nodejs; \
+        rm -rf /var/lib/apt/lists/*; \
+      fi; \
+      npm install -g --no-audit --no-fund \
+        --allow-scripts=@anthropic-ai/claude-code \
+        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"; \
+      npm cache clean --force; \
+      # Fail the build here rather than at pod startup if the CLI is unusable.
+      claude --version; \
     fi
 
 # --- Provider CLI: kiro-cli (opt in) ------------------------------------------
@@ -114,10 +165,11 @@ RUN if [ "${INSTALL_CLAUDE_CODE}" != "1" ]; then \
 # pays that once per image, but a node joining the group pays it before the first
 # worker on it can start.
 #
-# The MUSL build is deliberate, not a preference. The aarch64 *gnu* archive
-# requires glibc 2.39 and bookworm ships 2.36, so its own installer refuses with
-# "try installing the musl version"; for a musl target the installer skips the
-# glibc check entirely. The archive URL uses $(uname -m), so this builds on either
+# The MUSL build is deliberate, not a preference. The *gnu* archive requires
+# glibc 2.39, which a Debian provider base may not have (bookworm ships 2.36), and
+# its own installer then refuses with "try installing the musl version"; for a musl
+# target the installer skips the glibc check entirely, so it runs on any base. The
+# archive URL uses $(uname -m), so this builds on either
 # architecture -- x86_64 and aarch64 musl archives both exist at this version
 # (693MB and 689MB) -- and musl is kept for both rather than special-casing one.
 #
@@ -138,16 +190,26 @@ ARG INSTALL_KIRO_CLI=0
 ARG KIRO_CLI_VERSION=2.19.1
 RUN if [ "${INSTALL_KIRO_CLI}" = "1" ]; then \
       set -eux; \
-      apt-get update; \
-      apt-get install -y --no-install-recommends unzip; \
+      if command -v apk >/dev/null 2>&1; then \
+        apk add --no-cache unzip; \
+      else \
+        apt-get update; \
+        apt-get install -y --no-install-recommends unzip; \
+      fi; \
       curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/kirocli.zip \
         "https://desktop-release.q.us-east-1.amazonaws.com/${KIRO_CLI_VERSION}/kirocli-$(uname -m)-linux-musl.zip"; \
       unzip -q /tmp/kirocli.zip -d /tmp; \
+      # The installer copies into /usr/local/bin, which Wolfi's base lacks.
+      mkdir -p /usr/local/bin; \
       Q_INSTALL_GLOBAL=1 Q_SKIP_SETUP=1 sh /tmp/kirocli/install.sh; \
       rm -rf /tmp/kirocli.zip /tmp/kirocli; \
-      apt-get purge -y unzip; \
-      apt-get autoremove -y; \
-      rm -rf /var/lib/apt/lists/*; \
+      if command -v apk >/dev/null 2>&1; then \
+        apk del --no-cache unzip; \
+      else \
+        apt-get purge -y unzip; \
+        apt-get autoremove -y; \
+        rm -rf /var/lib/apt/lists/*; \
+      fi; \
       # Fail the build here rather than at pod startup. This also catches the
       # musl-on-glibc question: if the binary cannot run on this base, it cannot
       # report a version either.

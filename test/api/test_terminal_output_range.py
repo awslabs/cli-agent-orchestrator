@@ -37,6 +37,16 @@ def log_dir(monkeypatch, tmp_path):
     return d
 
 
+@pytest.fixture(autouse=True)
+def local_terminal(monkeypatch):
+    """These terminals run on this server; a remote one is refused (#745)."""
+    monkeypatch.setattr(
+        terminal_service,
+        "get_terminal_metadata",
+        lambda terminal_id: {"id": terminal_id, "runtime_id": None},
+    )
+
+
 def _write_log(log_dir, terminal_id: str, data: bytes) -> None:
     (log_dir / f"{terminal_id}.log").write_bytes(data)
 

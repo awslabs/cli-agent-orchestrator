@@ -1,0 +1,103 @@
+# An execution runtime: runs agents beside its own tmux and has no cao-server.
+# cao-bridge dials the central server (outbound only); the pod serves nothing.
+# Its runtime id is the pod name, so the first runtime is `cao-runtime-0`.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cao-runtime
+  # For Claude Code on Bedrock, give the runtime an IAM role, e.g. with IRSA:
+  # annotations:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/ROLE_NAME
+# Agents here run commands, and nothing in the pod calls the Kubernetes API, so
+# no API token is mounted. IRSA's web-identity token is a projected volume of
+# its own, which this does not affect.
+automountServiceAccountToken: false
+---
+# Required by the StatefulSet; it exposes no ports.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cao-runtime
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: cao-runtime
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cao-runtime
+spec:
+  serviceName: cao-runtime
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cao-runtime
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cao-runtime
+    spec:
+      serviceAccountName: cao-runtime
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: cao-runtime
+          image: cao-node
+          env:
+            - name: CAO_NODE_MODE
+              value: bridge
+            - name: CAO_BRIDGE_SERVER_URL
+              value: ws://cao-server:9889/runtime/channel
+            - name: CAO_BRIDGE_RUNTIME_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: CAO_RUNTIME_TOKEN_FILE
+              value: /var/run/cao/runtime-token/token
+            - name: CAO_BRIDGE_READY_FILE
+              value: /home/cao/.cao/state/bridge-ready
+            - name: CAO_HOME_DIR
+              value: /home/cao/.cao/state
+            # Claude Code on Bedrock. Credentials come from the pod's IAM role.
+            - name: CLAUDE_CODE_USE_BEDROCK
+              value: "1"
+            - name: AWS_REGION
+              value: us-east-1
+            # Pin every model tier, as ../eks/supervisor.yaml does: Claude Code's
+            # default model ids may not be enabled in your account. The Sonnet
+            # tier uses the Opus id on purpose, as there: one model to enable.
+            - name: ANTHROPIC_MODEL
+              value: global.anthropic.claude-opus-4-6-v1
+            - name: ANTHROPIC_DEFAULT_OPUS_MODEL
+              value: global.anthropic.claude-opus-4-6-v1
+            - name: ANTHROPIC_DEFAULT_SONNET_MODEL
+              value: global.anthropic.claude-opus-4-6-v1
+            - name: ANTHROPIC_DEFAULT_HAIKU_MODEL
+              value: global.anthropic.claude-haiku-4-5-20251001-v1:0
+          volumeMounts:
+            - name: state
+              mountPath: /home/cao/.cao
+            - name: runtime-token
+              mountPath: /var/run/cao/runtime-token
+              readOnly: true
+          # Ready while the channel to cao-server is up.
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "/home/cao/.cao/state/bridge-ready"]
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              memory: 3Gi
+      volumes:
+        # Pane bookkeeping only; the server holds the authoritative state.
+        - name: state
+          emptyDir: {}
+        - name: runtime-token
+          secret:
+            secretName: cao-runtime-token
+            defaultMode: 0440

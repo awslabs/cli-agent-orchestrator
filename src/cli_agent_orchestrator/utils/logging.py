@@ -84,8 +84,8 @@ def install_access_log_redaction() -> None:
             logger_.addFilter(RedactQueryTokenFilter())
 
 
-def setup_logging() -> None:
-    """Setup logging configuration."""
+def setup_logging(command: str = "cao-server", label: str = "Server") -> None:
+    """Setup logging configuration; the console banner names ``label`` and ``command``."""
     log_level = str(ConfigService.get("logging.level", default="INFO")).upper()
 
     # Ensure log directory exists
@@ -108,6 +108,6 @@ def setup_logging() -> None:
         handlers=[logging.FileHandler(log_file), stderr_handler],
     )
 
-    print(f"Server logs: {log_file}")
-    print("For debug logs: export CAO_LOG_LEVEL=DEBUG && cao-server")
+    print(f"{label} logs: {log_file}")
+    print(f"For debug logs: export CAO_LOG_LEVEL=DEBUG && {command}")
     logging.info(f"Logging to: {log_file}")

@@ -260,6 +260,12 @@ class TestExitTerminalCli:
     """Tests for exit_terminal_cli — the graceful CLI shutdown helper shared by
     the exit endpoint and run_agent_step teardown (issue #312 review fix #4)."""
 
+    @pytest.fixture(autouse=True)
+    def _local_terminal(self):
+        # exit_terminal_cli reads the row first to route a remote terminal (#745).
+        with patch(f"{_TS}.get_terminal_metadata", return_value={"id": "abcd1234"}):
+            yield
+
     @patch(f"{_TS}.send_input")
     @patch(f"{_TS}.send_special_key")
     @patch(f"{_TS}.provider_manager")
