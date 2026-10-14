@@ -308,6 +308,32 @@ class TestExecute:
             await _bridge().execute(_command(type_, session="cao-old", **payload))
 
     @pytest.mark.asyncio
+    async def test_a_delete_for_a_terminal_this_runtime_no_longer_has_is_absent(self, monkeypatch):
+        # The fence's own no-row arm: the delete names a session, and no pane
+        # under the id is left here at all.
+        import cli_agent_orchestrator.clients.database as database
+
+        monkeypatch.setattr(database, "get_terminal_metadata", lambda tid: None)
+        monkeypatch.setattr(
+            terminal_service, "delete_terminal", lambda tid: pytest.fail("nothing to delete")
+        )
+        result = await _bridge().execute(_command(CommandType.DELETE, session="cao-old"))
+        assert result == {"deleted": True, "absent": True}
+
+    @pytest.mark.asyncio
+    async def test_a_command_for_a_terminal_this_runtime_no_longer_has_is_refused(
+        self, monkeypatch
+    ):
+        import cli_agent_orchestrator.clients.database as database
+
+        monkeypatch.setattr(database, "get_terminal_metadata", lambda tid: None)
+        monkeypatch.setattr(
+            terminal_service, "send_input", lambda *a, **k: pytest.fail("reached no terminal")
+        )
+        with pytest.raises(LookupError, match="not found"):
+            await _bridge().execute(_command(CommandType.INPUT, session="cao-old", message="hi"))
+
+    @pytest.mark.asyncio
     async def test_a_command_for_the_same_session_runs(self, monkeypatch):
         import cli_agent_orchestrator.clients.database as database
 
