@@ -61,7 +61,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   idempotently. A runtime's hello lists the terminals it runs, and the server
   drops the record of one it no longer runs (a replaced pod's, for instance).
   Status events (`terminal.{id}.status`) report `unknown` for a runtime's
-  terminals when its channel goes, and for a record a hello drops. A
+  terminals when its channel goes, and for a record a hello drops or cannot
+  drop; an accepted hello publishes each status it restores. A remote
+  launch records the working directory its runtime resolved. A record
+  dropped before a newer connection of the same runtime id registers stays
+  dropped, and that connection's hello then deletes the terminal as
+  unrecorded: under a shared token a duplicate runtime id can tear down
+  another runtime's agents. A
   `cao-bridge` that cannot remove its readiness file exits rather than stay
   Ready while disconnected. Commands for a terminal name its session, so a
   command that outlived its terminal never reaches a newer one reusing the id,

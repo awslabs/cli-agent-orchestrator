@@ -16,7 +16,9 @@ from typing_extensions import Annotated
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 #: Bumped whenever a frame or command changes meaning. Both sides refuse a peer
-#: with a different version at hello, before any work is accepted.
+#: with a different version at hello, before any work is accepted. A new
+#: optional field that an older peer may omit or ignore is not a change of
+#: meaning and does not bump it: a bump would refuse every older peer.
 PROTOCOL_VERSION = 1
 
 

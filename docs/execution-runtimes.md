@@ -154,7 +154,9 @@ retried until the runtime confirms it (see [Commands](#commands)).
   A readiness file it cannot write only logs a warning: the runtime then
   reads not Ready while connected.
 - A hello lists at most 1024 terminals; a larger one is refused (close code
-  1002), so one hello cannot make the server start unbounded work.
+  1002), so one hello cannot make the server start unbounded work. The bound
+  is per hello: reconnects are not rate-limited, so a token holder can still
+  make the server start up to 1024 cleanups each time it reconnects.
 - The token is read once from `CAO_RUNTIME_TOKEN_FILE`, or from
   `CAO_RUNTIME_TOKEN`; both are then removed from the process environment.
   When `CAO_RUNTIME_TOKEN_FILE` is set, only the file counts: if it is
@@ -180,7 +182,10 @@ retried until the runtime confirms it (see [Commands](#commands)).
   agent in the runtime, but once the genuine runtime reconnects and lists that
   terminal again, the server has no record of it and deletes it there. So the
   token lets its holder tear down another runtime's agents. Two runtimes
-  configured with the same id do the same to each other.
+  configured with the same id do the same to each other. The server
+  serialises a runtime's record drops with its reconnects, so no drop lands
+  after a newer connection has registered; but a record already dropped by
+  then is gone, and the newer hello cannot restore it.
   Until per-runtime credentials arrive in a later slice, give the token only
   to runtimes that may act for one another.
 - The runtime token does not protect the HTTP API. Turn on API authentication
@@ -213,7 +218,9 @@ retried until the runtime confirms it (see [Commands](#commands)).
   What follows depends on what the restarted bridge's hello lists:
   - Its tmux survived, and with it the runtime's rows: the hello lists those
     terminals, so the server keeps their records. Their status stays
-    `unknown`, while input, output and delete still work.
+    `unknown` (the restarted bridge reads no status for a pane it did not
+    start, so its hello reports `unknown`), while input, output and delete
+    still work.
   - Its tmux did not (in the EKS example a restart of `cao-bridge` restarts
     its container, which takes tmux and those terminals with it): the bridge
     drops their rows, its hello does not list them, and the server drops
