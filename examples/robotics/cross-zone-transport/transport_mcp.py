@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
-import httpx
+import httpx2
 from fastmcp import Client, FastMCP
 from fastmcp.client.transports import StreamableHttpTransport
 from fastmcp.exceptions import AuthorizationError
@@ -16,6 +17,8 @@ from fastmcp.server.auth import require_scopes
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.dependencies import get_access_token
 from simulation import Identifier, World
+
+LOGGER = logging.getLogger("transport")
 
 
 def save_snapshot(path: Path, state: dict) -> None:
@@ -43,15 +46,15 @@ def controller_client(url: str, token: str) -> Client:
 
     def local_http_client(
         headers: dict[str, str] | None = None,
-        timeout: httpx.Timeout | None = None,
-        auth: httpx.Auth | None = None,
+        timeout: httpx2.Timeout | None = None,
+        auth: httpx2.Auth | None = None,
         *,
         follow_redirects: bool = False,
-    ) -> httpx.AsyncClient:
+    ) -> httpx2.AsyncClient:
         # FastMCP requests redirects by default; this connection must remain local.
-        return httpx.AsyncClient(
+        return httpx2.AsyncClient(
             headers=headers,
-            timeout=timeout if timeout is not None else httpx.Timeout(20),
+            timeout=timeout if timeout is not None else httpx2.Timeout(20),
             auth=auth,
             trust_env=False,
             follow_redirects=False,
@@ -85,6 +88,17 @@ def make_server(world: World, tokens: dict[str, dict], snapshot: Path) -> FastMC
             raise AuthorizationError("a configured zone credential is required")
         return actor
 
+    def log_call(tool: str, **arguments: str) -> None:
+        # One line for each tool call, so the operator sees which agent does what.
+        token = get_access_token()
+        claims = token.claims if token else {}
+        if isinstance(claims.get("zone"), str):
+            caller = f"{claims['zone']} zone worker"
+        else:
+            caller = str(claims.get("role") or (token.client_id if token else "unknown"))
+        details = ", ".join(f"{key}={value}" for key, value in arguments.items())
+        LOGGER.info("%s called %s(%s)", caller, tool, details)
+
     @server.tool(auth=require_scopes("observe"), annotations={"readOnlyHint": True})
     def observe() -> dict:
         """Read current measured poses, custody, capabilities, and command outcomes.
@@ -93,6 +107,7 @@ def make_server(world: World, tokens: dict[str, dict], snapshot: Path) -> FastMC
         An accepted/running command is not a completed transport. A missing
         command is unknown, not successful. Check poses as well as status.
         """
+        log_call("observe")
         return world.observe()
 
     @server.tool(auth=require_scopes("act"))
@@ -109,6 +124,9 @@ def make_server(world: World, tokens: dict[str, dict], snapshot: Path) -> FastMC
         only to reconcile the identical call after a lost reply, never to
         request another motion. Your zone comes from authentication, not text.
         """
+        log_call(
+            "move", command_id=command_id, robot=robot, payload=payload, destination=destination
+        )
         return world.move(zone(), command_id, robot, payload, destination)
 
     @server.tool(auth=require_scopes("act"))
@@ -120,6 +138,9 @@ def make_server(world: World, tokens: dict[str, dict], snapshot: Path) -> FastMC
         The sender retains custody until the receiving zone accepts this
         offer. An offered payload cannot move while the handoff is pending.
         """
+        log_call(
+            "offer_handoff", command_id=command_id, payload=payload, receiver_zone=receiver_zone
+        )
         return world.offer(zone(), command_id, payload, receiver_zone)
 
     @server.tool(auth=require_scopes("act"))
@@ -134,11 +155,15 @@ def make_server(world: World, tokens: dict[str, dict], snapshot: Path) -> FastMC
         Requires your zone's capable robot at the offered dock. Never call
         this on the strength of another CLI agent's completion message alone.
         """
+        log_call(
+            "accept_handoff", command_id=command_id, payload=payload, robot=robot, offer_id=offer_id
+        )
         return world.accept(zone(), command_id, payload, robot, offer_id)
 
     @server.tool(auth=require_scopes("operate"))
     def stop_simulation() -> dict:
         """Operator-only stop and permanent motion lockout for this run."""
+        log_call("stop_simulation")
         state = world.stop()
         save_snapshot(snapshot, state)
         return state

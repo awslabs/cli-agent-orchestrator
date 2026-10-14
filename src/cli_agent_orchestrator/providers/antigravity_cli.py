@@ -765,6 +765,30 @@ class AntigravityCliProvider(BaseProvider):
     # viewport resolves the in-place redraw, leaving only the live footer.
     supports_screen_detection = True
 
+    # agy animates its spinner for the whole turn, so the screen does not go
+    # quiet until the turn ends. The only edge mid-turn is the rising edge, the
+    # echo of the paste, which is drawn before "esc to cancel": the terminal
+    # read IDLE for the whole turn, and the delivery check re-sent a task that
+    # the worker was already running. The probe is safe because
+    # get_status_from_screen() only reads the frame.
+    supports_midburst_processing_probe = True
+
+    def probe_processing_from_screen(self, screen_lines: List[str]) -> bool:
+        """Report whether a half-drawn agy frame shows a working turn.
+
+        Positive evidence only: the "esc to cancel" footer or a spinner row
+        must be drawn. Then the full detector decides, so that an approval
+        prompt keeps its WAITING_USER_ANSWER.
+        """
+        rows = [ln.rstrip() for ln in screen_lines if ln.strip()]
+        bottom_rows = rows[-12:]
+        if not (
+            re.search(PROCESSING_FOOTER_PATTERN, "\n".join(bottom_rows))
+            or any(re.search(PROCESSING_SPINNER_PATTERN, line) for line in bottom_rows)
+        ):
+            return False
+        return self.get_status_from_screen(screen_lines) == TerminalStatus.PROCESSING
+
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         """Detect agy status from a pyte-composited viewport (escape-free rows).
 
@@ -774,8 +798,9 @@ class AntigravityCliProvider(BaseProvider):
         ``esc to cancel`` / ``? for shortcuts`` is present — eliminating the
         stale-footer false PROCESSING the raw-stream path suffers from.
 
-        The StatusMonitor only invokes this on settled / rising-edge frames, so
-        the footer reflects a real end state, not a half-drawn one.
+        The StatusMonitor applies its verdict on settled and rising-edge frames.
+        On a half-drawn frame mid-turn, only probe_processing_from_screen()
+        runs, and only its PROCESSING verdict is applied.
 
         Precedence:
           1. Empty → UNKNOWN

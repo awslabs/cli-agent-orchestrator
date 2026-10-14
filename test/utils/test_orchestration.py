@@ -9,6 +9,7 @@ rather than duplicated. This file covers the three primitives added for the
 or test.
 """
 
+import os
 from unittest.mock import MagicMock, patch
 
 import requests
@@ -225,6 +226,43 @@ class TestCancelImpl:
 
         assert result["success"] is False
         assert "Failed to connect" in result["error"]
+
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.post")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.get")
+    def test_interrupt_is_bound_to_the_callers_tree(self, mock_get, mock_post):
+        """Review on PR #912 (P3): the interrupt path is bound like --delete.
+        A shell inside a CAO pane may not C-c a terminal it did not create."""
+        target = MagicMock()
+        target.status_code = 200
+        target.raise_for_status.return_value = None
+        target.json.return_value = {"id": "deadbeef", "caller_id": "0badf00d"}
+        mock_get.return_value = target
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "abcd1234"}):
+            result = _cancel_impl("deadbeef")
+
+        assert result["success"] is False
+        assert "may only act on" in result["error"]
+        mock_post.assert_not_called()
+
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.post")
+    @patch("cli_agent_orchestrator.utils.orchestration.requests.get")
+    def test_interrupt_of_own_worker_is_allowed(self, mock_get, mock_post):
+        target = MagicMock()
+        target.status_code = 200
+        target.raise_for_status.return_value = None
+        target.json.return_value = {"id": "c0ffee01", "caller_id": "abcd1234"}
+        mock_get.return_value = target
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        mock_post.return_value = resp
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "abcd1234"}):
+            result = _cancel_impl("c0ffee01")
+
+        assert result["success"] is True
+        assert mock_post.call_args[0][0] == f"{API_BASE_URL}/terminals/c0ffee01/key"
 
     @patch("cli_agent_orchestrator.utils.orchestration._delete_terminal_impl")
     @patch("cli_agent_orchestrator.utils.orchestration.requests.post")

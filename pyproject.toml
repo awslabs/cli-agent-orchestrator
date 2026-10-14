@@ -37,8 +37,8 @@ dependencies = [
     "fastapi>=0.104.0",
     # Upper bound: ext_apps/sep2133.advertise_capability monkey-patches a FastMCP
     # internal (create_initialization_options); cap the major to avoid silent
-    # breakage on a new major release. Tested against 3.x.
-    "fastmcp>=3.2.0,<4.0.0",
+    # breakage on a new major release. Tested against 3.x and 4.x.
+    "fastmcp>=3.2.0,<5.0.0",
     "mcp>=1.23.0",
     "pydantic>=2.10.6",
     "apscheduler>=3.10.4",
@@ -386,6 +386,9 @@ dev = [
     # with authlib; runtime verification needs only pyjwt[crypto].
     "authlib>=1.7.1",
     "types-psutil>=7.0.0",
+    # Tests import httpx directly; fastmcp 4 / mcp 2 use httpx2 and no longer
+    # pull httpx in transitively.
+    "httpx>=0.28.1",
 ]
 
 [tool.black]

@@ -222,6 +222,15 @@ class BaseProvider(ABC):
     # depends on raw \r) whose detectors are tuned for the raw stream.
     supports_screen_detection: bool = False
 
+    # Opt-in, with supports_screen_detection, for the screen in the cheap
+    # re-check that StatusMonitor.get_status() runs for a poller while a
+    # terminal reads PROCESSING. By default that re-check parses the raw
+    # rolling buffer. Set True when the raw stream of the provider does not
+    # parse like its screen: Codex redraws only the cells that change, so the
+    # raw buffer of a working turn can parse as IDLE, and that IDLE ended the
+    # PROCESSING of the turn just after it began.
+    status_recheck_uses_screen: bool = False
+
     # Opt-in for the deferred-init direct status probe (capture-pane bypass).
     # Set True on providers whose get_status() detector is line-oriented and
     # works correctly on a rendered capture-pane snapshot. Providers whose

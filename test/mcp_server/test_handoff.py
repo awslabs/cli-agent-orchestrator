@@ -636,7 +636,7 @@ class TestHandoffEarlyTerminalId:
             )
 
         assert result.success is True
-        mock_delete.assert_called_once_with("dev-t1")
+        mock_delete.assert_called_once_with("dev-t1", check_binding=False)
 
     @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
     @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
@@ -693,7 +693,7 @@ class TestHandoffEarlyTerminalId:
             )
 
         assert result.success is True
-        mock_delete.assert_called_once_with("dev-t1")
+        mock_delete.assert_called_once_with("dev-t1", check_binding=False)
 
     @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")

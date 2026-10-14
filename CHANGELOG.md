@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `assign` and `handoff` now launch ephemeral agents (#801) from their creator terminal: Claude Code by default, Codex when an operator allows it.
 - Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `ephemeral.enabled` stays off by default.
+- Security regression tests derived from the review harnesses Augusto Santos
+  (@gutosantos82) wrote while assessing CAO's CI security gates: a route-by-scope
+  authorization matrix with auth enabled (every HTTP route x no/read/write/admin
+  token, handlers stubbed, admin-only and read-tier routes pinned as literals), a
+  browser-boundary matrix for the Host (#124), WebSocket Origin (#533), CSRF
+  (#605), malformed-Origin (#656) and scheme-aware same-origin (#658) guards, and
+  filesystem invariants for the per-terminal FIFO path (#823) and atomic-file
+  modes under a concurrent writer (#821). `test/security/`. (#938)
+- Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `assign` and `handoff` still refuse them. `ephemeral.enabled` stays off by default.
 - Simulation-only cross-zone robot transport example (#845): existing CAO CLI
   supervisor, zone-operation, and checker agents share a persistent MuJoCo
   kinematic world through scoped MCP tools. Includes measured custody handoffs,
@@ -102,6 +111,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Copilot CLI readiness detection recognizes the downloaded-update notice prepended
   to the hint bar, avoiding initialization timeouts after a background update.
   Busy, waiting, error, and unrecognized rows still prevent readiness (#870).
+- Script workflows that exit while a process they started still holds their
+  stdout/stderr now settle on the script's own exit. On Python 3.11+ such a run
+  used to wait out the whole wall-clock bound and be recorded as a timeout with
+  its output dropped, and on 3.10 it did not settle until that process exited.
+  The pipes now get the reap grace to drain, and a warning names the case (#894).
+  Timeout and cancel likewise settle once the script itself is gone, instead of
+  waiting for that process, and a timed-out run closes the pipes too.
 - Audit all tracked npm, Bun, uv, and Cargo dependency graphs in every CI run
   and weekly, including development dependencies and unfixed advisories. Block
   every HIGH/CRITICAL finding and scan error, and publish complete inventory and
@@ -570,6 +586,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- SECURITY.md now states the supported release line as 2.x (it said 1.x while
+  2.5.x was on PyPI), guarded by `test/test_security_policy.py` against the
+  version in `pyproject.toml`, and documents how maintainers handle a report:
+  triage in the advisory draft, fix in its private fork unless the finding is
+  already public, no draft advisory identifiers in public commits or PRs, CVE
+  through Amazon's CNA rather than GitHub's request button, release before
+  publishing with an affected/fixed statement, reporter credit, and a
+  regression test for the class.
+- Dependabot now watches every tracked lockfile, not only the Actions pins:
+  `uv.lock` (root and the two example projects), the seven npm lockfiles, the
+  TUI `Cargo.lock`, and the two `bun.lock` files, with a seven-day release
+  cooldown and weekly minor/patch groups per ecosystem. The guarded `braces`
+  fork is excluded so Dependabot cannot propose a registry replacement for it.
+
 - The MCP server now requires fastmcp 3.2.0 or newer (was 2.14.0), the
   version CI tests. fastmcp 2.x does not export `ToolResult` from
   `fastmcp.tools`, so `cao-mcp-server` would not start on it. Upgrading
@@ -596,6 +626,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently, so `limit=500` keeps working rather than becoming a 422.
 
 ### Security
+
+- New `Actions Security` CI job runs zizmor 1.30.1 over `.github/` on every PR
+  and push to `main`, failing on Medium-or-higher findings. Accepted findings
+  are listed with reasons in `.github/zizmor.yml` (checkout credential
+  persistence, the workflow-level `security-events: write` in `ci.yml`, and
+  the npm cache in the release build), each a tracked follow-up rather than a
+  silenced result.
+
+- `delete_terminal`, `answer_user_prompt` and `send_message` (explicit
+  `receiver_id`) now refuse a target outside the caller's assign/handoff tree:
+  a terminal may act on itself, on terminals it created (locally or on a
+  `target_host` node), and (for `send_message`) on the terminal that created
+  it. The documented peer flow of issue #432 is kept: when the caller's
+  profile grants `discovery`, `send_message` also accepts a sibling that
+  `list_siblings` returns for the caller, checked by exact membership at send
+  time. `GET /terminals/{id}` gains `callback_terminal_id`, the cross-node
+  creator read from the `CAO_CALLBACK_TERMINAL_ID` the supervisor injected,
+  which is how a remote node recognises the supervisor deleting its worker
+  (`caller_id` is `null` on such rows); a remote node that does not report
+  the field, or has restarted since the worker was created, refuses the
+  delete. Operators and external MCP clients without `CAO_TERMINAL_ID` are
+  unchanged. The `cao` CLI commands that reach these paths are bound the same
+  way when run from a shell inside a CAO pane: `cao agent cancel <id>` (both
+  the interrupt and `--delete`). Supersedes #607 (shpalac), whose
+  own-terminal-only rule would have blocked in-terminal supervisors.
 
 - Require `shell-quote ^1.11.0` in the documentation toolchain to fix
   CVE-2026-102422, with comment-boundary and ordinary-argument regressions.
