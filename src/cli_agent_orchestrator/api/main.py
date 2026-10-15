@@ -179,7 +179,9 @@ from cli_agent_orchestrator.services.workflow_journal import (
 from cli_agent_orchestrator.services.workflow_journal import EventRow, GapMarker, StepRow
 from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
+from cli_agent_orchestrator.utils import delegation
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.delegation import DelegationCeilingError
 from cli_agent_orchestrator.utils.forwarded_env import ForwardedEnvError, validate_forwarded_env
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
 from cli_agent_orchestrator.utils.skills import (
@@ -344,6 +346,11 @@ class CreateSessionBody(CreateTerminalBody):
     env_vars: Optional[Dict[str, str]] = None
     group: Optional[List[str]] = None
     metadata: Optional[Dict] = None
+    # Delegation ceiling asserted by a caller on ANOTHER node (assign with
+    # target_host). This node has no row for that caller, so the client sends
+    # its own stored ceiling and the created terminal is bounded by it
+    # (utils/delegation.py). Rejected (400) together with a local caller.
+    caller_ceiling: Optional[List[str]] = None
 
     @field_validator("env_vars")
     @classmethod
@@ -480,7 +487,19 @@ class RunStepRequest(BaseModel):
     )
     allowed_tools: Optional[list[str]] = Field(
         default=None,
-        description="Resolved allowed-tools list for a freshly created terminal (handoff inheritance)",
+        description=(
+            "Resolved allowed-tools list for a freshly created terminal (handoff "
+            "inheritance). Checked against the caller's recorded delegation ceiling; "
+            "a list wider than the caller may delegate is refused with 403."
+        ),
+    )
+    caller_ceiling: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "Delegation ceiling asserted by a caller on another node (handoff with "
+            "target_host), which has no row here. Bounds the created terminal exactly "
+            "as a stored ceiling would. Rejected with 400 together with caller_id."
+        ),
     )
     use_worktree: bool = Field(
         default=False,
@@ -684,6 +703,17 @@ class StepOutputRequest(BaseModel):
     )
 
 
+def _workflow_caller_kwargs(caller_id: Optional[str]) -> Dict[str, str]:
+    """``{"caller_id": ...}`` when a terminal started the run, else ``{}``.
+
+    The workflow service entry points take ``caller_id`` as an optional keyword;
+    forwarding it only when present keeps the operator path (no caller) a
+    byte-identical call, so existing callers and test doubles with the original
+    positional signature keep working.
+    """
+    return {"caller_id": caller_id} if caller_id else {}
+
+
 class WorkflowRunRequest(BaseModel):
     """Request body for ``POST /workflows/runs`` (Bolt 3, N5, C5)."""
 
@@ -694,6 +724,15 @@ class WorkflowRunRequest(BaseModel):
     run_id: Optional[str] = Field(
         default=None,
         description="Optional run id (matches WORKFLOW_NAME_RE); auto-generated if omitted",
+    )
+    caller_id: Optional[TerminalId] = Field(
+        default=None,
+        description=(
+            "Terminal that is starting this run (the MCP workflow tools send their "
+            "CAO_TERMINAL_ID). Every agent step the run creates is bounded by that "
+            "terminal's recorded delegation ceiling; a step profile wider than it "
+            "fails the step. Omitted for operator-started runs."
+        ),
     )
 
 
@@ -722,11 +761,25 @@ class ResumeRunRequest(BaseModel):
             "400 and applies nothing at all."
         ),
     )
+    caller_id: Optional[TerminalId] = Field(
+        default=None,
+        description=(
+            "Terminal that is resuming this run; the re-run steps are bounded by its "
+            "recorded delegation ceiling (see WorkflowRunRequest.caller_id)."
+        ),
+    )
 
 
 class StepReplayRequest(BaseModel):
     """Request body for ``POST /workflows/runs/{run_id}/steps/{step_id}:replay`` (#640)."""
 
+    caller_id: Optional[TerminalId] = Field(
+        default=None,
+        description=(
+            "Terminal replaying this step; the replayed worker is bounded by its "
+            "recorded delegation ceiling (see WorkflowRunRequest.caller_id)."
+        ),
+    )
     prompt_override: Optional[str] = Field(
         default=None,
         description=(
@@ -1667,6 +1720,11 @@ async def health_check():
         "status": "ok",
         "service": "cli-agent-orchestrator",
         "terminal_backend": backend_name,
+        # Capabilities a peer node can rely on. ``delegation_ceiling``: this
+        # node bounds created terminals by the caller's delegation ceiling and
+        # honours ``caller_ceiling`` on POST /sessions and /terminals/run-step;
+        # a client placing work here with target_host checks for it first.
+        "features": [delegation.REMOTE_FEATURE],
         "components": {
             "cao": "ok",
             "herdr": _probe("herdr"),
@@ -3482,6 +3540,7 @@ async def create_session(
             resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
+            caller_ceiling=body.caller_ceiling if body else None,
         )
 
         if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
@@ -3546,6 +3605,10 @@ async def create_session(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except EphemeralPolicyError as e:
         raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
+    except DelegationCeilingError as e:
+        # The created terminal would hold tools its caller may not delegate; an
+        # authorization refusal, not a bad request or a missing resource.
+        raise HTTPException(status_code=e.status_code, detail=str(e)) from None
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except WorktreeError as e:
@@ -3812,6 +3875,11 @@ async def create_terminal_in_session(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except EphemeralPolicyError as e:
         raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
+    except DelegationCeilingError as e:
+        # The requested allowed_tools (client string or profile resolution)
+        # exceed what the caller_id row may delegate: 403, before the generic
+        # ValueError arm, and never masked as "session not found".
+        raise HTTPException(status_code=e.status_code, detail=str(e)) from None
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except WorktreeError as e:
@@ -4621,6 +4689,7 @@ async def run_step(
             use_worktree=body.use_worktree,
             job_id=job_id,
             claim_id=body.claim_id,
+            caller_ceiling=body.caller_ceiling,
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure
@@ -4751,6 +4820,12 @@ async def run_step(
         _settle_step(None, str(e))
         await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
+    except DelegationCeilingError as e:
+        # The step's worker would hold tools the caller may not delegate.
+        # Nothing ran; 403 with the message naming parent, child and tools.
+        _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
+        raise HTTPException(status_code=e.status_code, detail=str(e)) from None
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
         await _record_job_state(job_id, "error", error_message=str(e))
@@ -5404,7 +5479,11 @@ async def start_workflow_run_endpoint(
         return result.model_dump()
 
     try:
-        result = await workflow_service.start_run(spec, body.inputs, run_id)
+        # ``caller_id`` is forwarded only when supplied, so an operator-started
+        # run is byte-identical to the pre-ceiling call.
+        result = await workflow_service.start_run(
+            spec, body.inputs, run_id, **_workflow_caller_kwargs(body.caller_id)
+        )
     except NotBuiltYetError as e:
         raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(e))
     except KeyError as e:
@@ -5677,6 +5756,7 @@ async def submit_workflow_run_endpoint(
                 step.id: workflow_service.StepRunState(step_id=step.id) for step in spec.steps
             },
             started_at=started_at,
+            caller_id=body.caller_id,
         )
         tier = "yaml"
 
@@ -6987,7 +7067,9 @@ async def resume_workflow_run_endpoint(
         )
 
     try:
-        result = await workflow_service.resume_from_last_completed(run_id)
+        result = await workflow_service.resume_from_last_completed(
+            run_id, **_workflow_caller_kwargs(body.caller_id if body is not None else None)
+        )
     except KeyError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
     except workflow_service.ResumeNotAllowedError as e:
@@ -7043,6 +7125,7 @@ async def replay_workflow_step_endpoint(
             run_id,
             step_id,
             prompt_override=body.prompt_override if body is not None else None,
+            **_workflow_caller_kwargs(body.caller_id if body is not None else None),
         )
     except KeyError as e:
         # The service distinguishes "unknown run" from "unknown step" in the message;

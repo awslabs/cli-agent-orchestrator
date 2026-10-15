@@ -442,8 +442,16 @@ async def run_agent_step(
     use_worktree: bool = False,
     job_id: Optional[str] = None,
     claim_id: Optional[str] = None,
+    delegating_terminal_id: Optional[str] = None,
+    caller_ceiling: Optional[list[str]] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
+
+    ``delegating_terminal_id`` and ``caller_ceiling`` are forwarded to
+    ``create_terminal`` unchanged; see its docstring. Workflow steps pass the
+    first (the terminal that started the run bounds every step's tools);
+    remote handoff passes the second (the supervisor's ceiling asserted from
+    another node). Both are ignored when a terminal is reused.
 
     Sequence:
       1. Create a terminal (or reuse ``reuse_terminal_id``).
@@ -683,6 +691,8 @@ async def run_agent_step(
             model=model,
             use_worktree=use_worktree,
             claim_id=claim_id,
+            delegating_terminal_id=delegating_terminal_id,
+            caller_ceiling=caller_ceiling,
         )
         terminal_id = terminal.id
 

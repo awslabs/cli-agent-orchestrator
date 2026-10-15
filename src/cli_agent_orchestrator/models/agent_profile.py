@@ -40,6 +40,11 @@ class AgentProfile(BaseModel):
     provider: Optional[str] = None  # Provider override (e.g. "claude_code", "kiro_cli")
     system_prompt: Optional[str] = None  # The markdown content
     role: Optional[str] = None  # "supervisor", "developer", "reviewer", "workflow_scout"
+    # CAO-native. The most this agent may grant to children it creates through
+    # assign/handoff/workflow steps (its delegation ceiling). None = the role
+    # default: ``*`` for ``supervisor``, the agent's own allowedTools otherwise.
+    # Consumed by CAO's create-terminal policy only; never passed to provider JSON.
+    delegateTools: Optional[List[str]] = None
     engine: Optional[KiroEngine] = None  # Kiro v2/KAS selection; omitted resolves to v2.
 
     # CAO-native. Per-agent skill-catalog scope: when set, only skills whose name

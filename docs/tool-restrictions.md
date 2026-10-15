@@ -40,12 +40,14 @@ role: supervisor
 
 #### Built-in Roles
 
-| Role | Default `allowedTools` | What the agent can do |
-|------|----------------------|----------------------|
-| `supervisor` | `@cao-mcp-server`, `fs_read`, `fs_list` | Orchestrate workers + read files for context |
-| `developer` | `@builtin`, `fs_*`, `execute_bash`, `web_fetch`, `@cao-mcp-server` | Full access: read, write, execute, fetch, orchestrate |
-| `reviewer` | `@builtin`, `fs_read`, `fs_list`, `@cao-mcp-server` | Read-only: review code, no writes, execution, or network |
-| `workflow_scout` | `@builtin`, `fs_read`, `execute_bash`, `@cao-mcp-server` | Locate existing workflow specs (`cao workflow list` / `get`). Withholds `fs_write` and `web_fetch`; `execute_bash` is still a full shell |
+| Role | Default `allowedTools` | Default `delegateTools` (ceiling) | What the agent can do |
+|------|----------------------|-----------------------------------|----------------------|
+| `supervisor` | `@cao-mcp-server`, `fs_read`, `fs_list` | `*` | Orchestrate workers + read files for context; may launch workers holding any tools |
+| `developer` | `@builtin`, `fs_*`, `execute_bash`, `web_fetch`, `@cao-mcp-server` | its own list | Full access: read, write, execute, fetch, orchestrate |
+| `reviewer` | `@builtin`, `fs_read`, `fs_list`, `@cao-mcp-server` | its own list | Read-only: review code, no writes, execution, or network; may launch only read-only workers |
+| `workflow_scout` | `@builtin`, `fs_read`, `execute_bash`, `@cao-mcp-server` | its own list | Locate existing workflow specs (`cao workflow list` / `get`). Withholds `fs_write` and `web_fetch`; `execute_bash` is still a full shell |
+
+The third column is the role's **delegation ceiling**: the most an agent of that role may grant to the workers it creates with `assign`, `handoff` or a workflow step. Only `supervisor` widens by default; see [Cross-Provider Inheritance](#cross-provider-inheritance) for the rule and `delegateTools` for overriding it.
 
 `workflow_scout` finds existing specs (`cao workflow list` / `cao workflow get`) so an authoring agent can extend them instead of duplicating them. The allowlist withholds the file-write category (`fs_write`) and the web-fetch category (`web_fetch`). It still grants `execute_bash`, which maps to a full shell (`Bash`, `shell`, or `run_shell_command`, depending on the provider). A permitted shell command can write files and reach the network. The profile prompt asks the scout to stay read-only; that is a convention, not a sandbox.
 
@@ -72,6 +74,8 @@ role: data_analyst
 ```
 
 Custom roles follow the same rules as built-in roles — they're just a named `allowedTools` list. A custom role with the same name as a built-in role replaces it: the `settings.json` list is used and CAO logs a warning naming the role, so a policy you saved before a built-in of that name shipped keeps resolving as saved. The replacement is complete, in both directions: a settings entry can narrow a built-in or widen it, up to `["*"]` (unrestricted, which also switches off native tool denial). The `roles` key is written only by `cao config set` and by hand (no REST or MCP route touches `agents.roles`), so treat it as operator-trusted configuration.
+
+A custom role's delegation ceiling defaults to its own list, with one exception: a custom role literally named `supervisor` keeps the built-in `*` ceiling, because the default table is keyed by the role name. Declare `delegateTools` on the profile when you want something else.
 
 ### 2. `allowedTools` — The Precise Way
 
@@ -125,6 +129,21 @@ This is deliberate (see the design discussion on [issue #432](https://github.com
 
 **`group` is an organizational label, not a security boundary.** On a default install with auth disabled, a worker already has local shell access, so `discovery`/`group`/session-scoping provide no isolation guarantee even when used together — see [docs/api.md](api.md) and the coexistence write-up linked above.
 
+#### `delegateTools` — what an agent may hand down
+
+`allowedTools` bounds what an agent can call. `delegateTools` bounds what it can **create**: the most it may grant to a worker it launches through `assign`, `handoff`, or a workflow step. A child's resolved `allowedTools` must fit inside the parent's ceiling or the launch is refused. Without the field, the role default applies (`supervisor` → `*`, every other role → its own `allowedTools`), and the ceiling always includes the agent's own list: an agent can hand down what it holds.
+
+```yaml
+---
+name: build_reviewer
+description: Reviews code and may run a build worker
+role: reviewer                       # read-only itself
+delegateTools: ["fs_read", "fs_list", "execute_bash", "@cao-mcp-server"]
+---
+```
+
+This reviewer still has no shell, but it may `assign` a worker that does. Use the same vocabulary as `allowedTools`; `*` means it may launch anything. Like `allowedTools`, the list you write is the complete spec (#772): a worker holding `fs_write` would be refused here because the ceiling omits it.
+
 ### 3. `--yolo` — The Escape Hatch
 
 ```bash
@@ -154,6 +173,7 @@ When you run `cao launch` without `--yolo` or `--auto-approve`, CAO shows a summ
 Agent 'code_supervisor' launching on kiro_cli:
   Role:      supervisor
   Allowed:   @cao-mcp-server, fs_read, fs_list
+  Delegates: ALL TOOLS (unrestricted)
   Directory: /home/user/my-project
 
   To skip this prompt next time, relaunch with --auto-approve
@@ -240,6 +260,12 @@ Installed workflow callers with an explicit restricted allowlist must include
 `@cao-mcp-server` to execute or resume workflows; installed profiles do not bypass
 this check. Ephemeral callers additionally remain subject to
 `ephemeral.child_may_delegate`. Read-only workflow inspection is unchanged.
+
+Holding `@cao-mcp-server` lets a caller *reach* `assign`, `handoff` and the workflow
+tools. What those tools may launch is a second check, the delegation ceiling below:
+the MCP layer prechecks the child's resolved tools against the caller's recorded
+ceiling and returns the refusal early, and cao-server repeats the check from the
+caller's stored row before any terminal exists. The server is authoritative.
 
 ## How Overrides Work
 
@@ -363,21 +389,41 @@ Do NOT attempt to use: execute_bash, fs_write
 
 ## Cross-Provider Inheritance
 
-When a supervisor delegates work via `handoff()` or `assign()`, the child agent gets its own `allowedTools` resolved from its profile — not inherited from the parent.
+When a supervisor delegates work via `handoff()` or `assign()`, the child agent gets its own `allowedTools` resolved from its profile, **bounded by the parent's delegation ceiling**. The rule, in one sentence:
+
+> A child's `allowedTools` must fit inside its creator's ceiling, and the child's own ceiling is its declared ceiling intersected with the creator's.
+
+The ceiling is read from the **creator's terminal record**, written when that terminal was created, never re-derived from a profile. So a reviewer that launches a profile declaring `role: supervisor` gets a worker whose recorded ceiling is still the reviewer's, and that worker cannot launch a developer either. Ceilings only narrow down a tree.
 
 ```
-Supervisor (role: supervisor → @cao-mcp-server, fs_read, fs_list)
+Supervisor (role: supervisor → @cao-mcp-server, fs_read, fs_list; delegates *)
   │
   ├─ assign("developer")
-  │    → Developer profile: role: developer → full access
-  │    → Claude Code launched with no --disallowedTools
+  │    → Developer profile: role: developer → full access, fits inside *
+  │    → Claude Code launched with no --disallowedTools; its ceiling: its own list
   │
   └─ handoff("reviewer")
-       → Reviewer profile: role: reviewer → read-only
+       → Reviewer profile: role: reviewer → read-only, fits inside *
        → Claude Code launched with --disallowedTools Bash Edit Write
+
+Reviewer (role: reviewer → @builtin, fs_read, fs_list, @cao-mcp-server; delegates its own list)
+  │
+  ├─ assign("developer")
+  │    → REFUSED: "Delegation refused: terminal 3f9a… (profile 'reviewer') may not
+  │       launch 'developer' with tools it cannot delegate: fs_*, execute_bash, web_fetch.
+  │       … Remedy: declare `delegateTools` on the parent's profile …"
+  │
+  └─ assign("reviewer")
+       → fits; the worker's ceiling is the reviewer's list
 ```
 
-Each agent is restricted based on its own profile, not its parent's permissions.
+What is compared: `*` is satisfied only by `*`; `fs_*` by `fs_*` or all three of `fs_read`, `fs_list`, `fs_write`; `@builtin` grants nothing on any provider and is ignored (so `supervisor`, which never lists it, can launch `reviewer`, which does); every other entry, including `@<server>` references and `discovery`, must appear by name. A child profile that declares `allowedTools: ["*"]` is honoured only under a `*` ceiling (issue #141, within the ceiling); under a restricted parent the launch is refused rather than silently narrowed.
+
+The same rule covers every way a terminal is created: `assign` and `handoff` (local and `target_host`), the in-session HTTP create (a client-supplied `allowed_tools` string is checked against the caller's recorded ceiling and never trusted beyond it), `cao agent run-step`, and workflow steps, which inherit the ceiling of the terminal that ran `workflow_run`, `workflow_start` or `workflow_resume`. An operator shell (no `CAO_TERMINAL_ID`) has no ceiling: `cao launch`, `cao assign` and `cao handoff` from the command line are unchanged, and the profile's declared ceiling is what the new terminal records. Ephemeral agents (`docs/ephemeral-agents.md`) have had this rule since they shipped; installed profiles now follow the same comparison.
+
+Remote placement (`assign`/`handoff` with `target_host`): the target node has no record of the supervisor, so the supervisor's recorded ceiling travels in the request and the remote node bounds the worker by it. The caller first checks the target's `/health` for the `delegation_ceiling` feature and **refuses to place work on a node that lacks it**, because an older node would accept the request and launch the worker unbounded. Upgrade both nodes together, or omit `target_host`.
+
+**Migration.** The ceiling is recorded in a new `delegate_tools` column on the terminals table, added automatically at server start. Terminals created before the upgrade have no recorded ceiling and are bounded by their own `allowedTools` until relaunched: a supervisor launched before the upgrade cannot `assign("developer")` until you relaunch it (the refusal says so). Every shipped example keeps working, because the pattern they teach is supervisor → developer. If you wrote a restricted profile that launches wider workers, add `delegateTools` to it; the error names the tools to add.
 
 ## Quick Reference
 
@@ -388,6 +434,7 @@ Each agent is restricted based on its own profile, not its parent's permissions.
 | Read-only reviewer | `role: reviewer` |
 | Custom tool set | `allowedTools: ["fs_read", "execute_bash"]` |
 | Reusable custom preset | Define in `settings.json` `roles`, use `role: my_preset` |
+| Let a restricted agent launch wider workers | `delegateTools: [...]` on that agent's profile, then relaunch it |
 | Override role at launch | `--allowed-tools fs_read --allowed-tools @cao-mcp-server` |
 | Skip confirmation in scripts/automation | `--auto-approve` (restrictions still enforced) |
 | No restrictions at all | `--yolo` |
