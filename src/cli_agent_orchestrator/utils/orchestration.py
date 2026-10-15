@@ -570,6 +570,20 @@ def _resolve_child_allowed_tools(
     # utils/delegation.ceiling_from_row). None = an unrestricted parent.
     ceiling = parent_ceiling if parent_ceiling is not None else parent_allowed_tools
     if ceiling is None:
+        if parent_id is not None:
+            # An identified parent whose row records neither a ceiling nor an
+            # allowlist (pre-migration, launched with no resolvable profile) has
+            # no immutable authority to delegate from; the server refuses the
+            # same way (utils/delegation.ceiling_from_row). Never fall back to
+            # the profile on disk, which can be edited after the fact.
+            raise DelegationCeilingError(
+                f"Delegation refused: terminal {parent_id}"
+                + (f" (profile '{parent_profile}')" if parent_profile else "")
+                + f" records neither a delegation ceiling nor an allowlist, so it cannot "
+                f"launch '{child_profile_name}'. Relaunch it so its ceiling is recorded.",
+                parent_id=parent_id,
+                child_profile=child_profile_name,
+            )
         ceiling = ["*"]
 
     # A child with no profile of its own inherits the parent's restrictions,

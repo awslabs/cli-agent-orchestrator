@@ -3724,6 +3724,12 @@ async def create_session(
                         working_directory=working_directory,
                         registry=registry,
                         idempotency_key=sidecar_idempotency_key,
+                        # The sidecar is a helper of the primary, not a new
+                        # authority: it is bounded by the PRIMARY's recorded
+                        # delegation ceiling (read from its row), so a restricted
+                        # primary cannot gain an unbounded supervisor-role sidecar
+                        # that launches what the primary may not.
+                        delegating_terminal_id=result.id,
                     )
                 except Exception as e:
                     logger.warning(f"Failed to spawn memory_manager sidecar: {e}")
@@ -3928,6 +3934,21 @@ async def create_terminal_in_session(
             _validate_model_id(model)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    if caller_id is None:
+        # An in-session create is how a running terminal adds a worker beside
+        # itself (assign/handoff name their caller). Without caller_id the
+        # server has nothing to bound the new terminal by and would launch it
+        # unbounded; an operator creates a session with POST /sessions instead.
+        # caller_id remains a client assertion under the shared bearer (see
+        # docs/api.md); requiring it closes the omission, not the substitution.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "caller_id is required: an in-session terminal is created on behalf of "
+                "the terminal that delegates to it and is bounded by that terminal's "
+                "recorded delegation ceiling. Operator launches use POST /sessions."
+            ),
+        )
     try:
         if provider is None:
             resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")

@@ -756,18 +756,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pattern and every shipped example keep working. `cao launch` prints the
   ceiling as `Delegates:`; `Terminal` responses carry `delegate_tools`;
   `/health` advertises `features: ["delegation_ceiling"]`.
+  The `memory_manager` sidecar is bounded by its primary's recorded ceiling;
+  `cao workflow run`/`resume`/`step` from inside a terminal send the terminal's
+  id; a delegated Kiro CLI launch whose installed agent file grants more than
+  the bounded allowlist is refused with the reinstall remedy; MCP references
+  are compared with the resolver's selector semantics (`@plugin-*` covers
+  `@plugin-search`, `@server` covers `@server/tool`).
   **Breaking changes:** (1) a user-authored restricted role or profile that
   launches wider children is now refused with a message naming the parent, the
   child, the exceeding tools and the remedy (add `delegateTools` to the parent
   profile and relaunch it); (2) terminals created before the upgrade have no
-  recorded ceiling and are bounded by their own `allowedTools` until relaunched;
-  (3) `assign`/`handoff` with `target_host` send the caller's ceiling as
-  `caller_ceiling` and refuse to place work on a node whose `/health` lacks the
-  feature, so mixed-version fleets must upgrade the worker nodes first;
-  (4) workflow steps started from inside a CAO terminal inherit that terminal's
-  ceiling rather than running unbounded. The issue #141 behaviour (a child
-  `allowedTools: ["*"]` is not collapsed to the parent's list) is kept within
-  the parent's ceiling.
+  recorded ceiling and are bounded by their own recorded `allowedTools` until
+  relaunched, and a pre-upgrade row with neither column recorded cannot
+  delegate until relaunched (the profile on disk is never consulted for an
+  existing terminal); (3) `assign`/`handoff` with `target_host` send the
+  caller's ceiling as `caller_ceiling` and refuse to place work on a node whose
+  `/health` lacks the feature, and the receiving node refuses a remote-shaped
+  create (callback env present) that omits the ceiling, so mixed-version
+  fleets must upgrade the worker nodes first; (4) workflow steps started from
+  inside a CAO terminal inherit that terminal's ceiling rather than running
+  unbounded; (5) `POST /sessions/{name}/terminals` requires `caller_id`
+  (operator launches use `POST /sessions`). `caller_id` and `caller_ceiling`
+  remain client assertions under the shared bearer; per-terminal identity is a
+  follow-up. The issue #141 behaviour (a child `allowedTools: ["*"]` is not
+  collapsed to the parent's list) is kept within the parent's ceiling.
 - New `Actions Security` CI job runs zizmor 1.30.1 over `.github/` on every PR
   and push to `main`, failing on Medium-or-higher findings. Accepted findings
   are listed with reasons in `.github/zizmor.yml` (checkout credential

@@ -171,13 +171,19 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
 - `/terminals/{terminal_id}*` inspects terminals, sends input or keys, reads
   output and working-directory state, exits providers, and deletes terminals.
 - Terminal responses carry `delegate_tools`, the terminal's recorded delegation
-  ceiling. Creating a terminal with `caller_id` checks the requested
-  `allowed_tools` (client string or profile resolution) against that caller's
-  recorded ceiling and answers `403` when they exceed it; the message names the
-  parent, the child, the exceeding tools and the remedy. `POST /sessions` and
-  `POST /terminals/run-step` accept `caller_ceiling` in the JSON body for a
-  caller on another node (remote `assign`/`handoff`); it is rejected together
-  with a local `caller_id`.
+  ceiling. `POST /sessions/{session_name}/terminals` requires `caller_id` (403
+  without it) and checks the requested `allowed_tools` (client string or profile
+  resolution) against that caller's recorded ceiling, answering `403` when they
+  exceed it; the message names the parent, the child, the exceeding tools and
+  the remedy. `POST /sessions` and `POST /terminals/run-step` accept
+  `caller_ceiling` in the JSON body for a caller on another node (remote
+  `assign`/`handoff`); it is rejected together with a local `caller_id`, it is
+  required when the body's `env_vars` carry `CAO_CALLBACK_TERMINAL_ID` (the
+  remote-assign shape), and when that callback terminal has a local row the
+  asserted ceiling must fit inside the row's. `caller_id` and `caller_ceiling`
+  remain client assertions under the shared bearer; see
+  [Tool Restrictions](tool-restrictions.md#cross-provider-inheritance) for what
+  that does and does not guarantee.
 - `GET /terminals/{terminal_id}/output?mode=full` returns the StatusMonitor
   rolling buffer (most recent `state_buffer_max` bytes of streamed output —
   server setting, 32KB by default, see [Configuration](configuration.md)),

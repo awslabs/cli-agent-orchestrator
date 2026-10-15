@@ -112,6 +112,7 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.install_service import (
+    installed_kiro_tools,
     kiro_install_predates_native_enforcement,
 )
 from cli_agent_orchestrator.services.memory_gateway import (
@@ -130,7 +131,10 @@ from cli_agent_orchestrator.services.settings_service import get_max_terminals
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.utils import agent_profiles, delegation
-from cli_agent_orchestrator.utils.delegation import DelegationCeilingError
+from cli_agent_orchestrator.utils.delegation import (
+    DelegationCeilingError,
+    InstalledPolicyExceedsAllowlistError,
+)
 from cli_agent_orchestrator.utils.enforcement import NATIVE as NATIVE_ENFORCEMENT
 from cli_agent_orchestrator.utils.enforcement import (
     PROVIDER_ENFORCEMENT,
@@ -1648,8 +1652,53 @@ async def _create_terminal_unguarded(
                     parent_id=bounding_id,
                     child_profile=agent_profile,
                 )
-        elif caller_ceiling is not None:
-            parent_ceiling = list(caller_ceiling)
+        else:
+            # Remote placement (assign/handoff with target_host) is recognised by
+            # the callback terminal the supervisor injects into the worker's env.
+            # Such a create MUST carry the supervisor's ceiling: without it the
+            # request would take the operator branch below and launch unbounded,
+            # which is exactly what an older or edited client would produce. When
+            # the callback terminal happens to have a row on THIS node (loopback,
+            # single-node fleets), the asserted ceiling must also fit inside what
+            # that row records; the row wins over the assertion.
+            remote_marker = (env_vars or {}).get(CALLBACK_TERMINAL_ID_ENV)
+            if remote_marker and caller_ceiling is None:
+                raise DelegationCeilingError(
+                    f"Delegation refused: a remote placement for terminal {remote_marker} "
+                    f"must carry caller_ceiling (the supervisor's recorded delegation "
+                    f"ceiling); without it '{agent_profile}' would launch unbounded. "
+                    f"Upgrade the placing node's cao so assign/handoff send it.",
+                    parent_id=remote_marker,
+                    child_profile=agent_profile,
+                )
+            if remote_marker and caller_ceiling is not None:
+                local_row = get_terminal_metadata(remote_marker)
+                if local_row is not None:
+                    local_ceiling = delegation.ceiling_from_row(local_row)
+                    if local_ceiling is None:
+                        raise DelegationCeilingError(
+                            f"Delegation refused: the delegation ceiling of terminal "
+                            f"{remote_marker} (profile '{local_row.get('agent_profile')}') "
+                            f"could not be resolved, so '{agent_profile}' is not launched. "
+                            f"Relaunch it so its ceiling is recorded.",
+                            parent_id=remote_marker,
+                            child_profile=agent_profile,
+                        )
+                    over = delegation.tools_exceeding(caller_ceiling, local_ceiling)
+                    if over:
+                        raise DelegationCeilingError(
+                            f"Delegation refused: the asserted caller_ceiling for terminal "
+                            f"{remote_marker} grants {', '.join(over)} beyond that terminal's "
+                            f"recorded ceiling [{', '.join(local_ceiling)}]; the recorded "
+                            f"ceiling is authoritative.",
+                            excess=over,
+                            parent_id=remote_marker,
+                            child_profile=agent_profile,
+                        )
+                    parent_profile_name = local_row.get("agent_profile")
+                    bounding_id = remote_marker
+            if caller_ceiling is not None:
+                parent_ceiling = list(caller_ceiling)
         if parent_ceiling is not None:
             delegate_tools = delegation.bound_child(
                 child_allowed_tools=allowed_tools,
@@ -1663,6 +1712,41 @@ async def _create_terminal_unguarded(
             # Operator-launched (cao launch, POST /sessions without a caller):
             # the operator is the authority and the profile's declaration stands.
             delegate_tools = declared_ceiling
+
+        # Step 0d: install-time providers run the INSTALLED policy, not the list
+        # this request resolved. For a create bounded by a RESTRICTED ceiling the
+        # row must be the effective policy, so a Kiro agent file that grants more
+        # than the row is refused here, before allocation, with the remedy. An
+        # unrestricted delegator (ceiling ``*``) and operator launches keep the
+        # launch-time warning instead: nothing the creator may not delegate can
+        # leak there, and the launch prompt already says what runs.
+        if (
+            provider == ProviderType.KIRO_CLI.value
+            and parent_ceiling is not None
+            and "*" not in parent_ceiling
+            and allowed_tools is not None
+            and "*" not in allowed_tools
+        ):
+            from cli_agent_orchestrator.utils.tool_mapping import kiro_agent_tools
+
+            installed = installed_kiro_tools(agent_profile)
+            if installed is not None:
+                permitted = set(kiro_agent_tools(allowed_tools))
+                wider = [tool for tool in installed if tool not in permitted]
+                if wider:
+                    raise InstalledPolicyExceedsAllowlistError(
+                        f"Delegation refused: the installed Kiro agent '{agent_profile}' "
+                        f"grants {', '.join(wider)} beyond the bounded allowlist "
+                        f"[{', '.join(allowed_tools)}] this terminal is allowed to run with; "
+                        f"Kiro enforces the installed file, so the launch would exceed the "
+                        f"creator's delegation ceiling. Remedy: reinstall the profile with "
+                        f"the narrower policy (`cao install {agent_profile} --provider "
+                        f"kiro_cli` after setting allowedTools), or launch it without an "
+                        f"allowed_tools override.",
+                        excess=wider,
+                        parent_id=bounding_id,
+                        child_profile=agent_profile,
+                    )
 
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
