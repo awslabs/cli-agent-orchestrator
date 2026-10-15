@@ -178,11 +178,7 @@ from cli_agent_orchestrator.services.terminal_service import (
 from cli_agent_orchestrator.services.workflow_journal import (
     _TERMINAL_RUN_STATES as _JOURNAL_TERMINAL_RUN_STATES,
 )
-from cli_agent_orchestrator.services.workflow_journal import (
-    EventRow,
-    GapMarker,
-    StepRow,
-)
+from cli_agent_orchestrator.services.workflow_journal import EventRow, GapMarker, StepRow
 from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
@@ -1811,6 +1807,33 @@ async def events_history(
     return {"events": events}
 
 
+async def _with_keepalive(events: Any, interval: float) -> Any:
+    """Yield items from ``events``, and ``None`` after each ``interval`` idle seconds.
+
+    The pending read is shielded across the timeout, as on the run plane, so a
+    keep-alive never cancels the source generator mid-step.
+    """
+    it = events.__aiter__()
+    pending: Optional["asyncio.Future[Any]"] = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(it.__anext__())
+            try:
+                item = await asyncio.wait_for(asyncio.shield(pending), timeout=interval)
+            except asyncio.TimeoutError:
+                yield None
+                continue
+            except StopAsyncIteration:
+                pending = None
+                return
+            pending = None
+            yield item
+    finally:
+        if pending is not None:
+            pending.cancel()
+
+
 @app.get("/agui/v1/stream")
 async def agui_stream(
     since: Optional[str] = Query(
@@ -2028,7 +2051,17 @@ async def agui_stream(
             # the stream cleanly in tests. On overflow the drain closes so the
             # client reconnects (F2); cancellation on client disconnect
             # propagates through the ``finally`` that unregisters the subscriber.
-            async for event in bus.drain(sub):
+            # An idle fleet sends nothing, so emit the run plane's SSE comment
+            # keep-alive on the same interval; otherwise a proxy with a read
+            # timeout (CloudFront defaults to 30s) closes the stream.
+            from cli_agent_orchestrator.services.agui import run_plane
+
+            async for event in _with_keepalive(
+                bus.drain(sub), run_plane.RUN_PLANE_HEARTBEAT_SECONDS
+            ):
+                if event is None:
+                    yield ":keep-alive\n\n"
+                    continue
                 rid = event.get("id")
                 # Skip the replay/live overlap so a reconnecting client that
                 # passed ``?since=`` never sees an event twice.

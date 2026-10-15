@@ -4,8 +4,13 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 1.x.x   | :white_check_mark: |
-| < 1.0   | :x:                |
+| 2.x.x   | :white_check_mark: |
+| < 2.0   | :x:                |
+
+Security fixes ship in the current 2.x release line only; there is no
+backport branch. `test/test_security_policy.py` fails CI when this table and
+the version in `pyproject.toml` disagree, so a major bump cannot leave the
+policy stale.
 
 ## Reporting a Vulnerability
 
@@ -39,7 +44,36 @@ Please include the following information in your report:
 - **Status Update**: Within 7 days, we will provide an initial assessment.
 - **Resolution**: We aim to resolve critical vulnerabilities within 30 days.
 
-## Security Scanning
+### How maintainers handle a report
+
+The reporter sees acknowledgement, a fix, credit and an advisory. Behind that,
+maintainers follow one sequence, so a fix for an unpublished finding cannot
+leak the finding before users can upgrade:
+
+1. **Triage in the advisory.** Every report becomes a GitHub Security Advisory
+   draft, including reports that arrive by email. The draft is where severity,
+   affected versions and the fix plan are discussed, not issues or PRs.
+2. **Fix in the advisory's temporary private fork** while the advisory is a
+   draft. Open a public PR only when the finding is already public (for
+   example an open PR or issue already describes it), and say so in the
+   advisory.
+3. **Never name a draft advisory in public.** Commit messages, PR titles and
+   bodies, CHANGELOG entries and test names describe the behaviour and cite
+   the PR, not a `GHSA-` identifier, until the advisory is published.
+4. **CVE IDs come from Amazon's CNA.** Maintainers request scoring and a CVE
+   through AWS Security, which coordinates publication with the reporter. Do
+   not use GitHub's "Request CVE" button on this repository.
+5. **Release before publishing.** The advisory is published after the fixed
+   version is on PyPI, with an affected and fixed version statement that names
+   commits and tags, since every source install reports the same version
+   string. Source installs from `main` are affected between the commit that
+   introduced the code and the fix commit, and that window is stated too.
+6. **Credit the reporter** in the CHANGELOG entry that ships the fix, with the
+   name they ask for, and in the published advisory.
+7. **Add the regression test** that would have caught the class, not only the
+   instance: boundary tests for a missing check, property tests for an
+   allow/deny surface, a pin test for a workflow or environment contract.
+
 
 This project uses automated security scanning to identify vulnerabilities:
 
@@ -601,7 +635,7 @@ We actively monitor and update dependencies to address security vulnerabilities:
 
 ## Security Updates
 
-Security updates are released as patch versions (e.g., 1.0.1) and are documented in:
+Security updates are released as patch versions (e.g., 2.5.3) and are documented in:
 
 - [CHANGELOG.md](CHANGELOG.md)
 - [GitHub Releases](https://github.com/awslabs/cli-agent-orchestrator/releases)

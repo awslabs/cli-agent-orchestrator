@@ -55,7 +55,7 @@ export function TaskControl({
   target,
   scopes,
   confirm,
-}: TaskControlProps): JSX.Element {
+}: TaskControlProps): React.JSX.Element {
   const [message, setMessage] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);

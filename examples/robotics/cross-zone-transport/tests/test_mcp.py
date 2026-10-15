@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import demo
-import httpx
+import httpx2
 import pytest
 import uvicorn
 from fastmcp.exceptions import ToolError
@@ -252,7 +252,7 @@ def test_operator_stops_without_a_worker_or_supervisor_inbox(controller):
 
 def test_missing_or_wrong_credential_is_not_read_access(controller):
     url, _, _, _ = controller
-    with httpx.Client(trust_env=False) as client:
+    with httpx2.Client(trust_env=False) as client:
         request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
         assert client.post(url, json=request).status_code == 401
         assert (

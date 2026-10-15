@@ -15,9 +15,7 @@ from apscheduler.triggers.cron import CronTrigger  # type: ignore
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import create_flow as db_create_flow
 from cli_agent_orchestrator.clients.database import delete_flow as db_delete_flow
-from cli_agent_orchestrator.clients.database import (
-    delete_terminals_by_ids,
-)
+from cli_agent_orchestrator.clients.database import delete_terminals_by_ids
 from cli_agent_orchestrator.clients.database import get_flow as db_get_flow
 from cli_agent_orchestrator.clients.database import get_flows_to_run as db_get_flows_to_run
 from cli_agent_orchestrator.clients.database import list_flows as db_list_flows
