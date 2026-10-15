@@ -120,3 +120,187 @@ async def test_a_refused_step_fails_the_run_loudly(monkeypatch):
 
     assert result.state == RunState.FAILED
     assert "Delegation refused" in (result.steps[0].error or "")
+
+
+# ---------------------------------------------------------------------------
+# Review A, B2: the REAL refusal from the REAL create_terminal must settle the
+# step FAILED and the run FAILED, never escape the engine.
+# ---------------------------------------------------------------------------
+from unittest.mock import MagicMock  # noqa: E402
+
+from cli_agent_orchestrator.clients.database import (
+    create_terminal as db_create_terminal,
+)  # noqa: E402
+from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS  # noqa: E402
+from cli_agent_orchestrator.models.agent_profile import AgentProfile  # noqa: E402
+from cli_agent_orchestrator.services import workflow_journal  # noqa: E402
+
+_TS = "cli_agent_orchestrator.services.terminal_service"
+_REVIEWER = ROLE_TOOL_DEFAULTS["reviewer"]
+
+
+@pytest.fixture
+def real_create_terminal(monkeypatch):
+    """run_agent_step and create_terminal run for real; tmux/provider are mocked and
+    the reviewer's row is a real SQLite row (isolated_memory_db)."""
+    profiles = {"dev": AgentProfile(name="dev", description="d", role="developer")}
+    monkeypatch.setattr(f"{_TS}.agent_profiles.load_agent_profile", lambda n: profiles[n])
+    monkeypatch.setattr(f"{_TS}.provider_manager", MagicMock())
+    backend = MagicMock()
+    backend.session_exists.return_value = True
+    monkeypatch.setattr("cli_agent_orchestrator.backends.registry._backend", backend)
+    db_create_terminal(
+        "0000beef", "cao-s", "rev", "claude_code", "reviewer", _REVIEWER, delegate_tools=_REVIEWER
+    )
+    return backend
+
+
+@pytest.fixture
+def journal_tables(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.clients.database import (
+        _migrate_workflow_run,
+        _migrate_workflow_run_step,
+    )
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.constants.DATABASE_FILE", tmp_path / "wf.db", raising=True
+    )
+    _migrate_workflow_run()
+    _migrate_workflow_run_step()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("isolated_memory_db", "journal_tables")
+async def test_real_refusal_settles_the_step_and_run_failed(real_create_terminal):
+    """No mock of the error type: create_terminal raises DelegationCeilingError
+    against the reviewer's stored ceiling; the step is FAILED with the refusal,
+    the run is FAILED, the journal row is settled, nothing escaped."""
+    spec = WorkflowSpec(
+        name="wf",
+        mode="sequential",
+        steps=[WorkflowStep(id="s1", provider="claude_code", agent="dev", prompt="go")],
+    )
+
+    result = await ws.start_run(spec, {}, "run-refused", caller_id="0000beef")
+
+    assert result.state == RunState.FAILED
+    step = result.steps[0]
+    assert step.state == StepState.FAILED
+    assert step.attempts == 1, "a refusal is deterministic and must not be retried"
+    assert "Delegation refused" in (step.error or "")
+    assert "0000beef" in step.error and "fs_*, execute_bash, web_fetch" in step.error
+    real_create_terminal.create_window.assert_not_called()
+    row = workflow_journal.get_run("run-refused")
+    assert row is not None and row.state == RunState.FAILED.value
+    (step_row,) = workflow_journal.get_steps("run-refused")
+    assert step_row.state == StepState.FAILED.value
+    assert "run-refused" not in ws._active_drives
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("isolated_memory_db", "journal_tables")
+async def test_real_refusal_with_on_failure_continue_keeps_sequencing(real_create_terminal):
+    spec = WorkflowSpec(
+        name="wf",
+        mode="sequential",
+        steps=[
+            WorkflowStep(
+                id="s1", provider="claude_code", agent="dev", prompt="go", on_failure="continue"
+            ),
+        ],
+    )
+    result = await ws.start_run(spec, {}, "run-continue", caller_id="0000beef")
+    assert result.steps[0].state == StepState.FAILED
+    assert "Delegation refused" in (result.steps[0].error or "")
+
+
+@pytest.mark.usefixtures("isolated_memory_db", "journal_tables")
+def test_blocking_run_route_returns_the_failed_run_not_500(real_create_terminal, monkeypatch):
+    """Review A: the blocking POST /workflows/runs used to 500 and leave the row RUNNING."""
+    from fastapi.testclient import TestClient
+
+    from cli_agent_orchestrator.api.main import app
+    from cli_agent_orchestrator.plugins import PluginRegistry
+
+    spec = WorkflowSpec(
+        name="wf",
+        mode="sequential",
+        steps=[WorkflowStep(id="s1", provider="claude_code", agent="dev", prompt="go")],
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.workflow_spec_service.get_workflow",
+        lambda name_or_path, scan_dir=None: spec,
+    )
+    app.state.plugin_registry = PluginRegistry()
+    client = TestClient(app)
+    resp = client.post(
+        "/workflows/runs",
+        json={"name_or_path": "wf", "inputs": {}, "run_id": "run-http", "caller_id": "0000beef"},
+        headers={"Host": "localhost"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["state"] == "failed"
+    assert "Delegation refused" in body["steps"][0]["error"]
+    assert workflow_journal.get_run("run-http").state == "failed"
+
+
+# ---------------------------------------------------------------------------
+# Review A, T1: the replay site must carry the kwarg (fails if it is dropped).
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("journal_tables")
+async def test_replay_carries_the_replaying_terminal(monkeypatch):
+    import json
+
+    spec = WorkflowSpec(
+        name="wf",
+        mode="sequential",
+        steps=[WorkflowStep(id="s1", provider="claude_code", agent="dev", prompt="go")],
+    )
+    workflow_journal.insert_run(
+        run_id="runR",
+        workflow_name="wf",
+        spec_snapshot=spec.model_dump_json(),
+        inputs_json=json.dumps({}),
+        state=RunState.COMPLETED.value,
+        started_at="2026-01-01T00:00:00Z",
+        tier="yaml",
+    )
+    workflow_journal.insert_steps("runR", [("s1", StepState.PENDING.value)], "2026-01-01T00:00:00Z")
+    mock = AsyncMock(return_value=_ok())
+    monkeypatch.setattr(ws, "run_agent_step", mock)
+
+    await ws.replay_single_step("runR", "s1", caller_id="a1b2c3d4")
+
+    assert mock.call_args.kwargs["delegating_terminal_id"] == "a1b2c3d4"
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("isolated_memory_db", "journal_tables")
+async def test_replay_reports_a_real_refusal_in_the_payload(real_create_terminal):
+    import json
+
+    spec = WorkflowSpec(
+        name="wf",
+        mode="sequential",
+        steps=[WorkflowStep(id="s1", provider="claude_code", agent="dev", prompt="go")],
+    )
+    workflow_journal.insert_run(
+        run_id="runRR",
+        workflow_name="wf",
+        spec_snapshot=spec.model_dump_json(),
+        inputs_json=json.dumps({}),
+        state=RunState.COMPLETED.value,
+        started_at="2026-01-01T00:00:00Z",
+        tier="yaml",
+    )
+    workflow_journal.insert_steps(
+        "runRR", [("s1", StepState.PENDING.value)], "2026-01-01T00:00:00Z"
+    )
+
+    payload = await ws.replay_single_step("runRR", "s1", caller_id="0000beef")
+
+    assert payload["error_kind"] == "error"
+    assert "Delegation refused" in payload["error"]
+    assert payload["terminal_id"] is None

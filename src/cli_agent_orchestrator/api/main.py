@@ -4589,6 +4589,7 @@ async def run_step(
         make_step_terminal_recorder,
         record_step_completion,
         record_step_replay,
+        step_delegating_terminal_id,
     )
     from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
     from cli_agent_orchestrator.services.workflow_errors import (
@@ -4862,6 +4863,11 @@ async def run_step(
             job_id=job_id,
             claim_id=body.claim_id,
             caller_ceiling=body.caller_ceiling,
+            # Script-tier step: bounded by the ceiling of the terminal that started
+            # the run, read from the live ScriptRunRecord the generation-fenced run
+            # id names (never from anything the script subprocess asserts). None for
+            # handoff/YAML/operator callers, whose own paths carry the bound.
+            delegating_terminal_id=step_delegating_terminal_id(body.env_vars),
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure
@@ -5967,6 +5973,7 @@ async def start_workflow_run_endpoint(
                 resolved,
                 run_id,
                 working_directory=root,
+                **_workflow_caller_kwargs(body.caller_id),
             )
         except script_runner.ScriptLintError as e:
             raise HTTPException(
@@ -6240,6 +6247,7 @@ async def submit_workflow_run_endpoint(
             finished_at=None,
             tier="script",
             working_directory=root,
+            caller_id=body.caller_id,
         )
         tier = "script"
     else:
@@ -7694,11 +7702,17 @@ async def resume_workflow_run_endpoint(
     if row.tier == "script":
         try:
             if decisions:
-                result = await script_runner.resume_script_run(run_id, decisions=decisions)
+                result = await script_runner.resume_script_run(
+                    run_id,
+                    decisions=decisions,
+                    **_workflow_caller_kwargs(body.caller_id if body is not None else None),
+                )
             else:
                 # Byte-identical to the pre-#583 call, so an ordinary resume cannot
                 # regress on a code path it never enters.
-                result = await script_runner.resume_script_run(run_id)
+                result = await script_runner.resume_script_run(
+                    run_id, **_workflow_caller_kwargs(body.caller_id if body is not None else None)
+                )
         except KeyError:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'"

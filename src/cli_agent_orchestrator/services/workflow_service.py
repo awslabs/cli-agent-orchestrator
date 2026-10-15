@@ -91,6 +91,7 @@ from cli_agent_orchestrator.services.workflow_errors import (
 from cli_agent_orchestrator.services.workflow_errors import (
     ReplayDivergenceError as ReplayDivergenceError,
 )
+from cli_agent_orchestrator.utils.delegation import DelegationCeilingError
 
 logger = logging.getLogger(__name__)
 
@@ -830,6 +831,28 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
                 step.id,
             )
             return
+        except DelegationCeilingError as exc:
+            # The step's worker would hold tools the run's caller may not delegate
+            # (utils/delegation.py). Raised by create_terminal BEFORE any terminal
+            # exists, deterministic for the run, so it consumes the whole budget:
+            # retrying would refuse again. Settle the step FAILED with the refusal
+            # text (kind ``error``), journal it, and let the drive loop finish the
+            # run as any other step failure, rather than escaping the engine.
+            st.error = str(exc)
+            last_error_kind = "error"
+            await _ajournal(_journal_step, record, step.id, last_error_kind)
+            await _journal_event(
+                record,
+                "step.attempt.failed",
+                step_id=step.id,
+                attempt=attempt,
+                state=st.state.value,
+                error_kind=last_error_kind,
+                terminal_id=None,
+                provider=step.provider,
+                agent_profile=step.agent,
+            )
+            break  # no retry: the refusal does not change between attempts
         except StepExecutionError as exc:
             st.error = str(exc)
             last_error_kind = exc.kind
@@ -1863,6 +1886,12 @@ async def replay_single_step(
             # registry either: the in-process engine path dispatches no plugin hooks.
             if e.terminal_id is not None:
                 await _best_effort_teardown(e.terminal_id, None)
+        except DelegationCeilingError as e:
+            # The replayed worker would hold tools the replaying terminal may not
+            # delegate. Nothing ran and no terminal exists, so there is nothing to
+            # tear down; report it in the payload like any other step failure.
+            payload["error"] = str(e)
+            payload["error_kind"] = "error"
         except (TimeoutError, OutputExtractionError) as e:
             # Two terminal-layer failures ``run_agent_step`` propagates verbatim instead
             # of wrapping in ``StepExecutionError``, and both are the STEP failing rather
