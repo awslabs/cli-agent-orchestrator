@@ -134,6 +134,35 @@ class ScriptRunRecord:
     started_at: str
     finished_at: Optional[str]
     tier: str = "script"
+    # The terminal that started (or resumed) this run, when an agent did
+    # (``WorkflowRunRequest.caller_id``). The run-step handler reads it from THIS
+    # record for every step the script dispatches and passes it to
+    # ``run_agent_step`` as ``delegating_terminal_id``, so script-tier workers are
+    # bounded by that terminal's recorded delegation ceiling exactly like YAML
+    # steps (utils/delegation.py). The script subprocess asserts nothing: the
+    # record, keyed by the generation-fenced run id, is the source. None for an
+    # operator-started run.
+    caller_id: Optional[str] = None
+
+
+def step_delegating_terminal_id(env_vars: Optional[Dict[str, str]]) -> Optional[str]:
+    """The terminal whose delegation ceiling bounds a script-tier run-step call.
+
+    Same guard as ``make_step_terminal_recorder``: returns ``None`` (operator
+    path, unchanged) unless the call names a live ``ScriptRunRecord`` through
+    ``CAO_WORKFLOW_RUN_ID``; then it is that record's ``caller_id``. The
+    generation fence has already run by the time the handler calls this, so a
+    stale or forged run id never reaches the lookup.
+    """
+    if not env_vars:
+        return None
+    run_id = env_vars.get("CAO_WORKFLOW_RUN_ID")
+    if not run_id:
+        return None
+    record = run_registry.get(run_id)
+    if not isinstance(record, ScriptRunRecord):
+        return None
+    return record.caller_id
 
 
 # ---------------------------------------------------------------------------
@@ -1219,8 +1248,14 @@ async def _persist_generation_best_effort(record: ScriptRunRecord) -> None:
 # ---------------------------------------------------------------------------
 # A1 — run_script_workflow (S1 flow, M1 + M2 run-path gate)
 # ---------------------------------------------------------------------------
-async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) -> WorkflowRunResult:
+async def run_script_workflow(
+    spec: Any, inputs: Dict[str, Any], run_id: str, caller_id: Optional[str] = None
+) -> WorkflowRunResult:
     """Run a script workflow to completion, awaited inline (A1, S1, US-B1/B4/B5).
+
+    ``caller_id`` is the terminal starting the run, if an agent did; it is kept on
+    the ``ScriptRunRecord`` so every step the script dispatches is bounded by that
+    terminal's delegation ceiling (see ``ScriptRunRecord.caller_id``).
 
     ``spec`` is the resolved ``ScriptSpec`` (U5/C4) — duck-typed here (U5 owns the
     concrete model): it exposes ``.source`` (script text), ``.path`` (display path
@@ -1280,6 +1315,7 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
         started_at=_now(),
         finished_at=None,
         tier="script",
+        caller_id=caller_id,
     )
     # M3 (traceability): a registered record lives for the process lifetime — it is
     # NOT evicted on finalize, mirroring the base YAML registry, so a bounded
@@ -1368,7 +1404,9 @@ async def run_script_workflow_prepared(
 # A2 — resume_script_run (S2 flow, M3, US-C1/C2)
 # ---------------------------------------------------------------------------
 async def resume_script_run(
-    run_id: str, decisions: Optional[Mapping[str, str]] = None
+    run_id: str,
+    decisions: Optional[Mapping[str, str]] = None,
+    caller_id: Optional[str] = None,
 ) -> WorkflowRunResult:
     """Resume a crashed/failed/cancelled script run from its journal (A2, S2).
 
@@ -1543,6 +1581,9 @@ async def resume_script_run(
             started_at=row.started_at,
             finished_at=None,
             tier="script",
+            # The resumer bounds the re-run steps (the journal does not carry the
+            # original starter); None for an operator resume.
+            caller_id=caller_id,
         )
 
         # --- Execution: bump + PERSIST generation BEFORE spawn (INV-6, load-bearing) ---

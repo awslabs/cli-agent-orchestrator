@@ -173,3 +173,45 @@ class TestWorkflowToolsForwardCaller:
         run_payload, resume_payload = (c.kwargs["json"] for c in mock_post.call_args_list)
         assert "caller_id" not in run_payload
         assert resume_payload is None
+
+
+class TestHandoffPrecheckUsesTheRecordedCeiling:
+    """Review A, T1: ``_resolve_handoff_provider`` must pass the parent's recorded
+    ceiling to the precheck. With a parent row whose ``allowed_tools`` is NULL
+    (legacy) but whose ``delegate_tools`` is the reviewer list, dropping the
+    ``parent_ceiling`` argument would fall back to "unrestricted" and let the
+    developer through; this test fails on that mutation."""
+
+    @patch("cli_agent_orchestrator.utils.tool_mapping.resolve_allowed_tools")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    @patch(f"{_SRV}.resolve_provider", return_value="claude_code")
+    def test_recorded_ceiling_bounds_the_handoff(self, _prov, mock_load, mock_resolve):
+        from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS
+        from cli_agent_orchestrator.utils.delegation import DelegationCeilingError
+        from cli_agent_orchestrator.utils.orchestration import _resolve_handoff_provider
+
+        profile = MagicMock()
+        profile.allowedTools = None
+        profile.role = "developer"
+        profile.mcpServers = None
+        mock_load.return_value = profile
+        mock_resolve.return_value = ROLE_TOOL_DEFAULTS["developer"]
+        meta = _response(
+            200,
+            {
+                "provider": "claude_code",
+                "session_name": "cao-sup",
+                "agent_profile": "reviewer",
+                "allowed_tools": None,
+                "delegate_tools": ROLE_TOOL_DEFAULTS["reviewer"],
+            },
+        )
+        with (
+            patch.dict(os.environ, {"CAO_TERMINAL_ID": "c0ffee01"}),
+            patch(f"{_SRV}.requests") as mock_requests,
+        ):
+            mock_requests.get.return_value = meta
+            with pytest.raises(DelegationCeilingError) as excinfo:
+                _resolve_handoff_provider("developer")
+        assert excinfo.value.excess == ["fs_*", "execute_bash", "web_fetch"]
+        assert "c0ffee01" in str(excinfo.value) and "reviewer" in str(excinfo.value)

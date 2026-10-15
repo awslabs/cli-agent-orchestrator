@@ -638,9 +638,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restricted tree. The check runs on every creation path: `assign`/`handoff`
   (the MCP layer prechecks and the server re-checks), `POST
   /sessions/{name}/terminals` with a client `allowed_tools` string (403),
-  `/terminals/run-step`, and workflow steps, which now inherit the ceiling of
+  `/terminals/run-step`, and workflow steps on both tiers (YAML steps and the
+  run-step calls a `.py` script dispatches), which now inherit the ceiling of
   the terminal that started or resumed the run (the MCP workflow tools send
-  `caller_id`). Ephemeral agents already enforced this rule; installed profiles
+  `caller_id`). A refused step settles FAILED with the refusal text instead
+  of escaping the engine. Ephemeral agents already enforced this rule; installed profiles
   now use the same comparator (`utils/delegation.py`). Profiles declare a
   ceiling with `delegateTools`; the built-in `supervisor` role defaults to `*`
   and every other role to its own list, so the documented supervisor → developer

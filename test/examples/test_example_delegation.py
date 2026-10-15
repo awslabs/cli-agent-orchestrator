@@ -133,3 +133,84 @@ def test_reviewer_profiles_cannot_launch_developers():
         "execute_bash",
         "web_fetch",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Review A, T2: drive the REAL create_terminal for the example pairs, so the
+# "no shipped example breaks" claim is exercised where the enforcement lives.
+# ---------------------------------------------------------------------------
+import asyncio  # noqa: E402
+from unittest.mock import AsyncMock, MagicMock  # noqa: E402
+
+from cli_agent_orchestrator.services.terminal_service import create_terminal  # noqa: E402
+from cli_agent_orchestrator.utils.delegation import DelegationCeilingError  # noqa: E402
+
+_TS = "cli_agent_orchestrator.services.terminal_service"
+
+
+@pytest.fixture
+def example_launch(monkeypatch):
+    """Real create_terminal + real SQLite rows; tmux, provider and FIFOs mocked.
+    Profiles resolve by NAME across every example set, as the server would."""
+    by_name = {prof.name: prof for profiles in _SETS.values() for prof in profiles.values()}
+    ids = iter(f"{n:08x}" for n in range(0xB0000000, 0xB0000FFF))
+    monkeypatch.setattr(f"{_TS}.generate_terminal_id", lambda: next(ids))
+    monkeypatch.setattr(f"{_TS}.generate_window_name", lambda p: f"{p}-win")
+    monkeypatch.setattr(f"{_TS}.generate_session_name", lambda: "cao-ex")
+    monkeypatch.setattr(f"{_TS}.agent_profiles.load_agent_profile", lambda n: by_name[n])
+    monkeypatch.setattr(f"{_TS}.status_monitor", MagicMock())
+    monkeypatch.setattr(f"{_TS}.fifo_manager", MagicMock())
+    fifo_dir = MagicMock()
+    fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+    monkeypatch.setattr(f"{_TS}.FIFO_DIR", fifo_dir)
+    provider = AsyncMock()
+    provider.initialize.return_value = True
+    pm = MagicMock()
+    pm.create_provider.return_value = provider
+    monkeypatch.setattr(f"{_TS}.provider_manager", pm)
+    backend = MagicMock()
+    backend.session_exists.return_value = True
+    backend.create_window.return_value = "win"
+    backend.supports_event_inbox.return_value = True
+    monkeypatch.setattr("cli_agent_orchestrator.backends.registry._backend", backend)
+
+    def _launch(profile_name, **kw):
+        return asyncio.run(
+            create_terminal(
+                "claude_code", profile_name, session_name="cao-ex", new_session=False, **kw
+            )
+        )
+
+    return _launch
+
+
+@pytest.mark.usefixtures("isolated_memory_db")
+@pytest.mark.parametrize(
+    "example,parent_path,parent,child_path,child",
+    list(_delegating_pairs()),
+    ids=[f"{p}->{c}" for _, p, _, c, _ in _delegating_pairs()],
+)
+def test_supervisor_assigns_every_profile_through_create_terminal(
+    example_launch, example, parent_path, parent, child_path, child
+):
+    """Operator launches the parent (its ceiling is recorded on the row), then the
+    parent creates the child with caller_id, exactly as assign does server-side."""
+    parent_terminal = example_launch(parent.name)
+    child_terminal = example_launch(child.name, caller_id=parent_terminal.id)
+    assert child_terminal.caller_id == parent_terminal.id
+    assert tools_exceeding(child_terminal.allowed_tools, parent_terminal.delegate_tools) == []
+    assert tools_exceeding(child_terminal.delegate_tools, parent_terminal.delegate_tools) == []
+
+
+@pytest.mark.usefixtures("isolated_memory_db")
+def test_shipped_reviewer_cannot_assign_the_shipped_developer(example_launch):
+    """The closed hole, through the real path: tool_restrictions_reviewer ->
+    tool_restrictions_developer is refused with the tools named."""
+    reviewer = example_launch("tool_restrictions_reviewer")
+    with pytest.raises(DelegationCeilingError) as excinfo:
+        example_launch("tool_restrictions_developer", caller_id=reviewer.id)
+    assert excinfo.value.excess == ["fs_*", "execute_bash", "web_fetch"]
+    assert reviewer.id in str(excinfo.value)
+    # ...while the reviewer may still launch another reviewer.
+    peer = example_launch("tool_restrictions_reviewer", caller_id=reviewer.id)
+    assert peer.delegate_tools == reviewer.delegate_tools
