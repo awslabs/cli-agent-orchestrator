@@ -8,13 +8,17 @@ covers the bound itself).
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
+from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.models.workflow import RunState, StepState, WorkflowSpec, WorkflowStep
 from cli_agent_orchestrator.models.workflow_runtime import StepOutputRecord
+from cli_agent_orchestrator.services import workflow_journal
 from cli_agent_orchestrator.services import workflow_service as ws
 from cli_agent_orchestrator.services.agent_step import StepExecutionError
 
@@ -126,14 +130,6 @@ async def test_a_refused_step_fails_the_run_loudly(monkeypatch):
 # Review A, B2: the REAL refusal from the REAL create_terminal must settle the
 # step FAILED and the run FAILED, never escape the engine.
 # ---------------------------------------------------------------------------
-from unittest.mock import MagicMock  # noqa: E402
-
-from cli_agent_orchestrator.clients.database import (
-    create_terminal as db_create_terminal,
-)  # noqa: E402
-from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS  # noqa: E402
-from cli_agent_orchestrator.models.agent_profile import AgentProfile  # noqa: E402
-from cli_agent_orchestrator.services import workflow_journal  # noqa: E402
 
 _TS = "cli_agent_orchestrator.services.terminal_service"
 _REVIEWER = ROLE_TOOL_DEFAULTS["reviewer"]
