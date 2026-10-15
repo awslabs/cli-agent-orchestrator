@@ -150,3 +150,53 @@ class TestWorkflowCaller:
             response = client.post("/workflows/runs/r1/resume", json={"caller_id": "a1b2c3d4"})
         assert response.status_code == 404
         assert mock_resume.call_args.kwargs["caller_id"] == "a1b2c3d4"
+
+
+class TestReviewBIdentityAndSidecar:
+    def test_in_session_create_without_caller_id_is_403(self, client):
+        """Review B F3(a): omission used to take the operator branch (201,
+        unbounded). An in-session create must name its delegating terminal."""
+        with patch(
+            "cli_agent_orchestrator.api.main.terminal_service.create_terminal",
+            new=AsyncMock(),
+        ) as mock_create:
+            response = client.post(
+                "/sessions/cao-sess/terminals",
+                params={"agent_profile": "developer", "provider": "claude_code"},
+            )
+        assert response.status_code == 403
+        assert "caller_id is required" in response.json()["detail"]
+        mock_create.assert_not_called()
+
+    def test_memory_sidecar_is_bounded_by_the_primary_row(self, client):
+        """Review B F2: the sidecar create carries delegating_terminal_id=primary.id
+        so its ceiling is capped by the primary's recorded ceiling."""
+        from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
+
+        primary = Terminal(
+            id="0000a1b2",
+            name="w",
+            provider="claude_code",
+            session_name="cao-sess",
+            agent_profile="reviewer",
+            status=TerminalStatus.IDLE,
+            last_active="2026-01-01T00:00:00Z",
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.session_service.create_session",
+                new=AsyncMock(return_value=primary),
+            ),
+            patch("cli_agent_orchestrator.api.main.resolve_provider", return_value="claude_code"),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.create_terminal",
+                new=AsyncMock(),
+            ) as sidecar_create,
+        ):
+            response = client.post(
+                "/sessions",
+                params={"agent_profile": "reviewer", "memory_manager": "true"},
+            )
+        assert response.status_code == 201
+        assert sidecar_create.call_args.kwargs["agent_profile"] == "memory_manager"
+        assert sidecar_create.call_args.kwargs["delegating_terminal_id"] == "0000a1b2"

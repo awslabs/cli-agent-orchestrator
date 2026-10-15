@@ -47,6 +47,47 @@ class TestToolsExceeding:
     def test_table(self, child, ceiling, expected):
         assert tools_exceeding(child, ceiling) == expected
 
+    @pytest.mark.parametrize(
+        "child,ceiling,expected",
+        [
+            (["@plugin-search"], ["@plugin-*"], []),  # Review B F7: glob grant covers the name
+            (["@plugin-search"], ["@plugin-s*"], []),
+            (["@plugin-search"], ["@plugin-x*"], ["@plugin-search"]),
+            (["@plugin-search"], ["@PLUGIN-*"], ["@plugin-search"]),  # case-sensitive
+            (["@plugin-*"], ["@*"], []),  # a broader pattern covers a narrower one
+            (["@*"], ["@plugin-*"], ["@*"]),  # never the other way round
+            (["@plugin-*"], ["@plugin-*"], []),
+            (["@plugin-*"], ["@plugin-search"], ["@plugin-*"]),  # a name does not cover a glob
+            (["@cao-mcp-server/assign"], ["@cao-mcp-server"], []),  # server grant covers its tool
+            (["@cao-mcp-server/assign"], ["@cao-mcp-server/assign"], []),
+            (["@cao-mcp-server/assign"], ["@cao-mcp-server/hand*"], ["@cao-mcp-server/assign"]),
+            (
+                ["@cao-mcp-server"],
+                ["@cao-mcp-server/assign"],
+                ["@cao-mcp-server"],
+            ),  # tool grant is narrower
+            (["@srv[1]"], ["@srv[1]"], []),  # exact match survives glob syntax
+            (["@builtin", "@plugin-search"], ["@plugin-*"], []),
+            (["@plugin-search"], ["*"], []),
+            (["@"], ["@*"], ["@"]),  # not a reference at all
+        ],
+    )
+    def test_mcp_reference_semantics_match_the_resolver(self, child, ceiling, expected):
+        """Same answers as granted_mcp_servers gives when expanding concrete names."""
+        from cli_agent_orchestrator.utils.tool_mapping import granted_mcp_servers
+
+        assert tools_exceeding(child, ceiling) == expected
+        name = child[0][1:].split("/")[0]
+        if (
+            len(child) == 1
+            and "/" not in child[0]
+            and "*" not in child[0]
+            and "[" not in child[0]
+            and name
+        ):
+            resolver_grants = name in granted_mcp_servers(ceiling, [name])
+            assert resolver_grants == (expected == []), "comparator and resolver disagree"
+
     def test_matches_ephemeral_creator_rule(self):
         """Same answers the ephemeral path's inline comparison gave (fs_*/* expansion)."""
         assert tools_exceeding(["fs_read", "fs_list"], ["fs_*", "@cao-mcp-server"]) == []
@@ -70,6 +111,14 @@ class TestIntersectCeiling:
             "@cao-mcp-server",
         ]
         assert intersect_ceiling(SUPERVISOR, REVIEWER) == SUPERVISOR
+
+    def test_mcp_glob_in_ceiling_keeps_matching_declared_servers(self):
+        assert intersect_ceiling(
+            ["@plugin-search", "@other", "fs_read"], ["@plugin-*", "fs_read"]
+        ) == [
+            "@plugin-search",
+            "fs_read",
+        ]
 
     def test_fs_glob_narrows_to_present_atoms(self):
         assert intersect_ceiling(["fs_*", "execute_bash"], ["fs_read", "fs_list"]) == [
@@ -131,19 +180,18 @@ class TestCeilingFromRow:
     def test_legacy_row_is_bounded_by_its_own_allowlist(self):
         assert ceiling_from_row({"delegate_tools": None, "allowed_tools": REVIEWER}) == REVIEWER
 
-    def test_legacy_row_without_tools_resolves_profile(self, monkeypatch):
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.utils.caller_tools.caller_effective_allowed_tools",
-            lambda row: ["fs_read"],
-        )
-        assert ceiling_from_row({"delegate_tools": None, "allowed_tools": None}) == ["fs_read"]
+    def test_double_null_row_has_no_authority_and_never_reads_the_profile(self, monkeypatch):
+        """Review B F6: a row recording neither column must not resolve the live
+        profile, which is mutable; it is None and the caller fails closed."""
 
-    def test_unresolvable_is_none(self, monkeypatch):
+        def _boom(_row):
+            raise AssertionError("profile must not be consulted for a stored ceiling")
+
         monkeypatch.setattr(
-            "cli_agent_orchestrator.utils.caller_tools.caller_effective_allowed_tools",
-            lambda row: None,
+            "cli_agent_orchestrator.utils.caller_tools.caller_effective_allowed_tools", _boom
         )
-        assert ceiling_from_row({"delegate_tools": None, "allowed_tools": None}) is None
+        row = {"delegate_tools": None, "allowed_tools": None, "agent_profile": "legacy"}
+        assert ceiling_from_row(row) is None
 
 
 class TestBoundChild:

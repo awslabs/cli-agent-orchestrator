@@ -45,6 +45,7 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from cli_agent_orchestrator.constants import ROLE_DELEGATE_DEFAULTS
+from cli_agent_orchestrator.utils.tool_mapping import mcp_reference_covers, split_mcp_reference
 
 UNRESTRICTED = "*"
 FS_GLOB = "fs_*"
@@ -91,7 +92,7 @@ def _dedupe(items: Iterable[str]) -> List[str]:
 
 
 def _grants(tools: Iterable[str]) -> set[str]:
-    """Everything ``tools`` grants, with ``fs_*`` expanded. ``*`` stays literal."""
+    """Everything ``tools`` grants by exact name, with ``fs_*`` expanded. ``*`` stays literal."""
     granted: set[str] = set()
     for tool in tools:
         granted.add(tool)
@@ -102,6 +103,32 @@ def _grants(tools: Iterable[str]) -> set[str]:
     return granted
 
 
+def covers(ceiling: Sequence[str], tool: str) -> bool:
+    """Whether ``ceiling`` authorizes the single CAO-vocabulary entry ``tool``.
+
+    The one predicate behind :func:`tools_exceeding` and :func:`intersect_ceiling`:
+
+    - ``*`` in the ceiling covers everything; ``*`` as the tool needs ``*``.
+    - ``@builtin`` grants nothing and is always covered (ignored).
+    - an MCP reference (``@server``, ``@server/tool``, globs) is covered when some
+      ceiling reference covers it under :func:`mcp_reference_covers`, the same
+      selector semantics the provider resolvers use to grant servers at launch.
+    - ``fs_*`` needs ``fs_*`` or all three filesystem atoms; an atom needs itself
+      or ``fs_*``.
+    - anything else matches by exact name. Unknown, odd-case or whitespace names
+      are therefore excess (fail closed).
+    """
+    if UNRESTRICTED in ceiling:
+        return True
+    if tool == BUILTIN_SELECTOR:
+        return True
+    if tool == UNRESTRICTED:
+        return False
+    if split_mcp_reference(tool) is not None:
+        return any(mcp_reference_covers(grant, tool) for grant in ceiling)
+    return tool in _grants(ceiling)
+
+
 def tools_exceeding(child: Optional[Sequence[str]], ceiling: Sequence[str]) -> List[str]:
     """Entries of ``child`` that ``ceiling`` does not cover, in ``child`` order.
 
@@ -109,16 +136,7 @@ def tools_exceeding(child: Optional[Sequence[str]], ceiling: Sequence[str]) -> L
     An empty result means the child fits. ``@builtin`` never exceeds.
     """
     requested = [UNRESTRICTED] if child is None else list(child)
-    if UNRESTRICTED in ceiling:
-        return []
-    granted = _grants(ceiling)
-    excess: List[str] = []
-    for tool in _dedupe(requested):
-        if tool == BUILTIN_SELECTOR:
-            continue
-        if tool not in granted:
-            excess.append(tool)
-    return excess
+    return [tool for tool in _dedupe(requested) if not covers(ceiling, tool)]
 
 
 def intersect_ceiling(declared: Sequence[str], ceiling: Sequence[str]) -> List[str]:
@@ -136,11 +154,9 @@ def intersect_ceiling(declared: Sequence[str], ceiling: Sequence[str]) -> List[s
     granted = _grants(ceiling)
     out: List[str] = []
     for tool in declared:
-        if tool == BUILTIN_SELECTOR:
-            out.append(tool)
-        elif tool == FS_GLOB and FS_GLOB not in granted:
+        if tool == FS_GLOB and FS_GLOB not in granted:
             out.extend(atom for atom in FS_ATOMS if atom in granted)
-        elif tool in granted:
+        elif covers(ceiling, tool):
             out.append(tool)
     return _dedupe(out)
 
@@ -181,20 +197,19 @@ def ceiling_from_row(row: Dict[str, Any]) -> Optional[List[str]]:
     """The ceiling recorded on a terminal row, with the pre-migration fallback.
 
     Rows written before the ``delegate_tools`` column existed have ``None``
-    there. They are bounded by their OWN allowlist until relaunched -- the
-    strict reading, chosen over re-deriving from the profile, because such a
-    row may itself have been created by a restricted parent under the old
-    rule and the whole point is to stop trusting the profile for that. The
-    own allowlist is the recorded ``allowed_tools``, or the profile resolution
-    that ``None`` stands for (``caller_effective_allowed_tools``). Returns
-    ``None`` only when nothing can be resolved; callers fail closed on that.
+    there. They are bounded by their OWN RECORDED allowlist until relaunched --
+    the strict reading, chosen over re-deriving from the profile, because such a
+    row may itself have been created by a restricted parent under the old rule
+    and the whole point is to stop trusting the profile for that. A row with
+    NEITHER column recorded has no immutable authority at all and returns
+    ``None``: the profile on disk is mutable, so resolving it here would let an
+    edit to the profile widen an existing terminal's ceiling after the fact.
+    Callers fail closed on ``None`` and tell the operator to relaunch.
     """
     recorded = row.get("delegate_tools")
     if recorded is not None:
         return list(recorded)
-    from cli_agent_orchestrator.utils.caller_tools import caller_effective_allowed_tools
-
-    own = caller_effective_allowed_tools(row)
+    own = row.get("allowed_tools")
     return list(own) if own is not None else None
 
 
@@ -253,6 +268,18 @@ def bound_child(
             child_profile=child_profile,
         )
     return intersect_ceiling(child_declared_ceiling, caller_ceiling)
+
+
+class InstalledPolicyExceedsAllowlistError(DelegationCeilingError):
+    """An install-time provider's materialised policy is wider than the bounded row.
+
+    Kiro (and any provider that enforces from a file ``cao install`` wrote) runs
+    the INSTALLED policy, not the allowlist the create request resolved. For a
+    delegated create the row must be the effective policy, so a launch whose
+    installed file grants more than the row is refused before allocation with
+    the remedy (reinstall the profile with the narrower policy, or do not
+    override the allowlist). Operator launches keep the existing warning.
+    """
 
 
 #: ``/health`` feature flag a node advertises once it evaluates ceilings. A

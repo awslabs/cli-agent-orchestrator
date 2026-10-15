@@ -216,3 +216,125 @@ async def test_operator_launch_records_the_declared_ceiling(launch):
     assert yolo.delegate_tools == ["*"]
     unrestricted = await launch("unrestricted")
     assert unrestricted.delegate_tools == ["*"]
+
+
+# ---------------------------------------------------------------------------
+# Review B, F3(b): a remote-shaped create (callback terminal in env) must carry
+# the supervisor's ceiling, and a local callback row bounds the assertion.
+# ---------------------------------------------------------------------------
+from cli_agent_orchestrator.constants import (  # noqa: E402
+    CALLBACK_TERMINAL_ID_ENV,
+    CALLBACK_URL_ENV,
+)
+
+_REMOTE_ENV = {CALLBACK_URL_ENV: "http://sup:9889", CALLBACK_TERMINAL_ID_ENV: "0000beef"}
+
+
+@pytest.mark.asyncio
+async def test_remote_shaped_create_without_ceiling_is_refused(launch):
+    with pytest.raises(DelegationCeilingError, match="must carry caller_ceiling"):
+        await launch("developer", env_vars=_REMOTE_ENV)
+
+
+@pytest.mark.asyncio
+async def test_remote_shaped_create_with_ceiling_is_bounded(launch):
+    with pytest.raises(DelegationCeilingError):
+        await launch("developer", env_vars=_REMOTE_ENV, caller_ceiling=REVIEWER)
+    child = await launch("reviewer", env_vars=_REMOTE_ENV, caller_ceiling=REVIEWER)
+    assert child.delegate_tools == REVIEWER
+
+
+@pytest.mark.asyncio
+async def test_local_callback_row_bounds_an_edited_ceiling(launch):
+    """Loopback: the callback terminal has a row here. An asserted ``*`` that
+    exceeds that row's recorded ceiling is refused; the row is authoritative."""
+    _seed("0000beef", "reviewer", REVIEWER, REVIEWER)
+    with pytest.raises(DelegationCeilingError, match="recorded ceiling is authoritative"):
+        await launch("developer", env_vars=_REMOTE_ENV, caller_ceiling=["*"])
+    child = await launch("reviewer", env_vars=_REMOTE_ENV, caller_ceiling=REVIEWER)
+    assert child.delegate_tools == REVIEWER
+
+
+# ---------------------------------------------------------------------------
+# Review B, F6: a double-NULL legacy caller row refuses (no profile re-read).
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_double_null_legacy_caller_refuses_without_reading_the_profile(launch, monkeypatch):
+    _seed("0000dead", "reviewer", None, None)
+    PROFILES["reviewer"] = AgentProfile(name="reviewer", description="edited", allowedTools=["*"])
+    try:
+        with pytest.raises(DelegationCeilingError, match="could not be resolved"):
+            await launch("developer", caller_id="0000dead")
+    finally:
+        PROFILES["reviewer"] = AgentProfile(name="reviewer", description="r", role="reviewer")
+
+
+# ---------------------------------------------------------------------------
+# Review B, F4: Kiro runs the INSTALLED policy; a delegated create whose installed
+# agent grants more than the bounded row is refused before allocation.
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def kiro_install(tmp_path, monkeypatch):
+    import json
+
+    from cli_agent_orchestrator.services import install_service
+    from cli_agent_orchestrator.utils.tool_mapping import kiro_agent_tools
+
+    monkeypatch.setattr(install_service, "KIRO_AGENTS_DIR", str(tmp_path))
+    monkeypatch.setattr(f"{_TS}.probe_kiro_capabilities", lambda engine, requested: MagicMock())
+
+    def _write(profile, allowed):
+        (tmp_path / f"{profile}.json").write_text(json.dumps({"tools": kiro_agent_tools(allowed)}))
+
+    return _write
+
+
+@pytest.mark.asyncio
+async def test_kiro_installed_policy_wider_than_the_row_is_refused(launch, kiro_install):
+    from cli_agent_orchestrator.utils.delegation import InstalledPolicyExceedsAllowlistError
+
+    _seed("0000beef", "reviewer", REVIEWER, REVIEWER)
+    kiro_install("developer", ["execute_bash", "fs_*", "@cao-mcp-server"])
+
+    with pytest.raises(InstalledPolicyExceedsAllowlistError) as excinfo:
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-sess",
+            new_session=False,
+            caller_id="0000beef",
+            allowed_tools=["fs_read"],
+        )
+    assert "shell" in excinfo.value.excess
+    assert "cao install developer" in str(excinfo.value)
+    assert excinfo.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_kiro_installed_policy_within_the_row_launches(launch, kiro_install):
+    _seed("0000beef", "reviewer", REVIEWER, REVIEWER)
+    kiro_install("developer", ["fs_read"])
+    child = await create_terminal(
+        "kiro_cli",
+        "developer",
+        session_name="cao-sess",
+        new_session=False,
+        caller_id="0000beef",
+        allowed_tools=["fs_read"],
+    )
+    assert child.allowed_tools == ["fs_read"]
+
+
+@pytest.mark.asyncio
+async def test_kiro_operator_launch_keeps_the_warning_path(launch, kiro_install):
+    """No caller: the operator is the authority; the installed-vs-requested mismatch
+    stays the launch-time warning, not a refusal."""
+    kiro_install("developer", ["execute_bash", "fs_*", "@cao-mcp-server"])
+    child = await create_terminal(
+        "kiro_cli",
+        "developer",
+        session_name="cao-sess",
+        new_session=False,
+        allowed_tools=["fs_read"],
+    )
+    assert child.allowed_tools == ["fs_read"]

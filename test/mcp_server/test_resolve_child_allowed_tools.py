@@ -195,3 +195,26 @@ class TestResolveChildAllowedTools:
         with pytest.raises(DelegationCeilingError) as excinfo:
             _resolve_child_allowed_tools(["fs_read"], "writer", parent_ceiling=["fs_read"])
         assert excinfo.value.excess == ["fs_*"]
+
+
+class TestDoubleNullParent:
+    """Review B F6 at the precheck: an identified parent whose row records
+    neither a ceiling nor an allowlist cannot delegate; never fall back to the
+    profile on disk. An operator context (no parent id) stays unrestricted."""
+
+    @patch("cli_agent_orchestrator.utils.tool_mapping.resolve_allowed_tools")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_identified_double_null_parent_is_refused(self, mock_load, mock_resolve):
+        mock_load.return_value = _profile(None, role="reviewer")
+        mock_resolve.return_value = ["@builtin", "fs_read", "fs_list", "@cao-mcp-server"]
+        with pytest.raises(DelegationCeilingError, match="neither a delegation ceiling"):
+            _resolve_child_allowed_tools(
+                None, "reviewer", parent_ceiling=None, parent_id="a1b2c3d4", parent_profile="legacy"
+            )
+
+    @patch("cli_agent_orchestrator.utils.tool_mapping.resolve_allowed_tools")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_operator_context_stays_unrestricted(self, mock_load, mock_resolve):
+        mock_load.return_value = _profile(None, role="developer")
+        mock_resolve.return_value = ["*"]
+        assert _resolve_child_allowed_tools(None, "developer") is None
