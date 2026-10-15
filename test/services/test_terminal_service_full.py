@@ -1497,6 +1497,12 @@ class TestReplayDuringInitializationBehaviour:
     only create_terminal itself: a real keyed synchronous create is left inside
     provider.initialize() while a replay with the same key runs."""
 
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self):
+        terminal_service._pending_sync_inits.clear()
+        yield
+        terminal_service._pending_sync_inits.clear()
+
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
@@ -1738,6 +1744,25 @@ class TestIdempotentReplayWaitsForInitialization:
         )
         assert result.id == "prior-terminal"
         assert not waiter.settled.is_set()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
+    async def test_lookup_only_with_another_requests_key_is_a_conflict(
+        self, mock_lookup, mock_get_terminal
+    ):
+        """lookup_only runs the same fingerprint check as any replay, so it
+        cannot be used to read the terminal id of a different request that
+        happens to share the key."""
+        mock_lookup.return_value = _record(
+            terminal_id="prior-terminal", agent_profile="someone-elses-profile"
+        )
+        mock_get_terminal.return_value = dict(_PRIOR_ROW)
+
+        with pytest.raises(terminal_service.IdempotencyKeyConflict):
+            await create_terminal(
+                "kiro_cli", "developer", new_session=True, idempotency_key="k", lookup_only=True
+            )
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")

@@ -840,7 +840,7 @@ class TestHandoffCreateTimeoutCoversProviderFloors:
         against the pre-fix constant, passes after."""
         assert _HANDOFF_CREATE_TIMEOUT_S > 180.0
 
-    def test_slow_but_successful_create_is_not_killed_client_side(self):
+    def test_slow_but_successful_create_is_not_killed_client_side(self, monkeypatch):
         """Companion end-to-end sanity check, independent of the constant's
         actual value: a real HTTP round trip (no `requests` mocking) against a
         stand-in server that sleeps past a client timeout before answering
@@ -851,7 +851,6 @@ class TestHandoffCreateTimeoutCoversProviderFloors:
         milliseconds -- the mechanism being verified is identical at the real
         240.0s scale."""
         import http.server
-        import json
         import threading
         import time
 
@@ -863,12 +862,12 @@ class TestHandoffCreateTimeoutCoversProviderFloors:
             def log_message(self, format, *args):  # noqa: A002 -- matches base signature
                 pass
 
-            def do_POST(self):
+            def do_POST(self):  # noqa: N802 -- stdlib handler naming
                 if self.path.split("?", 1)[0] == "/sessions":
-                    # Stand-in for cao-server actually finishing provider.initialize()
-                    # after longer than the OLD client timeout would have allowed,
-                    # but still comfortably under the fixed (current) one.
-                    time.sleep(1.2)
+                    # Stand-in for cao-server taking a while to finish
+                    # provider.initialize(), well inside the client timeout so a
+                    # slow CI runner cannot turn it into a spurious timeout.
+                    time.sleep(0.3)
                     terminal_id = "term-0001"
                     created_terminal_ids.append(terminal_id)
                     body = json.dumps({"id": terminal_id, "provider": "antigravity_cli"}).encode()
@@ -889,14 +888,11 @@ class TestHandoffCreateTimeoutCoversProviderFloors:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
 
-        old_base_url = orchestration.API_BASE_URL
-        old_timeout = orchestration._HANDOFF_CREATE_TIMEOUT_S
-        # Scale both the client timeout and server delay down 150:1 from the
-        # real 240.0s constant, preserving the same "server takes longer than
-        # the OLD 150.0s value but well within the fixed value" relationship.
-        orchestration.API_BASE_URL = f"http://127.0.0.1:{port}"
-        orchestration._HANDOFF_CREATE_TIMEOUT_S = 1.6  # stand-in for 240.0
-        os.environ.pop("CAO_TERMINAL_ID", None)
+        monkeypatch.setattr(orchestration, "API_BASE_URL", f"http://127.0.0.1:{port}")
+        monkeypatch.setattr(orchestration, "_HANDOFF_CREATE_TIMEOUT_S", 3.0)
+        # Unset, so handoff takes the new-session POST /sessions branch, the only
+        # one the stand-in server implements.
+        monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)
 
         try:
             reported = []
@@ -909,8 +905,6 @@ class TestHandoffCreateTimeoutCoversProviderFloors:
                 )
             )
         finally:
-            orchestration.API_BASE_URL = old_base_url
-            orchestration._HANDOFF_CREATE_TIMEOUT_S = old_timeout
             server.shutdown()
             thread.join(timeout=2)
 
@@ -928,12 +922,11 @@ class TestHandoffCreateTimeoutRecovery:
     terminal is also a ready one, and an attempt that never reached the server
     is simply performed again with the full budget."""
 
-    def test_timed_out_create_recovers_the_terminal_only_once_it_is_ready(self):
+    def test_timed_out_create_recovers_the_terminal_only_once_it_is_ready(self, monkeypatch):
         """Real HTTP round trip: the first attempt's client timeout fires while
         the stand-in server is still "initializing"; the keyed retry must
         return the same terminal, and only after initialization finished."""
         import http.server
-        import json
         import threading
         import time
         from urllib.parse import parse_qs
@@ -964,7 +957,7 @@ class TestHandoffCreateTimeoutRecovery:
                         with lock:
                             committed[key] = terminal_id
                             init_done[terminal_id] = event
-                        time.sleep(0.6)
+                        time.sleep(1.2)
                         event.set()
                     else:
                         # Replay: held until the original init settles.
@@ -991,10 +984,14 @@ class TestHandoffCreateTimeoutRecovery:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
 
-        old_base_url = orchestration.API_BASE_URL
-        old_timeout = orchestration._HANDOFF_CREATE_TIMEOUT_S
-        orchestration.API_BASE_URL = f"http://127.0.0.1:{server.server_address[1]}"
-        orchestration._HANDOFF_CREATE_TIMEOUT_S = 0.3  # shorter than the 0.6s init
+        monkeypatch.setattr(
+            orchestration, "API_BASE_URL", f"http://127.0.0.1:{server.server_address[1]}"
+        )
+        # The first attempt always times out (init takes 1.2s > 1.0s). The replay
+        # starts at ~1.0s and is held only until init settles at ~1.2s, so it
+        # uses ~0.2s of its own 1.0s budget: ample headroom on a loaded runner.
+        monkeypatch.setattr(orchestration, "_HANDOFF_CREATE_TIMEOUT_S", 1.0)
+        monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)
         try:
             reported = []
             result = asyncio.run(
@@ -1006,8 +1003,6 @@ class TestHandoffCreateTimeoutRecovery:
                 )
             )
         finally:
-            orchestration.API_BASE_URL = old_base_url
-            orchestration._HANDOFF_CREATE_TIMEOUT_S = old_timeout
             server.shutdown()
             thread.join(timeout=2)
 

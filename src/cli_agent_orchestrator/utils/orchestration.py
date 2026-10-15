@@ -1727,7 +1727,8 @@ async def _handoff_impl(
                 idempotency_key=create_key,
             )
             if terminal_id is None:
-                # Nothing is committed for this key: report the original error.
+                # Nothing is committed for this key: report the error that ended
+                # the create (the last attempt's), as before this lookup.
                 raise unresolved.__cause__ or unresolved
             _notify_terminal_id(on_terminal_id, terminal_id)
             return HandoffResult(
