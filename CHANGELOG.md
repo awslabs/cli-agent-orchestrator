@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The publish workflow now refuses, in seconds, a release tag whose version
+  `pyproject.toml`, `uv.lock` and the devcontainer feature do not carry, and a
+  version already on PyPI (`scripts/assert_release_version.py`). v2.5.1, v2.5.2 and
+  v2.5.4 each spent ~80 minutes building wheels before TestPyPI answered
+  `400 File already exists`, because the tag sat on a commit that had not been
+  bumped.
 - Security regression tests derived from the review harnesses Augusto Santos
   (@gutosantos82) wrote while assessing CAO's CI security gates: a route-by-scope
   authorization matrix with auth enabled (every HTTP route x no/read/write/admin
