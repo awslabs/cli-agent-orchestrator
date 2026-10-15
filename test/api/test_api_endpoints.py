@@ -358,6 +358,7 @@ class TestCreateSession:
             resume_session_id=None,
             group=None,
             metadata=None,
+            caller_ceiling=None,
         )
 
     def test_create_session_forwards_use_worktree_true(self, client):

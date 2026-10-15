@@ -50,6 +50,13 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.description import normalize_description
+from cli_agent_orchestrator.utils.delegation import (
+    REMOTE_FEATURE,
+    DelegationCeilingError,
+    ceiling_from_row,
+    describe_rejection,
+    tools_exceeding,
+)
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_session_name_for_key,
@@ -529,7 +536,11 @@ def _cleanup_remote_terminal(base_url: str, terminal_id: str) -> bool:
 
 
 def _resolve_child_allowed_tools(
-    parent_allowed_tools: Optional[list], child_profile_name: str
+    parent_allowed_tools: Optional[list],
+    child_profile_name: str,
+    parent_ceiling: Optional[list] = None,
+    parent_id: Optional[str] = None,
+    parent_profile: Optional[str] = None,
 ) -> Optional[str]:
     """Resolve allowed_tools for a child terminal via intersection.
 
@@ -553,23 +564,41 @@ def _resolve_child_allowed_tools(
     except FileNotFoundError:
         child_allowed = None
 
-    # If parent is unrestricted or has no restrictions, use child's tools
-    if parent_allowed_tools is None or "*" in parent_allowed_tools:
-        if child_allowed:
-            return ",".join(child_allowed)
-        return None
+    # The ceiling the child must fit inside: the parent's RECORDED
+    # delegate_tools, or, for a row written before that column existed, the
+    # parent's own allowlist (the strict reading; see
+    # utils/delegation.ceiling_from_row). None = an unrestricted parent.
+    ceiling = parent_ceiling if parent_ceiling is not None else parent_allowed_tools
+    if ceiling is None:
+        ceiling = ["*"]
 
-    # If child has no opinion (None), inherit parent's restrictions
+    # A child with no profile of its own inherits the parent's restrictions,
+    # which by construction fit inside the ceiling.
     if child_allowed is None:
-        return ",".join(parent_allowed_tools)
+        if "*" in ceiling and parent_allowed_tools is None:
+            return None
+        return ",".join(parent_allowed_tools if parent_allowed_tools is not None else ceiling)
 
-    # If child explicitly requests unrestricted ("*"), honor it
+    # Precheck (the server is authoritative; this gives the early error). An
+    # explicit child ["*"] is honoured only within the parent's ceiling (#141
+    # as bounded here): under a supervisor it stays unrestricted, under a
+    # restricted parent it is refused with the tools named.
+    excess = tools_exceeding(child_allowed, ceiling)
+    if excess:
+        raise DelegationCeilingError(
+            describe_rejection(
+                parent_id=parent_id,
+                parent_profile=parent_profile,
+                child_profile=child_profile_name,
+                excess=excess,
+                ceiling=ceiling,
+            ),
+            excess=excess,
+            parent_id=parent_id,
+            child_profile=child_profile_name,
+        )
     if "*" in child_allowed:
         return None
-
-    # Both have restrictions: child gets its own profile tools
-    # (the child profile defines what it needs; parent's restrictions
-    # are enforced by the parent not delegating unauthorized work)
     return ",".join(child_allowed)
 
 
@@ -588,6 +617,74 @@ def _remote_ephemeral_refusal(name: str, target_host: Optional[str]) -> Optional
         )
         return f"remote_placement_not_allowed: ephemeral agent '{name}' can only launch on the node that created it; omit target_host"
     return None
+
+
+def _require_remote_delegation_ceiling(base_url: str, target_host: str) -> None:
+    """Refuse a remote placement unless the target node evaluates delegation ceilings.
+
+    The ceiling travels as ``caller_ceiling`` in the request body. A node from
+    before that field existed accepts the body and IGNORES the field, so the
+    worker would launch unbounded with no error anywhere -- the version-skew
+    case this probe exists to close. ``/health`` advertises
+    ``features: ["delegation_ceiling"]`` once a node enforces it.
+
+    Raises:
+        ValueError: the node is unreachable, or does not advertise the feature.
+    """
+    try:
+        response = requests.get(f"{base_url}/health", timeout=(REMOTE_CONNECT_TIMEOUT, 5.0))
+        features = response.json().get("features") if response.status_code == 200 else None
+    except (requests.RequestException, ValueError) as exc:
+        raise ValueError(
+            f"cannot verify that remote CAO node {target_host} enforces delegation "
+            f"ceilings ({exc}); refusing to place work there"
+        )
+    if not isinstance(features, list) or REMOTE_FEATURE not in features:
+        raise ValueError(
+            f"remote CAO node {target_host} does not enforce delegation ceilings "
+            f"(its /health lacks the '{REMOTE_FEATURE}' feature, so it would launch the "
+            f"worker unbounded by this terminal's allowlist). Upgrade cao on that node, "
+            f"or omit target_host."
+        )
+
+
+def _own_delegation_ceiling() -> list:
+    """The calling terminal's recorded delegation ceiling, read from its own row.
+
+    For remote placement, where the target has no row for this terminal. Uses
+    the stored ``delegate_tools`` and falls back to the terminal's own effective
+    allowlist for a row written before that column existed (the same strict
+    reading the server applies, ``utils/delegation.ceiling_from_row``).
+
+    Raises:
+        ValueError: no ``CAO_TERMINAL_ID``, or the row/ceiling cannot be read.
+    """
+    current_terminal_id = _current_terminal_id()
+    if not current_terminal_id:
+        raise ValueError(
+            "remote placement needs CAO_TERMINAL_ID so this terminal's delegation "
+            "ceiling can be sent to the target node"
+        )
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/terminals/{current_terminal_id}",
+            headers=_auth_headers() or None,
+            timeout=_mcp_timeout(),
+        )
+        response.raise_for_status()
+        row = response.json()
+        ceiling = ceiling_from_row(row)
+    except Exception as exc:  # noqa: BLE001  (an unknown ceiling must not place work)
+        raise ValueError(
+            f"the delegation ceiling of terminal {current_terminal_id} could not be "
+            f"read ({exc}); refusing remote placement"
+        )
+    if ceiling is None:
+        raise ValueError(
+            f"the delegation ceiling of terminal {current_terminal_id} could not be "
+            f"resolved; relaunch it so the ceiling is recorded"
+        )
+    return ceiling
 
 
 class EphemeralClaim(NamedTuple):
@@ -802,11 +899,20 @@ def _create_terminal(
                     f"Error fetching conductor's working directory: {e}, will use server default"
                 )
 
-        # Resolve child's allowed_tools via inheritance
+        # Resolve the child's allowed_tools and precheck them against the
+        # caller's recorded delegation ceiling (the server re-checks from the
+        # caller's row and is authoritative; this surfaces the error early). A
+        # claimed ephemeral target already carries its policy-bounded tools.
         child_allowed_tools = (
             ",".join(claim.effective_tools)
             if claim is not None
-            else _resolve_child_allowed_tools(parent_allowed_tools, agent_profile)
+            else _resolve_child_allowed_tools(
+                parent_allowed_tools,
+                agent_profile,
+                parent_ceiling=terminal_metadata.get("delegate_tools"),
+                parent_id=current_terminal_id,
+                parent_profile=terminal_metadata.get("agent_profile"),
+            )
         )
 
         # Create new terminal in existing session - always pass working_directory
@@ -1017,6 +1123,11 @@ class HandoffContext(NamedTuple):
     caller_id: Optional[str]
     allowed_tools: Optional[list]
     claim_id: Optional[str] = None
+    # Remote placement only: the supervisor's recorded delegation ceiling,
+    # asserted to the target node (which has no row for the supervisor) so the
+    # worker it creates is bounded by it. None on every local path, where the
+    # server reads the ceiling from the caller_id row itself.
+    caller_ceiling: Optional[list] = None
 
 
 def _resolve_handoff_provider(
@@ -1067,7 +1178,13 @@ def _resolve_handoff_provider(
     # used; _resolve_child_allowed_tools returns a comma-separated string (or
     # None for unrestricted), which we split into the list the payload expects.
     parent_allowed_tools = terminal_metadata.get("allowed_tools")
-    child_allowed_tools = _resolve_child_allowed_tools(parent_allowed_tools, agent_profile)
+    child_allowed_tools = _resolve_child_allowed_tools(
+        parent_allowed_tools,
+        agent_profile,
+        parent_ceiling=terminal_metadata.get("delegate_tools"),
+        parent_id=current_terminal_id,
+        parent_profile=terminal_metadata.get("agent_profile"),
+    )
     allowed_tools_list = child_allowed_tools.split(",") if child_allowed_tools else None
     return HandoffContext(
         provider=provider,
@@ -1591,11 +1708,16 @@ async def _handoff_impl(
             # (the remote DB has no row for the supervisor's terminal); the
             # provider comes from the remote node's own profile store.
             base_url = _resolve_target_base_url(target_host)
+            # The one piece of supervisor state that DOES travel: its recorded
+            # delegation ceiling, so the remote node bounds the worker by it.
+            # Refuses (fail closed) when the target cannot evaluate it.
+            _require_remote_delegation_ceiling(base_url, target_host)
             ctx = HandoffContext(
                 provider=_resolve_remote_provider(base_url, agent_profile),
                 session_name=None,
                 caller_id=None,
                 allowed_tools=None,
+                caller_ceiling=_own_delegation_ceiling(),
             )
         else:
             # Resolve the supervisor context WITHOUT creating a terminal, so the
@@ -1658,6 +1780,8 @@ async def _handoff_impl(
                 payload["claim_id"] = ctx.claim_id
             if ctx.allowed_tools or ctx.claim_id is not None:
                 payload["allowed_tools"] = ctx.allowed_tools
+            if ctx.caller_ceiling is not None:
+                payload["caller_ceiling"] = ctx.caller_ceiling
             if working_directory:
                 payload["working_directory"] = working_directory
             if provider == ProviderType.KIRO_CLI.value and engine is not None:
@@ -1874,6 +1998,20 @@ def _assign_remote(
     base_url = _resolve_target_base_url(target_host)
     if ready_wait_seconds > 0:
         _wait_remote_ready(base_url, ready_wait_seconds)
+    # The supervisor's recorded delegation ceiling travels with the request so
+    # the remote node bounds the worker by it; refuse (fail closed) when the
+    # target does not advertise that it evaluates ceilings, because an older
+    # node would silently ignore the field and launch the worker unbounded.
+    try:
+        _require_remote_delegation_ceiling(base_url, target_host)
+        caller_ceiling = _own_delegation_ceiling()
+    except ValueError as exc:
+        return {
+            "success": False,
+            "terminal_id": None,
+            "target_host": target_host,
+            "message": f"Assignment failed: {exc}",
+        }
     params: Dict[str, Any] = {"agent_profile": agent_profile}
     if remote_session_name:
         params["session_name"] = remote_session_name
@@ -1898,6 +2036,7 @@ def _assign_remote(
                 CALLBACK_URL_ENV: advertised_url.rstrip("/"),
                 CALLBACK_TERMINAL_ID_ENV: current_terminal_id,
             },
+            "caller_ceiling": caller_ceiling,
         },
         timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
     )

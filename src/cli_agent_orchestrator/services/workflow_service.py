@@ -210,6 +210,13 @@ class RunRecord:
     # constructed here; it binds to the running loop lazily on first await, so
     # building a RunRecord outside a loop (unit tests) is safe.
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # The terminal that started (or resumed) this run, when an agent did
+    # (``WorkflowRunRequest.caller_id``, sent by the MCP workflow tools). Every
+    # step's worker is created with ``delegating_terminal_id=caller_id`` so its
+    # tools are bounded by that terminal's RECORDED delegation ceiling
+    # (utils/delegation.py). In-memory only: a resume re-binds it to whoever
+    # resumes. None for operator-started runs (CLI, curl), which are unbounded.
+    caller_id: Optional[str] = None
 
 
 # Process-local run registry (ADR-8, B3-LC-2 singleton). A process restart loses
@@ -695,6 +702,7 @@ async def _collect_structured_output(
                 "CAO_WORKFLOW_STEP_ID": step.id,
             },
             cancel_event=record.cancel_event,
+            delegating_terminal_id=record.caller_id,
         )
         st.terminal_id = result.terminal_id
         rec = step_output_store.get(record.run_id, step.id)
@@ -771,6 +779,9 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
                     "CAO_WORKFLOW_STEP_ID": step.id,
                 },
                 cancel_event=record.cancel_event,
+                # The agent that started the run bounds every step it dispatches
+                # (utils/delegation.py); None for an operator-started run.
+                delegating_terminal_id=record.caller_id,
             )
             st.terminal_id = result.terminal_id
             # U2 emission: a terminal exists for this step (after the id is bound).
@@ -1098,8 +1109,17 @@ def _check_run_id_available(run_id: str) -> None:
 # ---------------------------------------------------------------------------
 # §1 — start_run entry point
 # ---------------------------------------------------------------------------
-async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> WorkflowRunResult:
+async def start_run(
+    spec: WorkflowSpec,
+    inputs: Dict[str, Any],
+    run_id: str,
+    caller_id: Optional[str] = None,
+) -> WorkflowRunResult:
     """Run a validated workflow spec to completion, awaited inline (§1, Q1=A).
+
+    ``caller_id`` is the terminal starting the run, if an agent did; it is
+    recorded on the ``RunRecord`` so every step is bounded by that terminal's
+    delegation ceiling (see ``RunRecord.caller_id``).
 
     Steps: validate the run_id key (B3-BR-1, shared validator) and the inputs
     against ``spec.inputs`` (B3-BR-2) — failing BEFORE any terminal is created;
@@ -1138,6 +1158,7 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
         cancelled=False,
         step_states={step.id: StepRunState(step_id=step.id) for step in spec.steps},
         started_at=_now(),
+        caller_id=caller_id,
     )
     # 4. Register (in-memory floor) + mark the drive live + journal the run +
     # seed every step (§1). The ``finally`` guarantees the liveness mark is
@@ -1507,8 +1528,14 @@ def _dispatch_reserved_mode(spec: WorkflowSpec) -> None:
     raise NotBuiltYetError(f"workflow mode '{spec.mode}' is reserved (not built yet)")
 
 
-async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
+async def resume_from_last_completed(
+    run_id: str, caller_id: Optional[str] = None
+) -> WorkflowRunResult:
     """Resume a crashed/failed run from its durable journal (§3, FR-6.2, N6).
+
+    ``caller_id`` is the terminal resuming the run, if an agent is; the re-run
+    steps are bounded by ITS delegation ceiling (the journal does not carry the
+    original starter, and the resumer is who dispatches now).
 
     Un-reserves the B3-BR-10 stub. The algorithm (business-logic-model §3):
 
@@ -1601,6 +1628,7 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
     record.cancelled = False
     record.current_step_id = None
     record.finished_at = None
+    record.caller_id = caller_id
     run_registry[run_id] = record
     # Mark the drive live BEFORE the first await: the off-loop journal writes
     # below yield, and a concurrent resume for the same run_id must hit the
@@ -1635,8 +1663,12 @@ async def replay_single_step(
     run_id: str,
     step_id: str,
     prompt_override: Optional[str] = None,
+    caller_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Re-execute ONE recorded step live, leaving the source run untouched (#640).
+
+    ``caller_id``: the terminal replaying the step, if an agent is; the replayed
+    worker is bounded by its delegation ceiling like any workflow step.
 
     The authoring loop this exists for: on a 57-step workflow, fixing two sentences
     of step 55's prompt should not cost a full re-run to reach step 55 again. The
@@ -1795,6 +1827,7 @@ async def replay_single_step(
                     "CAO_WORKFLOW_RUN_ID": replay_run_id,
                     "CAO_WORKFLOW_STEP_ID": step_id,
                 },
+                delegating_terminal_id=caller_id,
             )
         except StepExecutionError as e:
             # Recorded, not raised (the drive loop's posture). Deliberately NO retry

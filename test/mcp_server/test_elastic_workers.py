@@ -4,10 +4,25 @@ import asyncio
 import time
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+
 from cli_agent_orchestrator.mcp_server import server
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.utils import orchestration
+
+
+@pytest.fixture(autouse=True)
+def _remote_node_enforces_ceilings():
+    """Remote placement probes the target's /health for ``delegation_ceiling`` and
+    reads this terminal's own recorded ceiling before posting (fail closed on an
+    older node). Stubbed here so these tests stay about elastic provisioning;
+    the probe itself is covered in test_delegation_remote.py."""
+    with (
+        patch.object(orchestration, "_require_remote_delegation_ceiling", return_value=None),
+        patch.object(orchestration, "_own_delegation_ceiling", return_value=["*"]),
+    ):
+        yield
 
 
 def test_assign_elastic_provisions_then_assigns(monkeypatch):
