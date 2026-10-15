@@ -9,6 +9,7 @@ provider's native status. These tests pin both paths.
 import asyncio
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1359,6 +1360,48 @@ class TestRawDebounceArmedDetection:
         sm._process_chunk("t1", "● Working on task...")
 
         assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+
+class TestRawDetectionGeneration:
+    @pytest.mark.parametrize(
+        "detected", [TerminalStatus.PROCESSING, TerminalStatus.WAITING_USER_ANSWER]
+    )
+    @pytest.mark.parametrize("has_loop", [False, True])
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_pre_input_verdict_does_not_stamp_new_generation(
+        self, mock_pm, mock_settings, has_loop, detected
+    ):
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        mock_pm.get_provider.return_value = provider
+        sm = StatusMonitor()
+        if has_loop:
+            sm._loop = MagicMock()
+        started = threading.Event()
+        resume = threading.Event()
+
+        def detect(_terminal_id, _buffer):
+            started.set()
+            assert resume.wait(timeout=5)
+            return detected
+
+        with patch.object(sm, "_detect_status", side_effect=detect):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(sm._process_chunk, "t1", "old pane")
+                try:
+                    assert started.wait(timeout=5)
+                    previous_generation = sm._capture_generation["t1"]
+                    sm.notify_input_sent("t1")
+                    assert sm._capture_generation["t1"] == previous_generation + 1
+                finally:
+                    resume.set()
+                future.result(timeout=5)
+
+        assert sm._last_status.get("t1", TerminalStatus.UNKNOWN) == TerminalStatus.UNKNOWN
+        assert "t1" not in sm._waiting_generation
+        assert "t1" not in sm._processing_generation
 
 
 class TestProcessChunkBufferTruncation:

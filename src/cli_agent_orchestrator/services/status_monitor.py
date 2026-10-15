@@ -310,7 +310,8 @@ class StatusMonitor:
             # before this chunk no longer describes it and must not be confirmable
             # by a later read.
             self._buffer_changed_at[terminal_id] = time.monotonic()
-            self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
+            capture_generation = self._capture_generation.get(terminal_id, 0) + 1
+            self._capture_generation[terminal_id] = capture_generation
             self._output_generation[terminal_id] = self._output_generation.get(terminal_id, 0) + 1
             self._pending_stale_capture.pop(terminal_id, None)
             self._confirmed_stale_capture_commit.pop(terminal_id, None)
@@ -325,7 +326,7 @@ class StatusMonitor:
             # (catches PROCESSING transition), then waits for output to settle
             # before re-detecting (catches IDLE/COMPLETED without running costly
             # regex on every single chunk during bursts).
-            self._schedule_raw_detection(terminal_id, buffer)
+            self._schedule_raw_detection(terminal_id, buffer, capture_generation)
             return
 
         self._schedule_screen_detection(terminal_id, provider)
@@ -698,7 +699,9 @@ class StatusMonitor:
         else:
             self._spawn_tracked(loop, _detect_and_apply())
 
-    def _schedule_raw_detection(self, terminal_id: str, buffer: str) -> None:
+    def _schedule_raw_detection(
+        self, terminal_id: str, buffer: str, capture_generation: int
+    ) -> None:
         """Edge-debounce detection on the raw rolling buffer.
 
         Detects on every chunk while the terminal is in a ready/armed state
@@ -719,7 +722,11 @@ class StatusMonitor:
         if loop is None:
             # No loop ever captured (unit tests / offline replay): detect
             # inline and skip the debounce timer.
-            self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
+            self._apply_detection(
+                terminal_id,
+                self._detect_status(terminal_id, buffer),
+                capture_generation=capture_generation,
+            )
             return
 
         with self._lock:
@@ -734,7 +741,7 @@ class StatusMonitor:
         # delivery by InboxService). Once PROCESSING is observed, debounce.
         if not was_bursting or last_status in _STICKY_READY_STATUSES or last_status is None:
             detected = self._detect_status(terminal_id, buffer)
-            self._apply_detection(terminal_id, detected)
+            self._apply_detection(terminal_id, detected, capture_generation=capture_generation)
 
         self._arm_quiesce_timer(loop, terminal_id, self._on_raw_quiescent)
 
