@@ -139,12 +139,34 @@ _REVIEWER = ROLE_TOOL_DEFAULTS["reviewer"]
 def real_create_terminal(monkeypatch):
     """run_agent_step and create_terminal run for real; tmux/provider are mocked and
     the reviewer's row is a real SQLite row (isolated_memory_db)."""
+    from unittest.mock import AsyncMock as _AsyncMock
+
+    from cli_agent_orchestrator.services import agent_step, terminal_service
+
     profiles = {"dev": AgentProfile(name="dev", description="d", role="developer")}
     monkeypatch.setattr(f"{_TS}.agent_profiles.load_agent_profile", lambda n: profiles[n])
-    monkeypatch.setattr(f"{_TS}.provider_manager", MagicMock())
+    provider = _AsyncMock()
+    provider.initialize.return_value = True
+    pm = MagicMock()
+    pm.create_provider.return_value = provider
+    monkeypatch.setattr(f"{_TS}.provider_manager", pm)
+    monkeypatch.setattr(f"{_TS}.status_monitor", MagicMock())
+    monkeypatch.setattr(f"{_TS}.fifo_manager", MagicMock())
+    fifo_dir = MagicMock()
+    fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+    monkeypatch.setattr(f"{_TS}.FIFO_DIR", fifo_dir)
+    # The refusal fires BEFORE any of this is reached. It is mocked so that, if
+    # the bound were ever dropped (the mutation Review B ran), the worker would
+    # launch and the ASSERTIONS below fail, rather than a mock raising first.
     backend = MagicMock()
-    backend.session_exists.return_value = True
+    backend.session_exists.return_value = False
+    backend.create_window.return_value = "win"
+    backend.supports_event_inbox.return_value = True
     monkeypatch.setattr("cli_agent_orchestrator.backends.registry._backend", backend)
+    monkeypatch.setattr(agent_step, "wait_until_status", _AsyncMock(return_value=True))
+    monkeypatch.setattr(agent_step, "_wait_for_completion", _AsyncMock())
+    monkeypatch.setattr(terminal_service, "send_input", MagicMock())
+    monkeypatch.setattr(terminal_service, "get_output", lambda *a, **kw: "done")
     db_create_terminal(
         "0000beef", "cao-s", "rev", "claude_code", "reviewer", _REVIEWER, delegate_tools=_REVIEWER
     )
@@ -185,6 +207,7 @@ async def test_real_refusal_settles_the_step_and_run_failed(real_create_terminal
     assert step.attempts == 1, "a refusal is deterministic and must not be retried"
     assert "Delegation refused" in (step.error or "")
     assert "0000beef" in step.error and "fs_*, execute_bash, web_fetch" in step.error
+    real_create_terminal.create_session.assert_not_called()
     real_create_terminal.create_window.assert_not_called()
     row = workflow_journal.get_run("run-refused")
     assert row is not None and row.state == RunState.FAILED.value
