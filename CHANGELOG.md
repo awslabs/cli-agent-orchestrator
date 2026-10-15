@@ -777,8 +777,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside a CAO terminal inherit that terminal's ceiling rather than running
   unbounded; (5) `POST /sessions/{name}/terminals` requires `caller_id`
   (operator launches use `POST /sessions`). `caller_id` and `caller_ceiling`
-  remain client assertions under the shared bearer; per-terminal identity is a
-  follow-up. The issue #141 behaviour (a child `allowedTools: ["*"]` is not
+  remain client assertions under the shared bearer; per-terminal identity is
+  the follow-up tracked as bead `caom-776.2`. The issue #141 behaviour (a child `allowedTools: ["*"]` is not
   collapsed to the parent's list) is kept within the parent's ceiling.
 - New `Actions Security` CI job runs zizmor 1.30.1 over `.github/` on every PR
   and push to `main`, failing on Medium-or-higher findings. Accepted findings
