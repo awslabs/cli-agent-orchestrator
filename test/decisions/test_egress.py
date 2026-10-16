@@ -25,9 +25,15 @@ def test_halt_beats_flags_and_environment(egress, monkeypatch):
     settings.set_point("model.route", "shadow", "external")
     egress.HALT_FILE.touch()
     monkeypatch.setenv("CAO_DECISION_MODEL_ROUTE", "on")
-    snapshot = settings.load_settings(flags={"effort.route": "on"})
-    assert all(point.state.value == "off" for point in snapshot.points.values())
-    assert snapshot.points["model.route"].decider == "external"
+    # `cao-server --decision` writes the same variables into the server's startup snapshot.
+    for snapshot in (
+        settings.load_settings(),
+        settings.load_settings(
+            environment={"CAO_DECISION_MODEL_ROUTE": "on", "CAO_DECISION_EFFORT_ROUTE": "on"}
+        ),
+    ):
+        assert all(point.state.value == "off" for point in snapshot.points.values())
+        assert snapshot.points["model.route"].decider == "external"
 
 
 @pytest.mark.parametrize("state", ["shadow", "on", "off"])

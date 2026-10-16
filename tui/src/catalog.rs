@@ -1031,7 +1031,7 @@ fn entry(id: CommandId) -> Command {
             id: CommandId::DecisionsEnable,
             parent: Some("decisions"),
             leaf_name: "enable",
-            summary: "Run an installed decider's consent command in an interactive terminal.",
+            summary: "Run an installed decider's consent command.",
             policy: Policy::Hidden, // Local operator controls have no HTTP route.
             params: &[],
             handoff_reason: None,
