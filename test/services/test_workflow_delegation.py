@@ -323,3 +323,69 @@ async def test_replay_reports_a_real_refusal_in_the_payload(real_create_terminal
     assert payload["error_kind"] == "error"
     assert "Delegation refused" in payload["error"]
     assert payload["terminal_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# Review B round 3, R2: the caller is journaled; a YAML resume re-binds to it.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("journal_tables")
+async def test_yaml_resume_rebinds_to_the_journaled_caller(monkeypatch):
+    spec = WorkflowSpec(
+        name="wf",
+        mode="sequential",
+        steps=[WorkflowStep(id="s1", provider="claude_code", agent="dev", prompt="go")],
+    )
+    import json
+
+    failing = AsyncMock(side_effect=StepExecutionError("boom", kind="error", terminal_id=None))
+    monkeypatch.setattr(ws, "run_agent_step", failing)
+    result = await ws.start_run(spec, {}, "run-start", caller_id="0000beef")
+    assert result.state == RunState.FAILED
+    assert workflow_journal.get_run("run-start").caller_id == "0000beef", "journaled at start"
+
+    # A crashed run as the journal would hold it after a restart: FAILED row carrying
+    # the original caller, its step PENDING, no live record.
+    workflow_journal.insert_run(
+        run_id="run-rb",
+        workflow_name="wf",
+        spec_snapshot=spec.model_dump_json(),
+        inputs_json=json.dumps({}),
+        state=RunState.FAILED.value,
+        started_at="2026-01-01T00:00:00Z",
+        caller_id="0000beef",
+    )
+    workflow_journal.insert_steps(
+        "run-rb", [("s1", StepState.PENDING.value)], "2026-01-01T00:00:00Z"
+    )
+    ws.run_registry.clear()  # the restart
+    ok = AsyncMock(return_value=_ok())
+    monkeypatch.setattr(ws, "run_agent_step", ok)
+    await ws.resume_from_last_completed("run-rb", caller_id="0000cafe")
+    assert ok.call_args.kwargs["delegating_terminal_id"] == "0000beef"
+
+    workflow_journal.update_run_state("run-rb", RunState.FAILED.value, None)
+    workflow_journal.update_step(
+        run_id="run-rb",
+        step_id="s1",
+        state=StepState.PENDING.value,
+        attempts=0,
+        updated_at="2026-01-01T00:00:02Z",
+        output_json=None,
+    )
+    ws.run_registry.clear()
+    await ws.resume_from_last_completed("run-rb")  # operator resume
+    assert ok.call_args.kwargs["delegating_terminal_id"] == "0000beef"
+
+
+@pytest.mark.usefixtures("journal_tables")
+def test_workflow_run_row_has_the_caller_column(tmp_path):
+    import sqlite3
+
+    from cli_agent_orchestrator import constants
+
+    with sqlite3.connect(str(constants.DATABASE_FILE)) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(workflow_run)")}
+    assert "caller_id" in columns
+    workflow_journal.insert_run("legacy", "wf", "{}", "{}", "running", "t")
+    assert workflow_journal.get_run("legacy").caller_id is None

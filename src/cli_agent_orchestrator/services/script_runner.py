@@ -68,6 +68,7 @@ from cli_agent_orchestrator.services.workflow_service import (
     StepRunState,
     _active_drives,
     _is_resumable_for_tier,
+    bound_caller,
     run_registry,
 )
 
@@ -163,6 +164,42 @@ def step_delegating_terminal_id(env_vars: Optional[Dict[str, str]]) -> Optional[
     if not isinstance(record, ScriptRunRecord):
         return None
     return record.caller_id
+
+
+class OrphanedScriptRunError(Exception):
+    """A script-tier run-step call names a journaled script run with no live record.
+
+    The in-memory ``ScriptRunRecord`` carries the run's caller binding; after a
+    server restart it is gone while the script subprocess may still be running
+    and its generation still matches the journal. Launching such a step would
+    bound it by nothing. Refused at the route (403); ``cao workflow resume``
+    rebuilds the record from the journal, including the original caller.
+    """
+
+
+def require_live_script_run(run_id: Optional[str]) -> None:
+    """Refuse a script-tier run-step whose run is journaled but not live.
+
+    No-op when ``run_id`` is None, names a live ``ScriptRunRecord``, or names a
+    run the journal does not know as ``tier='script'`` (YAML and handoff callers
+    never reach here with a script row). Only the orphan shape raises.
+    """
+    if not run_id:
+        return
+    if isinstance(run_registry.get(run_id), ScriptRunRecord):
+        return
+    try:
+        row = workflow_journal.get_run(run_id)
+    except Exception:  # noqa: BLE001 — an unreadable journal cannot prove liveness
+        row = None
+    if row is not None and row.tier == "script":
+        raise OrphanedScriptRunError(
+            f"run '{run_id}' is a script-tier run with no live record on this server "
+            f"(the server restarted since it started, or it was never started here), so "
+            f"its caller binding and delegation ceiling cannot be evaluated; the step is "
+            f"refused rather than launched unbounded. Resume the run with "
+            f"`cao workflow resume {run_id}` to rebuild it from the journal."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1351,6 +1388,7 @@ async def run_script_workflow(
             # ``approval-gate`` (Bolt 2 unit 7) built this value at Step 0b and has already gated on
             # it; reusing it rather than rebuilding is what makes checked-equals-stored true.
             manifest_json,
+            **({"caller_id": caller_id} if caller_id else {}),
         )
     except (
         Exception
@@ -1581,9 +1619,10 @@ async def resume_script_run(
             started_at=row.started_at,
             finished_at=None,
             tier="script",
-            # The resumer bounds the re-run steps (the journal does not carry the
-            # original starter); None for an operator resume.
-            caller_id=caller_id,
+            # The ORIGINAL starter (journaled) keeps bounding the re-run steps; a
+            # resume by a different actor must not widen them. Only a run started
+            # with no caller takes the resumer's bound.
+            caller_id=bound_caller(row.caller_id, caller_id),
         )
 
         # --- Execution: bump + PERSIST generation BEFORE spawn (INV-6, load-bearing) ---

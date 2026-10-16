@@ -338,3 +338,124 @@ async def test_kiro_operator_launch_keeps_the_warning_path(launch, kiro_install)
         allowed_tools=["fs_read"],
     )
     assert child.allowed_tools == ["fs_read"]
+
+
+# ---------------------------------------------------------------------------
+# Review B round 3, R1: the reviewer's three-generation glob case to a real launch.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_glob_shaped_child_cannot_widen_to_a_grandchild(launch):
+    parent = ["fs_read", "@plugin-?"]
+    _seed("0000beef", "narrow-parent", parent, parent)
+    PROFILES["wide-child"] = AgentProfile(
+        name="wide-child", description="w", allowedTools=["fs_read", "@plugin-*"]
+    )
+    PROFILES["shell-user"] = AgentProfile(
+        name="shell-user", description="s", allowedTools=["fs_read", "@plugin-shell"]
+    )
+    PROFILES["plugin-a-user"] = AgentProfile(
+        name="plugin-a-user", description="a", allowedTools=["fs_read", "@plugin-a"]
+    )
+    try:
+        with pytest.raises(DelegationCeilingError) as excinfo:
+            await launch("wide-child", caller_id="0000beef")
+        assert excinfo.value.excess == ["@plugin-*"]
+        with pytest.raises(DelegationCeilingError):
+            await launch("shell-user", caller_id="0000beef")
+        ok = await launch("plugin-a-user", caller_id="0000beef")  # concrete name within @plugin-?
+        assert ok.delegate_tools == ["fs_read", "@plugin-a"]
+    finally:
+        for name in ("wide-child", "shell-user", "plugin-a-user"):
+            PROFILES.pop(name, None)
+
+
+# ---------------------------------------------------------------------------
+# Review B round 3, R3: OpenCode runs the installed permission block.
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def opencode_install(tmp_path, monkeypatch):
+    import frontmatter
+
+    from cli_agent_orchestrator.providers import opencode_cli
+    from cli_agent_orchestrator.utils.opencode_permissions import cao_tools_to_opencode_permission
+
+    config = tmp_path / "opencode"
+    (config / "agents").mkdir(parents=True)
+    monkeypatch.setattr(opencode_cli, "OPENCODE_CONFIG_DIR", config)
+
+    def _write(profile, allowed):
+        (config / "agents" / f"{profile}.md").write_text(
+            frontmatter.dumps(
+                frontmatter.Post(
+                    "x",
+                    description="d",
+                    mode="all",
+                    permission=cao_tools_to_opencode_permission(allowed),
+                )
+            )
+        )
+
+    return _write
+
+
+@pytest.mark.asyncio
+async def test_opencode_installed_policy_wider_than_the_row_is_refused(launch, opencode_install):
+    from cli_agent_orchestrator.utils.delegation import InstalledPolicyExceedsAllowlistError
+
+    _seed("0000beef", "reviewer", REVIEWER, REVIEWER)
+    opencode_install("developer", ["fs_*", "execute_bash"])
+    with pytest.raises(InstalledPolicyExceedsAllowlistError) as excinfo:
+        await create_terminal(
+            "opencode_cli",
+            "developer",
+            session_name="cao-sess",
+            new_session=False,
+            caller_id="0000beef",
+            allowed_tools=["fs_read"],
+        )
+    assert "bash" in excinfo.value.excess
+    assert "cao install developer --provider opencode_cli" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_opencode_installed_policy_within_the_row_launches(launch, opencode_install):
+    _seed("0000beef", "reviewer", REVIEWER, REVIEWER)
+    opencode_install("developer", ["fs_read"])
+    child = await create_terminal(
+        "opencode_cli",
+        "developer",
+        session_name="cao-sess",
+        new_session=False,
+        caller_id="0000beef",
+        allowed_tools=["fs_read"],
+    )
+    assert child.allowed_tools == ["fs_read"]
+
+
+@pytest.mark.asyncio
+async def test_opencode_operator_launch_keeps_the_warning_path(launch, opencode_install):
+    opencode_install("developer", ["fs_*", "execute_bash"])
+    child = await create_terminal(
+        "opencode_cli",
+        "developer",
+        session_name="cao-sess",
+        new_session=False,
+        allowed_tools=["fs_read"],
+    )
+    assert child.allowed_tools == ["fs_read"]
+
+
+def test_installed_opencode_permission_reader(tmp_path):
+    import frontmatter
+
+    from cli_agent_orchestrator.services.install_service import installed_opencode_permission
+
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    assert installed_opencode_permission("developer", agents) is None
+    (agents / "developer.md").write_text(
+        frontmatter.dumps(frontmatter.Post("x", permission={"bash": "allow", "read": "allow"}))
+    )
+    assert installed_opencode_permission("developer", agents) == {"bash": "allow", "read": "allow"}
+    (agents / "odd.md").write_text(frontmatter.dumps(frontmatter.Post("x", permission="allow")))
+    assert installed_opencode_permission("odd", agents) is None

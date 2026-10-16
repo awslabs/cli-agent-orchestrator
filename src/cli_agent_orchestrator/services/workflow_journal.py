@@ -77,6 +77,10 @@ _REQUIRED_RUN_COLUMNS = frozenset(
         "finished_at",
         "tier",
         "generation",
+        # The starting terminal (delegation ceiling, PR #948): registered here for the
+        # same reason as manifest_json below, so a failed ALTER cannot leave a journal
+        # that silently forgets who a run is bounded by.
+        "caller_id",
         # manifest-column (issue #583 Bolt 2, ADR-583-12). Registering the column here is
         # NOT bookkeeping — it is what gives the silent-migration risk a RUNTIME mitigation.
         # ``_migrate_workflow_run`` swallows its own failures at debug level, so a failed
@@ -132,6 +136,11 @@ class RunRow:
     manifest_json: Optional[str] = None
     # Issue #753: redacted, bounded script-level failure diagnostic.
     error: Optional[str] = None
+    # The terminal that started the run, when an agent did. Persisted so a
+    # resumed or recovered run re-binds to the ORIGINAL caller's recorded
+    # delegation ceiling rather than to whoever resumes it (utils/delegation.py).
+    # NULL for operator-started runs and for rows written before the column.
+    caller_id: Optional[str] = None
 
 
 @dataclass
@@ -380,8 +389,12 @@ def insert_run(
     tier: str = "yaml",
     generation: str = "1",
     manifest_json: Optional[str] = None,
+    caller_id: Optional[str] = None,
 ) -> None:
     """INSERT the ``workflow_run`` row at ``start_run`` (lifecycle table, E1).
+
+    ``caller_id`` (additive, defaulted) persists the starting terminal so the
+    run's delegation bound survives a server restart; see ``RunRow.caller_id``.
 
     A plain ``INSERT``: a re-INSERT for an already-journaled ``run_id`` raises
     ``sqlite3.IntegrityError`` rather than silently overwriting the durable row
@@ -400,8 +413,9 @@ def insert_run(
         conn.execute(
             "INSERT INTO workflow_run "
             "(run_id, workflow_name, spec_snapshot, inputs_json, state, "
-            " current_step_id, started_at, finished_at, tier, generation, manifest_json) "
-            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?)",
+            " current_step_id, started_at, finished_at, tier, generation, manifest_json, "
+            " caller_id) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?)",
             (
                 run_id,
                 workflow_name,
@@ -412,6 +426,7 @@ def insert_run(
                 tier,
                 generation,
                 manifest_json,
+                caller_id,
             ),
         )
 
@@ -428,6 +443,7 @@ def insert_run_with_steps(
     tier: str = "yaml",
     generation: str = "1",
     manifest_json: Optional[str] = None,
+    caller_id: Optional[str] = None,
 ) -> None:
     """Atomically INSERT the run row AND seed its step rows in ONE transaction (U2, TR-1).
 
@@ -457,8 +473,9 @@ def insert_run_with_steps(
         conn.execute(
             "INSERT INTO workflow_run "
             "(run_id, workflow_name, spec_snapshot, inputs_json, state, "
-            " current_step_id, started_at, finished_at, tier, generation, manifest_json) "
-            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?)",
+            " current_step_id, started_at, finished_at, tier, generation, manifest_json, "
+            " caller_id) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?)",
             (
                 run_id,
                 workflow_name,
@@ -469,6 +486,7 @@ def insert_run_with_steps(
                 tier,
                 generation,
                 manifest_json,
+                caller_id,
             ),
         )
         conn.executemany(
@@ -874,7 +892,8 @@ def get_run(run_id: str) -> Optional[RunRow]:
     with _connect() as conn:
         row = conn.execute(
             "SELECT run_id, workflow_name, spec_snapshot, inputs_json, state, "
-            "current_step_id, started_at, finished_at, tier, generation, manifest_json, error "
+            "current_step_id, started_at, finished_at, tier, generation, manifest_json, error, "
+            "caller_id "
             "FROM workflow_run WHERE run_id = ?",
             (run_id,),
         ).fetchone()
@@ -895,6 +914,7 @@ def get_run(run_id: str) -> Optional[RunRow]:
         # failed. Both read back as None, which the resume gate refuses when enforcement is on.
         manifest_json=row[10],
         error=row[11],
+        caller_id=row[12],
     )
 
 

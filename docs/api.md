@@ -264,7 +264,10 @@ than calling these routes directly.
 - `POST /workflows/runs` starts a run **inline** and holds the connection until it
   finishes, returning the complete result. `caller_id` (also on `:submit`, `resume`
   and step replay) names the terminal starting the run; every agent step is then
-  bounded by that terminal's recorded delegation ceiling.
+  bounded by that terminal's recorded delegation ceiling. It is persisted on the
+  run's journal row, so a resume re-binds to the original caller. A script-tier
+  `POST /terminals/run-step` whose run has no live record (server restarted) is
+  refused with 403.
 - `POST /workflows/runs:submit` starts a run **asynchronously**: it returns `202` with
   `{run_id, state, links}` as soon as the run is durably journaled, then drives the run in
   the background. The `links` map always carries `self`/`status`/`result`/`cancel`;

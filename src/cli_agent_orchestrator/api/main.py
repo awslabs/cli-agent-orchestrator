@@ -4440,9 +4440,11 @@ async def run_step(
     # callers (no run/step env or no script record in the registry).
     from cli_agent_orchestrator.services import step_replay, workflow_service
     from cli_agent_orchestrator.services.script_runner import (
+        OrphanedScriptRunError,
         make_step_terminal_recorder,
         record_step_completion,
         record_step_replay,
+        require_live_script_run,
         step_delegating_terminal_id,
     )
     from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
@@ -4525,6 +4527,16 @@ async def run_step(
             )
         except KeyError as e:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+        # A script-tier run id that names NO live record is an orphan: the server
+        # restarted and the in-memory caller binding went with it, while the
+        # script subprocess (a plain child) kept running and its generation still
+        # matches the journal. Launching its step would take the operator branch
+        # unbounded, so refuse; `cao workflow resume` re-binds the run to the
+        # journaled caller and re-drives it.
+        try:
+            require_live_script_run(fence_run_id)
+        except OrphanedScriptRunError as e:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
 
     # Mark the job as in-progress before the long-running substrate starts.
     # This is best-effort; a failure here must not block execution. Placed
@@ -5701,6 +5713,7 @@ async def submit_workflow_run_endpoint(
                 # ``approval-gate`` (Bolt 2 unit 7) built this value at Step 4b and has already gated
                 # on it; reusing it rather than rebuilding is what makes checked-equals-stored true.
                 manifest_json,
+                **_workflow_caller_kwargs(body.caller_id),
             )
         except sqlite3.IntegrityError:
             # TOCTOU (PR #525 review): step 0's uniqueness check and this insert are
@@ -5760,6 +5773,7 @@ async def submit_workflow_run_endpoint(
                 started_at,
                 "yaml",
                 "1",
+                **_workflow_caller_kwargs(body.caller_id),
             )
         except sqlite3.IntegrityError:
             # Same TOCTOU → 409 mapping as the script arm above; ordered before the

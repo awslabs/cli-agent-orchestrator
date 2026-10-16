@@ -286,6 +286,17 @@ def _record_from_json(output_json: Optional[str]) -> Optional[StepOutputRecord]:
     )
 
 
+def bound_caller(original: Optional[str], resumer: Optional[str]) -> Optional[str]:
+    """The terminal whose ceiling bounds a resumed run: the original starter if known.
+
+    Journaled ``caller_id`` (the agent that started the run) wins over whoever
+    resumes it, so an operator or a wider agent resuming a reviewer's run does
+    not widen its steps. A run started with no caller is bounded by the resumer,
+    which can only narrow it.
+    """
+    return original if original else resumer
+
+
 def _journal_insert_run(record: RunRecord) -> None:
     """Best-effort INSERT of the run + its seeded steps at ``start_run`` (§1)."""
     try:
@@ -296,6 +307,9 @@ def _journal_insert_run(record: RunRecord) -> None:
             inputs_json=json.dumps(record.inputs),
             state=record.state.value,
             started_at=record.started_at,
+            # Only when an agent started the run, so operator runs write the
+            # same call as before.
+            **({"caller_id": record.caller_id} if record.caller_id else {}),
         )
         workflow_journal.insert_steps(
             record.run_id,
@@ -1348,6 +1362,7 @@ def _rebuild_record_from_journal(run_id: str) -> Optional[RunRecord]:
             current_step_id=row.current_step_id,
             started_at=row.started_at,
             finished_at=row.finished_at,
+            caller_id=row.caller_id,
         )
     except (ValidationError, ValueError, TypeError) as e:
         # ValidationError subclasses ValueError (pydantic v2) but is named for clarity;
@@ -1636,7 +1651,10 @@ async def resume_from_last_completed(
     record.cancelled = False
     record.current_step_id = None
     record.finished_at = None
-    record.caller_id = caller_id
+    # The ORIGINAL caller (journaled at start) keeps bounding the run; a resume by
+    # a different actor must not widen it. Only a run that was started with no
+    # caller (operator) takes the resumer's bound.
+    record.caller_id = bound_caller(row.caller_id, caller_id)
     run_registry[run_id] = record
     # Mark the drive live BEFORE the first await: the off-loop journal writes
     # below yield, and a concurrent resume for the same run_id must hit the

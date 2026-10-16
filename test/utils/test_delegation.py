@@ -242,3 +242,38 @@ class TestBoundChild:
             ceiling=REVIEWER,
         )
         assert text.startswith("Delegation refused: the calling terminal may not launch")
+
+
+class TestPatternShapedRequests:
+    """Review B round 3, R1: a requested reference that is itself a pattern is a
+    language, not a name. It is covered only by an identical grant or a bare ``*``
+    grant; matching it as literal text let ``@plugin-?`` admit ``@plugin-*``."""
+
+    @pytest.mark.parametrize(
+        "grant,requested,covered",
+        [
+            ("@plugin-?", "@plugin-*", False),
+            ("@a?c", "@a*c", False),
+            ("@plugin-[?]", "@plugin-?", False),
+            ("@srv/read_?", "@srv/read_*", False),
+            ("@plugin-*", "@*", False),
+            ("@plugin-a", "@plugin-*", False),
+            ("@*", "@plugin-*", True),  # bare * grant covers every language
+            ("@plugin-*", "@plugin-*", True),  # identical text
+            ("@srv/*", "@srv/read_*", True),  # bare * tool grant
+            ("@srv/read_*", "@srv/read_*", True),
+            ("@srv", "@srv/read_*", True),  # whole-server grant covers any tool pattern
+            ("@plugin-*", "@plugin-a", True),  # concrete names still match the grant pattern
+            ("@plugin-?", "@plugin-a", True),
+        ],
+    )
+    def test_pattern_inclusion_rule(self, grant, requested, covered):
+        from cli_agent_orchestrator.utils.tool_mapping import mcp_reference_covers
+
+        assert mcp_reference_covers(grant, requested) is covered
+
+    def test_three_generations_cannot_widen_through_a_glob_child(self):
+        parent = ["fs_read", "@plugin-?"]
+        assert tools_exceeding(["fs_read", "@plugin-*"], parent) == ["@plugin-*"]
+        assert intersect_ceiling(["@plugin-*"], parent) == []
+        assert tools_exceeding(["@plugin-shell"], parent) == ["@plugin-shell"]

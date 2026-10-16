@@ -112,6 +112,7 @@ from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.install_service import (
     installed_kiro_tools,
+    installed_opencode_permission,
     kiro_install_predates_native_enforcement,
 )
 from cli_agent_orchestrator.services.memory_gateway import (
@@ -1732,6 +1733,46 @@ async def _create_terminal_unguarded(
                         f"the narrower policy (`cao install {agent_profile} --provider "
                         f"kiro_cli` after setting allowedTools), or launch it without an "
                         f"allowed_tools override.",
+                        excess=wider,
+                        parent_id=bounding_id,
+                        child_profile=agent_profile,
+                    )
+
+        # Same rule for OpenCode, the other install-time provider: the launch
+        # runs the installed ``permission:`` block, so under a restricted ceiling
+        # a block that allows a tool the bounded allowlist does not is refused.
+        if (
+            provider == ProviderType.OPENCODE_CLI.value
+            and parent_ceiling is not None
+            and "*" not in parent_ceiling
+            and allowed_tools is not None
+            and "*" not in allowed_tools
+        ):
+            from cli_agent_orchestrator.providers import opencode_cli
+            from cli_agent_orchestrator.utils.opencode_permissions import (
+                cao_tools_to_opencode_permission,
+            )
+
+            installed_permission = installed_opencode_permission(
+                agent_profile, opencode_cli.OPENCODE_CONFIG_DIR / "agents"
+            )
+            if installed_permission is not None:
+                bounded = cao_tools_to_opencode_permission(allowed_tools)
+                wider = sorted(
+                    tool
+                    for tool, verdict in installed_permission.items()
+                    if verdict == "allow" and bounded.get(tool) != "allow"
+                )
+                if wider:
+                    raise InstalledPolicyExceedsAllowlistError(
+                        f"Delegation refused: the installed OpenCode agent '{agent_profile}' "
+                        f"allows {', '.join(wider)} beyond the bounded allowlist "
+                        f"[{', '.join(allowed_tools)}] this terminal is allowed to run with; "
+                        f"OpenCode enforces the installed permission block, so the launch "
+                        f"would exceed the creator's delegation ceiling. Remedy: reinstall the "
+                        f"profile with the narrower policy (`cao install {agent_profile} "
+                        f"--provider opencode_cli` after setting allowedTools), or launch it "
+                        f"without an allowed_tools override.",
                         excess=wider,
                         parent_id=bounding_id,
                         child_profile=agent_profile,
