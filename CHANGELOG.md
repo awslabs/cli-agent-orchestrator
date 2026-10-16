@@ -767,6 +767,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminal is journaled on the run row (`workflow_run.caller_id`, migration at
   server start) so a resumed run re-binds to the original caller, and a
   script-tier run-step whose run has no live record after a restart is refused.
+  Two guards against the class recurring: `test/test_launch_path_invariant.py`
+  enumerates every terminal-launch path from the source and fails on one that
+  neither threads a ceiling nor is a classified operator path, and
+  `test/services/test_delegation_forwarding_invariant.py` checks on every run
+  that the ceiling arguments reach `create_terminal` and cause the refusal.
   **Breaking changes:** (1) a user-authored restricted role or profile that
   launches wider children is now refused with a message naming the parent, the
   child, the exceeding tools and the remedy (add `delegateTools` to the parent
