@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -60,6 +61,11 @@ def _guard_job() -> Dict[str, Any]:
 
 def _guard_steps() -> list:
     return [s for s in _guard_job()["steps"] if "assert_release_version.py" in s.get("run", "")]
+
+
+def _index_args(run: str) -> list:
+    """Every value passed to ``--index`` in a run block, in order."""
+    return re.findall(r"--index\s+(\S+)", run)
 
 
 def _release_step() -> Dict[str, Any]:
@@ -320,7 +326,8 @@ class TestWhichIndexIsAsked:
         )
         assert report.ok
         err = capsys.readouterr().err
-        assert err.count("WARNING") == 2 and "test.pypi.org" in err and "pypi.org" in err
+        # Exact list, not substring checks: which index was named, in which order.
+        assert re.findall(r"WARNING: could not ask (\S+) about", err) == [arv.TESTPYPI, arv.PYPI]
 
     def test_an_unexpected_status_is_unknown_not_published(self, tmp_path, capsys):
         report = _check(
@@ -412,21 +419,20 @@ class TestPublishWorkflowRunsTheGuardFirst:
         guaranteed 400 later. Pinned as literal URLs: this is the review's P2."""
         run = _release_step()["run"]
         assert '--tag "$GITHUB_REF_NAME"' in run
-        assert "--index https://test.pypi.org" in run
-        assert "--index https://pypi.org" in run
+        assert _index_args(run) == [arv.TESTPYPI, arv.PYPI]
 
     def test_the_dispatch_step_asks_only_the_index_it_targets(self):
         """`inputs.environment` selects the index in `env:`, and `run:` reads it from the
         environment. A testpypi dispatch must never be refused on pypi.org state, and a
         pypi dispatch must never be passed on test.pypi.org state."""
         step = _dispatch_step()
-        target = step["env"]["TARGET_INDEX"]
-        assert "inputs.environment" in target
-        assert "https://test.pypi.org" in target and "https://pypi.org" in target
-        assert "testpypi" in target
-        run = step["run"]
-        assert '--index "$TARGET_INDEX"' in run
-        assert "pypi.org" not in run, "the run block must not hard-code an index"
+        # The whole expression, pinned exactly: the choice input picks the index.
+        assert step["env"]["TARGET_INDEX"] == (
+            "${{ inputs.environment == 'testpypi' && 'https://test.pypi.org' "
+            "|| 'https://pypi.org' }}"
+        )
+        # Every --index in the run block is the environment variable; none is a literal.
+        assert _index_args(step["run"]) == ['"$TARGET_INDEX"', '"$TARGET_INDEX"']
 
     def test_the_dispatch_step_compares_the_tag_when_dispatched_from_one(self):
         """The pypi environment is restricted to v* tags, so the PyPI escape hatch always
