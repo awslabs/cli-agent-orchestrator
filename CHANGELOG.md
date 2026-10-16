@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `POST /sessions` and `POST /sessions/{session_name}/terminals` accept
+  `lookup_only=true` with an `idempotency_key`: the request returns the terminal
+  that key already committed, without waiting for it to initialize and without
+  creating anything (404 when nothing is committed, 400 without a key) (#773).
 - Security regression tests derived from the review harnesses Augusto Santos
   (@gutosantos82) wrote while assessing CAO's CI security gates: a route-by-scope
   authorization matrix with auth enabled (every HTTP route x no/read/write/admin
@@ -102,6 +106,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `cao agent handoff` no longer loses the worker when provider startup
+  outlasts the client's create timeout. The create is retried under one
+  idempotency key with the full timeout each time (raised from 150s to 240s),
+  and cao-server holds a replay until the original initialization finishes, so
+  input is sent only to a ready worker. If startup outlasts every attempt, the
+  handoff fails but reports the worker's terminal ID and sends it no input; if
+  the original startup failed, that cause is reported and no second worker is
+  started. A keyed replay of a create whose initialization failed answers 424
+  with the cause, and a keyed replay no longer publishes `post_create_session`
+  again (#773).
 - Kiro profile installation now preserves profile-defined `resources` alongside
   CAO's default context and skill resources. Reinstall existing profiles to
   include their configured resources in the generated Kiro agent configuration
