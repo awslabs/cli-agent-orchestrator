@@ -3079,4 +3079,4 @@ class TestClaudeCodeTurnEndGate:
         window never holds this TUI's input box mid-turn."""
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.supports_screen_detection is True
-        assert provider.supports_screen_status_poll is True
+        assert provider.status_recheck_uses_screen is True

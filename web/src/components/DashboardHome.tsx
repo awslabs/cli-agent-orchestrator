@@ -434,6 +434,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                             const relCreated = fmtRel(t.created_at)
                             const relActive = fmtRel(t.last_active)
                             const showActive = relActive && relActive !== relCreated
+                            const pendingInboxCount = t.pending_inbox_count ?? 0
                             return (
                               <div key={t.id} className="bg-gray-900/50 border border-gray-700/30 rounded-lg px-3 py-2 space-y-1.5">
                                 <div className="flex items-center justify-between">
@@ -445,7 +446,19 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                                     <span className="text-[10px] text-gray-600">{t.provider}</span>
                                   </div>
                                   <div className="flex items-center gap-1 shrink-0">
-                                    <button onClick={() => setInboxTerminalId(t.id)} className="p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Inbox"><Mail size={12} /></button>
+                                    <button
+                                      onClick={() => setInboxTerminalId(t.id)}
+                                      className="relative p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors"
+                                      title="Inbox"
+                                      aria-label={pendingInboxCount > 1 ? `Inbox: ${pendingInboxCount} pending messages` : 'Inbox'}
+                                    >
+                                      <Mail size={12} />
+                                      {pendingInboxCount > 1 && (
+                                        <span aria-hidden="true" className="pointer-events-none absolute -top-2.5 -right-1 flex h-4 min-w-4 items-center justify-center whitespace-nowrap rounded-full bg-red-600 px-1 text-[10px] font-semibold leading-none text-white">
+                                          {pendingInboxCount}
+                                        </span>
+                                      )}
+                                    </button>
                                     <button onClick={() => setOutputTerminalId(t.id)} className="p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Output"><FileText size={12} /></button>
                                     <button onClick={() => setLiveTerminal({ id: t.id, provider: t.provider, agentProfile: t.agent_profile })} className="flex items-center gap-1 px-2 py-1 bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-medium rounded transition-colors"><Monitor size={12} />Terminal</button>
                                     <button onClick={() => setPendingExit(t)} disabled={exitingTerminal === t.id} className="p-1 text-gray-500 hover:text-amber-400 bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Graceful Exit"><LogOut size={12} /></button>

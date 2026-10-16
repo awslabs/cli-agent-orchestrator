@@ -1327,7 +1327,7 @@ class ClaudeCodeProvider(BaseProvider):
     # detector below is tuned for a COMPOSITED viewport, not the raw stream.
     supports_screen_detection = True
     # The raw rolling window never holds this TUI's input box mid-turn (GH #865).
-    supports_screen_status_poll = True
+    status_recheck_uses_screen = True
 
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         """Detect status from a pyte-composited viewport (escape-free rows).

@@ -6,9 +6,13 @@ backends (tmux) it returns the pushed pipeline status; for event-inbox backends
 provider's native status. These tests pin both paths.
 """
 
+import asyncio
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.status_monitor import (
@@ -41,6 +45,154 @@ class TestGetStatusTmux:
         sm = StatusMonitor()
 
         assert sm.get_status("missing") == TerminalStatus.UNKNOWN
+
+
+class TestPollerRecheckInput:
+    """The cheap re-check that get_status() runs for a poller while a terminal
+    reads PROCESSING parses the raw buffer, unless the provider opts in to the
+    screen with ``status_recheck_uses_screen``. A Codex raw buffer of a working
+    turn parsed as IDLE; applied, it ended PROCESSING right after it began, and
+    the latch then refused the turn's real PROCESSING (live, 2026-10-11)."""
+
+    @staticmethod
+    def _provider(screen_recheck):
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.supports_direct_status_probe = False
+        provider.supports_stale_processing_capture = False
+        provider.status_recheck_uses_screen = screen_recheck
+        provider.get_status.return_value = TerminalStatus.IDLE  # the raw buffer
+        provider.get_status_from_screen.return_value = TerminalStatus.PROCESSING
+        return provider
+
+    @staticmethod
+    def _monitor():
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = "raw redraw fragments"
+        sm._buffer_changed_at["t1"] = time.monotonic()
+        with sm._lock:
+            sm._feed_screen_locked("t1", "• Working (3s • esc to interrupt)")
+        return sm
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_opted_in_provider_rechecks_the_screen(self, mock_pm, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = self._provider(screen_recheck=True)
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        provider.get_status.assert_not_called()
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_polls_on_unchanged_output_reuse_the_verdict(self, mock_pm, mock_get_backend):
+        """The render holds the lock that the output consumer needs."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = self._provider(screen_recheck=True)
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+
+        for _ in range(3):
+            assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert provider.get_status_from_screen.call_count == 1
+
+        sm._output_generation["t1"] = sm._output_generation.get("t1", 0) + 1
+        sm.get_status("t1")
+        assert provider.get_status_from_screen.call_count == 2
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_codex_recheck_reads_its_screen(self, mock_pm, mock_get_backend, mock_codex_backend):
+        """A real Codex provider: its raw buffer parses IDLE, its screen shows
+        a reply that is still streaming."""
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+
+        provider = CodexProvider("t1", "s", "w")
+        provider._codex_version = (0, 160, 0)
+        provider._ends_turns_with_footer = True
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        mock_get_backend.return_value = backend
+        mock_codex_backend.return_value = backend
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = "› Ask Codex to do anything\n  gpt-6 · /tmp/project\n"
+        sm._buffer_changed_at["t1"] = time.monotonic()
+        with sm._lock:
+            sm._feed_screen_locked(
+                "t1",
+                "\r\n".join(
+                    [
+                        "› Analyze Dataset A.",
+                        "• The mean is 3, because the values are",
+                        "› Ask Codex to do anything",
+                        "  gpt-6 · /tmp/project",
+                    ]
+                ),
+            )
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_ready_verdict_from_output_that_changed_during_the_read_is_not_applied(
+        self, mock_pm, mock_get_backend
+    ):
+        """The read releases the lock. A chunk that lands meanwhile can show a
+        new turn, and the old ready verdict would let the inbox type into it."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = self._provider(screen_recheck=True)
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+
+        def read_while_a_chunk_lands(_lines):
+            with sm._lock:
+                sm._output_generation["t1"] = sm._output_generation.get("t1", 0) + 1
+            return TerminalStatus.COMPLETED
+
+        provider.get_status_from_screen.side_effect = read_while_a_chunk_lands
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert "t1" not in sm._recheck_cache
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_ready_verdict_is_not_applied_after_newer_output(self, mock_pm, mock_get_backend):
+        """Output can also land between the read and the apply."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = self._provider(screen_recheck=True)
+        provider.get_status_from_screen.return_value = TerminalStatus.COMPLETED
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+        generation = sm._output_generation.get("t1", 0)
+
+        assert (
+            sm._apply_detection("t1", TerminalStatus.COMPLETED, output_generation=generation + 1)
+            is False
+        )
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert (
+            sm._apply_detection("t1", TerminalStatus.COMPLETED, output_generation=generation)
+            is True
+        )
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_other_providers_keep_the_raw_recheck(self, mock_pm, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = self._provider(screen_recheck=False)
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+
+        assert sm.get_status("t1") == TerminalStatus.IDLE
+        provider.get_status.assert_called_once_with("raw redraw fragments")
 
 
 class TestGetStatusEventInbox:
@@ -1210,6 +1362,48 @@ class TestRawDebounceArmedDetection:
         assert sm._last_status["t1"] == TerminalStatus.PROCESSING
 
 
+class TestRawDetectionGeneration:
+    @pytest.mark.parametrize(
+        "detected", [TerminalStatus.PROCESSING, TerminalStatus.WAITING_USER_ANSWER]
+    )
+    @pytest.mark.parametrize("has_loop", [False, True])
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_pre_input_verdict_does_not_stamp_new_generation(
+        self, mock_pm, mock_settings, has_loop, detected
+    ):
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        mock_pm.get_provider.return_value = provider
+        sm = StatusMonitor()
+        if has_loop:
+            sm._loop = MagicMock()
+        started = threading.Event()
+        resume = threading.Event()
+
+        def detect(_terminal_id, _buffer):
+            started.set()
+            assert resume.wait(timeout=5)
+            return detected
+
+        with patch.object(sm, "_detect_status", side_effect=detect):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(sm._process_chunk, "t1", "old pane")
+                try:
+                    assert started.wait(timeout=5)
+                    previous_generation = sm._capture_generation["t1"]
+                    sm.notify_input_sent("t1")
+                    assert sm._capture_generation["t1"] == previous_generation + 1
+                finally:
+                    resume.set()
+                future.result(timeout=5)
+
+        assert sm._last_status.get("t1", TerminalStatus.UNKNOWN) == TerminalStatus.UNKNOWN
+        assert "t1" not in sm._waiting_generation
+        assert "t1" not in sm._processing_generation
+
+
 class TestProcessChunkBufferTruncation:
     """_process_chunk truncates the rolling buffer to the live
     state_buffer_max server setting, not a fixed constant."""
@@ -1655,11 +1849,13 @@ class TestStatusObservationIsStampedWhenEarned:
 
 class TestPollRederivesOnRegisteredDetector:
     """GH #865: while the cached status is PROCESSING, ``get_status`` re-derives
-    on every poll. A screen-path provider must be re-read from its composited
-    screen, not the raw rolling window: Ink repaints only changed cells, so the
-    window holds glyph fragments and, once a long answer has pushed the input box
-    past the size cap, no box at all. Read from there, the raw detector called a
-    streaming turn ready and ``run_step`` tore the worker down mid-answer."""
+    on every poll. A provider that opts in with ``status_recheck_uses_screen``
+    (claude_code) must be re-read from its composited screen, not the raw rolling
+    window: Ink repaints only changed cells, so the window holds glyph fragments
+    and, once a long answer has pushed the input box past the size cap, no box at
+    all. Read from there, the raw detector called a streaming turn ready and
+    ``run_step`` tore the worker down mid-answer. A screen-path provider that has
+    not opted in (kimi_cli) keeps the raw re-check."""
 
     class _Screen:
         def __init__(self, rows):
@@ -1679,7 +1875,7 @@ class TestPollRederivesOnRegisteredDetector:
     def test_screen_provider_is_polled_from_the_composite(self, mock_pm, mock_get_backend):
         provider = MagicMock()
         provider.supports_screen_detection = True
-        provider.supports_screen_status_poll = True
+        provider.status_recheck_uses_screen = True
         provider.get_status_from_screen.return_value = TerminalStatus.PROCESSING
         provider.get_status.return_value = TerminalStatus.COMPLETED  # what the raw window would say
         mock_pm.get_provider.return_value = provider
@@ -1700,7 +1896,7 @@ class TestPollRederivesOnRegisteredDetector:
     ):
         provider = MagicMock()
         provider.supports_screen_detection = True
-        provider.supports_screen_status_poll = True
+        provider.status_recheck_uses_screen = True
         provider.get_status_from_screen.return_value = TerminalStatus.COMPLETED
         mock_pm.get_provider.return_value = provider
         mock_get_backend.return_value = _backend(event_inbox=False)
@@ -1717,7 +1913,7 @@ class TestPollRederivesOnRegisteredDetector:
     def test_raw_provider_keeps_the_raw_rederivation(self, mock_pm, mock_get_backend):
         provider = MagicMock()
         provider.supports_screen_detection = False
-        provider.supports_screen_status_poll = False
+        provider.status_recheck_uses_screen = False
         provider.get_status.return_value = TerminalStatus.COMPLETED
         mock_pm.get_provider.return_value = provider
         mock_get_backend.return_value = _backend(event_inbox=False)
@@ -1738,7 +1934,7 @@ class TestPollRederivesOnRegisteredDetector:
         from the raw window as before; its turn bookkeeping lives there."""
         provider = MagicMock()
         provider.supports_screen_detection = True
-        provider.supports_screen_status_poll = False
+        provider.status_recheck_uses_screen = False
         provider.get_status.return_value = TerminalStatus.COMPLETED
         mock_pm.get_provider.return_value = provider
         mock_get_backend.return_value = _backend(event_inbox=False)
@@ -1748,3 +1944,432 @@ class TestPollRederivesOnRegisteredDetector:
         assert sm.get_status("t1") == TerminalStatus.COMPLETED
         provider.get_status.assert_called_once_with(sm._buffers["t1"])
         provider.get_status_from_screen.assert_not_called()
+
+
+class TestCopilotBoxedComposerRecovery:
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            "● The utility asks before deleting: [y/n].",
+            "● For instance:\n  Continue? [y/n]",
+            "● The installer shows:\n  The prompt reads\n  Press enter to continue",
+            " ● APT asks for confirmation.\n\n   Do you want to continue? [Y/n]\n\n ● Task complete",
+            " ● ┌──────┬────────────────────────────────┐\n"
+            "   │ Tool │ Question                       │\n"
+            "   ├──────┼────────────────────────────────┤\n"
+            "   │ apt  │ Do you want to continue? [Y/n] │\n"
+            "   └──────┴────────────────────────────────┘",
+        ],
+    )
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_reported_choice_in_completed_reply_does_not_block_recovery(
+        self, mock_pm, mock_backend, layout, answer
+    ):
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+
+        provider = CopilotCliProvider("t1", "s", "w")
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        mock_backend.return_value = backend
+        composer = "❯\n" if layout == "prompt" else "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀▀▀▀▀\n"
+        backend.get_history.return_value = (
+            "❯ explain the confirmation prompt\n"
+            "   including [y/n]\n"
+            + answer
+            + "\n"
+            + composer
+            + "← open sidebar · Autopilot · Allow All · / commands · tab next tab\n"
+        )
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffer_changed_at["t1"] = time.monotonic() - STALE_PROCESSING_BUFFER_QUIET_S - 1
+        sm._processing_generation["t1"] = 0
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm._pending_stale_capture["t1"][0] == TerminalStatus.COMPLETED
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+
+    def test_confirmation_scheduling_during_shutdown_keeps_processing(self):
+        sm = StatusMonitor()
+        sm._loop = MagicMock()
+        sm._loop.call_soon_threadsafe.side_effect = RuntimeError("Event loop is closed")
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._capture_generation["t1"] = 3
+        candidate = (TerminalStatus.IDLE, 100.0, 3)
+        sm._pending_stale_capture["t1"] = candidate
+        with patch("cli_agent_orchestrator.services.status_monitor.bus.publish") as publish:
+            sm._schedule_stale_capture_confirmation("t1", 3)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert sm._pending_stale_capture["t1"] == candidate
+        assert not sm._stale_capture_handle
+        assert not sm._detect_tasks
+        sm._loop.call_later.assert_not_called()
+        publish.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("boundary", ["input", "candidate_cleared", "candidate_replaced"])
+    async def test_queued_confirmation_revalidates_before_capture(self, boundary):
+        sm = StatusMonitor()
+        sm._loop = asyncio.get_running_loop()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._capture_generation["t1"] = 3
+        sm._pending_stale_capture["t1"] = (TerminalStatus.IDLE, 100.0, 3)
+        handle = MagicMock()
+        sm._stale_capture_handle["t1"] = handle
+        with (
+            patch.object(sm, "get_status") as capture,
+            patch("cli_agent_orchestrator.services.status_monitor.bus.publish") as publish,
+        ):
+            sm._on_stale_capture_confirmation("t1", 3, handle)
+            # Invalidate after the timer fires but before its coroutine runs.
+            if boundary == "input":
+                sm.notify_input_sent("t1")
+            elif boundary == "candidate_cleared":
+                sm._pending_stale_capture.pop("t1")
+            else:
+                sm._pending_stale_capture["t1"] = (TerminalStatus.IDLE, 101.0, 4)
+            await asyncio.gather(*list(sm._detect_tasks))
+        capture.assert_not_called()
+        publish.assert_not_called()
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert not sm._stale_capture_handle
+
+    @pytest.mark.asyncio
+    async def test_confirmation_read_failure_keeps_processing_and_is_reported(self):
+        sm = StatusMonitor()
+        sm._loop = asyncio.get_running_loop()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._capture_generation["t1"] = 3
+        sm._pending_stale_capture["t1"] = (TerminalStatus.IDLE, 100.0, 3)
+        handle = MagicMock()
+        sm._stale_capture_handle["t1"] = handle
+        with (
+            patch.object(sm, "get_status", side_effect=RuntimeError("capture unavailable")),
+            patch.object(sm, "_schedule_stale_capture_confirmation") as reschedule,
+            patch("cli_agent_orchestrator.services.status_monitor.logger") as logger,
+            patch("cli_agent_orchestrator.services.status_monitor.bus.publish") as publish,
+        ):
+            sm._on_stale_capture_confirmation("t1", 3, handle)
+            await asyncio.gather(*list(sm._detect_tasks))
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert not sm._stale_capture_handle
+        logger.exception.assert_called_once_with("Stale capture confirmation failed for %s", "t1")
+        reschedule.assert_not_called()
+        publish.assert_not_called()
+
+    def test_cancelled_confirmation_cannot_remove_a_new_turn_timer(self):
+        sm = StatusMonitor()
+        old_handle = MagicMock()
+        current_handle = MagicMock()
+        sm._stale_capture_handle["t1"] = current_handle
+        sm._capture_generation["t1"] = 2
+        sm._pending_stale_capture["t1"] = (TerminalStatus.IDLE, 100.0, 2)
+        sm._on_stale_capture_confirmation("t1", 1, old_handle)
+        assert sm._stale_capture_handle["t1"] is current_handle
+        assert not sm._detect_tasks
+
+    @pytest.mark.parametrize(
+        "cached", [TerminalStatus.PROCESSING, TerminalStatus.WAITING_USER_ANSWER]
+    )
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_unearned_new_turn_never_schedules_a_capture(self, mock_pm, mock_backend, cached):
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+
+        provider = CopilotCliProvider("t1", "s", "w")
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        mock_backend.return_value = backend
+        sm = StatusMonitor()
+        sm._last_status["t1"] = cached
+        sm._processing_generation["t1"] = 0
+        sm._waiting_generation["t1"] = 0
+        sm._buffer_changed_at["t1"] = -1000
+        sm.notify_input_sent("t1")
+        with patch.object(sm, "_schedule_stale_capture_confirmation") as schedule:
+            assert sm.get_status("t1") == cached
+        backend.get_history.assert_not_called()
+        schedule.assert_not_called()
+
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_ready_box_requires_two_reads_and_busy_read_resets_candidate(
+        self, mock_pm, mock_backend, layout
+    ):
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+
+        provider = CopilotCliProvider("t1", "s", "w")
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        mock_backend.return_value = backend
+        composer = "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀▀▀▀▀\n" if layout == "box" else "────────\n❯\n────────\n"
+        ready = composer + ("← open sidebar · Autopilot · Allow All · / commands · tab next tab\n")
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = ""
+        sm._buffer_changed_at["t1"] = time.monotonic() - STALE_PROCESSING_BUFFER_QUIET_S - 1
+        sm._processing_generation["t1"] = 0
+
+        backend.get_history.return_value = ready
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm._pending_stale_capture["t1"][0] == TerminalStatus.IDLE
+        backend.get_history.return_value = "∙ Thinking (Esc to cancel)\n" + ready
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert "t1" not in sm._pending_stale_capture
+        backend.get_history.return_value = ready
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.IDLE
+        backend.get_history.assert_called_with("s", "w", strip_escapes=True, visible_only=True)
+
+
+class TestCopilotStaleWaitingCapture:
+    trust = "Confirm folder trust\n1. Yes\n2. Yes, and remember\n"
+    hint = "← open sidebar · Autopilot · Allow All · / commands · tab next tab"
+
+    @pytest.mark.parametrize("source", ["raw", "pane"])
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_framed_trust_is_waiting(self, mock_pm, mock_backend, source):
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+
+        provider = CopilotCliProvider("t1", "s", "w")
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        mock_backend.return_value = backend
+        trust = (
+            "╭────────────╮\n"
+            "│ Confirm folder trust │\n"
+            "│ Do you trust the files in this folder? │\n"
+            "│ ❯ 1. Yes │\n"
+            "╰────────────╯\n"
+        )
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = trust if source == "raw" else ""
+        sm._buffer_changed_at["t1"] = time.monotonic() - STALE_PROCESSING_BUFFER_QUIET_S - 1
+        sm._processing_generation["t1"] = 0
+        backend.get_history.return_value = trust
+        if source == "pane":
+            assert sm.get_status("t1") == TerminalStatus.PROCESSING
+            assert sm._pending_stale_capture["t1"][0] == TerminalStatus.WAITING_USER_ANSWER
+            sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("interruption", ["input", "idle", "reset"])
+    async def test_old_raw_dialog_verdict_cannot_cross_a_new_state(self, interruption):
+        sm = StatusMonitor()
+        sm._loop = asyncio.get_running_loop()
+        sm._buffers["t1"] = self.trust
+        sm._last_status["t1"] = TerminalStatus.WAITING_USER_ANSWER
+        sm._waiting_generation["t1"] = 0
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def deferred_detection(*args):
+            started.set()
+            await release.wait()
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        with patch(
+            "cli_agent_orchestrator.services.status_monitor.asyncio.to_thread", deferred_detection
+        ):
+            sm._on_raw_quiescent("t1")
+            await started.wait()
+            if interruption == "input":
+                sm.notify_input_sent("t1")
+            elif interruption == "idle":
+                sm._apply_detection("t1", TerminalStatus.IDLE)
+            else:
+                sm.reset_buffer("t1")
+            release.set()
+            await asyncio.gather(*list(sm._detect_tasks))
+
+        if interruption == "input":
+            assert sm._waiting_generation["t1"] == 0
+        elif interruption == "idle":
+            assert sm._last_status["t1"] == TerminalStatus.IDLE
+        else:
+            assert "t1" not in sm._last_status
+
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
+    @pytest.mark.parametrize("redraw", ["lost", "cursor", "evicted"])
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_dismissed_trust_recovers_after_two_current_pane_reads(
+        self, mock_pm, mock_backend, mock_settings, layout, redraw
+    ):
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+
+        provider = CopilotCliProvider("t1", "s", "w")
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        mock_backend.return_value = backend
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        composer = "❯\n" if layout == "prompt" else "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀▀▀▀▀\n"
+        ready = composer + self.hint + "\n"
+        sm = StatusMonitor()
+        with patch.object(sm, "_running_loop", return_value=None):
+            sm._process_chunk("t1", self.trust)
+            assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+            if redraw != "lost":
+                if redraw == "evicted":
+                    mock_settings.return_value = {"state_buffer_max": 40}
+                # Stripping CSI does not reconstruct cursor-addressed rows.
+                sm._process_chunk("t1", "\x1b[2J\x1b[H❯\x1b[2;1H" + self.hint)
+        assert sm._last_status["t1"] == TerminalStatus.WAITING_USER_ANSWER
+        assert provider.get_status(ready) == TerminalStatus.IDLE
+        backend.get_history.return_value = ready
+        backend.get_history.reset_mock()
+        sm._buffer_changed_at["t1"] = -1000
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        assert sm._pending_stale_capture["t1"][0] == TerminalStatus.IDLE
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.IDLE
+        assert sm._last_status["t1"] == TerminalStatus.IDLE
+        backend.get_history.assert_called_with("s", "w", strip_escapes=True, visible_only=True)
+
+    @pytest.fixture
+    def waiting_monitor(self):
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+
+        provider = CopilotCliProvider("t1", "s", "w")
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        sm = StatusMonitor()
+        with (
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
+                return_value=provider,
+            ),
+            patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.get_server_settings",
+                return_value={"state_buffer_max": 32768},
+            ),
+            patch.object(sm, "_running_loop", return_value=None),
+        ):
+            sm._process_chunk("t1", self.trust)
+            sm._buffer_changed_at["t1"] = -1000
+            backend.get_history.return_value = "❯\n" + self.hint
+            yield sm, provider, backend
+
+    def test_completed_table_recovers_cached_waiting(self, waiting_monitor):
+        sm, _, backend = waiting_monitor
+        backend.get_history.return_value = (
+            "❯ show the confirmation table\n"
+            " ● ┌──────┬────────────────────────────────┐\n"
+            "   │ Tool │ Question                       │\n"
+            "   ├──────┼────────────────────────────────┤\n"
+            "   │ apt  │ Do you want to continue? [Y/n] │\n"
+            "   └──────┴────────────────────────────────┘\n"
+            "────────\n❯\n────────\n" + self.hint
+        )
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        assert sm._pending_stale_capture["t1"][0] == TerminalStatus.COMPLETED
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+
+    @pytest.mark.parametrize("layout", ["prompt", "draft", "box"])
+    @pytest.mark.parametrize("placement", ["before", "after"])
+    def test_live_approval_prevents_recovery_and_breaks_ready_confirmation(
+        self, waiting_monitor, layout, placement
+    ):
+        sm, provider, backend = waiting_monitor
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        assert sm._pending_stale_capture["t1"][0] == TerminalStatus.IDLE
+        composer = (
+            "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀▀▀▀▀\n"
+            if layout == "box"
+            else "❯ draft\n" if layout == "draft" else "❯\n"
+        )
+        ready = composer + self.hint + "\n"
+        approval = "Allow this tool to run? [y/n]\n"
+        backend.get_history.return_value = (
+            approval + ready if placement == "before" else ready + approval
+        )
+        assert (
+            provider.probe_stale_processing_capture(backend.get_history.return_value)
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+        for _ in range(2):
+            sm._last_stale_capture_check["t1"] = None
+            assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        backend.get_history.return_value = ready
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.IDLE
+
+    @pytest.mark.parametrize(
+        "pane",
+        [
+            "",
+            "╻▄▄▄▄▄▄▄▄\n┃\n",
+            "∙ Thinking (Esc to cancel)\n❯\n",
+        ],
+    )
+    def test_blank_incomplete_or_busy_read_cannot_confirm_ready(self, waiting_monitor, pane):
+        sm, provider, backend = waiting_monitor
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        ready = backend.get_history.return_value
+        backend.get_history.return_value = pane
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        backend.get_history.return_value = ready
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_waiting_recovery_is_opt_in_and_quiet_and_rate_limited(self, waiting_monitor):
+        sm, provider, backend = waiting_monitor
+        provider.supports_stale_waiting_capture = False
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        backend.get_history.assert_not_called()
+        provider.supports_stale_waiting_capture = True
+        sm._last_stale_capture_check["t1"] = None
+        sm._buffer_changed_at["t1"] = time.monotonic()
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        backend.get_history.assert_not_called()
+        sm._buffer_changed_at["t1"] = -1000
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        assert backend.get_history.call_count == 1
+
+    @pytest.mark.parametrize("during_read", [False, True])
+    def test_new_input_invalidates_waiting_capture_evidence(self, waiting_monitor, during_read):
+        sm, provider, backend = waiting_monitor
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        ready = backend.get_history.return_value
+        sm._last_stale_capture_check["t1"] = None
+        if during_read:
+
+            def new_input_then_ready(*args, **kwargs):
+                sm.notify_input_sent("t1")
+                return ready
+
+            backend.get_history.side_effect = new_input_then_ready
+        else:
+            sm.notify_input_sent("t1")
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        assert "t1" not in sm._pending_stale_capture
+        backend.get_history.side_effect = None
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        sm._process_chunk("t1", "\nConfirm folder trust\n")
+        sm._buffer_changed_at["t1"] = -1000
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.IDLE

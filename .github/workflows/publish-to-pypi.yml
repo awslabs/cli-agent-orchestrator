@@ -188,7 +188,7 @@ jobs:
       # (`[tool.cibuildwheel] test-command`) installs the wheel and RUNS `cao tui`, so a
       # wheel whose binary is missing, non-executable, or built for the wrong architecture
       # fails HERE rather than on an operator's machine (SR-1).
-      - uses: pypa/cibuildwheel@e090b81e30c4d855ea63bf4b6e59204c09a101ae  # v4.2.1
+      - uses: pypa/cibuildwheel@adba99c781d3746d38b3a09b1cf797965bcb7fe6  # v4.3.0
         env:
           CIBW_ARCHS: ${{ matrix.archs }}
           # See `macos-target` in the matrix: this is what keeps delocate from rejecting a

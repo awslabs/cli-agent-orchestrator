@@ -30,6 +30,7 @@ from cli_agent_orchestrator.backends.base import TerminalBackend, TerminalCleanu
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     delete_terminals_by_ids,
+    get_pending_inbox_counts,
     get_session_incarnation,
     get_session_incarnations,
     list_terminals_by_session,
@@ -500,7 +501,9 @@ def get_session(session_name: str) -> Dict:
         from cli_agent_orchestrator.services.status_monitor import status_monitor
         from cli_agent_orchestrator.services.terminal_service import reported_status
 
+        pending_counts = get_pending_inbox_counts([terminal["id"] for terminal in terminals])
         for terminal in terminals:
+            terminal["pending_inbox_count"] = pending_counts.get(terminal["id"], 0)
             failure = failures.get(str(terminal["id"]))
             if failure is not None:
                 terminal["deferred_init_failure"] = failure

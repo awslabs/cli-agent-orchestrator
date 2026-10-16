@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
@@ -2597,3 +2597,75 @@ def test_no_upsert_against_the_terminals_table():
         "upsert against terminals would break the ownership ordering contract "
         "(see TerminalModel); use UPDATE instead:\n  " + "\n  ".join(offenders)
     )
+
+
+class TestPendingInboxCounts:
+    def test_empty_receivers_do_not_open_database(self):
+        with patch.object(db_mod, "SessionLocal") as factory:
+            assert db_mod.get_pending_inbox_counts([]) == {}
+        factory.assert_not_called()
+
+    def test_receivers_without_pending_messages(self, test_db):
+        with test_db() as db:
+            db.add(
+                InboxModel(
+                    sender_id="sender",
+                    receiver_id="empty",
+                    message="done",
+                    status=MessageStatus.DELIVERED.value,
+                )
+            )
+            db.commit()
+        with patch.object(db_mod, "SessionLocal", test_db):
+            assert db_mod.get_pending_inbox_counts(["empty", "missing"]) == {}
+
+    def test_counts_are_exact_grouped_and_independent_of_sender(self, test_db):
+        # Inbox persistence has no orchestration-type column: all delivery modes
+        # share these rows and the counter must not inspect their payloads.
+        with test_db() as db:
+            for receiver, count in [("first", 123), ("second", 2), ("excluded", 5)]:
+                db.add(
+                    TerminalModel(
+                        id=receiver,
+                        tmux_session="synthetic-session",
+                        tmux_window=receiver,
+                        provider="codex",
+                    )
+                )
+                for index in range(count):
+                    db.add(
+                        InboxModel(
+                            sender_id=f"sender-{index % 3}",
+                            receiver_id=receiver,
+                            message=f"synthetic message {index}",
+                            status=MessageStatus.PENDING.value,
+                        )
+                    )
+                for status in (MessageStatus.DELIVERED, MessageStatus.FAILED):
+                    db.add(
+                        InboxModel(
+                            sender_id="sender",
+                            receiver_id=receiver,
+                            message="not pending",
+                            status=status.value,
+                        )
+                    )
+            db.commit()
+        statements = []
+        engine = test_db.kw["bind"]
+
+        def observe(conn, cursor, statement, parameters, context, executemany):
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", observe)
+        try:
+            with patch.object(db_mod, "SessionLocal", test_db):
+                assert db_mod.get_pending_inbox_counts(["first", "second", "missing"]) == {
+                    "first": 123,
+                    "second": 2,
+                }
+        finally:
+            event.remove(engine, "before_cursor_execute", observe)
+        assert len(statements) == 1
+        assert "GROUP BY" in statements[0].upper()

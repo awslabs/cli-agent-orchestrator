@@ -862,6 +862,13 @@ class TestSessionOwnershipIntegration:
                     delete_session(second.session_name)
 
 
+@pytest.fixture
+def pending_inbox_counts():
+    with patch.object(session_service_mod, "get_pending_inbox_counts", return_value={}) as counts:
+        yield counts
+
+
+@pytest.mark.usefixtures("pending_inbox_counts")
 class TestGetSessionMasksPendingDelivery:
     """#566: the masking WIRING here, not just ``reported_status`` in isolation.
 
@@ -912,6 +919,7 @@ class TestGetSessionMasksPendingDelivery:
         ), "masking leaked to a terminal with no pending delivery; it is per-terminal"
 
 
+@pytest.mark.usefixtures("pending_inbox_counts")
 class TestGetSession:
     """Tests for get_session function."""
 
@@ -1030,7 +1038,12 @@ class TestGetSession:
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_get_session_keeps_failed_sibling_from_current_incarnation(
-        self, mock_get_backend, mock_list_terminals, mock_get_status, mock_failure
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_get_status,
+        mock_failure,
+        pending_inbox_counts,
     ):
         """A failed worker from the current live incarnation remains visible.
 
@@ -1075,7 +1088,13 @@ class TestGetSession:
         }.get(terminal_id)
         mock_get_status.return_value.value = "idle"
 
+        metadata_before = [dict(t) for t in mock_list_terminals.return_value[:2]]
+        pending_inbox_counts.return_value = {"conductor": 123, "old-failed": 9}
         result = get_session("cao-current")
+        pending_inbox_counts.assert_called_once_with(["conductor", "failed-worker"])
+        assert [t["pending_inbox_count"] for t in result["terminals"]] == [123, 0]
+        for actual, original in zip(result["terminals"], metadata_before):
+            assert {key: actual[key] for key in original} == original
 
         assert [terminal["id"] for terminal in result["terminals"]] == [
             "conductor",
@@ -1165,6 +1184,7 @@ class TestGetSession:
         mock_failure.return_value = failure
 
         result = get_session("cao-gone")
+        assert result["terminals"][0]["pending_inbox_count"] == 0
 
         assert result["session"] == {
             "id": "cao-gone",
@@ -1212,6 +1232,25 @@ class TestGetSession:
         mock_get_backend.return_value.session_exists.side_effect = Exception("Tmux error")
 
         with pytest.raises(Exception, match="Tmux error"):
+            get_session("cao-test")
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_empty_session_counts(self, backend, terminals, pending_inbox_counts):
+        backend.return_value.session_exists.return_value = True
+        backend.return_value.list_sessions.return_value = [{"id": "cao-empty"}]
+        terminals.return_value = []
+        assert get_session("cao-empty")["terminals"] == []
+        pending_inbox_counts.assert_called_once_with([])
+
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_pending_count_failure_propagates(self, backend, terminals, pending_inbox_counts):
+        backend.return_value.session_exists.return_value = True
+        backend.return_value.list_sessions.return_value = [{"id": "cao-test"}]
+        terminals.return_value = [{"id": "receiver", "agent_profile": "worker"}]
+        pending_inbox_counts.side_effect = RuntimeError("count query failed")
+        with pytest.raises(RuntimeError, match="count query failed"):
             get_session("cao-test")
 
 

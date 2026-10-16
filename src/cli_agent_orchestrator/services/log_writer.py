@@ -20,6 +20,7 @@ terminal A doesn't block writes for terminal B.
 
 import asyncio
 import logging
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List
@@ -92,10 +93,23 @@ class LogWriter:
 
     @staticmethod
     def _write(path: Path, data: str) -> None:
+        # Raw PTY bytes can carry whatever an agent printed, keys included, so
+        # the log is created private (0600) and never through a symlink
+        # (O_NOFOLLOW): a link planted at the log path raises instead of
+        # appending to its destination. The directory is already 0700.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(path), flags, 0o600)
         # Explicit UTF-8: the platform default encoding can be non-UTF-8
         # (e.g. POSIX/C locale), and a single unencodable chunk would raise
         # UnicodeEncodeError and stop log persistence for the terminal.
-        with open(path, "a", encoding="utf-8", errors="replace") as f:
+        with os.fdopen(fd, "a", encoding="utf-8", errors="replace") as f:
+            # O_CREAT's mode applies only when the open CREATES the file. A
+            # log that already existed at 0644 (written before this change, by
+            # a terminal still running across the upgrade) keeps its old bits
+            # unless tightened here, on the fd we just opened, so the chmod
+            # cannot race a path swap. Windows has os.fchmod only from 3.13.
+            if hasattr(os, "fchmod"):
+                os.fchmod(f.fileno(), 0o600)
             f.write(data)
 
 

@@ -92,6 +92,18 @@ class Terminal(BaseModel):
     caller_id: Optional[str] = Field(
         None, description="Terminal that created this one via handoff/assign (callback target)"
     )
+    callback_terminal_id: Optional[str] = Field(
+        None,
+        description=(
+            "For a worker created from ANOTHER node (assign/handoff with target_host): "
+            "the creating supervisor's terminal id, read back from the "
+            "CAO_CALLBACK_TERMINAL_ID the supervisor injected into this terminal's "
+            "session environment. caller_id is None for such rows because the "
+            "supervisor has no row on this node. None for locally created terminals, "
+            "and None again after a cao-server restart (the session-env store is "
+            "process-local)."
+        ),
+    )
     allowed_tools: Optional[List[str]] = Field(None, description="Allowed CAO tools")
     engine: Optional[KiroEngine] = Field(None, description="Resolved Kiro engine")
     shell_command: Optional[str] = Field(

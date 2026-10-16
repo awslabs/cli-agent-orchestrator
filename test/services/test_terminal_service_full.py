@@ -12,9 +12,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
-from cli_agent_orchestrator.clients.database import (
-    get_idempotency_record,
-)
+from cli_agent_orchestrator.clients.database import get_idempotency_record
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -2305,6 +2303,57 @@ class TestGetTerminal:
         assert result["id"] == "test1234"
         assert result["status"] == TerminalStatus.IDLE.value
         assert result["session_incarnation_id"] == "inc-current"
+
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_terminal_publishes_cross_node_creator_from_session_env(
+        self, mock_get_metadata, mock_status_monitor
+    ):
+        """A worker placed here from another node has caller_id None; its
+        creator is the CAO_CALLBACK_TERMINAL_ID the supervisor injected (#912)."""
+        mock_get_metadata.return_value = {
+            "id": "test1234",
+            "tmux_window": "developer-abcd",
+            "provider": "kiro_cli",
+            "tmux_session": "cao-remote-ses",
+            "agent_profile": "developer",
+            "caller_id": None,
+            "last_active": datetime.now(),
+        }
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service.get_session_env",
+            return_value={
+                "CAO_CALLBACK_URL": "http://supervisor:9889",
+                "CAO_CALLBACK_TERMINAL_ID": "0badf00d",
+            },
+        ) as mock_env:
+            result = get_terminal("test1234")
+        mock_env.assert_called_once_with("cao-remote-ses")
+        assert result["caller_id"] is None
+        assert result["callback_terminal_id"] == "0badf00d"
+
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_terminal_callback_creator_is_none_for_local_rows(
+        self, mock_get_metadata, mock_status_monitor
+    ):
+        mock_get_metadata.return_value = {
+            "id": "test1234",
+            "tmux_window": "developer-abcd",
+            "provider": "kiro_cli",
+            "tmux_session": "cao-session",
+            "agent_profile": "developer",
+            "caller_id": "abcd1234",
+            "last_active": datetime.now(),
+        }
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service.get_session_env",
+            return_value={"FOO": "bar"},
+        ):
+            result = get_terminal("test1234")
+        assert result["callback_terminal_id"] is None
 
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_terminal_not_found(self, mock_get_metadata):

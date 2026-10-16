@@ -19,6 +19,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    func,
     literal_column,
     text,
 )
@@ -2874,6 +2875,24 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
             status=MessageStatus(inbox_msg.status),
             created_at=inbox_msg.created_at,
         )
+
+
+def get_pending_inbox_counts(receiver_ids: List[str]) -> Dict[str, int]:
+    """Count pending messages grouped by the requested receivers."""
+    if not receiver_ids:
+        return {}
+
+    with SessionLocal() as db:
+        counts = (
+            db.query(InboxModel.receiver_id, func.count(InboxModel.id))
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.receiver_id.in_(receiver_ids),
+            )
+            .group_by(InboxModel.receiver_id)
+            .all()
+        )
+        return {receiver_id: int(count) for receiver_id, count in counts}
 
 
 def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]:

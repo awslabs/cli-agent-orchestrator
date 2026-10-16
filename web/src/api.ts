@@ -125,6 +125,7 @@ export interface SessionDetail {
 
 export interface TerminalMeta {
   id: string
+  pending_inbox_count?: number
   tmux_session: string
   tmux_window: string
   provider: string
