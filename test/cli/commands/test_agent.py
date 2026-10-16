@@ -271,6 +271,7 @@ class TestHandoff:
             "terminal_id": "w1",
             "pending": None,
             "job_id": None,
+            "rule": None,
         }
 
 

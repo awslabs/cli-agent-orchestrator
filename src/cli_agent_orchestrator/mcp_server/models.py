@@ -15,6 +15,13 @@ class HandoffResult(BaseModel):
 
     success: bool = Field(description="Whether the handoff was successful")
     message: str = Field(description="A message describing the result of the handoff")
+    rule: Optional[str] = Field(
+        default=None,
+        description=(
+            "Policy rule when an ephemeral launch is refused, or `unexpected_failure` "
+            "when it fails before a worker is known."
+        ),
+    )
     output: Optional[str] = Field(None, description="The output from the target agent")
     terminal_id: Optional[str] = Field(None, description="The terminal ID used for the handoff")
     # Async-retrieval fields (issue #447). Present only when the transport timed

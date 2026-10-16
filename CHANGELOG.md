@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `assign` and `handoff` now launch ephemeral agents (#801) from their creator terminal: Claude Code by default, Codex when an operator allows it.
+- Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `ephemeral.enabled` stays off by default.
 - Security regression tests derived from the review harnesses Augusto Santos
   (@gutosantos82) wrote while assessing CAO's CI security gates: a route-by-scope
   authorization matrix with auth enabled (every HTTP route x no/read/write/admin
