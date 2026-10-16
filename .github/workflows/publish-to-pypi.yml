@@ -42,9 +42,10 @@ jobs:
   #
   # `GITHUB_REF_NAME` is read from the ENVIRONMENT, not interpolated with `${{ }}` into the
   # script, so the ref can never be executed as shell (zizmor template-injection). On a
-  # `workflow_dispatch` there is no tag to compare, so only the tree-consistency and
-  # already-on-PyPI halves run. `test/scripts/test_assert_release_version.py` asserts the
-  # job exists, that both build jobs wait on it, and that the guard FAILS on the v2.5.4 shape.
+  # `workflow_dispatch` from a branch there is no tag to compare, so only the
+  # tree-consistency and already-on-the-target-index halves run.
+  # `test/scripts/test_assert_release_version.py` asserts the job exists, that both build
+  # jobs wait on it, which index each step asks, and that the guard FAILS on the v2.5.4 shape.
   # ---------------------------------------------------------------------------------------
   verify-release-version:
     name: Tag matches the packaged version
@@ -57,13 +58,33 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Refuse a release tag whose version the tree does not carry
+      # A release uploads to TestPyPI FIRST (publish-testpypi) and PyPI second, and the two
+      # indexes diverge in both directions (2.1.0 and 2.2.0 exist only on TestPyPI, 2.4.1 only
+      # on PyPI), so the question is asked of BOTH: a version on either one is a guaranteed
+      # `400 File already exists` ~80 minutes from now. (Review on PR #947.)
+      - name: Refuse a release tag whose version the tree does not carry, or that an index already has
         if: github.event_name == 'release'
-        run: python scripts/assert_release_version.py --tag "$GITHUB_REF_NAME" --refuse-published
+        run: >-
+          python scripts/assert_release_version.py --tag "$GITHUB_REF_NAME"
+          --index https://test.pypi.org --index https://pypi.org
 
-      - name: Manual dispatch has no tag; check the tree agrees with itself and PyPI
+      # A manual dispatch uploads to exactly one index, chosen by `inputs.environment`, so
+      # only THAT index is asked: a testpypi dispatch must not be refused on pypi.org state,
+      # and a pypi dispatch must not be passed on test.pypi.org state. The index is selected
+      # in `env:` and read from the environment; nothing from the event reaches `run:`.
+      #
+      # The `pypi` environment is restricted to `v*` tags, so the PyPI escape hatch always
+      # runs on a tag ref; when it does, the tag gets the same comparison a release does.
+      - name: Manual dispatch; check the tree agrees with itself and the target index lacks the version
         if: github.event_name != 'release'
-        run: python scripts/assert_release_version.py --refuse-published
+        env:
+          TARGET_INDEX: ${{ inputs.environment == 'testpypi' && 'https://test.pypi.org' || 'https://pypi.org' }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            python scripts/assert_release_version.py --tag "$GITHUB_REF_NAME" --index "$TARGET_INDEX"
+          else
+            python scripts/assert_release_version.py --index "$TARGET_INDEX"
+          fi
 
   # ---------------------------------------------------------------------------------------
   # Per-platform wheels (issue #321, unit `wheel-matrix`). THIS JOB ADDS THIS REPO'S FIRST
