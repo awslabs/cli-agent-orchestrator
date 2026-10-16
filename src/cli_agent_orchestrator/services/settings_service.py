@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, Set
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.utils.atomic_file import locked_atomic_write
 from cli_agent_orchestrator.utils.paths import normalized_path
 
 logger = logging.getLogger(__name__)
@@ -138,9 +139,15 @@ def settings_readable() -> bool:
 
 
 def _save(data: Dict[str, Any]) -> None:
-    """Save settings to disk."""
+    """Save settings to disk.
+
+    Published atomically at mode 0600 through the shared writer: the new file
+    replaces the ``settings.json`` directory entry, so a symlink planted at
+    that path is swapped out rather than followed, and the result is private
+    like ``.env`` and the database. ``write_text`` did neither.
+    """
     CAO_HOME_DIR.mkdir(parents=True, exist_ok=True)
-    SETTINGS_FILE.write_text(json.dumps(data, indent=2))
+    locked_atomic_write(SETTINGS_FILE, json.dumps(data, indent=2), mode=0o600)
 
 
 def get_agent_dirs() -> Dict[str, str]:

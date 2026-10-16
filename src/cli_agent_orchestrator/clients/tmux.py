@@ -11,6 +11,7 @@ import uuid
 from typing import Callable, Dict, FrozenSet, List, Optional, Tuple, TypeVar, Union
 
 import libtmux
+import psutil
 from libtmux.constants import PaneDirection
 from libtmux.exc import LibTmuxException
 from libtmux.pane import Pane
@@ -433,6 +434,112 @@ def _require_cao_session_name(session_name: str, action: str) -> None:
             f"refusing to {action} tmux session {session_name!r}: CAO only acts on "
             f"sessions it created, and those start with {SESSION_PREFIX!r}"
         )
+
+
+def _foreground_process_group(pid: int) -> Optional[int]:
+    """Return the foreground process group of the controlling tty of ``pid``, or None."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as stat_file:
+            # After "pid (comm)": state ppid pgrp session tty_nr tpgid ...
+            fields = stat_file.read().rsplit(b")", 1)[1].split()
+        return int(fields[5])
+    except (OSError, IndexError, ValueError):
+        pass  # no procfs (macOS): ask ps
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "tpgid=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        return int(result.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _command_inside_pty_proxy(pane_pid: int) -> Optional[str]:
+    """Return the name of the program that runs inside a PTY proxy, or None.
+
+    A PTY proxy starts the real shell in a new session, on the inner tty. So
+    the pane process is a proxy when one of its children is a shell in another
+    session than the pane process. The program in the foreground of the inner
+    tty is the answer, or the shell itself at its prompt. A background child of
+    the shell (a prompt helper such as gitstatusd) is not.
+
+    The session, not ``psutil.Process.terminal()``, identifies the inner tty:
+    psutil reads the tty names once per process, so a cao-server that is
+    already running does not see the tty of a pane that it opens later.
+
+    Returns None when the pane process is not a proxy, or when the process
+    table cannot be read. The caller then keeps the name that tmux reported.
+    """
+    try:
+        session = os.getsid(pane_pid)
+        descendants = psutil.Process(pane_pid).children(recursive=True)
+    except (psutil.Error, OSError):
+        return None
+
+    by_parent: Dict[int, List[psutil.Process]] = {}
+    for process in descendants:
+        try:
+            by_parent.setdefault(process.ppid(), []).append(process)
+        except psutil.Error:
+            continue  # exited during the scan
+
+    def started(process: psutil.Process) -> float:
+        try:
+            return process.create_time()
+        except psutil.Error:
+            return 0.0
+
+    shells = []
+    for child in by_parent.get(pane_pid, []):
+        try:
+            if (
+                os.getsid(child.pid) != session
+                and child.name() in BRACKETED_PASTE_INCOMPATIBLE_SHELLS
+            ):
+                shells.append(child)
+        except (psutil.Error, OSError):
+            continue
+    if not shells:
+        return None
+    shell = max(shells, key=started)
+
+    try:
+        shell_session = os.getsid(shell.pid)
+        shell_name = shell.name()
+    except (psutil.Error, OSError):
+        return None
+    jobs = []
+    for child in by_parent.get(shell.pid, []):
+        try:
+            if os.getsid(child.pid) == shell_session:
+                jobs.append((child, os.getpgid(child.pid)))
+        except (psutil.Error, OSError):
+            continue
+
+    foreground = _foreground_process_group(shell.pid)
+    if foreground is not None and foreground > 0:
+        try:
+            if foreground == os.getpgid(shell.pid):
+                return shell_name
+        except OSError:
+            return None
+        for child, group in jobs:
+            if group == foreground:
+                try:
+                    return child.name()
+                except psutil.Error:
+                    return None
+    # The foreground group is unknown: the newest job, or the shell at its prompt.
+    if not jobs:
+        return shell_name
+    try:
+        return max((child for child, _group in jobs), key=started).name()
+    except psutil.Error:
+        return None
 
 
 class TmuxClient:
@@ -2350,10 +2457,21 @@ class TmuxClient:
         """Get the current foreground command running in a pane.
 
         Returns None when it cannot be determined, including on a listing parse
-        failure. Its only caller
-        (``_pane_is_bracketed_paste_incompatible``) already treats None as
-        "assume a real TUI", the pre-existing safe default — so there is no
-        "gone" claim to get wrong here either.
+        failure. Callers treat None as "the provider still runs":
+        ``_pane_is_bracketed_paste_incompatible`` then assumes a real TUI, the
+        pre-existing safe default, and the exit checks of the codex, kiro_cli,
+        and omp providers find no shell. So there is no "gone" claim to get
+        wrong here either.
+
+        tmux names the foreground process of the pane's own tty. A shell
+        startup file can replace that process with a PTY proxy, which runs the
+        real shell on a second tty: the shell integration of Kiro CLI execs
+        ``zsh (kiro-cli-term)`` from ``~/.zshrc``. tmux then reports ``zsh``
+        for the life of the pane, whatever runs in it, and each caller reads
+        "the provider exited to a shell". ``send_keys`` then drops the
+        bracketed-paste wrap, so the TUI submits a multi-line message one line
+        at a time, and the Codex provider reports ERROR. So when tmux reports a
+        shell, look through a proxy to the program on the inner tty.
         """
         try:
             session = self._find_session(session_name)
@@ -2361,9 +2479,14 @@ class TmuxClient:
                 return None
             pane = self._resolve_pane(session, session_name, window_name)
             if pane:
-                result = pane.cmd("display-message", "-p", "#{pane_current_command}")
+                result = pane.cmd("display-message", "-p", "#{pane_current_command}\t#{pane_pid}")
                 if result.stdout:
-                    return result.stdout[0].strip()
+                    command, _, pane_pid = result.stdout[0].partition("\t")
+                    command = command.strip()
+                    pane_pid = pane_pid.strip()
+                    if command in BRACKETED_PASTE_INCOMPATIBLE_SHELLS and pane_pid.isdigit():
+                        return _command_inside_pty_proxy(int(pane_pid)) or command
+                    return command
             return None
         except Exception as e:
             logger.error(f"Failed to get pane command for {session_name}:{window_name}: {e}")

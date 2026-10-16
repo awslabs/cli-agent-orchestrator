@@ -97,7 +97,13 @@ def _validate_frontmatter(metadata: dict) -> list[str]:
 
 @click.group()
 def profile():
-    """Manage agent profiles."""
+    """Manage agent profiles.
+
+    \b
+    Examples:
+      cao profile list
+      cao profile find "code review" --limit 3
+    """
 
 
 @profile.command("list")
@@ -176,6 +182,7 @@ def validate_cmd(name_or_path: str):
     NAME_OR_PATH can be a profile name (looked up in the local store)
     or a path to a .md file.
 
+    \b
     Checks:
     - Required fields (name)
     - Deprecated fields (autoApproveTools)
@@ -333,7 +340,9 @@ def create_cmd(template: str, config_path: str, output_dir: str):
 @click.option("--limit", default=None, type=int, help="Maximum results to return.  [default: 10]")
 @click.option("--json", "as_json", is_flag=True, help="Output results as JSON.")
 def find_cmd(query: str, limit: Optional[int], as_json: bool):
-    """Find agent profiles by keyword (searches name, description, tags, capabilities).
+    """Find agent profiles by keyword.
+
+    Searches name, description, tags, and capabilities.
 
     Examples:
 

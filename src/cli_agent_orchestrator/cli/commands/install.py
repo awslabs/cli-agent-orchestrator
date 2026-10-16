@@ -83,8 +83,11 @@ def _read_local_profile(agent_source: str) -> Optional[Tuple[str, str]]:
 )
 def install(agent_source: str, provider: Optional[str], env_vars: tuple[str, ...]) -> None:
     """
-    Install an agent from local store, built-in store, URL, or file path.
+    Install an agent by name, file path, or URL.
 
+    A name is resolved from the local agent store or the built-in store.
+
+    \b
     AGENT_SOURCE can be:
     - Agent name (e.g., 'developer', 'code_supervisor')
     - File path (e.g., './my-agent.md', '/path/to/agent.md')
@@ -95,11 +98,10 @@ def install(agent_source: str, provider: Optional[str], env_vars: tuple[str, ...
     manage those values separately, or pass `--env KEY=VALUE` during install to write
     them before the profile is loaded.
 
-    Example:
     \b
-        cao install ./service-agent.md --provider claude_code \
-          --env API_TOKEN=my-secret-token \
-          --env SERVICE_URL=http://127.0.0.1:27124
+    Examples:
+      cao install developer
+      cao install ./service-agent.md --provider claude_code --env API_TOKEN=my-secret-token
     """
     try:
         parsed_env = dict(parse_env_assignment(env_assignment) for env_assignment in env_vars)

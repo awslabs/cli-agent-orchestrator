@@ -18,7 +18,10 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils import agent_profiles
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
+from cli_agent_orchestrator.utils.mcp_resolution import (
+    CAO_MCP_SERVER_COMMAND,
+    resolve_mcp_server_config,
+)
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -98,6 +101,45 @@ TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d{1,3}%\s+left|·\s+[
 # tolerates zero-or-more characters before the "(", so the only gap was the
 # glyph itself.
 TUI_PROGRESS_PATTERN = r"[•◦][^\n]*\((?:(?:\d+h\s+)?\d+m\s+)?\d+s\s*•\s*esc to interrupt\)"
+
+# Codex 0.155 and later end each successful turn with a dim completion footer
+# below the final message: the time at which the turn ended, after "Worked for
+# <duration>" when the duration is shown. 0.155 draws "done 4:19 PM" and
+# "Worked for 1m 5s · done 4:19 PM". 0.159 and later draw "Worked for 32s •
+# 4:19 PM" (or "16:19" on a 24-hour clock), with the date on another day.
+# Until the footer is drawn, the final message can still stream. Codex shows no
+# spinner while it streams the answer, so without the footer a streaming frame
+# looks like a finished turn, and a handoff returns a partial reply. The "─
+# Worked for 1m 5s ─" rule of 0.154 and earlier is above the final message, so
+# it does not end a turn, and the pattern does not match it (the rule comes
+# first on the line).
+_FOOTER_DURATION = r"(?:<1s|(?:\d+h\s+)?(?:\d+m\s+)?\d+s)"
+_FOOTER_CLOCK = (
+    r"(?:done\s+)?(?:[A-Z][a-z]{2}\s+\d{1,2}(?:,\s+\d{4})?(?:\s+at)?\s+)?"
+    r"\d{1,2}:\d{2}(?:\s*[AP]M)?"
+)
+# The time is never left out: for a live turn without a saved time, Codex uses
+# the current time. So "Worked for 2s" with no time is reply text, not a footer.
+COMPLETION_FOOTER_PATTERN = (
+    rf"^[^\S\n]*(?:Worked for {_FOOTER_DURATION}[^\S\n]*[•·][^\S\n]*)?{_FOOTER_CLOCK}"
+    rf"(?:[^\S\n]*[•·][^\n]*)?[^\S\n]*$"
+)
+# The first release that draws the completion footer.
+COMPLETION_FOOTER_MIN_VERSION = (0, 155, 0)
+# From 0.159, the footer of a live turn starts with "Worked for" (short turns
+# included), and 0.155 writes "done" before the time. Only the releases in
+# between draw a bare time, which a reply row can also be.
+BARE_CLOCK_FOOTER_VERSIONS = ((0, 156, 0), (0, 159, 0))
+# Reading the pane command costs about 0.1 s of tmux calls. A verdict that is
+# not ready reads it at most this often (see CodexProvider._exited_to_shell).
+EXIT_CHECK_INTERVAL_S = 2.0
+# The startup banner names the running release: ">_ OpenAI Codex (v0.160.0)".
+BANNER_VERSION_PATTERN = r"OpenAI Codex \(v(\d+)\.(\d+)\.(\d+)"
+# A failed or interrupted turn ends with an error cell, not with the footer.
+ERROR_CELL_PATTERN = r"^■\s"
+# A row that Codex draws for a turn: the spinner, a tool row and its output
+# ("• Ran ...", "└ ..."), the reply, or an error cell.
+TURN_ACTIVITY_PATTERN = r"^[^\S\n]*[•◦└■]"
 
 # Workspace trust/approval prompt shown when Codex opens a new directory.
 # Two known variants:
@@ -358,6 +400,46 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
             break
 
     return len("\n".join(all_lines[:footer_start_idx]))
+
+
+def _banner_version(text: str) -> tuple[int, int, int]:
+    """Return the release in the Codex startup banner, or (0, 0, 0) if none is drawn."""
+    matches = re.findall(BANNER_VERSION_PATTERN, text)
+    if not matches:
+        return (0, 0, 0)
+    major, minor, patch = (int(part) for part in matches[-1])
+    return (major, minor, patch)
+
+
+def _is_completion_footer(row: str, version: tuple[int, int, int]) -> bool:
+    """Return True when ``row`` is the completion footer that ``version`` draws."""
+    if not re.match(COMPLETION_FOOTER_PATTERN, row):
+        return False
+    stripped = row.strip()
+    if stripped.startswith(("Worked for ", "done ")):
+        return True
+    low, high = BARE_CLOCK_FOOTER_VERSIONS
+    return low <= version < high
+
+
+def _turn_ended_with_footer(
+    turn_text: str, version: tuple[int, int, int], *, from_user_message: bool
+) -> bool:
+    """Return True when the last row of the turn is its completion footer.
+
+    ``turn_text`` runs to the composer, or to the end of a frame whose status
+    bar is not drawn, so a composer row at the end is skipped. When the turn
+    starts at the user message, a reply or tool row must come between the two:
+    the lines of the user message can look like a footer ("09:00 · Standup").
+    """
+    rows = [line for line in turn_text.splitlines() if line.strip()]
+    if len(rows) > 1 and re.match(rf"\s*{IDLE_PROMPT_PATTERN}", rows[-1]):
+        rows = rows[:-1]
+    if not rows or not _is_completion_footer(rows[-1], version):
+        return False
+    if not from_user_message:
+        return True
+    return any(re.match(TURN_ACTIVITY_PATTERN, row) for row in rows[1:-1])
 
 
 def _toml_scalar(value: Any) -> str:
@@ -962,12 +1044,17 @@ class CodexProvider(BaseProvider):
     # the live frame rather than stale redraw history.
     supports_screen_detection = True
 
+    # The raw stream of a working Codex turn can parse as IDLE (see the base
+    # class), so the poller re-check reads the screen as well.
+    status_recheck_uses_screen = True
+
     # Codex is the provider the mid-burst probe exists for: 0.153 redraws its
     # spinner about once a second for the whole turn, so the screen never goes
     # quiescent and the rising edge composites before the spinner draws. Opting
     # in is safe because this detector is a pure function of the frame —
-    # get_status() reads patterns and returns, it commits no turn bookkeeping —
-    # so a probed frame the monitor discards leaves nothing behind.
+    # get_status() reads patterns and returns, it commits no turn bookkeeping
+    # (it only caches when it last read the pane command) — so a probed frame
+    # the monitor discards leaves nothing behind.
     supports_midburst_processing_probe = True
 
     def __init__(
@@ -986,6 +1073,15 @@ class CodexProvider(BaseProvider):
         self._agent_profile = agent_profile
         # Explicit per-call override for profile.model, see _build_codex_command.
         self._model = model
+        # The release in the startup banner, and whether it ends each turn with
+        # COMPLETION_FOOTER_PATTERN. initialize() sets both. A provider rebuilt
+        # after a cao-server restart does not run initialize(), and keeps the
+        # older rules.
+        self._codex_version: tuple[int, int, int] = (0, 0, 0)
+        self._ends_turns_with_footer = False
+        # The cached result of the exit check (see _exited_to_shell).
+        self._exit_checked_at: Optional[float] = None
+        self._exited = False
 
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
@@ -1192,6 +1288,12 @@ class CodexProvider(BaseProvider):
                         cfg = dict(server_config)
                     else:
                         cfg = server_config.model_dump(exclude_none=True)
+                    # The CAO server, by its usual name or its bundled command
+                    # (a profile can also start it through uvx).
+                    is_cao_server = (
+                        server_name == CAO_MCP_SERVER_COMMAND
+                        or cfg.get("command") == CAO_MCP_SERVER_COMMAND
+                    )
                     # Resolve the bundled cao-mcp-server console script to a
                     # PATH-independent invocation.
                     cfg = resolve_mcp_server_config(cfg)
@@ -1245,6 +1347,17 @@ class CodexProvider(BaseProvider):
                     # is silently rejected and falls back to the 60s default.
                     if "tool_timeout_sec" not in cfg:
                         command_parts.extend(["-c", f"{prefix}.tool_timeout_sec=600.0"])
+                    # Recent Codex releases defer MCP tools behind tool_search,
+                    # and the search can rank other CAO tools above assign and
+                    # handoff: on 0.160, "+cao-mcp-server assign handoff"
+                    # returned load_skill, delete_terminal, and
+                    # answer_user_prompt. The supervisor then reported that
+                    # cao-mcp-server failed to start. The CAO server is how the
+                    # agent orchestrates, so keep its tools in the initial tool
+                    # list. The key exists from 0.150. Older releases do not
+                    # reject keys that their MCP server config does not know.
+                    if is_cao_server:
+                        command_parts.extend(["-c", f'{prefix}.omit_tools_from=["deferred"]'])
 
             # Inline Codex config overrides (-c key=value). Lets a profile set
             # per-agent Codex knobs — reasoning effort, service tier, fast mode,
@@ -1630,10 +1743,40 @@ class CodexProvider(BaseProvider):
                 "it was not dismissed within the init window"
             )
 
+        # The completion footer marks the end of a turn only on a release that
+        # draws it. The status-bar check in get_status() needs a status bar that
+        # TUI_FOOTER_PATTERN knows, so a custom status line keeps the older rules.
+        startup_screen = strip_terminal_escapes(
+            await asyncio.to_thread(get_backend().get_history, self.session_name, self.window_name)
+            or ""
+        )
+        # A capture of the pane ends with its blank rows, so look at the last
+        # rows that have text.
+        startup_rows = [line for line in startup_screen.splitlines() if line.strip()]
+        version = _banner_version(startup_screen)
+        self._codex_version = version
+        self._ends_turns_with_footer = version >= COMPLETION_FOOTER_MIN_VERSION and any(
+            re.search(TUI_FOOTER_PATTERN, line) for line in startup_rows[-IDLE_PROMPT_TAIL_LINES:]
+        )
+        logger.info(
+            "Terminal %s: Codex %s; a completion footer ends a turn: %s",
+            self.terminal_id,
+            ".".join(str(part) for part in version) if any(version) else "(no banner)",
+            self._ends_turns_with_footer,
+        )
         self._initialized = True
         return True
 
     def get_status(self, output: str) -> TerminalStatus:
+        return self._get_status(output, rendered=False)
+
+    def _get_status(self, output: str, *, rendered: bool) -> TerminalStatus:
+        """Detect the status of ``output``, a rendered screen or the raw stream.
+
+        The completion-footer rules need the rows that the screen shows. The
+        raw stream keeps every redraw, so a stale status bar or footer can
+        follow the live rows; it keeps the older rules.
+        """
         # Native status (herdr): trust the backend's agent state when available;
         # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
         native = self._resolve_native_status(output)
@@ -1646,22 +1789,77 @@ class CodexProvider(BaseProvider):
         if not output:
             return TerminalStatus.UNKNOWN
 
+        status = self._status_of_frame(
+            output, footer_mode=rendered and self._ends_turns_with_footer
+        )
+
         # Detect when the codex process has exited and the pane is back to a
         # bare shell. The pane's current command will revert to the shell
         # (e.g. "zsh") that was running before we launched codex. Returning
         # ERROR prevents the inbox service from typing a queued message into
         # the shell — which would execute it as arbitrary commands.
-        if self._initialized and self.shell_baseline:
+        if (
+            self._initialized
+            and self.shell_baseline
+            and self._exited_to_shell(
+                fresh=status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
+            )
+        ):
+            return TerminalStatus.ERROR
+        return status
+
+    def _exited_to_shell(self, *, fresh: bool) -> bool:
+        """Return True when the pane is back at the shell that ran before Codex.
+
+        A ready verdict could let the inbox type into that shell, so it always
+        reads the pane command. Any other verdict reads it at most every
+        EXIT_CHECK_INTERVAL_S: the lookup costs about 0.1 s of tmux calls, and
+        StatusMonitor runs get_status() in its one output consumer on every
+        edge and probe of a busy terminal. A lookup for each frame put five
+        Codex terminals one to two minutes behind their panes.
+        """
+        now = time.monotonic()
+        if (
+            fresh
+            or self._exit_checked_at is None
+            or now - self._exit_checked_at >= EXIT_CHECK_INTERVAL_S
+        ):
             current_cmd = get_backend().get_pane_current_command(
                 self.session_name, self.window_name
             )
-            if current_cmd == self.shell_baseline:
-                return TerminalStatus.ERROR
+            self._exited = current_cmd == self.shell_baseline
+            self._exit_checked_at = now
+        return self._exited
 
+    def _turn_ended_above_composer(self, clean_output: str) -> bool:
+        """Return True when a frame without the status bar ends with footer and composer.
+
+        Without the status bar, the composer row can pass for the last user
+        message, so the turn is read from the user message above it.
+        """
+        body_end = clean_output.rfind("\n")
+        if body_end == -1 or not re.match(
+            rf"\s*{IDLE_PROMPT_PATTERN}", clean_output[body_end + 1 :]
+        ):
+            return False
+        body = clean_output[:body_end]
+        user = None
+        for user in re.finditer(USER_PREFIX_PATTERN, body, re.IGNORECASE | re.MULTILINE):
+            pass
+        return _turn_ended_with_footer(
+            body[user.start() if user else 0 :],
+            self._codex_version,
+            from_user_message=user is not None,
+        )
+
+    def _status_of_frame(self, output: str, *, footer_mode: bool) -> TerminalStatus:
+        """Classify one frame of Codex output (_get_status() adds the exit check)."""
         # Strip the RAW pipe-pane escapes (cursor positioning, in-place redraws),
         # not just SGR colour codes — otherwise cursor sequences survive and the
         # idle ``›`` prompt / structural checks below misfire on the raw stream.
-        clean_output = strip_terminal_escapes(output)
+        # Trailing blank rows (a pane read ends with them) are dropped, so that
+        # the status bar is among the last rows.
+        clean_output = strip_terminal_escapes(output).rstrip()
         tail_output = "\n".join(clean_output.splitlines()[-25:])
 
         # Search for user messages, excluding the Codex TUI footer when present.
@@ -1675,6 +1873,7 @@ class CodexProvider(BaseProvider):
         tui_footer_detected = any(
             re.search(TUI_FOOTER_PATTERN, line) for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]
         )
+
         if tui_footer_detected:
             cutoff_pos = _compute_tui_footer_cutoff(all_lines)
         else:
@@ -1773,14 +1972,59 @@ class CodexProvider(BaseProvider):
                 return TerminalStatus.WAITING_USER_ANSWER
             if re.search(ERROR_PATTERN, tail_output, re.IGNORECASE | re.MULTILINE):
                 return TerminalStatus.ERROR
+        # On a release that draws COMPLETION_FOOTER_PATTERN, only the footer
+        # (or an error cell) ends a turn. The text before the composer is the
+        # current turn: from the last user message, or the whole frame when
+        # that message has scrolled away.
+        turn_text = clean_output[last_user.start() if last_user else 0 : cutoff_pos]
+        turn_ended = footer_mode and _turn_ended_with_footer(
+            turn_text, self._codex_version, from_user_message=last_user is not None
+        )
+        # A spinner above the footer of a finished turn is history, for example
+        # a spinner line that a tool result quotes.
+        live_spinner = not turn_ended and (
+            re.search(TUI_PROGRESS_PATTERN, tail_output, re.MULTILINE) is not None
+        )
+        if footer_mode and not tui_footer_detected:
+            # initialize() saw this release draw a status bar under the composer,
+            # and every settled frame has one. Without it, the frame is a redraw
+            # in progress, or the bar does not fit the pane any more. A footer
+            # or a spinner still decides. Otherwise UNKNOWN keeps the last
+            # status: StatusMonitor never lets UNKNOWN replace a known status.
+            # PROCESSING here would use up the arm that notify_input_sent() sets
+            # before a paste, and the real PROCESSING of the turn would then be
+            # refused.
+            if turn_ended or self._turn_ended_above_composer(clean_output):
+                return TerminalStatus.COMPLETED
+            return TerminalStatus.PROCESSING if live_spinner else TerminalStatus.UNKNOWN
         if has_idle_prompt_at_end:
             # Check for TUI progress indicator ("• Working (0s • esc to interrupt)").
             # With --no-alt-screen, the TUI footer (› hint + status bar) is always
             # rendered at the bottom, even during processing. The • in the progress
             # spinner matches ASSISTANT_PREFIX_PATTERN, causing a false COMPLETED.
             # Detect the spinner and return PROCESSING before checking for COMPLETED.
-            if re.search(TUI_PROGRESS_PATTERN, tail_output, re.MULTILINE):
+            if live_spinner:
                 return TerminalStatus.PROCESSING
+
+            if turn_ended:
+                return TerminalStatus.COMPLETED
+            if footer_mode and not re.search(ERROR_CELL_PATTERN, turn_text, re.MULTILINE):
+                if last_user is not None:
+                    # The turn is in progress when Codex has drawn a row under
+                    # the user message: a spinner, a tool row, or the reply.
+                    # With nothing under it, the frame is a redraw, or Codex has
+                    # not drawn the first row yet: no evidence either way.
+                    user_line_end = turn_text.find("\n")
+                    if user_line_end != -1 and re.search(
+                        TURN_ACTIVITY_PATTERN, turn_text[user_line_end:], re.MULTILINE
+                    ):
+                        return TerminalStatus.PROCESSING
+                    return TerminalStatus.UNKNOWN
+                if not re.search(CODEX_WELCOME_PATTERN, turn_text):
+                    # The user message has scrolled away, and no footer is
+                    # drawn under the reply yet. Only a terminal that has not
+                    # had a turn shows the startup banner instead.
+                    return TerminalStatus.PROCESSING
 
             # Consider COMPLETED only if we see an assistant marker (skipping
             # MCP tool-call markers) after the last user message. Without the
@@ -1821,7 +2065,7 @@ class CodexProvider(BaseProvider):
         rows = [line.rstrip() for line in screen_lines if line.strip()]
         if not rows:
             return TerminalStatus.UNKNOWN
-        return self.get_status("\n".join(rows))
+        return self._get_status("\n".join(rows), rendered=True)
 
     def probe_processing_from_screen(self, screen_lines: list[str]) -> bool:
         """Report whether a half-drawn Codex frame shows a working turn.
@@ -1850,7 +2094,7 @@ class CodexProvider(BaseProvider):
         frame = "\n".join(rows)
         if not re.search(TUI_PROGRESS_PATTERN, frame, re.MULTILINE):
             return False
-        return self.get_status(frame) == TerminalStatus.PROCESSING
+        return self._get_status(frame, rendered=True) == TerminalStatus.PROCESSING
 
     def extract_current_composer(self, rendered_pane: str) -> Optional[str]:
         """Return Codex's bottom composer without admitting transcript prompts."""
@@ -1970,7 +2214,7 @@ class CodexProvider(BaseProvider):
                     count=1,
                     flags=re.IGNORECASE,
                 )
-                return response_text.strip()
+                return self._strip_completion_footer(response_text)
 
         # Fallback: assistant marker based extraction (no user message found).
         # Filter out "• Called <tool>(...)" MCP tool call markers so we anchor
@@ -2001,12 +2245,23 @@ class CodexProvider(BaseProvider):
         )
         end_pos = start_pos + idle_after.start() if idle_after else len(clean_output)
 
-        final_answer = clean_output[start_pos:end_pos].strip()
+        final_answer = self._strip_completion_footer(clean_output[start_pos:end_pos])
 
         if not final_answer:
             raise ValueError("Empty Codex response - no content found")
 
         return final_answer
+
+    def _strip_completion_footer(self, text: str) -> str:
+        """Remove the completion footer, the last row of a finished turn, from a reply."""
+        lines = text.rstrip().split("\n")
+        if (
+            self._ends_turns_with_footer
+            and len(lines) > 1
+            and _is_completion_footer(lines[-1], self._codex_version)
+        ):
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
 
     def exit_cli(self) -> str:
         """Get the command to exit Codex CLI."""
