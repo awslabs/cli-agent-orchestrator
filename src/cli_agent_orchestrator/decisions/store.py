@@ -139,7 +139,15 @@ class DecisionStore:
                         model_honored=model_honored,
                         updated_at=datetime.now(timezone.utc),
                     )
-                    if not_honored:
+                    current = (
+                        db.get(database.DecisionRecordModel, record_id) if not_honored else None
+                    )
+                    # Only an on-mode model decision changed the launch, so only it was not honored.
+                    if (
+                        current is not None
+                        and current.point == "model.route"
+                        and current.state == "on"
+                    ):
                         values.update(outcome="fallback", reason="not_honored", applied_value=None)
                     changed = query.update(values)
                     if not changed and launch_status == "launch_failed":

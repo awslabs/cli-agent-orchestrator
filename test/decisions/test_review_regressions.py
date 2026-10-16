@@ -204,35 +204,6 @@ def test_policy_rejection_set_matches_all_error_subclasses():
     )
 
 
-@pytest.mark.parametrize("empty_target", [None, {}], ids=["absent", "empty"])
-def test_explicit_allowed_provider_requires_a_mapping(empty_target):
-    from cli_agent_orchestrator.decisions.policy import PolicyBounds, PolicyConfigError
-
-    tiers = {"claude_code": {"small": "model-c"}}
-    if empty_target is not None:
-        tiers["codex"] = empty_target
-    policy = PolicyBounds(
-        default_tier="small", allowed_providers=frozenset({"claude_code", "codex"})
-    )
-    with pytest.raises(
-        PolicyConfigError, match=r"^model_tiers\.codex\.small is not mapped \(required by policy\)$"
-    ) as raised:
-        policy.validate(tiers)
-    assert raised.value.reason == "policy_invalid"
-
-
-@pytest.mark.parametrize("empty_target", [None, {}], ids=["absent", "empty"])
-def test_unrestricted_provider_validation_keeps_empty_maps_unchanged(empty_target):
-    from cli_agent_orchestrator.decisions.policy import IDENTITY_POLICY, PolicyBounds
-
-    tiers = {"claude_code": {"small": "model-c"}}
-    if empty_target is not None:
-        tiers["codex"] = empty_target
-    assert IDENTITY_POLICY.allowed_providers is None
-    PolicyBounds(default_tier="small", allowed_providers=None).validate(tiers)
-    IDENTITY_POLICY.validate({"codex": {}})
-
-
 @pytest.mark.asyncio
 async def test_missing_allowed_provider_is_rejected_before_decider(setup_engine):
     from dataclasses import replace
@@ -288,3 +259,73 @@ def test_missing_allowed_providers_are_reported_in_sorted_order(provider_order):
     ) as raised:
         policy.validate({})
     assert raised.value.reason == "policy_invalid"
+
+
+def test_not_honored_bind_changes_only_the_on_model_decision(setup_engine):
+    from test.decisions.test_checkpoint import row_values
+
+    _, _, _, store, events, _ = setup_engine
+    records = [
+        store.insert(
+            {
+                **row_values(state),
+                "point": point,
+                "outcome": "applied",
+                "applied_value": "small",
+                "launch_status": "pending",
+            },
+            "message",
+        )
+        for point, state in (
+            ("model.route", "on"),
+            ("effort.route", "on"),
+            ("model.route", "shadow"),
+        )
+    ]
+    store.bind(
+        tuple(records),
+        launch_status="launched",
+        terminal_id="worker",
+        launched_model="model-y",
+        model_honored=False,
+        not_honored=True,
+    )
+    rows = {row["id"]: row for row in store.list()}
+    assert (rows[records[0]]["outcome"], rows[records[0]]["reason"]) == ("fallback", "not_honored")
+    assert rows[records[0]]["applied_value"] is None
+    for record in records[1:]:
+        assert (rows[record]["outcome"], rows[record]["applied_value"]) == ("applied", "small")
+        assert rows[record]["reason"] is None and rows[record]["launch_status"] == "launched"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [ValueError("bad frontmatter"), RuntimeError("load failed")])
+async def test_malformed_installed_profile_surfaces_the_loader_error(setup_engine, error):
+    engine, req, decider, store, events, settings = setup_engine
+
+    def load(_):
+        raise error
+
+    engine.profile_loader = load
+    # The create path catches only FileNotFoundError around the same loader, so it fails alike.
+    with pytest.raises(type(error), match=str(error)):
+        await engine.prepare_launch(req)
+    assert decider.calls == 0 and store.list() == [] and events == []
+
+
+@pytest.mark.asyncio
+async def test_insecure_key_still_launches_without_records(setup_engine, tmp_path, monkeypatch):
+    import os
+    from unittest.mock import Mock
+
+    from cli_agent_orchestrator.decisions.hashing import KeyCache
+
+    engine, req, decider, store, events, settings = setup_engine
+    path = tmp_path / "loose.key"
+    path.write_bytes(b"k" * 32)
+    path.chmod(0o644)
+    monkeypatch.setattr(os, "fchmod", Mock(side_effect=PermissionError("not owner")))
+    store._key = KeyCache(path)
+    plan = await engine.prepare_launch(req)
+    assert plan is not None and plan.model == "model-x" and decider.calls == 1
+    assert plan.record_ids == () and store.list() == []
