@@ -87,8 +87,9 @@ server logs effective states at startup.
 The server captures these overrides at startup and keeps them until it restarts.
 While one is set, `cao decisions set <point> off` and `decisions_set_point` change
 only `settings.json`: the running server keeps using the override for that point.
-To turn such a point off, restart the server without the flag or variable. This
-version has no single command that turns every point off.
+`cao decisions off` turns every point off on a running server, overrides included:
+its halt marker is checked above the flag and environment layers (see External
+deciders).
 
 ```json
 {

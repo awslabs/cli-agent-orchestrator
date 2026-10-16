@@ -134,7 +134,10 @@ def _dispatch(name: str, action: str, extra: tuple[str, ...]) -> None:
 @click.argument("name")
 @click.argument("extra", nargs=-1, type=click.UNPROCESSED)
 def enable(name: str, extra: tuple[str, ...]) -> None:
-    """Run an installed decider's consent command in an interactive terminal."""
+    """Run an installed decider's consent command.
+
+    Consent needs an interactive terminal.
+    """
     _dispatch(name, "consent", extra)
 
 
