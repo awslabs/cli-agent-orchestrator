@@ -147,10 +147,35 @@ class TestRunStepHandler:
         monkeypatch.setitem(workflow_service.run_registry, "r3", _record("r3", "0000beef"))
         profiles = {"developer": AgentProfile(name="developer", description="d", role="developer")}
         monkeypatch.setattr(f"{_TS}.agent_profiles.load_agent_profile", lambda n: profiles[n])
-        monkeypatch.setattr(f"{_TS}.provider_manager", MagicMock())
+        # Launch-capable: everything after the refusal point is mocked so that, if
+        # the bound were dropped, the developer would LAUNCH (200, a stored row
+        # with execute_bash) and the assertions below fail on that observation,
+        # not on a mock raising first (review of the first version of this test).
+        from cli_agent_orchestrator.services import agent_step
+
+        provider = AsyncMock()
+        provider.initialize.return_value = True
+        pm = MagicMock()
+        pm.create_provider.return_value = provider
+        monkeypatch.setattr(f"{_TS}.provider_manager", pm)
+        monkeypatch.setattr(f"{_TS}.status_monitor", MagicMock())
+        monkeypatch.setattr(f"{_TS}.fifo_manager", MagicMock())
+        fifo_dir = MagicMock()
+        fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+        monkeypatch.setattr(f"{_TS}.FIFO_DIR", fifo_dir)
         backend = MagicMock()
         backend.session_exists.return_value = True
+        backend.create_window.return_value = "developer-win"
+        backend.supports_event_inbox.return_value = True
         monkeypatch.setattr("cli_agent_orchestrator.backends.registry._backend", backend)
+        monkeypatch.setattr(agent_step, "wait_until_status", AsyncMock(return_value=True))
+        monkeypatch.setattr(agent_step, "_wait_for_completion", AsyncMock())
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.api.main.terminal_service.send_input", MagicMock()
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.api.main.terminal_service.get_output", lambda *a, **kw: "done"
+        )
 
         with patch(
             "cli_agent_orchestrator.services.workflow_service.check_generation",
@@ -166,11 +191,18 @@ class TestRunStepHandler:
                     "env_vars": _env("r3"),
                 },
             )
-        assert resp.status_code == 403
+        assert resp.status_code == 403, resp.text
         detail = resp.json()["detail"]
         assert "Delegation refused" in detail and "0000beef" in detail
         assert "fs_*, execute_bash, web_fetch" in detail
         backend.create_window.assert_not_called()
+        from cli_agent_orchestrator.clients import database
+
+        with database.SessionLocal() as session:
+            developers = (
+                session.query(database.TerminalModel).filter_by(agent_profile="developer").count()
+            )
+        assert developers == 0, "no developer row may exist: the launch must not have happened"
         step = workflow_service.run_registry["r3"].step_states["step-1"]
         assert step.state == StepState.FAILED
         assert "Delegation refused" in (step.error or "")
@@ -277,3 +309,94 @@ class TestRoutesCarryTheCaller:
         resp = client.post("/workflows/runs/run1/resume", json={"caller_id": "a1b2c3d4"})
         assert resp.status_code == 200
         assert seen == {"caller_id": "a1b2c3d4"}
+
+
+class TestCallerBindingSurvivesRestart:
+    """Review B round 3, R2: the binding must not live only in memory."""
+
+    def test_orphaned_script_run_step_is_refused(self, client, isolated_journal):
+        """Journal row for a reviewer-started script run, registry empty (the server
+        restarted): the step is refused, nothing launches."""
+        from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
+
+        workflow_journal.insert_run(
+            "r9",
+            "wf",
+            "{}",
+            "{}",
+            "running",
+            "t",
+            tier="script",
+            generation="1",
+            caller_id="0000beef",
+        )
+        assert "r9" not in workflow_service.run_registry
+        with patch(_RUN_STEP, new=AsyncMock()) as m_run:
+            resp = client.post(
+                TERMINALS_RUN_STEP_ROUTE,
+                json={
+                    "provider": "claude_code",
+                    "agent": "developer",
+                    "prompt": "go",
+                    "env_vars": _env("r9"),
+                },
+            )
+        assert resp.status_code == 403, resp.text
+        assert "no live record" in resp.json()["detail"]
+        assert "cao workflow resume r9" in resp.json()["detail"]
+        m_run.assert_not_called()
+
+    def test_live_script_run_still_passes(self, client, isolated_journal, monkeypatch):
+        from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
+
+        workflow_journal.insert_run("r10", "wf", "{}", "{}", "running", "t", tier="script")
+        monkeypatch.setitem(workflow_service.run_registry, "r10", _record("r10", "0000beef"))
+        result = AgentStepResult(
+            terminal_id="abc12345", last_message="done", status=TerminalStatus.COMPLETED
+        )
+        with patch(_RUN_STEP, new=AsyncMock(return_value=result)) as m_run:
+            resp = client.post(
+                TERMINALS_RUN_STEP_ROUTE,
+                json={
+                    "provider": "claude_code",
+                    "agent": "developer",
+                    "prompt": "go",
+                    "env_vars": _env("r10"),
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        assert m_run.call_args.kwargs["delegating_terminal_id"] == "0000beef"
+
+    def test_caller_is_journaled_and_resume_rebinds_to_the_original(
+        self, monkeypatch, isolated_journal
+    ):
+        """The run row carries caller_id; a script resume by another actor (or the
+        operator) re-binds to the ORIGINAL caller, never widening."""
+        import asyncio
+
+        from cli_agent_orchestrator.services.workflow_service import bound_caller
+
+        spec = _script_spec()
+        captured = {}
+
+        async def _drive(record, spec_path, env):
+            captured["record"] = record
+            workflow_journal.update_run_state(record.run_id, RunState.FAILED.value, "t")
+            return WorkflowRunResult(
+                run_id=record.run_id, workflow_name="wf", state=RunState.FAILED, started_at="t"
+            )
+
+        monkeypatch.setattr(script_runner, "_drive_process", _drive)
+        monkeypatch.setattr(script_runner.approval_gate, "ensure_plan_approved", lambda **kw: None)
+        asyncio.run(script_runner.run_script_workflow(spec, {}, "run-j", caller_id="0000beef"))
+        assert workflow_journal.get_run("run-j").caller_id == "0000beef"
+
+        workflow_service.run_registry.clear()
+        asyncio.run(script_runner.resume_script_run("run-j", caller_id="0000cafe"))
+        assert captured["record"].caller_id == "0000beef", "the original caller bounds the resume"
+        workflow_service.run_registry.clear()
+        asyncio.run(script_runner.resume_script_run("run-j"))
+        assert captured["record"].caller_id == "0000beef", "an operator resume does not widen"
+
+        assert bound_caller(None, "0000cafe") == "0000cafe"
+        assert bound_caller("0000beef", None) == "0000beef"

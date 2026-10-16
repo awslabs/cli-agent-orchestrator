@@ -1679,6 +1679,12 @@ def _migrate_workflow_run() -> None:
             if "kind" not in columns:
                 conn.execute("ALTER TABLE workflow_run ADD COLUMN kind TEXT DEFAULT NULL")
                 logger.info("Migration: added kind column to workflow_run")
+            if "caller_id" not in columns:
+                # The terminal that started the run; lets a resumed or recovered
+                # run re-bind to the ORIGINAL caller's delegation ceiling. NULL
+                # for operator-started runs and every pre-existing row.
+                conn.execute("ALTER TABLE workflow_run ADD COLUMN caller_id TEXT DEFAULT NULL")
+                logger.info("Migration: added caller_id column to workflow_run")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run migration skipped: {e}")
 

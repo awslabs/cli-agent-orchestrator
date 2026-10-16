@@ -761,7 +761,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   id; a delegated Kiro CLI launch whose installed agent file grants more than
   the bounded allowlist is refused with the reinstall remedy; MCP references
   are compared with the resolver's selector semantics (`@plugin-*` covers
-  `@plugin-search`, `@server` covers `@server/tool`).
+  `@plugin-search`, `@server` covers `@server/tool`; a pattern-shaped child
+  entry is covered only by an identical or bare-`*` grant). OpenCode CLI gets
+  the same installed-policy check as Kiro for delegated launches. The starting
+  terminal is journaled on the run row (`workflow_run.caller_id`, migration at
+  server start) so a resumed run re-binds to the original caller, and a
+  script-tier run-step whose run has no live record after a restart is refused.
   **Breaking changes:** (1) a user-authored restricted role or profile that
   launches wider children is now refused with a message naming the parent, the
   child, the exceeding tools and the remedy (add `delegateTools` to the parent

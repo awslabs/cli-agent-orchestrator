@@ -330,13 +330,38 @@ def mcp_reference_covers(grant: str, requested: str) -> bool:
         return False
     g_server, g_tool = granted
     w_server, w_tool = wanted
-    if not (w_server == g_server or fnmatch.fnmatchcase(w_server, g_server)):
+    if not _part_covers(g_server, w_server):
         return False
     if g_tool is None:
         return True
     if w_tool is None:
         return False
-    return w_tool == g_tool or fnmatch.fnmatchcase(w_tool, g_tool)
+    return _part_covers(g_tool, w_tool)
+
+
+_GLOB_META = frozenset("*?[")
+
+
+def _part_covers(grant_part: str, requested_part: str) -> bool:
+    """One reference component (server or tool) of a grant covering a request.
+
+    A CONCRETE requested name is covered when it equals the grant or matches the
+    grant pattern (``fnmatchcase``). A PATTERN-SHAPED request (any of ``*``,
+    ``?``, ``[``) is a language, not a name, and ``fnmatchcase`` would match it
+    as literal text: ``@plugin-?`` would cover ``@plugin-*`` because the
+    one-character ``*`` fits ``?``, and the child would then store a ceiling
+    wider than its parent's. Pattern inclusion is only decided in the two cases
+    that are certain: the grant is the bare ``*`` (every language is a subset)
+    or the grant is byte-identical text. Anything else is refused; the operator
+    can widen the grant explicitly.
+    """
+    if requested_part == grant_part:
+        return True
+    if grant_part == "*":
+        return True
+    if _GLOB_META & set(requested_part):
+        return False
+    return fnmatch.fnmatchcase(requested_part, grant_part)
 
 
 #: Kiro built-ins that ``@builtin`` grants on the ``tools`` axis: the ones that
