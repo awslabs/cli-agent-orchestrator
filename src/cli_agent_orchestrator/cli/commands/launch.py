@@ -282,6 +282,7 @@ def launch(
 
         resolved_allowed_tools = None
         no_role_set = False
+        launch_profile = None
         if yolo:
             resolved_allowed_tools = ["*"]
         elif allowed_tools:
@@ -290,6 +291,7 @@ def launch(
             # Load profile to get role-based defaults
             try:
                 profile = load_agent_profile(agents)
+                launch_profile = profile
                 mcp_server_names = grantable_server_names(profile)
                 no_role_set = not profile.role and not profile.allowedTools
                 resolved_allowed_tools = resolve_allowed_tools(
@@ -299,6 +301,16 @@ def launch(
                 # Profile not found — use developer defaults (backward compatible)
                 no_role_set = True
                 resolved_allowed_tools = resolve_allowed_tools(None, None, None)
+        # The delegation ceiling the server will record for this terminal (what
+        # it may grant to workers it assigns/hands off to); see
+        # docs/tool-restrictions.md "Delegation ceiling".
+        from cli_agent_orchestrator.utils.delegation import resolve_delegate_tools
+
+        resolved_delegate_tools = resolve_delegate_tools(
+            getattr(launch_profile, "delegateTools", None),
+            getattr(launch_profile, "role", None),
+            resolved_allowed_tools,
+        )
 
         # Honour profile.provider whenever the user did not pass --provider
         # explicitly. This runs regardless of which permission-resolution
@@ -406,6 +418,7 @@ def launch(
                     f"\nAgent '{agents}' launching on {provider}:\n"
                     f"  Allowed:  {tool_summary}\n"
                     f"  Blocked:  {blocked_summary}\n"
+                    f"  Delegates: {format_tool_summary(resolved_delegate_tools)}\n"
                     f"  Enforcement: {describe_enforcement(provider, resolved_allowed_tools)}\n"
                     f"  Directory: {display_dir}\n"
                 )

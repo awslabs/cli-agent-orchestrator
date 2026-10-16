@@ -24,7 +24,10 @@ see [Configuration](configuration.md) and [Security](../SECURITY.md).
 
 ### Health and auth discovery
 
-- `GET /health` reports service health.
+- `GET /health` reports service health. Its `features` list names capabilities a
+  peer node can rely on; `delegation_ceiling` means this node bounds created
+  terminals by the caller's delegation ceiling and honours `caller_ceiling` (see
+  [Tool Restrictions](tool-restrictions.md#cross-provider-inheritance)).
 - `GET /.well-known/oauth-protected-resource` publishes OAuth protected
   resource metadata when applicable.
 
@@ -167,6 +170,20 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   if you need a different order.
 - `/terminals/{terminal_id}*` inspects terminals, sends input or keys, reads
   output and working-directory state, exits providers, and deletes terminals.
+- Terminal responses carry `delegate_tools`, the terminal's recorded delegation
+  ceiling. `POST /sessions/{session_name}/terminals` requires `caller_id` (403
+  without it) and checks the requested `allowed_tools` (client string or profile
+  resolution) against that caller's recorded ceiling, answering `403` when they
+  exceed it; the message names the parent, the child, the exceeding tools and
+  the remedy. `POST /sessions` and `POST /terminals/run-step` accept
+  `caller_ceiling` in the JSON body for a caller on another node (remote
+  `assign`/`handoff`); it is rejected together with a local `caller_id`, it is
+  required when the body's `env_vars` carry `CAO_CALLBACK_TERMINAL_ID` (the
+  remote-assign shape), and when that callback terminal has a local row the
+  asserted ceiling must fit inside the row's. `caller_id` and `caller_ceiling`
+  remain client assertions under the shared bearer; see
+  [Tool Restrictions](tool-restrictions.md#cross-provider-inheritance) for what
+  that does and does not guarantee.
 - `GET /terminals/{terminal_id}/output?mode=full` returns the StatusMonitor
   rolling buffer (most recent `state_buffer_max` bytes of streamed output —
   server setting, 32KB by default, see [Configuration](configuration.md)),
@@ -245,7 +262,12 @@ than calling these routes directly.
 
 - `/workflows*` validates and inspects workflow specifications.
 - `POST /workflows/runs` starts a run **inline** and holds the connection until it
-  finishes, returning the complete result.
+  finishes, returning the complete result. `caller_id` (also on `:submit`, `resume`
+  and step replay) names the terminal starting the run; every agent step is then
+  bounded by that terminal's recorded delegation ceiling. It is persisted on the
+  run's journal row, so a resume re-binds to the original caller. A script-tier
+  `POST /terminals/run-step` whose run has no live record (server restarted) is
+  refused with 403.
 - `POST /workflows/runs:submit` starts a run **asynchronously**: it returns `202` with
   `{run_id, state, links}` as soon as the run is durably journaled, then drives the run in
   the background. The `links` map always carries `self`/`status`/`result`/`cancel`;

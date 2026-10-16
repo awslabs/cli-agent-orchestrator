@@ -111,6 +111,8 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.install_service import (
+    installed_kiro_tools,
+    installed_opencode_permission,
     kiro_install_predates_native_enforcement,
 )
 from cli_agent_orchestrator.services.memory_gateway import (
@@ -128,7 +130,11 @@ from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
 from cli_agent_orchestrator.services.settings_service import get_max_terminals
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
-from cli_agent_orchestrator.utils import agent_profiles
+from cli_agent_orchestrator.utils import agent_profiles, delegation
+from cli_agent_orchestrator.utils.delegation import (
+    DelegationCeilingError,
+    InstalledPolicyExceedsAllowlistError,
+)
 from cli_agent_orchestrator.utils.enforcement import NATIVE as NATIVE_ENFORCEMENT
 from cli_agent_orchestrator.utils.enforcement import (
     PROVIDER_ENFORCEMENT,
@@ -830,8 +836,15 @@ def _request_fingerprint(
     initial_message: Optional[str],
     initial_message_orchestration_type: Optional[OrchestrationType],
     claim_id: Optional[str] = None,
+    caller_ceiling: Optional[List[str]] = None,
 ) -> str:
     """Fingerprint the create-terminal request an idempotency key stands for.
+
+    ``caller_ceiling`` (a remote caller's asserted delegation ceiling, see
+    ``create_terminal``) is appended ONLY when supplied, like ``claim_id``, so
+    every request that does not carry it keeps the digest it had before the
+    field existed. It is hashed because it decides the created terminal's
+    recorded ceiling, i.e. a privilege, exactly as ``allowed_tools`` does.
 
     Review on PR #634, issue #616. Stored alongside the key so a later call
     presenting the same key can be told apart: same fingerprint is a RETRY
@@ -1012,6 +1025,10 @@ def _request_fingerprint(
     ]
     if claim_id is not None:
         parts.append(claim_id)
+    if caller_ceiling is not None:
+        parts.append(
+            _FP_TOOLS_SET + "".join(_fingerprint_component(t) for t in sorted(caller_ceiling))
+        )
     return hashlib.sha256(
         "\x00".join(_fingerprint_component(part) for part in parts).encode("utf-8")
     ).hexdigest()
@@ -1046,6 +1063,8 @@ async def create_terminal(
     metadata: Optional[Dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
     claim_id: Optional[str] = None,
+    delegating_terminal_id: Optional[str] = None,
+    caller_ceiling: Optional[list[str]] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -1075,7 +1094,25 @@ async def create_terminal(
         caller_id: Terminal ID of the supervisor that created this terminal
             via handoff/assign. Recorded so send_message can route callbacks
             structurally instead of parsing IDs out of message text (issue #284).
-            None for operator-launched terminals.
+            None for operator-launched terminals. When set, the caller's STORED
+            ROW also bounds this terminal: its resolved ``allowed_tools`` must
+            fit inside the caller's recorded delegation ceiling and its own
+            ceiling is capped by it (``utils/delegation.py``); a caller whose
+            row cannot be read refuses the create (fail closed). A client
+            ``allowed_tools`` list is therefore never trusted beyond what the
+            caller may delegate.
+        delegating_terminal_id: The terminal whose stored ceiling bounds this
+            create when it is NOT recorded as ``caller_id``. Workflow steps use
+            it: the agent that ran ``workflow_run`` is not the step's callback
+            parent, but the step still inherits its ceiling. Ignored when
+            ``caller_id`` is set (the caller row wins).
+        caller_ceiling: A ceiling ASSERTED by the client, for a caller whose
+            row lives on another node (``assign``/``handoff`` with
+            ``target_host``). Accepted only when neither ``caller_id`` nor
+            ``delegating_terminal_id`` names a local row; the created
+            terminal is bounded by it exactly as by a stored ceiling. The
+            client sends its own stored ceiling and refuses to place on a node
+            that does not advertise ``delegation_ceiling`` in ``/health``.
         engine: Explicit Kiro engine. For Kiro, it must agree with the selected
             profile's engine when both are present; omitted resolves to v2.
         kiro_capability_probe: Optional test seam for the bounded wrapper probe.
@@ -1301,6 +1338,8 @@ async def create_terminal(
             metadata=metadata,
             idempotency_key=idempotency_key,
             claim_id=claim_id,
+            delegating_terminal_id=delegating_terminal_id,
+            caller_ceiling=caller_ceiling,
             ephemeral_state=state,
         )
     except BaseException as exc:
@@ -1334,6 +1373,8 @@ async def _create_terminal_unguarded(
     metadata: Optional[Dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
     claim_id: Optional[str] = None,
+    delegating_terminal_id: Optional[str] = None,
+    caller_ceiling: Optional[list[str]] = None,
     *,
     ephemeral_state: _EphemeralLaunchState,
 ) -> Terminal:
@@ -1361,6 +1402,7 @@ async def _create_terminal_unguarded(
             initial_message,
             initial_message_orchestration_type,
             claim_id,
+            caller_ceiling=caller_ceiling,
         )
         existing_record = get_idempotency_record(idempotency_key)
         existing_terminal_id = existing_record.terminal_id if existing_record else None
@@ -1548,6 +1590,193 @@ async def _create_terminal_unguarded(
             allowed_tools = resolve_allowed_tools(
                 profile.allowedTools, profile.role, mcp_server_names
             )
+
+        # Step 0c: Delegation ceiling (utils/delegation.py). Runs on EVERY
+        # creation path -- in-session create, assign/handoff, run-step and
+        # workflow steps, remote placement -- because this is the one function
+        # they all reach, and before any backend resource is allocated. The
+        # bounding ceiling comes from the CALLER'S STORED ROW (never from a
+        # profile, which is how an intermediate ``role: supervisor`` profile
+        # would otherwise launder privilege), or, for a caller on another node,
+        # from the ceiling that caller asserted in the request. Whatever
+        # ``allowed_tools`` the client sent is checked against it here, so the
+        # server never trusts a client list beyond what the caller may delegate.
+        bounding_id = caller_id if caller_id is not None else delegating_terminal_id
+        if caller_ceiling is not None and bounding_id is not None:
+            raise ValueError(
+                "caller_ceiling is only accepted without caller_id/delegating_terminal_id: "
+                "a caller with a row on this node is bounded by that row"
+            )
+        declared_ceiling = delegation.resolve_delegate_tools(
+            getattr(profile, "delegateTools", None),
+            getattr(profile, "role", None),
+            allowed_tools,
+        )
+        parent_ceiling: Optional[List[str]] = None
+        parent_profile_name: Optional[str] = None
+        if bounding_id is not None:
+            parent_row = get_terminal_metadata(bounding_id)
+            if parent_row is None:
+                raise DelegationCeilingError(
+                    f"Delegation refused: caller terminal {bounding_id} has no registered "
+                    f"row on this node, so its delegation ceiling cannot be evaluated and "
+                    f"'{agent_profile}' is not launched. A remote caller must place through "
+                    f"assign/handoff with target_host, which carries its ceiling.",
+                    parent_id=bounding_id,
+                    child_profile=agent_profile,
+                )
+            parent_profile_name = parent_row.get("agent_profile")
+            try:
+                parent_ceiling = delegation.ceiling_from_row(parent_row)
+            except Exception as exc:  # noqa: BLE001  (an unresolvable ceiling must refuse)
+                parent_ceiling = None
+                logger.warning(
+                    "delegation ceiling of caller %s could not be resolved: %s", bounding_id, exc
+                )
+            if parent_ceiling is None:
+                raise DelegationCeilingError(
+                    f"Delegation refused: the delegation ceiling of caller terminal "
+                    f"{bounding_id} (profile '{parent_profile_name}') could not be resolved, "
+                    f"so '{agent_profile}' is not launched. Relaunch the caller so its "
+                    f"ceiling is recorded.",
+                    parent_id=bounding_id,
+                    child_profile=agent_profile,
+                )
+        else:
+            # Remote placement (assign/handoff with target_host) is recognised by
+            # the callback terminal the supervisor injects into the worker's env.
+            # Such a create MUST carry the supervisor's ceiling: without it the
+            # request would take the operator branch below and launch unbounded,
+            # which is exactly what an older or edited client would produce. When
+            # the callback terminal happens to have a row on THIS node (loopback,
+            # single-node fleets), the asserted ceiling must also fit inside what
+            # that row records; the row wins over the assertion.
+            remote_marker = (env_vars or {}).get(CALLBACK_TERMINAL_ID_ENV)
+            if remote_marker and caller_ceiling is None:
+                raise DelegationCeilingError(
+                    f"Delegation refused: a remote placement for terminal {remote_marker} "
+                    f"must carry caller_ceiling (the supervisor's recorded delegation "
+                    f"ceiling); without it '{agent_profile}' would launch unbounded. "
+                    f"Upgrade the placing node's cao so assign/handoff send it.",
+                    parent_id=remote_marker,
+                    child_profile=agent_profile,
+                )
+            if remote_marker and caller_ceiling is not None:
+                local_row = get_terminal_metadata(remote_marker)
+                if local_row is not None:
+                    local_ceiling = delegation.ceiling_from_row(local_row)
+                    if local_ceiling is None:
+                        raise DelegationCeilingError(
+                            f"Delegation refused: the delegation ceiling of terminal "
+                            f"{remote_marker} (profile '{local_row.get('agent_profile')}') "
+                            f"could not be resolved, so '{agent_profile}' is not launched. "
+                            f"Relaunch it so its ceiling is recorded.",
+                            parent_id=remote_marker,
+                            child_profile=agent_profile,
+                        )
+                    over = delegation.tools_exceeding(caller_ceiling, local_ceiling)
+                    if over:
+                        raise DelegationCeilingError(
+                            f"Delegation refused: the asserted caller_ceiling for terminal "
+                            f"{remote_marker} grants {', '.join(over)} beyond that terminal's "
+                            f"recorded ceiling [{', '.join(local_ceiling)}]; the recorded "
+                            f"ceiling is authoritative.",
+                            excess=over,
+                            parent_id=remote_marker,
+                            child_profile=agent_profile,
+                        )
+                    parent_profile_name = local_row.get("agent_profile")
+                    bounding_id = remote_marker
+            if caller_ceiling is not None:
+                parent_ceiling = list(caller_ceiling)
+        if parent_ceiling is not None:
+            delegate_tools = delegation.bound_child(
+                child_allowed_tools=allowed_tools,
+                child_declared_ceiling=declared_ceiling,
+                caller_ceiling=parent_ceiling,
+                parent_id=bounding_id,
+                parent_profile=parent_profile_name,
+                child_profile=agent_profile,
+            )
+        else:
+            # Operator-launched (cao launch, POST /sessions without a caller):
+            # the operator is the authority and the profile's declaration stands.
+            delegate_tools = declared_ceiling
+
+        # Step 0d: install-time providers run the INSTALLED policy, not the list
+        # this request resolved. For a create bounded by a RESTRICTED ceiling the
+        # row must be the effective policy, so a Kiro agent file that grants more
+        # than the row is refused here, before allocation, with the remedy. An
+        # unrestricted delegator (ceiling ``*``) and operator launches keep the
+        # launch-time warning instead: nothing the creator may not delegate can
+        # leak there, and the launch prompt already says what runs.
+        if (
+            provider == ProviderType.KIRO_CLI.value
+            and parent_ceiling is not None
+            and "*" not in parent_ceiling
+            and allowed_tools is not None
+            and "*" not in allowed_tools
+        ):
+            from cli_agent_orchestrator.utils.tool_mapping import kiro_agent_tools
+
+            installed = installed_kiro_tools(agent_profile)
+            if installed is not None:
+                permitted = set(kiro_agent_tools(allowed_tools))
+                wider = [tool for tool in installed if tool not in permitted]
+                if wider:
+                    raise InstalledPolicyExceedsAllowlistError(
+                        f"Delegation refused: the installed Kiro agent '{agent_profile}' "
+                        f"grants {', '.join(wider)} beyond the bounded allowlist "
+                        f"[{', '.join(allowed_tools)}] this terminal is allowed to run with; "
+                        f"Kiro enforces the installed file, so the launch would exceed the "
+                        f"creator's delegation ceiling. Remedy: reinstall the profile with "
+                        f"the narrower policy (`cao install {agent_profile} --provider "
+                        f"kiro_cli` after setting allowedTools), or launch it without an "
+                        f"allowed_tools override.",
+                        excess=wider,
+                        parent_id=bounding_id,
+                        child_profile=agent_profile,
+                    )
+
+        # Same rule for OpenCode, the other install-time provider: the launch
+        # runs the installed ``permission:`` block, so under a restricted ceiling
+        # a block that allows a tool the bounded allowlist does not is refused.
+        if (
+            provider == ProviderType.OPENCODE_CLI.value
+            and parent_ceiling is not None
+            and "*" not in parent_ceiling
+            and allowed_tools is not None
+            and "*" not in allowed_tools
+        ):
+            from cli_agent_orchestrator.providers import opencode_cli
+            from cli_agent_orchestrator.utils.opencode_permissions import (
+                cao_tools_to_opencode_permission,
+            )
+
+            installed_permission = installed_opencode_permission(
+                agent_profile, opencode_cli.OPENCODE_CONFIG_DIR / "agents"
+            )
+            if installed_permission is not None:
+                bounded = cao_tools_to_opencode_permission(allowed_tools)
+                wider = sorted(
+                    tool
+                    for tool, verdict in installed_permission.items()
+                    if verdict == "allow" and bounded.get(tool) != "allow"
+                )
+                if wider:
+                    raise InstalledPolicyExceedsAllowlistError(
+                        f"Delegation refused: the installed OpenCode agent '{agent_profile}' "
+                        f"allows {', '.join(wider)} beyond the bounded allowlist "
+                        f"[{', '.join(allowed_tools)}] this terminal is allowed to run with; "
+                        f"OpenCode enforces the installed permission block, so the launch "
+                        f"would exceed the creator's delegation ceiling. Remedy: reinstall the "
+                        f"profile with the narrower policy (`cao install {agent_profile} "
+                        f"--provider opencode_cli` after setting allowedTools), or launch it "
+                        f"without an allowed_tools override.",
+                        excess=wider,
+                        parent_id=bounding_id,
+                        child_profile=agent_profile,
+                    )
 
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
@@ -1834,6 +2063,7 @@ async def _create_terminal_unguarded(
                         idempotency_key=idempotency_key,
                         request_fingerprint=request_fingerprint,
                         new_session_incarnation=created_session,
+                        delegate_tools=delegate_tools,
                         # The initial message is ACCEPTED the moment this row is
                         # visible, so its outcome starts life as pending in the same
                         # transaction (#566): a restart between here and the deferred
@@ -2004,6 +2234,7 @@ async def _create_terminal_unguarded(
             ),
             caller_id=caller_id,
             allowed_tools=allowed_tools,
+            delegate_tools=delegate_tools,
             engine=resolved_engine,
             shell_command=shell_command,
             group=group,
@@ -3715,6 +3946,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "caller_id": metadata.get("caller_id"),
             "callback_terminal_id": callback_terminal_id_for_session(metadata["tmux_session"]),
             "allowed_tools": metadata.get("allowed_tools"),
+            "delegate_tools": metadata.get("delegate_tools"),
             "engine": metadata.get("engine"),
             "group": metadata.get("group"),
             "metadata": public_metadata,

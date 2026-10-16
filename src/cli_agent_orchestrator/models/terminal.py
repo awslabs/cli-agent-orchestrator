@@ -105,6 +105,15 @@ class Terminal(BaseModel):
         ),
     )
     allowed_tools: Optional[List[str]] = Field(None, description="Allowed CAO tools")
+    delegate_tools: Optional[List[str]] = Field(
+        None,
+        description=(
+            "Delegation ceiling: the most this terminal may grant to children it "
+            "creates via assign/handoff/workflow steps. Resolved from the profile's "
+            "delegateTools (or the role default) and capped by the creator's own "
+            "ceiling at creation time. None for rows written before the column existed."
+        ),
+    )
     engine: Optional[KiroEngine] = Field(None, description="Resolved Kiro engine")
     shell_command: Optional[str] = Field(
         None, description="Shell process name captured before kiro launch"

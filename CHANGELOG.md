@@ -625,6 +625,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Child allowlists are bounded by the creator's delegation ceiling.** A
+  terminal's `allowedTools` limited what it could call, not what it could
+  create: a restricted agent could `assign` or `handoff` to a profile holding
+  tools it lacked (for example a read-only reviewer launching a developer with
+  `execute_bash`), and the in-session create endpoint stored whatever
+  `allowed_tools` string the client sent. `create_terminal` now refuses a child
+  whose resolved tools exceed the creator's **delegation ceiling**, recorded on
+  the new `terminals.delegate_tools` column at creation (migration runs at
+  server start), read from the creator's stored row, and never re-derived from
+  a profile, so an intermediate `role: supervisor` profile cannot widen a
+  restricted tree. The check runs on every creation path: `assign`/`handoff`
+  (the MCP layer prechecks and the server re-checks), `POST
+  /sessions/{name}/terminals` with a client `allowed_tools` string (403),
+  `/terminals/run-step`, and workflow steps on both tiers (YAML steps and the
+  run-step calls a `.py` script dispatches), which now inherit the ceiling of
+  the terminal that started or resumed the run (the MCP workflow tools send
+  `caller_id`). A refused step settles FAILED with the refusal text instead
+  of escaping the engine. Ephemeral agents already enforced this rule; installed profiles
+  now use the same comparator (`utils/delegation.py`). Profiles declare a
+  ceiling with `delegateTools`; the built-in `supervisor` role defaults to `*`
+  and every other role to its own list, so the documented supervisor → developer
+  pattern and every shipped example keep working. `cao launch` prints the
+  ceiling as `Delegates:`; `Terminal` responses carry `delegate_tools`;
+  `/health` advertises `features: ["delegation_ceiling"]`.
+  The `memory_manager` sidecar is bounded by its primary's recorded ceiling;
+  `cao workflow run`/`resume`/`step` from inside a terminal send the terminal's
+  id; a delegated Kiro CLI launch whose installed agent file grants more than
+  the bounded allowlist is refused with the reinstall remedy; MCP references
+  are compared with the resolver's selector semantics (`@plugin-*` covers
+  `@plugin-search`, `@server` covers `@server/tool`; a pattern-shaped child
+  entry is covered only by an identical or bare-`*` grant). OpenCode CLI gets
+  the same installed-policy check as Kiro for delegated launches. The starting
+  terminal is journaled on the run row (`workflow_run.caller_id`, migration at
+  server start) so a resumed run re-binds to the original caller, and a
+  script-tier run-step whose run has no live record after a restart is refused.
+  Two guards against the class recurring: `test/test_launch_path_invariant.py`
+  enumerates every terminal-launch path from the source and fails on one that
+  neither threads a ceiling nor is a classified operator path, and
+  `test/services/test_delegation_forwarding_invariant.py` checks on every run
+  that the ceiling arguments reach `create_terminal` and cause the refusal.
+  **Breaking changes:** (1) a user-authored restricted role or profile that
+  launches wider children is now refused with a message naming the parent, the
+  child, the exceeding tools and the remedy (add `delegateTools` to the parent
+  profile and relaunch it); (2) terminals created before the upgrade have no
+  recorded ceiling and are bounded by their own recorded `allowedTools` until
+  relaunched, and a pre-upgrade row with neither column recorded cannot
+  delegate until relaunched (the profile on disk is never consulted for an
+  existing terminal); (3) `assign`/`handoff` with `target_host` send the
+  caller's ceiling as `caller_ceiling` and refuse to place work on a node whose
+  `/health` lacks the feature, and the receiving node refuses a remote-shaped
+  create (callback env present) that omits the ceiling, so mixed-version
+  fleets must upgrade the worker nodes first; (4) workflow steps started from
+  inside a CAO terminal inherit that terminal's ceiling rather than running
+  unbounded; (5) `POST /sessions/{name}/terminals` requires `caller_id`
+  (operator launches use `POST /sessions`). `caller_id` and `caller_ceiling`
+  remain client assertions under the shared bearer; binding caller identity to
+  an authenticated terminal is the follow-up. The issue #141 behaviour (a child `allowedTools: ["*"]` is not
+  collapsed to the parent's list) is kept within the parent's ceiling.
 - New `Actions Security` CI job runs zizmor 1.30.1 over `.github/` on every PR
   and push to `main`, failing on Medium-or-higher findings. Accepted findings
   are listed with reasons in `.github/zizmor.yml` (checkout credential

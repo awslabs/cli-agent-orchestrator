@@ -35,6 +35,21 @@ from cli_agent_orchestrator.utils.orchestration import (
 _SRV = "cli_agent_orchestrator.utils.orchestration"
 
 
+@pytest.fixture(autouse=True)
+def _remote_node_enforces_ceilings(request):
+    """Every remote placement first probes the target's /health for the
+    ``delegation_ceiling`` feature and reads this terminal's own recorded
+    ceiling. Those two seams are stubbed here (target enforces; ceiling ``*``)
+    so the placement tests below stay about placement. The probe itself is
+    covered in test_delegation_remote.py.
+    """
+    with (
+        patch(f"{_SRV}._require_remote_delegation_ceiling", return_value=None),
+        patch(f"{_SRV}._own_delegation_ceiling", return_value=["*"]),
+    ):
+        yield
+
+
 def _response(status_code=200, json_body=None):
     resp = MagicMock()
     resp.status_code = status_code
@@ -157,6 +172,8 @@ class TestAssignRemote:
             "CAO_CALLBACK_URL": "http://cao-supervisor:9889",
             "CAO_CALLBACK_TERMINAL_ID": "a1b2c3d4",
         }
+        # The supervisor's recorded delegation ceiling travels with the request.
+        assert body["caller_ceiling"] == ["*"]
 
     @patch(f"{_SRV}.requests")
     def test_elastic_callback_url_overrides_the_full_control_api(self, mock_requests):
@@ -258,6 +275,9 @@ class TestHandoffRemote:
         assert "session_name" not in payload
         assert "caller_id" not in payload
         assert "allowed_tools" not in payload
+        # ...except the supervisor's recorded delegation ceiling, which the
+        # remote node needs to bound the worker it creates.
+        assert payload["caller_ceiling"] == ["*"]
 
     @patch(f"{_SRV}._get_cleanup_nudge", return_value="")
     @patch(f"{_SRV}._resolve_handoff_provider")
