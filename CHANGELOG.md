@@ -201,8 +201,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fallback to the previous verdict for an end state that paints no summary.
   While a terminal is PROCESSING, the status monitor's per-poll re-derivation
   now reads Claude Code from its composited screen (the provider opts in with
-  `status_recheck_uses_screen`) instead of the raw rolling window, whose
-  repaint fragments and size cap left no input box to anchor on (#865).
+  `status_recheck_uses_screen`, #907) instead of the raw rolling window, whose
+  repaint fragments and size cap left no input box to anchor on. That re-check
+  reuses its verdict while the output is unchanged, so the 15 s fallback lands
+  at the next stale-pane re-check (#558) after the grace period (#865).
 
 - Address five baseline CodeQL alerts without suppressions: remove filesystem
   probes from plugin source-kind inference, confine Kiro policy-file inspection

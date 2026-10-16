@@ -2814,9 +2814,9 @@ class TestClaudeCodeTurnEndGate:
 
     @staticmethod
     def _both(provider: ClaudeCodeProvider, lines: list) -> tuple:
-        """(rendered-screen verdict, raw-stream verdict) for one frame. The
-        run-step wait polls the RAW detector while the cached status is PROCESSING,
-        even with the pyte path on, so both must agree."""
+        """(rendered-screen verdict, raw-stream verdict) for one frame. While the
+        cached status is PROCESSING the run-step wait re-reads the raw window with
+        the pyte path off and the composite with it on, so both must agree."""
         return (
             provider.get_status_from_screen(lines),
             provider.get_status("\n".join(lines)),

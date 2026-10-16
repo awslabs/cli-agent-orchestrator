@@ -17,6 +17,7 @@ import pytest
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.status_monitor import (
     STALE_PROCESSING_BUFFER_QUIET_S,
+    STALE_PROCESSING_CAPTURE_INTERVAL_S,
     STALE_PROCESSING_CONFIRM_TTL_S,
     StatusMonitor,
 )
@@ -1872,25 +1873,6 @@ class TestPollRederivesOnRegisteredDetector:
     @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
-    def test_screen_provider_is_polled_from_the_composite(self, mock_pm, mock_get_backend):
-        provider = MagicMock()
-        provider.supports_screen_detection = True
-        provider.status_recheck_uses_screen = True
-        provider.get_status_from_screen.return_value = TerminalStatus.PROCESSING
-        provider.get_status.return_value = TerminalStatus.COMPLETED  # what the raw window would say
-        mock_pm.get_provider.return_value = provider
-        mock_get_backend.return_value = _backend(event_inbox=False)
-
-        sm = self._monitor(provider, ["⏺ BEGIN", "  1 Hydrogen …", "────", "❯", "────"])
-
-        assert sm.get_status("t1") == TerminalStatus.PROCESSING
-        provider.get_status_from_screen.assert_called_once()
-        provider.get_status.assert_not_called()
-        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
-
-    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
-    @patch("cli_agent_orchestrator.backends.registry.get_backend")
-    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     def test_screen_provider_ready_verdict_from_the_composite_is_applied(
         self, mock_pm, mock_get_backend
     ):
@@ -1925,25 +1907,79 @@ class TestPollRederivesOnRegisteredDetector:
         provider.get_status_from_screen.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.providers.claude_code.get_backend")
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
-    def test_screen_provider_without_the_opt_in_keeps_the_raw_rederivation(
-        self, mock_pm, mock_get_backend
+    def test_claude_valve_fires_through_the_stale_pane_recheck(
+        self, mock_pm, mock_get_backend, mock_claude_backend
     ):
-        """A screen-path provider that has not opted in (kimi_cli) is re-read
-        from the raw window as before; its turn bookkeeping lives there."""
-        provider = MagicMock()
-        provider.supports_screen_detection = True
-        provider.status_recheck_uses_screen = False
-        provider.get_status.return_value = TerminalStatus.COMPLETED
+        """A real ClaudeCodeProvider through ``get_status``, polled once a second
+        as a run-step waiter does, on an end state that paints no summary (the
+        reply to ``/compact``). The poll re-check reads the composite once and
+        reuses that verdict while the output stays the same (#907), so the grace
+        valve runs again only through the stale-pane re-check (#558), every 3 s
+        once the buffer is quiet. PROCESSING holds through the grace period; the
+        fallback lands at the first capture read after it and is applied on the
+        confirming read. The composite keeps a hint row the pane has cleared, so
+        the two views are different frames (the P2 of the review)."""
+        from cli_agent_orchestrator.providers.claude_code import (
+            TURN_END_GRACE_S,
+            ClaudeCodeProvider,
+        )
+
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        backend.get_history.return_value = ""  # the dispatch snapshot: nothing on screen yet
+        mock_get_backend.return_value = backend
+        mock_claude_backend.return_value = backend
+        provider = ClaudeCodeProvider("t1", "s", "w")
+        provider.mark_input_received()
+        clock = {"now": 1000.0}
+        provider._turn_gate_clock = lambda: clock["now"]
         mock_pm.get_provider.return_value = provider
-        mock_get_backend.return_value = _backend(event_inbox=False)
 
-        sm = self._monitor(provider, ["> "])
+        rail = "─" * 40
+        pane = ["❯ /compact", "  ⎿  Not enough messages to compact.", rail, "❯ ", rail]
+        hint = "  ❯ /compact        Free up context by summarizing the conversation so far"
+        composite = pane[:2] + [hint] + pane[2:]
+        backend.get_history.return_value = "\n".join(pane)  # the capture-pane read
 
-        assert sm.get_status("t1") == TerminalStatus.COMPLETED
-        provider.get_status.assert_called_once_with(sm._buffers["t1"])
-        provider.get_status_from_screen.assert_not_called()
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = "raw repaint fragments"
+        sm._buffer_changed_at["t1"] = -1000.0  # quiet: the stale-pane re-check may run
+        with sm._lock:
+            sm._feed_screen_locked("t1", "\r\n".join(composite))
+        composite_reads = []
+        real_detect_screen = sm._detect_screen
+
+        def counting_detect_screen(terminal_id, prov):
+            composite_reads.append(clock["now"])
+            return real_detect_screen(terminal_id, prov)
+
+        sm._detect_screen = counting_detect_screen  # type: ignore[method-assign]
+
+        ready_at = None
+        for t in range(1, 61):
+            clock["now"] = 1000.0 + t
+            if t % 3 == 0:
+                # The capture read is rate-limited on real time; release it on
+                # the 3 s cadence it has live instead of sleeping.
+                sm._last_stale_capture_check.pop("t1", None)
+            status = sm.get_status("t1")
+            if status != TerminalStatus.PROCESSING:
+                ready_at = t
+                break
+            assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+        assert ready_at is not None, "the valve never fired through the stale-pane re-check"
+        assert ready_at > TURN_END_GRACE_S
+        # One capture read to fall back, one to confirm, on the 3 s cadence.
+        assert ready_at <= TURN_END_GRACE_S + 2 * STALE_PROCESSING_CAPTURE_INTERVAL_S
+        assert status == TerminalStatus.IDLE
+        assert sm._last_status["t1"] == TerminalStatus.IDLE
+        assert len(composite_reads) == 1, "the poll re-check must reuse its verdict"
+        assert backend.get_history.call_count >= 3  # dispatch snapshot + fall back + confirm
 
 
 class TestCopilotBoxedComposerRecovery:
