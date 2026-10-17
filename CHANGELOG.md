@@ -120,6 +120,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `claude_code` workers running with Claude Code's `prefersReducedMotion` setting
+  are no longer reported as completed while they work. That setting draws the
+  spinner with a static `●`, which both status paths read as a finished response,
+  so `handoff` and workflow steps tore the worker down about 2s after sending the
+  task. A `● <Word>… (` line is now treated as a live spinner (#908).
+
 - Kiro profile installation now preserves profile-defined `resources` alongside
   CAO's default context and skill resources. Reinstall existing profiles to
   include their configured resources in the generated Kiro agent configuration
