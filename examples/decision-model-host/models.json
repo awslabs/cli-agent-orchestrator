@@ -1,0 +1,29 @@
+{
+  "llama_tag": "b11669",
+  "jevk5_tag": "v0.3.3",
+  "idle_minutes": 120,
+  "cuda_arch": 75,
+  "models": {
+    "jevk5-4b": {
+      "repo": "alibiserikbay/JevK5-GGUF",
+      "file": "jevk5-4b-v0.3-Q8_0.gguf",
+      "sha256": "aea433883bc7ed399f2fbd539e53d2eac7caf71a946fe6650995a413979d4a30",
+      "name": "jevk5-4b-v0.3-q8",
+      "temperature": 1.367
+    },
+    "plumb-4b": {
+      "repo": "crh225/plumb-4b-GGUF",
+      "file": "plumb-4b-v5-Q8_0.gguf",
+      "sha256": "a0d2974e04541b79e167d8acabfb7a7e4b4f93f3b47ac4a006d196d240f68177",
+      "name": "plumb-4b-v5-q8",
+      "temperature": 2.07
+    },
+    "jevk5-2b": {
+      "repo": "alibiserikbay/JevK5-GGUF",
+      "file": "jevk5-2b-v0.2-Q8_0.gguf",
+      "sha256": "17222f27a89273aca7614e34083a530b0d90cd51cffeb225c7acc8e79a7e0eba",
+      "name": "jevk5-2b-v0.2-q8",
+      "temperature": 1.42
+    }
+  }
+}
