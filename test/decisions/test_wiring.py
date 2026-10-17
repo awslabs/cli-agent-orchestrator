@@ -319,7 +319,15 @@ async def test_cancellation_binds_pending_plan(handler_path, path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["terminal", "step"])
-async def test_claimed_launch_skips_the_decision_site(handler_path, path):
+@pytest.mark.parametrize(
+    "agent,model",
+    [
+        ("Worker-fixture_task-0a1b", None),
+        ("Worker-fixture_task-0a1b", "model-x"),
+        ("developer", None),
+    ],
+)
+async def test_claimed_launch_skips_the_decision_site(handler_path, path, agent, model):
     from fastapi import BackgroundTasks
 
     api, client, engine, decider, store, events, calls = handler_path
@@ -335,7 +343,8 @@ async def test_claimed_launch_skips_the_decision_site(handler_path, path):
                 background_tasks=BackgroundTasks(),
                 body=api.RunStepRequest(
                     provider="codex",
-                    agent="developer",
+                    agent=agent,
+                    model=model,
                     prompt="task",
                     orchestration_type="handoff",
                     delegation_message="task",
@@ -347,8 +356,9 @@ async def test_claimed_launch_skips_the_decision_site(handler_path, path):
                 request=request,
                 response=Response(),
                 session_name="cao-fixture",
-                agent_profile="developer",
+                agent_profile=agent,
                 provider="codex",
+                model=model,
                 defer_init=True,
                 claim_id=claim,
                 body=api.CreateTerminalBody(
@@ -357,10 +367,34 @@ async def test_claimed_launch_skips_the_decision_site(handler_path, path):
                     delegation_message="task",
                 ),
             )
-    # A claimed launch keeps its own decision path: no decider call, no record, no plan.
+    # The launch is reached; a per-call model is left for the ephemeral policy to refuse.
+    assert target.call_args.kwargs["claim_id"] == claim
+    assert target.call_args.kwargs["model"] == model
+    if agent == "developer":
+        # A claim on an installed profile claims nothing, so the launch is routed as usual.
+        assert decider.calls == 1 and "launch_plan" in target.call_args.kwargs
+        return
+    # A claimed ephemeral launch keeps its own decision path: no decider call, no record, no plan.
     assert decider.calls == 0 and store.list() == [] and events == []
     assert "launch_plan" not in target.call_args.kwargs
-    assert target.call_args.kwargs["claim_id"] == claim
+
+
+@pytest.mark.parametrize("path", ["session", "terminal", "step"])
+def test_unclaimed_ephemeral_target_asks_nothing_and_writes_nothing(
+    handler_path, path, monkeypatch
+):
+    from cli_agent_orchestrator.decisions.targets import TargetKind
+
+    api, client, engine, decider, store, events, calls = handler_path
+    monkeypatch.setattr(api, "profile_source", lambda name: TargetKind.EPHEMERAL)
+    response = post_delegation(client, path)
+    assert response.status_code in (200, 201), response.text
+    # The engine asks nothing and records nothing for an ephemeral target, with or without a claim.
+    assert decider.calls == 0 and store.list() == [] and events == []
+    assert len(calls) == 1
+    plan = calls[0].get("launch_plan")
+    assert plan is None or (plan.record_ids == () and plan.model is None)
+    assert "X-CAO-Decision" not in response.headers
 
 
 @pytest.mark.parametrize("path", ["session", "terminal", "step"])

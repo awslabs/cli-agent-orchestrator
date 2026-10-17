@@ -98,7 +98,7 @@ from cli_agent_orchestrator.decisions.engine import (
 )
 from cli_agent_orchestrator.decisions.owner import WORKFLOW_STEP, launch_owner
 from cli_agent_orchestrator.decisions.policy import DecisionInputError
-from cli_agent_orchestrator.decisions.targets import profile_source
+from cli_agent_orchestrator.decisions.targets import TargetKind, profile_source
 from cli_agent_orchestrator.decisions.types import LaunchPlan
 from cli_agent_orchestrator.ext_apps import mount_widget_static
 from cli_agent_orchestrator.graph.models import GraphView
@@ -3445,6 +3445,12 @@ def _launch_options(plan: LaunchPlan | None) -> dict[str, Any]:
     return {"launch_plan": plan} if plan is not None else {}
 
 
+def _claimed_ephemeral(agent_profile: str | None, claim_id: str | None) -> bool:
+    # A claimed ephemeral launch has its own decision path, so delegation sites skip it.
+    # A claim on an installed profile claims nothing, so that launch is routed as usual.
+    return claim_id is not None and profile_source(agent_profile) is TargetKind.EPHEMERAL
+
+
 def _bind_unlaunched(plan: LaunchPlan | None) -> None:
     if plan is not None:
         try:
@@ -3909,8 +3915,11 @@ async def create_terminal_in_session(
                     ),
                 )
 
-        # A claimed (ephemeral) launch has its own decision path; this site skips it.
-        if body and body.delegation_message is not None and claim_id is None:
+        if (
+            body
+            and body.delegation_message is not None
+            and not _claimed_ephemeral(agent_profile, claim_id)
+        ):
             launch_plan = await prepare_launch(
                 DelegationRequest(
                     kind="handoff" if body.delegation_kind else "assign",
@@ -4768,10 +4777,9 @@ async def run_step(
             # EXECUTE falls through — the step runs normally.
 
         owner = launch_owner("run_step", body)
-        # A claimed (ephemeral) launch has its own decision path; this site skips it.
         if (
             body.reuse_terminal_id is None
-            and body.claim_id is None
+            and not _claimed_ephemeral(body.agent, body.claim_id)
             and (body.orchestration_type is not None or owner == WORKFLOW_STEP)
         ):
             launch_plan = await prepare_launch(
