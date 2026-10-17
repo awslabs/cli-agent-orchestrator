@@ -228,7 +228,12 @@ class BaseProvider(ABC):
     # rolling buffer. Set True when the raw stream of the provider does not
     # parse like its screen: Codex redraws only the cells that change, so the
     # raw buffer of a working turn can parse as IDLE, and that IDLE ended the
-    # PROCESSING of the turn just after it began.
+    # PROCESSING of the turn just after it began. Claude Code's Ink TUI repaints
+    # changed cells only, so the raw window holds glyph fragments and, once a
+    # long answer has pushed the input box past the size cap, no box at all
+    # for its detector to anchor on (GH #865). Providers that leave this False
+    # keep the raw re-check, which their detectors and turn bookkeeping were
+    # built around.
     status_recheck_uses_screen: bool = False
 
     # Opt-in for the deferred-init direct status probe (capture-pane bypass).
