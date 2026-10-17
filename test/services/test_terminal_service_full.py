@@ -39,6 +39,7 @@ class TestCreateTerminal:
     """Tests for create_terminal function."""
 
     @pytest.mark.parametrize("registry_bound", [False, True])
+    @pytest.mark.parametrize("description", [None, "", "  ", "Review\ncode", "x" * 64, "😀" * 65])
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
@@ -65,6 +66,7 @@ class TestCreateTerminal:
         mock_status_monitor,
         mock_delete_terminals_by_session,
         registry_bound,
+        description,
     ):
         """Test creating terminal with new session."""
         mock_gen_id.return_value = "test1234"
@@ -79,8 +81,17 @@ class TestCreateTerminal:
 
         mock_db_create.return_value = {"ephemeral": registry_bound}
         result = await create_terminal(
-            "kiro_cli", "developer", new_session=True, metadata={"ephemeral": not registry_bound}
+            "kiro_cli",
+            "developer",
+            new_session=True,
+            description=description,
+            metadata={"ephemeral": not registry_bound},
         )
+        from cli_agent_orchestrator.utils.description import normalize_description
+
+        expected_description = normalize_description(description, truncate=True)
+        assert result.description == expected_description
+        assert mock_db_create.call_args.kwargs["description"] == expected_description
         assert result.ephemeral is registry_bound
 
         assert result.id == "test1234"
@@ -363,6 +374,7 @@ class TestCreateTerminal:
             engine="v2",
             group=None,
             metadata=None,
+            description=None,
             working_directory=os.path.realpath(os.getcwd()),
             deferred_init_external_owner=False,
             session_incarnation_id=result.session_incarnation_id,

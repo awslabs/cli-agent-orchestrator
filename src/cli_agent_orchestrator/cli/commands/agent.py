@@ -111,7 +111,14 @@ def agent():
     help="Give the worker its own git worktree instead of sharing the caller's checkout.",
 )
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
-def assign_cmd(agent_profile, message, working_directory, engine, model, use_worktree, as_json):
+@click.option(
+    "--description",
+    default=None,
+    help="Optional description of the worker responsibility (64 Unicode code points; truncated on creation).",
+)
+def assign_cmd(
+    agent_profile, message, working_directory, engine, model, use_worktree, as_json, description
+):
     """Assign a task to a new worker terminal without blocking.
 
     Equivalent to the MCP `assign` tool. Must run from inside a CAO terminal
@@ -132,6 +139,7 @@ def assign_cmd(agent_profile, message, working_directory, engine, model, use_wor
         engine=engine,
         model=model,
         use_worktree=use_worktree,
+        description=description,
     )
     if not _emit(result, as_json):
         raise click.exceptions.Exit(1)
@@ -170,6 +178,11 @@ def assign_cmd(agent_profile, message, working_directory, engine, model, use_wor
     help="Return once the worker exists; don't wait for it.",
 )
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
+@click.option(
+    "--description",
+    default=None,
+    help="Optional description of the worker responsibility (64 Unicode code points; truncated on creation).",
+)
 def handoff_cmd(
     agent_profile,
     message,
@@ -180,6 +193,7 @@ def handoff_cmd(
     use_worktree,
     no_wait,
     as_json,
+    description,
 ):
     """Hand off a task to a worker and wait for it.
 
@@ -232,6 +246,7 @@ def handoff_cmd(
                 engine=engine,
                 model=model,
                 use_worktree=use_worktree,
+                description=description,
                 on_terminal_id=_report_terminal_id,
                 wait=not no_wait,
             )

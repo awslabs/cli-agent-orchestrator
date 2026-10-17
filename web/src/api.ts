@@ -109,6 +109,7 @@ export interface Session {
 }
 
 export interface Terminal {
+  description: string | null
   id: string
   name: string
   provider: string
@@ -124,6 +125,7 @@ export interface SessionDetail {
 }
 
 export interface TerminalMeta {
+  description: string | null
   id: string
   pending_inbox_count?: number
   tmux_session: string
@@ -587,6 +589,9 @@ export interface PluginInstallBody {
   force?: boolean
 }
 
+export let sessionDescriptionRevision = 0
+export const SESSION_DESCRIPTION_READ_ATTEMPTS = 3
+
 export const api = {
   // Agent Profiles & Providers
   listProfiles: () => fetchJSON<AgentProfileInfo[]>('/agents/profiles'),
@@ -659,7 +664,16 @@ export const api = {
 
   // Sessions
   listSessions: () => fetchJSON<Session[]>('/sessions'),
-  getSession: (name: string) => fetchJSON<SessionDetail>(`/sessions/${name}`),
+  getSession: async (name: string): Promise<SessionDetail> => {
+    // Never return a pre-edit response, but let a future poll recover if edits
+    // keep invalidating every read instead of keeping this request alive forever.
+    for (let attempt = 0; attempt < SESSION_DESCRIPTION_READ_ATTEMPTS; attempt++) {
+      const revision = sessionDescriptionRevision
+      const detail = await fetchJSON<SessionDetail>(`/sessions/${name}`)
+      if (revision === sessionDescriptionRevision) return detail
+    }
+    throw new Error('Session descriptions kept changing; retry on the next poll')
+  },
   createSession: (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string) =>
     fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: 90000 }),
   deleteSession: async (name: string) => {
@@ -674,6 +688,15 @@ export const api = {
   },
 
   // Terminals
+  updateTerminalDescription: async (id: string, description: string | null) => {
+    const terminal = await fetchJSON<Terminal>(`/terminals/${encodeURIComponent(id)}/description`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ description }),
+    })
+    sessionDescriptionRevision++
+    return terminal
+  },
   getTerminalStatus: (id: string) =>
     fetchJSON<Terminal>(`/terminals/${id}`).then(t => t.status),
   getTerminalOutput: (id: string, mode: 'full' | 'last' = 'full') =>

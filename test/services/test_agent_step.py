@@ -165,7 +165,11 @@ class TestHappyPath:
             wait,
             status,
         ):
-            result = asyncio.run(run_agent_step("kiro_cli", "developer", "do the task"))
+            result = asyncio.run(
+                run_agent_step(
+                    "kiro_cli", "developer", "do the task", description="Review implementation"
+                )
+            )
 
         assert isinstance(result, AgentStepResult)
         assert result.terminal_id == "abc12345"
@@ -173,6 +177,7 @@ class TestHappyPath:
         assert result.status == TerminalStatus.COMPLETED
         # Canonical sequence: created, prompt sent, output extracted in LAST mode.
         m_create.assert_awaited_once()
+        assert m_create.call_args.kwargs["description"] == "Review implementation"
         m_send.assert_called_once_with("abc12345", "do the task")
         m_out.assert_called_once_with("abc12345", OutputMode.LAST)
         # Created-here + teardown default -> graceful exit THEN delete.
@@ -205,16 +210,24 @@ class TestHappyPath:
             exit_cli as m_exit,
             wait,
             status,
+            patch(f"{_MODULE}.terminal_service.update_description") as update_description,
             patch(
                 f"{_MODULE}.terminal_service.get_terminal_metadata",
                 return_value={"id": "reuse99", "provider": "kiro_cli", "engine": "v2"},
             ),
         ):
             result = asyncio.run(
-                run_agent_step("kiro_cli", "dev", "x", reuse_terminal_id="reuse99")
+                run_agent_step(
+                    "kiro_cli",
+                    "dev",
+                    "x",
+                    reuse_terminal_id="reuse99",
+                    description="Do not overwrite",
+                )
             )
         assert result.terminal_id == "reuse99"
         m_create.assert_not_awaited()
+        update_description.assert_not_called()
         m_delete.assert_not_called()
         # A reused terminal is owned by the caller — no graceful exit either.
         m_exit.assert_not_called()

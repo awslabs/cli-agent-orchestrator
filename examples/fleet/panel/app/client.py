@@ -56,13 +56,25 @@ async def send_input(c, base, terminal_id, text, sender_id=SENDER_ID):
     return r.json() if r.content else {}
 
 
-async def launch(c, base, agent_profile, provider, session_name, working_directory=None):
+async def launch(
+    c,
+    base,
+    agent_profile,
+    provider,
+    session_name,
+    working_directory=None,
+    *,
+    generated_name=False,
+):
+    """Suppress the server's name-to-description default only for generated names."""
     params = {"agent_profile": agent_profile, "session_name": session_name}
     if provider:
         params["provider"] = provider
     if working_directory:
         params["working_directory"] = working_directory
-    r = await c.post(f"{base}/sessions", params=params)
+    # Omission preserves the operator's chosen name as the server-side default.
+    body = {"json": {"description": None}} if generated_name else {}
+    r = await c.post(f"{base}/sessions", params=params, **body)
     r.raise_for_status()
     return r.json()
 
