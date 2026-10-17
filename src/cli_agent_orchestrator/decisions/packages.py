@@ -9,8 +9,9 @@ CONSENT_SAME_USER = (
     "nothing about who granted consent; a package's record of who granted it is a provenance note, "
     "not an identity claim. Any process running as you, including an agent with shell access, can "
     "edit settings.json or a package's consent file and can read any key or endpoint the package "
-    "stores. What keeps agents out is that no agent-facing tool can grant consent, the consent "
-    "command needs an interactive terminal, and each profile's tool restrictions."
+    "stores. What keeps agents out is each profile's tool restrictions, and two rules a package "
+    "must follow: no agent-facing tool may grant consent, and its consent command must need an "
+    "interactive terminal."
 )
 EXTERNAL_DISCLOSURE = "sends data off this machine only after its own consent"
 
