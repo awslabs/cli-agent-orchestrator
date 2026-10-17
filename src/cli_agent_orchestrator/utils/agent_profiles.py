@@ -1,7 +1,9 @@
 """Agent profile utilities."""
 
 import logging
+import os
 import re
+import stat
 from enum import Enum
 from importlib import resources
 from pathlib import Path
@@ -33,10 +35,6 @@ class EphemeralProfileUnavailable(ValueError):
     """A reserved name cannot be served by the ephemeral live store."""
 
 
-class EphemeralLaunchRefused(ValueError):
-    """The server cannot allocate an ephemeral runtime before claims are supported."""
-
-
 def routes_to_ephemeral_store(name: str) -> bool:
     """Route reserved names exclusively to the server-owned live store."""
     return _RESERVED_EPHEMERAL_PATTERN.fullmatch(name) is not None
@@ -50,7 +48,17 @@ def load_launch_profile(name: str) -> tuple[AgentProfile, ProfileSource]:
         path = _safe_join(EPHEMERAL_LIVE_DIR, f"{name}.md")
         if path is None:
             raise ValueError("live profile path escapes its store")
-        profile = parse_agent_profile_text(path.read_text(encoding="utf-8"), name)
+        # Validate containment, but open the lexical leaf so O_NOFOLLOW refuses
+        # even a symlink whose target happens to be inside the live store.
+        path = EPHEMERAL_LIVE_DIR / f"{name}.md"
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError("ephemeral store file is unsafe")
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                profile = parse_agent_profile_text(stream.read().decode("utf-8"), name)
+        finally:
+            os.close(fd)
     except Exception as exc:
         raise EphemeralProfileUnavailable(f"Ephemeral profile unavailable: {name}") from exc
     return profile, ProfileSource.EPHEMERAL

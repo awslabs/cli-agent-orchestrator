@@ -756,6 +756,11 @@ def _has_terminal_error(text: str, *, execution_established: bool = False) -> bo
     return _terminal_error_message(text, execution_established=execution_established) is not None
 
 
+# Shared with the provider-error classifier so a marker change cannot leave
+# terminal ownership and error classification disagreeing.
+KIMI_RESPONSE_MARKER_RE = re.compile(r"^[•●]\s")
+
+
 class KimiCliProvider(BaseProvider):
     """Provider for Kimi CLI tool integration.
 
@@ -790,7 +795,7 @@ class KimiCliProvider(BaseProvider):
     _KIMI_PROMPT_RE = re.compile(r"(?:\w{1,32}@[\w.\-]{1,64})?[✨💫][^\S\n]{1,4}\S")
     # Response/thinking markers used to bound a user message line. Matches
     # the same bullets the IDLE/PROCESSING path uses, in both dialects.
-    _KIMI_RESPONSE_MARKER_RE = re.compile(r"^[•●]\s")
+    KIMI_RESPONSE_MARKER_RE = KIMI_RESPONSE_MARKER_RE
 
     @property
     def allow_raw_transcript_fallback(self) -> bool:
@@ -3445,7 +3450,7 @@ class KimiCliProvider(BaseProvider):
                     msg_lines.append(after)
                 i += 1
                 while i < len(lines):
-                    if self._KIMI_PROMPT_RE.search(lines[i]) or self._KIMI_RESPONSE_MARKER_RE.match(
+                    if self._KIMI_PROMPT_RE.search(lines[i]) or self.KIMI_RESPONSE_MARKER_RE.match(
                         lines[i]
                     ):
                         break

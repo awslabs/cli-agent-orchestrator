@@ -248,6 +248,23 @@ class TestRunStepEndpoint:
         assert detail["kind"] == "error"
         assert detail["terminal_id"] == "abc12345"
 
+    def test_provider_error_maps_to_502_with_structured_kind(self, client):
+        with patch(
+            _RUN_STEP,
+            new=AsyncMock(
+                side_effect=StepExecutionError(
+                    "provider error (api_error) from codex: 401 invalid_api_key",
+                    kind="provider_error",
+                    terminal_id="abc12345",
+                )
+            ),
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())
+        assert resp.status_code == 502
+        detail = resp.json()["detail"]
+        assert detail["kind"] == "provider_error"
+        assert detail["terminal_id"] == "abc12345"
+
     def test_value_error_maps_to_404(self, client):
         with patch(_RUN_STEP, new=AsyncMock(side_effect=ValueError("Terminal 'x' not found"))):
             resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())
@@ -317,6 +334,78 @@ class TestRunStepEndpoint:
         assert step.state == StepState.FAILED
         assert step.attempts == 1
         assert step.error == str(exc)
+
+    def test_provider_error_settles_script_step_with_kind(
+        self, client, monkeypatch, isolated_journal
+    ):
+        """The script path must persist the kind, not only return it over HTTP."""
+        from cli_agent_orchestrator.models.workflow import StepState
+        from cli_agent_orchestrator.models.workflow_runtime import RunState
+        from cli_agent_orchestrator.services import workflow_journal, workflow_service
+        from cli_agent_orchestrator.services.script_runner import ScriptRunRecord
+
+        run_id = "run-provider-error-settlement"
+        env_vars = {
+            "CAO_WORKFLOW_RUN_ID": run_id,
+            "CAO_WORKFLOW_GENERATION": "1",
+            "CAO_WORKFLOW_STEP_ID": "step-1",
+        }
+        record = ScriptRunRecord(
+            run_id=run_id,
+            workflow_name="wf",
+            state=RunState.RUNNING,
+            cancelled=False,
+            current_step_id=None,
+            step_states={},
+            process=None,
+            generation="1",
+            started_at="2026-07-15T00:00:00Z",
+            finished_at=None,
+        )
+        workflow_journal.insert_run(
+            run_id=run_id,
+            workflow_name="wf",
+            spec_snapshot="{}",
+            inputs_json="{}",
+            state=RunState.RUNNING.value,
+            started_at="2026-07-15T00:00:00Z",
+            tier="script",
+        )
+        monkeypatch.setitem(workflow_service.run_registry, run_id, record)
+        monkeypatch.setattr(workflow_journal, "append_step", lambda *args, **kwargs: None)
+        monkeypatch.setattr(workflow_journal, "update_step", lambda *args, **kwargs: None)
+
+        error = StepExecutionError(
+            "provider error (api_error) from codex",
+            kind="provider_error",
+            terminal_id="term-provider",
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.services.workflow_service.check_generation",
+                return_value=None,
+            ),
+            patch(_RUN_STEP, new=AsyncMock(side_effect=error)),
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(env_vars=env_vars))
+
+        assert resp.status_code == 502
+        assert resp.json()["detail"]["kind"] == "provider_error"
+        step = record.step_states["step-1"]
+        assert step.state == StepState.FAILED
+        assert step.error_kind == "provider_error"
+        row = workflow_journal.get_step(run_id, "step-1")
+        assert row is not None
+        assert row.error_kind == "provider_error"
+
+        inspection = client.get(f"/workflows/runs/{run_id}")
+        assert inspection.status_code == 200
+        assert inspection.json()["steps"][0]["error_kind"] == "provider_error"
+
+        workflow_service.run_registry.pop(run_id)
+        cold_inspection = client.get(f"/workflows/runs/{run_id}")
+        assert cold_inspection.status_code == 200, cold_inspection.text
+        assert cold_inspection.json()["steps"][0]["error_kind"] == "provider_error"
 
     def test_missing_required_field_is_422(self, client):
         # Pydantic request-model validation rejects a missing prompt.

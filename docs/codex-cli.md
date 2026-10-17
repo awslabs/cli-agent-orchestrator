@@ -66,6 +66,16 @@ The provider supports two output formats for status detection:
 
 The `USER_PREFIX_PATTERN` uses `[^\S\n]` (horizontal whitespace only) to prevent matching across newline boundaries, correctly distinguishing `› ` (idle prompt) from `› text` (user input).
 
+**Completion footer (Codex 0.155 and later).** Codex streams the final answer with no spinner, so a frame of a streaming answer looks like a finished turn. From 0.155, Codex ends each successful turn with a dim footer under the final message: `Worked for 32s • 4:19 PM` (0.159 and later), `Worked for 1m 5s · done 4:19 PM` or `done 4:19 PM` (0.155), and a bare `4:19 PM` for short turns on 0.156 to 0.158. The footer always has the time. When `initialize()` reads such a release in the startup banner, and the status bar is one that `TUI_FOOTER_PATTERN` knows, the rendered screen follows these rules:
+
+- A turn is COMPLETED only when the last row above the composer is the footer, under a reply or tool row. An error cell (`■ ...`) also ends a turn.
+- A user message with rows under it and no footer is PROCESSING. A user message with nothing under it is UNKNOWN, which keeps the last status.
+- A frame without the status bar is a redraw in progress: UNKNOWN, unless a spinner or the footer decides.
+- A spinner above the footer of a finished turn is history (for example, a spinner line that a tool result quotes).
+- Extraction removes the footer row from the reply.
+
+The raw stream (`CAO_PYTE_STATUS=false`) keeps the older rules, because it keeps every redraw. A provider rebuilt after a cao-server restart does not run `initialize()` and also keeps the older rules.
+
 ### Message Extraction
 
 The provider automatically extracts the last assistant response from terminal output using a two-phase approach:
@@ -107,6 +117,8 @@ Codex parses the value side of `-c key=value` as TOML, so any environment key an
 that is not a bare TOML key (`^[A-Za-z0-9_-]+$`) would nest the entry under the wrong
 table. An agent-plugin server with such a name is not delivered to Codex and is
 reported as `mcp.server_name_unsupported`; that agent plugin's other servers are unaffected.
+
+For the CAO server, CAO also sets `omit_tools_from=["deferred"]`. Codex defers MCP tools behind its `tool_search` tool, and a search for `assign handoff` can rank other CAO tools first; a supervisor then reports that `cao-mcp-server` failed to start. With the setting, the CAO tools are in the initial tool list. The key exists from Codex 0.150.
 
 CAO also sets `tool_timeout_sec=600.0` (10 minutes) for each MCP server to allow long-running operations like handoff. **Important**: The value must be a TOML float (`600.0`, not `600`) because Codex deserializes this field via `Option<f64>`. A TOML integer is silently rejected, falling back to the 60-second default.
 
@@ -329,6 +341,7 @@ PY
 - `IDLE_PROMPT_STRICT_PATTERN` matches only empty prompt lines (`› ` or `❯ ` without trailing text) for extraction boundary detection.
 - Output mode `last` uses `CodexProvider.extract_last_message_from_script()`, which extracts text between the last user message and the next idle prompt.
 - Exiting a Codex terminal uses `/exit` (`POST /terminals/{terminal_id}/exit`).
+- **Exit check**: when the pane's command is again the shell that ran before Codex, the status is ERROR, so that the inbox does not type into the shell. The lookup costs about 0.1 s of tmux calls, so a ready verdict (IDLE or COMPLETED) reads it every time, and other verdicts read it at most every 2 s (`EXIT_CHECK_INTERVAL_S`).
 - **Handoff message context**: `_handoff_impl()` prepends a `[CAO Handoff]` prefix to the task message so the worker agent knows this is a blocking handoff. Without this, Codex agents proactively try to use `send_message` to notify the supervisor, which fails because the worker doesn't have the supervisor's terminal ID. The prefix tells the agent to simply output results and finish — the orchestrator captures the response automatically.
 - **TUI footer handling** (`--no-alt-screen` mode): Codex always renders a TUI footer at the bottom, even during processing. The footer format varies by version: v0.110 and earlier use `› [suggestion hint]` + `? for shortcuts` + `N% context left`; v0.111+ (PR #13202) use `› [suggestion hint]` + `model · N% left · path`. `TUI_FOOTER_PATTERN` detects both formats, and `_compute_tui_footer_cutoff()` finds the precise start of the footer area. Both `get_status()` and `extract_last_message_from_script()` use this cutoff to exclude footer lines from user-message matching — preventing false IDLE and extraction contamination.
 - **TUI progress spinner**: During processing, Codex shows `• [text] (Ns • esc to interrupt)` inline. The `•` would falsely match `ASSISTANT_PREFIX_PATTERN`, and the TUI `›` hint would match idle prompt — triggering false COMPLETED. `TUI_PROGRESS_PATTERN` detects the spinner and returns PROCESSING before the COMPLETED check. codex-cli 0.153.x alternates the leading glyph between `•` and `◦` as the spinner animates, so the pattern accepts either; a frame that lands on the hollow glyph used to read IDLE.

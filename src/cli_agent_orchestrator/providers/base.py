@@ -222,6 +222,20 @@ class BaseProvider(ABC):
     # depends on raw \r) whose detectors are tuned for the raw stream.
     supports_screen_detection: bool = False
 
+    # Opt-in, with supports_screen_detection, for the screen in the cheap
+    # re-check that StatusMonitor.get_status() runs for a poller while a
+    # terminal reads PROCESSING. By default that re-check parses the raw
+    # rolling buffer. Set True when the raw stream of the provider does not
+    # parse like its screen: Codex redraws only the cells that change, so the
+    # raw buffer of a working turn can parse as IDLE, and that IDLE ended the
+    # PROCESSING of the turn just after it began. Claude Code's Ink TUI repaints
+    # changed cells only, so the raw window holds glyph fragments and, once a
+    # long answer has pushed the input box past the size cap, no box at all
+    # for its detector to anchor on (GH #865). Providers that leave this False
+    # keep the raw re-check, which their detectors and turn bookkeeping were
+    # built around.
+    status_recheck_uses_screen: bool = False
+
     # Opt-in for the deferred-init direct status probe (capture-pane bypass).
     # Set True on providers whose get_status() detector is line-oriented and
     # works correctly on a rendered capture-pane snapshot. Providers whose
@@ -237,6 +251,9 @@ class BaseProvider(ABC):
     # started". A provider can therefore be safe to re-check from a settled
     # rendered viewport without being safe as delivery evidence.
     supports_stale_processing_capture: bool = False
+
+    # Uses the stale-processing probe/commit contract; active dialogs must stay waiting.
+    supports_stale_waiting_capture: bool = False
 
     # Opt-in for the mid-burst PROCESSING probe (StatusMonitor._midburst_processing_probe).
     # Set True ONLY alongside a probe_processing_from_screen() override that is

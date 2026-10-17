@@ -354,25 +354,42 @@ def wait_for_initial_delivery(
     Returns the terminal payload once ``initial_delivery.state == "delivered"``.
     Raises ``click.ClickException`` when the delivery failed, when the terminal
     reached ERROR first (``deferred_init_failure`` carries the detail), on
-    timeout, or on a transport failure.
+    timeout, or on a 4xx from the poll. A connection error, read timeout or 5xx
+    is retried until ``timeout``: the server is busy initializing and delivering
+    while this runs, and giving up on one failed poll made ``cao launch --async``
+    exit non-zero for a task that was still going to be delivered (#882).
     """
     import click
 
     start = time.time()
+    last_error: Optional[str] = None
     while True:
         elapsed = time.time() - start
         if elapsed > timeout:
-            raise click.ClickException(
+            message = (
                 f"Timed out after {int(elapsed)}s waiting for the initial message to be "
                 f"delivered to terminal {terminal_id}; the server may still be initializing "
                 "the provider. Inspect it with `cao terminal`."
             )
+            if last_error is not None:
+                message += (
+                    f" The last poll failed ({last_error}), so the message may already "
+                    "have been delivered."
+                )
+            raise click.ClickException(message)
         try:
             resp = api_http.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
             resp.raise_for_status()
             payload = resp.json()
         except api_http.exceptions.RequestException as e:
-            raise click.ClickException(f"Failed to poll terminal delivery state: {e}")
+            response = getattr(e, "response", None)
+            if response is not None and 400 <= response.status_code < 500:
+                raise click.ClickException(f"Failed to poll terminal delivery state: {e}")
+            last_error = str(e)
+            logger.debug(f"wait_for_initial_delivery [{terminal_id}]: poll failed, retrying: {e}")
+            time.sleep(polling_interval)
+            continue
+        last_error = None
         if not isinstance(payload, dict):
             payload = {}
         delivery = payload.get("initial_delivery")

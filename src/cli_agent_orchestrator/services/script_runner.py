@@ -10,7 +10,8 @@ monotonic through every (re)spawn/cancel/timeout (INV-6).
 The five algorithms + two helpers (business-logic-model A1-A7):
 
 - A1 ``run_script_workflow`` — lint gate -> journal row -> spawn -> serve
-  run-step calls while awaiting exit -> sentinel scan -> ``WorkflowRunResult``.
+  run-step calls while awaiting exit -> grace-bounded drain of the pipes ->
+  sentinel scan -> ``WorkflowRunResult``.
 - A2 ``resume_script_run`` — typed admission (delegated to U3) -> generation
   bump -> materialize frozen snapshot -> re-spawn with ``CAO_WORKFLOW_RESUME=1``.
 - A3 ``cancel_script_run`` — signal-first -> sweep -> journal CANCELLED,
@@ -79,6 +80,10 @@ _SENTINEL_PREFIX = "CAO_WORKFLOW_OUTPUT:"
 # Terminal step states — a step in one of these is NOT in-flight and its terminal
 # has already been released, so the orphan sweep skips it (A5, BR-14).
 _TERMINAL_STEP_STATES = {"completed", "failed", "skipped", "completed_unvalidated"}
+
+# How often ``_wait_for_exit`` checks ``returncode`` while ``wait()`` is still
+# blocked on the pipes.
+_EXIT_POLL_INTERVAL = 0.1
 
 
 class ScriptLintError(Exception):
@@ -297,6 +302,8 @@ async def _terminate(process: asyncio.subprocess.Process, grace: float) -> None:
     SIGTERM first, then a hard SIGKILL if the child does not exit within ``grace``.
     Used identically by the timeout reaper and cancel, so the observable total
     bound stays the single value ``WORKFLOW_SCRIPT_TIMEOUT + TERM_GRACE``.
+    Both waits use ``_wait_for_exit``: a process the script started can hold its
+    pipes, and a plain ``wait()`` would then block until that process exits.
     """
     if process.returncode is not None:
         return  # already exited — nothing to signal or reap
@@ -305,25 +312,50 @@ async def _terminate(process: asyncio.subprocess.Process, grace: float) -> None:
     except ProcessLookupError:
         return  # raced to exit between the check and the signal
     try:
-        await asyncio.wait_for(process.wait(), timeout=grace)
+        await asyncio.wait_for(_wait_for_exit(process), timeout=grace)
     except asyncio.TimeoutError:
+        if process.returncode is not None:
+            return  # exited on SIGTERM between two returncode polls
         try:
             process.kill()  # SIGKILL — hard stop
         except ProcessLookupError:
             return
-        await process.wait()  # reap the zombie
+        await _wait_for_exit(process)  # reap the zombie
+
+
+async def _wait_for_exit(process: asyncio.subprocess.Process) -> None:
+    """Return once the process itself has exited, pipes closed or not (A1 Step 3 reaper).
+
+    ``process.wait()`` alone is not that signal. From Python 3.11 a ``wait()``
+    that starts before the exit also waits for stdout and stderr to reach EOF,
+    and a background process the script started inherits both pipes, so it can
+    hold ``wait()`` open long after the script is gone. ``returncode`` is set
+    when the script exits, on every supported version, so it is checked
+    alongside the ``wait()``.
+    """
+    waiter = asyncio.ensure_future(process.wait())
+    try:
+        while process.returncode is None and not waiter.done():
+            await asyncio.wait({waiter}, timeout=_EXIT_POLL_INTERVAL)
+    finally:
+        waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
 
 
 async def _await_exit_within_bound(process: asyncio.subprocess.Process, timeout: float) -> None:
     """Await the process exit under the wall-clock bound (A1 Step 3 reaper).
 
-    A thin ``asyncio.wait_for(process.wait())`` wrapper that converts the elapsed
-    bound into a ``TimeoutBound`` the caller's timeout arm handles (reap ->
+    A thin ``asyncio.wait_for(_wait_for_exit(process))`` wrapper that converts the
+    elapsed bound into a ``TimeoutBound`` the caller's timeout arm handles (reap ->
     sweep -> FAILED,kind=timeout). Any other exit (natural, signal) returns.
     """
     try:
-        await asyncio.wait_for(process.wait(), timeout=timeout)
+        await asyncio.wait_for(_wait_for_exit(process), timeout=timeout)
     except asyncio.TimeoutError as e:
+        if process.returncode is not None:
+            # The exit landed between two returncode polls just before the bound
+            # elapsed. asyncio has already recorded it, so it is not a timeout.
+            return
         raise TimeoutBound(
             f"script subprocess did not exit within {timeout}s wall-clock bound"
         ) from e
@@ -729,7 +761,9 @@ def _sanitise_output_json(output_json: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 def record_step_completion(
     env_vars: Optional[Dict[str, str]],
-) -> Optional[Callable[[Optional[str], Optional[str], Optional[str], Optional[str]], None]]:
+) -> Optional[
+    Callable[[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]], None]
+]:
     """Build the RUNNING->COMPLETED/FAILED transition for a script-tier step.
 
     Mirrors ``make_step_terminal_recorder``'s guard exactly (BR-31 pattern):
@@ -750,7 +784,8 @@ def record_step_completion(
     - ``StepExecutionError`` (a crashed/timed-out step) -> ``FAILED`` with the
       error string recorded.
 
-    THE CALLBACK TAKES ``(terminal_id, error, last_message, response_status=None)``.
+    THE CALLBACK TAKES
+    ``(terminal_id, error, last_message, response_status=None, error_kind=None)``.
     ``last_message`` is the step's raw text result, needed for the durable result
     envelope: a settled row with no envelope is precisely what FR-4 guard 1 exists
     to prevent, and an envelope built without the step's own output would satisfy
@@ -762,7 +797,9 @@ def record_step_completion(
     ``last_message`` and ``response_status`` are both ``None`` on every failure arm,
     where the step produced no message — a FAILED step still gets an envelope (unit
     2 BR-1), because envelope ABSENCE must keep meaning *a crash between the
-    writes* and never *the step failed*.
+    writes* and never *the step failed*. ``error_kind`` is an additive trailing
+    optional argument carrying ``StepExecutionError.kind`` onto a failed step; its
+    default preserves every existing four-argument callback call.
 
     ``provider``/``agent``/``prompt`` WERE PARAMETERS AND ARE GONE (TD-5). They
     existed only to compute the call fingerprint here, and the fingerprint no longer
@@ -799,6 +836,7 @@ def record_step_completion(
         error: Optional[str],
         last_message: Optional[str],
         response_status: Optional[str] = None,
+        error_kind: Optional[str] = None,
     ) -> None:
         st = record.step_states.get(step_id)
         if st is None:
@@ -813,6 +851,7 @@ def record_step_completion(
         if error is not None:
             st.state = StepState.FAILED
             st.error = error
+            st.error_kind = error_kind
         else:
             # Adopt any structured output the worker returned via
             # ``workflow_return`` (keyed by the same run/step ids). A present but
@@ -825,6 +864,7 @@ def record_step_completion(
             else:
                 st.state = StepState.COMPLETED
             st.error = None
+            st.error_kind = None
 
         # ONE best-effort durable write (BR-6): state, attempts, envelope, output and
         # error settle atomically, so the row can never read settled with no result.
@@ -860,6 +900,7 @@ def record_step_completion(
                 ),
                 output_json=_sanitise_output_json(raw_output_json),
                 error=_sanitise_error(st.error),
+                error_kind=st.error_kind,
             )
             if not existed:
                 # AN OBSERVATION, NEVER A CONCLUSION (BR-7/SR-8, unit 6 TD-2a). The
@@ -948,7 +989,7 @@ def _delete_temp_file(path: Optional[str]) -> None:
 # ---------------------------------------------------------------------------
 # _finalize (INV-5) — construct the tier-neutral WorkflowRunResult
 # ---------------------------------------------------------------------------
-def _journal_run_state(record: ScriptRunRecord, error: Optional[str]) -> None:
+def _journal_run_state(record: ScriptRunRecord, error: Optional[str], kind: Optional[str]) -> None:
     """Best-effort terminal-state write-through (INV-4/INV-5). Never raises."""
     try:
         workflow_journal.update_run_state(
@@ -956,6 +997,7 @@ def _journal_run_state(record: ScriptRunRecord, error: Optional[str]) -> None:
             record.state.value,
             record.finished_at,
             error,
+            kind,
         )
     except (
         Exception
@@ -978,6 +1020,7 @@ def _build_steps(record: ScriptRunRecord) -> List[StepResult]:
                 attempts=st.attempts,
                 output=st.output.output if st.output is not None else None,
                 error=st.error,
+                error_kind=st.error_kind,
             )
         )
     return steps
@@ -1003,7 +1046,7 @@ async def _finalize(
     record.state = state
     record.current_step_id = None
     record.finished_at = _now()
-    await asyncio.to_thread(_journal_run_state, record, _sanitise_error(error))
+    await asyncio.to_thread(_journal_run_state, record, _sanitise_error(error), kind)
     # ``WorkflowRunResult`` has no top-level ``error`` field (per-step only), so a
     # run-level error (stderr tail on crash/timeout) is surfaced in ``warnings`` —
     # the FAILED state + ``kind`` already carry the failure semantics; the tail is
@@ -1024,8 +1067,34 @@ async def _finalize(
     )
 
 
+def _close_pipes(process: asyncio.subprocess.Process) -> bool:
+    """Close the parent's end of both pipes once their readers are cancelled.
+
+    Cancelling ``_pump`` stops the reads but leaves the pipe transports open. A
+    process the script started that keeps writing then fills a buffer nobody
+    drains, blocks on the write and never exits, and the two read fds stay open
+    in the server for good. ``asyncio.subprocess.Process`` has no public close,
+    so this goes through its transport. The script has already exited on every
+    caller, and ``close()`` only kills a child whose exit has not been recorded
+    (on both the stdlib loop and uvloop), so here it closes the pipes without
+    signalling.
+
+    Returns whether the pipes were closed. If the private ``_transport`` is
+    missing, this logs a warning and returns False instead of raising.
+    """
+    transport = getattr(process, "_transport", None)
+    if transport is None:
+        logger.warning(
+            "script process %r has no _transport, so its stdout/stderr pipes were left open",
+            process,
+        )
+        return False
+    transport.close()
+    return True
+
+
 # ---------------------------------------------------------------------------
-# Shared drive: spawn -> concurrent drain -> reap -> exit interp -> finalize
+# Shared drive: spawn -> concurrent drain -> reap -> bounded drain -> exit interp -> finalize
 # ---------------------------------------------------------------------------
 async def _drive_process(
     record: ScriptRunRecord, script_path: str, env: Dict[str, str]
@@ -1071,7 +1140,6 @@ async def _drive_process(
 
     try:
         await _await_exit_within_bound(process, WORKFLOW_SCRIPT_TIMEOUT)
-        await asyncio.gather(*drain)  # flush both tails after a clean exit
     except TimeoutBound:
         # Timeout arm: reap -> sweep -> bump+persist generation (INV-6, the
         # straggler fence a timeout-reaped run needs) -> FAILED,kind=timeout.
@@ -1079,6 +1147,7 @@ async def _drive_process(
         for task in drain:
             task.cancel()
         await asyncio.gather(*drain, return_exceptions=True)
+        _close_pipes(process)
         await _reconcile_orphans(record.run_id)
         record.generation = _bump(record.generation)
         await _persist_generation_best_effort(record)
@@ -1089,6 +1158,22 @@ async def _drive_process(
             kind="timeout",
             error=(stderr_tail + "\n[wall-clock timeout]").strip(),
             warnings=[f"run exceeded the {WORKFLOW_SCRIPT_TIMEOUT}s wall-clock bound"],
+        )
+
+    # Flush both tails. The script has exited, but a process it started in the
+    # background can still hold its stdout/stderr open, so the drain gets the
+    # same grace the reaper uses and then keeps whatever was read by then.
+    drain_warnings: List[str] = []
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*drain, return_exceptions=True), timeout=WORKFLOW_SCRIPT_TERM_GRACE
+        )
+    except asyncio.TimeoutError:
+        closed = _close_pipes(process)
+        drain_warnings.append(
+            f"stdout/stderr were still open {WORKFLOW_SCRIPT_TERM_GRACE}s after the script "
+            "exited, most likely held by a process it started; output read up to then was "
+            "kept and the pipes " + ("were closed" if closed else "could not be closed")
         )
 
     if record.cancelled or record.state == RunState.CANCELLED:
@@ -1102,7 +1187,11 @@ async def _drive_process(
     if rc == 0:
         output, warnings = _scan_sentinel(stdout_ring.text())
         return await _finalize(
-            record, state=RunState.COMPLETED, kind=None, output=output, warnings=warnings
+            record,
+            state=RunState.COMPLETED,
+            kind=None,
+            output=output,
+            warnings=warnings + drain_warnings,
         )
     # Nonzero / signal death -> sweep -> FAILED,kind=error (sentinel SKIPPED, BR-9a).
     await _reconcile_orphans(record.run_id)
@@ -1110,6 +1199,7 @@ async def _drive_process(
         record,
         state=RunState.FAILED,
         kind="error",
+        warnings=drain_warnings,
         error=stderr_ring.text().strip(),
     )
 
@@ -1149,12 +1239,13 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
     Steps: (0) lint gate — a ``fail`` raises ``ScriptLintError`` before any journal
     row or subprocess (BR-1); (1) journal the run row (tier=script, gen=1) +
     register the live record; (2) spawn with the constructed env (INV-2); (3) drain
-    both pipes concurrently while awaiting exit under the wall-clock bound; (4)
-    interpret the exit + sentinel scan. Only the lint gate raises, and it raises
-    exactly one type — ``ScriptLintError`` — while a run failure/timeout returns a
-    FAILED result instead. Naming the type matters: it is the only exception a
-    caller of this function must handle, so an ``except Exception`` here would be
-    both too broad and a silent way to swallow it.
+    both pipes concurrently while awaiting exit under the wall-clock bound, then
+    give the drain ``WORKFLOW_SCRIPT_TERM_GRACE`` after the exit and close pipes a
+    background process still holds; (4) interpret the exit + sentinel scan. Only
+    the lint gate raises, and it raises exactly one type — ``ScriptLintError`` —
+    while a run failure/timeout returns a FAILED result instead. Naming the type
+    matters: it is the only exception a caller of this function must handle, so an
+    ``except Exception`` here would be both too broad and a silent way to swallow it.
     """
     # --- Step -1: validate the run_id key BEFORE any journal/registry/path use
     # (shared validator, mirrors base start_run at workflow_service.py:713). A

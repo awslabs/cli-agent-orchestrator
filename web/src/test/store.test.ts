@@ -1,5 +1,6 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { useStore } from '../store'
+import { api, SessionDetail } from '../api'
 
 describe('Store', () => {
   beforeEach(() => {
@@ -50,5 +51,29 @@ describe('Store', () => {
     const { showSnackbar } = useStore.getState()
     showSnackbar({ type: 'error', message: 'Something failed' })
     expect(useStore.getState().snackbar).toEqual({ type: 'error', message: 'Something failed' })
+  })
+})
+
+
+describe('pending inbox count refresh', () => {
+  const initial = useStore.getState()
+  afterEach(() => {
+    vi.restoreAllMocks()
+    useStore.setState(initial, true)
+  })
+  it.each([3, 1, 0])('retains a count-only update from 2 to %s', async count => {
+    const detail: SessionDetail = {
+      session: { id: 'synthetic', name: 'synthetic', status: 'active' },
+      terminals: [{ id: 'receiver', tmux_session: 'synthetic', tmux_window: 'worker',
+        provider: 'codex', agent_profile: null, created_at: null, last_active: null,
+        pending_inbox_count: 2 }],
+    }
+    vi.spyOn(api, 'getSession').mockResolvedValueOnce(detail).mockResolvedValueOnce({
+      ...detail, terminals: [{ ...detail.terminals[0], pending_inbox_count: count }],
+    })
+    await useStore.getState().selectSession('synthetic')
+    expect(useStore.getState().activeSessionDetail?.terminals[0].pending_inbox_count).toBe(2)
+    await useStore.getState().selectSession('synthetic')
+    expect(useStore.getState().activeSessionDetail?.terminals[0].pending_inbox_count).toBe(count)
   })
 })

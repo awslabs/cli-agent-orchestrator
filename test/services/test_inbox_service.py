@@ -7,10 +7,217 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
-from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS
+from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS, INBOX_RECONCILE_INTERVAL
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.services.event_bus import EventBus
 from cli_agent_orchestrator.services.inbox_service import InboxService
+from cli_agent_orchestrator.services.status_monitor import (
+    STALE_PROCESSING_CAPTURE_INTERVAL_S,
+    StatusMonitor,
+)
+
+
+class TestCopilotQuietInboxRecovery:
+    @pytest.mark.asyncio
+    async def test_scheduled_confirmation_reaches_inbox_subscriber(self):
+        from types import SimpleNamespace
+
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+
+        loop = asyncio.get_running_loop()
+        clock = {"now": 100.0}
+        timers = []
+        sm = StatusMonitor()
+        sm._loop = SimpleNamespace(
+            call_soon_threadsafe=lambda fn, *args: fn(*args),
+            call_later=lambda delay, fn, *args: timers.append((delay, fn, args)) or MagicMock(),
+            create_task=loop.create_task,
+        )
+        sm._apply_detection("term-1", TerminalStatus.PROCESSING)
+        sm._buffers["term-1"] = "cursor-addressed redraw"
+        sm._buffer_changed_at["term-1"] = 0.0
+        provider = CopilotCliProvider("term-1", "s", "w")
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        backend.get_native_status.return_value = None
+        backend.get_history.return_value = (
+            "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀▀▀▀▀\n"
+            "← open sidebar · Autopilot · Allow All · / commands · tab next tab"
+        )
+        event_bus = EventBus()
+        event_bus.set_loop(loop)
+        delivered = asyncio.Event()
+        message = _make_message()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.time",
+                SimpleNamespace(monotonic=lambda: clock["now"]),
+            ),
+            patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
+                return_value=provider,
+            ),
+            patch("cli_agent_orchestrator.services.status_monitor.bus", event_bus),
+            patch("cli_agent_orchestrator.services.inbox_service.bus", event_bus),
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", sm),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+                return_value=[message],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_older_than",
+                return_value=["term-1"],
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.update_message_status") as update,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.terminal_service.send_input"
+            ) as send,
+        ):
+            send.side_effect = lambda *args: loop.call_soon_threadsafe(delivered.set)
+            svc = InboxService()
+            subscriber = asyncio.create_task(svc.run())
+            try:
+                await asyncio.sleep(0)
+                svc.reconcile_orphaned_messages()
+                send.assert_not_called()
+                delay, confirm, args = timers[-1]
+                clock["now"] = sm._pending_stale_capture["term-1"][1] + delay
+                confirm(*args)
+                await asyncio.wait_for(delivered.wait(), timeout=2)
+                send.assert_called_once_with("term-1", "hello")
+                update.assert_called_once_with(1, MessageStatus.DELIVERED)
+            finally:
+                subscriber.cancel()
+                await asyncio.gather(subscriber, return_exceptions=True)
+                event_bus.set_loop(None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
+    @pytest.mark.parametrize(
+        "interruption",
+        [
+            None,
+            "approval",
+            "busy",
+            "input",
+            "output",
+            "clear",
+            "reset",
+            "capture_input",
+            "capture_output",
+            "rate_limit",
+        ],
+    )
+    async def test_slow_reconciliation_confirms_idle_without_an_external_poller(
+        self, layout, interruption
+    ):
+        from types import SimpleNamespace
+
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+
+        clock = {"now": 100.0}
+        timers = []
+        loop = SimpleNamespace(
+            call_soon_threadsafe=lambda fn, *args: fn(*args),
+            call_later=lambda delay, fn, *args: timers.append((delay, fn, args)) or MagicMock(),
+            create_task=asyncio.create_task,
+        )
+        sm = StatusMonitor()
+        sm._loop = loop
+        sm._apply_detection("term-1", TerminalStatus.PROCESSING)
+        sm._buffers["term-1"] = "cursor-addressed redraw without logical prompt rows"
+        sm._buffer_changed_at["term-1"] = 0.0
+        provider = CopilotCliProvider("term-1", "s", "w")
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        backend.get_native_status.return_value = None
+        composer = "❯\n" if layout == "prompt" else "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀▀▀▀▀\n"
+        ready = composer + "← open sidebar · Autopilot · Allow All · / commands · tab next tab"
+        backend.get_history.return_value = ready
+        message = _make_message()
+        with (
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.time",
+                SimpleNamespace(monotonic=lambda: clock["now"]),
+            ),
+            patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
+                return_value=provider,
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", sm),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+                return_value=[message],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_older_than",
+                return_value=["term-1"],
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.update_message_status") as update,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.terminal_service.send_input"
+            ) as send,
+            patch("cli_agent_orchestrator.services.status_monitor.bus.publish") as publish,
+        ):
+            svc = InboxService()
+            # Reconciliation polls arrive after the confirmation TTL expires.
+            svc.reconcile_orphaned_messages()
+            send.assert_not_called()
+            assert timers, "a quiet ready candidate needs a follow-up within its TTL"
+            delay, confirm, args = timers[-1]
+            assert delay == STALE_PROCESSING_CAPTURE_INTERVAL_S
+            assert delay < INBOX_RECONCILE_INTERVAL
+            clock["now"] = sm._pending_stale_capture["term-1"][1] + delay
+            if interruption == "approval":
+                backend.get_history.return_value = "Allow tool execution? [y/n]\n" + ready
+            elif interruption == "busy":
+                backend.get_history.return_value = "∙ Thinking (Esc to cancel)\n" + ready
+            elif interruption == "input":
+                sm.notify_input_sent("term-1")
+            elif interruption == "output":
+                with patch.object(sm, "_schedule_raw_detection"):
+                    sm._process_chunk("term-1", "\x1b[2;1H")
+            elif interruption == "clear":
+                sm.clear_terminal("term-1")
+            elif interruption == "reset":
+                sm.reset_buffer("term-1")
+            elif interruption in ("capture_input", "capture_output"):
+
+                def straddling_capture(*args, **kwargs):
+                    if interruption == "capture_input":
+                        sm.notify_input_sent("term-1")
+                    else:
+                        with patch.object(sm, "_schedule_raw_detection"):
+                            sm._process_chunk("term-1", "\x1b[2;1H")
+                    return ready
+
+                backend.get_history.side_effect = straddling_capture
+            elif interruption == "rate_limit":
+                # A concurrent poll used the slot just before the timer fired.
+                sm._last_stale_capture_check["term-1"] = clock["now"] - 0.1
+            confirm(*args)
+            if sm._detect_tasks:
+                await asyncio.gather(*list(sm._detect_tasks))
+            if interruption == "rate_limit":
+                assert sm._last_status["term-1"] == TerminalStatus.PROCESSING
+                delay, confirm, args = timers[-1]
+                clock["now"] += delay
+                confirm(*args)
+                await asyncio.gather(*list(sm._detect_tasks))
+            if interruption in (None, "rate_limit"):
+                assert sm._last_status["term-1"] == TerminalStatus.IDLE
+                publish.assert_called_with("terminal.term-1.status", {"status": "idle"})
+                svc.deliver_pending("term-1")
+                send.assert_called_once_with("term-1", "hello")
+                update.assert_called_once_with(1, MessageStatus.DELIVERED)
+            else:
+                assert sm._last_status.get("term-1") != TerminalStatus.IDLE
+                send.assert_not_called()
+                update.assert_not_called()
 
 
 def _make_message(id=1, receiver_id="term-1", message="hello", status=MessageStatus.PENDING):

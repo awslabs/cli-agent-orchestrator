@@ -19,6 +19,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    func,
     literal_column,
     text,
 )
@@ -76,7 +77,7 @@ class SessionIncarnationModel(Base):
 
 
 class EphemeralAgentModel(Base):
-    """Read-only access to the server-owned ephemeral registry."""
+    """Server-owned ephemeral registry with guarded lifecycle transitions."""
 
     __tablename__ = "ephemeral_agents"
 
@@ -87,15 +88,15 @@ class EphemeralAgentModel(Base):
     state = Column(String, nullable=False)
     claim_id = Column(String, nullable=True)
     idempotency_key = Column(String, nullable=True)
-    claim_expires_at = Column(DateTime, nullable=True)
+    claim_expires_at = Column(UTCDateTime, nullable=True)
     launched_terminal_id = Column(String, nullable=True, index=True)
-    bound_at = Column(DateTime, nullable=True)
+    bound_at = Column(UTCDateTime, nullable=True)
     model_tier = Column(String, nullable=True)
     effort = Column(String, nullable=True)
     provider = Column(String, nullable=False)
     effective_tools = Column(Text, nullable=False)
-    created_at = Column(DateTime, nullable=False)
-    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(UTCDateTime, nullable=False)
+    expires_at = Column(UTCDateTime, nullable=False)
     gc_reason = Column(String, nullable=True)
     spec_sha256 = Column(String, nullable=False)
     profile_sha256 = Column(String, nullable=False)
@@ -1629,6 +1630,9 @@ def _migrate_workflow_run() -> None:
 
     Issue #753 additively appends nullable ``error`` for the redacted, bounded
     script-level failure diagnostic. Existing and non-script rows remain NULL.
+
+    PR #849 review additively appends nullable ``kind`` for the run-level terminal
+    verdict.  Existing rows keep NULL so cold reads retain the step-derived fallback.
     """
     import sqlite3
 
@@ -1665,6 +1669,9 @@ def _migrate_workflow_run() -> None:
             if "error" not in columns:
                 conn.execute("ALTER TABLE workflow_run ADD COLUMN error TEXT DEFAULT NULL")
                 logger.info("Migration: added error column to workflow_run")
+            if "kind" not in columns:
+                conn.execute("ALTER TABLE workflow_run ADD COLUMN kind TEXT DEFAULT NULL")
+                logger.info("Migration: added kind column to workflow_run")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run migration skipped: {e}")
 
@@ -2916,6 +2923,24 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
             status=MessageStatus(inbox_msg.status),
             created_at=inbox_msg.created_at,
         )
+
+
+def get_pending_inbox_counts(receiver_ids: List[str]) -> Dict[str, int]:
+    """Count pending messages grouped by the requested receivers."""
+    if not receiver_ids:
+        return {}
+
+    with SessionLocal() as db:
+        counts = (
+            db.query(InboxModel.receiver_id, func.count(InboxModel.id))
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.receiver_id.in_(receiver_ids),
+            )
+            .group_by(InboxModel.receiver_id)
+            .all()
+        )
+        return {receiver_id: int(count) for receiver_id, count in counts}
 
 
 def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]:

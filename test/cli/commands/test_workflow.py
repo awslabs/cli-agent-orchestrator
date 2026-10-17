@@ -448,6 +448,27 @@ def test_status_happy(runner):
     assert "running" in result.output
 
 
+def test_status_renders_structured_error_kind(runner):
+    body = {
+        "run_id": "run1",
+        "state": "failed",
+        "current_step_id": "s1",
+        "steps": [
+            {
+                "id": "s1",
+                "state": "failed",
+                "attempts": 2,
+                "error_kind": "provider_error",
+            }
+        ],
+    }
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
+        mock_req.get.return_value = _resp(200, body)
+        result = runner.invoke(workflow, ["status", "run1"])
+    assert result.exit_code == 0
+    assert "s1: failed [provider_error] (attempts=2)" in result.output
+
+
 def test_status_unknown_404(runner):
     with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
         mock_req.get.return_value = _resp(404, {"detail": "unknown run 'ghost'"})

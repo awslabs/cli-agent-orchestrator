@@ -595,3 +595,44 @@ class TestWorkflowJournalSettingsWritePath:
         rather than being silently persisted as an unread setting."""
         with pytest.raises(ValueError, match="Unknown memory setting"):
             settings_service.set_memory_setting("workflow_journal_retention_dayz", 30)
+
+
+class TestSavePrivateAndSymlinkSafe:
+    """settings.json is CAO-owned and may hold credentials: 0600, never via a symlink."""
+
+    def _patched(self, tmp_path):
+        home = tmp_path / "cao-home"
+        settings = home / "settings.json"
+        return (
+            settings,
+            patch("cli_agent_orchestrator.services.settings_service.SETTINGS_FILE", settings),
+            patch("cli_agent_orchestrator.services.settings_service.CAO_HOME_DIR", home),
+        )
+
+    def test_save_creates_file_private(self, tmp_path):
+        settings, p1, p2 = self._patched(tmp_path)
+        with p1, p2:
+            _save({"k": "v"})
+        assert oct(settings.stat().st_mode & 0o777) == oct(0o600)
+
+    def test_save_tightens_an_existing_world_readable_file(self, tmp_path):
+        settings, p1, p2 = self._patched(tmp_path)
+        settings.parent.mkdir(parents=True)
+        settings.write_text("{}")
+        settings.chmod(0o644)
+        with p1, p2:
+            _save({"k": "v"})
+        assert oct(settings.stat().st_mode & 0o777) == oct(0o600)
+        assert json.loads(settings.read_text()) == {"k": "v"}
+
+    def test_save_does_not_follow_a_symlink(self, tmp_path):
+        settings, p1, p2 = self._patched(tmp_path)
+        settings.parent.mkdir(parents=True)
+        victim = tmp_path / "victim.txt"
+        victim.write_text("do not touch")
+        settings.symlink_to(victim)
+        with p1, p2:
+            _save({"k": "v"})
+        assert victim.read_text() == "do not touch"
+        assert not settings.is_symlink()
+        assert json.loads(settings.read_text()) == {"k": "v"}

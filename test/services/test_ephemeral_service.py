@@ -84,7 +84,7 @@ def test_create_files_hashes_and_response(create_store):
     assert result["notes"] == [
         "model: provider default (tier omitted, no default_tier)",
         "effort: provider default (effort omitted, no default_effort)",
-        "launch: not supported by this server version",
+        "launch: not available through assign or handoff in this server version",
     ]
     row = database.get_ephemeral_agent(result["name"])
     assert row["owner_kind"] == "terminal" and row["owner_id"] == CALLER
@@ -832,7 +832,7 @@ def test_ignored_notes_split_keys_without_values(
     assert result["notes"] == [
         model_note,
         effort_note,
-        "launch: not supported by this server version",
+        "launch: not available through assign or handoff in this server version",
     ]
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert warnings == ["ephemeral create " + result["name"] + ": " + notice]

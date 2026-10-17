@@ -47,7 +47,8 @@ _COMPLETION_PATTERN = re.compile(r"(?:^|\n)[^\S\n]*└\s+Completed in\s+\d", re.
 # overlapped the following `.*` on every whitespace character outside ASCII, which
 # reads as re-guessable backtracking (CWE-1333); ^-anchoring means CPython never
 # actually walked it, but the narrower classes say what the line really looks like.
-_ASSISTANT_LINE_PATTERN = re.compile(r"^(?P<indent>[^\S\n]*)●[^\S\n]+(?P<text>\S.*)$")
+ASSISTANT_MARKER_PATTERN = re.compile(r"^(?P<indent>[^\S\n]*)●[^\S\n]+")
+_ASSISTANT_LINE_PATTERN = re.compile(ASSISTANT_MARKER_PATTERN.pattern + r"(?P<text>\S.*)$")
 _READY_ASSISTANT_LINE_PATTERN = re.compile(r"^\s*●\s+Ready\s*$")
 _WAITING_PATTERN = re.compile(
     r"Approval needed|Run this command\?|Allow for this conversation|"

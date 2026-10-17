@@ -1,5 +1,6 @@
 """Registry truth, not PATCHable metadata, controls ephemeral delegation."""
 
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from test.utils.test_agent_profiles_ephemeral import DOCUMENT, NAME, stores  # noqa: F401
@@ -90,6 +91,19 @@ def test_child_may_delegate_lifts_denial(registry, monkeypatch, tool):
 
 
 @pytest.mark.parametrize("tool", TOOLS)
+def test_child_may_delegate_does_not_override_allowlist(registry, monkeypatch, tool):
+    seed(registry, "gc")
+    monkeypatch.setattr(
+        settings_service, "_load_or_raise", lambda: {"ephemeral": {"child_may_delegate": True}}
+    )
+    with registry() as db:
+        row = db.get(database.TerminalModel, "abcd1234")
+        row.allowed_tools = json.dumps(["fs_read"])
+        db.commit()
+    assert "@cao-mcp-server" in server._tool_denied_reason(tool)
+
+
+@pytest.mark.parametrize("tool", TOOLS)
 def test_registry_lookup_failure_denies(registry, tool):
     from cli_agent_orchestrator.api.main import app
 
@@ -173,13 +187,17 @@ async def test_target_without_claim_refuses_before_tool_inheritance(stores, monk
     if path == "assign":
         result = orchestration._assign_impl(NAME, "task", working_directory="/workspace")
         assert result["success"] is False
-        assert "claim" in result["message"]
+        assert result["message"].endswith(
+            "Ephemeral targets cannot be launched through assign or handoff in this version."
+        )
     else:
         result = await orchestration._handoff_impl(
             NAME, "task", working_directory="/workspace", wait=path != "handoff_nowait"
         )
         assert result.success is False
-        assert "claim" in result.message
+        assert result.message.endswith(
+            "Ephemeral targets cannot be launched through assign or handoff in this version."
+        )
     inheritance.assert_not_called()
     post.assert_not_called()
 
@@ -313,13 +331,14 @@ def test_installed_handler_guard_does_not_read_source(stores, monkeypatch, handl
 
 @pytest.mark.parametrize("tool", ["workflow_run", "workflow_resume", "workflow_start"])
 @pytest.mark.parametrize("caller", ["installed", "unbound"])
+@pytest.mark.parametrize("allowed_tools", [["@cao-mcp-server"], ["*"], ["fs_read"], []])
 @pytest.mark.asyncio
-async def test_workflows_allow_installed_and_unbound_callers(registry, monkeypatch, tool, caller):
-    import json
-
+async def test_workflows_authorize_installed_and_unbound_callers(
+    registry, monkeypatch, tool, caller, allowed_tools
+):
     with registry() as db:
         row = db.get(database.TerminalModel, "abcd1234")
-        row.allowed_tools = json.dumps(["fs_read"])
+        row.allowed_tools = json.dumps(allowed_tools)
         db.commit()
     if caller == "unbound":
         monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)
@@ -336,8 +355,13 @@ async def test_workflows_allow_installed_and_unbound_callers(registry, monkeypat
     )
     monkeypatch.setattr(server.requests, "post", post)
     result = await getattr(server, tool)("run")
-    assert result["ok"] is True
-    post.assert_called_once()
+    if caller == "unbound" or "@cao-mcp-server" in allowed_tools or "*" in allowed_tools:
+        assert result["ok"] is True
+        post.assert_called_once()
+    else:
+        assert result["ok"] is False
+        assert "@cao-mcp-server" in result["error"]
+        post.assert_not_called()
 
 
 @pytest.mark.parametrize("tool", ["workflow_run", "workflow_resume", "workflow_start"])
