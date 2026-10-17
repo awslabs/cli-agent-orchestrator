@@ -450,6 +450,7 @@ async def run_agent_step(
     use_worktree: bool = False,
     job_id: Optional[str] = None,
     claim_id: Optional[str] = None,
+    description: Optional[str] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -692,6 +693,7 @@ async def run_agent_step(
             model=model,
             use_worktree=use_worktree,
             claim_id=claim_id,
+            description=description,
         )
         terminal_id = terminal.id
 

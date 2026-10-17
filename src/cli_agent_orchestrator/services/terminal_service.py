@@ -61,6 +61,7 @@ from cli_agent_orchestrator.clients.database import (
     update_terminal_deferred_init_external_owner,
     update_terminal_deferred_init_failure,
     update_terminal_deferred_init_runtime_reclaimed,
+    update_terminal_description,
     update_terminal_group,
     update_terminal_initial_delivery,
     update_terminal_metadata,
@@ -830,6 +831,7 @@ def _request_fingerprint(
     initial_message: Optional[str],
     initial_message_orchestration_type: Optional[OrchestrationType],
     claim_id: Optional[str] = None,
+    description: Optional[str] = None,
 ) -> str:
     """Fingerprint the create-terminal request an idempotency key stands for.
 
@@ -1010,6 +1012,8 @@ def _request_fingerprint(
         initial_message or "",
         orchestration_value,
     ]
+    if description is not None:
+        parts.extend(["description", description])
     if claim_id is not None:
         parts.append(claim_id)
     return hashlib.sha256(
@@ -1046,6 +1050,7 @@ async def create_terminal(
     metadata: Optional[Dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
     claim_id: Optional[str] = None,
+    description: Optional[str] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -1299,6 +1304,7 @@ async def create_terminal(
             use_worktree=use_worktree,
             group=group,
             metadata=metadata,
+            description=description,
             idempotency_key=idempotency_key,
             claim_id=claim_id,
             ephemeral_state=state,
@@ -1334,6 +1340,7 @@ async def _create_terminal_unguarded(
     metadata: Optional[Dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
     claim_id: Optional[str] = None,
+    description: Optional[str] = None,
     *,
     ephemeral_state: _EphemeralLaunchState,
 ) -> Terminal:
@@ -1344,6 +1351,9 @@ async def _create_terminal_unguarded(
     # retry on a full node -- the one case this feature exists to make safe.
     # The cap still precedes every actual allocation (worktree, tmux window, DB
     # row, provider process), which is all its own placement-guard needs.
+    from cli_agent_orchestrator.utils.description import normalize_description
+
+    description = normalize_description(description, truncate=True)
     request_fingerprint: Optional[str] = None
     if idempotency_key:
         request_fingerprint = _request_fingerprint(
@@ -1361,6 +1371,7 @@ async def _create_terminal_unguarded(
             initial_message,
             initial_message_orchestration_type,
             claim_id,
+            description,
         )
         existing_record = get_idempotency_record(idempotency_key)
         existing_terminal_id = existing_record.terminal_id if existing_record else None
@@ -1826,6 +1837,7 @@ async def _create_terminal_unguarded(
                         engine=resolved_engine.value if resolved_engine is not None else None,
                         group=group,
                         metadata=metadata,
+                        description=description,
                         working_directory=resolved_working_directory,
                         deferred_init_external_owner=bool(
                             defer_init and deferred_delete_on_failure is False
@@ -2008,6 +2020,7 @@ async def _create_terminal_unguarded(
             shell_command=shell_command,
             group=group,
             metadata=metadata,
+            description=description,
             deferred_init_failure=None,
             session_incarnation_id=session_incarnation_id,
             status=initial_status,
@@ -3718,6 +3731,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "engine": metadata.get("engine"),
             "group": metadata.get("group"),
             "metadata": public_metadata,
+            "description": metadata.get("description"),
             "deferred_init_failure": deferred_failure,
             "initial_delivery": metadata.get("initial_delivery"),
             "session_incarnation_id": metadata.get("session_incarnation_id"),
@@ -4776,3 +4790,10 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
     except Exception as e:
         logger.error(f"Failed to delete terminal {terminal_id}: {e}")
         raise
+
+
+def update_description(terminal_id: str, description: Optional[str]) -> bool:
+    """Normalize and validate an operator edit without touching lifecycle facts."""
+    from cli_agent_orchestrator.utils.description import normalize_description
+
+    return update_terminal_description(terminal_id, normalize_description(description))

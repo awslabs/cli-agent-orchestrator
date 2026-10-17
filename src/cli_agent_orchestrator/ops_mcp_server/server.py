@@ -334,6 +334,9 @@ async def _launch_session_impl(
         if validated_env:
             body["env_vars"] = validated_env
 
+    if not session_name:
+        body = {**(body or {}), "description": None}
+
     session_data, error = _request_json(
         "post", "/sessions", params=params, json=body, operation="Launch session"
     )
