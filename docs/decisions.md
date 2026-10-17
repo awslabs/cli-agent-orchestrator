@@ -1,9 +1,15 @@
 # Launch decisions
 
-CAO provides a local decision package for choosing a model size and reasoning
-effort. Both points are **off by default**. The package and its operator controls
-are available, but delegation handlers do not yet call it. Changing a setting
-in this version does not change how workers launch.
+CAO routes normal delegations to installed profiles through `model.route` when
+the caller omits a model. Local and remote assign, elastic assign, handoff and
+CLI handoff use it. Both decision points are **off by default**, so normal
+launches keep their existing behavior until an operator enables routing.
+
+Plain terminal creates and older clients that do not send the original task
+message are not routed. Reusing a terminal and replaying a workflow step launch
+nothing, so neither runs a decision. A script workflow's own step is out of
+scope for deciders; in shadow or on it gets an `out_of_scope` record. An agent's
+assign or handoff from inside that step remains an ordinary delegation.
 
 ## Points and states
 
@@ -25,6 +31,40 @@ value above a policy ceiling is refused; a decider answer above it is capped.
 The launch-time policy check covers every checked provider in the envelope,
 including providers other than the target. A missing mapping anywhere in that
 set refuses the launch and names `model_tiers.<provider>.<tier>`.
+
+## Delegation results
+
+An eligible delegation in on mode adds a note to the assign, handoff or elastic
+assign tool result. CLI handoff includes it when returning early with
+`--no-wait` and when waiting on the terminal it just created.
+
+| Result | Example note |
+| --- | --- |
+| Applied | `ran on model-small (auto: small 0.91)` |
+| Capped by policy | `ran on model-medium (auto: large 0.91, capped to medium)` |
+| Fallback | `ran on model-default (auto: fallback, unsure)` |
+| Model cannot be vouched for | `ran on provider default (auto: fallback, not_honored)` |
+
+The note names a model only when the bound terminal records it and the provider
+honors it. Otherwise it says `provider default`. Fallback reasons are fixed
+values, including timeout, error, unsure and an unmapped tier. Normal delegation
+has no policy envelope, so capping is reserved for callers that supply one.
+
+The server carries the note in the optional `X-CAO-Decision` response header,
+not in the response body. Model characters outside the model-ID alphabet are
+percent-encoded once, including spaces, non-ASCII and control characters. The
+client displays the header verbatim and does not decode it. A header-building
+error cannot fail a launch that has already succeeded.
+
+Off, shadow, explicit-model calls, excluded profiles and older clients show no
+note. Rejected launches return an error. A terminal-creation idempotent retry
+launches nothing and shows no note. Terminal and sibling responses gain no
+decision fields.
+
+A decided Kiro model that fails the capability probe is retried with the model
+that would have been used without routing. That fallback is probed before any
+allocation, recorded as `fallback` / `not_honored`, and reflected in the note.
+An unsupported explicit model still returns the existing error.
 
 ## Settings
 
@@ -135,7 +175,11 @@ value/source, answer and probabilities, capped candidate, applied value, latency
 reason, terminal ID, launched model and whether it was honored. A policy model
 fallback records the tier as `fallback_value`; the mapped model appears in
 `launched_model` only when bound. Effort results are recorded but not carried in
-a launch plan in this version.
+a launch plan in this version. A launch is recorded as launched when the
+provider has been built and its start has completed or been scheduled. A
+deferred startup failure updates the record to `launch_failed` without emitting
+a second decision span. A cancelled deferred start also moves a previously
+launched row to `launch_failed`, with no second emission.
 
 Records never hold task messages, descriptions, purposes, prompts or working directories.
 Messages, descriptions and purposes are redacted before every decider call, including the
@@ -184,10 +228,10 @@ expose decision access through agent-tool registration hooks. This version inclu
 
 ## Known limitations
 
-- Delegation wiring is not available yet; operator settings do not affect worker launches.
+- Deferred assignment reports placement and the scheduled model before provider initialization finishes. A startup failure can occur afterward; after abrupt server loss, restart recovery can record a terminal-side failure while the decision record retains its last launch status as launched.
 - YAML workflow launches do not appear in decision records.
 - Elastic decision records stay on the remote node and are lost with it.
 - Effort routing has no normal delegation consumer and launch plans carry no effort.
 - A decider that blocks the event loop cannot be preempted by an asynchronous timeout.
 - Terminal records expose the launched model and whether it was honored, independently of decision state; decision fields stay in operator records.
-- If a policy tightens between a launch and `create_terminal`'s own idempotent retry, the retry can be refused before replaying the existing terminal. This does not occur with an identity policy.
+- If a policy tightens between a launch and `create_terminal`'s own idempotent retry, the retry can be refused before replaying the existing terminal. This does not occur with an identity policy. Each replayed delegation create writes its own `not_launched` row; in shadow or on the decider is asked again.

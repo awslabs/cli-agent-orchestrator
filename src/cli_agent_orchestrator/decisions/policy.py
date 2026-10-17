@@ -9,6 +9,17 @@ from cli_agent_orchestrator.models.provider import ProviderType
 
 ModelTiers = Mapping[str, Mapping[str, str]]
 
+POLICY_REJECTION_REASONS: frozenset[str] = frozenset(
+    {
+        "above_ceiling",
+        "explicit_unmapped",
+        "provider_not_allowed",
+        "model_override_not_allowed",
+        "default_unmapped",
+        "policy_invalid",
+    }
+)
+
 
 class DecisionInputError(ValueError):
     """A launch violates a deterministic input constraint."""

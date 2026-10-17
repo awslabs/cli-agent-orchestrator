@@ -813,6 +813,7 @@ async def assign_elastic(
             ready_wait_seconds=_elastic_ready_wait(),
             callback_url=os.environ.get(ELASTIC_CALLBACK_URL_ENV) or None,
             remote_session_name=str(lease["session_name"]),
+            delegation_message=message,
         )
         result["worker_id"] = worker_id
         result["elastic"] = True
