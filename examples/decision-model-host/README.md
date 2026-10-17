@@ -57,6 +57,98 @@ python3 check.py                      # three routing questions, with probabilit
 On an M1 Pro (Metal), a decision takes about 0.6–0.9 s. You don't need a GPU: llama.cpp also runs on a
 CPU, more slowly.
 
+## Set up JevK5-4B by hand
+
+This is what `serve.sh` does, step by step, if you want to run it yourself or put it on another host.
+
+### Prerequisites
+
+- **llama.cpp:** new enough to load Qwen3.5's hybrid layers. This sample is tested with build `b11669`
+  (Homebrew `llama.cpp` 0.7.0). A much older build fails to load the model.
+- **Tools:** Python 3.10 or newer, `git` and `curl`.
+- **Disk and memory:** about 5 GB free for the model, and about 5 GB of memory (unified memory on a Mac,
+  or GPU memory) at the 8192-token context used below.
+
+### Steps
+
+1. **Fetch the runtime client** at the pinned tag. The GGUF path uses only the standard library, so there
+   is nothing to `pip install`:
+
+   ```sh
+   git clone --depth 1 --branch v0.3.3 https://github.com/allebee/jevk5 vendor/jevk5
+   ```
+
+2. **Download the model and check its SHA-256** (the value is also in `models.json`):
+
+   ```sh
+   mkdir -p models
+   curl -fL -o models/jevk5-4b-v0.3-Q8_0.gguf \
+     https://huggingface.co/alibiserikbay/JevK5-GGUF/resolve/main/jevk5-4b-v0.3-Q8_0.gguf
+   echo "aea433883bc7ed399f2fbd539e53d2eac7caf71a946fe6650995a413979d4a30  models/jevk5-4b-v0.3-Q8_0.gguf" \
+     | shasum -a 256 -c -          # on Linux: sha256sum -c -
+   ```
+
+3. **Start llama-server** on loopback. `-ngl 99` puts every layer on the GPU; use `-ngl 0` on a machine
+   without one:
+
+   ```sh
+   llama-server -m models/jevk5-4b-v0.3-Q8_0.gguf -c 8192 -ngl 99 --host 127.0.0.1 --port 8080
+   ```
+
+4. **Start the shim** in a second terminal. `--temperature 1.367` is JevK5-4B v0.3's calibration
+   temperature. Each GGUF has its own value, and with the wrong one the probabilities are miscalibrated:
+
+   ```sh
+   PYTHONPATH=vendor/jevk5 python3 serve_gguf.py --name jevk5-4b-v0.3-q8 --temperature 1.367 --port 8090
+   ```
+
+### Try a request
+
+```sh
+curl -s 127.0.0.1:8090/v1/systemone -d '{
+  "state": "Refunds need a receipt and a purchase within 30 days. The customer bought 12 days ago and has no receipt.",
+  "questions": {
+    "refund": {"type": "noul", "instructions": "Is a refund permitted under the policy?"},
+    "size": {"type": "choice", "instructions": "What model size does this task need?",
+             "criteria": {"small": "Mechanical work", "medium": "Ordinary engineering work",
+                          "large": "Open-ended or high-stakes work"}}}}'
+```
+
+The response, abridged: `noul` is the probability of *true*, and a choice gets a probability for every
+option:
+
+```json
+{"model": "jevk5-4b-v0.3-q8",
+ "answers": {"refund": {"type": "noul", "confidence": 0.93, "noul": 0.07},
+             "size": {"type": "choice", "confidence": 0.56, "choice": "medium",
+                      "probabilities": {"small": 0.28, "medium": 0.56, "large": 0.16}}},
+ "usage": {"input_tokens": 275, "output_tokens": 0}, "latency_ms": 1017.5}
+```
+
+The first request after a start is slower, while llama.cpp warms up.
+
+### Troubleshooting
+
+- **llama-server can't load the model** (it reports an unknown or unsupported architecture): llama.cpp is
+  too old. Upgrade it, or build `b11669` or newer.
+- **`502 llama-server unavailable`** from the shim: llama-server isn't running, or isn't on port 8080 yet.
+  Check `logs/llama.log` (with `serve.sh`), or the terminal running it.
+- **`address already in use`:** another process holds port 8080 or 8090. Stop it with `./serve.sh stop`, or
+  pick other ports with `--port` (shim) and `--llama-url` (the shim's view of llama-server).
+- **Slow decisions** (several seconds): the model is running on the CPU. Check two things:
+  - `llama-server --list-devices` should list a GPU (for example `MTL0: Apple M1 Pro` or a CUDA device);
+  - you passed `-ngl 99`.
+
+  The log's `prompt eval time` line shows the speed: on an M1 Pro it reads about 200–400 tokens per
+  second.
+
+### Another model
+
+`models.json` also lists `plumb-4b` (calibration temperature 2.07). To add one:
+1. Add its GGUF repo, file name, SHA-256, a name and its **calibration temperature**, which comes from its
+   model card.
+2. Run `./serve.sh fetch <key>` and `./serve.sh start <key>`.
+
 ## Run it on AWS (CDK)
 
 The stack in `aws/cdk` creates one GPU instance (g4dn.xlarge with a T4), a security group and a key pair.
