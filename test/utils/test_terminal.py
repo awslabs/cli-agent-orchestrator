@@ -820,21 +820,22 @@ class TestWaitForInitialDelivery:
         assert g.call_count == 1
         assert "Failed to poll terminal delivery state" in str(excinfo.value)
 
-    @patch("cli_agent_orchestrator.utils.terminal.time.sleep")
-    def test_persistent_transport_failure_times_out_naming_the_last_error(self, mock_sleep):
+    def test_persistent_transport_failure_times_out_naming_the_last_error(self):
         import click
         import requests
 
         from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
 
-        clock = iter([0.0, 0.0, 1.0, 2.5])
+        # Patch the module's `time` name, not `time.time` itself: the retry logs at
+        # DEBUG, and a LogRecord reads the global clock, which would eat a value.
         with (
             patch(
                 "cli_agent_orchestrator.utils.terminal.api_http.get",
                 side_effect=requests.exceptions.ConnectionError("boom"),
             ) as g,
-            patch("cli_agent_orchestrator.utils.terminal.time.time", side_effect=clock),
+            patch("cli_agent_orchestrator.utils.terminal.time") as t,
         ):
+            t.time.side_effect = iter([0.0, 0.0, 1.0, 2.5])
             with pytest.raises(click.ClickException) as excinfo:
                 wait_for_initial_delivery("t1", timeout=2)
         assert g.call_count == 2

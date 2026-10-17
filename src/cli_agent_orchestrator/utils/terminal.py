@@ -354,10 +354,11 @@ def wait_for_initial_delivery(
     Returns the terminal payload once ``initial_delivery.state == "delivered"``.
     Raises ``click.ClickException`` when the delivery failed, when the terminal
     reached ERROR first (``deferred_init_failure`` carries the detail), on
-    timeout, or on a 4xx from the poll. A connection error, read timeout or 5xx
-    is retried until ``timeout``: the server is busy initializing and delivering
-    while this runs, and giving up on one failed poll made ``cao launch --async``
-    exit non-zero for a task that was still going to be delivered (#882).
+    timeout, or on a 4xx from the poll. Any other request error (a connection
+    error, a read timeout, a 5xx, or a reply that is not JSON) is retried until
+    ``timeout``: the server is busy initializing and delivering while this runs,
+    and giving up on one failed poll made ``cao launch --async`` exit non-zero
+    for a task that was still going to be delivered (#882).
     """
     import click
 
