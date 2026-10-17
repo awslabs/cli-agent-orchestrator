@@ -63,7 +63,7 @@ class DelegationAdapter(EngineAdapter):
             lambda *a: o.HandoffContext(self.provider, "cao-fixture", "a1b2c3d4", None),
         )
         patch.setattr(o, "_send_direct_input_handoff", Mock())
-        patch.setattr(o, "_delete_terminal_impl", lambda tid: {"success": True})
+        patch.setattr(o, "_delete_terminal_impl", lambda tid, *a, **k: {"success": True})
         patch.setattr(o.time, "time", lambda: 1000.0)
         patch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker.example")
         patch.setenv("CAO_ELASTIC_BROKER_TOKEN", "fixture-token")
