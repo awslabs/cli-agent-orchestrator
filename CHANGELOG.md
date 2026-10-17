@@ -65,7 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cao session status`, and the ops MCP `get_terminal_status` and
   `get_session_info` return both fields; `list_siblings` and the delegation
   tool results are unchanged (#810)
-- launch-decision platform, not yet wired: `model.route` (`small`/`medium`/
+- launch-decision platform: `model.route` (`small`/`medium`/
   `large`) and `effort.route` (`low`/`medium`/`high`), each `off`, `shadow` or
   `on`, all off by default. Deciders register under the `cao.deciders`
   entry-point group; the built-in `fixed_table` looks a tier up by profile,
@@ -74,8 +74,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table (a keyed message hash, never the task text), kept 90 days. Operators
   control it through `cao decisions`, `cao-server --decision`, the
   `CAO_DECISION_*` variables and the ops MCP decision tools; the agent-facing
-  MCP server has none. No delegation calls it yet, so launches are unchanged.
-  See `docs/decisions.md` (#810)
+  MCP server has none. Assign, handoff, elastic assign and CLI handoff that
+  omit a model ask `model.route`; an explicit model always wins. In on mode
+  their result notes the model that ran, carried in the optional
+  `X-CAO-Decision` response header, and agent tool definitions are unchanged.
+  With every point off, launches are unchanged. See `docs/decisions.md` (#810)
 - pane-mode windows caption each pane with the terminal running in it.
   `pane_window` gets `pane-border-status` and a border format reading the
   `@cao_terminal` mark, so the caption survives an agent whose TUI sets its own
