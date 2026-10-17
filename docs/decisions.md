@@ -87,8 +87,9 @@ server logs effective states at startup.
 The server captures these overrides at startup and keeps them until it restarts.
 While one is set, `cao decisions set <point> off` and `decisions_set_point` change
 only `settings.json`: the running server keeps using the override for that point.
-To turn such a point off, restart the server without the flag or variable. This
-version has no single command that turns every point off.
+`cao decisions off` turns every point off on a running server, overrides included:
+its halt marker is checked above the flag and environment layers (see External
+deciders).
 
 ```json
 {
@@ -142,6 +143,10 @@ shutdown and crash recovery mark unfinished decisions interrupted.
 
 ```bash
 cao decisions status
+cao decisions off
+cao decisions enable <name>
+cao decisions disable <name>
+cao decisions show <name>
 cao decisions set model.route shadow --decider fixed_table
 cao decisions tier codex small model-small
 cao decisions tier codex large --unset
@@ -155,7 +160,7 @@ cao decisions purge --before 2026-01-01
 cao decisions purge --all --rotate-key
 ```
 
-The operations stdio MCP server offers `decisions_status`, `decisions_set_point`,
+The operations stdio MCP server offers `decisions_status`, `decisions_off`, `decisions_set_point`,
 `decisions_set_tier`, `decisions_set_exclusions`, `decisions_list` and
 `decisions_purge`. These run locally in-process; there are no decision HTTP
 routes. The agent-facing MCP server has no tools to read, change or ask for
@@ -223,8 +228,74 @@ installed dependency: CAO imports and constructs its class before checking what
 it declares. With every point off, no decider code runs. Failures are cached
 until restart. `async decide` must
 not block the event loop; every call has a timeout. External deciders must not
-expose decision access through agent-tool registration hooks. This version includes only
-`fixed_table` and makes no external calls.
+expose decision access through agent-tool registration hooks. Core bundles only
+`fixed_table`; external deciders are optional installed packages.
+
+## External deciders
+
+An external decider sends nothing until it has its own consent. Consent, endpoint
+disclosure and key handling belong to the decider package. Core redacts messages,
+descriptions and purposes before every call; redaction removes common credential
+shapes using patterns and is not a guarantee. Decision records hold no task content.
+Review the package's disclosure to learn exactly what it sends and where it sends it.
+
+External deciders must send only while holding
+`cli_agent_orchestrator.decisions.egress.egress_permit(point, decider)`:
+
+```python
+async with egress_permit("model.route", "external") as permitted:
+    if not permitted:
+        return None
+    # Check this package's consent before reading its key or sending a request.
+    return await send_request()
+```
+
+The permit takes a non-blocking shared lock, then freshly checks the halt marker,
+the effective point state and the decider binding. In the running server it uses
+the same startup environment snapshot as the engine. It refuses if the lock cannot
+be opened or acquired. Keep the permit until the request finishes or is cancelled;
+never block the event loop. The lock file must not be removed or replaced while
+requests may be running.
+
+`cao decisions off` creates `decisions.halt`, writes every point off, then waits
+for in-flight permit holders to finish. The wait is the configured shadow timeout
+plus five seconds. A successful return requires the drain to finish, the halt
+marker to remain present, and every returned point to be off. Every external
+decider that follows the permit rule has then drained and cannot start another
+request while the halt remains active. If a concurrent explicit change re-enables
+decisions during off, the CLI exits 1 and operations MCP reports failure, asking
+the operator to re-run `cao decisions off`. The command does not recreate the
+marker over that newer action. A timeout produces a non-zero CLI exit code,
+and the halt remains active. If settings cannot be read
+or saved, the marker still switches every point off and the result reports
+`settings_saved: false`. Fix the settings before re-enabling decisions.
+
+The marker overrides settings, environment and startup flags. Setting any point
+to `shadow` or `on` removes it and prints effective local states. This may also
+re-enable other points whose environment or startup flags select `shadow` or `on`;
+the CLI cannot see a running server's startup flags. `cao decisions status` shows
+`halted` and installed deciders' names, distribution versions and `builtin` or
+`external` classification without importing them. External entries carry the
+label “sends data off this machine only after its own consent”.
+
+A distribution providing the `cao.deciders` entry `<name>` can also provide the
+console script `cao-decider-<name>`, targeting
+`main(argv: Sequence[str] | None = None) -> int`. Core calls that function
+in-process: `enable <name>` passes `["consent", *extra]`, `disable <name>` passes
+`["revoke", *extra]`, and `show <name>` passes `["status", *extra]`. Additional
+arguments are forwarded, and the script's returned exit code becomes the CLI exit
+code. Use `-- --help` after the name to request the package's help. A decider with
+no script, including `fixed_table`, reports “no operator commands for <name>” and
+exits with code 2. Granting consent requires the package's interactive TTY command;
+operations MCP can read status and turn everything off, but cannot grant consent.
+
+Consent is a same-user local control, not a privilege boundary. CAO runs as you
+and verifies nothing about who typed the endpoint; `granted_by` is a provenance
+note, not an identity claim. Any process running as you, including an agent with
+shell access, can edit the consent file or `settings.json` and can read the key
+from the key store. What keeps agents out is that no agent-facing tool can grant
+consent, the consent command needs an interactive terminal, and each profile's
+tool restrictions.
 
 ## Known limitations
 

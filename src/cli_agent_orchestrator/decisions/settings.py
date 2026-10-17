@@ -72,6 +72,9 @@ def load_settings(*, environment: Mapping[str, str] | None = None) -> DecisionSe
     except settings_service.SettingsUnreadableError:
         logger.warning("Decision settings unreadable; all points off")
         return DecisionSettings()
+    from cli_agent_orchestrator.decisions.egress import is_halted
+
+    halted = is_halted()
     env = os.environ if environment is None else environment
     block = _block(raw.get("decisions"))
     saved = _block(block.get("points"))
@@ -84,6 +87,8 @@ def load_settings(*, environment: Mapping[str, str] | None = None) -> DecisionSe
         except (ValueError, TypeError):
             parsed = PointState.OFF
             logger.warning("Invalid decision state; point off")
+        if halted:
+            parsed = PointState.OFF
         exclusions = item.get("exclude_profiles", []) if point == "model.route" else []
         names = (
             tuple(p for p in exclusions if isinstance(p, str))
@@ -146,6 +151,10 @@ def set_point(point: str, state: str, decider: str | None = None) -> None:
     if decider is not None:
         item["decider"] = decider
     settings_service._save(data)
+    if state in ("shadow", "on"):
+        from cli_agent_orchestrator.decisions import egress
+
+        egress.HALT_FILE.unlink(missing_ok=True)
 
 
 def set_tier(provider: str, tier: str, model: str | None) -> None:

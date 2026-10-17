@@ -1392,14 +1392,20 @@ async def lifespan(app: FastAPI):
         deferred_init_recovery_task = asyncio.create_task(
             terminal_service.retry_interrupted_deferred_init_external_owners()
         )
+    from cli_agent_orchestrator.decisions.egress import set_settings_loader
     from cli_agent_orchestrator.decisions.engine import DecisionEngine
     from cli_agent_orchestrator.decisions.registry import DeciderRegistry
-    from cli_agent_orchestrator.decisions.settings import load_settings
+    from cli_agent_orchestrator.decisions.settings import DecisionSettings, load_settings
     from cli_agent_orchestrator.decisions.shadow import ShadowRunner
     from cli_agent_orchestrator.decisions.store import DecisionStore
 
     decision_settings = load_settings(environment=dict(os.environ))
     decision_environment = dict(os.environ)
+
+    def decision_settings_loader() -> DecisionSettings:
+        return load_settings(environment=decision_environment)
+
+    set_settings_loader(decision_settings_loader)
     decision_store = DecisionStore()
     decision_store.sweep()
     decision_registry = DeciderRegistry()
@@ -1412,7 +1418,7 @@ async def lifespan(app: FastAPI):
         decision_registry,
         decision_store,
         decision_runner,
-        settings_loader=lambda: load_settings(environment=decision_environment),
+        settings_loader=decision_settings_loader,
     )
     logger.info(
         "Decision states: %s", {p: v.state.value for p, v in decision_settings.points.items()}

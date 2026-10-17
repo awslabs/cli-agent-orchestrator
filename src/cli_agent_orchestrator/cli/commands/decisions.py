@@ -5,20 +5,23 @@ from typing import Any, Callable
 
 import click
 
-from cli_agent_orchestrator.decisions import operator, settings
+from cli_agent_orchestrator.decisions import operator, packages, settings
 from cli_agent_orchestrator.decisions.types import POINTS
 from cli_agent_orchestrator.services.model_tiers import TIERS
 
 
-def _run(action: Callable[[], Any]) -> None:
+def _run(action: Callable[[], Any]) -> Any:
     try:
         result = action()
         click.echo(json.dumps(result if result is not None else {"success": True}, indent=2))
+        return result
     except (ValueError, OSError, RuntimeError) as error:
         raise click.ClickException(str(error)) from error
 
 
-@click.group(help="Manage local launch decisions. " + settings.SAME_USER)
+@click.group(
+    help="Manage local launch decisions. " + settings.SAME_USER + " " + packages.CONSENT_SAME_USER
+)
 def decisions() -> None:
     pass
 
@@ -38,7 +41,7 @@ def status() -> None:
 @click.option("--decider", default=None)
 def set_point(point: str, state: str, decider: str | None) -> None:
     """Set a point's state and optionally its installed decider name."""
-    _run(lambda: settings.set_point(point, state, decider))
+    _run(lambda: operator.set_point(point, state, decider))
 
 
 @decisions.command()
@@ -106,3 +109,49 @@ def purge(before: str | None, all_records: bool, rotate_key: bool) -> None:
     if (before is None) == (not all_records):
         raise click.UsageError("provide exactly one of --before or --all")
     _run(lambda: operator.purge(before=before, all_records=all_records, rotate=rotate_key))
+
+
+@decisions.command()
+def off() -> None:
+    """Halt all points and wait for external requests to finish."""
+    result = _run(operator.off)
+    if not result["success"]:
+        click.echo(result["message"], err=True)
+        raise click.exceptions.Exit(1)
+
+
+def _dispatch(name: str, action: str, extra: tuple[str, ...]) -> None:
+    try:
+        code = packages.dispatch(name, action, extra)
+    except ValueError as error:
+        raise click.UsageError(str(error)) from error
+    except (OSError, RuntimeError) as error:
+        raise click.ClickException(str(error)) from error
+    raise click.exceptions.Exit(code)
+
+
+@decisions.command(context_settings={"ignore_unknown_options": True})
+@click.argument("name")
+@click.argument("extra", nargs=-1, type=click.UNPROCESSED)
+def enable(name: str, extra: tuple[str, ...]) -> None:
+    """Run an installed decider's consent command.
+
+    Consent needs an interactive terminal.
+    """
+    _dispatch(name, "consent", extra)
+
+
+@decisions.command(context_settings={"ignore_unknown_options": True})
+@click.argument("name")
+@click.argument("extra", nargs=-1, type=click.UNPROCESSED)
+def disable(name: str, extra: tuple[str, ...]) -> None:
+    """Run an installed decider's revoke command."""
+    _dispatch(name, "revoke", extra)
+
+
+@decisions.command(context_settings={"ignore_unknown_options": True})
+@click.argument("name")
+@click.argument("extra", nargs=-1, type=click.UNPROCESSED)
+def show(name: str, extra: tuple[str, ...]) -> None:
+    """Run an installed decider's status command."""
+    _dispatch(name, "status", extra)
