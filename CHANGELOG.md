@@ -79,6 +79,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their result notes the model that ran, carried in the optional
   `X-CAO-Decision` response header, and agent tool definitions are unchanged.
   With every point off, launches are unchanged. See `docs/decisions.md` (#810)
+- `cao decisions off` turns every decision point off, including a running
+  server's environment and startup-flag overrides, and waits for in-flight
+  external decider requests to finish. An installed external decider must
+  send only while holding `decisions.egress.egress_permit`, which refuses
+  during the halt. `cao decisions enable|disable|show <name>` run the decider
+  package's own consent, revoke and status commands, and `cao decisions
+  status` shows the halt and each installed decider's version and kind
+  without importing it. Ops MCP gains `decisions_off` and cannot grant
+  consent. Core still bundles only `fixed_table` and makes no external call.
+  See `docs/decisions.md` (#810)
 - pane-mode windows caption each pane with the terminal running in it.
   `pane_window` gets `pane-border-status` and a border format reading the
   `@cao_terminal` mark, so the caption survives an agent whose TUI sets its own
