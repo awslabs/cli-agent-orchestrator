@@ -6,11 +6,11 @@ from typing import Any, Callable, Sequence, cast
 
 CONSENT_SAME_USER = (
     "Consent is a same-user local control, not a privilege boundary. CAO runs as you and verifies "
-    "nothing about who typed the endpoint; granted_by is a provenance note, not an identity claim. "
-    "Any process running as you, including an agent with shell access, can edit the consent file or "
-    "settings.json and can read the key from the key store. What keeps agents out is that no "
-    "agent-facing tool can grant consent, the consent command needs an interactive terminal, and "
-    "each profile's tool restrictions."
+    "nothing about who granted consent; a package's record of who granted it is a provenance note, "
+    "not an identity claim. Any process running as you, including an agent with shell access, can "
+    "edit settings.json or a package's consent file and can read any key or endpoint the package "
+    "stores. What keeps agents out is that no agent-facing tool can grant consent, the consent "
+    "command needs an interactive terminal, and each profile's tool restrictions."
 )
 EXTERNAL_DISCLOSURE = "sends data off this machine only after its own consent"
 

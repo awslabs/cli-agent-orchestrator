@@ -117,6 +117,35 @@ async def test_permit_uses_startup_snapshot_and_fresh_file(egress, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_permit_checks_the_marker_before_and_after_reading_settings(egress):
+    # The loader ignores the marker, so only the permit's own checks can refuse.
+    settings.set_point("model.route", "on", "external")
+    snapshot = settings.load_settings()
+    reads = []
+
+    def loader():
+        reads.append(egress.is_halted())
+        return snapshot
+
+    egress.set_settings_loader(loader)
+    async with egress.egress_permit("model.route", "external") as allowed:
+        assert allowed
+    egress.HALT_FILE.touch()
+    async with egress.egress_permit("model.route", "external") as allowed:
+        assert not allowed
+    assert reads == [False]  # a halted permit reads no settings
+
+    def halt_while_reading():
+        egress.HALT_FILE.touch()
+        return snapshot
+
+    egress.HALT_FILE.unlink()
+    egress.set_settings_loader(halt_while_reading)
+    async with egress.egress_permit("model.route", "external") as allowed:
+        assert not allowed
+
+
+@pytest.mark.asyncio
 async def test_cancellation_releases_permit(egress):
     settings.set_point("model.route", "on", "external")
     entered = asyncio.Event()
