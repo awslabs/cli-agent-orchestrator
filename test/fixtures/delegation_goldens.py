@@ -36,6 +36,7 @@ GOLDEN_RESULTS = {
     },
 }
 
-# Agent tool definitions and output models captured before delegation wiring.
-TOOL_DEFINITIONS_SHA256 = "3cad45832f57cd9c50477678c1f18016d42267b047ee50f38074ff6b1b72fd74"
+# Agent tool definitions captured from main 11f164da (#942 descriptions);
+# output models captured before delegation wiring.
+TOOL_DEFINITIONS_SHA256 = "3e144811fd442f49805146bcf9dbd6708e93a7915338ba04317576a8dfac445f"
 TOOL_MODELS_SHA256 = "6b9c510f965a658909efa356cb18d8a2009bd5fe7f58ad2e56c87fda3a7523c2"
