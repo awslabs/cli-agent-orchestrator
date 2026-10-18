@@ -56,6 +56,8 @@ from cli_agent_orchestrator.utils.orchestration import (
     _mcp_timeout,
     _resolve_target_base_url,
     _send_message_impl,
+    _target_binding_denial,
+    has_discovery_grant,
 )
 from cli_agent_orchestrator.utils.workflow_events import parse_sse_frames
 
@@ -117,6 +119,11 @@ def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
         )
         status_response.raise_for_status()
         terminal = status_response.json()
+        # The row we just fetched carries caller_id, so the binding check costs
+        # no extra request. Refuse before revealing the target's prompt state.
+        denial = _target_binding_denial(terminal_id, target_meta=terminal)
+        if denial:
+            return {"success": False, "terminal_id": terminal_id, "error": denial}
         current_status = terminal.get("status")
         if current_status != TerminalStatus.WAITING_USER_ANSWER.value:
             return {
@@ -310,8 +317,17 @@ if ENABLE_WORKING_DIRECTORY:
             ),
         ),
         target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
+        description: Annotated[
+            Optional[str],
+            Field(
+                description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
+            ),
+        ] = None,
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
+
+        Optionally supply description: a short phrase for the operator identifying
+        the child responsibility (64 Unicode code points, truncated on creation).
 
         This tool allows handing off tasks to other agents by creating a new terminal
         in the same session. It sends the message, waits for completion, and captures the output.
@@ -383,6 +399,7 @@ if ENABLE_WORKING_DIRECTORY:
             model=model,
             use_worktree=use_worktree,
             target_host=target_host,
+            description=description,
         )
 
 else:
@@ -416,8 +433,17 @@ else:
             ),
         ),
         target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
+        description: Annotated[
+            Optional[str],
+            Field(
+                description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
+            ),
+        ] = None,
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
+
+        Optionally supply description: a short phrase for the operator identifying
+        the child responsibility (64 Unicode code points, truncated on creation).
 
         This tool allows handing off tasks to other agents by creating a new terminal
         in the same session. It sends the message, waits for completion, and captures the output.
@@ -477,6 +503,7 @@ else:
             model=model,
             use_worktree=use_worktree,
             target_host=target_host,
+            description=description,
         )
 
 
@@ -534,6 +561,7 @@ call delete_terminal(terminal_id) to free system resources.
 
 Args:
     agent_profile: Agent profile for the worker terminal
+    description: Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)
     message: Task message (include callback instructions)"""
 
     if enable_workdir:
@@ -590,6 +618,12 @@ if ENABLE_WORKING_DIRECTORY:
             ),
         ),
         target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
+        description: Annotated[
+            Optional[str],
+            Field(
+                description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
+            ),
+        ] = None,
     ) -> Dict[str, Any]:
         denied = _tool_denied_reason("assign")
         if denied:
@@ -602,6 +636,7 @@ if ENABLE_WORKING_DIRECTORY:
             model=model,
             use_worktree=use_worktree,
             target_host=target_host,
+            description=description,
         )
 
 else:
@@ -628,6 +663,12 @@ else:
             ),
         ),
         target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
+        description: Annotated[
+            Optional[str],
+            Field(
+                description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
+            ),
+        ] = None,
     ) -> Dict[str, Any]:
         denied = _tool_denied_reason("assign")
         if denied:
@@ -640,6 +681,7 @@ else:
             model=model,
             use_worktree=use_worktree,
             target_host=target_host,
+            description=description,
         )
 
 
@@ -701,8 +743,17 @@ async def assign_elastic(
     ),
     engine: Optional[str] = Field(default=None, description="Optional Kiro engine override"),
     model: Optional[str] = Field(default=None, description=_model_field_desc),
+    description: Annotated[
+        Optional[str],
+        Field(
+            description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
+        ),
+    ] = None,
 ) -> Dict[str, Any]:
     """Provision one elastic worker and assign one task to it.
+
+    Optionally supply description: an operator-facing phrase identifying the
+    child responsibility (64 Unicode code points, truncated on creation).
 
     The worker must call ``complete_assignment`` exactly once after producing
     its final result. That tool durably delivers the callback before releasing
@@ -806,6 +857,7 @@ async def assign_elastic(
             ready_wait_seconds=_elastic_ready_wait(),
             callback_url=os.environ.get(ELASTIC_CALLBACK_URL_ENV) or None,
             remote_session_name=str(lease["session_name"]),
+            description=description,
         )
         result["worker_id"] = worker_id
         result["elastic"] = True
@@ -843,6 +895,11 @@ async def send_message(
     When receiver_id is omitted, the message goes to the recorded caller —
     the terminal that created this one via handoff/assign. This is the
     reliable way to send results back to your supervisor.
+
+    An explicit receiver_id must be one of: a terminal you created via
+    assign/handoff, the terminal that created you, or (when your profile
+    grants the 'discovery' tool) a sibling that list_siblings returns for
+    you. Any other id is refused before anything is sent.
 
     Args:
         message: Message content to send
@@ -995,6 +1052,12 @@ def delete_terminal(
     handoff/assign left behind on a target_host node (on CAO_MAX_TERMINALS=1
     worker pods a leftover terminal — including one stuck in ERROR — occupies
     the pod's only slot until deleted).
+
+    You may delete your own terminal or one you created via assign/handoff,
+    locally or on a target_host node; any other id is refused. A remote node
+    recognises you through the callback id it recorded when you created the
+    worker, so the node must run a cao-server that reports it (this release
+    or later) and must not have restarted since the worker was created.
 
     Args:
         terminal_id: The terminal ID to delete
@@ -1162,11 +1225,9 @@ def _require_discovery_marker(own_terminal_id: str, action: str) -> Optional[Dic
         }
     # None (no role/allowedTools resolved at all) and "*" both mean
     # unrestricted, matching resolve_allowed_tools' own semantics elsewhere.
-    if (
-        allowed_tools is not None
-        and "*" not in allowed_tools
-        and (DISCOVERY_TOOL_MARKER not in allowed_tools)
-    ):
+    # The test itself lives in orchestration.has_discovery_grant so the
+    # send_message sibling allowance uses the identical definition.
+    if not has_discovery_grant(allowed_tools):
         return {
             "success": False,
             "error": (
@@ -1284,7 +1345,10 @@ async def list_siblings(
     here.
 
     Use this to find other agents working in the same project/folder/tenant,
-    then message them with send_message using the returned id.
+    then message them with send_message using the returned id. send_message
+    accepts a sibling as receiver_id only while you hold the same 'discovery'
+    grant this tool needs; it checks the sibling list itself, so a terminal
+    that is not your sibling (or has since left the group) is refused.
     """
     return _list_siblings_impl(depth, cross_session)
 

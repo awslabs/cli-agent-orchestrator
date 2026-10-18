@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Persistent agent descriptions with creation-time CLI/MCP labels and editable
+  descriptions in Web UI Home and Agents (#942).
+
+- The publish workflow now refuses, in seconds, a release tag whose version
+  `pyproject.toml`, `uv.lock` and the devcontainer feature do not carry, and a
+  version the target index already serves: both TestPyPI and PyPI on a release,
+  only the chosen one on a manual dispatch (`scripts/assert_release_version.py`).
+  v2.5.1, v2.5.2 and v2.5.4 each spent ~80 minutes building wheels before TestPyPI
+  answered `400 File already exists`, because the tag sat on a commit that had not
+  been bumped. The failure text names the remedy for the situation it found.
+- Security regression tests derived from the review harnesses Augusto Santos
+  (@gutosantos82) wrote while assessing CAO's CI security gates: a route-by-scope
+  authorization matrix with auth enabled (every HTTP route x no/read/write/admin
+  token, handlers stubbed, admin-only and read-tier routes pinned as literals), a
+  browser-boundary matrix for the Host (#124), WebSocket Origin (#533), CSRF
+  (#605), malformed-Origin (#656) and scheme-aware same-origin (#658) guards, and
+  filesystem invariants for the per-terminal FIFO path (#823) and atomic-file
+  modes under a concurrent writer (#821). `test/security/`. (#938)
 - Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `assign` and `handoff` still refuse them. `ephemeral.enabled` stays off by default.
 - Simulation-only cross-zone robot transport example (#845): existing CAO CLI
   supervisor, zone-operation, and checker agents share a persistent MuJoCo
@@ -50,6 +68,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cao session status`, and the ops MCP `get_terminal_status` and
   `get_session_info` return both fields; `list_siblings` and the delegation
   tool results are unchanged (#810)
+- launch-decision platform, not yet wired: `model.route` (`small`/`medium`/
+  `large`) and `effort.route` (`low`/`medium`/`high`), each `off`, `shadow` or
+  `on`, all off by default. Deciders register under the `cao.deciders`
+  entry-point group; the built-in `fixed_table` looks a tier up by profile,
+  then role. The top-level `model_tiers` setting maps each provider's tiers to
+  model IDs. Shadow and on write content-free rows to a new `decision_records`
+  table (a keyed message hash, never the task text), kept 90 days. Operators
+  control it through `cao decisions`, `cao-server --decision`, the
+  `CAO_DECISION_*` variables and the ops MCP decision tools; the agent-facing
+  MCP server has none. No delegation calls it yet, so launches are unchanged.
+  See `docs/decisions.md` (#810)
 - pane-mode windows caption each pane with the terminal running in it.
   `pane_window` gets `pane-border-status` and a border format reading the
   `@cao_terminal` mark, so the caption survives an agent whose TUI sets its own
@@ -108,6 +137,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The pipes now get the reap grace to drain, and a warning names the case (#894).
   Timeout and cancel likewise settle once the script itself is gone, instead of
   waiting for that process, and a timed-out run closes the pipes too.
+- `cao launch` with an initial message no longer gives up on the first failed
+  poll of the delivery state (#882). A failed poll that is not a 4xx (a
+  connection error, a read timeout, a 5xx, or a reply that is not JSON) is
+  retried until the init allowance runs out, so `--async` no longer exits
+  non-zero for a task the server goes on to deliver. A 4xx still fails at once,
+  and a timeout after failed polls says the message may already have been
+  delivered.
 - Audit all tracked npm, Bun, uv, and Cargo dependency graphs in every CI run
   and weekly, including development dependencies and unfixed advisories. Block
   every HIGH/CRITICAL finding and scan error, and publish complete inventory and
@@ -182,6 +218,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `http-cache-semantics` to 4.3.0. Document the patch and disputed cache advisory,
   and run dependency regression checks as part of the existing site build
   without suppressing alerts or changing scan policy.
+
+- claude_code: a streaming answer no longer reads as a finished turn. The
+  newest Claude Code TUI draws no spinner while response text streams, so a
+  settled mid-answer frame read COMPLETED (a `⏺` still on screen) or IDLE (every
+  marker scrolled off), and `run_step` / `handoff` tore the worker down
+  mid-answer. After a dispatch, both the raw-stream and rendered-screen
+  detectors now require the end-of-turn summary (`✻ Worked for Ns`) as the
+  newest line above the input box before reporting a ready status, with a 15 s
+  fallback to the previous verdict for an end state that paints no summary.
+  While a terminal is PROCESSING, the status monitor's per-poll re-derivation
+  now reads Claude Code from its composited screen (the provider opts in with
+  `status_recheck_uses_screen`, #907) instead of the raw rolling window, whose
+  repaint fragments and size cap left no input box to anchor on. That re-check
+  reuses its verdict while the output is unchanged, so the 15 s fallback lands
+  at the next stale-pane re-check (#558) after the grace period (#865).
+
 - Address five baseline CodeQL alerts without suppressions: remove filesystem
   probes from plugin source-kind inference, confine Kiro policy-file inspection
   to its canonical agent directory, replace the flagged Kimi footer and swarm
@@ -246,6 +298,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   override configured, the guard and the probe also consult the default
   directory, so ownership records written there by earlier releases stay in
   force (#493).
+
+- **In-band provider refusals are now workflow step failures.** A provider
+  that exits cleanly after printing an error is classified as `provider_error`
+  instead of returning the refusal as a successful answer; `/terminals/run-step`
+  maps it to 502, and the structured kind survives journal settlement and status
+  rendering. (#638)
 
 - **Workflow script run-step refusals now retain their typed reason in run
   records.** When a structured HTTP error includes a string `detail.kind`,
@@ -623,6 +681,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   persistence, the workflow-level `security-events: write` in `ci.yml`, and
   the npm cache in the release build), each a tracked follow-up rather than a
   silenced result.
+
+- `settings.json` is now written atomically at mode 0600 through the shared
+  locked atomic writer by both of its writers (the settings service and
+  `cao config set`), so a symlink planted at that path is replaced rather than
+  followed, the file is private like `.env` and the database, and the two
+  writers serialize on one lock. Under `logs/terminal/`, the per-terminal
+  `.log` is created 0600 and opened with `O_NOFOLLOW`, so a symlinked log path
+  is refused instead of appended through, and every write re-applies 0600 to
+  the open descriptor so a log left at 0644 by a terminal running across the
+  upgrade is tightened on its next write. The `.scrollback` and
+  `.snapshot.json` sidecars written at teardown are published 0600 through
+  the new lock-free `unlocked_atomic_write` (unique temp file plus
+  `os.replace`, a planted symlink is replaced); they deliberately skip the
+  cross-process lock because each terminal gets fresh sidecar names and the
+  locked writer keeps one lock file per target for good, which would have
+  grown `locks/` by two files per teardown with nothing to reap them.
+  Existing 0644 `settings.json` and `.log` files are tightened on the next
+  write; sidecars are rewritten whole at 0600.
+- `delete_terminal`, `answer_user_prompt` and `send_message` (explicit
+  `receiver_id`) now refuse a target outside the caller's assign/handoff tree:
+  a terminal may act on itself, on terminals it created (locally or on a
+  `target_host` node), and (for `send_message`) on the terminal that created
+  it. The documented peer flow of issue #432 is kept: when the caller's
+  profile grants `discovery`, `send_message` also accepts a sibling that
+  `list_siblings` returns for the caller, checked by exact membership at send
+  time. `GET /terminals/{id}` gains `callback_terminal_id`, the cross-node
+  creator read from the `CAO_CALLBACK_TERMINAL_ID` the supervisor injected,
+  which is how a remote node recognises the supervisor deleting its worker
+  (`caller_id` is `null` on such rows); a remote node that does not report
+  the field, or has restarted since the worker was created, refuses the
+  delete. Operators and external MCP clients without `CAO_TERMINAL_ID` are
+  unchanged. The `cao` CLI commands that reach these paths are bound the same
+  way when run from a shell inside a CAO pane: `cao agent cancel <id>` (both
+  the interrupt and `--delete`). Supersedes #607 (shpalac), whose
+  own-terminal-only rule would have blocked in-terminal supervisors.
 
 - Require `shell-quote ^1.11.0` in the documentation toolchain to fix
   CVE-2026-102422, with comment-boundary and ordinary-argument regressions.

@@ -30,6 +30,63 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------------------
+  # Runs FIRST, in seconds, before either build job spends ~80 minutes compiling wheels.
+  #
+  # WHY: three of the last four release-event runs (v2.5.1, v2.5.2, v2.5.4) failed at the
+  # TestPyPI upload with `400 File already exists`. In every case the tag had been placed on
+  # a commit whose pyproject.toml still carried the PREVIOUS version, so the matrix built
+  # artifacts that were already published and twine named the artifact, not the tag.
+  # `release.yml` (bump, commit, tag) cannot push to `main` under the branch rulesets, so
+  # releases are cut by hand as a `chore: release vX.Y.Z` PR plus a GitHub Release; this job
+  # is what catches the second step happening without the first.
+  #
+  # `GITHUB_REF_NAME` is read from the ENVIRONMENT, not interpolated with `${{ }}` into the
+  # script, so the ref can never be executed as shell (zizmor template-injection). On a
+  # `workflow_dispatch` from a branch there is no tag to compare, so only the
+  # tree-consistency and already-on-the-target-index halves run.
+  # `test/scripts/test_assert_release_version.py` asserts the job exists, that both build
+  # jobs wait on it, which index each step asks, and that the guard FAILS on the v2.5.4 shape.
+  # ---------------------------------------------------------------------------------------
+  verify-release-version:
+    name: Tag matches the packaged version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      # A release uploads to TestPyPI FIRST (publish-testpypi) and PyPI second, and the two
+      # indexes diverge in both directions (2.1.0 and 2.2.0 exist only on TestPyPI, 2.4.1 only
+      # on PyPI), so the question is asked of BOTH: a version on either one is a guaranteed
+      # `400 File already exists` ~80 minutes from now. (Review on PR #947.)
+      - name: Refuse a release tag whose version the tree does not carry, or that an index already has
+        if: github.event_name == 'release'
+        run: >-
+          python scripts/assert_release_version.py --tag "$GITHUB_REF_NAME"
+          --index https://test.pypi.org --index https://pypi.org
+
+      # A manual dispatch uploads to exactly one index, chosen by `inputs.environment`, so
+      # only THAT index is asked: a testpypi dispatch must not be refused on pypi.org state,
+      # and a pypi dispatch must not be passed on test.pypi.org state. The index is selected
+      # in `env:` and read from the environment; nothing from the event reaches `run:`.
+      #
+      # The `pypi` environment is restricted to `v*` tags, so the PyPI escape hatch always
+      # runs on a tag ref; when it does, the tag gets the same comparison a release does.
+      - name: Manual dispatch; check the tree agrees with itself and the target index lacks the version
+        if: github.event_name != 'release'
+        env:
+          TARGET_INDEX: ${{ inputs.environment == 'testpypi' && 'https://test.pypi.org' || 'https://pypi.org' }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            python scripts/assert_release_version.py --tag "$GITHUB_REF_NAME" --index "$TARGET_INDEX"
+          else
+            python scripts/assert_release_version.py --index "$TARGET_INDEX"
+          fi
+
+  # ---------------------------------------------------------------------------------------
   # Per-platform wheels (issue #321, unit `wheel-matrix`). THIS JOB ADDS THIS REPO'S FIRST
   # NON-LINUX RUNNERS — measured before this change: 25 of 25 `runs-on:` were ubuntu-latest.
   #
@@ -42,6 +99,7 @@ jobs:
   # ---------------------------------------------------------------------------------------
   build-wheels:
     name: Wheel (${{ matrix.label }})
+    needs: verify-release-version
     runs-on: ${{ matrix.os }}
     # No job in this repo carried a timeout before (measured: zero `timeout-minutes` across
     # all 8 workflow files). These jobs compile Rust and, on Linux, run a container build —
@@ -227,6 +285,7 @@ jobs:
   # inside one would be both wrong and unusable on any other platform.
   build-sdist:
     name: Build sdist
+    needs: verify-release-version
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

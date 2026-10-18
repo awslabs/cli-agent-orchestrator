@@ -39,6 +39,7 @@ class TestCreateTerminal:
     """Tests for create_terminal function."""
 
     @pytest.mark.parametrize("registry_bound", [False, True])
+    @pytest.mark.parametrize("description", [None, "", "  ", "Review\ncode", "x" * 64, "😀" * 65])
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
@@ -65,6 +66,7 @@ class TestCreateTerminal:
         mock_status_monitor,
         mock_delete_terminals_by_session,
         registry_bound,
+        description,
     ):
         """Test creating terminal with new session."""
         mock_gen_id.return_value = "test1234"
@@ -79,8 +81,17 @@ class TestCreateTerminal:
 
         mock_db_create.return_value = {"ephemeral": registry_bound}
         result = await create_terminal(
-            "kiro_cli", "developer", new_session=True, metadata={"ephemeral": not registry_bound}
+            "kiro_cli",
+            "developer",
+            new_session=True,
+            description=description,
+            metadata={"ephemeral": not registry_bound},
         )
+        from cli_agent_orchestrator.utils.description import normalize_description
+
+        expected_description = normalize_description(description, truncate=True)
+        assert result.description == expected_description
+        assert mock_db_create.call_args.kwargs["description"] == expected_description
         assert result.ephemeral is registry_bound
 
         assert result.id == "test1234"
@@ -363,6 +374,7 @@ class TestCreateTerminal:
             engine="v2",
             group=None,
             metadata=None,
+            description=None,
             working_directory=os.path.realpath(os.getcwd()),
             deferred_init_external_owner=False,
             session_incarnation_id=result.session_incarnation_id,
@@ -2303,6 +2315,57 @@ class TestGetTerminal:
         assert result["id"] == "test1234"
         assert result["status"] == TerminalStatus.IDLE.value
         assert result["session_incarnation_id"] == "inc-current"
+
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_terminal_publishes_cross_node_creator_from_session_env(
+        self, mock_get_metadata, mock_status_monitor
+    ):
+        """A worker placed here from another node has caller_id None; its
+        creator is the CAO_CALLBACK_TERMINAL_ID the supervisor injected (#912)."""
+        mock_get_metadata.return_value = {
+            "id": "test1234",
+            "tmux_window": "developer-abcd",
+            "provider": "kiro_cli",
+            "tmux_session": "cao-remote-ses",
+            "agent_profile": "developer",
+            "caller_id": None,
+            "last_active": datetime.now(),
+        }
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service.get_session_env",
+            return_value={
+                "CAO_CALLBACK_URL": "http://supervisor:9889",
+                "CAO_CALLBACK_TERMINAL_ID": "0badf00d",
+            },
+        ) as mock_env:
+            result = get_terminal("test1234")
+        mock_env.assert_called_once_with("cao-remote-ses")
+        assert result["caller_id"] is None
+        assert result["callback_terminal_id"] == "0badf00d"
+
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_terminal_callback_creator_is_none_for_local_rows(
+        self, mock_get_metadata, mock_status_monitor
+    ):
+        mock_get_metadata.return_value = {
+            "id": "test1234",
+            "tmux_window": "developer-abcd",
+            "provider": "kiro_cli",
+            "tmux_session": "cao-session",
+            "agent_profile": "developer",
+            "caller_id": "abcd1234",
+            "last_active": datetime.now(),
+        }
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service.get_session_env",
+            return_value={"FOO": "bar"},
+        ):
+            result = get_terminal("test1234")
+        assert result["callback_terminal_id"] is None
 
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_terminal_not_found(self, mock_get_metadata):
