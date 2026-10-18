@@ -156,12 +156,16 @@ def test_default_runtime_guard_detects_swallowed_store_access(tmp_path):
 @pytest.mark.parametrize(
     "model_name,existing",
     [
-        ("CreateTerminalBody", ["initial_message", "initial_message_orchestration_type"]),
+        (
+            "CreateTerminalBody",
+            ["initial_message", "initial_message_orchestration_type", "description"],
+        ),
         (
             "CreateSessionBody",
             [
                 "initial_message",
                 "initial_message_orchestration_type",
+                "description",
                 "env_vars",
                 "group",
                 "metadata",
@@ -170,6 +174,7 @@ def test_default_runtime_guard_detects_swallowed_store_access(tmp_path):
         (
             "RunStepRequest",
             [
+                "description",
                 "provider",
                 "agent",
                 "prompt",
