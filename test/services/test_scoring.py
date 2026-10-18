@@ -1668,10 +1668,63 @@ class TestHybridAllTermContract:
         assert _row(db_engine, "shared", "session").access_count == 1
         assert _row(db_engine, "other").access_count == 1
 
+    def test_real_bm25_classifies_native_header_only_match(self, svc, db_engine):
+        from pathlib import Path
+
+        ctx = _ctx(caller_scope="global")
+        now = datetime.now(timezone.utc)
+        for i in range(50):
+            _run(
+                svc.store(
+                    content="kafka streams",
+                    scope="global",
+                    key=f"weak-{i}",
+                    terminal_context=ctx,
+                    occurred_at=now - timedelta(days=1, hours=i),
+                )
+            )
+        old = _run(
+            svc.store(
+                content="kafka",
+                tags="streams",
+                scope="global",
+                key="header-only",
+                terminal_context=ctx,
+                occurred_at=now - timedelta(days=100),
+            )
+        )
+        assert "streams" not in old.content
+        assert "streams" in Path(old.file_path).read_text(encoding="utf-8")
+        with sessionmaker(bind=db_engine)() as db:
+            db.query(MemoryMetadataModel).filter_by(key="header-only").update({"access_count": 50})
+            db.commit()
+        all_term_identities = set()
+        svc._bm25_search(
+            query="kafka streams",
+            scope="global",
+            scope_id=None,
+            memory_type=None,
+            limit=50,
+            exclude_keys=set(),
+            terminal_context=ctx,
+            scan_all=False,
+            all_terms_first=True,
+            all_term_identities=all_term_identities,
+        )
+        assert ("header-only", "global", None, "native") in all_term_identities
+        results = _run(
+            svc.recall(
+                query="kafka streams",
+                scope="global",
+                limit=1,
+                sort_by="usage",
+                terminal_context=ctx,
+            )
+        )
+        assert [m.key for m in results] == ["header-only"]
+
     @pytest.mark.parametrize("source_kind", ["native", "vault"])
-    def test_native_raw_header_and_vault_body_match_metadata_predicate(
-        self, svc, db_engine, monkeypatch, source_kind
-    ):
+    def test_recall_honours_bm25_classification_set(self, svc, db_engine, monkeypatch, source_kind):
         ctx = _ctx(caller_scope="global")
         now = datetime.now(timezone.utc)
         for i in range(50):
