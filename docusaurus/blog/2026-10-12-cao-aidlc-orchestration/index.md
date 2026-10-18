@@ -120,10 +120,14 @@ relay for those questions. It must never answer one itself. The example states t
 runner never calls `question answer`, but a relay enforced by prompt alone is one drift away from a
 fabricated, human-attributed approval.
 
-So enforce it by mechanism. Route each AI-DLC question onto CAO's human-approval step, and bind the
-answerer to the human who actually responded, rather than a string the agent types. The orchestrator
-then cannot speak for you even if a prompt drifts. Memory and parallelism both assume the human
-decisions were real, so this is what keeps the rest honest.
+So enforce it by mechanism, not just prompt. The example's `question answer` now takes a
+`--approval-id`, bound to a single-use approval record for that exact packet, instead of a free-text
+`--answered-by` string. The answerer identity comes from that record, and no CLI subcommand in the
+example lets an agent mint one. That's a real step up from a self-asserted name, and it's a shape worth
+copying: route the question onto CAO's human-approval surface and bind the resolution to who actually
+responded there. A full guarantee still needs that approval record to live outside the agent's own
+write reach, which is exactly what CAO's real human-approval surface gives you. Memory and parallelism
+both assume the human decisions were real, so getting this binding right is what keeps the rest honest.
 
 ## Summary
 

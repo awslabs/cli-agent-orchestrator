@@ -436,16 +436,20 @@ describe("portfolio workspace", () => {
     );
     await writeFile(answered, answeredText);
 
-    // MECHANISM: the answerer is not a free-text argument. Without a
-    // human-surface approval bound to this packet, the agent cannot resolve it
-    // no matter what identity it claims — a forged "answered-by" is impossible
-    // because there is no such argument and no approval record to match.
+    // MECHANISM: the answerer is not a free-text argument. An id with no
+    // matching, unconsumed approval record is refused outright — the agent
+    // cannot resolve the packet by asserting an identity through this flag.
+    // (This is a protocol-shape guarantee, not a write-access guarantee: see
+    // recordHumanApproval below and coordination-rules.md §Human Questions.)
     await expect(
       answerQuestionPacket(root, "feature-storage", answered, "guided", "forged-approval"),
     ).rejects.toThrow("no human-surface approval found");
 
-    // The human-approval surface mints the approval with a VERIFIED identity.
-    // This write path is not reachable from any agent CLI subcommand.
+    // recordHumanApproval stands in for CAO's real human-approval surface.
+    // In this sample it is a JSON file under the agent's own write reach, so
+    // the no-agent-CLI-subcommand-mints-this property holds, but a real
+    // write-access boundary needs the record to live outside the agent's
+    // reach or be signed with a key it doesn't hold.
     await recordHumanApproval(
       root,
       "feature-storage-approval",

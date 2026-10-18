@@ -214,7 +214,6 @@ interface LearningProposal {
   rule: string;
   evidence: string[];
   source: { stage: string };
-  baseRevision?: string;
   status?: LearningStatus;
   createdAt?: string;
   updatedAt?: string;
@@ -1276,6 +1275,11 @@ export async function promoteLearningProposal(
     // feedback); this utility only records that the review happened and which
     // CAO memory entry the proposal was promoted into. There is no canonical
     // file write and no compare-and-swap: CAO memory owns durability.
+    // scope/memoryType are fixed here: every promoted learning lands at
+    // project scope as feedback. proposal.destination ("project" | "team")
+    // is informational only at this point -- it records what the runner
+    // believed the learning was about, but does not change where or how
+    // promotion stores it.
     const scope = "project";
     const memoryType = "feedback";
     const now = new Date().toISOString();

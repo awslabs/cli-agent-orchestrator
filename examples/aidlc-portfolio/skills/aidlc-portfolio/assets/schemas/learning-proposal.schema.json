@@ -45,10 +45,6 @@
         "stage": { "type": "string", "minLength": 1 }
       }
     },
-    "baseRevision": {
-      "type": "string",
-      "pattern": "^[a-f0-9]{64}$"
-    },
     "status": { "enum": ["pending", "promoted", "rejected"] },
     "createdAt": { "type": "string", "minLength": 1 },
     "updatedAt": { "type": "string", "minLength": 1 },
