@@ -7445,6 +7445,13 @@ async def get_inbox_messages_endpoint(
     status_param: Optional[str] = Query(
         default=None, alias="status", description="Filter by message status"
     ),
+    order: str = Query(
+        default="asc",
+        description="Order by created_at: asc (oldest first) or desc (newest first)",
+    ),
+    sender_id: Optional[str] = Query(
+        default=None, description="Return only messages from this sender"
+    ),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[Dict]:
     """Get inbox messages for a terminal.
@@ -7453,6 +7460,8 @@ async def get_inbox_messages_endpoint(
         terminal_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10, max: 100)
         status_param: Optional filter by message status ('pending', 'delivered', 'failed')
+        order: Sort by created_at, 'asc' (default, oldest first) or 'desc' (newest first)
+        sender_id: Optional filter returning only messages from this sender
 
     Returns:
         List of inbox messages with sender_id, message, created_at, status
@@ -7469,8 +7478,21 @@ async def get_inbox_messages_endpoint(
                     detail=f"Invalid status: {status_param}. Valid values: pending, delivered, failed",
                 )
 
-        # Get messages using existing database function
-        messages = get_inbox_messages(terminal_id, limit=limit, status=status_filter)
+        if order not in ("asc", "desc"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid order: {order}. Valid values: asc, desc",
+            )
+
+        # Get messages using existing database function. ``limit`` applies after
+        # ordering, so ``order=desc`` with a small limit returns the newest rows.
+        messages = get_inbox_messages(
+            terminal_id,
+            limit=limit,
+            status=status_filter,
+            sender_id=sender_id,
+            newest_first=order == "desc",
+        )
 
         # Convert to response format
         result = []
