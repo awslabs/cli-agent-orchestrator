@@ -12,9 +12,12 @@ or test.
 import os
 from unittest.mock import MagicMock, patch
 
+import pytest
 import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
+from cli_agent_orchestrator.utils import orchestration as orch
+from cli_agent_orchestrator.utils.description import normalize_description
 from cli_agent_orchestrator.utils.orchestration import (
     _auth_headers,
     _cancel_impl,
@@ -293,3 +296,123 @@ class TestCancelImpl:
 
         _, kwargs = mock_post.call_args
         assert kwargs["headers"] == {"Authorization": "Bearer tok"}
+
+
+_DESCRIPTION_VALUES = [None, "", "  ", "  Review\ncode  ", "x" * 64, "😀" * 65]
+
+
+def _description_response(data):
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = data
+    return response
+
+
+# Exercise the actual HTTP payload rather than mocking the creation helper.
+@pytest.mark.parametrize("description", _DESCRIPTION_VALUES)
+@pytest.mark.parametrize("existing", [False, True])
+def test_worker_creation_description_payload(description, existing):
+    with (
+        patch.object(orch, "_current_terminal_id", return_value="abcd1234" if existing else None),
+        patch.object(orch, "_resolve_child_allowed_tools", return_value=None),
+        patch.object(orch, "resolve_provider", return_value="kiro_cli"),
+        patch.object(
+            orch.requests,
+            "get",
+            return_value=_description_response(
+                {"provider": "kiro_cli", "session_name": "cao-parent"}
+            ),
+        ),
+        patch.object(
+            orch.requests,
+            "post",
+            return_value=_description_response({"id": "feed1234", "provider": "kiro_cli"}),
+        ) as post,
+    ):
+        assert orch._create_terminal("developer", description=description) == (
+            "feed1234",
+            "kiro_cli",
+        )
+    assert post.call_args.kwargs["json"]["description"] == normalize_description(
+        description, truncate=True
+    )
+
+
+@pytest.mark.parametrize("description", _DESCRIPTION_VALUES)
+def test_remote_assignment_description_payload(description):
+    with (
+        patch.dict(os.environ, {"CAO_ADVERTISED_URL": "http://supervisor:9889"}),
+        patch.object(orch, "_resolve_target_base_url", return_value="http://remote:9889"),
+        patch.object(orch, "_wait_remote_ready"),
+        patch.object(
+            orch.requests,
+            "post",
+            return_value=_description_response(
+                {"id": "feed1234", "session_name": "cao-broker-name"}
+            ),
+        ) as post,
+    ):
+        result = orch._assign_remote(
+            agent_profile="developer",
+            worker_message="Task",
+            current_terminal_id="abcd1234",
+            target_host="remote",
+            working_directory=None,
+            engine=None,
+            model=None,
+            use_worktree=False,
+            remote_session_name="cao-broker-name",
+            description=description,
+        )
+    assert result["success"]
+    assert post.call_args.kwargs["json"]["description"] == normalize_description(
+        description, truncate=True
+    )
+    assert post.call_args.kwargs["json"]["initial_message"] == "Task"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("description", _DESCRIPTION_VALUES)
+@pytest.mark.parametrize("remote", [False, True])
+async def test_handoff_description_run_step_payload(description, remote):
+    with (
+        patch.object(
+            orch,
+            "_resolve_handoff_provider",
+            return_value=orch.HandoffContext("kiro_cli", "cao-parent", None, None),
+        ),
+        patch.object(orch, "_resolve_target_base_url", return_value="http://remote:9889"),
+        patch.object(orch, "_resolve_remote_provider", return_value="kiro_cli"),
+        patch.object(
+            orch.requests,
+            "post",
+            return_value=_description_response(
+                {"terminal_id": "feed1234", "last_message": "Done", "status": "completed"}
+            ),
+        ) as post,
+    ):
+        result = await orch._handoff_impl(
+            "developer", "Task", description=description, target_host="remote" if remote else None
+        )
+    assert result.success
+    assert result.output == "Done"
+    assert post.call_args.kwargs["json"]["description"] == normalize_description(
+        description, truncate=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_handoff_early_creation_receives_description():
+    with (
+        patch.object(
+            orch,
+            "_resolve_handoff_provider",
+            return_value=orch.HandoffContext("kiro_cli", "cao-parent", None, None),
+        ),
+        patch.object(orch, "_create_terminal", return_value=("feed1234", "kiro_cli")) as create,
+        patch.object(orch, "_send_direct_input_handoff") as send,
+    ):
+        result = await orch._handoff_impl("developer", "Task", wait=False, description="Review")
+    assert result.success
+    assert create.call_args.kwargs["description"] == "Review"
+    send.assert_called_once_with("feed1234", "kiro_cli", "Task")

@@ -201,10 +201,11 @@ def test_assign_elastic_omits_provider_so_the_broker_default_wins(monkeypatch):
         # own imported reference, so both need patching.
         patch.object(orchestration, "_current_terminal_id", return_value="abc12345"),
         patch.object(server.requests, "post", return_value=_lease_response()) as post,
-        patch.object(server, "_assign_impl", return_value={"success": True}),
+        patch.object(server, "_assign_impl", return_value={"success": True}) as assign,
     ):
-        asyncio.run(server.assign_elastic("developer", "Implement it"))
+        asyncio.run(server.assign_elastic("developer", "Implement it", description="Review code"))
 
+    assert assign.call_args.kwargs["description"] == "Review code"
     assert post.call_args.kwargs["json"] == {
         "agent_profile": "developer",
         "callback_terminal_id": "abc12345",

@@ -87,6 +87,21 @@ Then open the same URLs (localhost:5173 or localhost:9889) in your local browser
 
 Manage sessions, spawn agents, browse and author agent profiles (create from templates or from scratch, edit, clone, delete — with server-side validation before every write), create scheduled flows, configure agent directories, and interact with live terminals — all from the browser. Includes live status badges, an inbox for agent-to-agent messaging, output viewer, and provider auto-detection.
 
+### Edit agent descriptions
+
+In Home or Agents, use the pencil beside an agent's description to edit it.
+Choose Save or press Enter to save; choose Cancel or press Escape to discard
+the draft. Save an empty or whitespace-only value to clear the description.
+Descriptions persist across reloads. Polling updates and transient read failures
+preserve an open draft; deleting the selected session closes its detail panel
+when the next poll returns `404`.
+
+The editor normalizes line separators to spaces, removes C0/C1 controls
+(including interior tabs), and trims outer whitespace before validating the
+64 Unicode code point limit. Overlong edits show an error and keep the draft.
+See the [terminal description API contract](api.md#terminal-descriptions) for
+creation defaults, clearing, and retry behavior.
+
 ## Related
 
 - [web/README.md](../web/README.md) — frontend architecture and component details

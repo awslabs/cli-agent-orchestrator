@@ -64,6 +64,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_DESCRIPTION_UNSET = object()
+
+
 async def create_session(
     provider: str | None,
     agent_profile: str,
@@ -81,6 +84,7 @@ async def create_session(
     resume_session_id: str | None = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    description: Any = _DESCRIPTION_UNSET,
     launch_plan: "LaunchPlan | None" = None,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
@@ -122,6 +126,9 @@ async def create_session(
     else:
         resolved_provider = provider
 
+    if description is _DESCRIPTION_UNSET:
+        description = session_name or None
+
     launch_options: dict[str, Any] = {"launch_plan": launch_plan} if launch_plan is not None else {}
     terminal = await create_terminal(
         provider=resolved_provider,
@@ -142,6 +149,7 @@ async def create_session(
         resume_session_id=resume_session_id,
         group=group,
         metadata=metadata,
+        description=description,
         **launch_options,
     )
     dispatch_plugin_event(

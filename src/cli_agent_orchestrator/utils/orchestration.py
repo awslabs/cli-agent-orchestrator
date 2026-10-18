@@ -49,6 +49,7 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
 )
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
+from cli_agent_orchestrator.utils.description import normalize_description
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_session_name_for_key,
@@ -627,6 +628,7 @@ def _create_terminal(
     use_worktree: bool = False,
     create_timeout: Optional[float] = None,
     idempotency_key: Optional[str] = None,
+    description: Optional[str] = None,
     *,
     delegation_message: Optional[str] = None,
     delegation_kind: Optional[str] = None,
@@ -753,10 +755,9 @@ def _create_terminal(
         # The message payload goes in the JSON body, not the query string, so
         # prompt content isn't exposed in HTTP access logs and isn't subject to
         # URL-length limits. Only routing flags stay in params.
-        json_body = None
+        json_body = {"description": normalize_description(description, truncate=True)}
         if defer_init:
             params["defer_init"] = "true"
-            json_body = {}
             if initial_message is not None:
                 json_body["initial_message"] = initial_message
             if initial_message_orchestration_type is not None:
@@ -830,9 +831,9 @@ def _create_terminal(
         if idempotency_key:
             params["idempotency_key"] = idempotency_key
 
-        json_body = None
+        json_body = {"description": normalize_description(description, truncate=True)}
         if initial_message is not None:
-            json_body = {"initial_message": initial_message}
+            json_body["initial_message"] = initial_message
             if initial_message_orchestration_type is not None:
                 json_body["initial_message_orchestration_type"] = (
                     initial_message_orchestration_type.value
@@ -1323,6 +1324,7 @@ async def _handoff_impl(
     wait: bool = True,
     idempotency_key: Optional[str] = None,
     target_host: Optional[str] = None,
+    description: Optional[str] = None,
 ) -> HandoffResult:
     """Implementation of handoff logic.
 
@@ -1521,6 +1523,7 @@ async def _handoff_impl(
                 "timeout": float(timeout),
                 "use_worktree": use_worktree,
                 "job_id": job_id,
+                "description": normalize_description(description, truncate=True),
                 "orchestration_type": "handoff",
                 "delegation_message": message,
             }
@@ -1570,6 +1573,7 @@ async def _handoff_impl(
             use_worktree=use_worktree,
             create_timeout=_HANDOFF_CREATE_TIMEOUT_S,
             idempotency_key=idempotency_key,
+            description=description,
             delegation_message=message,
             delegation_kind="handoff",
             response_sink=_decision_response_sink(notes),
@@ -1677,6 +1681,7 @@ def _assign_remote(
     ready_wait_seconds: float = 0.0,
     callback_url: Optional[str] = None,
     remote_session_name: Optional[str] = None,
+    description: Optional[str] = None,
     delegation_message: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create an assign worker on a REMOTE CAO node (one-agent-per-pod topology).
@@ -1748,6 +1753,7 @@ def _assign_remote(
 
     notes: list[str] = []
     payload: Dict[str, Any] = {
+        "description": normalize_description(description, truncate=True),
         "initial_message": worker_message,
         "initial_message_orchestration_type": OrchestrationType.ASSIGN.value,
         "env_vars": {
@@ -1833,6 +1839,7 @@ def _assign_impl(
     ready_wait_seconds: float = 0.0,
     callback_url: Optional[str] = None,
     remote_session_name: Optional[str] = None,
+    description: Optional[str] = None,
     *,
     delegation_message: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -1911,6 +1918,7 @@ def _assign_impl(
                 ready_wait_seconds=ready_wait_seconds,
                 callback_url=callback_url,
                 remote_session_name=remote_session_name,
+                description=description,
                 delegation_message=canonical_message,
             )
 
@@ -1924,6 +1932,7 @@ def _assign_impl(
             working_directory,
             engine=engine,
             defer_init=True,
+            description=description,
             initial_message=worker_message,
             initial_message_orchestration_type=OrchestrationType.ASSIGN,
             model=model,

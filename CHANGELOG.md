@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Persistent agent descriptions with creation-time CLI/MCP labels and editable
+  descriptions in Web UI Home and Agents (#942).
+
 - The publish workflow now refuses, in seconds, a release tag whose version
   `pyproject.toml`, `uv.lock` and the devcontainer feature do not carry, and a
   version the target index already serves: both TestPyPI and PyPI on a release,
@@ -138,7 +141,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Timeout and cancel likewise settle once the script itself is gone, instead of
   waiting for that process, and a timed-out run closes the pipes too.
 - `cao launch` with an initial message no longer gives up on the first failed
-  poll of the delivery state (#882). A connection error, read timeout or 5xx is
+  poll of the delivery state (#882). A failed poll that is not a 4xx (a
+  connection error, a read timeout, a 5xx, or a reply that is not JSON) is
   retried until the init allowance runs out, so `--async` no longer exits
   non-zero for a task the server goes on to deliver. A 4xx still fails at once,
   and a timeout after failed polls says the message may already have been

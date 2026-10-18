@@ -9,6 +9,7 @@ import { CustomSelect, SelectOption } from './CustomSelect'
 import { TerminalMeta } from '../api'
 import { StatusBadge } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
+import { AgentDescription } from './AgentDescription'
 
 export const FALLBACK_PROVIDERS = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'gemini_cli', 'hermes', 'kimi_cli', 'copilot_cli', 'opencode_cli', 'cursor_cli', 'grok_cli']
 
@@ -417,6 +418,14 @@ export function AgentPanel() {
                     </button>
                   </div>
                 </div>
+                <AgentDescription className="!mt-0.5" id={t.id} description={t.description} onSaved={description => {
+                  useStore.setState(state => ({ activeSessionDetail: state.activeSessionDetail ? {
+                    ...state.activeSessionDetail,
+                    terminals: state.activeSessionDetail.terminals.map(terminal => terminal.id === t.id ? { ...terminal, description } : terminal),
+                  } : null }))
+                  const selectedSession = useStore.getState().activeSession
+                  if (selectedSession) void selectSession(selectedSession)
+                }} />
                 {/* Working Directory Display */}
                 {terminalWorkDirs[t.id] && (
                   <div className="flex items-center gap-1.5" title={terminalWorkDirs[t.id]!}>
