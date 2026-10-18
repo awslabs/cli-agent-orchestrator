@@ -2367,15 +2367,6 @@ class MemoryService:
             else None
         )
 
-    def _memory_matches_all_terms(self, query: str, memory: Memory) -> bool:
-        """Match the same source text as metadata: native wiki bytes or vault body."""
-        content = (
-            memory.content
-            if memory.source_kind == "vault"
-            else Path(memory.file_path).read_text(encoding="utf-8")
-        )
-        return _matches_all_terms(query, content)
-
     async def recall(
         self,
         query: Optional[str] = None,
@@ -2498,8 +2489,10 @@ class MemoryService:
             by_identity: dict[tuple, Memory] = {}
             for memory in metadata_results:
                 by_identity.setdefault(self._identity(memory), memory)
-            # Metadata scans before slicing: BM25 is needed only for truncation or fill.
-            if len(metadata_results) == candidate_limit or len(metadata_results) < limit:
+            # An untruncated metadata scan is a census of index-listed rows.
+            # Check possible truncation or a shortfall after identity deduplication.
+            if len(metadata_results) == candidate_limit or len(by_identity) < limit:
+                all_term_identities: set[tuple] = set()
                 bm25_results = self._bm25_search(
                     query=query,
                     scope=scope,
@@ -2511,10 +2504,11 @@ class MemoryService:
                     scan_all=scan_all,
                     policy=recall_policy,
                     all_terms_first=True,
+                    all_term_identities=all_term_identities,
                 )
                 partial_results = []
                 for memory in bm25_results:
-                    if self._memory_matches_all_terms(query, memory):
+                    if self._identity(memory) in all_term_identities:
                         by_identity.setdefault(self._identity(memory), memory)
                     else:
                         partial_results.append(memory)
@@ -3188,13 +3182,16 @@ class MemoryService:
         max_body_chars: int = 4096,
         policy: Optional[VaultInjectionPolicy] = None,
         all_terms_first: bool = False,
+        all_term_identities: Optional[set[tuple]] = None,
     ) -> list[Memory]:
         """Rank wiki bodies by BM25 against ``query``.
 
         ``all_terms_first`` partitions matches before slicing, preserving BM25
         order within each group. Native checks use raw wiki text; vault checks
         use the loaded body, exactly as metadata recall does. This keeps partial
-        hits from consuming the widened all-term candidate budget.
+        hits from consuming the widened all-term candidate budget. When supplied,
+        ``all_term_identities`` receives the returned all-term identities from
+        that same scored-text snapshot; it is untouched when the flag is False.
 
         Returns ``[]`` (and logs at debug) if ``rank_bm25`` is unavailable —
         callers must continue gracefully without it.
@@ -3343,20 +3340,28 @@ class MemoryService:
             key=lambda x: x[0],
             reverse=True,
         )
+        all_term_indexes = set()
         if all_terms_first:
-            ranked.sort(key=lambda item: not _matches_all_terms(query, contents[item[1]]))
+            all_term_indexes = {
+                idx for _score, idx in ranked if _matches_all_terms(query, contents[idx])
+            }
+            ranked.sort(key=lambda item: item[1] not in all_term_indexes)
         ranked = ranked[:limit]
 
         results: list[Memory] = []
         for _score, idx in ranked:
             if idx in vault_memories:
                 results.append(vault_memories[idx])
+                if all_term_identities is not None and idx in all_term_indexes:
+                    all_term_identities.add(self._identity(vault_memories[idx]))
                 continue
             wiki_file, entry = candidates[idx]
             assert wiki_file is not None
             memory = self._parse_wiki_file(wiki_file, contents[idx], entry)
             if memory:
                 results.append(memory)
+                if all_term_identities is not None and idx in all_term_indexes:
+                    all_term_identities.add(self._identity(memory))
         return results
 
     def _get_search_dirs(

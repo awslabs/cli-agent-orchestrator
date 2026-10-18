@@ -1717,7 +1717,15 @@ class TestHybridAllTermContract:
                 )
             db.commit()
         hit = old.model_copy(update={"source_kind": source_kind})
-        monkeypatch.setattr(svc, "_bm25_search", lambda **kwargs: [hit])
+
+        def bm25_source(**kwargs):
+            # Supply the source's raw-native/header vs vault-body classification.
+            identities = kwargs.get("all_term_identities")
+            if identities is not None and source_kind == "native":
+                identities.add(svc._identity(hit))
+            return [hit]
+
+        monkeypatch.setattr(svc, "_bm25_search", bm25_source)
         results = _run(
             svc.recall(
                 query="kafka streams",
@@ -1760,3 +1768,79 @@ class TestHybridAllTermContract:
             )
         )
         assert len(calls) == expected_calls
+
+
+class TestHybridScoredTextSnapshot:
+    @pytest.mark.parametrize("mutation", ["delete", "invalid-utf8"])
+    def test_fill_uses_scored_text_after_native_file_changes(self, svc, monkeypatch, mutation):
+        from pathlib import Path
+
+        ctx = _ctx(caller_scope="global")
+        now = datetime.now(timezone.utc)
+        for key, content, days in [
+            ("exact", "kafka streams exact", 1),
+            ("partial-0", "kafka partial 0", 2),
+            ("partial-1", "kafka partial 1", 3),
+        ]:
+            _run(
+                svc.store(
+                    content=content,
+                    scope="global",
+                    key=key,
+                    terminal_context=ctx,
+                    occurred_at=now - timedelta(days=days),
+                )
+            )
+        source = svc._bm25_search
+
+        def mutate_after_search(**kwargs):
+            results = source(**kwargs)
+            partial = next(m for m in results if m.key.startswith("partial-"))
+            path = Path(partial.file_path)
+            if mutation == "delete":
+                path.unlink()
+            else:
+                path.write_bytes(b"\xff\xfe broken")
+            return results
+
+        monkeypatch.setattr(svc, "_bm25_search", mutate_after_search)
+        results = _run(
+            svc.recall(
+                query="kafka streams",
+                scope="global",
+                limit=3,
+                sort_by="score",
+                terminal_context=ctx,
+            )
+        )
+        assert [svc._identity(m) for m in results] == [
+            (key, "global", None, "native") for key in ("exact", "partial-0", "partial-1")
+        ]
+
+    def test_duplicate_index_rows_do_not_suppress_partial_fill(self, svc, monkeypatch):
+        ctx = _ctx(caller_scope="global")
+        for key, content in [("exact", "kafka streams exact"), ("partial", "kafka lunch")]:
+            _run(svc.store(content=content, scope="global", key=key, terminal_context=ctx))
+        metadata_source = svc._metadata_recall
+
+        async def duplicate_metadata(**kwargs):
+            rows = await metadata_source(**kwargs)
+            assert [m.key for m in rows] == ["exact"]
+            return rows * 2
+
+        monkeypatch.setattr(svc, "_metadata_recall", duplicate_metadata)
+        results = _run(
+            svc.recall(
+                query="kafka streams",
+                scope="global",
+                limit=2,
+                sort_by="score",
+                terminal_context=ctx,
+            )
+        )
+        identities = [svc._identity(m) for m in results]
+        assert set(identities) == {
+            ("exact", "global", None, "native"),
+            ("partial", "global", None, "native"),
+        }
+        assert len(identities) == 2
