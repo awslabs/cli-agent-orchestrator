@@ -1255,3 +1255,217 @@ class TestScorePerf:
         per_call_us = (elapsed / N) * 1_000_000
         # Generous bound for CI noise; the target is < 50µs.
         assert per_call_us < 200, f"score_memory {per_call_us:.1f}µs/call > 200µs budget"
+
+
+@pytest.fixture
+def hybrid_starvation_corpus(svc, db_engine):
+    """A dense old match, a weak new match, and nonmatching IDF ballast."""
+    ctx = _ctx(caller_scope="global")
+    for key, content in [
+        ("strong-old", "kafka streams " * 12),
+        ("weak-new", "kafka streams " + "unrelated filler prose " * 40),
+        *[(f"ballast-{i}", "gardening flowers soil") for i in range(4)],
+    ]:
+        _run(svc.store(content=content, scope="global", key=key, terminal_context=ctx))
+    now = datetime.now(timezone.utc)
+    _stamp_updated_at(db_engine, "strong-old", "global", now - timedelta(days=20))
+    _stamp_updated_at(db_engine, "weak-new", "global", now - timedelta(days=1))
+    for i in range(4):
+        _stamp_updated_at(db_engine, f"ballast-{i}", "global", now - timedelta(hours=i + 1))
+    with sessionmaker(bind=db_engine)() as db:
+        db.query(MemoryMetadataModel).filter_by(key="strong-old").update({"access_count": 40})
+        db.commit()
+    return ctx
+
+
+class TestHybridCandidatePool:
+    @pytest.mark.parametrize("sort_by", ["score", "usage"])
+    @pytest.mark.parametrize("metadata_match", [True, False])
+    def test_limit_one_ranks_older_match_and_only_bumps_winner(
+        self, svc, db_engine, hybrid_starvation_corpus, sort_by, metadata_match
+    ):
+        # Without "streams", the old memory is only a partial-query BM25 hit.
+        if not metadata_match:
+            from pathlib import Path
+
+            row = _row(db_engine, "strong-old")
+            wiki = Path(row.file_path)
+            wiki.write_text(wiki.read_text().replace("kafka streams", "kafka"))
+        if sort_by == "score":
+            # Prove lexical strength wins without any usage advantage.
+            with sessionmaker(bind=db_engine)() as db:
+                db.query(MemoryMetadataModel).filter_by(key="strong-old").update(
+                    {"access_count": 0}
+                )
+                db.commit()
+        results = _run(
+            svc.recall(
+                query="kafka streams",
+                scope="global",
+                limit=1,
+                sort_by=sort_by,
+                terminal_context=hybrid_starvation_corpus,
+            )
+        )
+        assert [m.key for m in results] == ["strong-old"]
+        assert _row(db_engine, "strong-old").access_count == (1 if sort_by == "score" else 41)
+        assert _row(db_engine, "weak-new").access_count == 0
+
+    @pytest.mark.parametrize("sort_by", ["score", "usage"])
+    def test_same_slug_in_two_projects_is_eligible_and_scope_filter_isolates(
+        self, svc, db_engine, sort_by
+    ):
+        contexts = [_ctx(cwd="/projects/one"), _ctx(cwd="/projects/two")]
+        now = datetime.now(timezone.utc)
+        for i, ctx in enumerate(contexts):
+            _run(
+                svc.store(
+                    content="kafka streams weak" if i == 0 else "kafka " * 12,
+                    scope="project",
+                    key="same-slug",
+                    terminal_context=ctx,
+                    occurred_at=now - timedelta(days=i + 1),
+                )
+            )
+            for j in range(4):
+                _run(
+                    svc.store(
+                        content="gardening soil",
+                        scope="project",
+                        key=f"ballast-{j}",
+                        terminal_context=ctx,
+                    )
+                )
+        ids = [svc.resolve_scope_id("project", ctx) for ctx in contexts]
+        results = _run(svc.recall(query="kafka streams", sort_by=sort_by, limit=2, scan_all=True))
+        assert {svc._identity(m) for m in results} == {
+            ("same-slug", "project", sid, "native") for sid in ids
+        }
+        for ctx, sid in zip(contexts, ids):
+            filtered = _run(
+                svc.recall(
+                    query="kafka streams",
+                    scope="project",
+                    terminal_context=ctx,
+                    sort_by=sort_by,
+                    limit=2,
+                )
+            )
+            assert [svc._identity(m) for m in filtered] == [("same-slug", "project", sid, "native")]
+
+    @pytest.mark.parametrize("sort_by", ["score", "usage"])
+    @pytest.mark.parametrize("limit", [1, 2])
+    def test_duplicate_bm25_hit_keeps_metadata_object(
+        self, svc, hybrid_starvation_corpus, monkeypatch, sort_by, limit
+    ):
+        metadata = _run(svc._metadata_recall(query="kafka streams", scope="global", limit=1))
+        original = metadata[0]
+        duplicate = original.model_copy(update={"content": "duplicate BM25 object"})
+
+        # Control the overlap at the source boundary; real sorting and bump run.
+        async def metadata_source(**kwargs):
+            return [original]
+
+        monkeypatch.setattr(svc, "_metadata_recall", metadata_source)
+        monkeypatch.setattr(svc, "_bm25_search", lambda **kwargs: [duplicate])
+        results = _run(
+            svc.recall(query="kafka streams", scope="global", limit=limit, sort_by=sort_by)
+        )
+        assert len(results) == 1
+        assert results[0] is original
+
+    @pytest.mark.parametrize("sort_by", ["score", "usage"])
+    def test_same_slug_native_and_vault_remain_distinct(
+        self, svc, hybrid_starvation_corpus, monkeypatch, sort_by
+    ):
+        original = _run(svc._metadata_recall(query="kafka streams", scope="global", limit=1))[0]
+        vault = original.model_copy(update={"source_kind": "vault"})
+
+        async def metadata_source(**kwargs):
+            return [original]
+
+        def bm25_source(**kwargs):
+            return [vault] if vault.key not in kwargs["exclude_keys"] else []
+
+        monkeypatch.setattr(svc, "_metadata_recall", metadata_source)
+        monkeypatch.setattr(svc, "_bm25_search", bm25_source)
+        results = _run(svc.recall(query="kafka streams", scope="global", limit=2, sort_by=sort_by))
+        assert {svc._identity(m) for m in results} == {
+            ("weak-new", "global", None, "native"),
+            ("weak-new", "global", None, "vault"),
+        }
+
+    @pytest.mark.parametrize("sort_by", ["score", "usage"])
+    def test_metadata_fills_limit_without_unique_bm25_results(
+        self, svc, db_engine, hybrid_starvation_corpus, sort_by
+    ):
+        results = _run(
+            svc.recall(
+                query="filler",
+                scope="global",
+                limit=1,
+                sort_by=sort_by,
+                terminal_context=hybrid_starvation_corpus,
+            )
+        )
+        assert [m.key for m in results] == ["weak-new"]
+        assert _row(db_engine, "weak-new").access_count == 1
+        assert _row(db_engine, "strong-old").access_count == 40
+
+    @pytest.mark.parametrize("limit, candidate_limit", [(1, 50), (20, 60), (67, 200), (1000, 200)])
+    def test_per_source_candidate_limit_is_bounded(
+        self, svc, hybrid_starvation_corpus, monkeypatch, limit, candidate_limit
+    ):
+        metadata_limits, bm25_limits = [], []
+        metadata_source, bm25_source = svc._metadata_recall, svc._bm25_search
+
+        async def metadata_spy(**kwargs):
+            metadata_limits.append(kwargs["limit"])
+            return await metadata_source(**kwargs)
+
+        def bm25_spy(**kwargs):
+            bm25_limits.append(kwargs["limit"])
+            return bm25_source(**kwargs)
+
+        monkeypatch.setattr(svc, "_metadata_recall", metadata_spy)
+        monkeypatch.setattr(svc, "_bm25_search", bm25_spy)
+        results = _run(
+            svc.recall(query="kafka streams", scope="global", limit=limit, sort_by="score")
+        )
+        assert metadata_limits == [candidate_limit]
+        assert bm25_limits == [candidate_limit]
+        assert len(results) == min(limit, 2)
+
+    @pytest.mark.parametrize(
+        "mode, query, sort_by, expected",
+        [
+            ("hybrid", "kafka streams", "recency", ["weak-new"]),
+            ("metadata", "kafka streams", "recency", ["weak-new"]),
+            ("metadata", "kafka streams", "score", ["weak-new"]),
+            ("metadata", "kafka streams", "usage", ["weak-new"]),
+            ("bm25", "kafka streams", "recency", ["strong-old"]),
+            ("bm25", "kafka streams", "score", ["strong-old"]),
+            ("bm25", "kafka streams", "usage", ["strong-old"]),
+            ("hybrid", None, "recency", ["ballast-0"]),
+            ("hybrid", None, "score", ["ballast-0"]),
+            ("hybrid", None, "usage", ["ballast-0"]),
+            ("metadata", None, "score", ["ballast-0"]),
+            ("bm25", None, "score", []),
+        ],
+    )
+    def test_unchanged_modes_match_legacy_selection(
+        self, svc, db_engine, hybrid_starvation_corpus, mode, query, sort_by, expected
+    ):
+        # Explicit timestamp avoids same-second store ties in the query-free path.
+        _stamp_updated_at(db_engine, "ballast-0", "global", datetime.now(timezone.utc))
+        results = _run(
+            svc.recall(
+                query=query,
+                scope="global",
+                limit=1,
+                sort_by=sort_by,
+                search_mode=mode,
+                terminal_context=hybrid_starvation_corpus,
+            )
+        )
+        assert [m.key for m in results] == expected

@@ -53,6 +53,11 @@ logger = logging.getLogger(__name__)
 
 VALID_SEARCH_MODES = ("metadata", "bm25", "hybrid")
 
+# #861: widen hybrid score/usage candidates before ranking, with bounded per-source pools.
+HYBRID_CANDIDATE_MIN = 50
+HYBRID_CANDIDATE_MULTIPLIER = 3
+HYBRID_CANDIDATE_MAX = 200
+
 
 MEMORY_DISABLED_MESSAGE = (
     "memory subsystem is disabled. Set memory.enabled=true in settings.json " "to re-enable."
@@ -2430,11 +2435,20 @@ class MemoryService:
                 policy=recall_policy,
             )
 
+        widen_candidates = search_mode == "hybrid" and bool(query) and sort_by in {"score", "usage"}
+        candidate_limit = (
+            min(
+                HYBRID_CANDIDATE_MAX, max(HYBRID_CANDIDATE_MIN, HYBRID_CANDIDATE_MULTIPLIER * limit)
+            )
+            if widen_candidates
+            else limit
+        )
+
         metadata_results = await self._metadata_recall(
             query=query,
             scope=scope,
             memory_type=memory_type,
-            limit=limit,
+            limit=candidate_limit,
             terminal_context=terminal_context,
             scan_all=scan_all,
             policy=recall_policy,
@@ -2443,6 +2457,38 @@ class MemoryService:
         if search_mode == "metadata" or not query:
             return self._apply_sort_and_increment(
                 metadata_results,
+                scope,
+                sort_by,
+                limit,
+                include_related=include_related,
+                query=query,
+                terminal_context=terminal_context,
+                scan_all=scan_all,
+                policy=recall_policy,
+            )
+
+        if widen_candidates and query:
+            scope_id = (
+                self.resolve_scope_id(scope, terminal_context)
+                if scope and scope != MemoryScope.GLOBAL.value and terminal_context
+                else None
+            )
+            bm25_results = self._bm25_search(
+                query=query,
+                scope=scope,
+                scope_id=scope_id,
+                memory_type=memory_type,
+                limit=candidate_limit,
+                exclude_keys=set(),
+                terminal_context=terminal_context,
+                scan_all=scan_all,
+                policy=recall_policy,
+            )
+            by_identity: dict[tuple, Memory] = {}
+            for memory in metadata_results + bm25_results:
+                by_identity.setdefault(self._identity(memory), memory)
+            return self._apply_sort_and_increment(
+                list(by_identity.values()),
                 scope,
                 sort_by,
                 limit,
