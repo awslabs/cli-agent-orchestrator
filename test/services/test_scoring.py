@@ -1412,7 +1412,42 @@ class TestHybridCandidatePool:
         assert _row(db_engine, "weak-new").access_count == 1
         assert _row(db_engine, "strong-old").access_count == 40
 
-    @pytest.mark.parametrize("limit, candidate_limit", [(1, 50), (20, 60), (67, 200), (1000, 200)])
+    def test_large_limit_returns_at_least_legacy_metadata_count(self, svc):
+        ctx = _ctx(caller_scope="global")
+        limit = 450
+        for i in range(limit):
+            _run(
+                svc.store(
+                    content="kafka streams",
+                    scope="global",
+                    key=f"large-pool-{i}",
+                    terminal_context=ctx,
+                )
+            )
+        legacy = _run(
+            svc.recall(
+                query="kafka streams",
+                scope="global",
+                limit=limit,
+                search_mode="metadata",
+                sort_by="score",
+                terminal_context=ctx,
+            )
+        )
+        hybrid = _run(
+            svc.recall(
+                query="kafka streams",
+                scope="global",
+                limit=limit,
+                search_mode="hybrid",
+                sort_by="score",
+                terminal_context=ctx,
+            )
+        )
+        assert len(legacy) == limit
+        assert len(hybrid) >= len(legacy)
+
+    @pytest.mark.parametrize("limit, candidate_limit", [(1, 50), (20, 60), (67, 200), (1000, 1000)])
     def test_per_source_candidate_limit_is_bounded(
         self, svc, hybrid_starvation_corpus, monkeypatch, limit, candidate_limit
     ):

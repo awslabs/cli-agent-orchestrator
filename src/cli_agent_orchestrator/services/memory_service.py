@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 VALID_SEARCH_MODES = ("metadata", "bm25", "hybrid")
 
-# #861: widen hybrid score/usage candidates before ranking, with bounded per-source pools.
+# #861: cap hybrid score/usage widening at 200 per source, never below the requested limit.
 HYBRID_CANDIDATE_MIN = 50
 HYBRID_CANDIDATE_MULTIPLIER = 3
 HYBRID_CANDIDATE_MAX = 200
@@ -2437,8 +2437,12 @@ class MemoryService:
 
         widen_candidates = search_mode == "hybrid" and bool(query) and sort_by in {"score", "usage"}
         candidate_limit = (
-            min(
-                HYBRID_CANDIDATE_MAX, max(HYBRID_CANDIDATE_MIN, HYBRID_CANDIDATE_MULTIPLIER * limit)
+            max(
+                limit,
+                min(
+                    HYBRID_CANDIDATE_MAX,
+                    max(HYBRID_CANDIDATE_MIN, HYBRID_CANDIDATE_MULTIPLIER * limit),
+                ),
             )
             if widen_candidates
             else limit
@@ -2467,7 +2471,7 @@ class MemoryService:
                 policy=recall_policy,
             )
 
-        if widen_candidates and query:
+        if widen_candidates:
             scope_id = (
                 self.resolve_scope_id(scope, terminal_context)
                 if scope and scope != MemoryScope.GLOBAL.value and terminal_context
