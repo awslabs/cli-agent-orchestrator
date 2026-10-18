@@ -1307,9 +1307,11 @@ class TestHybridCandidatePool:
                 terminal_context=hybrid_starvation_corpus,
             )
         )
-        assert [m.key for m in results] == ["strong-old"]
-        assert _row(db_engine, "strong-old").access_count == (1 if sort_by == "score" else 41)
-        assert _row(db_engine, "weak-new").access_count == 0
+        expected = "strong-old" if metadata_match else "weak-new"
+        assert [m.key for m in results] == [expected]
+        initial_usage = 0 if sort_by == "score" else 40
+        assert _row(db_engine, "strong-old").access_count == initial_usage + int(metadata_match)
+        assert _row(db_engine, "weak-new").access_count == int(not metadata_match)
 
     @pytest.mark.parametrize("sort_by", ["score", "usage"])
     def test_same_slug_in_two_projects_is_eligible_and_scope_filter_isolates(
@@ -1468,7 +1470,7 @@ class TestHybridCandidatePool:
             svc.recall(query="kafka streams", scope="global", limit=limit, sort_by="score")
         )
         assert metadata_limits == [candidate_limit]
-        assert bm25_limits == [candidate_limit]
+        assert bm25_limits == ([] if limit == 1 else [candidate_limit])
         assert len(results) == min(limit, 2)
 
     @pytest.mark.parametrize(
@@ -1504,3 +1506,257 @@ class TestHybridCandidatePool:
             )
         )
         assert [m.key for m in results] == expected
+
+
+class TestHybridAllTermContract:
+    @pytest.mark.parametrize("sort_by", ["score", "usage"])
+    def test_unscoped_all_terms_are_not_evicted_by_session_partials(self, svc, db_engine, sort_by):
+        ctx = _ctx(caller_scope="global")
+        now = datetime.now(timezone.utc)
+        for i in range(3):
+            _run(
+                svc.store(
+                    content=f"kafka streams exact match {i}",
+                    scope="global",
+                    key=f"g-exact-{i}",
+                    terminal_context=ctx,
+                    occurred_at=now - timedelta(days=2, hours=i),
+                )
+            )
+            _run(
+                svc.store(
+                    content=f"kafka lunch order {i}",
+                    scope="session",
+                    key=f"s-partial-{i}",
+                    terminal_context=ctx,
+                    occurred_at=now - timedelta(days=30, hours=i),
+                )
+            )
+        results = _run(
+            svc.recall(query="kafka streams", limit=3, sort_by=sort_by, terminal_context=ctx)
+        )
+        assert {(m.scope, m.key) for m in results} == {("global", f"g-exact-{i}") for i in range(3)}
+        assert all(_row(db_engine, f"g-exact-{i}").access_count == 1 for i in range(3))
+        assert all(_row(db_engine, f"s-partial-{i}", "session").access_count == 0 for i in range(3))
+
+    def test_usage_all_terms_are_not_evicted_by_popular_partial(self, svc, db_engine):
+        ctx = _ctx(caller_scope="global")
+        now = datetime.now(timezone.utc)
+        for i in range(2):
+            _run(
+                svc.store(
+                    content=f"kafka streams retention policy {i}",
+                    scope="global",
+                    key=f"exact-{i}",
+                    terminal_context=ctx,
+                    occurred_at=now - timedelta(days=1, hours=i),
+                )
+            )
+        _run(
+            svc.store(
+                content="kafka",
+                scope="global",
+                key="partial-popular",
+                terminal_context=ctx,
+                occurred_at=now - timedelta(days=300),
+            )
+        )
+        with sessionmaker(bind=db_engine)() as db:
+            db.query(MemoryMetadataModel).filter_by(key="partial-popular").update(
+                {"access_count": 50}
+            )
+            db.commit()
+        results = _run(
+            svc.recall(
+                query="kafka streams retention",
+                scope="global",
+                limit=2,
+                sort_by="usage",
+                terminal_context=ctx,
+            )
+        )
+        assert {m.key for m in results} == {"exact-0", "exact-1"}
+        assert _row(db_engine, "partial-popular").access_count == 50
+
+    @pytest.mark.parametrize("sort_by", ["score", "usage"])
+    def test_all_term_bm25_hit_survives_higher_scoring_partials(self, svc, db_engine, sort_by):
+        ctx = _ctx(caller_scope="global")
+        now = datetime.now(timezone.utc)
+        # Metadata uses substrings, not token equality: both strings contain
+        # every query term, but only the old one has an exact BM25 token.
+        for i in range(50):
+            _run(
+                svc.store(
+                    content="akafkaz upstreams",
+                    scope="global",
+                    key=f"weak-{i}",
+                    terminal_context=ctx,
+                    occurred_at=now - timedelta(days=1, hours=i),
+                )
+            )
+        _run(
+            svc.store(
+                content="kafka upstreams",
+                scope="global",
+                key="old-all-terms",
+                terminal_context=ctx,
+                occurred_at=now - timedelta(days=100),
+            )
+        )
+        for i in range(60):
+            _run(
+                svc.store(
+                    content="kafka " * 20, scope="global", key=f"partial-{i}", terminal_context=ctx
+                )
+            )
+        for i in range(120):
+            _run(
+                svc.store(
+                    content="gardening soil",
+                    scope="global",
+                    key=f"ballast-{i}",
+                    terminal_context=ctx,
+                )
+            )
+        with sessionmaker(bind=db_engine)() as db:
+            db.query(MemoryMetadataModel).filter_by(key="old-all-terms").update(
+                {"access_count": 50 if sort_by == "usage" else 0}
+            )
+            db.commit()
+        raw = svc._bm25_search(
+            query="kafka streams",
+            scope="global",
+            scope_id=None,
+            memory_type=None,
+            limit=50,
+            exclude_keys=set(),
+            terminal_context=ctx,
+            scan_all=False,
+        )
+        assert len(raw) == 50
+        assert all(m.key.startswith("partial-") for m in raw)
+        results = _run(
+            svc.recall(
+                query="kafka streams",
+                scope="global",
+                limit=1,
+                sort_by=sort_by,
+                terminal_context=ctx,
+            )
+        )
+        assert [m.key for m in results] == ["old-all-terms"]
+        assert _row(db_engine, "old-all-terms").access_count == (51 if sort_by == "usage" else 1)
+        assert all(_row(db_engine, f"partial-{i}").access_count == 0 for i in range(60))
+
+    @pytest.mark.parametrize("sort_by", ["score", "usage"])
+    def test_partial_fill_keeps_same_slug_in_different_scope(self, svc, db_engine, sort_by):
+        ctx = _ctx(caller_scope="global")
+        _run(svc.store(content="kafka streams", scope="global", key="shared", terminal_context=ctx))
+        _run(svc.store(content="kafka lunch", scope="session", key="shared", terminal_context=ctx))
+        _run(svc.store(content="kafka snack", scope="global", key="other", terminal_context=ctx))
+        results = _run(
+            svc.recall(query="kafka streams", limit=3, sort_by=sort_by, terminal_context=ctx)
+        )
+        identities = [svc._identity(m) for m in results]
+        assert set(identities) == {
+            ("shared", "global", None, "native"),
+            ("shared", "session", ctx["session_name"], "native"),
+            ("other", "global", None, "native"),
+        }
+        assert len(identities) == len(set(identities)) == 3
+        assert _row(db_engine, "shared").access_count == 1
+        assert _row(db_engine, "shared", "session").access_count == 1
+        assert _row(db_engine, "other").access_count == 1
+
+    @pytest.mark.parametrize("source_kind", ["native", "vault"])
+    def test_native_raw_header_and_vault_body_match_metadata_predicate(
+        self, svc, db_engine, monkeypatch, source_kind
+    ):
+        ctx = _ctx(caller_scope="global")
+        now = datetime.now(timezone.utc)
+        for i in range(50):
+            _run(
+                svc.store(
+                    content="kafka streams",
+                    scope="global",
+                    key=f"weak-{i}",
+                    terminal_context=ctx,
+                    occurred_at=now - timedelta(days=1, hours=i),
+                )
+            )
+        old = _run(
+            svc.store(
+                content="kafka",
+                tags="streams",
+                scope="global",
+                key="header-only",
+                terminal_context=ctx,
+                occurred_at=now - timedelta(days=100),
+            )
+        )
+        assert "streams" not in old.content
+        with sessionmaker(bind=db_engine)() as db:
+            if source_kind == "native":
+                db.query(MemoryMetadataModel).filter_by(key="header-only").update(
+                    {"access_count": 50}
+                )
+            else:
+                db.add(
+                    MemoryMetadataModel(
+                        id="vault-header",
+                        key=old.key,
+                        scope="global",
+                        scope_id=None,
+                        source_kind="vault",
+                        file_path=old.file_path,
+                        memory_type=old.memory_type,
+                        access_count=50,
+                        created_at=old.created_at,
+                        updated_at=old.updated_at,
+                    )
+                )
+            db.commit()
+        hit = old.model_copy(update={"source_kind": source_kind})
+        monkeypatch.setattr(svc, "_bm25_search", lambda **kwargs: [hit])
+        results = _run(
+            svc.recall(
+                query="kafka streams",
+                scope="global",
+                limit=1,
+                sort_by="usage",
+                terminal_context=ctx,
+            )
+        )
+        assert [m.key for m in results] == ["header-only" if source_kind == "native" else "weak-0"]
+
+    @pytest.mark.parametrize(
+        "count, expected_calls", [(0, 1), (1, 0), (2, 0), (49, 0), (50, 1), (51, 1)]
+    )
+    def test_bm25_runs_only_for_truncated_pool_or_fill(
+        self, svc, monkeypatch, count, expected_calls
+    ):
+        ctx = _ctx(caller_scope="global")
+        for i in range(count):
+            _run(
+                svc.store(
+                    content="kafka streams", scope="global", key=f"match-{i}", terminal_context=ctx
+                )
+            )
+        source = svc._bm25_search
+        calls = []
+
+        def spy(**kwargs):
+            calls.append(kwargs["limit"])
+            return source(**kwargs)
+
+        monkeypatch.setattr(svc, "_bm25_search", spy)
+        _run(
+            svc.recall(
+                query="kafka streams",
+                scope="global",
+                limit=1,
+                sort_by="score",
+                terminal_context=ctx,
+            )
+        )
+        assert len(calls) == expected_calls
