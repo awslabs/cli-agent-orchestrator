@@ -2496,6 +2496,7 @@ class TestListTerminalsInSessions:
         # Keys pinned absolutely, not just against each other — a key dropped
         # from BOTH projections would otherwise pass while breaking consumers.
         assert set(batched[0]) == {
+            "description",
             "id",
             "tmux_session",
             "tmux_window",

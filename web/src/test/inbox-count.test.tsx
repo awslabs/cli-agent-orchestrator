@@ -15,7 +15,7 @@ const session = { id: 'synthetic-session', name: 'synthetic-session', status: 'a
 const initialStore = useStore.getState()
 function terminal(id: string, count?: number): TerminalMeta {
   return { id, tmux_session: session.name, tmux_window: id, provider: 'codex',
-    agent_profile: id, created_at: null, last_active: null,
+    agent_profile: id, description: null, created_at: null, last_active: null,
     ...(count === undefined ? {} : { pending_inbox_count: count }),
   }
 }

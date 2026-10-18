@@ -304,6 +304,7 @@ class CreateTerminalBody(_CreateMessageBody):
     message content lives here.
     """
 
+    description: Optional[str] = None
     delegation_message: Optional[str] = Field(default=None, min_length=1)
     delegation_kind: Optional[Literal["handoff"]] = None
 
@@ -378,6 +379,7 @@ class CreateSessionBody(_CreateMessageBody):
     level, e.g. ``ops_mcp_server/server.py``'s ``_launch_session_impl``).
     """
 
+    description: Optional[str] = None
     env_vars: Optional[Dict[str, str]] = None
     group: Optional[List[str]] = None
     metadata: Optional[Dict] = None
@@ -503,9 +505,16 @@ class UpdateMetadataBody(BaseModel):
         return _check_metadata_size(v)
 
 
+class UpdateDescriptionBody(BaseModel):
+    """Require the key; explicit null clears the description, omission is invalid."""
+
+    description: Optional[str]
+
+
 class RunStepRequest(BaseModel):
     """Request body for the combined step-execution endpoint (N0, #312)."""
 
+    description: Optional[str] = None
     provider: str = Field(description="Provider type (e.g. 'kiro_cli', 'claude_code')")
     agent: str = Field(description="Agent profile name")
     prompt: str = Field(description="Prompt to send (caller applies any prompt shaping first)")
@@ -3607,6 +3616,11 @@ async def create_session(
                     target_kind=profile_source(agent_profile),
                 )
             )
+        description_options: Dict[str, Any] = (
+            {"description": body.description}
+            if body and "description" in body.model_fields_set
+            else {}
+        )
         result = await session_service.create_session(
             provider=launch_provider,
             agent_profile=agent_profile,
@@ -3624,6 +3638,7 @@ async def create_session(
             resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
+            **description_options,
             **_launch_options(launch_plan),
         )
 
@@ -3950,6 +3965,7 @@ async def create_terminal_in_session(
             defer_init=defer_init,
             initial_message=initial_message,
             initial_message_orchestration_type=orch_type,
+            description=body.description if body else None,
             engine=engine,
             model=model,
             use_worktree=use_worktree,
@@ -4091,6 +4107,23 @@ async def update_terminal_group_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to update terminal group: {str(e)}",
         )
+
+
+@app.patch("/terminals/{terminal_id}/description", response_model=Terminal)
+async def update_terminal_description_endpoint(
+    terminal_id: TerminalId,
+    body: UpdateDescriptionBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Terminal:
+    try:
+        updated = await asyncio.to_thread(
+            terminal_service.update_description, terminal_id, body.description
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"Terminal '{terminal_id}' not found")
+    return Terminal(**await asyncio.to_thread(terminal_service.get_terminal, terminal_id))
 
 
 @app.patch("/terminals/{terminal_id}/metadata", response_model=Terminal)
@@ -4808,6 +4841,7 @@ async def run_step(
             provider=body.provider,
             agent=body.agent,
             prompt=body.prompt,
+            description=body.description,
             session_name=body.session_name,
             reuse_terminal_id=body.reuse_terminal_id,
             teardown=body.teardown,

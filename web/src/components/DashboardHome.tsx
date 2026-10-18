@@ -1,12 +1,13 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
 import { useStore } from '../store'
-import { api, TerminalMeta } from '../api'
+import { api, TerminalMeta, sessionDescriptionRevision } from '../api'
 import { Bot, Zap, Package, Monitor, Terminal as TermIcon, Trash2, Mail, FileText, LogOut, Send, ChevronRight, ChevronDown, Users, Filter, ArrowDownUp } from 'lucide-react'
 import { TerminalView } from './TerminalView'
 import { ConfirmModal } from './ConfirmModal'
 import { InboxPanel } from './InboxPanel'
 import { StatusBadge, STATUS_CONFIG } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
+import { AgentDescription } from './AgentDescription'
 import { parseServerTime } from '../time'
 
 const STATUS_ORDER = ['PROCESSING', 'IDLE', 'WAITING_USER_ANSWER', 'ERROR', 'COMPLETED', 'UNKNOWN']
@@ -75,6 +76,8 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
   const { sessions, terminalStatuses, setTerminalStatus, clearTerminalStatuses, showSnackbar, deleteSession } = useStore()
   const [profileCount, setProfileCount] = useState(0)
   const [sessionData, setSessionData] = useState<SessionWithTerminals[]>([])
+  const sessionDataRef = useRef(sessionData)
+  sessionDataRef.current = sessionData
   const [expandedSessions, setExpandedSessions] = useState<Set<string>>(new Set())
   const [liveTerminal, setLiveTerminal] = useState<{ id: string; provider?: string; agentProfile?: string | null } | null>(null)
   const [pendingClose, setPendingClose] = useState<TerminalMeta | null>(null)
@@ -129,16 +132,18 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
   useEffect(() => {
     const fetchAll = async () => {
       try {
+        const revision = sessionDescriptionRevision
         const sessionDetails = await Promise.all(
           sessions.map(async s => {
             try {
               const detail = await api.getSession(s.name)
               return { name: s.name, status: s.status, terminals: detail.terminals || [] }
             } catch {
-              return { name: s.name, status: s.status, terminals: [] }
+              return sessionDataRef.current.find(session => session.name === s.name) || { name: s.name, status: s.status, terminals: [] }
             }
           })
         )
+        if (revision !== sessionDescriptionRevision) { void fetchAll(); return }
         setSessionData(sessionDetails)
         // Auto-expand only newly seen sessions
         const newNames = sessionDetails.map(s => s.name).filter(n => !seenSessionsRef.current.has(n))
@@ -465,6 +470,20 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                                     <button onClick={() => setPendingClose(t)} disabled={closingTerminal === t.id} className="p-1 text-gray-500 hover:text-red-400 bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Close"><Trash2 size={12} /></button>
                                   </div>
                                 </div>
+                                <AgentDescription id={t.id} description={t.description} onSaved={description => {
+                                  setSessionData(current => current.map(session => ({ ...session,
+                                    terminals: session.terminals.map(terminal => terminal.id === t.id ? { ...terminal, description } : terminal),
+                                  })))
+                                  useStore.setState(state => ({ activeSessionDetail: state.activeSessionDetail ? {
+                                    ...state.activeSessionDetail,
+                                    terminals: state.activeSessionDetail.terminals.map(terminal => terminal.id === t.id ? { ...terminal, description } : terminal),
+                                  } : null }))
+                                  const revision = sessionDescriptionRevision
+                                  void api.getSession(t.tmux_session).then(detail => {
+                                    if (revision !== sessionDescriptionRevision) return
+                                    setSessionData(current => current.map(session => session.name === t.tmux_session ? { ...session, terminals: detail.terminals } : session))
+                                  }).catch(() => {})
+                                }} />
                                 {/* Timestamps */}
                                 <div className="flex items-center gap-3 text-[10px] text-gray-600">
                                   {relCreated && <span title={fmtAbs(t.created_at) || ''}>{relCreated}</span>}

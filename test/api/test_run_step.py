@@ -485,3 +485,15 @@ class TestRunStepEndpoint:
         assert resp.status_code == 504
         detail = resp.json()["detail"]
         assert detail["kind"] == "timeout"
+
+
+@pytest.mark.parametrize("description", [None, "", "  ", "Review code", "😀" * 65])
+def test_run_step_description_forwarded(client, description):
+    result = AgentStepResult(
+        terminal_id="abcd1234", last_message="Done", status=TerminalStatus.COMPLETED
+    )
+    with patch(_RUN_STEP, new=AsyncMock(return_value=result)) as run:
+        response = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(description=description))
+    assert response.status_code == 200
+    assert response.json()["last_message"] == "Done"
+    assert run.call_args.kwargs["description"] == description

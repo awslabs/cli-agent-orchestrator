@@ -211,6 +211,37 @@ security boundary on top of them.
 Terminal identifiers used in these routes are eight-character hexadecimal
 strings. See [Control Planes](control-planes.md) for operator-facing choices.
 
+#### Terminal descriptions
+
+Terminal responses include a persistent `description: string | null`, independent
+of `metadata` and `group`. The optional JSON `description` field is accepted by
+`POST /sessions`, `POST /sessions/{session_name}/terminals`, and
+`POST /terminals/run-step`. Creation replaces line separators (including CRLF,
+NEL, and Unicode line/paragraph separators) with spaces, removes remaining C0/C1
+controls (`U+0000–001F`, `U+007F–009F`, including interior tabs), trims outer
+whitespace, and truncates to 64 Unicode code points. This counts neither bytes
+nor visible grapheme clusters. An empty normalized value is stored as `null`.
+
+For the first terminal of `POST /sessions`, omitting `description` uses the
+supplied session name as its default description. Explicit `{"description": null}`
+suppresses that default. Clients generating random session names should send
+`null`; other creation routes have no session-name default.
+
+`PATCH /terminals/{terminal_id}/description` replaces the value and returns the
+updated terminal. With authentication enabled it requires `cao:write` or
+`cao:admin`. Its JSON body must include `description`: an omitted key returns
+`422`, while `null`, an empty string, or whitespace alone clears the value.
+Editing applies the same normalization, but **rejects** a normalized value over
+64 code points with `422` instead of truncating it. A valid body for a missing
+terminal returns `404`; invalid bodies may return `422` before existence is
+checked.
+
+Reusing a terminal does not update its description. Idempotent creation retries
+also preserve an operator's subsequent edit. A non-null normalized creation
+description participates in the request fingerprint: omitting it is not
+equivalent to supplying a nonempty description on a retry. Normalization applies
+to new inputs and edits; existing rows and stored fingerprints are not migrated.
+
 ### Durable handoff results
 
 - `POST /terminals/run-step` runs one agent step and accepts an optional
