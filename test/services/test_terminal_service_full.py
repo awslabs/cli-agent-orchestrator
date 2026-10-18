@@ -17,6 +17,7 @@ from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import OutputExtractionError
+from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.terminal_service import (
     IdempotencyKeyConflict,
@@ -2696,6 +2697,47 @@ class TestGetOutput:
         result = get_output("test1234", OutputMode.LAST)
 
         assert result == "last message"
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_output_last_returns_empty_without_escalating(
+        self, mock_get_metadata, mock_backend, mock_status_monitor, mock_pm
+    ):
+        """A confirmed empty Codex response must not fall back to old output."""
+        from pathlib import Path
+
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_status_monitor.get_buffer.return_value = "older non-empty output"
+        capture = (
+            Path(__file__).parents[1] / "providers/fixtures/codex_empty_turn_completed.txt"
+        ).read_text()
+        backend = MagicMock()
+        backend.get_history.return_value = "› Previous message\n› Ask Codex to do anything\n"
+        mock_backend.get_history.return_value = capture
+
+        provider = CodexProvider("test1234", "cao-session", "developer-abcd")
+        provider._ends_turns_with_footer = True
+        provider._codex_version = (0, 162, 1)
+        with patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend):
+            provider.notify_status_buffer_reset(1)
+            provider.mark_input_received()
+            provider.record_dispatched_message(
+                "ACK: agente disponible\n\n"
+                "[Message from terminal worker. Use send_message MCP tool for any follow-up work.]"
+            )
+        mock_backend.get_history.return_value = capture
+        mock_backend.get_history.reset_mock()
+        mock_pm.get_provider.return_value = provider
+
+        assert get_output("test1234", OutputMode.LAST) == ""
+        mock_backend.get_history.assert_called_once_with(
+            "cao-session", "developer-abcd", tail_lines=200
+        )
 
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_output_not_found(self, mock_get_metadata):
