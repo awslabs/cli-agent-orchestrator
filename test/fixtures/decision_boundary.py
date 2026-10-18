@@ -44,6 +44,8 @@ def assert_agent_boundary(tools: Sequence[Mapping[str, Any]], base: Mapping[str,
             assert item["description"] == base["memory_store_description"]
             item["description"] = None
         text = json.dumps(item).lower()
+        # Character-count wording is unrelated to decision-platform vocabulary.
+        text = re.sub(r"\bunicode code points\b", "unicode characters", text)
         for word in VOCABULARY:
             assert not re.search(r"(?<![a-z])" + re.escape(word) + r"(?![a-z])", text), (
                 item["name"],
