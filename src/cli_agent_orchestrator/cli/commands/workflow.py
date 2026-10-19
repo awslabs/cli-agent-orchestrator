@@ -155,8 +155,8 @@ def _approval_refusal_message(refusal: dict) -> str:
     if kind == "plan_identity_unavailable":
         return (
             f"{message}\n"
-            "This is a CAO-side failure, not a permission problem: no plan identifier could be read, "
-            "so there is nothing to approve. Retry the run."
+            "No plan identifier could be computed, so there is nothing to approve. "
+            "The reason above says what to change."
         )
     if kind == "approval_required":
         plan_id = refusal["plan_id"]

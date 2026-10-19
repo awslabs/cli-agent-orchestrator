@@ -538,7 +538,11 @@ async def test_blocking_script_manifest_freeze_is_offloaded_from_event_loop(monk
         source="def main():\n    pass\n",
         content_hash="deadbeef",
     )
-    monkeypatch.setattr(manifest_freeze, "build_manifest_json", blocking_manifest)
+    monkeypatch.setattr(
+        manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: manifest_freeze.FrozenManifest((blocking_manifest)(**kwargs)),
+    )
     monkeypatch.setattr(
         script_runner, "lint_script", lambda source, path: SimpleNamespace(status="pass")
     )
@@ -1057,7 +1061,11 @@ def test_submit_manifest_freeze_failure_runs_when_approval_is_disabled(
     """The explicit approval opt-out preserves manifest freeze's best-effort contract."""
     from cli_agent_orchestrator.services import manifest_freeze
 
-    monkeypatch.setattr(manifest_freeze, "build_manifest_json", lambda **kwargs: None)
+    monkeypatch.setattr(
+        manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: manifest_freeze.FrozenManifest((lambda **kwargs: None)(**kwargs)),
+    )
 
     response = client.post(
         "/workflows/runs:submit",
@@ -1084,7 +1092,11 @@ def test_submit_manifest_freeze_failure_is_503_when_approval_is_required(
     gate_on = tmp_path / "gate-on.json"
     gate_on.write_text(json.dumps({"workflow": {"require_approval": True}}))
     monkeypatch.setattr(settings_service, "SETTINGS_FILE", gate_on)
-    monkeypatch.setattr(manifest_freeze, "build_manifest_json", lambda **kwargs: None)
+    monkeypatch.setattr(
+        manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: manifest_freeze.FrozenManifest((lambda **kwargs: None)(**kwargs)),
+    )
 
     response = client.post(
         "/workflows/runs:submit",
@@ -1109,8 +1121,10 @@ def test_submit_script_tier_202_and_drives(client, async_script_env, monkeypatch
     manifest_cwds = []
     monkeypatch.setattr(
         manifest_freeze,
-        "build_manifest_json",
-        lambda **kwargs: manifest_cwds.append(kwargs["cwd"]) or None,
+        "freeze_manifest",
+        lambda **kwargs: manifest_freeze.FrozenManifest(
+            (lambda **kwargs: manifest_cwds.append(kwargs["cwd"]) or None)(**kwargs)
+        ),
     )
     resp = client.post(
         "/workflows/runs:submit", json={"name_or_path": "scr", "inputs": {}, "run_id": "async-scr"}
@@ -1190,7 +1204,11 @@ def test_submit_script_manifest_freezes_resolved_inputs(client, async_script_env
     def _capture_schedule(record, spec_arg, run_id, tier, inputs, **kwargs):
         captured["scheduled_inputs"] = inputs
 
-    monkeypatch.setattr(manifest_freeze, "build_manifest_json", _capture_manifest)
+    monkeypatch.setattr(
+        manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: manifest_freeze.FrozenManifest((_capture_manifest)(**kwargs)),
+    )
     monkeypatch.setattr(api_main, "_schedule_background_drive", _capture_schedule)
 
     response = client.post(
@@ -1244,7 +1262,11 @@ async def test_submit_script_manifest_freeze_is_offloaded_from_event_loop(monkey
     monkeypatch.setattr(workflow_spec_service, "get_workflow", lambda name_or_path: spec)
     monkeypatch.setattr(workflow_service, "_validate_inputs", lambda spec, inputs: inputs)
     monkeypatch.setattr(workflow_service, "_now", lambda: "2026-01-01T00:00:00Z")
-    monkeypatch.setattr(manifest_freeze, "build_manifest_json", blocking_manifest)
+    monkeypatch.setattr(
+        manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: manifest_freeze.FrozenManifest((blocking_manifest)(**kwargs)),
+    )
     monkeypatch.setattr(
         script_runner, "lint_script", lambda source, path: SimpleNamespace(status="pass")
     )
@@ -2641,3 +2663,104 @@ def test_non_git_approval_cannot_transfer_to_another_root(
         == workflow_service.run_registry["root-a"].working_directory
         == os.path.realpath(a)
     )
+
+
+@pytest.mark.parametrize("endpoint", ["/workflows/runs", "/workflows/runs:submit"])
+@pytest.mark.parametrize("size", [2048, 65 * 1024 * 1024], ids=["small-test-budget", "real-65MiB"])
+def test_untracked_budget_503_has_no_retry_or_path(
+    client, async_script_env, tmp_path, monkeypatch, endpoint, size
+):
+    import subprocess
+
+    from cli_agent_orchestrator.services import approval_gate
+    from cli_agent_orchestrator.utils import git_baseline
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "--no-gpg-sign",
+            "-qm",
+            "init",
+        ],
+        cwd=root,
+        check=True,
+    )
+    path = root / "large-untracked.bin"
+    path.touch()
+    os.truncate(path, size)
+    if size == 2048:
+        monkeypatch.setattr(git_baseline, "_UNTRACKED_HASH_BUDGET_BYTES", 1024)
+    monkeypatch.setattr(approval_gate, "is_workflow_approval_required", lambda: True)
+    response = client.post(
+        endpoint,
+        json={
+            "name_or_path": "scr",
+            "inputs": {},
+            "run_id": "budget-refused",
+            "working_directory": str(root),
+        },
+    )
+    assert response.status_code == 503, response.text
+    detail = response.json()["detail"]
+    assert set(detail) == {"kind", "plan_id", "message"}
+    assert detail["kind"] == "plan_identity_unavailable" and detail["plan_id"] is None
+    assert "64 MiB" in detail["message"]
+    assert "gitignore" in detail["message"].lower()
+    assert "Retry" not in detail["message"]
+    assert str(tmp_path) not in response.text and str(path) not in response.text
+    assert workflow_journal.get_run("budget-refused") is None
+
+
+@pytest.mark.parametrize("endpoint", ["/workflows/runs", "/workflows/runs:submit"])
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "untracked_too_large",
+        "untracked_unsupported",
+        "repository_unreadable",
+        "git_unavailable",
+        "git_timeout",
+        "changed_during_snapshot",
+        "internal",
+        "no_recorded_identity",
+        "profiles_unreadable",
+    ],
+)
+def test_each_freeze_reason_has_fixed_path_free_503(
+    client, async_script_env, tmp_path, monkeypatch, endpoint, reason
+):
+    from cli_agent_orchestrator.services import approval_gate, manifest_freeze
+
+    monkeypatch.setattr(approval_gate, "is_workflow_approval_required", lambda: True)
+    monkeypatch.setattr(
+        manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: manifest_freeze.FrozenManifest(None, reason),
+    )
+    response = client.post(
+        endpoint,
+        json={
+            "name_or_path": "scr",
+            "inputs": {},
+            "run_id": "reason-refused",
+            "working_directory": str(tmp_path),
+        },
+    )
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"] == {
+        "kind": "plan_identity_unavailable",
+        "plan_id": None,
+        "message": approval_gate._identity_message(reason),
+    }
+    assert "retry-after" not in response.headers
+    assert str(tmp_path) not in response.text
+    assert workflow_journal.get_run("reason-refused") is None

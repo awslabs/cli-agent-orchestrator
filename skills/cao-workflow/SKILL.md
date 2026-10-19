@@ -174,7 +174,7 @@ Attempt the run. If it is refused, the response tells you which of two things ha
 | `class` / `kind` | What happened | What to do |
 | --- | --- | --- |
 | `approval_required` | this plan has no approval yet | present the `plan_id` to the user and **stop** |
-| `plan_identity_unavailable` | **CAO** could not complete its own freeze | retry; there is nothing to approve |
+| `plan_identity_unavailable` | CAO could not compute a plan identifier for the working directory | there is nothing to approve; follow `message`, retrying only when it says so, otherwise tell the user |
 
 On `approval_required`, show the user the identifier and the one command that grants it:
 

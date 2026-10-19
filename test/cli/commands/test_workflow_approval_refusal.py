@@ -99,8 +99,8 @@ def test_a_failed_freeze_does_not_offer_an_approval(runner, monkeypatch):
         "no identifier exists to approve; offering the command sends the operator to grant something "
         "that cannot be named"
     )
-    assert "Retry" in result.output or "retry" in result.output
-    assert "CAO-side" in result.output
+    assert "Retry the run" not in result.output
+    assert "The reason above says what to change" in result.output
 
 
 def test_the_resume_verb_reports_a_refusal_the_same_way(runner, monkeypatch):
@@ -201,3 +201,17 @@ def test_both_skill_examples_frame_approval_as_a_user_decision():
         assert "you cannot, and no tool can" not in source
         assert "Approve it with:" not in source
         assert "needs human approval before it can run: an operator approves it with" in source
+
+
+def test_identity_refusal_does_not_invent_retry(runner, monkeypatch):
+    message = "CAO could not compute a plan identifier. Gitignore the large untracked files."
+    payload = {"detail": {"kind": "plan_identity_unavailable", "plan_id": None, "message": message}}
+    response = SimpleNamespace(
+        status_code=503, json=lambda: payload, text=json.dumps(payload), headers={}
+    )
+    monkeypatch.setattr(wf.api_http, "post", lambda *args, **kwargs: response)
+    result = runner.invoke(wf.workflow, ["run", "wf"])
+    assert result.exit_code == 1
+    assert message in result.output
+    assert "Retry" not in result.output
+    assert "The reason above says what to change" in result.output

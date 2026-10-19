@@ -252,8 +252,8 @@ def _refusal_envelope_fields(response: requests.Response) -> Dict[str, Any]:
       authorisation gate is a bypass by repetition. There is deliberately no tool that grants an
       approval.
     * ``class: "plan_identity_unavailable"`` with ``plan_id: None`` -> CAO could not complete its own
-      freeze. Retry. Presenting an approval prompt here would send someone hunting for a plan to grant
-      when nothing about the caller was wrong.
+      freeze. There is nothing to approve. Relay ``message`` to the user. Retry only if ``message``
+      says a retry can help. Never present an approval prompt.
 
     Returns ``{}`` for every other body, INCLUDING a string ``detail`` from an older server -- so the
     envelope simply keeps its previous shape rather than growing a null ``class``.

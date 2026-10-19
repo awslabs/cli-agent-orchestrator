@@ -506,8 +506,10 @@ The refusal causes are deliberately distinct, because the operator's next action
 |---|---|---|
 | `403` | The plan's `plan_id` has no approval. | `cao workflow approve <plan_id>`, then run again. |
 | `409` | `plan_inputs_changed`: while approval enforcement is on, the run's recorded agent profile or memory setting changed, its launch state is unreadable, approval enforcement was turned on after this run started, or approval settings could not be read. This surfaces from an agent step's `POST /terminals/run-step`, not the initial run attempt. | Start a new run for changed inputs, unreadable launch state, or newly enabled enforcement. If approval settings could not be read, repair `settings.json`, then resume. |
-| `503` | No plan identifier could be read from the run's frozen manifest — CAO's own freeze failed. Nothing about your request was wrong. | Retry. No approval will help. |
+| `503` | CAO could not compute a plan identifier: untracked files exceed 64 MiB or contain unsupported entries, Git is unavailable/unreadable/timed out, files changed during the snapshot, profiles are unreadable, the freeze failed, or an older run has no recorded identity. | Follow the message; retry only when it says the cause was transient. No approval will help. |
 | `503` | The approval store could not be read, so CAO cannot determine whether the plan is approved. | Restore database access, then retry. The run remains refused. |
+
+An operator may choose the settings-file [opt-out](#opting-out) as an explicit policy decision. An agent must follow the refusal message and must not disable approval enforcement.
 
 The missing-approval and missing-identity refusal bodies carry the identifier as a **field**, not only in the message
 (issue #583 Bolt 3), so a script or agent branches on it rather than parsing prose:

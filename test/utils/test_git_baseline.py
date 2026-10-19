@@ -8,6 +8,9 @@ than being mistaken for that state.
 import os
 import subprocess
 import threading
+from types import SimpleNamespace
+
+import pytest
 
 from cli_agent_orchestrator.utils import git_baseline
 
@@ -151,8 +154,9 @@ def test_untracked_file_replaced_by_fifo_before_open_returns_unavailable_without
     assert result == [
         {
             "available": False,
+            "reason": "changed_during_snapshot",
             "commit": result[0]["commit"],
-            "worktree_state": {"status": "unavailable"},
+            "worktree_state": {"status": "unavailable", "reason": "changed_during_snapshot"},
         }
     ]
 
@@ -232,8 +236,9 @@ def test_records_an_unavailable_worktree_state_explicitly(monkeypatch, tmp_path)
 
     assert baseline == {
         "available": False,
+        "reason": "git_timeout",
         "commit": baseline["commit"],
-        "worktree_state": {"status": "unavailable"},
+        "worktree_state": {"status": "unavailable", "reason": "git_timeout"},
     }
 
 
@@ -248,7 +253,8 @@ def test_untracked_hash_budget_exhaustion_records_an_unavailable_baseline(tmp_pa
     baseline = git_baseline.derive_baseline(str(tmp_path))
 
     assert baseline["available"] is False
-    assert baseline["worktree_state"] == {"status": "unavailable"}
+    assert baseline["worktree_state"] == {"status": "unavailable", "reason": "untracked_too_large"}
+    assert baseline["reason"] == "untracked_too_large"
 
 
 def test_records_absence_outside_a_repository(tmp_path):
@@ -286,7 +292,10 @@ def test_failed_probe_with_git_marker_is_not_treated_as_plain_directory(monkeypa
         return actual_run(args, *rest, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", _failed_probe)
-    assert git_baseline.derive_baseline(str(tmp_path)) == {"available": False}
+    assert git_baseline.derive_baseline(str(tmp_path)) == {
+        "available": False,
+        "reason": "repository_unreadable",
+    }
 
 
 def test_broken_git_marker_is_not_treated_as_plain_directory(monkeypatch, tmp_path):
@@ -299,7 +308,10 @@ def test_broken_git_marker_is_not_treated_as_plain_directory(monkeypatch, tmp_pa
         ),
     )
 
-    assert git_baseline.derive_baseline(str(tmp_path)) == {"available": False}
+    assert git_baseline.derive_baseline(str(tmp_path)) == {
+        "available": False,
+        "reason": "repository_unreadable",
+    }
 
 
 def test_inherited_git_dir_cannot_redirect_the_selected_root(monkeypatch, tmp_path):
@@ -370,7 +382,10 @@ def test_records_absence_when_git_is_missing(monkeypatch, tmp_path):
         raise FileNotFoundError("git")
 
     monkeypatch.setattr(subprocess, "run", _boom)
-    assert git_baseline.derive_baseline(str(tmp_path)) == {"available": False}
+    assert git_baseline.derive_baseline(str(tmp_path)) == {
+        "available": False,
+        "reason": "git_unavailable",
+    }
 
 
 def test_records_absence_on_timeout(monkeypatch, tmp_path):
@@ -380,12 +395,18 @@ def test_records_absence_on_timeout(monkeypatch, tmp_path):
         raise subprocess.TimeoutExpired(cmd="git", timeout=1)
 
     monkeypatch.setattr(subprocess, "run", _hang)
-    assert git_baseline.derive_baseline(str(tmp_path)) == {"available": False}
+    assert git_baseline.derive_baseline(str(tmp_path)) == {
+        "available": False,
+        "reason": "git_timeout",
+    }
 
 
 def test_records_absence_on_unreadable_directory():
     """A nonexistent cwd surfaces as ``OSError`` from ``subprocess.run``; also an absence."""
-    assert git_baseline.derive_baseline("/nonexistent/path/for/test") == {"available": False}
+    assert git_baseline.derive_baseline("/nonexistent/path/for/test") == {
+        "available": False,
+        "reason": "git_unavailable",
+    }
 
 
 def test_captures_no_branch_and_no_path(tmp_path):
@@ -414,3 +435,92 @@ def test_non_git_roots_and_aliases_have_directory_identity(tmp_path):
     assert [value["root"] for value in results] == [os.path.realpath(path) for path in [a, b, sub]]
     assert len({value["root"] for value in results}) == 3
     assert git_baseline.derive_baseline(str(alias)) == results[0]
+
+
+@pytest.mark.parametrize(
+    "seam,reason",
+    [
+        ("marker", "git_unavailable"),
+        ("missing", "git_unavailable"),
+        ("timeout", "git_timeout"),
+        ("probe", "repository_unreadable"),
+        ("head", "repository_unreadable"),
+        ("diff", "repository_unreadable"),
+        ("untracked", "repository_unreadable"),
+        ("fifo", "untracked_unsupported"),
+        ("flags", "untracked_unsupported"),
+        ("inode", "changed_during_snapshot"),
+        ("hash-error", "changed_during_snapshot"),
+    ],
+)
+def test_unavailable_reason_covers_failure_seams(tmp_path, monkeypatch, seam, reason):
+    _initialise_repository(tmp_path)
+    if seam == "marker":
+        monkeypatch.setattr(git_baseline, "_git_marker_state", lambda cwd: None)
+    elif seam in {"missing", "timeout", "probe", "head", "diff", "untracked"}:
+        real_run = subprocess.run
+
+        def fail(args, **kwargs):
+            matches = (
+                seam in {"missing", "timeout"}
+                or (seam == "probe" and "--is-inside-work-tree" in args)
+                or (seam == "head" and "HEAD" in args and "rev-parse" in args)
+                or (seam == "diff" and "diff" in args)
+                or (seam == "untracked" and "ls-files" in args)
+            )
+            if matches:
+                if seam == "missing":
+                    raise FileNotFoundError("private git executable")
+                if seam == "timeout":
+                    raise subprocess.TimeoutExpired(args, 10)
+                return subprocess.CompletedProcess(args, 1, stdout="", stderr=str(tmp_path))
+            return real_run(args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", fail)
+    else:
+        entry = tmp_path / "entry"
+        if seam == "fifo":
+            os.mkfifo(entry)
+            real_run = subprocess.run
+
+            def listed_entry(args, **kwargs):
+                if "ls-files" in args:
+                    return subprocess.CompletedProcess(args, 0, stdout=b"entry\0", stderr=b"")
+                return real_run(args, **kwargs)
+
+            monkeypatch.setattr(subprocess, "run", listed_entry)
+        else:
+            entry.write_bytes(b"data")
+        if seam == "flags":
+            monkeypatch.setattr(os, "O_NOFOLLOW", None)
+        if seam == "inode":
+            original = os.fstat
+
+            def raced(fd):
+                result = original(fd)
+                return SimpleNamespace(
+                    st_mode=result.st_mode,
+                    st_dev=result.st_dev,
+                    st_ino=result.st_ino + 1,
+                    st_size=result.st_size,
+                )
+
+            monkeypatch.setattr(os, "fstat", raced)
+        if seam == "hash-error":
+
+            def unreadable(fd):
+                raise OSError(str(tmp_path))
+
+            monkeypatch.setattr(os, "fstat", unreadable)
+    result = git_baseline.derive_baseline(str(tmp_path))
+    assert result["available"] is False
+    assert result["reason"] == reason
+    assert result["reason"] in git_baseline.UNAVAILABLE_REASONS
+
+
+def test_empty_git_repository_is_repository_unreadable(tmp_path):
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    assert git_baseline.derive_baseline(str(tmp_path)) == {
+        "available": False,
+        "reason": "repository_unreadable",
+    }

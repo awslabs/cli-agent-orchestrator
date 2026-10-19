@@ -1328,8 +1328,8 @@ async def run_script_workflow(
     # Built ONCE here and handed to the INSERT below unchanged, so the manifest that is CHECKED is
     # byte-identical to the one STORED — and ADR-583-4's one-write discipline is preserved.
     root = os.path.realpath(working_directory if working_directory is not None else os.getcwd())
-    manifest_json = await asyncio.to_thread(
-        manifest_freeze.build_manifest_json,
+    frozen = await asyncio.to_thread(
+        manifest_freeze.freeze_manifest,
         source_hash=spec.content_hash,
         inputs=inputs,
         cwd=root,
@@ -1343,7 +1343,12 @@ async def run_script_workflow(
     #     be logged and the run would continue — the gate would appear to work and would authorise
     #     nothing.
     # No-ops entirely when enforcement is disabled, which is the default.
-    approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)
+    manifest_json = frozen.manifest_json
+    approval_gate.ensure_plan_approved(
+        tier="script",
+        manifest_json=manifest_json,
+        unavailable_reason=frozen.unavailable_reason or "internal",
+    )
     guard = await asyncio.to_thread(launch_guard.capture)
 
     # --- Step 1: register the live record + journal the durable run row ---
@@ -1581,7 +1586,11 @@ async def resume_script_run(
         # ``plan_id`` comes from the manifest ALREADY on the row and is never recomputed: recomputing
         # would re-read the script from disk, so an edit between start and resume would refuse a run
         # whose approval is perfectly valid for what it actually froze.
-        approval_gate.ensure_plan_approved(tier=row.tier, manifest_json=row.manifest_json)
+        approval_gate.ensure_plan_approved(
+            tier=row.tier,
+            manifest_json=row.manifest_json,
+            unavailable_reason="no_recorded_identity",
+        )
 
         # --- The human's recovery decisions (issue #583, FR-7). NOT a gate: admission
         # is over, this resume holds the drive claim, and nothing has been spawned yet.

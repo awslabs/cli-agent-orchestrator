@@ -28,12 +28,32 @@ import logging
 import os
 import stat
 import subprocess
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 logger = logging.getLogger(__name__)
 
 # Bounded so a hung git process cannot delay run start. Generous relative to the work — two local
 # invocations that read refs — because the point is to fail eventually, not quickly.
+UNAVAILABLE_REASONS = frozenset(
+    {
+        "untracked_too_large",
+        "untracked_unsupported",
+        "repository_unreadable",
+        "git_unavailable",
+        "git_timeout",
+        "changed_during_snapshot",
+        "internal",
+        "no_recorded_identity",
+        "profiles_unreadable",
+    }
+)
+
+
+def normalize_unavailable_reason(reason: Optional[str]) -> str:
+    """Keep diagnostics in the closed vocabulary; never echo an unknown reason."""
+    return reason if reason is not None and reason in UNAVAILABLE_REASONS else "internal"
+
+
 _GIT_TIMEOUT_SECONDS = 10
 _HASH_CHUNK_BYTES = 64 * 1024
 _UNTRACKED_HASH_BUDGET_BYTES = 64 * 1024 * 1024  # 64 MiB
@@ -80,17 +100,15 @@ _TRACKED_DIFF_ARGS = [
 
 def _run_git(
     args: list[str], cwd: str, environment: Dict[str, str], *, text: bool = True
-) -> Optional[subprocess.CompletedProcess[Any]]:
-    """Run ``git <args>`` in ``cwd``, returning ``None`` when it could not run or did not succeed.
+) -> Union[subprocess.CompletedProcess[Any], str]:
+    """Run ``git <args>`` in ``cwd``, returning a closed reason when it could not run or did not succeed.
 
     LIST-ARGV, NEVER A SHELL STRING, and no value is interpolated into the arguments — every element is an
     authored literal and the only variable is the working directory. Command injection is closed by
     construction rather than by escaping.
 
-    An ``OSError`` (``git`` absent, ``cwd`` unreadable) and a ``TimeoutExpired`` (hung process) are reported
-    the SAME way a nonzero exit code is: ``None``. The caller has one branch to write, which is what makes
-    this module's "never raises" contract hold rather than being a docstring claim that an exotic
-    environment quietly breaks.
+    Failures return a fixed reason, distinguishing a timeout, launch failure and nonzero exit.
+    No stderr or working-directory value becomes a reason.
     """
     try:
         completed = subprocess.run(
@@ -101,15 +119,12 @@ def _run_git(
             timeout=_GIT_TIMEOUT_SECONDS,
             env=environment,
         )
-    except (OSError, subprocess.TimeoutExpired) as e:
-        # Debug, not warning: a workspace outside git is entirely ordinary and this is not a fault.
-        logger.debug("git_baseline: %s failed (baseline recorded absent): %s", args, e)
-        return None
+    except subprocess.TimeoutExpired:
+        return "git_timeout"
+    except OSError:
+        return "git_unavailable"
     if completed.returncode != 0:
-        logger.debug(
-            "git_baseline: %s exited %d (baseline recorded absent)", args, completed.returncode
-        )
-        return None
+        return "repository_unreadable"
     return completed
 
 
@@ -141,8 +156,9 @@ def _worktree_state(cwd: str, environment: Dict[str, str]) -> Dict[str, str]:
         environment,
         text=False,
     )
-    if tracked is None or untracked is None:
-        return {"status": "unavailable"}
+    if isinstance(tracked, str) or isinstance(untracked, str):
+        reason = tracked if isinstance(tracked, str) else untracked
+        return {"status": "unavailable", "reason": str(reason)}
 
     tracked_bytes = tracked.stdout
     untracked_paths = [path for path in untracked.stdout.split(b"\0") if path]
@@ -162,7 +178,7 @@ def _worktree_state(cwd: str, environment: Dict[str, str]) -> Dict[str, str]:
                     "git_baseline: invalid untracked path (baseline recorded absent): %r",
                     relative_path,
                 )
-                return {"status": "unavailable"}
+                return {"status": "unavailable", "reason": "untracked_unsupported"}
 
             contents_path = os.fsencode(cwd)
             path_components = relative_path.split(b"/")
@@ -175,7 +191,7 @@ def _worktree_state(cwd: str, environment: Dict[str, str]) -> Dict[str, str]:
                             "(baseline recorded absent): %r",
                             relative_path,
                         )
-                        return {"status": "unavailable"}
+                        return {"status": "unavailable", "reason": "untracked_unsupported"}
                     break
 
             digest.update(len(relative_path).to_bytes(8, "big"))
@@ -193,7 +209,7 @@ def _worktree_state(cwd: str, environment: Dict[str, str]) -> Dict[str, str]:
                     "git_baseline: invalid untracked entry (baseline recorded absent): %r",
                     relative_path,
                 )
-                return {"status": "unavailable"}
+                return {"status": "unavailable", "reason": "untracked_unsupported"}
 
             digest.update(b"F")
             nonblocking_flag = getattr(os, "O_NONBLOCK", None)
@@ -204,7 +220,7 @@ def _worktree_state(cwd: str, environment: Dict[str, str]) -> Dict[str, str]:
                     "(baseline recorded absent): %r",
                     relative_path,
                 )
-                return {"status": "unavailable"}
+                return {"status": "unavailable", "reason": "untracked_unsupported"}
 
             descriptor = -1
             try:
@@ -220,7 +236,7 @@ def _worktree_state(cwd: str, environment: Dict[str, str]) -> Dict[str, str]:
                         "(baseline recorded absent): %r",
                         relative_path,
                     )
-                    return {"status": "unavailable"}
+                    return {"status": "unavailable", "reason": "changed_during_snapshot"}
 
                 content_length = opened_stat.st_size
                 if content_length + hashed_untracked_bytes > _UNTRACKED_HASH_BUDGET_BYTES:
@@ -228,7 +244,7 @@ def _worktree_state(cwd: str, environment: Dict[str, str]) -> Dict[str, str]:
                         "git_baseline: untracked hash budget exhausted (baseline recorded absent): %r",
                         relative_path,
                     )
-                    return {"status": "unavailable"}
+                    return {"status": "unavailable", "reason": "untracked_too_large"}
                 hashed_untracked_bytes += content_length
 
                 with os.fdopen(descriptor, "rb") as untracked_file:
@@ -251,10 +267,10 @@ def _worktree_state(cwd: str, environment: Dict[str, str]) -> Dict[str, str]:
                     "(baseline recorded absent): %r",
                     relative_path,
                 )
-                return {"status": "unavailable"}
+                return {"status": "unavailable", "reason": "changed_during_snapshot"}
     except OSError as e:
         logger.debug("git_baseline: untracked entry unavailable (baseline recorded absent): %s", e)
-        return {"status": "unavailable"}
+        return {"status": "unavailable", "reason": "changed_during_snapshot"}
 
     return {"status": "dirty", "digest": f"sha256:{digest.hexdigest()}"}
 
@@ -300,7 +316,7 @@ def derive_baseline(cwd: str) -> Dict[str, Any]:
     environment = _git_environment()
     marker_before = _git_marker_state(cwd)
     if marker_before is None:
-        return {"available": False}
+        return {"available": False, "reason": "git_unavailable"}
     try:
         probe = subprocess.run(
             [
@@ -317,27 +333,37 @@ def derive_baseline(cwd: str) -> Dict[str, Any]:
             timeout=_GIT_TIMEOUT_SECONDS,
             env=environment,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return {"available": False}
+    except subprocess.TimeoutExpired:
+        return {"available": False, "reason": "git_timeout"}
+    except OSError:
+        return {"available": False, "reason": "git_unavailable"}
     if probe.returncode != 0:
         marker_after = _git_marker_state(cwd)
         if marker_before is False and marker_after is False:
             return {"available": True, "repository": False, "root": os.path.realpath(cwd)}
-        return {"available": False}
+        return {
+            "available": False,
+            "reason": "git_unavailable" if marker_after is None else "repository_unreadable",
+        }
     if probe.stdout.strip() != "true":
-        return {"available": False}
+        return {"available": False, "reason": "repository_unreadable"}
 
     head = _run_git(["rev-parse", "HEAD"], cwd, environment)
-    if head is None:
-        return {"available": False}
+    if isinstance(head, str):
+        return {"available": False, "reason": head}
 
     commit = head.stdout.strip()
     if not commit:
-        return {"available": False}
+        return {"available": False, "reason": "repository_unreadable"}
 
     worktree_state = _worktree_state(cwd, environment)
     if worktree_state["status"] == "unavailable":
-        return {"available": False, "commit": commit, "worktree_state": worktree_state}
+        return {
+            "available": False,
+            "reason": worktree_state["reason"],
+            "commit": commit,
+            "worktree_state": worktree_state,
+        }
     return {
         "available": True,
         "commit": commit,

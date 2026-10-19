@@ -387,8 +387,10 @@ async def test_happy_completed_result_shape_and_sentinel(
     manifest_cwds = []
     monkeypatch.setattr(
         script_runner.manifest_freeze,
-        "build_manifest_json",
-        lambda **kwargs: manifest_cwds.append(kwargs["cwd"]) or None,
+        "freeze_manifest",
+        lambda **kwargs: script_runner.manifest_freeze.FrozenManifest(
+            (lambda **kwargs: manifest_cwds.append(kwargs["cwd"]) or None)(**kwargs)
+        ),
     )
     result = await run_script_workflow(
         _FakeScriptSpec(),
@@ -927,7 +929,13 @@ async def test_resume_live_run_raises_not_allowed(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
     # Admission freezing is covered separately; avoid timing this liveness proof
     # against filesystem/profile discovery before the drive starts.
-    monkeypatch.setattr(script_runner.manifest_freeze, "build_manifest_json", lambda **kw: None)
+    monkeypatch.setattr(
+        script_runner.manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: script_runner.manifest_freeze.FrozenManifest(
+            (lambda **kw: None)(**kwargs)
+        ),
+    )
     proc = _FakeProcess(exit_rc=0, hang=True)
     _install_fake_spawn(monkeypatch, proc)
 

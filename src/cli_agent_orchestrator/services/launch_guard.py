@@ -40,7 +40,8 @@ def capture() -> Dict[str, Any]:
     except Exception as exc:
         raise approval_gate.PlanIdentityUnavailableError(
             "Could not read the agent profile set for this script run, so its approval "
-            "cannot be bound."
+            "cannot be bound.",
+            reason="profiles_unreadable",
         ) from exc
 
 

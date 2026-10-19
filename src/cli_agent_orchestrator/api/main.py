@@ -6047,14 +6047,19 @@ async def submit_workflow_run_endpoint(
         # that never happened. The blocking arm in ``script_runner`` gates identically at its Step 0b,
         # because otherwise a run's approvability would depend on which route started it. No-ops
         # entirely when enforcement is disabled through the explicit settings-file opt-out.
-        manifest_json = await asyncio.to_thread(
-            manifest_freeze.build_manifest_json,
+        frozen = await asyncio.to_thread(
+            manifest_freeze.freeze_manifest,
             source_hash=spec.content_hash,
             inputs=resolved,
             cwd=root,
         )
+        manifest_json = frozen.manifest_json
         try:
-            approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)
+            approval_gate.ensure_plan_approved(
+                tier="script",
+                manifest_json=manifest_json,
+                unavailable_reason=frozen.unavailable_reason or "internal",
+            )
             guard = await asyncio.to_thread(launch_guard.capture)
         except approval_gate.PlanIdentityUnavailableError as e:
             # 503, not 403: the freeze above returned None, so CAO could not complete its own work and

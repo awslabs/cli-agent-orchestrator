@@ -244,6 +244,8 @@ def test_the_resume_endpoint_answers_503_when_the_manifest_carries_no_identity()
     detail = response.json()["detail"]
     assert detail["kind"] == "plan_identity_unavailable"
     assert detail["plan_id"] is None, "present-and-null: there is no identifier to approve"
+    assert "Start a new run" in detail["message"]
+    assert "Retry" not in detail["message"]
 
 
 def test_the_two_causes_do_not_share_a_status_on_the_resume_arm():
@@ -327,6 +329,7 @@ def test_both_start_arms_reach_the_same_verdict_on_the_same_inputs():
     Both call sites are checked in source, and the gate's verdict is exercised directly — which is what
     makes "identical" mean something rather than being two separately-drifting copies.
     """
+    import ast
     import inspect
 
     from cli_agent_orchestrator.api import main as api_main
@@ -336,10 +339,25 @@ def test_both_start_arms_reach_the_same_verdict_on_the_same_inputs():
     blocking_arm = inspect.getsource(script_runner)
 
     for source, name in ((async_arm, "api/main.py"), (blocking_arm, "script_runner.py")):
-        assert 'ensure_plan_approved(tier="script", manifest_json=manifest_json)' in source, (
-            f"{name} must gate through the shared ensure_plan_approved with the frozen manifest; "
-            "two inline checks are two chances for one to drift"
-        )
+        calls = [
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "ensure_plan_approved"
+        ]
+        arguments = [{kw.arg: kw.value for kw in call.keywords} for call in calls]
+        assert any(
+            isinstance(args.get("tier"), ast.Constant)
+            and args["tier"].value == "script"
+            and isinstance(args.get("manifest_json"), ast.Name)
+            and args["manifest_json"].id == "manifest_json"
+            and any(
+                isinstance(node, ast.Attribute) and node.attr == "unavailable_reason"
+                for node in ast.walk(args.get("unavailable_reason", ast.Constant(None)))
+            )
+            for args in arguments
+        ), f"{name} must pass the frozen manifest and its reason through the shared gate"
 
     manifest = _manifest()
     with pytest.raises(approval_gate.PlanApprovalRequiredError):
@@ -367,7 +385,11 @@ def test_store_fault_refuses_start_before_writing_a_run(endpoint, monkeypatch):
         content_hash="sha256:abc",
     )
     monkeypatch.setattr(workflow_spec_service, "get_workflow", lambda name: spec)
-    monkeypatch.setattr(manifest_freeze, "build_manifest_json", lambda **kwargs: _manifest())
+    monkeypatch.setattr(
+        manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: manifest_freeze.FrozenManifest((lambda **kwargs: _manifest())(**kwargs)),
+    )
 
     def unreadable_store():
         raise sqlite3.OperationalError("database is locked")
