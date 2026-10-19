@@ -569,6 +569,13 @@ class ConfigService:
             ),
             memory=MemoryConfig(
                 enabled=_get_value("memory.enabled", default=True),
+                explain_enabled=_get_value("memory.explain_enabled", default=True),
+                non_accessing_inspection=_get_value(
+                    "memory.non_accessing_inspection", default=False
+                ),
+                lifecycle=LifecycleConfig(
+                    enabled=_get_value("memory.lifecycle.enabled", default=False)
+                ),
                 lint_enabled=_get_value("memory.lint_enabled", default=True),
                 compile_mode=_get_value("memory.compile_mode", default="llm"),
                 flush_threshold=_get_value("memory.flush_threshold", default=0.85),

@@ -398,3 +398,92 @@ def test_config_set_get_explain_enabled(_isolated_settings, monkeypatch):
     assert ConfigService.list_all()["memory.explain_enabled"] is False
     monkeypatch.setenv("CAO_MEMORY_EXPLAIN_ENABLED", "true")
     assert ConfigService.get("memory.explain_enabled") is True
+
+
+@pytest.mark.parametrize(
+    "saved,env,expected",
+    [
+        ({}, {}, (True, False, False)),
+        (
+            {
+                "explain_enabled": False,
+                "non_accessing_inspection": True,
+                "lifecycle": {"enabled": True},
+            },
+            {},
+            (False, True, True),
+        ),
+        (
+            {
+                "explain_enabled": True,
+                "non_accessing_inspection": False,
+                "lifecycle": {"enabled": True},
+            },
+            {"CAO_MEMORY_EXPLAIN_ENABLED": "false", "CAO_MEMORY_NON_ACCESSING_INSPECTION": "true"},
+            (False, True, True),
+        ),
+        (
+            {
+                "explain_enabled": False,
+                "non_accessing_inspection": True,
+                "lifecycle": {"enabled": True},
+            },
+            {
+                "CAO_MEMORY_EXPLAIN_ENABLED": "true",
+                "CAO_MEMORY_NON_ACCESSING_INSPECTION": "false",
+                "CAO_MEMORY_LIFECYCLE_ENABLED": "false",
+            },
+            (True, False, False),
+        ),
+        (
+            {},
+            {
+                "CAO_MEMORY_EXPLAIN_ENABLED": "false",
+                "CAO_MEMORY_NON_ACCESSING_INSPECTION": "true",
+                "CAO_MEMORY_LIFECYCLE_ENABLED": "true",
+            },
+            (False, True, True),
+        ),
+        (
+            {"lifecycle": {"enabled": False}},
+            {"CAO_MEMORY_LIFECYCLE_ENABLED": "yes"},
+            (True, False, True),
+        ),
+        (
+            {
+                "explain_enabled": False,
+                "non_accessing_inspection": True,
+                "lifecycle": {"enabled": True},
+            },
+            {
+                "CAO_MEMORY_EXPLAIN_ENABLED": "",
+                "CAO_MEMORY_NON_ACCESSING_INSPECTION": "",
+                "CAO_MEMORY_LIFECYCLE_ENABLED": "",
+            },
+            (False, True, True),
+        ),
+        ({"lifecycle": {"enabled": "yes"}}, {}, (True, False, False)),
+    ],
+)
+def test_typed_memory_config_matches_resolved_flags(
+    _isolated_settings, monkeypatch, saved, env, expected
+):
+    _isolated_settings["settings"].write_text(json.dumps({"memory": saved}))
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    memory = ConfigService.get_config().memory
+    actual = (memory.explain_enabled, memory.non_accessing_inspection, memory.lifecycle.enabled)
+    assert actual == expected
+    assert actual == tuple(
+        ConfigService.get(path)
+        for path in (
+            "memory.explain_enabled",
+            "memory.non_accessing_inspection",
+            "memory.lifecycle.enabled",
+        )
+    )
+    assert actual == (
+        settings_service.is_memory_explain_enabled(),
+        settings_service.is_non_accessing_inspection_enabled(),
+        settings_service.is_memory_lifecycle_enabled(),
+    )
