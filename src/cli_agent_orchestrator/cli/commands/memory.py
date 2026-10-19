@@ -484,7 +484,7 @@ def _print_explain_table(diagnostic: dict) -> None:
     click.echo(
         f"Pool: {diagnostic['pool_size']}  Candidates/source: {diagnostic['candidate_limit']}"
     )
-    header = f"{'KEY':<30} {'SCOPE':<10} {'SRC':<8} {'TIER':<10} {'LEX':>6} {'AGE×':>6} {'REL':>6} {'REL#':>5} {'DEF#':>5} {'REC':>5} {'SUP':>5}"
+    header = f"{'KEY':<30} {'SCOPE':<10} {'SRC':<8} {'TIER':<10} {'LEX':>6} {'AGE×':>6} {'REL':>6} {'REL#':>5} {'DEF#':>5} {'REC':>5} {'SUP':>5} {'INJ':>9}"
     click.echo(header)
     click.echo("-" * len(header))
     for row in diagnostic["candidates"]:
@@ -493,7 +493,7 @@ def _print_explain_table(diagnostic: dict) -> None:
         click.echo(
             f"{row['key']:<30} {row['scope']:<10} {row['source_kind']:<8} {row['tier']:<10} "
             f"{row['lexical']:>6.4f} {row['recency_factor']:>6.4f} {row['relevance']:>6.4f} "
-            f"{rel_rank!s:>5} {def_rank!s:>5} {str(row['recovered']):>5} {str(row['superseded']):>5}"
+            f"{rel_rank!s:>5} {def_rank!s:>5} {str(row['recovered']):>5} {str(row['superseded']):>5} {row['injection']:>9}"
         )
 
 

@@ -267,6 +267,34 @@ memory_forget(
 )
 ```
 
+### Injection eligibility sources
+
+The in-tree `services.memory_eligibility` registry provides batch lifecycle
+verdicts keyed by `(key, scope, scope_id, source_kind)`. Each enabled source is
+queried once per new candidate batch; identities are memoized only within the
+current injection build or curator recall. There is no cross-call cache or
+automatic discovery of external sources. C5 ships an empty registry.
+
+Native entries, vault candidates and related targets are checked before their
+caps; vault exclusions happen before body loading. The same check also covers
+curator metadata, BM25, widened pools and related expansion. Candidate verdicts
+are evaluated lazily in chunks, so no exclusions means one primary chunk of
+10 per populated injection scope. Empty scopes require no verdict batch.
+Related targets use a separate bounded batch when needed. The BM25 corpus
+remains unfiltered so exclusions cannot change IDF.
+
+Explicit operator/agent recall never excludes through this seam. Curator
+recall is an injection path: it is recognized by the resolved policy or the
+`memory_manager` requester profile (including distributed calls). Its requester
+is the curator, not the worker it serves. Sources requiring worker identity
+must fail open on `curated_recall` rather than trust task text as identity.
+
+A source exception or invalid reason token fails open only that source's
+batch. Other sources still apply. Warnings report source, purpose and count;
+injection exclusion summaries report scope, count and source names, without
+keys or content. **Eligibility is lifecycle, not confidentiality:** vault
+binding policy and provider redaction retain their separate fail-closed gates.
+
 ### On-demand relevance explain
 
 `cao memory list --query Q --explain` compares default recency recall with
@@ -282,7 +310,10 @@ the fixed recency constants, overlap at the limit, and at most twice the limit
 in candidates: the union of the relevance and default top sets. Candidate
 fields are `key`, `scope`, `scope_id`, `source_kind`, `tier`, `lexical`,
 `recency_factor`, `relevance`, `relevance_rank`, `recency_rank`, `recovered`,
-and `superseded`. Ranks are 1-based; relevance rank covers the entire pool,
+and `superseded`, plus `injection` (`eligible`/`excluded`) and
+`exclusion_reasons` (ordered reason tokens). Top-level `eligibility_errors`
+lists sources that failed open. Injection verdicts describe this lifecycle
+seam only; confidentiality and budget gates still apply. Ranks are 1-based; relevance rank covers the entire pool,
 default rank covers only the default top set. A missing rank is JSON null.
 `recovered` means relevance selected a row the default top set omitted.
 Scores use the exact ordering values, rounded to four decimal places.

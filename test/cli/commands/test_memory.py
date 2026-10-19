@@ -775,6 +775,8 @@ class TestMemoryListExplain:
                         "recency_rank": None,
                         "recovered": True,
                         "superseded": False,
+                        "injection": "eligible",
+                        "exclusion_reasons": [],
                     }
                 ],
             }

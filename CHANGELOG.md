@@ -37,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run-step transport does not yet receive that credential; subprocess credential delivery
   remains a separate security-boundary decision.
 
+- Batch lifecycle eligibility seam for native, vault, related and curator
+  injection paths, with lazy checks before caps and per-source fail-open
+  diagnostics. The registry starts empty; explicit recall remains unfiltered.
+  Part of #861. Refs #867.
+
 - On-demand `cao memory list --query Q --explain` compares default/relevance
   ranks without recording access or exposing memory content, tags or paths.
   Table/JSON output is bounded; `memory.explain_enabled` defaults to true and

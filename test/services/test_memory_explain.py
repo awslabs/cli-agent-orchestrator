@@ -100,6 +100,7 @@ def test_candidate_keys_are_exactly_the_schema(explained):
         "recency_scale_days",
         "overlap_at_limit",
         "candidates",
+        "eligibility_errors",
     }
     expected = {
         "key",
@@ -114,6 +115,8 @@ def test_candidate_keys_are_exactly_the_schema(explained):
         "recency_rank",
         "recovered",
         "superseded",
+        "injection",
+        "exclusion_reasons",
     }
     assert all(set(c) == expected for c in result["candidates"])
     assert len(result["candidates"]) <= 2 * args["limit"]
