@@ -9,7 +9,7 @@ WHY A RATCHET AND NOT A CLEANUP SPRINT
 Main carries 177 pre-existing errors in 22 files. Two options were available:
 
 1. Fix all 177, then make ``mypy src/`` blocking. That is a multi-week cleanup touching
-   ``services/agui/run_plane.py`` (69 errors), ``utils/agent_profiles.py`` (24) and 20 other
+   ``services/agui/run_plane.py`` (69 errors), ``utils/agent_profiles.py`` (20) and 20 other
    modules, and until it lands the gate stays open — which is how the repo got here.
 2. Freeze the current count, block anything that makes it worse, and let it fall.
 

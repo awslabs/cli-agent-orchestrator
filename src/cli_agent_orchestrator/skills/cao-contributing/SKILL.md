@@ -113,7 +113,8 @@ failure states, and the required-status rollout after the workflow lands.
 
 > **mypy is blocking, via a ratchet** (issue #9005). The repo has **known, pre-existing,
 > repo-wide mypy errors** — 177 of them in 22 files when the ratchet landed, concentrated in
-> `services/agui/run_plane.py`, `utils/agent_profiles.py` and `services/status_monitor.py`.
+> `services/agui/run_plane.py`, `utils/agent_profiles.py`, `utils/orchestration.py`,
+> `mcp_server/server.py`, and `services/vault/reader.py`.
 > They are frozen in [`mypy-baseline.json`](../../mypy-baseline.json) per file and per error
 > code, and `scripts/mypy_ratchet.py` fails only when a count **rises**. Therefore:
 > - **Your change must add zero *new* mypy errors.** Check the delta, not the raw count —
