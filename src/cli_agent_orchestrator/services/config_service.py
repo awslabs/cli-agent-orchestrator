@@ -273,8 +273,12 @@ def _load_raw(*, strict: bool = False) -> Dict[str, Any]:
     settings.json is PRESENT but cannot be read or parsed, instead of
     answering ``{}``. Writers must pass it (GH #737): the lenient answer is
     indistinguishable from "no settings yet", so a caller that mutates it and
-    saves publishes an empty file over the user's real one. ``strict`` also
-    suppresses the legacy migration, which is itself a write.
+    saves publishes an empty file over the user's real one. ``strict`` still
+    merges the legacy migration into the returned dict (so a strict writer's
+    own publish carries it forward under the same lock), but does not persist
+    it itself — persisting a partial ``terminal`` object independently of a
+    strict writer's own update would permanently block the migration (GH
+    #737 follow-up).
     """
     global _migration_logged
 
@@ -309,10 +313,12 @@ def _load_raw(*, strict: bool = False) -> Dict[str, Any]:
             logger.warning(f"Failed to read {settings_file}: {e2}")
             unreadable = True
 
-    # Never migrate on top of a file we could not read: the migration writes,
-    # and writing {"terminal": ...} over unknown content is the same data loss
-    # the strict path exists to prevent (GH #737).
-    if not strict and not unreadable and "terminal" not in data and LEGACY_CONFIG_FILE.exists():
+    # Never migrate on top of a file we could not read: the migration writes
+    # (in non-strict mode) or merges into data a strict writer is about to
+    # publish, and either way unknown content must not be silently discarded.
+    # Reached only when the loader did not already raise above, so `data` is
+    # a real parse result (or {}) and `unreadable` is False here.
+    if not unreadable and "terminal" not in data and LEGACY_CONFIG_FILE.exists():
         try:
             legacy = json.loads(LEGACY_CONFIG_FILE.read_text())
         except Exception as e:
@@ -326,7 +332,12 @@ def _load_raw(*, strict: bool = False) -> Dict[str, Any]:
                 terminal_section["herdr_session"] = legacy["herdr_session"]
             if terminal_section:
                 data["terminal"] = terminal_section
-                _save_raw(data)
+                # In strict mode (called from _mutate_raw's compute), the
+                # merged data is persisted by the enclosing writer's own
+                # publish under the same lock — persisting it here too would
+                # be a second, independent write to the same file.
+                if not strict:
+                    _save_raw(data)
                 if not _migration_logged:
                     logger.info(
                         f"Migrated legacy {LEGACY_CONFIG_FILE} into {settings_file} "

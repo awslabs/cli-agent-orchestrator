@@ -502,6 +502,28 @@ class TestSetFailsClosedOverAnUnreadableFile:
         ConfigService.set("logging.level", "INFO")
         assert json.loads(settings.read_text())["logging"]["level"] == "INFO"
 
+    def test_migration_survives_a_strict_write(self, _isolated_settings):
+        """GH #737 follow-up: a strict write (``ConfigService.set``, which
+        calls ``_load_raw(strict=True)``) must not suppress the legacy
+        migration outright. A write that touches only ``terminal.spawn_mode``
+        used to persist a partial ``{"terminal": {"spawn_mode": ...}}``
+        section whose mere presence then permanently blocked the migration,
+        silently resetting backend/herdr_session to defaults forever after.
+        """
+        _isolated_settings["legacy"].write_text(
+            json.dumps({"terminal_backend": "herdr", "herdr_session": "my-sess"})
+        )
+        ConfigService.set("terminal.spawn_mode", "pane")
+
+        on_disk = json.loads(_isolated_settings["settings"].read_text())
+        assert on_disk["terminal"] == {
+            "backend": "herdr",
+            "herdr_session": "my-sess",
+            "spawn_mode": "pane",
+        }
+        assert ConfigService.get("terminal.backend") == "herdr"
+        assert ConfigService.get("terminal.herdr_session") == "my-sess"
+
     def test_legacy_migration_does_not_run_over_an_unreadable_file(self, _isolated_settings):
         """``_load_raw``'s config.json migration is itself a write. Over an
         unreadable settings.json the lenient load saw no ``terminal`` key and
