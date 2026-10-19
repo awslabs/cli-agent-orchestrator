@@ -56,9 +56,7 @@ def stale_terminal_runtime_is_live(terminal: TerminalModel) -> bool:
     session_name = str(terminal.tmux_session)
     window_name = str(terminal.tmux_window)
     try:
-        result = backend.cleanup_terminal_exact(
-            terminal_id, session_name, window_name, close=False
-        )
+        result = backend.cleanup_terminal_exact(terminal_id, session_name, window_name, close=False)
     except Exception as exc:  # noqa: BLE001 — unanswerable liveness fails closed
         logger.warning(
             "Could not establish liveness for stale terminal %s (%s:%s); retaining it: %s",

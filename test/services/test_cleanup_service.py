@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome, TerminalCleanupResult
 from cli_agent_orchestrator.clients.database import (
     Base,
     HandoffResultModel,
@@ -251,8 +252,9 @@ class TestCleanupOldData:
         mock_terminal_log_dir.exists.return_value = False
 
         backend = mock_get_backend.return_value
-        backend.session_exists_strict.return_value = True
-        backend.get_pane_current_command.return_value = "claude"
+        backend.cleanup_terminal_exact.return_value = TerminalCleanupResult(
+            TerminalCleanupOutcome.STILL_PRESENT, "pane carrying the id is present"
+        )
 
         cleanup_old_data()
 
@@ -263,12 +265,14 @@ class TestCleanupOldData:
     @patch("cli_agent_orchestrator.services.cleanup_service.get_backend")
     def test_stale_terminal_runtime_is_live_reports_gone_for_a_dead_session(self, mock_get_backend):
         backend = mock_get_backend.return_value
-        backend.session_exists_strict.return_value = False
+        backend.cleanup_terminal_exact.return_value = TerminalCleanupResult(
+            TerminalCleanupOutcome.ABSENT, "session is gone"
+        )
 
         terminal = MagicMock(id="t", tmux_session="cao-dead", tmux_window="w0")
 
         assert stale_terminal_runtime_is_live(terminal) is False
-        backend.get_pane_current_command.assert_not_called()
+        backend.cleanup_terminal_exact.assert_called_once_with("t", "cao-dead", "w0", close=False)
 
     @patch("cli_agent_orchestrator.services.cleanup_service.get_backend")
     def test_stale_terminal_runtime_is_live_reports_gone_for_a_killed_window(
@@ -276,8 +280,9 @@ class TestCleanupOldData:
     ):
         """Session alive but this terminal's window gone: the row may age out."""
         backend = mock_get_backend.return_value
-        backend.session_exists_strict.return_value = True
-        backend.get_pane_current_command.return_value = None
+        backend.cleanup_terminal_exact.return_value = TerminalCleanupResult(
+            TerminalCleanupOutcome.ABSENT, "no object carries this terminal id"
+        )
 
         terminal = MagicMock(id="t", tmux_session="cao-s", tmux_window="w9")
 
@@ -287,11 +292,50 @@ class TestCleanupOldData:
     def test_stale_terminal_runtime_is_live_fails_closed_when_unanswerable(self, mock_get_backend):
         """A lookup error must never be read as 'the agent is gone'."""
         backend = mock_get_backend.return_value
-        backend.session_exists_strict.side_effect = RuntimeError("tmux server unreachable")
+        backend.cleanup_terminal_exact.side_effect = RuntimeError("tmux server unreachable")
 
         terminal = MagicMock(id="t", tmux_session="cao-s", tmux_window="w0")
 
         assert stale_terminal_runtime_is_live(terminal) is True
+
+    @patch("cli_agent_orchestrator.services.cleanup_service.get_backend")
+    def test_stale_terminal_runtime_is_live_retains_on_unknown_outcome(self, mock_get_backend):
+        """UNKNOWN (ambiguous identity, unreadable listing, ...) must retain, not delete."""
+        backend = mock_get_backend.return_value
+        backend.cleanup_terminal_exact.return_value = TerminalCleanupResult(
+            TerminalCleanupOutcome.UNKNOWN, "could not list tmux sessions"
+        )
+
+        terminal = MagicMock(id="t", tmux_session="cao-s", tmux_window="w0")
+
+        assert stale_terminal_runtime_is_live(terminal) is True
+
+    @patch("cli_agent_orchestrator.services.cleanup_service.get_backend")
+    def test_stale_terminal_runtime_is_live_fails_closed_against_real_tmux_client(
+        self, mock_get_backend
+    ):
+        """Drive the real client's exception-to-UNKNOWN behaviour, not a mock.
+
+        A mock whose pane helper raises directly proves nothing about
+        production: ``TmuxClient.cleanup_terminal_exact`` catches
+        ``TmuxLookupError`` internally and reports ``UNKNOWN`` rather than
+        letting the exception escape (#708 fail-open regression -- the old
+        window-level probe's ``except`` branch was unreachable dead code
+        because ``get_pane_current_command`` swallowed the same error and
+        returned ``None``, which the old gate read as "window gone").
+        """
+        from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
+        from cli_agent_orchestrator.clients.tmux import TmuxClient, TmuxLookupError
+
+        backend = TmuxBackend(client=TmuxClient())
+        mock_get_backend.return_value = backend
+        with patch.object(
+            backend._client,
+            "_sessions_for_identity_scan",
+            side_effect=TmuxLookupError("tmux server unreachable"),
+        ):
+            terminal = MagicMock(id="t", tmux_session="cao-s", tmux_window="w0")
+            assert stale_terminal_runtime_is_live(terminal) is True
 
     @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
     @patch("cli_agent_orchestrator.services.cleanup_service.RETENTION_DAYS", 7)
