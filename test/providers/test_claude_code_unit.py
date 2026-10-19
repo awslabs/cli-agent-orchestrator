@@ -3284,3 +3284,30 @@ class TestClaudeCodeReducedMotionFinishedResponse:
         )
         assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
         assert self._p().get_status("\n".join(screen)) == TerminalStatus.PROCESSING
+
+    @pytest.mark.xfail(
+        reason="Known limitation (GH #9011 follow-up): the gerund anchor narrows "
+        "the match surface but cannot distinguish spinner prose from response "
+        "prose on a single line. A finished response that happens to open with "
+        "a gerund still reads PROCESSING. Needs a 'newer output below this line' "
+        "escape on get_status_from_screen's bottom-25-row scan.",
+        strict=True,
+    )
+    def test_gerund_leading_finished_response_still_misreads_processing(self):
+        screen = self._screen("● Refactoring complete… (3m 12s)")
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+        assert self._p().get_status("\n".join(screen)) == TerminalStatus.COMPLETED
+
+    @pytest.mark.xfail(
+        reason="Known limitation (GH #9011 follow-up): the gerund anchor requires "
+        "a present-participle first word, so a custom non-gerund spinnerVerbs "
+        "entry (e.g. 'Work in progress') falls through and misreads as COMPLETED "
+        "instead of PROCESSING -- the same shape this fix was meant to close. "
+        "Needs a 'newer output below this line' escape on "
+        "get_status_from_screen's bottom-25-row scan, not another regex anchor.",
+        strict=True,
+    )
+    def test_non_gerund_custom_spinner_verb_still_misreads_completed(self):
+        screen = self._screen("● Work in progress… (12s · ↓ 300 tokens)")
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+        assert self._p().get_status("\n".join(screen)) == TerminalStatus.PROCESSING
