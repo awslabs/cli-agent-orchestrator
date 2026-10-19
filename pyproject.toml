@@ -416,7 +416,7 @@ line_length = 100
 #
 #     F401 unused import        165      selected  (165 of them autofixable)
 #     F841 unused local          27      selected  (the #752 class exactly)
-#     F811 redefinition         105      NOT selected -- see below, and see #9003
+#     F811 redefinition         104      NOT selected -- see below, and see #9003
 #     ARG  unused argument     3718      NOT selected
 #     B    flake8-bugbear        609      NOT selected (B904 346, B008 204, B905 23 ...)
 #
@@ -426,7 +426,7 @@ line_length = 100
 # with its own triage, and B904/B008 in particular are worth it.
 #
 # F811 IS NOT MERELY NOISY -- IT IS THE MOST VALUABLE RULE HERE AND IT IS STILL OFF.
-# 105 findings in 18 files. The large majority are a known ruff/pytest interaction: a
+# 104 findings in 15 files. The large majority are a known ruff/pytest interaction: a
 # module does `from conftest import setup_engine` and then writes
 # `def test_x(setup_engine)`, and ruff reads the fixture PARAMETER as a redefinition of
 # the import. Those are false positives.
@@ -440,7 +440,7 @@ line_length = 100
 #   test/providers/test_kiro_cli_unit.py:758/772/792/808 shadowed by :830/844/864/880
 #   test/services/agui/test_edit_sanitization.py:47 shadowed by :67
 #
-# Turning F811 on means (a) suppressing the fixture-parameter pattern in those 18 files
+# Turning F811 on means (a) suppressing the fixture-parameter pattern in those 15 files
 # via per-file-ignores and (b) un-shadowing six tests that have never executed and may
 # well fail. Both belong in a change that can take the failures seriously rather than
 # riding along with a tooling PR. Tracked on #9003.
@@ -492,11 +492,12 @@ addopts = "--cov=src --cov-report=term-missing -m 'not e2e'"
 # reports roughly 24% coverage of the whole package. A `fail_under = 80` here
 # would therefore fail ordinary focused test runs.
 #
-# The default marker expression above also excludes integration tests, while
-# the coverage figure is measured over CI's explicitly selected `-m "not e2e"`
-# suite across `test/` and `examples/workflow/tests/`. The two invocations do
-# not measure the same test population, so a pyproject floor would enforce the
-# CI threshold against a different suite even on a full default local run.
+# The default marker expression above now matches CI's `-m "not e2e"`, but the
+# coverage figure is still measured over CI's `testpaths` -- `test/` AND
+# `examples/workflow/tests/` -- while a local default run only collects
+# `test/` (see `testpaths` above). The two invocations do not measure the
+# same test population, so a pyproject floor would enforce the CI threshold
+# against a different suite even on a full default local run.
 #
 # The floor is enforced instead by `--cov-fail-under=80` on that explicit CI
 # invocation in `.github/workflows/ci.yml`.
