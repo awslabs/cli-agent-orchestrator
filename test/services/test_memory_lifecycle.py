@@ -386,3 +386,29 @@ def test_relevance_demotion_independent_of_flag(lifecycle, monkeypatch, enabled)
         )
     )
     assert [m.key for m in rows] == ["active", "replacement", "blocked"]
+
+
+def test_recall_reuses_snapshot_for_primary_and_related_labels(lifecycle, monkeypatch):
+    service, factory, ctx = lifecycle
+    with factory() as db:
+        db.query(MemoryMetadataModel).filter_by(key="active").update(
+            {"related_keys": "replacement,blocked"}
+        )
+        db.commit()
+    original = service._superseded_keys
+    calls = []
+
+    def lookup(rows):
+        calls.append({row.key for row in rows})
+        return original(rows) if len(calls) == 1 else set()
+
+    monkeypatch.setattr(service, "_superseded_keys", lookup)
+    rows = _run(
+        service.recall(
+            query="active", scope="global", terminal_context=ctx, limit=1, include_related=True
+        )
+    )
+    assert len(calls) == 1
+    assert calls[0] == {"active", "replacement", "blocked"}
+    assert [row.key for row in rows] == ["active", "replacement", "blocked"]
+    assert rows[-1].lifecycle_status == "superseded"

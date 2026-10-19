@@ -246,3 +246,67 @@ def test_negative_normalized_lexical_is_zero(explained, monkeypatch):
     result = _run(service.recall_explain(**args))
     weak = next(c for c in result["candidates"] if c["key"] == "weak-new")
     assert weak["lexical"] == weak["relevance"] == 0.0
+
+
+@pytest.mark.parametrize("lifecycle_enabled", [False, True])
+@pytest.mark.parametrize("initial", [set(), {"strong-old"}])
+@pytest.mark.parametrize("second_read", ["alternating", "failure"])
+def test_explain_uses_one_superseded_snapshot(
+    explained, monkeypatch, initial, second_read, lifecycle_enabled
+):
+    from cli_agent_orchestrator.services.memory_relationship_service import (
+        MemoryRelationshipService,
+    )
+
+    monkeypatch.setenv("CAO_MEMORY_LIFECYCLE_ENABLED", str(lifecycle_enabled).lower())
+    service, args = explained
+    calls = []
+
+    def lookup(self, scope, scope_id, keys):
+        calls.append(set(keys))
+        if len(calls) > 1:
+            if second_read == "failure":
+                raise OSError("transient relationship outage")
+            return {"strong-old"} - initial
+        return initial
+
+    monkeypatch.setattr(MemoryRelationshipService, "superseded_targets", lookup)
+    result = _run(service.recall_explain(**dict(args, limit=2)))
+    assert len(calls) == 1
+    assert calls[0] == {"strong-old", "weak-new"}
+    ordered = sorted(result["candidates"], key=lambda row: row["relevance_rank"])
+    assert [row["superseded"] for row in ordered] == sorted(row["superseded"] for row in ordered)
+    assert {row["key"] for row in ordered if row["superseded"]} == initial
+    assert [row["key"] for row in ordered] == (
+        ["weak-new", "strong-old"] if initial else ["strong-old", "weak-new"]
+    )
+
+
+def test_explain_snapshot_includes_default_only_rows(explained, monkeypatch):
+    from cli_agent_orchestrator.services.memory_relationship_service import (
+        MemoryRelationshipService,
+    )
+
+    service, args = explained
+    original = service._recall_pool
+
+    async def pool(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        if result.effective_sort == "relevance":
+            result.rows = [row for row in result.rows if row.key != "weak-new"]
+        return result
+
+    calls = []
+
+    def lookup(self, scope, scope_id, keys):
+        calls.append(set(keys))
+        return {"weak-new"} if "weak-new" in keys else set()
+
+    monkeypatch.setattr(service, "_recall_pool", pool)
+    monkeypatch.setattr(MemoryRelationshipService, "superseded_targets", lookup)
+    result = _run(service.recall_explain(**args))
+    assert len(calls) == 1
+    assert calls[0] == {"strong-old", "weak-new"}
+    default_only = next(row for row in result["candidates"] if row["key"] == "weak-new")
+    assert default_only["relevance_rank"] is None
+    assert default_only["superseded"] is True

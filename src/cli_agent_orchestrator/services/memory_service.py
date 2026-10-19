@@ -2126,25 +2126,8 @@ class MemoryService:
         """
         return (m.scope, self._effective_scope_id(m), m.key) in superseded
 
-    def _expand_related(
-        self,
-        primaries: list,
-        *,
-        terminal_id: Optional[str] = None,
-        policy: Optional[VaultInjectionPolicy] = None,
-        eligibility: Optional[memory_eligibility.EligibilityCheck] = None,
-    ) -> list:
-        """One-level cross-reference traversal for ``recall(include_related=True)``.
-
-        Appended AFTER the limit slice — the caller asked for related, we
-        deliver in addition. ``visited`` is seeded with primary keys for
-        cycle/dedup prevention. Depth = 1; no recursion. NOT subject to
-        ``RELATED_FANOUT_CAP`` (the per-primary parse cap of 3 suffices).
-        """
-        if not primaries:
-            return primaries
-        visited: set = {m.key for m in primaries}
-        extras: list = []
+    def _related_target_plan(self, primaries: list) -> list[tuple[Memory, list[str]]]:
+        """Resolve typed/legacy targets in batches, without loading their bodies."""
         # One-level expansion follows ACTIVE relates_to edges from the
         # relationship STORE (issue #511, FR-4.2 — the store is authoritative for
         # typed edges: only active relates_to is traversed; proposal/rejected/
@@ -2211,6 +2194,35 @@ class MemoryService:
                 raw = legacy_lookups.get((primary.scope, primary_scope_id), {}).get(primary.key)
                 targets = self._parse_related_keys(raw, scope=primary.scope)
             return targets
+
+        return [(primary, targets_for(primary)) for primary in primaries]
+
+    def _expand_related(
+        self,
+        primaries: list,
+        *,
+        terminal_id: Optional[str] = None,
+        policy: Optional[VaultInjectionPolicy] = None,
+        eligibility: Optional[memory_eligibility.EligibilityCheck] = None,
+        target_plan: Optional[list[tuple[Memory, list[str]]]] = None,
+    ) -> list:
+        """One-level cross-reference traversal for ``recall(include_related=True)``.
+
+        Appended AFTER the limit slice — the caller asked for related, we
+        deliver in addition. ``visited`` is seeded with primary keys for
+        cycle/dedup prevention. Depth = 1; no recursion. NOT subject to
+        ``RELATED_FANOUT_CAP`` (the per-primary parse cap of 3 suffices).
+        """
+        if not primaries:
+            return primaries
+        visited: set = {m.key for m in primaries}
+        extras: list = []
+        if target_plan is None:
+            target_plan = self._related_target_plan(primaries)
+        targets_by_identity = {self._identity(primary): targets for primary, targets in target_plan}
+
+        def targets_for(primary):
+            return targets_by_identity.get(self._identity(primary), [])
 
         related_reasons = {}
         if eligibility is not None:
@@ -2517,6 +2529,24 @@ class MemoryService:
             recall_policy,
             **eligibility_kwargs,
         )
+        superseded_snapshot = None
+        target_plan = None
+        if (
+            lifecycle_on
+            or pool.effective_sort == "relevance"
+            or (pool.effective_sort == "score" and (check is not None or not record_access))
+        ):
+            snapshot_rows = list(pool.rows)
+            if lifecycle_on and include_related:
+                target_plan = self._related_target_plan(pool.rows)
+                snapshot_rows.extend(
+                    primary.model_copy(
+                        update={"key": key, "scope_id": self._effective_scope_id(primary)}
+                    )
+                    for primary, targets in target_plan
+                    for key in targets
+                )
+            superseded_snapshot = self._superseded_keys(snapshot_rows)
         if (
             pool.effective_sort == "relevance"
             or check is not None
@@ -2534,6 +2564,7 @@ class MemoryService:
                 all_term_identities=pool.all_term_identities,
                 now=datetime.now(timezone.utc),
                 lifecycle_on=lifecycle_on,
+                superseded_snapshot=superseded_snapshot,
             )
             return self._finish_recall(
                 ordered,
@@ -2545,6 +2576,8 @@ class MemoryService:
                 **eligibility_kwargs,
                 lifecycle_on=lifecycle_on,
                 record_access=record_access,
+                superseded_snapshot=superseded_snapshot,
+                target_plan=target_plan,
             )
         return self._apply_sort_and_increment(
             pool.rows,
@@ -2605,17 +2638,6 @@ class MemoryService:
             "recency",
             policy,
         )
-        default_rows = self._order_candidates(
-            default_pool.rows,
-            scope,
-            "recency",
-            query=query,
-            terminal_context=terminal_context,
-            scan_all=scan_all,
-            policy=policy,
-            now=now,
-            lifecycle_on=lifecycle_on,
-        )[:limit]
         relevance_pool = await self._recall_pool(
             query,
             scope,
@@ -2627,6 +2649,25 @@ class MemoryService:
             "relevance",
             policy,
         )
+        snapshot_rows = {self._identity(memory): memory for memory in relevance_pool.rows}
+        for memory in default_pool.rows:
+            snapshot_rows.setdefault(self._identity(memory), memory)
+        try:
+            superseded = self._superseded_keys(list(snapshot_rows.values()))
+        except Exception:
+            superseded = set()
+        default_rows = self._order_candidates(
+            default_pool.rows,
+            scope,
+            "recency",
+            query=query,
+            terminal_context=terminal_context,
+            scan_all=scan_all,
+            policy=policy,
+            now=now,
+            lifecycle_on=lifecycle_on,
+            superseded_snapshot=superseded,
+        )[:limit]
         scores: dict[tuple, RelevanceScore] = {}
         relevance_rows = self._order_candidates(
             relevance_pool.rows,
@@ -2640,6 +2681,7 @@ class MemoryService:
             lifecycle_on=lifecycle_on,
             all_term_identities=relevance_pool.all_term_identities,
             relevance_scores=scores,
+            superseded_snapshot=superseded,
         )
         relevance_ranks = {self._identity(m): i for i, m in enumerate(relevance_rows, 1)}
         default_ranks = {self._identity(m): i for i, m in enumerate(default_rows, 1)}
@@ -2647,15 +2689,12 @@ class MemoryService:
         union = {self._identity(m): m for m in relevance_rows[:limit]}
         for memory in default_rows:
             union.setdefault(self._identity(memory), memory)
-        try:
-            superseded = self._superseded_keys(list(union.values()))
-        except Exception:
-            superseded = set()
         check = memory_eligibility.begin_check(
             memory_eligibility.EligibilityRequest.from_context("injected_context", terminal_context)
         )
         verdicts: dict[tuple, tuple[str, ...]] = {}
         if check is not None:
+            check.use_superseded_snapshot(superseded)
             verdicts = {
                 tuple(identity): reasons
                 for identity, reasons in check.reasons(
@@ -2936,6 +2975,7 @@ class MemoryService:
         now: Optional[datetime] = None,
         relevance_scores: Optional[dict[tuple, RelevanceScore]] = None,
         lifecycle_on: bool = False,
+        superseded_snapshot: Optional[set] = None,
     ) -> list:
         """Order candidates only; never increment access or expand related rows."""
         from cli_agent_orchestrator.services.memory_scoring import (
@@ -3016,7 +3056,11 @@ class MemoryService:
                 # unchanged. NULL confidence is NOT used here (never treated as
                 # zero — NFR-2.3); this demotion is purely lifecycle-based.
                 try:
-                    superseded = self._superseded_keys(results)
+                    superseded = (
+                        superseded_snapshot
+                        if superseded_snapshot is not None
+                        else self._superseded_keys(results)
+                    )
                     if superseded:
                         # Full (scope, scope_id, key) identity — see
                         # _superseded_keys. A (scope, key) comparison would
@@ -3031,7 +3075,11 @@ class MemoryService:
 
         if lifecycle_on:
             if sort_by == "recency":
-                superseded = self._superseded_keys(results)
+                superseded = (
+                    superseded_snapshot
+                    if superseded_snapshot is not None
+                    else self._superseded_keys(results)
+                )
                 results.sort(key=lambda m: 1 if self._is_superseded(m, superseded) else 0)
             for memory in results:
                 memory.lifecycle_status = (
@@ -3110,11 +3158,15 @@ class MemoryService:
         eligibility: Optional[memory_eligibility.EligibilityCheck] = None,
         lifecycle_on: bool = False,
         record_access: bool = True,
+        superseded_snapshot: Optional[set] = None,
+        target_plan: Optional[list[tuple[Memory, list[str]]]] = None,
     ) -> list:
         """Slice, bump only returned primaries, and optionally append related rows."""
         eligibility_kwargs: dict[str, Any] = (
             {"eligibility": eligibility} if eligibility is not None else {}
         )
+        if target_plan is not None:
+            eligibility_kwargs["target_plan"] = target_plan
         sliced = results[:limit]
 
         if record_access:
@@ -3145,7 +3197,7 @@ class MemoryService:
         if lifecycle_on:
             extras = [memory for memory in sliced if memory.is_related]
             if extras:
-                superseded = self._superseded_keys(extras)
+                superseded = superseded_snapshot if superseded_snapshot is not None else set()
                 for memory in extras:
                     memory.lifecycle_status = (
                         "superseded" if self._is_superseded(memory, superseded) else None

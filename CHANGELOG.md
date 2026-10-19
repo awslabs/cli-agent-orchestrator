@@ -174,6 +174,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Memory explain and lifecycle recall use one supersedes snapshot for
+  ordering and status labels, including related targets and default-only
+  diagnostic rows, so concurrent graph changes cannot contradict ranks.
+  Part of #861.
+
 - Corrective workflow re-prompts now reuse the attempt's rendered prompt, so
   workflow inputs and earlier step outputs stay filled in when structured output
   is missing or invalid (#966).

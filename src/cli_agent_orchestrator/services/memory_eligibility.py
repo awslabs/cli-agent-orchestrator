@@ -98,6 +98,13 @@ class EligibilityCheck:
         self._memo: dict[MemoryIdentity, tuple[str, ...]] = {}
         self._origins: dict[MemoryIdentity, set[str]] = {}
 
+    def use_superseded_snapshot(self, snapshot: set) -> None:
+        """Use a call-local supersedes snapshot for diagnostic verdicts, not a fresh read."""
+        self._sources = tuple(
+            _SnapshotSupersedesSource(snapshot) if type(source) is SupersedesSource else source
+            for source in self._sources
+        )
+
     def reasons(
         self, candidates: Sequence[MemoryIdentity]
     ) -> dict[MemoryIdentity, tuple[str, ...]]:
@@ -212,6 +219,22 @@ class SupersedesSource:
                 {identity: "superseded" for identity in members if identity.key in targets}
             )
         return result
+
+
+class _SnapshotSupersedesSource(SupersedesSource):
+    """A per-check immutable view of an already resolved graph snapshot."""
+
+    def __init__(self, snapshot: set):
+        self._snapshot = frozenset(snapshot)
+
+    def excluded(
+        self, request: EligibilityRequest, candidates: Sequence[MemoryIdentity]
+    ) -> Mapping[MemoryIdentity, str]:
+        return {
+            identity: "superseded"
+            for identity in candidates
+            if (identity.scope, identity.scope_id, identity.key) in self._snapshot
+        }
 
 
 register_source(SupersedesSource())

@@ -358,6 +358,11 @@ seam only; confidentiality and budget gates still apply. Ranks are 1-based; rele
 default rank covers only the default top set. A missing rank is JSON null.
 `recovered` means relevance selected a row the default top set omitted.
 Scores use the exact ordering values, rounded to four decimal places.
+Explain resolves supersedes state once over both pools and uses that same
+snapshot for ordering, labels and the built-in injection verdict. Lifecycle
+recall similarly shares one ordering/label snapshot, including potential
+related targets discovered before ordering; their bodies still load only
+after the primary slice. These snapshots never survive the call.
 Relevance clamps negative normalized BM25 values to zero; the existing
 normalizer and frozen `score` behavior remain unchanged.
 A default-only row outside the relevance pool has no relevance rank and has
