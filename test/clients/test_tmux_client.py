@@ -7,10 +7,13 @@ which is deliberately NOT mocked — see its module docstring for why.
 import os
 import shutil
 import subprocess
+import time
 import uuid
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+
+from cli_agent_orchestrator.constants import TMUX_HISTORY_LIMIT
 
 
 @pytest.fixture
@@ -173,13 +176,17 @@ class TestCreateSession:
         tmux.server.cmd.side_effect = [
             MagicMock(returncode=1, stdout=[], stderr=["server exited unexpectedly"]),
             MagicMock(returncode=0, stdout=[], stderr=[]),
+            MagicMock(returncode=0, stdout=[], stderr=[]),  # history-limit (#728)
         ]
 
         with patch("cli_agent_orchestrator.clients.tmux.time.sleep") as mock_sleep:
             tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
 
         exit_empty = call("start-server", ";", "set-option", "-s", "exit-empty", "off")
-        assert tmux.server.cmd.call_args_list == [exit_empty, exit_empty]
+        history_limit = call(
+            "start-server", ";", "set-option", "-g", "history-limit", str(TMUX_HISTORY_LIMIT)
+        )
+        assert tmux.server.cmd.call_args_list == [exit_empty, exit_empty, history_limit]
         mock_sleep.assert_called_once_with(tmux._EXIT_EMPTY_RETRY_DELAY_S)
         assert "exit-empty" not in caplog.text
 
@@ -1426,6 +1433,144 @@ class TestRealTmuxExitEmpty:
         finally:
             subprocess.run(["tmux", "-S", socket_path, "kill-server"], capture_output=True)
             shutil.rmtree(socket_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
+class TestRealTmuxHistoryLimit:
+    """A CAO pane must keep enough scrollback to hold a worker's whole reply (#728).
+
+    Real tmux, isolated socket, same tier and lifecycle discipline as
+    ``TestRealTmuxExitEmpty`` above — and for the same reason: the bug being
+    guarded is a tmux-behaviour bug (the default 2000-line scrollback is
+    shallower than the extraction ladder reaches), which no mock-call
+    assertion can observe.
+    """
+
+    def _require_tmux(self) -> None:
+        if not shutil.which("tmux"):
+            pytest.skip("tmux not installed")
+
+    def test_first_pane_of_a_new_session_keeps_the_configured_scrollback(self, tmp_path):
+        """The session's FIRST window is an agent terminal, and a pane reads
+        history-limit only at creation time. Pre-fix this reads tmux's default
+        2000 — shallower than ``_ESCALATION_STEPS[-1]`` (5000), so the deepest
+        extraction rung could not reach further than the middle rungs and a
+        long reply was silently lost from scrollback (#728).
+        """
+        self._require_tmux()
+
+        import libtmux
+
+        from cli_agent_orchestrator.clients.tmux import TmuxClient
+        from cli_agent_orchestrator.constants import TMUX_HISTORY_LIMIT
+
+        socket_name = f"cao-test-history-limit-{uuid.uuid4().hex[:12]}"
+        subprocess.run(["tmux", "-L", socket_name, "kill-server"], capture_output=True)
+
+        client = TmuxClient()
+        client.server = libtmux.Server(socket_name=socket_name)
+
+        try:
+            client.create_session("history-probe", "win1", "term-hist-1", str(tmp_path))
+
+            # Read the PANE's effective limit via a bare tmux call, not through
+            # libtmux/TmuxClient: the assertion must not share a code path with
+            # the thing under test.
+            result = subprocess.run(
+                [
+                    "tmux",
+                    "-L",
+                    socket_name,
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "history-probe:win1",
+                    "#{history_limit}",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 0, f"tmux display-message failed: {result.stderr}"
+            assert int(result.stdout.strip()) == TMUX_HISTORY_LIMIT, (
+                "the first pane of a CAO session must keep CAO's configured "
+                f"scrollback, not tmux's 2000-line default; got {result.stdout.strip()!r}"
+            )
+
+            # And a window added later to the same session, which is how every
+            # assign/handoff worker terminal is created.
+            client.create_window("history-probe", "win2", "term-hist-2", str(tmp_path))
+            later = subprocess.run(
+                [
+                    "tmux",
+                    "-L",
+                    socket_name,
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "history-probe:win2",
+                    "#{history_limit}",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            assert later.returncode == 0, f"tmux display-message failed: {later.stderr}"
+            assert int(later.stdout.strip()) == TMUX_HISTORY_LIMIT, (
+                "a worker window created after the session must inherit the same "
+                f"scrollback depth; got {later.stdout.strip()!r}"
+            )
+        finally:
+            subprocess.run(["tmux", "-L", socket_name, "kill-server"], capture_output=True)
+
+    def test_deep_capture_rungs_actually_reach_deeper_than_shallow_ones(self, tmp_path):
+        """The ladder must be monotonic on real tmux: with the default 2000-line
+        limit, ``-S -5000`` and ``-S -`` both return ~2004 lines on a pane that
+        printed 3000 (measured, tmux 3.2a) and the earliest ~1000 lines are
+        gone. With CAO's limit in force the deepest rung sees all of them.
+        """
+        self._require_tmux()
+
+        import libtmux
+
+        from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+        socket_name = f"cao-test-history-depth-{uuid.uuid4().hex[:12]}"
+        subprocess.run(["tmux", "-L", socket_name, "kill-server"], capture_output=True)
+
+        client = TmuxClient()
+        client.server = libtmux.Server(socket_name=socket_name)
+
+        try:
+            client.create_session("depth-probe", "win1", "term-hist-3", str(tmp_path))
+            client.send_keys(
+                "depth-probe",
+                "win1",
+                'for i in $(seq 1 3000); do echo "cao-line-$i"; done',
+            )
+
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                out = client.get_history(
+                    "depth-probe", "win1", strip_escapes=True, visible_only=True
+                )
+                if "cao-line-3000" in out:
+                    break
+                time.sleep(0.5)
+            else:
+                pytest.fail("the probe pane never finished printing 3000 lines")
+
+            deep = client.get_history("depth-probe", "win1", strip_escapes=True, full_history=True)
+            shallow = client.get_history("depth-probe", "win1", strip_escapes=True, tail_lines=1000)
+
+            assert deep.count("\n") > shallow.count("\n"), (
+                "the full_history rung must read deeper than a 1000-line tail, "
+                "not get clamped to the same scrollback cap (#728)"
+            )
+            assert "cao-line-1" in deep, (
+                "the earliest line must still be in scrollback: with tmux's "
+                "2000-line default it has already been discarded (#728)"
+            )
+        finally:
+            subprocess.run(["tmux", "-L", socket_name, "kill-server"], capture_output=True)
 
 
 class TestKillRefusesForeignSessions:

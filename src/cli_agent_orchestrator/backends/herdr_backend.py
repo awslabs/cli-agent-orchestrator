@@ -26,7 +26,10 @@ from cli_agent_orchestrator.backends.base import (
     TerminalCleanupResult,
     TerminalNotFoundError,
 )
-from cli_agent_orchestrator.constants import BRACKETED_PASTE_INCOMPATIBLE_SHELLS
+from cli_agent_orchestrator.constants import (
+    BRACKETED_PASTE_INCOMPATIBLE_SHELLS,
+    TMUX_HISTORY_LIMIT,
+)
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 logger = logging.getLogger(__name__)
@@ -739,7 +742,15 @@ class HerdrBackend(TerminalBackend):
             # get_status() before that fallback is reached.
             args.extend(["--source", "recent", "--lines", "50"])
         elif full_history:
-            pass  # no flags — returns full scrollback
+            # Ask for a depth explicitly. A flagless `pane read` was assumed to
+            # mean "full scrollback", but it was measured returning roughly a
+            # screenful: on the get_output escalation ladder the flagless
+            # full_history rung returned 80 lines immediately after the
+            # 5000-line rung returned 604, so the deepest rung lost content the
+            # shallower ones had already read (#728). Request the configured
+            # scrollback depth instead, so this rung is at least as deep as
+            # every rung before it.
+            args.extend(["--source", "recent", "--lines", str(TMUX_HISTORY_LIMIT)])
         elif tail_lines:
             args.extend(["--source", "recent", "--lines", str(tail_lines)])
         else:

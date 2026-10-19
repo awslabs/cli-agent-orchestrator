@@ -529,6 +529,40 @@ class TestHerdrBackendCommands:
         assert "--format" not in cmd
 
     @patch("subprocess.run")
+    def test_get_history_full_history_requests_an_explicit_depth(self, mock_run, backend):
+        """full_history must ask for a depth, not rely on a flagless read (#728).
+
+        A flagless ``pane read`` was assumed to return the whole scrollback, but
+        it was measured returning roughly a screenful: on get_output's
+        escalation ladder this rung returned 80 lines right after the 5000-line
+        rung returned 604, so the deepest rung lost content shallower rungs had
+        already read.
+        """
+        from cli_agent_orchestrator.constants import TMUX_HISTORY_LIMIT
+
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(stdout="deep scrollback"),  # pane read
+        ]
+
+        backend.get_history("cao-test", "window-0", full_history=True)
+
+        cmd = mock_run.call_args_list[-1][0][0]
+        assert "--lines" in cmd, "the deepest rung must name a line count"
+        requested = int(cmd[cmd.index("--lines") + 1])
+        assert requested == TMUX_HISTORY_LIMIT
+        assert requested > 5000, (
+            "full_history must reach at least as deep as get_output's deepest "
+            "tail rung (_ESCALATION_STEPS[-1] == 5000)"
+        )
+
+    @patch("subprocess.run")
     def test_get_pane_working_directory(self, mock_run, backend):
         """get_pane_working_directory should parse cwd from pane get."""
         ws = [{"label": "cao-test", "workspace_id": "w1"}]

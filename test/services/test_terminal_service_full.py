@@ -2920,6 +2920,58 @@ class TestGetOutput:
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_output_last_keeps_the_deepest_capture_when_the_ladder_is_not_monotonic(
+        self, mock_get_metadata, mock_tmux, mock_status_monitor, mock_provider_manager
+    ):
+        """A deeper rung that reads SHALLOWER than an earlier one must not shrink
+        what the supervisor receives (#728).
+
+        Reported on the herdr backend: the flagless ``full_history`` rung
+        returned 80 lines right after the 5000-line rung returned 604. Counting
+        the final read's lines then reports "sparse buffer -> the agent produced
+        no text response" for a worker that actually produced thousands of
+        lines, and the supervisor re-delegates the whole task.
+        """
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_status_monitor.get_buffer.return_value = "buffered output"
+
+        deep_tail = "\n".join(f"worker line {i}" for i in range(4800))
+
+        def history_side_effect(*args, **kwargs):
+            if kwargs.get("full_history"):
+                # The clamped last rung: roughly a screenful.
+                return "\n".join(f"tail line {i}" for i in range(80))
+            if kwargs.get("tail_lines") == 5000:
+                return deep_tail
+            return "short capture"
+
+        mock_tmux.get_history.side_effect = history_side_effect
+        mock_provider = MagicMock(
+            spec=[
+                "extract_last_message_from_script",
+                "extraction_retries",
+            ]
+        )  # no extraction_tail_lines attribute → escalation path
+        mock_provider.extract_last_message_from_script.side_effect = ValueError("no marker")
+        mock_provider_manager.get_provider.return_value = mock_provider
+
+        result = get_output("test1234", OutputMode.LAST)
+
+        # Classified from the deepest capture (4800 lines >= 4500), not from the
+        # 80 lines the final rung returned.
+        assert result.startswith("[PARTIAL RESPONSE")
+        assert "buffer overflow likely" in result
+        assert "4800 lines retrieved" in result
+        # And the content handed back is the deepest capture, not the shallowest.
+        assert "worker line 4799" in result
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_output_last_full_history_fallback_finds_marker(
         self, mock_get_metadata, mock_tmux, mock_status_monitor, mock_provider_manager
     ):

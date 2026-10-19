@@ -69,6 +69,21 @@ DEFAULT_PROVIDER = ProviderType.KIRO_CLI.value
 # Higher values provide more context but increase memory usage
 TMUX_HISTORY_LINES = 200
 
+# Scrollback depth CAO asks its own tmux server to keep per pane.
+#
+# tmux's default is 2000 lines, which is SHALLOWER than the deepest rung of
+# ``get_output``'s extraction escalation (5000 lines, see
+# ``terminal_service._ESCALATION_STEPS``). On a default server the top rungs are
+# dead weight -- ``capture-pane -S -5000`` and ``-S -`` both return the same
+# ~2000 lines -- and a long worker reply plus the redraw burst a TUI emits at the
+# end of a turn can push the response marker out of scrollback entirely. The
+# supervisor then receives a truncated reply, or none (#728).
+#
+# 50000 matches the repo's own recommended ``.tmux.conf`` and leaves the whole
+# ladder, including the overflow threshold, reachable. Cost is bounded: tmux
+# allocates scrollback lazily, per pane, as output arrives.
+TMUX_HISTORY_LIMIT = 50000
+
 # Foreground commands to treat as bracketed-paste INCOMPATIBLE.
 # (\x1b[200~...\x1b[201~). send_keys(force_bracketed_paste=True) checks the
 # pane's live #{pane_current_command} against this set before wrapping, so a

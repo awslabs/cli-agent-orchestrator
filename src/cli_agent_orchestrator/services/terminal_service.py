@@ -4268,12 +4268,29 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             # the response marker is found or we hit the cap.
             last_err = None
             full_output = ""
+            # Deepest capture seen across every rung, by line count. The ladder
+            # is NOT guaranteed monotonic: a backend's deepest rung can return
+            # LESS than a shallower one (reported on herdr, where the flagless
+            # full_history read returned 80 lines right after the 5000-line
+            # rung returned 604 — #728). The raw fallback below must publish
+            # the most content any rung managed to read, not whatever the last
+            # rung happened to return.
+            best_output = ""
+            best_lines = 0
+
+            def _remember(candidate: str) -> None:
+                nonlocal best_output, best_lines
+                lines = candidate.count("\n") + 1 if candidate else 0
+                if lines > best_lines:
+                    best_output, best_lines = candidate, lines
+
             for step_lines in _ESCALATION_STEPS:
                 full_output = get_backend().get_history(
                     metadata["tmux_session"],
                     metadata["tmux_window"],
                     tail_lines=step_lines,
                 )
+                _remember(full_output)
                 try:
                     result = provider.extract_last_message_from_script(full_output)
                     if step_lines > _ESCALATION_STEPS[0]:
@@ -4305,6 +4322,7 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                 metadata["tmux_window"],
                 full_history=True,
             )
+            _remember(full_output)
             try:
                 result = provider.extract_last_message_from_script(full_output)
                 logger.debug("get_output: %s marker found in full_history", terminal_id)
@@ -4329,7 +4347,15 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             # response marker was likely produced but pushed past the scrollback
             # limit (overflow).  If the buffer is mostly empty, the agent never
             # produced a text response (e.g. only tool calls, crash, or timeout).
-            actual_lines = full_output.count("\n") + 1
+            # Measured against the DEEPEST capture any rung achieved, not
+            # against whatever the final rung returned: on a backend whose last
+            # rung reads shallower than an earlier one, counting the final
+            # read's lines reports "sparse buffer -> the agent produced no text
+            # response" for a worker that in fact produced thousands of lines
+            # (#728). A supervisor reads that label as a worker failure and
+            # re-delegates the whole task.
+            full_output = best_output
+            actual_lines = best_lines
             overflow_threshold = int(_ESCALATION_STEPS[-1] * 0.9)
             if actual_lines >= overflow_threshold:
                 logger.warning(

@@ -25,6 +25,7 @@ from cli_agent_orchestrator.backends.base import (
 from cli_agent_orchestrator.constants import (
     BRACKETED_PASTE_INCOMPATIBLE_SHELLS,
     SESSION_PREFIX,
+    TMUX_HISTORY_LIMIT,
     TMUX_HISTORY_LINES,
 )
 from cli_agent_orchestrator.utils import fifo_writer
@@ -639,6 +640,49 @@ class TmuxClient:
                 "; ".join(result.stderr) or f"tmux exited {result.returncode}",
             )
 
+    def _set_server_history_limit(self) -> None:
+        """Give CAO's panes a scrollback deep enough to hold a worker's reply.
+
+        tmux keeps 2000 scrollback lines per pane by default -- shallower than
+        the deepest rung of ``get_output``'s extraction escalation (5000 lines).
+        Measured on tmux 3.2a against a pane that had printed 3000 lines:
+        ``-S -1000`` returned 1023 lines, while BOTH ``-S -5000`` and ``-S -``
+        returned 2004, and the first ~1000 lines were simply gone. So on a
+        default server the top of the ladder cannot reach further than the
+        middle of it, and a long reply plus the full-screen redraw burst a TUI
+        emits at the end of a turn can push the response marker out of
+        scrollback -- the supervisor then gets a truncated reply or nothing,
+        and the worker's pane is torn down right after (#728).
+
+        Set as a GLOBAL session option, before ``new_session``: a pane reads
+        ``history-limit`` when it is created and never re-reads it, so setting
+        it on the Session object afterwards (as ``mouse`` is set) would leave
+        the session's own first pane -- which IS an agent terminal -- at 2000.
+        Setting it globally also covers every window ``create_window`` adds to
+        the session later.
+
+        Same ``start-server ; set-option`` single-invocation idiom as
+        :meth:`_set_server_exit_empty_off`, and for the same reason: on a clean
+        socket a bare ``set-option`` finds no server and lands nowhere. Kept as
+        a separate invocation from that one so neither option's failure can
+        swallow the other's. Best-effort: a shallower scrollback degrades
+        extraction, it does not prevent a launch.
+        """
+        try:
+            result = self.server.cmd(
+                "start-server", ";", "set-option", "-g", "history-limit", str(TMUX_HISTORY_LIMIT)
+            )
+        except Exception:
+            logger.warning("failed to set tmux option 'history-limit'", exc_info=True)
+            return
+
+        if result.returncode != 0:
+            logger.warning(
+                "failed to set tmux option 'history-limit %d': %s",
+                TMUX_HISTORY_LIMIT,
+                "; ".join(result.stderr) or f"tmux exited {result.returncode}",
+            )
+
     # ── libtmux listing boundary ─────────────────────────────────────────
     #
     # Every read that makes libtmux shell out to `list-sessions` /
@@ -1089,6 +1133,9 @@ class TmuxClient:
             # mass teardown (harness-control#845). Runs before new_session, and
             # starts the server if it isn't up yet.
             self._set_server_exit_empty_off()
+            # Deepen scrollback BEFORE new_session: the session's first pane
+            # reads history-limit at creation and never re-reads it (#728).
+            self._set_server_history_limit()
 
             working_directory = self._resolve_and_validate_working_directory(working_directory)
 
