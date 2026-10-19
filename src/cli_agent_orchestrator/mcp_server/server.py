@@ -1654,7 +1654,7 @@ async def create_ephemeral_agent(
         Any, WithJsonSchema({"anyOf": [{"type": "string"}, {"type": "null"}]})
     ] = None,
 ) -> Dict[str, Any]:
-    """Create and store a bounded agent profile; these names cannot launch yet.
+    """Create and store a bounded agent profile for its creator to launch once.
 
     The CAO-recorded tool list is bounded by the creator's effective list.
     This is not an OS privilege boundary or a per-tool MCP restriction.

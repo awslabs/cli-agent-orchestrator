@@ -589,15 +589,95 @@ def _remote_ephemeral_refusal(name: str, target_host: Optional[str]) -> Optional
     return None
 
 
-def _refuse_ephemeral_target_without_claim(name: str) -> None:
-    """Refuse reserved targets while orchestration does not carry launch claims."""
+class EphemeralClaim(NamedTuple):
+    """Recorded launch authority, or an existing terminal returned by a keyed retry."""
+
+    provider: str
+    effective_tools: list[str]
+    claim_id: Optional[str] = None
+    terminal_id: Optional[str] = None
+
+
+class _ClaimRefused(ValueError):
+    """Carry only the policy relay's public rule and message to the handler."""
+
+    def __init__(self, rule: str, message: str):
+        super().__init__(message)
+        self.rule = rule
+
+
+def _local_claim_refusal(rule: str, detail: str = "") -> _ClaimRefused:
+    from cli_agent_orchestrator.services.ephemeral_service import log_refusal
+
+    log_refusal(rule, os.environ.get("CAO_TERMINAL_ID"), None, detail)
+    return _ClaimRefused(rule, f"ephemeral policy: {rule}" + (f" {detail}" if detail else ""))
+
+
+def _claim_ephemeral(
+    name: str, model: Optional[str], idempotency_key: Optional[str] = None
+) -> Optional[EphemeralClaim]:
+    """Claim reserved names before resolution; installed targets keep their old path."""
     from cli_agent_orchestrator.utils import agent_profiles
 
-    if agent_profiles.routes_to_ephemeral_store(name):
-        agent_profiles.resolve_agent_profile_source(name)
-        raise ValueError(
-            "Ephemeral targets cannot be launched through assign or handoff in this version."
+    if not agent_profiles.routes_to_ephemeral_store(name):
+        return None
+    if model is not None:
+        raise _local_claim_refusal("model_override_not_allowed", "set model_tier in the spec")
+    caller_id = _current_terminal_id()
+    if not caller_id:
+        raise _local_claim_refusal("not_owner")
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/ephemeral-agents/{name}/claim",
+            params={"caller_id": caller_id},
+            json={"idempotency_key": idempotency_key} if idempotency_key is not None else {},
+            headers=_auth_headers() or None,
+            timeout=_mcp_timeout(),
         )
+        data = response.json()
+        if response.status_code != 200:
+            error = data.get("detail") if isinstance(data, dict) else None
+            if isinstance(error, dict):
+                raise _ClaimRefused(
+                    error.get("rule", "unexpected_failure"),
+                    error.get("message", "ephemeral policy: unexpected_failure"),
+                )
+            raise ValueError()
+        if data.get("replayed") is True:
+            terminal_id = data["terminal_id"]
+            # The replay response deliberately contains only the terminal id.
+            # Recover its recorded launch settings, never resolve the profile again.
+            response = requests.get(
+                f"{API_BASE_URL}/terminals/{terminal_id}",
+                headers=_auth_headers() or None,
+                timeout=_mcp_timeout(),
+            )
+            response.raise_for_status()
+            metadata = response.json()
+            return EphemeralClaim(
+                metadata["provider"], metadata["allowed_tools"], terminal_id=terminal_id
+            )
+        return EphemeralClaim(data["provider"], data["effective_tools"], data["claim_id"])
+    except _ClaimRefused:
+        raise
+    except requests.exceptions.JSONDecodeError:
+        raise _local_claim_refusal("unexpected_failure") from None
+    except requests.HTTPError:
+        raise _local_claim_refusal("unexpected_failure") from None
+    except requests.RequestException:
+        raise _local_claim_refusal(
+            "creator_unresolved", "cao-server could not be reached"
+        ) from None
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise _local_claim_refusal("unexpected_failure") from None
+
+
+def _require_claim(name: str, claim: Optional[EphemeralClaim]) -> None:
+    """Low-level helpers never launch a reserved target without a claim."""
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    if claim is None and agent_profiles.routes_to_ephemeral_store(name):
+        raise ValueError("Ephemeral targets cannot be launched without a claim.")
 
 
 def _create_terminal(
@@ -611,6 +691,7 @@ def _create_terminal(
     use_worktree: bool = False,
     create_timeout: Optional[float] = None,
     idempotency_key: Optional[str] = None,
+    claim: Optional[EphemeralClaim] = None,
     description: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
@@ -618,6 +699,8 @@ def _create_terminal(
     Args:
         agent_profile: Agent profile for the terminal
         working_directory: Optional working directory for the terminal
+        claim: Optional ephemeral launch claim for binding the child terminal
+        description: Optional description persisted on the child terminal
         idempotency_key: Review on PR #634, issue #616. Forwarded as a query
             param to whichever endpoint this call hits (existing-session or
             new-session); the server returns the terminal a PRIOR call with
@@ -668,7 +751,10 @@ def _create_terminal(
     Raises:
         Exception: If terminal creation fails
     """
-    _refuse_ephemeral_target_without_claim(agent_profile)
+    _require_claim(agent_profile, claim)
+
+    if claim is not None and claim.terminal_id is not None:
+        return claim.terminal_id, claim.provider
 
     provider = DEFAULT_PROVIDER
     parent_allowed_tools = None
@@ -686,7 +772,11 @@ def _create_terminal(
         terminal_metadata = response.json()
 
         # Treat the supervisor provider as a fallback, not an explicit override.
-        provider = resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
+        provider = (
+            claim.provider
+            if claim is not None
+            else resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
+        )
         session_name = terminal_metadata["session_name"]
         parent_allowed_tools = terminal_metadata.get("allowed_tools")
 
@@ -712,13 +802,19 @@ def _create_terminal(
                 )
 
         # Resolve child's allowed_tools via inheritance
-        child_allowed_tools = _resolve_child_allowed_tools(parent_allowed_tools, agent_profile)
+        child_allowed_tools = (
+            ",".join(claim.effective_tools)
+            if claim is not None
+            else _resolve_child_allowed_tools(parent_allowed_tools, agent_profile)
+        )
 
         # Create new terminal in existing session - always pass working_directory
         params = {"provider": provider, "agent_profile": agent_profile}
         # Record the creating terminal so send_message can route callbacks
         # structurally instead of parsing IDs out of message text (issue #284).
         params["caller_id"] = current_terminal_id
+        if claim is not None and claim.claim_id is not None:
+            params["claim_id"] = claim.claim_id
         if working_directory:
             params["working_directory"] = working_directory
         if child_allowed_tools:
@@ -753,6 +849,13 @@ def _create_terminal(
             headers=_auth_headers() or None,
             timeout=create_timeout if create_timeout is not None else _mcp_timeout(),
         )
+        if claim is not None and response.status_code >= 400:
+            kind, message, _, rule = _parse_run_step_error(response)
+            if kind == "ephemeral_policy":
+                raise _ClaimRefused(rule or "unexpected_failure", message)
+            raise _ClaimRefused(
+                "unexpected_failure", f"ephemeral launch failed ({response.status_code})"
+            )
         response.raise_for_status()
         terminal = response.json()
     else:
@@ -912,9 +1015,12 @@ class HandoffContext(NamedTuple):
     session_name: Optional[str]
     caller_id: Optional[str]
     allowed_tools: Optional[list]
+    claim_id: Optional[str] = None
 
 
-def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
+def _resolve_handoff_provider(
+    agent_profile: str, claim: Optional[EphemeralClaim] = None
+) -> HandoffContext:
     """Resolve the handoff context for a worker WITHOUT creating a terminal.
 
     Mirrors the resolution branch of the former ``_create_terminal``: a worker
@@ -928,7 +1034,7 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
     the single combined run-step call, while preserving the same-session /
     caller_id / allowed_tools behavior the old six-call path had.
     """
-    _refuse_ephemeral_target_without_claim(agent_profile)
+    _require_claim(agent_profile, claim)
 
     current_terminal_id = _current_terminal_id()
     if not current_terminal_id:
@@ -947,6 +1053,14 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
     response.raise_for_status()
     terminal_metadata = response.json()
 
+    if claim is not None:
+        return HandoffContext(
+            claim.provider,
+            terminal_metadata["session_name"],
+            current_terminal_id,
+            claim.effective_tools,
+            claim.claim_id,
+        )
     provider = resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
     # Resolve the child's allowed-tools via the same inheritance the old path
     # used; _resolve_child_allowed_tools returns a comma-separated string (or
@@ -976,8 +1090,8 @@ def _terminal_id_from_detail(detail: str) -> Optional[str]:
 
 def _parse_run_step_error(
     response: requests.Response,
-) -> tuple[Optional[str], str, Optional[str]]:
-    """Parse a run-step error response into ``(kind, message, terminal_id)``.
+) -> tuple[Optional[str], str, Optional[str], Optional[str]]:
+    """Parse a run-step error into ``(kind, message, terminal_id, policy_rule)``.
 
     The run-step endpoint returns a STRUCTURED detail object
     ``{"message", "kind", "terminal_id"}`` so callers read the failure kind and
@@ -989,16 +1103,18 @@ def _parse_run_step_error(
         payload = response.json()
     except ValueError:
         fallback = f"status {response.status_code}"
-        return None, fallback, None
+        return None, fallback, None, None
 
-    detail = payload.get("detail")
+    detail = payload.get("detail") if isinstance(payload, dict) else None
     if isinstance(detail, dict):
         message = detail.get("message") or f"status {response.status_code}"
-        return detail.get("kind"), message, detail.get("terminal_id")
+        kind = detail.get("kind")
+        rule = detail.get("rule", "unexpected_failure") if kind == "ephemeral_policy" else None
+        return kind, message, detail.get("terminal_id"), rule
     if isinstance(detail, str) and detail:
-        return None, detail, _terminal_id_from_detail(detail)
+        return None, detail, _terminal_id_from_detail(detail), None
     fallback = f"status {response.status_code}"
-    return None, fallback, None
+    return None, fallback, None, None
 
 
 def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
@@ -1218,13 +1334,25 @@ async def _run_step_and_build_result(
         # run-step endpoint returns a STRUCTURED detail object
         # ({message, kind, terminal_id}) so we read terminal_id and the
         # failure kind as fields rather than scraping the message.
-        kind, structured_detail, tid = _parse_run_step_error(response)
+        kind, structured_detail, tid, rule = _parse_run_step_error(response)
         # worker RAN LONG (timeout) vs CRASHED (terminal reached ERROR) must
         # be reported distinctly so a 5s crash is not mislabeled as an
         # N-second timeout. The structured `kind` is authoritative; the
         # status code is only the fallback when an older server omits it
         # (504 -> timeout, 502 -> error).
-        if kind == "error" or (kind is None and response.status_code == 502):
+        if kind == "ephemeral_policy":
+            msg = structured_detail
+        # Generic text is only for failures before any worker is known; a launched
+        # worker's timeout, error or extraction failure keeps its handoff result.
+        elif (
+            payload.get("claim_id") is not None
+            and kind not in ("error", "timeout")
+            and response.status_code not in (502, 504)
+            and tid is None
+        ):
+            msg = f"ephemeral launch failed ({response.status_code})"
+            rule = "unexpected_failure"
+        elif kind == "error" or (kind is None and response.status_code == 502):
             msg = f"Handoff failed: worker errored ({structured_detail})"
         elif kind == "timeout" or (kind is None and response.status_code == 504):
             msg = f"Handoff timed out after {timeout} seconds"
@@ -1246,7 +1374,9 @@ async def _run_step_and_build_result(
                     f"on {target_host}; DELETE {base_url}/terminals/{resolved_tid} "
                     f"(or delete_terminal('{resolved_tid}', target_host='{target_host}'))."
                 )
-        return HandoffResult(success=False, message=msg, output=None, terminal_id=resolved_tid)
+        return HandoffResult(
+            success=False, message=msg, rule=rule, output=None, terminal_id=resolved_tid
+        )
 
     data = response.json()
     terminal_id = data.get("terminal_id", known_terminal_id)
@@ -1422,7 +1552,13 @@ async def _handoff_impl(
             terminal_id=None,
         )
 
+    claim: Optional[EphemeralClaim] = None
     try:
+        claim = _claim_ephemeral(
+            agent_profile,
+            model,
+            idempotency_key if on_terminal_id is not None or not wait else None,
+        )
         if target_host:
             # Remote placement: the worker runs on target_host's node in a
             # fresh session there. The supervisor's session/caller_id/allowed
@@ -1441,7 +1577,11 @@ async def _handoff_impl(
             # codex fast-fail (which needs CAO_TERMINAL_ID) can run before any
             # terminal exists, on every path below.
             base_url = API_BASE_URL
-            ctx = _resolve_handoff_provider(agent_profile)
+            ctx = (
+                _resolve_handoff_provider(agent_profile, claim=claim)
+                if claim is not None
+                else _resolve_handoff_provider(agent_profile)
+            )
         provider = ctx.provider
 
         # Fail fast for codex: its handoff banner requires CAO_TERMINAL_ID. We
@@ -1489,7 +1629,9 @@ async def _handoff_impl(
                 payload["session_name"] = ctx.session_name
             if ctx.caller_id:
                 payload["caller_id"] = ctx.caller_id
-            if ctx.allowed_tools:
+            if ctx.claim_id is not None:
+                payload["claim_id"] = ctx.claim_id
+            if ctx.allowed_tools or ctx.claim_id is not None:
                 payload["allowed_tools"] = ctx.allowed_tools
             if working_directory:
                 payload["working_directory"] = working_directory
@@ -1519,6 +1661,7 @@ async def _handoff_impl(
         # GET); reassigning ``provider`` to its return value uses whatever it
         # actually persisted on the terminal as the source of truth for the
         # reuse call below, rather than assuming the two resolutions agree.
+        claim_kwargs: Dict[str, Any] = {"claim": claim} if claim is not None else {}
         terminal_id, provider = _create_terminal(
             agent_profile,
             working_directory,
@@ -1528,6 +1671,7 @@ async def _handoff_impl(
             create_timeout=_HANDOFF_CREATE_TIMEOUT_S,
             idempotency_key=idempotency_key,
             description=description,
+            **claim_kwargs,
         )
         if on_terminal_id is not None:
             try:
@@ -1605,7 +1749,29 @@ async def _handoff_impl(
                 )
         return result
 
+    except _ClaimRefused as exc:
+        return HandoffResult(
+            success=False,
+            rule=exc.rule,
+            message=str(exc),
+            terminal_id=terminal_id,
+            output=None,
+            job_id=None,
+            pending=None,
+        )
+
     except Exception as e:
+        if claim is not None and terminal_id is None:
+            logger.warning("ephemeral launch failed after claim: %s", type(e).__name__)
+            return HandoffResult(
+                success=False,
+                rule="unexpected_failure",
+                message="ephemeral launch failed",
+                output=None,
+                terminal_id=None,
+                job_id=None,
+                pending=None,
+            )
         # Surface terminal_id when known. With the single-call design the server
         # owns the terminal lifecycle, so on a client-side failure (e.g. the
         # provider resolution) there is usually no terminal to surface.
@@ -1805,6 +1971,7 @@ def _assign_impl(
         return {"success": False, "terminal_id": None, "message": refusal}
 
     terminal_id: Optional[str] = None
+    claim: Optional[EphemeralClaim] = None
     try:
         # Fail fast before creating the worker terminal when CAO_TERMINAL_ID is
         # unset — REGARDLESS of the sender-ID-injection flag. The deferred-init
@@ -1814,6 +1981,7 @@ def _assign_impl(
         # which cannot honor defer_init/initial_message — assign would create a
         # worker, never deliver the task, and still return success. Guarding
         # here also avoids leaving an orphan window behind (issue #284).
+        claim = _claim_ephemeral(agent_profile, model)
         current_terminal_id = _current_terminal_id()
         if not current_terminal_id:
             return {
@@ -1861,6 +2029,7 @@ def _assign_impl(
         # provider.initialize() and initial-message delivery run as a
         # background task on the server. The call typically returns
         # in under 2 seconds regardless of how long init takes.
+        claim_kwargs: Dict[str, Any] = {"claim": claim} if claim is not None else {}
         terminal_id, _ = _create_terminal(
             agent_profile,
             working_directory,
@@ -1871,6 +2040,7 @@ def _assign_impl(
             initial_message_orchestration_type=OrchestrationType.ASSIGN,
             model=model,
             use_worktree=use_worktree,
+            **claim_kwargs,
         )
 
         return {
@@ -1885,7 +2055,18 @@ def _assign_impl(
             ),
         }
 
+    except _ClaimRefused as exc:
+        return {"success": False, "terminal_id": terminal_id, "rule": exc.rule, "message": str(exc)}
+
     except Exception as e:
+        if claim is not None and terminal_id is None:
+            logger.warning("ephemeral launch failed after claim: %s", type(e).__name__)
+            return {
+                "success": False,
+                "terminal_id": None,
+                "rule": "unexpected_failure",
+                "message": "ephemeral launch failed",
+            }
         # Surface the terminal_id when creation succeeded before the failure
         # (e.g. the send POST failed) so the orphaned terminal can be
         # inspected or deleted — matching the ready-timeout path above.
