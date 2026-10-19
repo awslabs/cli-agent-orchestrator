@@ -11,8 +11,12 @@ Scanning only for the state *clients* is not enough. A tool that instantiates a
 state *service* -- which opens those clients on its behalf -- passes a
 clients-only check while reaching the database anyway (issue #744:
 ``MemoryService()`` inside ``store_lesson``). So the scan also rejects the
-service modules that open a state client themselves; see
-``FORBIDDEN_STATE_SERVICES`` and the two pinned allowlists below.
+service modules that open a state client themselves. ``FORBIDDEN_STATE_SERVICES``
+is derived by AST-scanning every module under ``services/`` for a direct
+``clients.tmux``/``clients.database`` import, rather than hand-picked, so a
+tool that reaches for a state service ``mcp_server/`` has never imported
+before is still caught; see ``_derive_forbidden_state_services`` and the two
+pinned allowlists below.
 
 Depth is deliberately ONE hop. ``services.settings_service`` imports
 ``services.vault.config``, which imports ``clients.database``, so a transitive
@@ -37,17 +41,19 @@ FORBIDDEN_MODULES = (
     "cli_agent_orchestrator.clients.database",
 )
 
-# Service modules that import a state client directly (module scope or inside a
-# function body), and so give an ``mcp_server`` caller a non-HTTP path to the
-# database. Every entry below was confirmed by grepping the service for
-# ``clients.tmux`` / ``clients.database``; the reason records what it opens.
-#
-# This list is scoped to the services ``mcp_server/`` imports today plus the
-# ones it is most likely to reach for next. 25 modules under ``services/``
-# touch a state client; listing all 25 would pin modules the boundary has no
-# relationship with and would churn on every unrelated rename. Add an entry
-# here when an ``mcp_server`` module starts importing another state service.
-FORBIDDEN_STATE_SERVICES: Dict[str, str] = {
+# Bare suffixes used to also catch relative or partially-qualified imports such
+# as ``from ..clients import tmux`` or ``import clients.database``.
+FORBIDDEN_SUFFIXES = ("clients.tmux", "clients.database")
+
+# Name used for imports that sit at module scope rather than inside a function.
+MODULE_SCOPE = "<module>"
+
+# Prose reasons for the four state services ``mcp_server/`` actually imports
+# today. Kept as documentation only -- ``FORBIDDEN_STATE_SERVICES`` below is
+# derived by scanning, so a service that starts getting imported by
+# ``mcp_server/`` is caught even without an entry here; add one anyway when
+# that happens, to keep the failure message specific.
+_KNOWN_STATE_SERVICE_REASONS: Dict[str, str] = {
     # Writes memory metadata rows and wiki files: SessionLocal,
     # MemoryMetadataModel, record_project_alias (memory_service.py:299, :391,
     # :433, :493, :1150).
@@ -71,13 +77,6 @@ FORBIDDEN_STATE_SERVICES: Dict[str, str] = {
         "imports clients.database models at module scope (vault/reader.py:15-21)"
     ),
 }
-
-# Bare suffixes used to also catch relative or partially-qualified imports such
-# as ``from ..clients import tmux`` or ``import clients.database``.
-FORBIDDEN_SUFFIXES = ("clients.tmux", "clients.database")
-
-# Name used for imports that sit at module scope rather than inside a function.
-MODULE_SCOPE = "<module>"
 
 # --------------------------------------------------------------------------
 # Pinned exceptions.
@@ -180,6 +179,7 @@ ALLOWLIST: Dict[Tuple[str, str, str], str] = {**DUAL_MODE_ALLOWLIST, **KNOWN_GAP
 
 _PACKAGE_ROOT = Path(cli_agent_orchestrator.__file__).parent
 _MCP_SERVER_DIR = _PACKAGE_ROOT / "mcp_server"
+_SERVICES_DIR = _PACKAGE_ROOT / "services"
 
 _FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
 
@@ -188,6 +188,19 @@ def _mcp_server_modules() -> List[Path]:
     """Return every Python module under the mcp_server package."""
 
     return sorted(_MCP_SERVER_DIR.rglob("*.py"))
+
+
+def _service_modules() -> List[Path]:
+    """Return every Python module under the services package."""
+
+    return sorted(_SERVICES_DIR.rglob("*.py"))
+
+
+def _module_name(path: Path) -> str:
+    """Dotted module name for a path under the package root."""
+
+    rel = path.relative_to(_PACKAGE_ROOT).with_suffix("")
+    return "cli_agent_orchestrator." + ".".join(rel.parts)
 
 
 def _scoped_imports(tree: ast.AST, scope: str = MODULE_SCOPE) -> Iterator[Tuple[str, int, str]]:
@@ -223,6 +236,50 @@ def _scoped_imports(tree: ast.AST, scope: str = MODULE_SCOPE) -> Iterator[Tuple[
                 yield scope, node.lineno, (f"{base}.{alias.name}" if base else alias.name)
             continue
         yield from _scoped_imports(node, scope)
+
+
+def _imports_state_client_directly(target: str) -> bool:
+    """True if an import target names clients.tmux/clients.database itself.
+
+    Used only to derive ``FORBIDDEN_STATE_SERVICES`` below -- deliberately
+    checks against ``FORBIDDEN_MODULES``/``FORBIDDEN_SUFFIXES`` only, not the
+    (not-yet-built) state-service set, so the derivation stays one hop deep:
+    a service is forbidden because it names a client itself, not because it
+    imports another forbidden service.
+    """
+
+    for module in FORBIDDEN_MODULES:
+        if target == module or target.startswith(f"{module}."):
+            return True
+    for suffix in FORBIDDEN_SUFFIXES:
+        if target == suffix or target.endswith(f".{suffix}"):
+            return True
+    return False
+
+
+def _derive_forbidden_state_services() -> Dict[str, str]:
+    """AST-scan services/ for every module that opens a state client itself.
+
+    An mcp_server module importing one of these has the same non-HTTP path to
+    the database as importing the client directly (the gap #744 found in
+    ``store_lesson``). Scanning finds every such service, not just the ones
+    mcp_server/ happens to import today, so the next tool that reaches for
+    one of the other 21 is caught without editing this file.
+    """
+
+    derived: Dict[str, str] = {}
+    for module_path in _service_modules():
+        name = _module_name(module_path)
+        source = module_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(module_path))
+        if any(_imports_state_client_directly(target) for _, _, target in _scoped_imports(tree)):
+            derived[name] = _KNOWN_STATE_SERVICE_REASONS.get(
+                name, "opens clients.tmux/clients.database directly"
+            )
+    return derived
+
+
+FORBIDDEN_STATE_SERVICES: Dict[str, str] = _derive_forbidden_state_services()
 
 
 def _all_forbidden() -> Tuple[str, ...]:
@@ -363,3 +420,25 @@ def test_every_forbidden_state_service_has_a_reason() -> None:
         name for name, reason in FORBIDDEN_STATE_SERVICES.items() if not reason.strip()
     )
     assert not missing, f"FORBIDDEN_STATE_SERVICES entries without a reason: {missing}"
+
+
+def test_forbidden_state_services_cover_services_not_imported_by_mcp_server() -> None:
+    """The forbidden set must be derived, not limited to today's four imports.
+
+    A hand-picked list scoped to what mcp_server/ already imports cannot catch
+    the *next* tool reaching for an unrelated state service -- e.g.
+    ``session_service``, which opens ``clients.database`` at module scope but
+    nothing under mcp_server/ imports it today. This fails against a
+    hardcoded four-entry map and passes only because the set is derived by
+    scanning services/.
+    """
+
+    bypass_candidates = (
+        "cli_agent_orchestrator.services.session_service",
+        "cli_agent_orchestrator.services.terminal_service",
+        "cli_agent_orchestrator.services.inbox_service",
+        "cli_agent_orchestrator.services.approval_store",
+    )
+    missing = [name for name in bypass_candidates if name not in FORBIDDEN_STATE_SERVICES]
+    assert not missing, f"derived FORBIDDEN_STATE_SERVICES is missing: {missing}"
+    assert len(FORBIDDEN_STATE_SERVICES) == 25
