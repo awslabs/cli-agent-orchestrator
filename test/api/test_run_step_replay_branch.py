@@ -57,6 +57,7 @@ from one run would change the verdict of the next.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
 import json
@@ -987,6 +988,10 @@ class TestTheScriptTierGuard:
         response = observed["response"]
         assert response.status_code == 409, response.text
         assert response.json()["detail"]["kind"] == "plan_inputs_changed"
+        assert str(cao_workflow.ShimHTTPError(response.status_code, response.text)) == (
+            "run-step returned HTTP 409 (plan_inputs_changed): "
+            + response.json()["detail"]["message"]
+        )
         assert "profile 'developer' changed" in response.json()["detail"]["message"].lower()
         assert _raw_row(run_id, "s1") is None
         create_terminal.assert_not_awaited()
@@ -1068,6 +1073,10 @@ class TestTheScriptTierGuard:
 
         assert response.status_code == 409, response.text
         assert response.json()["detail"]["kind"] == "plan_inputs_changed"
+        assert str(cao_workflow.ShimHTTPError(response.status_code, response.text)) == (
+            "run-step returned HTTP 409 (plan_inputs_changed): "
+            + response.json()["detail"]["message"]
+        )
         assert message in response.json()["detail"]["message"]
         assert _raw_row(run_id) is None
         m_create.assert_not_awaited()
@@ -1115,6 +1124,10 @@ class TestTheScriptTierGuard:
 
         assert response.status_code == 409, response.text
         assert response.json()["detail"]["kind"] == "plan_inputs_changed"
+        assert str(cao_workflow.ShimHTTPError(response.status_code, response.text)) == (
+            "run-step returned HTTP 409 (plan_inputs_changed): "
+            + response.json()["detail"]["message"]
+        )
         assert _raw_row(run_id) is None
         m_create.assert_not_awaited()
         assert record_job.await_args_list[-1].args[:2] == (job_id, "error")
@@ -1637,3 +1650,24 @@ class TestAReplayedStepIsVisibleInTheRunResult:
         assert resp.json()["replayed"] is False  # no gate at all for this tier
         m_run.assert_awaited_once()
         assert run_id not in workflow_service.run_registry
+
+
+def test_preterminal_drift_and_ephemeral_handlers_precede_value_error():
+    from cli_agent_orchestrator.api import main as api_main
+
+    tree = ast.parse(inspect.getsource(api_main.run_step))
+    ladders = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Try)
+        and any(h.type and ast.unparse(h.type) == "PlanInputsChangedError" for h in n.handlers)
+    ]
+    assert len(ladders) == 1
+    handlers = ladders[0].handlers
+    names = [ast.unparse(h.type) if h.type else "" for h in handlers]
+    assert names.index("PlanInputsChangedError") < names.index("ValueError")
+    assert names.index("EphemeralPolicyError") < names.index("ValueError")
+    drift = handlers[names.index("PlanInputsChangedError")]
+    assert not any(
+        isinstance(n, ast.Call) and ast.unparse(n.func) == "_settle_step" for n in ast.walk(drift)
+    )

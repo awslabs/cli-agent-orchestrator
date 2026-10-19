@@ -49,11 +49,6 @@ from cli_agent_orchestrator.utils.workflow_events import SseFrame, parse_sse_fra
 _TERMINAL_RUN_STATES = frozenset({"completed", "failed", "cancelled"})
 
 
-def _auth_headers() -> dict[str, str]:
-    """Return the configured bearer header for the CLI-to-API hop, if any."""
-    return api_http.auth_headers_for(API_BASE_URL)
-
-
 def _authentication_failure_detail(
     response: api_http.Response,
     auth_headers: dict[str, str] | None,
@@ -284,6 +279,15 @@ def _authoring_failure(
     raise AssertionError("unreachable")
 
 
+def _auth_not_configured(
+    exc: api_http.AuthNotConfiguredError, as_json: bool
+) -> "click.ClickException":
+    """Report an authentication refusal without labelling the server unreachable."""
+    if as_json:
+        _emit_json_failure({"ok": False, "class": "auth_not_configured", "message": str(exc)})
+    return click.ClickException(str(exc))
+
+
 def _unreachable(exc: Exception, as_json: bool) -> "click.ClickException":
     """A transport failure is not a refusal, and must not read like one.
 
@@ -353,13 +357,15 @@ def create_cmd(name, from_file, as_json):
     except (OSError, ValueError) as e:
         raise click.ClickException(f"could not read {from_file}: {e}")
 
-    auth_headers = _auth_headers() or None
+    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
     try:
         response = api_http.post(
             f"{API_BASE_URL}/workflows",
             json={"name": name, "source": source},
             timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise _unreachable(e, as_json)
 
@@ -414,13 +420,15 @@ def update_cmd(name, from_file, expected_hash, as_json):
     except (OSError, ValueError) as e:
         raise click.ClickException(f"could not read {from_file}: {e}")
 
-    auth_headers = _auth_headers() or None
+    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
     try:
         response = api_http.put(
             f"{API_BASE_URL}/workflows/{quoted_name}",
             json={"source": source, "expected_hash": expected_hash},
             timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise _unreachable(e, as_json)
 
@@ -447,13 +455,15 @@ def validate_cmd(file, as_json):
       0  spec is valid (pass or pass_reserved)
       1  spec failed validation, or the request errored
     """
-    auth_headers = _auth_headers() or None
+    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
     try:
         response = api_http.post(
             f"{API_BASE_URL}/workflows/validate",
             json={"path": file},
             timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise _unreachable(e, as_json)
 
@@ -501,6 +511,8 @@ def list_cmd(scan_dir, as_json):
             params=params,
             timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -537,12 +549,14 @@ def list_cmd(scan_dir, as_json):
 def get_cmd(name, as_json):
     """Show the parsed and validated spec for an indexed workflow name."""
     quoted_name = _quoted_workflow_name(name, as_json)
-    auth_headers = _auth_headers() or None
+    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
     try:
         response = api_http.get(
             f"{API_BASE_URL}/workflows/{quoted_name}",
             timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -611,7 +625,7 @@ def approve_cmd(plan_id, as_json):
       0  the plan is approved (whether this call approved it or found it already approved)
       1  the request was rejected or the server could not be reached
     """
-    auth_headers = _auth_headers() or None
+    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
     try:
         response = api_http.post(
             f"{API_BASE_URL}/workflows/plans/approve",
@@ -620,6 +634,8 @@ def approve_cmd(plan_id, as_json):
             json={"plan_id": plan_id},
             timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -654,12 +670,14 @@ def delete_cmd(name, yes, as_json):
     quoted_name = _quoted_workflow_name(name, as_json)
     if not yes:
         click.confirm(f"Delete workflow '{name}'?", abort=True)
-    auth_headers = _auth_headers() or None
+    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
     try:
         response = api_http.delete(
             f"{API_BASE_URL}/workflows/{quoted_name}",
             timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -874,6 +892,8 @@ def _poll_to_terminal(run_id, as_json):
                 f"{API_BASE_URL}/workflows/runs/{run_id}",
                 timeout=MCP_REQUEST_TIMEOUT,
             )
+        except api_http.AuthNotConfiguredError as exc:
+            raise _auth_not_configured(exc, as_json)
         except api_http.exceptions.RequestException as e:
             transport_failures += 1
             if transport_failures > 1:
@@ -964,7 +984,7 @@ def run_cmd(name_or_path, inputs, run_id, working_directory, detach, wait, as_js
     }
     if run_id is not None:
         payload["run_id"] = run_id
-    auth_headers = _auth_headers() or None
+    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
 
     # --- --wait: the retained blocking path (VR-2, FR-4.5). ------------------
     # ``--wait`` blocks on the server inline until the whole workflow finishes, so
@@ -977,6 +997,8 @@ def run_cmd(name_or_path, inputs, run_id, working_directory, detach, wait, as_js
                 json=payload,
                 timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
             )
+        except api_http.AuthNotConfiguredError as exc:
+            raise _auth_not_configured(exc, as_json)
         except api_http.exceptions.RequestException as e:
             raise click.ClickException(f"could not reach cao-server: {e}")
         if response.status_code == 404:
@@ -1006,6 +1028,8 @@ def run_cmd(name_or_path, inputs, run_id, working_directory, detach, wait, as_js
             json=payload,
             timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -1086,6 +1110,8 @@ def _resolve_latest_run_id():
             params={"limit": 1},
             timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, False)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
     if response.status_code != 200:
@@ -1118,6 +1144,8 @@ def status_cmd(run_id, as_json):
             f"{API_BASE_URL}/workflows/runs/{run_id}",
             timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -1157,6 +1185,8 @@ def runs_cmd(state, limit, as_json):
             params=params,
             timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -1226,6 +1256,8 @@ def result_cmd(run_id, as_json):
             f"{API_BASE_URL}/workflows/runs/{run_id}/result",
             timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -1288,6 +1320,8 @@ def resume_cmd(run_id, decide, as_json):
             json={"decisions": decisions} if decisions else None,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -1416,6 +1450,8 @@ def step_cmd(run_id, step_id, prompt_file, prompt_override, as_json):
             json=payload,
             timeout=WORKFLOW_STEP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -1448,6 +1484,8 @@ def cancel_cmd(run_id):
             f"{API_BASE_URL}/workflows/runs/{run_id}/cancel",
             timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, False)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -1509,6 +1547,8 @@ def _events_route_or_run_missing(run_id: str) -> click.ClickException:
             f"{API_BASE_URL}/workflows/runs/{run_id}",
             timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, False)
     except api_http.exceptions.RequestException:
         return click.ClickException(f"unknown run '{run_id}'")
     if probe.status_code == 200:
@@ -1655,6 +1695,8 @@ def _events_batch_read(run_id: str, after_seq, as_json: bool) -> None:
             params=params,
             timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 

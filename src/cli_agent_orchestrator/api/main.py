@@ -7159,9 +7159,12 @@ def _durable_error_kind(steps: List[Any]) -> Optional[str]:
     CORRECTED (issue #583 Bolt 3, ``failure-classification``): this docstring previously
     said the helper was "INERT" because "``StepRow`` carries no ``error_kind`` attribute",
     and that the swap awaited #504. The column has landed. The claim mattered enough to fix
-    here rather than leave to a later docs pass: ``failure-classification`` reads this
-    value as its PRIMARY INPUT, and a reader who believed the docstring would conclude the
-    classification runs on inference alone and would test the wrong branch.
+    here rather than leave to a later docs pass: this value is the durable step
+    fallback after run state and the run-level kind. A reader who believed the
+    old docstring would conclude the fallback runs on inference alone.
+
+    Persistors emit ``error``, ``timeout``, ``cancelled`` and ``provider_error``. A provider refusal
+    remains recognised even though its diagnostic slug is not persisted.
 
     Reading via ``getattr(step, "error_kind", None)`` is kept rather than a direct attribute
     access, so the helper stays total against a pre-migration ``StepRow`` shape (RP-5).
@@ -7228,6 +7231,7 @@ def _resolve_error_kind(row: Any, steps: List[Any]) -> Optional[str]:
 #: ``artifact_defect`` default AND logs, because an unrecognised kind is exactly the case where a
 #: confident answer would be unearned. See ``_classify_failure``.
 _TRANSIENT_ERROR_KINDS = frozenset({"timeout"})
+_ARTIFACT_DEFECT_ERROR_KINDS = frozenset({"error", "provider_error"})
 
 #: The three classifications this surface can emit. ``diverged`` and ``decision_required`` belong to the
 #: same vocabulary but are NOT here: both are live-call kinds returned as a 409 from the ``run_step``
@@ -7255,8 +7259,9 @@ def _classify_failure(row: Any, error_kind: Optional[str]) -> Optional[str]:
     arriving from a direction the requirement's wording does not anticipate. Ordered wrongly this
     returns a plausible ``transient`` rather than raising, so a test asserts the order by planting it.
 
-    ``provider_error`` also takes this conservative default: an in-band refusal
-    identifies a provider failure but does not establish that retrying is safe.
+    ``provider_error`` is a recognised ``artifact_defect`` with no warning. Its provider slug is
+    not persisted, so an authentication refusal or unknown model cannot safely be called transient.
+    Inspect the failing step's error; retry guidance needs the future persisted-slug taxonomy.
 
     A BARE ``error`` RESOLVES TO ``artifact_defect``, AND THAT IS A JUDGEMENT RATHER THAN A DEDUCTION.
     ``error`` is both the most common value and the least informative: a provider blip and a broken
@@ -7298,7 +7303,9 @@ def _classify_failure(row: Any, error_kind: Optional[str]) -> Optional[str]:
         return CLASSIFICATION_CANCELLED
     if error_kind in _TRANSIENT_ERROR_KINDS:
         return CLASSIFICATION_TRANSIENT
-    if error_kind is not None and error_kind not in {"error", "provider_error"}:
+    if error_kind in _ARTIFACT_DEFECT_ERROR_KINDS:
+        return CLASSIFICATION_ARTIFACT_DEFECT
+    if error_kind is not None:
         # An UNRECOGNISED kind. The value returned is the same default a bare ``error`` gets, but the
         # reason is different and the difference must not be silent: under the CLI's action phrasing
         # this renders as "Fix the spec", a confident instruction derived from no evidence. A silent

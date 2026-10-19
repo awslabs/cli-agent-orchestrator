@@ -23,6 +23,7 @@ self-contained. Run with: ``uv run pytest -m e2e test/e2e/test_script_runner_e2e
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import time
@@ -92,6 +93,13 @@ def _temp_db(tmp_path, monkeypatch):
     )
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+    # These subprocess proofs exercise the runner, independently of plan approval.
+    from cli_agent_orchestrator.services import settings_service
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"workflow": {"require_approval": False}}))
+    monkeypatch.setattr(settings_service, "SETTINGS_FILE", settings)
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
     workflow_service.run_registry.clear()
     workflow_service._active_drives.clear()
     yield

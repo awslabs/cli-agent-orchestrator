@@ -2687,7 +2687,7 @@ mod tests {
 
     /// **23 routes for the 24 IN-APP commands, and `profile find` is the one without.**
     ///
-    /// The distribution is settled ground truth — 24 IN-APP / 18 HANDOFF / 55 HIDE = 97 — and
+    /// The distribution is settled ground truth — 24 IN-APP / 18 HANDOFF / 63 HIDE = 105 — and
     /// every number below is a **hard-coded literal**. Deriving any of them from `route()` or
     /// from the catalog would compare production against itself, which is the vacuous shape this
     /// project has hit repeatedly.
@@ -2751,7 +2751,7 @@ mod tests {
             .count();
         assert_eq!(
             in_app, 24,
-            "the settled distribution is 24 IN-APP / 18 HANDOFF / 55 HIDE = 97; if this moved, \
+            "the settled distribution is 24 IN-APP / 18 HANDOFF / 63 HIDE = 105; if this moved, \
              the 23-route figure above needs re-deriving rather than adjusting"
         );
     }

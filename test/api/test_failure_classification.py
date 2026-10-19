@@ -48,6 +48,7 @@ def _row(state: str, run_id: str = "r1", current_step_id: str | None = None):
         ("completed", "error", None),  # a kind on a success is still not a failure
         ("running", None, None),
         ("failed", "timeout", "transient"),
+        ("failed", "provider_error", "artifact_defect"),
         ("failed", "error", "artifact_defect"),
         ("failed", None, "artifact_defect"),
         ("failed", "cancelled", "cancelled"),
@@ -171,7 +172,7 @@ def test_the_classification_is_reproducible():
     assert [api_main._classify_failure(row, "error") for _ in range(5)] == ["artifact_defect"] * 5
 
 
-def test_the_transient_kind_set_excludes_provider_errors():
+def test_the_known_kind_sets_recognize_provider_errors_as_artifact_defects():
     """``diverged`` and ``decision_required`` are NOT classifications (BR-5, BR-9).
 
     Both are returned as a ``kind`` on a 409 from the step-execution route and neither is persisted, so
@@ -179,6 +180,14 @@ def test_the_transient_kind_set_excludes_provider_errors():
     set, someone has conflated a live-call condition with a run outcome.
     """
     assert api_main._TRANSIENT_ERROR_KINDS == {"timeout"}
+    assert api_main._ARTIFACT_DEFECT_ERROR_KINDS == {"error", "provider_error"}
     assert "provider_error" not in api_main._TRANSIENT_ERROR_KINDS
     assert "diverged" not in api_main._TRANSIENT_ERROR_KINDS
     assert "decision_required" not in api_main._TRANSIENT_ERROR_KINDS
+
+
+def test_provider_error_is_artifact_defect_without_warning(caplog):
+    with caplog.at_level(logging.WARNING, logger=api_main.logger.name):
+        result = api_main._classify_failure(_row("failed"), "provider_error")
+    assert result == "artifact_defect"
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]

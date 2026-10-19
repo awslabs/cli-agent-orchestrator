@@ -12,6 +12,7 @@ and the other's forgotten. The end-to-end and unit tests both stay green through
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 from fastapi.testclient import TestClient
@@ -210,3 +211,12 @@ def test_the_classification_adds_no_journal_query(client, monkeypatch):
         "get_run",
         "get_steps",
     ], f"exactly the two reads the endpoint already made, got {calls} — the classifier must add none"
+
+
+def test_provider_error_is_artifact_defect_over_http_without_warning(client, caplog):
+    _failed_run("run-provider-error", "provider_error")
+    with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.api.main"):
+        result = _envelope(client, "run-provider-error")
+    assert result["classification"] == "artifact_defect"
+    assert result["error_kind"] == "provider_error"
+    assert not [record for record in caplog.records if record.levelno >= logging.WARNING]

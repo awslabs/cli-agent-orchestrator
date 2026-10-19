@@ -388,7 +388,7 @@ def _contains_auth_derivation(node: ast.AST, derived_names: set[str]) -> bool:
         func = child.func
         if isinstance(func, ast.Name) and func.id == "_auth_headers":
             return True
-        if isinstance(func, ast.Attribute) and func.attr == "_auth_headers":
+        if isinstance(func, ast.Attribute) and func.attr in {"_auth_headers", "auth_headers_for"}:
             return True
     return False
 
@@ -491,6 +491,18 @@ def test_every_workflow_cli_http_hop_forwards_auth():
     assert inspected == []
     assert failures == []
     tree = ast.parse(inspect.getsource(cli_workflow))
+    assert not any(
+        isinstance(n, ast.Import)
+        and any(a.name == "requests" for a in n.names)
+        or isinstance(n, ast.ImportFrom)
+        and n.module == "requests"
+        for n in tree.body
+    )
+    assert not any(isinstance(n, ast.FunctionDef) and n.name == "_auth_headers" for n in tree.body)
+    assert not any(
+        isinstance(n, ast.Call) and ast.unparse(n.func).startswith("api_http.requests.")
+        for n in ast.walk(tree)
+    )
     calls = [
         call
         for call in ast.walk(tree)
@@ -502,9 +514,15 @@ def test_every_workflow_cli_http_hop_forwards_auth():
     ]
     assert len(calls) >= 21
     # The shared transport attaches auth; callers must not derive a second header.
+    derived = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            if _contains_auth_derivation(node.value, derived):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                derived.update(n.id for n in targets if isinstance(n, ast.Name))
     for call in calls:
         headers = next((kw.value for kw in call.keywords if kw.arg == "headers"), None)
-        assert headers is None or not _contains_auth_derivation(headers, set())
+        assert headers is None or not _contains_auth_derivation(headers, derived)
 
 
 @pytest.mark.parametrize(
@@ -649,19 +667,21 @@ def test_auth_off_sends_no_header_and_both_client_types_still_work(
     assert client_boundary.seen_headers == [None] * 7
 
 
+@pytest.mark.parametrize("as_json", [False, True], ids=["plain", "json"])
 def test_missing_token_401_is_actionable_without_becoming_unreachable(
     auth_enabled_env,
     jwks_boundary,
     client_boundary,
     source_file,
     monkeypatch,
+    as_json,
 ):
     monkeypatch.delenv("CAO_AUTH_LOCAL_TOKEN", raising=False)
 
     mcp_result = asyncio.run(_mcp_tool("workflow_validate")(source=SOURCE))
     cli_result = CliRunner().invoke(
         cli_workflow.workflow,
-        ["create", "wf", "--from-file", str(source_file)],
+        ["create", "wf", "--from-file", str(source_file)] + (["--json"] if as_json else []),
     )
 
     assert mcp_result["ok"] is False
@@ -670,6 +690,11 @@ def test_missing_token_401_is_actionable_without_becoming_unreachable(
     assert cli_result.exit_code == 1
     assert "CAO_AUTH_LOCAL_TOKEN" in cli_result.output
     assert "unreachable" not in cli_result.output.lower()
+    assert "could not reach" not in cli_result.output.lower()
+    if as_json:
+        import json
+
+        assert json.loads(cli_result.output)["class"] == "auth_not_configured"
     assert client_boundary.seen_headers == [None, None]
 
 
@@ -758,3 +783,18 @@ def test_valid_write_token_gets_403_from_admin_only_approval(
     assert "cao:admin" in result.output
     assert "unreachable" not in result.output.lower()
     _assert_secret_absent(token, result.output, result.stderr, result.exception)
+
+
+def test_cli_missing_auth_precedes_every_transport_failure_handler():
+    tree = ast.parse(inspect.getsource(cli_workflow))
+    checked = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        handlers = [ast.unparse(h.type) if h.type else "" for h in node.handlers]
+        broad = "api_http.exceptions.RequestException"
+        if broad in handlers:
+            checked += 1
+            assert "api_http.AuthNotConfiguredError" in handlers
+            assert handlers.index("api_http.AuthNotConfiguredError") < handlers.index(broad)
+    assert checked >= 21

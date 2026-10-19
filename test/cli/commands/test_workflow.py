@@ -1015,9 +1015,10 @@ def test_step_failed_step_exits_1(runner):
 
 
 def test_step_unreachable_server(runner):
-    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
-        mock_req.exceptions = requests.exceptions
-        mock_req.post.side_effect = requests.exceptions.ConnectionError("refused")
+    with patch(
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.post",
+        side_effect=requests.exceptions.ConnectionError("refused"),
+    ):
         result = runner.invoke(workflow, ["step", "run1", "s2"])
     assert result.exit_code != 0
     assert "could not reach cao-server" in result.output
