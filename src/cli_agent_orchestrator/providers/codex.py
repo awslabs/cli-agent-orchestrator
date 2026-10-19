@@ -1909,9 +1909,19 @@ class CodexProvider(BaseProvider):
         Returns None when the pane shows anything else, so every caller keeps
         its existing failure. Called only from paths that are already failing.
         """
-        output = await asyncio.to_thread(
-            get_backend().get_history, self.session_name, self.window_name
-        )
+        try:
+            output = await asyncio.to_thread(
+                get_backend().get_history, self.session_name, self.window_name
+            )
+        except Exception:
+            # A transient capture failure must not replace the startup failure
+            # this helper exists to explain -- the caller's own TimeoutError
+            # (or "blocked" dialog) stands instead.
+            logger.exception(
+                "Terminal %s: failed to capture pane for config-rejection check",
+                self.terminal_id,
+            )
+            return None
         if not output:
             return None
         clean_output = strip_terminal_escapes(re.sub(ANSI_CODE_PATTERN, "", output))

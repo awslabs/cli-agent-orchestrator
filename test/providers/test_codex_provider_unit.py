@@ -1049,6 +1049,25 @@ class TestCodexConfigRejectionDiagnostic:
             with pytest.raises(TimeoutError, match="Codex initialization timed out"):
                 await provider.initialize()
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_a_capture_failure_does_not_replace_the_original_timeout(
+        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_sleep
+    ):
+        """A transient backend error must not mask the failure it was meant to explain."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = False
+        mock_tmux.return_value.get_history.side_effect = RuntimeError("capture failed")
+
+        provider = CodexProvider("tid", "sess", "win", None)
+
+        with patch.object(provider, "_handle_trust_prompt", new=AsyncMock(return_value="settled")):
+            with pytest.raises(TimeoutError, match="Codex initialization timed out"):
+                await provider.initialize()
+
 
 class TestTomlScalar:
     """Tests for ``_toml_scalar`` TOML-literal serialization."""
