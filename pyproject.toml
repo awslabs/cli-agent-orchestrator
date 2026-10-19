@@ -138,6 +138,9 @@ codex_memory = "cli_agent_orchestrator.plugins.builtin.codex_memory:CodexMemoryP
 event_log_publisher = "cli_agent_orchestrator.plugins.builtin.event_log_publisher:EventLogPublisher"
 mcp_apps = "cli_agent_orchestrator.plugins.builtin.mcp_apps:McpAppsPlugin"
 
+[project.entry-points."cao.deciders"]
+fixed_table = "cli_agent_orchestrator.decisions.fixed_table:FixedTableDecider"
+
 [project.urls]
 Homepage = "https://github.com/awslabs/cli-agent-orchestrator"
 Repository = "https://github.com/awslabs/cli-agent-orchestrator"

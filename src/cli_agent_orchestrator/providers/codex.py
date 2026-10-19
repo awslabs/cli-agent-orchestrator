@@ -5,9 +5,12 @@ import logging
 import os
 import re
 import shlex
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+from wcwidth import wcswidth
 
 from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.agent_plugins.mcp_mapping import CODEX_BARE_KEY
@@ -440,6 +443,101 @@ def _turn_ended_with_footer(
     if not from_user_message:
         return True
     return any(re.match(TURN_ACTIVITY_PATTERN, row) for row in rows[1:-1])
+
+
+def _body_rows(text: str) -> list[str]:
+    """Return rendered transcript rows without the composer/status chrome."""
+    clean = strip_terminal_escapes(text).rstrip("\n")
+    rows = clean.splitlines()
+    tui_footer = any(re.search(TUI_FOOTER_PATTERN, row) for row in rows[-IDLE_PROMPT_TAIL_LINES:])
+    if tui_footer:
+        cutoff = _compute_tui_footer_cutoff(rows)
+    else:
+        # The status bar may be outside a resized viewport while the composer
+        # remains visible. Exclude only a bottom prompt-like row; if it was
+        # user text, losing that attribution makes the result conservative.
+        composer_index = next(
+            (
+                index
+                for index in range(
+                    len(rows) - 1, max(-1, len(rows) - IDLE_PROMPT_TAIL_LINES - 1), -1
+                )
+                if re.match(rf"\s*{IDLE_PROMPT_PATTERN}", rows[index])
+            ),
+            None,
+        )
+        cutoff = len("\n".join(rows[:composer_index])) if composer_index is not None else len(clean)
+    return [row.rstrip() for row in clean[:cutoff].splitlines()]
+
+
+def _dispatched_echoes(rows: list[str], message: str) -> list[tuple[int, int]]:
+    """Find full Codex user echoes, including soft-wrapped rows.
+
+    The prompt glyph and Codex's two-cell continuation indent are presentation
+    chrome. Spaces omitted at soft-wrap boundaries are restored from the
+    expected logical line. Whitespace within physical rows and blank logical
+    lines remain significant. Elided message content is rejected.
+    """
+    logical_lines = message.split("\n")
+    candidates: list[tuple[int, int]] = []
+    for start, row in enumerate(rows):
+        match = re.match(r"^[^\S\n]*[›»][^\S\n]?", row)
+        if not match:
+            continue
+        cursor = start
+        ok = True
+        for logical in logical_lines:
+            if logical == "":
+                if cursor >= len(rows) or rows[cursor].strip():
+                    ok = False
+                    break
+                cursor += 1
+                continue
+            remaining = logical
+            first = True
+            while remaining:
+                if cursor >= len(rows):
+                    ok = False
+                    break
+                physical = rows[cursor]
+                if first:
+                    physical = physical[match.end() :]
+                else:
+                    # Codex uses two spaces for wrapped and subsequent lines.
+                    physical = re.sub(r"^ {0,2}", "", physical, count=1)
+                if not physical:
+                    ok = False
+                    break
+                width = wcswidth(physical)
+                if width < 0:
+                    ok = False
+                    break
+                # Word wrapping can omit the separating spaces (and rendered
+                # rows have already lost their right padding). Only restore
+                # expected ASCII spaces at a continuation boundary, preferring
+                # the exact match when those spaces are still visible. Never
+                # skip text within a row or cross a logical newline this way.
+                if not first and not remaining.startswith(physical):
+                    remaining = remaining.lstrip(" ")
+                # A wrapped row must be an exact prefix of the remaining
+                # logical line. In particular, once the expected message ends,
+                # the rendered row must end there too; accepting a row suffix
+                # would let unrelated text disappear before a following footer.
+                matched = remaining[: len(physical)]
+                if matched != physical:
+                    ok = False
+                    break
+                # Consume exactly the physical row. If it completes the
+                # logical line, ``matched`` equals all of ``remaining``; a
+                # trailing row suffix therefore cannot be silently swallowed.
+                remaining = remaining[len(matched) :]
+                cursor += 1
+                first = False
+            if not ok:
+                break
+        if ok:
+            candidates.append((start, cursor))
+    return candidates
 
 
 def _toml_scalar(value: Any) -> str:
@@ -1082,6 +1180,14 @@ class CodexProvider(BaseProvider):
         # The cached result of the exit check (see _exited_to_shell).
         self._exit_checked_at: Optional[float] = None
         self._exited = False
+        # Dispatch attribution is provider-local and intentionally ephemeral.
+        # Screen parsing only reads snapshots; lifecycle hooks own mutations.
+        self._dispatch_lock = threading.Lock()
+        self._logical_dispatch_id = 0
+        self._buffer_epoch: Optional[int] = None
+        self._dispatch_message: Optional[str] = None
+        self._pre_dispatch_body: Optional[tuple[str, ...]] = None
+        self._attribution_available = False
 
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
@@ -1106,6 +1212,152 @@ class CodexProvider(BaseProvider):
         expression independently, which would let the two silently drift apart.
         """
         return CAO_HOME_DIR / "tmp" / f"{self.terminal_id}.codex_developer_instructions"
+
+    def notify_status_buffer_reset(self, epoch: int) -> None:
+        """Invalidate screen attribution when the monitor begins a new buffer."""
+        with self._dispatch_lock:
+            self._buffer_epoch = epoch
+            self._dispatch_message = None
+            self._pre_dispatch_body = None
+            self._attribution_available = False
+
+    def mark_input_received(self) -> None:
+        """Start a logical dispatch and reset stale-screen attribution."""
+        super().mark_input_received()
+        with self._dispatch_lock:
+            self._logical_dispatch_id += 1
+            self._dispatch_message = None
+            self._pre_dispatch_body = None
+            self._attribution_available = False
+
+    def mark_redelivery_received(self) -> None:
+        """Start another delivery attempt without changing the logical ID."""
+        super().mark_input_received()
+        with self._dispatch_lock:
+            self._dispatch_message = None
+            self._pre_dispatch_body = None
+            self._attribution_available = False
+
+    def record_dispatched_message(self, message: str) -> None:
+        """Record the effective dispatch and a pre-send rendered baseline."""
+        if not self._ends_turns_with_footer:
+            return
+        with self._dispatch_lock:
+            dispatch_id = self._logical_dispatch_id
+            epoch = self._buffer_epoch
+            self._dispatch_message = None
+            self._pre_dispatch_body = None
+            self._attribution_available = False
+        try:
+            baseline_text = get_backend().get_history(
+                self.session_name,
+                self.window_name,
+                strip_escapes=True,
+                visible_only=True,
+            )
+            baseline = tuple(_body_rows(baseline_text))
+        except Exception:
+            logger.debug("Could not capture Codex pre-dispatch baseline", exc_info=True)
+            return
+        with self._dispatch_lock:
+            if dispatch_id != self._logical_dispatch_id or epoch != self._buffer_epoch:
+                return
+            self._dispatch_message = message
+            self._pre_dispatch_body = baseline
+            self._attribution_available = True
+
+    def _current_dispatch_echo_end(self, output: str) -> Optional[int]:
+        """Return the end row of a fresh, complete echo for this dispatch."""
+        with self._dispatch_lock:
+            if not self._attribution_available or not self._dispatch_message:
+                return None
+            message = self._dispatch_message
+            baseline = self._pre_dispatch_body
+            dispatch_id = self._logical_dispatch_id
+        if baseline is None:
+            return None
+        rows = _body_rows(output)
+        if tuple(rows) == baseline:
+            return None
+        echoes = _dispatched_echoes(rows, message)
+        if not echoes:
+            return None
+        baseline_echoes = _dispatched_echoes(list(baseline), message)
+        if baseline_echoes:
+            # Map the old footer into this capture before comparing locations.
+            # Pane scroll and resize change row numbers, so baseline coordinates
+            # are never meaningful in the current frame.
+            prior_end = baseline_echoes[-1][1]
+            prior_footer = next(
+                (
+                    i
+                    for i in range(prior_end, len(baseline))
+                    if _is_completion_footer(baseline[i], self._codex_version)
+                ),
+                None,
+            )
+            mapped_footer = (
+                self._map_baseline_row(baseline, rows, prior_footer)
+                if prior_footer is not None
+                else None
+            )
+            if mapped_footer is None:
+                return None
+            current_echoes = [item for item in echoes if item[0] > mapped_footer]
+        else:
+            current_echoes = echoes
+        if len(current_echoes) != 1:
+            return None
+        _, echo_end = current_echoes[0]
+        with self._dispatch_lock:
+            current = (
+                dispatch_id == self._logical_dispatch_id
+                and self._attribution_available
+                and self._dispatch_message == message
+            )
+        return echo_end if current else None
+
+    def _map_baseline_row(
+        self, baseline: tuple[str, ...], current: list[str], index: int
+    ) -> Optional[int]:
+        """Map a row only when its strongest exact context has one location.
+
+        SequenceMatcher chooses one alignment among possible alignments; that
+        choice alone is not evidence that a repeated footer belongs to the same
+        historical occurrence. Grow a local exact context around the row and
+        reject ties at the strongest context length.
+        """
+        best_candidates = []
+        for radius in range(0, min(len(baseline), len(current))):
+            start = max(0, index - radius)
+            end = min(len(baseline), index + radius + 1)
+            context = list(baseline[start:end])
+            candidates = [
+                offset + index - start
+                for offset in range(len(current) - len(context) + 1)
+                if current[offset : offset + len(context)] == context
+            ]
+            if candidates:
+                best_candidates = candidates
+        return best_candidates[0] if len(best_candidates) == 1 else None
+
+    def _has_dispatch_attribution(self) -> bool:
+        """Whether a successful baseline was installed for the current send."""
+        with self._dispatch_lock:
+            return self._attribution_available and self._dispatch_message is not None
+
+    def _empty_current_dispatch(self, output: str) -> bool:
+        """Return whether output proves the attributed dispatch ended empty."""
+        echo_end = self._current_dispatch_echo_end(output)
+        if echo_end is None:
+            return False
+        rows = _body_rows(output)
+        tail = rows[echo_end:]
+        while tail and not tail[-1].strip():
+            tail.pop()
+        if not tail or not _is_completion_footer(tail[-1], self._codex_version):
+            return False
+        return not any(row.strip() for row in tail[:-1])
 
     def _build_codex_command(self) -> str:
         """Build Codex command with agent profile if provided.
@@ -1843,6 +2095,10 @@ class CodexProvider(BaseProvider):
         ):
             return False
         body = clean_output[:body_end]
+        if self._empty_current_dispatch(body):
+            return True
+        if not self._has_current_turn_activity(clean_output):
+            return False
         user = None
         for user in re.finditer(USER_PREFIX_PATTERN, body, re.IGNORECASE | re.MULTILINE):
             pass
@@ -1851,6 +2107,61 @@ class CodexProvider(BaseProvider):
             self._codex_version,
             from_user_message=user is not None,
         )
+
+    def _has_visible_unattributed_reply(
+        self, output: str, baseline: Optional[tuple[str, ...]]
+    ) -> bool:
+        """Find current reply evidence when the dispatched echo is not visible."""
+        if _find_assistant_marker(output) is not None:
+            return True
+        rows = _body_rows(output)
+        if not rows or not _is_completion_footer(rows[-1], self._codex_version):
+            return False
+        baseline_rows = set(baseline or ())
+        return rows[-1] not in baseline_rows and any(
+            row.strip() and row not in baseline_rows for row in rows[:-1]
+        )
+
+    def _has_current_turn_activity(self, frame: str) -> bool:
+        """Apply the shared activity policy for attributed footer completions.
+
+        A visible dispatch echo is direct evidence. Without one, ordinary reply
+        evidence is accepted unless the previous turn's footer can be aligned in
+        this frame; in that case only assistant activity after that boundary can
+        belong to the current turn. If the boundary is no longer visible, retain
+        the existing permissive behavior for long replies whose echo scrolled off.
+        """
+        if not self._has_dispatch_attribution():
+            return True
+        if self._current_dispatch_echo_end(frame) is not None:
+            return True
+
+        with self._dispatch_lock:
+            baseline = self._pre_dispatch_body
+        has_activity = self._has_visible_unattributed_reply(frame, baseline)
+
+        prior_footer = None
+        if baseline:
+            prior_footer = next(
+                (
+                    index
+                    for index in range(len(baseline) - 1, -1, -1)
+                    if _is_completion_footer(baseline[index], self._codex_version)
+                ),
+                None,
+            )
+        current_rows = _body_rows(frame)
+        mapped_footer = (
+            self._map_baseline_row(baseline, current_rows, prior_footer)
+            if baseline is not None and prior_footer is not None
+            else None
+        )
+        if mapped_footer is not None:
+            has_activity = any(
+                re.match(ASSISTANT_PREFIX_PATTERN, row, re.MULTILINE)
+                for row in current_rows[mapped_footer + 1 :]
+            )
+        return has_activity
 
     def _status_of_frame(self, output: str, *, footer_mode: bool) -> TerminalStatus:
         """Classify one frame of Codex output (_get_status() adds the exit check)."""
@@ -1977,8 +2288,16 @@ class CodexProvider(BaseProvider):
         # current turn: from the last user message, or the whole frame when
         # that message has scrolled away.
         turn_text = clean_output[last_user.start() if last_user else 0 : cutoff_pos]
-        turn_ended = footer_mode and _turn_ended_with_footer(
-            turn_text, self._codex_version, from_user_message=last_user is not None
+        turn_ended = footer_mode and (
+            self._empty_current_dispatch(clean_output)
+            or (
+                self._has_current_turn_activity(clean_output)
+                and _turn_ended_with_footer(
+                    turn_text,
+                    self._codex_version,
+                    from_user_message=last_user is not None,
+                )
+            )
         )
         # A spinner above the footer of a finished turn is history, for example
         # a spinner line that a tool result quotes.
@@ -2062,7 +2381,9 @@ class CodexProvider(BaseProvider):
         detector against the rendered screen; cursor-erased startup frames are
         absent here, which prevents a stale spinner from pinning PROCESSING.
         """
-        rows = [line.rstrip() for line in screen_lines if line.strip()]
+        rows = [line.rstrip() for line in screen_lines]
+        while rows and not rows[-1].strip():
+            rows.pop()
         if not rows:
             return TerminalStatus.UNKNOWN
         return self._get_status("\n".join(rows), rendered=True)
@@ -2088,7 +2409,9 @@ class CodexProvider(BaseProvider):
         Pure: it matches patterns against the text it is handed and touches no
         turn bookkeeping, so a verdict the monitor discards changes nothing.
         """
-        rows = [line.rstrip() for line in screen_lines if line.strip()]
+        rows = [line.rstrip() for line in screen_lines]
+        while rows and not rows[-1].strip():
+            rows.pop()
         if not rows:
             return False
         frame = "\n".join(rows)
@@ -2153,6 +2476,11 @@ class CodexProvider(BaseProvider):
         # newlines — this is fed a tmux capture-pane render (already laid out),
         # so the line-based extraction below still anchors correctly.
         clean_output = strip_terminal_escapes(script_output)
+
+        # Use the same dispatch/footer evidence as status classification so an
+        # empty turn returns an actual empty string instead of the CAO annotation.
+        if self._ends_turns_with_footer and self._empty_current_dispatch(clean_output):
+            return ""
 
         # Primary: find last user message, extract response between it and idle prompt.
         # Exclude the Codex TUI footer from user-message matching when detected.
@@ -2270,6 +2598,10 @@ class CodexProvider(BaseProvider):
     def cleanup(self) -> None:
         """Clean up Codex CLI provider."""
         self._initialized = False
+        with self._dispatch_lock:
+            self._dispatch_message = None
+            self._pre_dispatch_body = None
+            self._attribution_available = False
         # Remove the developer_instructions temp file written by _build_codex_command, if any --
         # same convention claude_code.py's own cleanup() uses for its analogous .prompt file.
         # Path comes from _developer_instructions_file_path() (single source of truth shared

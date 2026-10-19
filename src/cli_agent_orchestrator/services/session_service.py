@@ -60,6 +60,9 @@ from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 logger = logging.getLogger(__name__)
 
 
+_DESCRIPTION_UNSET = object()
+
+
 async def create_session(
     provider: str | None,
     agent_profile: str,
@@ -77,6 +80,7 @@ async def create_session(
     resume_session_id: str | None = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    description: Any = _DESCRIPTION_UNSET,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
@@ -117,6 +121,9 @@ async def create_session(
     else:
         resolved_provider = provider
 
+    if description is _DESCRIPTION_UNSET:
+        description = session_name or None
+
     terminal = await create_terminal(
         provider=resolved_provider,
         agent_profile=agent_profile,
@@ -136,6 +143,7 @@ async def create_session(
         resume_session_id=resume_session_id,
         group=group,
         metadata=metadata,
+        description=description,
     )
     dispatch_plugin_event(
         registry,

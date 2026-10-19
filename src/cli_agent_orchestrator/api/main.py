@@ -278,6 +278,7 @@ class CreateTerminalBody(BaseModel):
     message content lives here.
     """
 
+    description: Optional[str] = None
     initial_message: Optional[str] = None
     initial_message_orchestration_type: Optional[str] = None
 
@@ -454,9 +455,16 @@ class UpdateMetadataBody(BaseModel):
         return _check_metadata_size(v)
 
 
+class UpdateDescriptionBody(BaseModel):
+    """Require the key; explicit null clears the description, omission is invalid."""
+
+    description: Optional[str]
+
+
 class RunStepRequest(BaseModel):
     """Request body for the combined step-execution endpoint (N0, #312)."""
 
+    description: Optional[str] = None
     provider: str = Field(description="Provider type (e.g. 'kiro_cli', 'claude_code')")
     agent: str = Field(description="Agent profile name")
     prompt: str = Field(description="Prompt to send (caller applies any prompt shaping first)")
@@ -1332,6 +1340,31 @@ async def lifespan(app: FastAPI):
         deferred_init_recovery_task = asyncio.create_task(
             terminal_service.retry_interrupted_deferred_init_external_owners()
         )
+    from cli_agent_orchestrator.decisions.engine import DecisionEngine
+    from cli_agent_orchestrator.decisions.registry import DeciderRegistry
+    from cli_agent_orchestrator.decisions.settings import load_settings
+    from cli_agent_orchestrator.decisions.shadow import ShadowRunner
+    from cli_agent_orchestrator.decisions.store import DecisionStore
+
+    decision_settings = load_settings(environment=dict(os.environ))
+    decision_environment = dict(os.environ)
+    decision_store = DecisionStore()
+    decision_store.sweep()
+    decision_registry = DeciderRegistry()
+    decision_runner = ShadowRunner(
+        decision_store,
+        max_concurrent=decision_settings.max_concurrent,
+        max_pending=decision_settings.max_pending,
+    )
+    app.state.decision_engine = DecisionEngine(
+        decision_registry,
+        decision_store,
+        decision_runner,
+        settings_loader=lambda: load_settings(environment=decision_environment),
+    )
+    logger.info(
+        "Decision states: %s", {p: v.state.value for p, v in decision_settings.points.items()}
+    )
     _seed_default_skills_at_startup()
     _reconcile_memory_at_startup()
     registry = PluginRegistry()
@@ -1476,6 +1509,8 @@ async def lifespan(app: FastAPI):
     # asyncio.gather with the tasks above.
     fifo_manager.stop_watchdog()
 
+    await decision_runner.close()
+    await decision_registry.close()
     await registry.teardown()
     # OpenTelemetry (ported): flush + shut down exporters (no-op when disabled).
     try:
@@ -3483,6 +3518,11 @@ async def create_session(
             resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
+            **(
+                {"description": body.description}
+                if body and "description" in body.model_fields_set
+                else {}
+            ),
         )
 
         if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
@@ -3783,6 +3823,7 @@ async def create_terminal_in_session(
             defer_init=defer_init,
             initial_message=initial_message,
             initial_message_orchestration_type=orch_type,
+            description=body.description if body else None,
             engine=engine,
             model=model,
             use_worktree=use_worktree,
@@ -3917,6 +3958,23 @@ async def update_terminal_group_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to update terminal group: {str(e)}",
         )
+
+
+@app.patch("/terminals/{terminal_id}/description", response_model=Terminal)
+async def update_terminal_description_endpoint(
+    terminal_id: TerminalId,
+    body: UpdateDescriptionBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Terminal:
+    try:
+        updated = await asyncio.to_thread(
+            terminal_service.update_description, terminal_id, body.description
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"Terminal '{terminal_id}' not found")
+    return Terminal(**await asyncio.to_thread(terminal_service.get_terminal, terminal_id))
 
 
 @app.patch("/terminals/{terminal_id}/metadata", response_model=Terminal)
@@ -4610,6 +4668,7 @@ async def run_step(
             provider=body.provider,
             agent=body.agent,
             prompt=body.prompt,
+            description=body.description,
             session_name=body.session_name,
             reuse_terminal_id=body.reuse_terminal_id,
             teardown=body.teardown,
@@ -8688,7 +8747,20 @@ def main():
         default=None,
         help="Terminal backend to use, overriding terminal_backend in config.json",
     )
+    parser.add_argument(
+        "--decision",
+        action="append",
+        default=[],
+        help="Point state override: <point>=off|shadow|on (repeatable)",
+    )
     args = parser.parse_args()
+    if args.decision:
+        from cli_agent_orchestrator.decisions.settings import apply_flags
+
+        try:
+            apply_flags(args.decision)
+        except ValueError as error:
+            parser.error(str(error))
 
     if args.agents_dir:
         os.environ["CAO_AGENTS_DIR"] = args.agents_dir

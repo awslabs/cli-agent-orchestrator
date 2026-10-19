@@ -104,6 +104,16 @@ def cleanup_old_data():
                 .filter(IdempotencyKeyModel.created_at < cutoff_date)
                 .delete()
             )
+            from cli_agent_orchestrator.decisions.settings import load_settings
+            from cli_agent_orchestrator.decisions.store import DecisionStore
+
+            try:
+                decision_cutoff = datetime.now(timezone.utc) - timedelta(
+                    days=load_settings().retention_days
+                )
+                DecisionStore(sessions=SessionLocal).purge(before=decision_cutoff, session=db)
+            except Exception:
+                logger.warning("Failed to clean up old decision records")
             db.commit()
             logger.info(f"Deleted {deleted_keys} old idempotency keys from database")
 

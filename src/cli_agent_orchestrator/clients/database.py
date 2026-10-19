@@ -156,6 +156,7 @@ class TerminalModel(Base):
     __tablename__ = "terminals"
 
     id = Column(String, primary_key=True)  # "abc123ef"
+    description = Column(Text, nullable=True)
     tmux_session = Column(String, nullable=False)  # "cao-session-name"
     tmux_window = Column(String, nullable=False)  # a window name, or a pane mark
     provider = Column(String, nullable=False)  # "kiro_cli", "claude_code"
@@ -277,6 +278,48 @@ class InboxModel(Base):
     message = Column(String, nullable=False)
     status = Column(String, nullable=False)  # MessageStatus enum value
     created_at = Column(UTCDateTime, default=_utcnow)
+
+
+class DecisionRecordModel(Base):
+    """Content-free decision records retained independently of terminals."""
+
+    __tablename__ = "decision_records"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
+    contract_version = Column(Integer, default=1, nullable=False)
+    point = Column(String, nullable=False)
+    state = Column(String, nullable=False)
+    decider = Column(String, nullable=True)
+    decider_version = Column(String, nullable=True)
+    kind = Column(String, nullable=False)
+    provider = Column(String, nullable=False)
+    agent_profile = Column(String, nullable=True)
+    fallback_value = Column(String, nullable=True)
+    fallback_source = Column(String, nullable=False)
+    answer = Column(String, nullable=True)
+    probabilities = Column(Text, nullable=True)
+    confidence = Column(Float, nullable=True)
+    candidate_value = Column(String, nullable=True)
+    candidate_model = Column(String, nullable=True)
+    applied_value = Column(String, nullable=True)
+    outcome = Column(String, nullable=False)
+    reason = Column(String, nullable=True)
+    launched_model = Column(String, nullable=True)
+    model_honored = Column(Boolean, nullable=True)
+    latency_ms = Column(Float, nullable=True)
+    decision_status = Column(String, default="done", nullable=False)
+    launch_status = Column(String, default="pending", nullable=False)
+    terminal_id = Column(String, nullable=True)
+    message_hash = Column(String, nullable=True)
+    hash_key_id = Column(String, nullable=True)
+    message_bytes = Column(Integer, nullable=True)
+    __table_args__ = (
+        Index("ix_decision_records_created_at", "created_at"),
+        Index("ix_decision_records_terminal_id", "terminal_id"),
+        Index("ix_decision_records_point_created_at", "point", "created_at"),
+        {"sqlite_autoincrement": True},
+    )
 
 
 class MemoryMetadataModel(Base):
@@ -1902,6 +1945,10 @@ def _migrate_terminals_schema() -> None:
         conn = sqlite3.connect(str(DATABASE_FILE))
         cursor = conn.execute("PRAGMA table_info(terminals)")
         columns = {row[1] for row in cursor.fetchall()}
+        if "description" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN description TEXT")
+            conn.commit()
+            logger.info("Migration: added description column to terminals table")
         if "allowed_tools" not in columns:
             conn.execute("ALTER TABLE terminals ADD COLUMN allowed_tools TEXT")
             conn.commit()
@@ -1999,6 +2046,7 @@ def create_terminal(
     model: Optional[str] = None,
     model_honored: Optional[bool] = None,
     initial_delivery: Optional[Dict[str, Any]] = None,
+    description: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
 
@@ -2040,6 +2088,7 @@ def create_terminal(
             tmux_window=tmux_window,
             provider=provider,
             agent_profile=agent_profile,
+            description=description,
             model=model,
             model_honored=model_honored,
             working_directory=working_directory,
@@ -2079,6 +2128,7 @@ def create_terminal(
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "description": terminal.description,
             "model": terminal.model,
             "model_honored": terminal.model_honored,
             "ephemeral": _is_ephemeral_terminal(db, str(terminal.id)),
@@ -2199,6 +2249,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "description": terminal.description,
             "model": terminal.model,
             "model_honored": terminal.model_honored,
             "ephemeral": _is_ephemeral_terminal(db, str(terminal.id)),
@@ -2221,6 +2272,18 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "session_incarnation_id": getattr(terminal, "session_incarnation_id", None),
             "last_active": terminal.last_active,
         }
+
+
+def update_terminal_description(terminal_id: str, description: Optional[str]) -> bool:
+    """Update only the description; clearing it still returns True for an existing row."""
+    with SessionLocal() as db:
+        count = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.id == terminal_id)
+            .update({TerminalModel.description: description})
+        )
+        db.commit()
+        return bool(count)
 
 
 def update_terminal_group(terminal_id: str, group: Optional[List[str]]) -> bool:
@@ -2614,6 +2677,7 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "description": t.description,
                 "model": t.model,
                 "model_honored": t.model_honored,
                 "ephemeral": str(t.id) in ephemeral_ids,
@@ -2719,6 +2783,7 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "description": t.description,
                 "model": t.model,
                 "model_honored": t.model_honored,
                 "ephemeral": str(t.id) in ephemeral_ids,
@@ -2752,6 +2817,7 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "description": t.description,
                 "model": t.model,
                 "model_honored": t.model_honored,
                 "ephemeral": str(t.id) in ephemeral_ids,

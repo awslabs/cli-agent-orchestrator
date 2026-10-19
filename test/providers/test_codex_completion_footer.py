@@ -6,7 +6,9 @@ partial reply, or, when the user message had scrolled away, a spinner line. The
 frames below are trimmed from live codex-cli 0.160.0 panes (2026-10-11).
 """
 
+import json
 import re
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,6 +19,7 @@ from cli_agent_orchestrator.providers.codex import (
     EXIT_CHECK_INTERVAL_S,
     CodexProvider,
     _banner_version,
+    _dispatched_echoes,
     _is_completion_footer,
 )
 
@@ -151,6 +154,19 @@ class TestStatusWithCompletionFooter:
         )
         assert footer_provider().get_status_from_screen(frame) == TerminalStatus.COMPLETED
 
+    @pytest.mark.parametrize("with_status_bar", [False, True])
+    def test_attributed_long_reply_completes_after_echo_and_message_scroll_away(
+        self, with_status_bar
+    ):
+        provider = TestEmptyDispatchedTurn()._dispatched_provider("a very long task " * 8)
+        frame = [
+            *(f"• Reply row {n}" for n in range(40)),
+            "  Worked for 55s • 4:15 PM",
+            COMPOSER,
+            *([STATUS_BAR] if with_status_bar else []),
+        ]
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+
     def test_previous_turn_footer_does_not_complete_the_next_turn(self):
         frame = screen(
             *TASK,
@@ -192,6 +208,358 @@ class TestStatusWithCompletionFooter:
         provider = CodexProvider("test1234", "test-session", "window-0")
         frame = screen("› Plan the day:", "  09:00 · Standup")
         assert provider.get_status_from_screen(frame) == TerminalStatus.IDLE
+
+
+class TestEmptyDispatchedTurn:
+    MESSAGE = (
+        "ACK: agente disponible\n\n"
+        "[Message from terminal worker. Use send_message MCP tool for any follow-up work.]"
+    )
+
+    def _dispatched_provider(
+        self,
+        message=None,
+        baseline="› Earlier task.\n" + COMPOSER + "\n" + STATUS_BAR,
+    ):
+        provider = footer_provider()
+        with patch("cli_agent_orchestrator.providers.codex.get_backend") as get_backend:
+            get_backend.return_value.get_history.return_value = baseline
+            provider.notify_status_buffer_reset(1)
+            provider.mark_input_received()
+            provider.record_dispatched_message(message or self.MESSAGE)
+        return provider
+
+    @pytest.mark.parametrize("with_status_bar", [False, True])
+    def test_current_full_echo_and_short_footer_complete_and_extract_empty(self, with_status_bar):
+        provider = self._dispatched_provider()
+        fixture = Path(__file__).parent / "fixtures/codex_empty_turn_completed.txt"
+        capture = fixture.read_text()
+        if not with_status_bar:
+            capture = capture.replace("\n" + STATUS_BAR, "")
+        frame = capture.splitlines()
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script(capture) == ""
+
+    def test_footer_in_user_text_without_actual_footer_does_not_complete(self):
+        provider = self._dispatched_provider("Worked for 5s • 4:19 PM")
+        frame = screen("› Worked for 5s • 4:19 PM")
+        assert provider.get_status_from_screen(frame) != TerminalStatus.COMPLETED
+
+    def test_identical_baseline_frame_is_not_current_turn_evidence(self):
+        frame = (
+            Path(__file__)
+            .parent.joinpath("fixtures/codex_empty_turn_completed.txt")
+            .read_text()
+            .splitlines()
+        )
+        provider = self._dispatched_provider("\n".join(frame))
+        assert provider.get_status_from_screen(frame) != TerminalStatus.COMPLETED
+
+    @pytest.mark.parametrize("with_status_bar", [False, True])
+    def test_previous_turn_footer_cannot_complete_a_new_dispatch(self, with_status_bar):
+        previous = "\n".join(
+            [
+                "› Previous task",
+                "• Previous answer",
+                "  Worked for 2s • 4:19 PM",
+                COMPOSER,
+                STATUS_BAR,
+            ]
+        )
+        provider = self._dispatched_provider("new task", baseline=previous)
+        frame = [
+            "› Previous task",
+            "• Previous answer",
+            "  Worked for 2s • 4:19 PM",
+            COMPOSER,
+            *([STATUS_BAR] if with_status_bar else []),
+        ]
+
+        detected = provider.get_status_from_screen(frame)
+        assert detected != TerminalStatus.COMPLETED
+        if not with_status_bar:
+            assert detected == TerminalStatus.UNKNOWN
+
+    @pytest.mark.parametrize("with_status_bar", [False, True])
+    @pytest.mark.parametrize("include_previous_user", [False, True])
+    def test_previous_reply_and_footer_outside_viewport_cannot_complete_dispatch(
+        self, include_previous_user, with_status_bar
+    ):
+        previous_rows = ["• Previous answer", "  Worked for 2s • 4:19 PM"]
+        if include_previous_user:
+            previous_rows.insert(0, "› Previous task")
+        previous = "\n".join([*previous_rows, COMPOSER, STATUS_BAR])
+        provider = self._dispatched_provider("new task", baseline=previous)
+        frame = [
+            "• Previous answer",
+            "  Worked for 2s • 4:19 PM",
+            COMPOSER,
+            *([STATUS_BAR] if with_status_bar else []),
+        ]
+
+        detected = provider.get_status_from_screen(frame)
+        assert detected != TerminalStatus.COMPLETED
+        if not with_status_bar:
+            assert detected == TerminalStatus.UNKNOWN
+
+    @pytest.mark.parametrize("with_status_bar", [False, True])
+    def test_new_reply_after_previous_footer_completes_without_echo(self, with_status_bar):
+        previous = "\n".join(
+            [
+                "› Previous task",
+                "• Previous answer",
+                "  Worked for 2s • 4:19 PM",
+                COMPOSER,
+                STATUS_BAR,
+            ]
+        )
+        provider = self._dispatched_provider("new task", baseline=previous)
+        frame = [
+            "• Current answer after the previous turn",
+            "  Worked for 5s • 4:20 PM",
+            COMPOSER,
+            *([STATUS_BAR] if with_status_bar else []),
+        ]
+        capture = "\n".join(frame)
+
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+        assert not provider._empty_current_dispatch(capture)
+
+    def test_previous_footer_without_visible_user_echo_cannot_complete_dispatch(self):
+        provider = self._dispatched_provider("new task whose echo is not visible")
+        frame = screen("  Worked for 2s • 4:19 PM")
+
+        assert provider.get_status_from_screen(frame) != TerminalStatus.COMPLETED
+
+    def test_stale_footer_without_echo_cannot_complete_without_status_bar(self):
+        provider = self._dispatched_provider("new task whose echo is not visible")
+        frame = ["  Worked for 2s • 4:19 PM", COMPOSER]
+
+        assert provider.get_status_from_screen(frame) != TerminalStatus.COMPLETED
+
+    @pytest.mark.parametrize(
+        "rows",
+        [
+            ["› abc extra", "  Worked for 1s • 4:19 PM"],
+            ["› abc", "  continuation extra", "  Worked for 1s • 4:19 PM"],
+        ],
+    )
+    def test_text_after_dispatch_echo_on_final_physical_row_is_not_discarded(self, rows):
+        provider = self._dispatched_provider("abc")
+        frame = screen(*rows)
+
+        assert provider.get_status_from_screen(frame) != TerminalStatus.COMPLETED
+
+    def test_echo_matcher_rejects_same_row_suffix_and_accepts_exact_wrapping(self):
+        assert _dispatched_echoes(["› abc extra"], "abc") == []
+        assert _dispatched_echoes(["› abc", "  def"], "abcdef") == [(0, 2)]
+
+    def test_captured_word_wrapped_initial_dispatch_completes(self):
+        """Sanitized 226-column capture from the e8948af1 inbox stall."""
+        fixture = Path(__file__).parent / "fixtures/codex_word_wrapped_completed.json"
+        captured = json.loads(fixture.read_text())
+        provider = self._dispatched_provider(captured["message"])
+
+        assert provider.get_status_from_screen(captured["screen"]) == TerminalStatus.COMPLETED
+
+    @pytest.mark.parametrize("with_status_bar", [False, True])
+    @pytest.mark.parametrize("reply", [[], ["• Acknowledged."]])
+    def test_word_wrapped_multiline_dispatch_completes(self, with_status_bar, reply):
+        message = (
+            "ACK: agent available\n\n"
+            "[Message from terminal worker01. Use send_message MCP tool for any follow-up work.]"
+        )
+        provider = self._dispatched_provider(message)
+        frame = [
+            "› ACK: agent",
+            "  available",
+            "",
+            "  [Message from terminal worker01. Use send_message MCP",
+            "  tool for any follow-up work.]",
+            "",
+            *reply,
+            "  Worked for <1s • 7:46 AM",
+            COMPOSER,
+        ]
+        if with_status_bar:
+            frame.append(STATUS_BAR)
+
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+        if not reply:
+            assert provider.extract_last_message_from_script("\n".join(frame)) == ""
+
+    def test_word_wrapped_echo_with_footer_in_user_text_does_not_complete(self):
+        provider = self._dispatched_provider("Meeting notes\nWorked for 5s • 4:19 PM")
+        frame = screen("› Meeting", "  notes", "  Worked for 5s • 4:19 PM")
+
+        assert provider.get_status_from_screen(frame) != TerminalStatus.COMPLETED
+
+    def test_word_wrapped_echo_already_in_baseline_does_not_complete_new_dispatch(self):
+        frame = screen("› abc", "  def", "  Worked for 5s • 4:19 PM")
+        provider = self._dispatched_provider("abc def", baseline="\n".join(frame))
+
+        assert provider.get_status_from_screen(frame) != TerminalStatus.COMPLETED
+
+    def test_empty_current_turn_completes_without_status_bar(self):
+        provider = self._dispatched_provider()
+        frame = [
+            "› ACK: agente disponible",
+            "",
+            "  [Message from terminal worker. Use send_message MCP tool for any follow-up work.]",
+            "",
+            "  Worked for <1s • 7:46 AM",
+            COMPOSER,
+        ]
+
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script("\n".join(frame)) == ""
+
+    def test_identical_message_needs_a_new_echo_after_the_previous_footer(self):
+        fixture = Path(__file__).parent / "fixtures/codex_empty_turn_completed.txt"
+        baseline = fixture.read_text()
+        provider = self._dispatched_provider(baseline=baseline)
+        frame = screen(
+            "› ACK: agente disponible",
+            "",
+            "  [Message from terminal worker. Use send_message MCP tool for any follow-up work.]",
+            "",
+            "  Worked for <1s • 7:46 AM",
+            "› ACK: agente disponible",
+            "",
+            "  [Message from terminal worker. Use send_message MCP tool for any follow-up work.]",
+            "",
+            "  Worked for <1s • 7:47 AM",
+        )
+
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+
+    def test_full_38_row_pane_with_chrome_maps_the_repeated_empty_turn(self):
+        notice = "ACK: agent available"
+        baseline = [f"history {i}" for i in range(32)] + [
+            "› " + notice,
+            "",
+            "  Worked for <1s • 7:46 AM",
+            COMPOSER,
+            "",
+            STATUS_BAR,
+        ]
+        current = [f"history {i}" for i in range(3, 32)] + [
+            "› " + notice,
+            "",
+            "  Worked for <1s • 7:46 AM",
+            "› " + notice,
+            "",
+            "  Worked for <1s • 7:47 AM",
+            COMPOSER,
+            "",
+            STATUS_BAR,
+        ]
+        assert len(baseline) == len(current) == 38
+        provider = self._dispatched_provider(notice, baseline="\n".join(baseline))
+
+        capture = "\n".join(current)
+        assert provider.get_status_from_screen(current) == TerminalStatus.COMPLETED
+        assert provider._empty_current_dispatch(capture)
+        assert provider.extract_last_message_from_script(capture) == ""
+
+    def test_prepended_old_echo_is_not_a_fresh_repeat(self):
+        notice = "ACK: agent available"
+        baseline = [
+            "› " + notice,
+            "",
+            "  Worked for <1s • 7:46 AM",
+            COMPOSER,
+            "",
+            STATUS_BAR,
+        ]
+        provider = self._dispatched_provider(notice, baseline="\n".join(baseline))
+        current = [f"newly visible history {i}" for i in range(10)] + [
+            "› " + notice,
+            "",
+            "  Worked for <1s • 7:46 AM",
+        ]
+
+        assert provider._current_dispatch_echo_end("\n".join(current)) is None
+        assert not provider._empty_current_dispatch("\n".join(current))
+        assert provider.get_status_from_screen(screen(*current)) != TerminalStatus.COMPLETED
+
+    def test_ambiguous_exact_alignment_is_rejected(self):
+        provider = self._dispatched_provider("message")
+        baseline = ("before", "  Worked for <1s • 7:46 AM", "after")
+        current = [*baseline, *baseline]
+
+        assert provider._map_baseline_row(baseline, current, 1) is None
+
+    @pytest.mark.parametrize(
+        ("message", "rendered_echo"),
+        [
+            ("Run:\\tmake test", "› Run:    make test"),
+            ("Done.  \\nNext step", "› Done.\n  Next step"),
+        ],
+    )
+    def test_tab_and_trailing_spaces_in_sent_message_do_not_prove_empty(
+        self, message, rendered_echo
+    ):
+        provider = self._dispatched_provider(message)
+        capture = rendered_echo + "\n  Worked for <1s • 7:46 AM"
+
+        assert not provider._empty_current_dispatch(capture)
+
+    def test_repeated_message_in_full_pane_uses_aligned_scroll_boundary(self):
+        msg = "repeat"
+        prior = [f"context {i}" for i in range(31)] + ["› repeat", "  Worked for 2s • 4:18 PM"]
+        baseline = "\n".join(prior)
+        provider = self._dispatched_provider(msg, baseline=baseline)
+        # The pane stays at 38 rows: two old rows leave at the top, while a new
+        # identical echo and footer arrive at the bottom.
+        current = [f"context {i}" for i in range(2, 31)] + [
+            "› repeat",
+            "  Worked for 2s • 4:18 PM",
+            "› repeat",
+            "  Worked for <1s • 4:19 PM",
+        ]
+        capture = "\n".join(current)
+        assert provider._current_dispatch_echo_end(capture) == 30
+        assert provider.get_status_from_screen(current) == TerminalStatus.COMPLETED
+        assert provider.extract_last_message_from_script(capture) == ""
+
+    def test_echo_matcher_keeps_tabs_and_trailing_spaces_significant(self):
+        assert _dispatched_echoes(["› abc\tdef"], "abc def") == []
+        assert _dispatched_echoes(["› abc def  "], "abc def") == []
+
+
+class TestDispatchedEchoWrapping:
+    @pytest.mark.parametrize(
+        ("message", "rows"),
+        [
+            ("abc def", ["› abc", "  def"]),
+            ("abc   def", ["› abc", "  def"]),
+            ("abc def ghi", ["› abc", "  def", "  ghi"]),
+            ("abc def", ["› abc", "   def"]),
+            ("abc def", ["› abc de", "  f"]),
+            ("acción 😀 漢字", ["› acción", "  😀", "  漢字"]),
+            ("abc def\n\nghi jkl", ["› abc", "  def", "", "  ghi", "  jkl"]),
+        ],
+    )
+    def test_spaces_omitted_only_at_soft_wrap_boundaries(self, message, rows):
+        assert _dispatched_echoes(rows, message) == [(0, len(rows))]
+
+    @pytest.mark.parametrize(
+        ("message", "rows"),
+        [
+            ("abc def", ["› abcdef"]),
+            ("abc  def", ["› abc def"]),
+            ("abc def", ["› abc", "  def extra"]),
+            ("abc def", ["› abc", "    def"]),
+            ("abc\tdef", ["› abc", "  def"]),
+            ("abc\u00a0def", ["› abc", "  def"]),
+            ("abc\ndef", ["› abc def"]),
+            ("abc\n\ndef", ["› abc", "  def"]),
+            ("abc\n def", ["› abc", "  def"]),
+        ],
+    )
+    def test_other_whitespace_and_row_suffixes_remain_significant(self, message, rows):
+        assert _dispatched_echoes(rows, message) == []
 
 
 class TestSpinnerQuotedByAToolResult:
