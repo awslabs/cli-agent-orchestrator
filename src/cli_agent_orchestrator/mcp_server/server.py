@@ -1930,7 +1930,7 @@ async def memory_recall(
     search_mode: str = "hybrid",
     sort_by: str = Field(
         default="recency",
-        description='Ranking: "recency" (default), "score" (BM25+recency+usage), or "usage".',
+        description='Ranking: "recency" (default), "score" (BM25+recency+usage), "usage", or "relevance" (lexical relevance over a widened pool; needs query, else behaves as recency).',
     ),
     include_related: bool = Field(
         default=False,

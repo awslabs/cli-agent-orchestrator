@@ -221,7 +221,7 @@ memory_recall(
   memory_type=None,        # optional, filter by type
   limit=10,                # optional, default 10, max 100
   search_mode="hybrid",    # optional: "hybrid" (default), "bm25", "metadata"
-  sort_by="recency",       # optional: "recency" (default), "score", "usage"
+  sort_by="recency",       # optional: "recency" (default), "score", "usage", "relevance"
   include_related=False    # optional, expand cross-referenced memories
 )
 ```
@@ -229,6 +229,27 @@ memory_recall(
 `sort_by` controls ranking: `recency` (newest first), `score` (composite 3-factor —
 BM25 relevance + recency + usage), or `usage` (most accessed). When no `scope` is
 given, results follow scope precedence: `session` > `project` > `global`.
+
+`relevance` is opt-in and needs a query; without one it follows the exact
+`recency` path. Hybrid relevance uses the existing widened pool; metadata and
+BM25 relevance widen their single source too. Each source considers
+`max(limit, min(200, max(50, 3 * limit)))` rows. Partial BM25 matches fill only
+slots left by all-term matches, and all-term matches rank first.
+
+Within each tier, rank is normalized BM25 times an age factor. Only native
+project memories get `0.85 + 0.15 / (1 + days_old / 30)`; every vault row and
+all other scopes are time-neutral. Future dates clamp to age zero; naive dates
+mean UTC. An exact match aged 365 days has factor about 0.861, so a fresh match
+with lexical strength 0.862 can beat it. These constants need rollout validation.
+Ties use lexical strength and full identity, with no timestamp tie-break.
+Scope precedence still dominates when no scope is specified. Only returned
+primary rows increment access; related expansion remains unchanged.
+
+Active supersedes targets are always demoted in `score` and `relevance`, using
+the existing same-scope relationship predicate. The lifecycle flag planned for
+later work does not undo this lexical-mode demotion. Explicit recall does not
+exclude superseded memories. Default recall and injection are unchanged.
+An older remote memory owner may reject the new sort value; upgrade both nodes.
 
 ### `memory_forget`
 

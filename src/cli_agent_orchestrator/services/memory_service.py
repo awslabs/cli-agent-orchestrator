@@ -68,6 +68,16 @@ class RecallPool:
     effective_sort: str
 
 
+@dataclass(frozen=True)
+class RelevanceScore:
+    """Content-free, per-call values used by ordering and explain."""
+
+    tier: int
+    lexical: float
+    recency_factor: float
+    relevance: float
+
+
 def _matches_all_terms(query: str, content: str) -> bool:
     """Use metadata recall's case-insensitive, all-term substring predicate."""
     content_lower = content.lower()
@@ -2402,6 +2412,8 @@ class MemoryService:
             DEFAULT — byte-identical to the pre-scoring behaviour.
           - ``score``: composite 3-factor (BM25 + recency + usage).
           - ``usage``: most-accessed first.
+          - ``relevance``: all-term tier, lexical relevance, bounded project-native age.
+            With no query, behaves exactly as recency.
 
         ``include_related``: when True, each result's
         ``related_keys`` cross-references are loaded (one level, same scope)
@@ -2424,6 +2436,8 @@ class MemoryService:
         from cli_agent_orchestrator.services.memory_scoring import validate_sort_by
 
         validate_sort_by(sort_by)
+        if sort_by == "relevance" and not query:
+            sort_by = "recency"
         terminal_id = (terminal_context or {}).get("terminal_id")
         recall_policy = _resolve_injection_policy(
             False,
@@ -2445,6 +2459,26 @@ class MemoryService:
             sort_by,
             recall_policy,
         )
+        if pool.effective_sort == "relevance":
+            ordered = self._order_candidates(
+                pool.rows,
+                scope,
+                "relevance",
+                query=query,
+                terminal_context=terminal_context,
+                scan_all=scan_all,
+                policy=recall_policy,
+                all_term_identities=pool.all_term_identities,
+                now=datetime.now(timezone.utc),
+            )
+            return self._finish_recall(
+                ordered,
+                scope,
+                limit,
+                include_related=include_related,
+                terminal_context=terminal_context,
+                policy=recall_policy,
+            )
         return self._apply_sort_and_increment(
             pool.rows,
             scope,
@@ -2470,24 +2504,37 @@ class MemoryService:
         policy: Optional[VaultInjectionPolicy],
     ) -> RecallPool:
         """Select candidates without ordering, access increments or expansion."""
+        relevance = sort_by == "relevance" and bool(query)
+        candidate_limit = self._candidate_limit(limit) if relevance else limit
         if search_mode == "bm25":
             if not query:
                 return RecallPool([], set(), sort_by)
+            all_terms: set[tuple] = set()
+            tier_kwargs: dict[str, Any] = (
+                {"all_terms_first": True, "all_term_identities": all_terms} if relevance else {}
+            )
             rows = self._bm25_search(
                 query=query,
                 scope=scope,
                 scope_id=self._bm25_scope_id(scope, terminal_context),
                 memory_type=memory_type,
-                limit=limit,
+                limit=candidate_limit,
                 exclude_keys=set(),
                 terminal_context=terminal_context,
                 scan_all=scan_all,
                 policy=policy,
+                **tier_kwargs,
             )
-            return RecallPool(rows, set(), sort_by)
+            if relevance:
+                all_rows = [m for m in rows if self._identity(m) in all_terms]
+                partials = [m for m in rows if self._identity(m) not in all_terms]
+                rows = all_rows + partials[: max(0, limit - len(all_rows))]
+            return RecallPool(rows, all_terms, sort_by)
 
-        widen_candidates = search_mode == "hybrid" and bool(query) and sort_by in {"score", "usage"}
-        candidate_limit = self._candidate_limit(limit) if widen_candidates else limit
+        widen_candidates = (
+            search_mode == "hybrid" and bool(query) and sort_by in {"score", "usage", "relevance"}
+        )
+        candidate_limit = self._candidate_limit(limit) if widen_candidates or relevance else limit
         metadata_results = await self._metadata_recall(
             query=query,
             scope=scope,
@@ -2498,7 +2545,11 @@ class MemoryService:
             policy=policy,
         )
         if search_mode == "metadata" or not query:
-            return RecallPool(metadata_results, set(), sort_by)
+            return RecallPool(
+                metadata_results,
+                {self._identity(m) for m in metadata_results} if relevance else set(),
+                sort_by,
+            )
         if widen_candidates:
             rows, all_terms = self._widened_hybrid_pool(
                 metadata_results,
@@ -2646,7 +2697,8 @@ class MemoryService:
         )
 
         if sort_by != "recency":
-            self._enrich_access_counts(results)
+            if sort_by != "relevance":
+                self._enrich_access_counts(results)
             now_utc = now if now is not None else datetime.now(timezone.utc)
             if sort_by == "usage":
                 results.sort(
@@ -2655,6 +2707,19 @@ class MemoryService:
                         -m.updated_at.timestamp(),
                         m.key,
                     )
+                )
+            elif sort_by == "relevance":
+                self._rank_relevance(
+                    results,
+                    query,
+                    terminal_context,
+                    scope,
+                    scan_all,
+                    all_term_identities=all_term_identities or set(),
+                    now=now_utc,
+                    vault_candidates=vault_candidates,
+                    max_body_chars=max_body_chars,
+                    policy=policy,
                 )
             else:  # "score"
                 # Genuine 3-factor: score the WHOLE candidate set against the
@@ -2691,6 +2756,7 @@ class MemoryService:
                         m.key,
                     )
                 )
+            if sort_by in {"score", "relevance"}:
                 # FR-4.6: a memory that is the TARGET of an active supersedes edge
                 # must not outrank active guidance merely by textual similarity.
                 # Apply a stable demotion — superseded memories sink below
@@ -2713,6 +2779,63 @@ class MemoryService:
                 results.sort(key=lambda m: SCOPE_PRECEDENCE.get(m.scope, 99))
 
         return results
+
+    def _rank_relevance(
+        self,
+        results: list[Memory],
+        query: Optional[str],
+        terminal_context: Optional[dict],
+        scope: Optional[str],
+        scan_all: bool,
+        *,
+        all_term_identities: set[tuple],
+        now: datetime,
+        vault_candidates: Optional[Sequence[VaultCandidate]] = None,
+        max_body_chars: int = 4096,
+        policy: Optional[VaultInjectionPolicy] = None,
+    ) -> dict[tuple, RelevanceScore]:
+        """Rank the pool and return the exact unrounded values used in that rank."""
+        from cli_agent_orchestrator.services.memory_scoring import (
+            normalise_bm25_scores,
+            relevance_recency_factor,
+        )
+
+        lexical = normalise_bm25_scores(
+            self._bm25_relevance(
+                query,
+                results,
+                terminal_context,
+                scope,
+                scan_all,
+                vault_candidates=vault_candidates,
+                max_body_chars=max_body_chars,
+                policy=policy,
+            )
+        )
+        values = {}
+        for memory in results:
+            identity = self._identity(memory)
+            factor = (
+                relevance_recency_factor(memory.updated_at, now=now)
+                if memory.scope == "project" and memory.source_kind == "native"
+                else 1.0
+            )
+            lex = lexical.get(identity, 0.0)
+            values[identity] = RelevanceScore(
+                0 if identity in all_term_identities else 1, lex, factor, lex * factor
+            )
+        results.sort(
+            key=lambda m: (
+                values[self._identity(m)].tier,
+                -values[self._identity(m)].relevance,
+                -values[self._identity(m)].lexical,
+                m.key,
+                m.scope,
+                self._effective_scope_id(m) or "",
+                m.source_kind,
+            )
+        )
+        return values
 
     def _finish_recall(
         self,
