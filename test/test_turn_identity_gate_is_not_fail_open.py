@@ -1,4 +1,4 @@
-"""#735 class guard: a turn-identity gate that is opt-in and fail-open.
+"""#735 guard: a turn-identity gate that is opt-in and fail-open.
 
 #566 built the recency token that says WHICH turn a status belongs to
 (``StatusMonitor.output_generation`` / ``status_observation``), but it is
@@ -13,8 +13,22 @@
    ``poll_until_done`` stops carrying the field, the gate silently switches off
    and every per-side test keeps passing: each asserts its own literal key name.
 
-These two tests close both halves. The second deliberately never names the wire
-field, so it cannot be satisfied by a rename on both sides of one seam.
+The first test below is a call-shape lint, not coverage of the defect class: it
+pins every dispatch-then-wait *call shape* it can see in ``src/`` -- a dispatch
+and a wait reachable from the same function body -- allowlisted with a written
+reason where it is sound. It does not see a dispatch helper split across two
+functions, or a bespoke inline poll loop that never calls one of ``WAITS`` by
+name. One live sibling of exactly that uncaught shape:
+``services/memory_service.py``'s reused-curator path (around line 4219) calls
+``send_input`` and then polls with its own inline ``for _ in range(30)`` loop
+instead of ``poll_until_done`` -- the same defect, impact bounded (not
+eliminated) by the ``output_before`` watermark above it. It is not in
+``UNGATED_WAITS`` because the lint never considers it a dispatch-then-wait site
+in the first place; recorded here instead, pending either extending the lint to
+see bespoke loops or filing it as its own issue.
+
+The second test closes the other half structurally: it deliberately never names
+the wire field, so it cannot be satisfied by a rename on both sides of one seam.
 """
 
 from __future__ import annotations
