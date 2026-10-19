@@ -471,14 +471,22 @@ def profile_declares_capability(profile_name: Optional[str], capability: str) ->
     not share a filesystem with the server cannot read it, so the check has
     to run server-side.
 
-    Fails closed on any lookup error: an unknown answer must not authorize.
+    Fails closed when the answer is actually known to be "no": a missing
+    profile (``FileNotFoundError``) or one that fails to parse (``ValueError``)
+    does not declare the capability. A fault reading the profile STORE itself
+    — permissions, I/O, anything ``load_agent_profile`` wraps in
+    ``RuntimeError`` — is a different thing from "not authorized" and is
+    deliberately NOT caught here: swallowing it into ``False`` would turn an
+    unknown answer into a confident denial, the exact fault-laundering this
+    check exists to avoid. Callers that need a boolean for a non-authorization
+    use must catch ``RuntimeError`` themselves.
     """
     if not profile_name:
         return False
     try:
         profile = load_agent_profile(profile_name)
         return capability in (profile.capabilities or [])
-    except Exception as e:  # noqa: BLE001 — authz check fails closed
+    except (FileNotFoundError, ValueError) as e:
         logger.warning(f"capability lookup failed for profile {profile_name!r}: {e}")
         return False
 

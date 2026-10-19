@@ -9361,15 +9361,27 @@ async def create_lesson_endpoint(
         )
     caller_profile = record.get("agent_profile")
 
-    if target != caller_profile and not profile_declares_capability(caller_profile, "store_lesson"):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=(
-                f"caller profile {caller_profile!r} is not authorized to store lessons "
-                f"for {target!r}: cross-agent lesson writes require the 'store_lesson' "
-                "capability in the caller's profile frontmatter"
-            ),
-        )
+    if target != caller_profile:
+        try:
+            authorized = profile_declares_capability(caller_profile, "store_lesson")
+        except RuntimeError as e:
+            # A fault reading the profile STORE, not a known "no" — the same
+            # distinction _require_learning_enabled draws for settings.json.
+            # Answering 403 here would be this issue's own bug: a filesystem
+            # fault reported as a confident policy decision.
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"could not read profile {caller_profile!r} to authorize the write: {e}",
+            )
+        if not authorized:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"caller profile {caller_profile!r} is not authorized to store lessons "
+                    f"for {target!r}: cross-agent lesson writes require the 'store_lesson' "
+                    "capability in the caller's profile frontmatter"
+                ),
+            )
 
     # agent_profile is the TARGET so resolve_scope_id lands the lesson in the
     # worker's scope; the provenance fields still identify the actual caller.

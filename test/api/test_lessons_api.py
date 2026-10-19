@@ -129,6 +129,23 @@ class TestLessonsAuthorization:
         assert response.status_code == 403
         assert "not authorized" in response.json()["detail"]
 
+    def test_capability_lookup_fault_is_503_not_the_denials_403(self, client):
+        """A profile-store read fault is not a known "no" — reporting 403 here is
+        the exact fault-laundering this issue is about, just moved server-side."""
+        with (
+            patch(LEARNING_TARGET, return_value=True),
+            patch(METADATA_TARGET, return_value=_record("developer")),
+            patch(
+                CAPABILITY_TARGET,
+                side_effect=RuntimeError(
+                    "Failed to load agent profile 'developer': Permission denied"
+                ),
+            ),
+        ):
+            response = client.post("/lessons", json=BODY)
+        assert response.status_code == 503
+        assert "developer" in response.json()["detail"]
+
     def test_capability_is_read_for_the_record_profile_not_the_body(self, client, memory_service):
         """The authorization input is the terminal record's profile, full stop."""
         with (

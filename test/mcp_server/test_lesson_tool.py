@@ -277,3 +277,16 @@ class TestCapabilityHelperLivesServerSide:
         # Unknown/missing profiles fail closed.
         assert profile_declares_capability("no-such-profile", "store_lesson") is False
         assert profile_declares_capability(None, "store_lesson") is False
+
+    def test_profile_store_fault_raises_rather_than_fails_closed(self):
+        """A PermissionError reading the profile store is not a known "no" — it
+        must not be swallowed into False, which would answer a confident 403 to
+        an authorization question the lookup never actually answered."""
+        from cli_agent_orchestrator.utils.agent_profiles import profile_declares_capability
+
+        with patch(
+            "cli_agent_orchestrator.utils.agent_profiles._read_agent_profile_source",
+            side_effect=PermissionError("Permission denied"),
+        ):
+            with pytest.raises(RuntimeError):
+                profile_declares_capability("retrospector", "store_lesson")
