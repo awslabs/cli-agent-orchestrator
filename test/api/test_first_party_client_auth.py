@@ -6,7 +6,11 @@ safe by construction. The CALLER side is per-module convention: each client modu
 own ``_auth_headers()`` (``mcp_server/utils.py:21``, ``mcp_server/app_tools.py:105``,
 ``ops_mcp_server/server.py:74``, ``utils/orchestration.py:65``) and every ``requests`` call
 is supposed to pass ``headers=_auth_headers() or None``. A convention does not stop the next
-call site from omitting it, and ten of them already have (#829).
+call site from omitting it, and ten of them already have, in ``mcp_server/server.py``. Only
+one of those ten (the script-tier shim's call site) has a fix in flight: the filed #829
+ticket's unmerged ``agent/gh-829`` branch adds a run-scoped token for exactly that case. The
+other nine -- five of which this module exercises -- are untouched by that branch; they are
+the same shape of bug but have no fix in flight.
 
 The two guards that exist test the wrong axis. ``test/test_bearer_scope_boundary.py`` (#822)
 checks a bearer is never paired with a REMOTE url — it says nothing about a local url paired
@@ -257,45 +261,60 @@ def _shim_run_step() -> Any:
 # ---------------------------------------------------------------------------
 # The surfaces. ``xfail(strict=True)`` marks the ones that are broken TODAY --
 # every one of them is a client that attaches no credential against a route that
-# requires one. They are #829's fix, not this module's; strict=True means the
-# marker must be REMOVED when that lands, so these cannot rot into permanent
-# exemptions.
+# requires one. Only ``script_tier.run_step`` has a fix in flight: the filed #829
+# ticket's unmerged ``agent/gh-829`` branch adds a run-scoped token for exactly that
+# shim. The five ``mcp_server`` surfaces below are the same #829-shaped class of bug
+# but #829's branch never touches ``mcp_server/`` -- they have no fix in flight and
+# need their own. strict=True means each marker must be REMOVED when its own surface
+# is actually fixed, so none of these can rot into a permanent exemption.
 # ---------------------------------------------------------------------------
 
-_BROKEN = pytest.mark.xfail(
+_BROKEN_MCP_SERVER = pytest.mark.xfail(
     strict=True,
-    reason="#829: client attaches no Authorization header to a scope-gated local route",
+    reason=(
+        "the #829-shaped class, NOT covered by #829 itself: mcp_server/server.py attaches "
+        "no Authorization header to a scope-gated local route, and the unmerged agent/gh-829 "
+        "branch never touches mcp_server/, so no fix is in flight for this surface"
+    ),
+)
+
+_BROKEN_SCRIPT_TIER = pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "#829: the script-tier shim has no credential to attach; the filed #829 ticket's "
+        "unmerged agent/gh-829 branch (security/run_tokens.py) implements the fix in flight"
+    ),
 )
 
 SURFACES = [
-    # --- mcp_server tools: the #829 class -------------------------------------
+    # --- mcp_server tools: the #829-shaped class, but not covered by #829 ------
     pytest.param(
         lambda: _call(_tool(mcp_server, "load_skill"), name="cao-memory"),
         id="mcp.load_skill",
-        marks=_BROKEN,
+        marks=_BROKEN_MCP_SERVER,
     ),
     pytest.param(
         lambda: _call(_tool(mcp_server, "emit_ui"), component="progress", props={"pct": 1}),
         id="mcp.emit_ui",
-        marks=_BROKEN,
+        marks=_BROKEN_MCP_SERVER,
     ),
     pytest.param(
         lambda: _call(_tool(mcp_server, "answer_user_prompt"), terminal_id=TERMINAL_ID, answer="1"),
         id="mcp.answer_user_prompt",
-        marks=_BROKEN,
+        marks=_BROKEN_MCP_SERVER,
     ),
     pytest.param(
         lambda: _call(_tool(mcp_server, "list_siblings"), depth=None, cross_session=False),
         id="mcp.list_siblings",
-        marks=_BROKEN,
+        marks=_BROKEN_MCP_SERVER,
     ),
     pytest.param(
         lambda: _call(_tool(mcp_server, "update_metadata"), metadata={"doing": "gate"}),
         id="mcp.update_metadata",
-        marks=_BROKEN,
+        marks=_BROKEN_MCP_SERVER,
     ),
     # --- script tier: the shim cannot see a credential at all -----------------
-    pytest.param(_shim_run_step, id="script_tier.run_step", marks=_BROKEN),
+    pytest.param(_shim_run_step, id="script_tier.run_step", marks=_BROKEN_SCRIPT_TIER),
     # --- surfaces that already attach the bearer ------------------------------
     pytest.param(
         lambda: _call(_tool(mcp_server, "workflow_list")),
