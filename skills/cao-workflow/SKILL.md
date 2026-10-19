@@ -288,7 +288,7 @@ class from the message, the state, or the status:
 | `classification` | What it means | What to do |
 | --- | --- | --- |
 | `transient` | a persisted timeout; the artifact may still be usable | **Retry — transient failure**: resume the same run |
-| `artifact_defect` | `error` and `provider_error` map here. A `provider_error` is the provider refusing the step in band (authentication, quota, unknown model, rate limit). | Read the failing step’s error and tell the user. Don’t edit the script unless the step names the wrong model, and don’t resume in a loop. |
+| `artifact_defect` | `error` and `provider_error` map here. A `provider_error` is the provider refusing the step in band (authentication, quota, unknown model, rate limit). | **Fix the spec — artifact defect.** For `error`: inspect and repair the script before authoring a new run. If the failing step's `error_kind` is `provider_error`: read its error and tell the user; don't edit the script unless it names the wrong model, and don't resume in a loop. |
 | `cancelled` | the run was deliberately cancelled | **Cancelled by a human**: inspect the intent before taking another action; no automatic retry is promised |
 
 `plan_inputs_changed` surfaces later, from an agent step's `POST /terminals/run-step`, rather than
