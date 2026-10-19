@@ -20,14 +20,22 @@ on:
     branches: [ main, develop ]
     paths:
       - 'src/cli_agent_orchestrator/providers/claude_code.py'
-      - 'test/providers/test_claude_code_unit.py'
+      # Globbed, not a per-file list: a single hardcoded filename meant every
+      # Claude Code test outside test_claude_code_unit.py was invisible to this
+      # workflow, and so was any file a future fix adds. The run step below
+      # expands the same glob.
+      - 'test/providers/test_claude_code_*.py'
       - 'pyproject.toml'
       - '.github/workflows/test-claude-code-provider.yml'
   pull_request:
     branches: [ main, develop ]
     paths:
       - 'src/cli_agent_orchestrator/providers/claude_code.py'
-      - 'test/providers/test_claude_code_unit.py'
+      # Globbed, not a per-file list: a single hardcoded filename meant every
+      # Claude Code test outside test_claude_code_unit.py was invisible to this
+      # workflow, and so was any file a future fix adds. The run step below
+      # expands the same glob.
+      - 'test/providers/test_claude_code_*.py'
       - 'pyproject.toml'
       - '.github/workflows/test-claude-code-provider.yml'
 
@@ -57,7 +65,7 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
-          uv run pytest test/providers/test_claude_code_unit.py \
+          uv run pytest test/providers/test_claude_code_*.py \
             --cov=src/cli_agent_orchestrator/providers/claude_code.py \
             --cov-report=xml \
             --cov-report=term-missing \
