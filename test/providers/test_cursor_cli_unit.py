@@ -513,6 +513,120 @@ class TestGetStatusV2026Tui:
 
 
 # ---------------------------------------------------------------------------
+# get_status() — Cursor CLI v2026+ TUI regressions (issue #752)
+# ---------------------------------------------------------------------------
+
+
+class TestGetStatusV2026Issue752:
+    """Readiness must not depend on the active model name, and the
+    processing indicator must not survive the frame that rendered it.
+
+    Both defects come from the same omission: the input-box placeholder
+    was computed and then ignored, leaving readiness gated on the
+    status bar (which renders the model name) and the processing check
+    gated on a whole-window substring search.
+    """
+
+    # --- Defect 1: Free-plan "Auto" status bar ---------------------------
+
+    def test_free_plan_auto_status_bar_fresh_spawn_returns_idle(self):
+        # A Cursor Free plan cannot select a named model, so the status
+        # bar renders "Auto" and matches neither alternative in
+        # TUI_STATUS_BAR_PATTERN. Readiness must come from the
+        # placeholder instead, or every Free-plan launch sits at
+        # UNKNOWN until wait_until_status times out and CAO tears the
+        # session down.
+        output = load_fixture("cursor_cli_v2026_free_plan_idle_output.txt")
+        # Sanity: the status-bar half of the old gate genuinely fails here.
+        assert not re.search(TUI_STATUS_BAR_PATTERN, output)
+        provider = make_provider()
+        assert provider.get_status(output) == TerminalStatus.IDLE
+
+    def test_free_plan_auto_status_bar_after_turn_returns_completed(self):
+        output = load_fixture("cursor_cli_v2026_free_plan_idle_output.txt")
+        provider = make_provider()
+        provider.mark_input_received()
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_free_plan_auto_status_bar_while_working_returns_processing(self):
+        # The same status-bar dependency also gated the PROCESSING
+        # branch, so on a Free plan a working agent was reported
+        # UNKNOWN rather than PROCESSING.
+        output = (
+            "  Cursor Agent\n"
+            "  v2026.09.02-c22c1a3\n"
+            "\n"
+            "  ⠠⠛ Composing  23 tokens\n"
+            "\n"
+            "  \x1b[48;5;233m \x1b[2m→ \x1b[0;7m"
+            "Add a follow-up\x1b[0m"
+            "                                                    "
+            "    \x1b[2mctrl+c to stop\x1b[0m"
+            " \x1b[49m\n"
+            "  Auto  case-study | modelling-simulation\n"
+            "   0%\n"
+        )
+        assert not re.search(TUI_STATUS_BAR_PATTERN, output)
+        provider = make_provider()
+        provider.mark_input_received()
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    # --- Defect 2: stale processing indicator inside the tail window -----
+
+    def test_stale_indicator_in_tail_window_returns_completed(self):
+        # The pipe-pane buffer is an append-only stream of every TUI
+        # redraw, and a finished Cursor frame is only a few hundred
+        # bytes, so the last working frame's "ctrl+c to stop" is still
+        # inside TUI_TAIL_WINDOW after the turn ends. A whole-window
+        # search therefore pinned the terminal at PROCESSING forever
+        # and assign / handoff never saw the worker complete.
+        output = load_fixture("cursor_cli_v2026_stale_indicator_output.txt")
+        # Sanity: this is the case the old whole-window search got wrong
+        # — the stale indicator is still inside the 1KB tail.
+        assert "ctrl+c to stop" in output[-1024:]
+        provider = make_provider()
+        provider.mark_input_received()
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_stale_indicator_fresh_spawn_returns_idle(self):
+        output = load_fixture("cursor_cli_v2026_stale_indicator_output.txt")
+        provider = make_provider()
+        assert provider.get_status(output) == TerminalStatus.IDLE
+
+    def test_indicator_on_last_input_box_line_still_returns_processing(self):
+        # Guard against over-correcting: when the indicator is on the
+        # LAST input-box line the agent really is working, even though
+        # an earlier frame rendered an input box without it.
+        idle_frame = (
+            "  \x1b[48;5;233m \x1b[2m→ \x1b[0;7mPlan, search, build anything\x1b[0m \x1b[49m\n"
+            "  \x1b[2mComposer 2.5 Fast\x1b[0m   \x1b[35mRun Everything\x1b[39m\n"
+        )
+        working_frame = (
+            "  \x1b[48;5;233m \x1b[2m→ \x1b[0;7mAdd a follow-up\x1b[0m"
+            "          \x1b[2mctrl+c to stop\x1b[0m \x1b[49m\n"
+            "  \x1b[2mComposer 2.5 Fast\x1b[0m   \x1b[35mRun Everything\x1b[39m\n"
+        )
+        output = idle_frame + working_frame
+        provider = make_provider()
+        provider.mark_input_received()
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_indicator_without_input_box_line_falls_back_to_tail_search(self):
+        # Builds that render no placeholder have no input-box line to
+        # anchor to; the whole-window search must still apply there so
+        # their behaviour is unchanged.
+        output = (
+            "  Cursor Agent\n"
+            "  \x1b[2mctrl+c to stop\x1b[0m\n"
+            "  \x1b[2mComposer 2.5 Fast\x1b[0m   \x1b[35mRun Everything\x1b[39m\n"
+        )
+        assert not re.search(TUI_PLACEHOLDER_PATTERN, output, re.IGNORECASE)
+        provider = make_provider()
+        provider.mark_input_received()
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+
+# ---------------------------------------------------------------------------
 # extract_last_message_from_script()
 # ---------------------------------------------------------------------------
 

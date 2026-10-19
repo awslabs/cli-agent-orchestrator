@@ -1,0 +1,13 @@
+  Cursor Agent
+  v2026.09.02-c22c1a3
+
+  ⠠⠛ Composing  23 tokens
+
+  1 + 1 = 2
+
+  [48;5;233m [2m→ [0;7m[48;5;233mA[0;2m[48;5;233mdd a follow-up[0m[48;5;233m                                                       [0m                       [2mctrl+c to stop[0m [49m
+  [2mComposer 2.5 Fast[0m                                             [35mRun Everything[39m
+
+  [48;5;233m [2m→ [0;7m[48;5;233mA[0;2m[48;5;233mdd a follow-up[0m[48;5;233m                                                                       [49m
+  [2mComposer 2.5 Fast[0m                                             [35mRun Everything[39m
+   0%
