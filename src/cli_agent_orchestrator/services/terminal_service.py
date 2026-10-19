@@ -3699,7 +3699,14 @@ def get_terminal(terminal_id: str) -> Dict:
             # evidence for the send it just made.
             status_generation: Optional[int] = None
         else:
-            observed_status = status_monitor.get_status(terminal_id)
+            # Read the status and the generation it was earned at as one pair
+            # (status_observation), not two separate lock acquisitions -- a
+            # detector applying this turn's PROCESSING between two separate
+            # reads would otherwise pair the previous turn's COMPLETED with
+            # the new turn's generation, defeating the #735 gate it feeds.
+            observation = status_monitor.status_observation(terminal_id)
+            observed_status = observation.status
+            status_generation: Optional[int] = observation.output_generation
             # External deferred initialization has a short two-phase window:
             # the provider can render ERROR before the background init task has
             # durably written ``deferred_init_failure``. Publishing that
@@ -3719,11 +3726,6 @@ def get_terminal(terminal_id: str) -> Dict:
                 status = TerminalStatus.UNKNOWN.value
             else:
                 status = reported_status(terminal_id, observed_status).value
-            # Read AFTER get_status so any verdict it freshly applied is stamped.
-            try:
-                status_generation = status_monitor.status_generation(terminal_id)
-            except Exception:  # pragma: no cover - defensive; status stays usable
-                status_generation = None
 
         return {
             "id": metadata["id"],
