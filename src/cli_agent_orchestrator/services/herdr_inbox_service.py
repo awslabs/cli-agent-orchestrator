@@ -673,10 +673,10 @@ class HerdrInboxService:
             return
 
         # Live pane_ids (from snapshot.panes).
-        live_pane_ids = {p["pane_id"] for p in snapshot.get("panes", []) if p.get("pane_id")}
+        live_pane_ids = {p["pane_id"] for p in snapshot.get("panes") or [] if p.get("pane_id")}
         live_pane_by_terminal = {
             str(p["terminal_id"]): str(p["pane_id"])
-            for p in snapshot.get("panes", [])
+            for p in snapshot.get("panes") or []
             if p.get("terminal_id") and p.get("pane_id")
         }
 
@@ -941,7 +941,7 @@ class HerdrInboxService:
             return
 
         delivered = 0
-        for pane in snapshot.get("panes", []):
+        for pane in snapshot.get("panes") or []:
             if not isinstance(pane, dict):
                 continue
             terminal_id = self._pane_to_terminal.get(pane.get("pane_id") or "")
@@ -1202,7 +1202,7 @@ class HerdrInboxService:
                     )
                     return
                 if any(
-                    str(p.get("pane_id") or "") == str(pane_id) for p in snapshot.get("panes", [])
+                    str(p.get("pane_id") or "") == str(pane_id) for p in snapshot.get("panes") or []
                 ):
                     logger.info(
                         "pane.closed: ignoring close for %s while pane %s is still live "

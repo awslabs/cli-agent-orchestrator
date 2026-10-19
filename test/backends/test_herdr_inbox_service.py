@@ -530,6 +530,26 @@ class TestHerdrInboxServiceReconcile:
         assert delivered == []
 
     @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_settled_sweep_survives_null_panes(self, mock_snap):
+        """A snapshot with an explicit `"panes": null` must not raise.
+
+        `.get("panes", [])` only falls back to `[]` when the key is absent, not
+        when it is present with value None, so a bare `.get` here would raise
+        a TypeError that escapes the narrow except in _socket_loop and
+        permanently kills the inbox task.
+        """
+        delivered = []
+        service = HerdrInboxService(
+            socket_path="/tmp/test.sock", delivery_callback=delivered.append
+        )
+        service.register_terminal("tid1", "pane-1")
+        mock_snap.return_value = {"panes": None}
+
+        _run_async(service._deliver_settled_panes())
+
+        assert delivered == []
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
     def test_settled_sweep_survives_snapshot_failure(self, mock_snap):
         """A failed snapshot degrades to a no-op, never an exception.
 
@@ -791,6 +811,19 @@ class TestHerdrInboxServiceReconcile:
         # Must not raise; w1:p1 is live so nothing pruned.
         _run_async(service._reconcile())
         assert service._pane_to_terminal == {"w1:p1": "tid1"}
+
+    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_reconcile_survives_null_panes(self, mock_snap, mock_list):
+        """`"panes": null` must not raise (which would escape _reconcile and
+        kill the socket loop, same hazard as a missing pane_id)."""
+        mock_list.return_value = []
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        mock_snap.return_value = {"panes": None, "workspaces": [], "tabs": []}
+
+        # Must not raise.
+        _run_async(service._reconcile())
+        assert service._pane_to_terminal == {}
 
 
 class TestHerdrInboxSnapshot:
@@ -1223,6 +1256,22 @@ class TestHerdrInboxServiceLifecycleEvents:
         service.register_terminal("tid-dead", "pane-a")
         mock_meta.side_effect = RuntimeError("database is locked")
         mock_snapshot.return_value = {"panes": [], "workspaces": [], "tabs": []}
+        mock_retain.return_value = True
+
+        service._handle_lifecycle_event("pane.closed", {"pane_id": "pane-a"})
+
+        assert "tid-dead" not in service._terminal_to_pane
+        mock_retain.assert_called_once_with("tid-dead", on_cleanup_deferred=ANY)
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service._retain_deferred_failure_tombstone")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_pane_closed_db_outage_survives_null_panes(self, mock_meta, mock_snapshot, mock_retain):
+        """A snapshot with `"panes": null` during a DB outage must not raise."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid-dead", "pane-a")
+        mock_meta.side_effect = RuntimeError("database is locked")
+        mock_snapshot.return_value = {"panes": None, "workspaces": [], "tabs": []}
         mock_retain.return_value = True
 
         service._handle_lifecycle_event("pane.closed", {"pane_id": "pane-a"})
