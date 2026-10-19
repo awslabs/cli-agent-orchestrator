@@ -1470,9 +1470,9 @@ class TestSendTerminalInput:
     """Tests for POST /terminals/{terminal_id}/input endpoint."""
 
     def test_send_input_success(self, client):
-        """POST /terminals/{id}/input sends message successfully."""
+        """POST /terminals/{id}/input sends the message and names the turn it started."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.send_input.return_value = True
+            mock_svc.dispatch_input.return_value = 11
 
             response = client.post(
                 "/terminals/abcd1234/input",
@@ -1482,7 +1482,10 @@ class TestSendTerminalInput:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        mock_svc.send_input.assert_called_once_with(
+        # The dispatch boundary lets the caller tell a status earned for THIS send
+        # from the previous turn's, which is still on screen (#735).
+        assert data["dispatch_boundary"] == 11
+        mock_svc.dispatch_input.assert_called_once_with(
             "abcd1234",
             "hello world",
             registry=ANY,
@@ -1493,7 +1496,7 @@ class TestSendTerminalInput:
     def test_send_input_with_orchestration_context(self, client):
         """POST /terminals/{id}/input forwards registry and orchestration metadata when provided."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.send_input.return_value = True
+            mock_svc.dispatch_input.return_value = 0
 
             response = client.post(
                 "/terminals/abcd1234/input",
@@ -1505,7 +1508,10 @@ class TestSendTerminalInput:
             )
 
         assert response.status_code == 200
-        mock_svc.send_input.assert_called_once_with(
+        # A first-ever dispatch has boundary 0; it must still be reported, and
+        # success must not be derived from it.
+        assert response.json() == {"success": True, "dispatch_boundary": 0}
+        mock_svc.dispatch_input.assert_called_once_with(
             "abcd1234",
             "hello world",
             registry=ANY,
@@ -1516,7 +1522,7 @@ class TestSendTerminalInput:
     def test_send_input_terminal_not_found(self, client):
         """POST /terminals/{id}/input returns 404 for nonexistent terminal."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.send_input.side_effect = ValueError("Terminal not found")
+            mock_svc.dispatch_input.side_effect = ValueError("Terminal not found")
 
             response = client.post(
                 "/terminals/deadbeef/input",
@@ -1532,7 +1538,7 @@ class TestSendTerminalInput:
 
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.TerminalInputBlockedError = TerminalInputBlockedError
-            mock_svc.send_input.side_effect = TerminalInputBlockedError(
+            mock_svc.dispatch_input.side_effect = TerminalInputBlockedError(
                 "Terminal abcd1234 is waiting for a user answer"
             )
 
@@ -1547,7 +1553,7 @@ class TestSendTerminalInput:
     def test_send_input_server_error(self, client):
         """POST /terminals/{id}/input returns 500 on error."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.send_input.side_effect = Exception("TMux send failed")
+            mock_svc.dispatch_input.side_effect = Exception("TMux send failed")
 
             response = client.post(
                 "/terminals/abcd1234/input",
