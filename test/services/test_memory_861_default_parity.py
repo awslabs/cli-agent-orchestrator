@@ -1,4 +1,4 @@
-"""Immutable default-output pins for #861, recorded before opt-in features."""
+"""Default-output pins for #861, with non-tied query fixtures verified on base."""
 
 import asyncio
 import os
@@ -38,6 +38,36 @@ def defaults(request, monkeypatch):
             monkeypatch.delenv(name, raising=False)
 
 
+def _guard_distinct_bm25_matches(monkeypatch):
+    """Check the actual ranking batch, not an independently recomputed corpus."""
+    import rank_bm25
+
+    original = rank_bm25.BM25Okapi
+
+    def guarded(corpus_tokens, *args, **kwargs):
+        model = original(corpus_tokens, *args, **kwargs)
+        get_scores = model.get_scores
+
+        def checked(query_tokens):
+            scores = get_scores(query_tokens)
+            terms = set(query_tokens)
+            matched = [
+                float(scores[i])
+                for i, tokens in enumerate(corpus_tokens)
+                if terms.intersection(tokens)
+            ]
+            assert len(matched) == len(set(matched)), (
+                "Parity pin fixture has tied raw BM25 scores; vary query term frequency/length "
+                f"instead of relying on filesystem listing order: query={query_tokens}, scores={matched}"
+            )
+            return scores
+
+        model.get_scores = checked
+        return model
+
+    monkeypatch.setattr(rank_bm25, "BM25Okapi", guarded)
+
+
 def _edge(factory, target, scope="global", scope_id="", source="replacement", origin="human"):
     with factory() as db:
         db.add(
@@ -67,13 +97,15 @@ def corpus(tmp_path, monkeypatch, defaults):
         "resolve_scope_id",
         lambda scope, ctx: {"project": "pin-project", "session": "pin-session"}.get(scope),
     )
-    for key, scope, days, usage in [
-        ("session-pin", "session", 0, 0),
-        ("project-pin", "project", 1, 0),
-        ("global-new", "global", 2, 7),
-        ("global-old", "global", 3, 3),
+    # Legacy BM25 keeps corpus order on ties; distinct term frequencies remove
+    # macOS/Linux filesystem enumeration from these literal parity expectations.
+    for key, scope, days, usage, content in [
+        ("session-pin", "session", 0, 0, "pin pin body"),
+        ("project-pin", "project", 1, 0, "pin pin pin pin body"),
+        ("global-new", "global", 2, 7, "pin pin pin pin pin pin pin pin body"),
+        ("global-old", "global", 3, 3, "pin body"),
     ]:
-        asyncio.run(svc.store(content="pin body", key=key, scope=scope, terminal_context=CTX))
+        asyncio.run(svc.store(content=content, key=key, scope=scope, terminal_context=CTX))
         _stamp_updated_at(engine, key, scope, STAMP - timedelta(days=days))
         svc._update_index(
             scope,
@@ -81,7 +113,7 @@ def corpus(tmp_path, monkeypatch, defaults):
             key,
             "reference",
             "",
-            "pin body",
+            content,
             (STAMP - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "update",
         )
@@ -96,8 +128,10 @@ class TestRecallParity:
     @pytest.mark.parametrize("sort_by", ["recency", "score", "usage"])
     @pytest.mark.parametrize("search_mode", ["hybrid", "metadata", "bm25"])
     @pytest.mark.parametrize("scope", [None, "global"])
-    def test_recall_pinned(self, corpus, sort_by, search_mode, scope):
+    def test_recall_pinned(self, corpus, sort_by, search_mode, scope, monkeypatch):
         svc, engine, factory = corpus
+        if search_mode == "bm25":
+            _guard_distinct_bm25_matches(monkeypatch)
         with factory() as db:
             before = {r.key: r.access_count for r in db.query(MemoryMetadataModel)}
         rows = asyncio.run(
@@ -116,7 +150,7 @@ class TestRecallParity:
                 "global",
                 None,
                 "native",
-                "pin body",
+                "pin pin pin pin pin pin pin pin body",
                 "2025-12-30T00:00:00+00:00",
                 False,
             ),
@@ -141,7 +175,7 @@ class TestRecallParity:
                     "session",
                     "pin-session",
                     "native",
-                    "pin body",
+                    "pin pin body",
                     "2026-01-01T00:00:00+00:00",
                     False,
                 ),
@@ -150,13 +184,54 @@ class TestRecallParity:
                     "project",
                     "pin-project",
                     "native",
-                    "pin body",
+                    "pin pin pin pin body",
                     "2025-12-31T00:00:00+00:00",
                     False,
                 ),
                 *expected_global,
             ]
         )
+        if scope is None and search_mode == "bm25" and sort_by == "recency":
+            # Pure legacy BM25 uses lexical rank before any scope ordering.
+            # These literals were observed on bfad0d4b with the distinct corpus.
+            expected = [
+                (
+                    "global-new",
+                    "global",
+                    None,
+                    "native",
+                    "pin pin pin pin pin pin pin pin body",
+                    "2025-12-30T00:00:00+00:00",
+                    False,
+                ),
+                (
+                    "project-pin",
+                    "project",
+                    "pin-project",
+                    "native",
+                    "pin pin pin pin body",
+                    "2025-12-31T00:00:00+00:00",
+                    False,
+                ),
+                (
+                    "session-pin",
+                    "session",
+                    "pin-session",
+                    "native",
+                    "pin pin body",
+                    "2026-01-01T00:00:00+00:00",
+                    False,
+                ),
+                (
+                    "global-old",
+                    "global",
+                    None,
+                    "native",
+                    "pin body",
+                    "2025-12-29T00:00:00+00:00",
+                    False,
+                ),
+            ]
         assert [
             (
                 m.key,
@@ -219,14 +294,14 @@ class TestInjectionParity:
         _edge(factory, "cap-00", "project", "pin-project", "cap-01")
         assert svc.get_memory_context(CTX) == (
             "<cao-memory>\n## Context from CAO Memory\n"
-            "- [session] session-pin: pin body\n"
+            "- [session] session-pin: pin pin body\n"
             "- [project] cap-00: body 00\n- [project] cap-01: body 01\n"
             "- [project] cap-02: body 02\n- [project] cap-03: body 03\n"
             "- [project] cap-04: body 04\n- [project] cap-05: body 05\n"
             "- [project] cap-06: body 06\n- [project] cap-07: body 07\n"
             "- [project] cap-08: body 08\n- [project] cap-09: body 09\n"
             "- [project] cap-10 [related]: body 10\n"
-            "- [global] global-new: pin body\n- [global] global-old: pin body\n</cao-memory>"
+            "- [global] global-new: pin pin pin pin pin pin pin pin body\n- [global] global-old: pin body\n</cao-memory>"
         )
 
     def test_vault_block_pinned(self, tmp_path, monkeypatch, defaults, isolated_memory_db):

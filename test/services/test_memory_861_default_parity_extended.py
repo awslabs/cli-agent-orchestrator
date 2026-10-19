@@ -9,7 +9,13 @@ import json
 import os
 import re
 from datetime import timedelta
-from test.services.test_memory_861_default_parity import CTX, STAMP, corpus, defaults
+from test.services.test_memory_861_default_parity import (
+    CTX,
+    STAMP,
+    _guard_distinct_bm25_matches,
+    corpus,
+    defaults,
+)
 from test.services.test_scoring import _row, _stamp_updated_at
 from test.services.vault.test_vault_injection_renderer import _injectable_renderer
 
@@ -25,7 +31,7 @@ from cli_agent_orchestrator.services import memory_relationship_service
 def extended(corpus, monkeypatch):
     service, engine, factory = corpus
     for key, content, memory_type, days in [
-        ("global-extra", "pin extra", "feedback", 4),
+        ("global-extra", "pin pin extra", "feedback", 4),
         ("global-ballast", "orchard gardening", "reference", 5),
     ]:
         asyncio.run(
@@ -109,13 +115,20 @@ def extended(corpus, monkeypatch):
 
 
 NATIVE_ROWS = {
-    "global-new": ("global", None, "native", "pin body", "2025-12-30T00:00:00+00:00", "project"),
+    "global-new": (
+        "global",
+        None,
+        "native",
+        "pin pin pin pin pin pin pin pin body",
+        "2025-12-30T00:00:00+00:00",
+        "project",
+    ),
     "global-old": ("global", None, "native", "pin body", "2025-12-29T00:00:00+00:00", "project"),
     "global-extra": (
         "global",
         None,
         "native",
-        "pin extra",
+        "pin pin extra",
         "2025-12-28T00:00:00+00:00",
         "feedback",
     ),
@@ -123,7 +136,7 @@ NATIVE_ROWS = {
         "project",
         "pin-project",
         "native",
-        "pin body",
+        "pin pin pin pin body",
         "2025-12-31T00:00:00+00:00",
         "project",
     ),
@@ -205,13 +218,14 @@ BM25_CELLS = {
         ),
     ],
 )
-def test_default_recall_cells(extended, cell, kwargs, expected, deltas, search_mode):
+def test_default_recall_cells(extended, cell, kwargs, expected, deltas, search_mode, monkeypatch):
     service, engine, factory = extended
     with factory() as db:
         before = {r.key: r.access_count for r in db.query(MemoryMetadataModel)}
         assert db.query(MemoryMetadataModel).filter_by(scope="global").count() == 4
     args = {"scope": "global", "search_mode": search_mode, "terminal_context": CTX, **kwargs}
     if search_mode == "bm25":
+        _guard_distinct_bm25_matches(monkeypatch)
         query, expected, deltas = BM25_CELLS[cell]
         args["query"] = query
     rows = asyncio.run(service.recall(**args))
@@ -243,7 +257,7 @@ MCP_PIN = {
     "memories": [
         {
             "key": "global-new",
-            "content": "pin body",
+            "content": "pin pin pin pin pin pin pin pin body",
             "memory_type": "project",
             "scope": "global",
             "tags": "",
@@ -288,7 +302,7 @@ INTERNAL_PIN = {
             "access_count": 0,
             "last_compiled_at": None,
             "related_keys": None,
-            "content": "pin body",
+            "content": "pin pin pin pin pin pin pin pin body",
             "source_kind": "native",
             "source_path": None,
             "indexed_at": None,
