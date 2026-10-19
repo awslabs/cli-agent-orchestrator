@@ -474,10 +474,10 @@ cao workflow create summarize_dir --from-file ./summarize_dir.py
 
 # d. attempt the run — refused, because this plan is new
 cao workflow run summarize_dir --run-id sum-1 --input target_dir=./reports
-#   -> Plan 'plan-v1:9f3c…' has not been approved. …
-#      Approve it with:  cao workflow approve plan-v1:9f3c…
+#   -> Plan 'plan-v1:9f3c…' needs human approval before it can run: an operator approves it with `cao workflow approve plan-v1:9f3c…`, then runs it again. …
+#      Approval is a human decision; an agent must not grant it.
 
-# the USER approves (you cannot, and no tool can):
+# the USER approves (you must not; no tool does):
 cao workflow approve plan-v1:9f3c…
 
 # e. run for real, with the run-id announced first

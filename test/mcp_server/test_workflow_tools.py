@@ -7,8 +7,10 @@ server-error envelope, and a transport-error envelope.
 """
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 import requests
 
 from cli_agent_orchestrator.constants import MCP_REQUEST_TIMEOUT, WORKFLOW_RUN_REQUEST_TIMEOUT
@@ -746,3 +748,32 @@ class TestTimeoutSplitGuardC6:
         ) as get:
             asyncio.run(workflow_wait("run1"))
         assert get.call_args_list[0].kwargs["timeout"] == _mcp_timeout()
+
+
+@pytest.mark.parametrize("tool", [workflow_run, workflow_resume])
+def test_approval_refusal_preserves_human_remedy_for_agents(monkeypatch, tool):
+    from cli_agent_orchestrator.services import approval_gate, approval_store
+
+    plan_id = "plan-v1:agent-boundary"
+    monkeypatch.setattr(approval_gate, "is_workflow_approval_required", lambda: True)
+    monkeypatch.setattr(approval_store, "approval_state", lambda plan: approval_store.ABSENT)
+    with pytest.raises(approval_gate.PlanApprovalRequiredError) as refused:
+        approval_gate.ensure_plan_approved(
+            tier="script", manifest_json=json.dumps({"plan_id": plan_id})
+        )
+    message = str(refused.value)
+    response = _resp(
+        403, {"detail": {"kind": "approval_required", "plan_id": plan_id, "message": message}}
+    )
+    with patch("cli_agent_orchestrator.mcp_server.server.requests.post", return_value=response):
+        out = asyncio.run(tool("wf"))
+
+    assert out == {
+        "ok": False,
+        "class": "approval_required",
+        "plan_id": plan_id,
+        "error": message,
+    }
+    assert "\n" not in out["error"]
+    assert "needs human approval" in out["error"]
+    assert f"an operator approves it with `cao workflow approve {plan_id}`" in out["error"]

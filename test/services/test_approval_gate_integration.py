@@ -199,6 +199,11 @@ def test_the_resume_endpoint_answers_403_and_not_400_or_409():
     detail = response.json()["detail"]
     assert detail["kind"] == "approval_required"
     assert detail["plan_id"] == PLAN_ID, "byte-identical: the next act is `cao workflow approve`"
+    assert set(detail) == {"kind", "plan_id", "message"}
+    assert "\n" not in detail["message"]
+    first_sentence = detail["message"].split(". ", 1)[0]
+    assert "needs human approval" in first_sentence
+    assert f"an operator approves it with `cao workflow approve {PLAN_ID}`" in first_sentence
 
 
 def test_the_resume_endpoint_answers_503_when_the_manifest_carries_no_identity():

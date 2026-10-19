@@ -441,6 +441,12 @@ before assuming a verb and a tool with similar names do the same thing:
 
 ## Plan approval (script tier)
 
+A script plan needs human approval before it can run: an operator approves it
+with `cao workflow approve <plan_id>` using the exact identifier from the `403`
+refusal, then runs it again. The first run of a new or changed script plan is
+refused by design. An agent must present the identifier to the user and stop;
+there is no agent-side tool that grants approval.
+
 **Nothing in this section applies to YAML workflows.** Script-tier approval enforcement is active by
 default.
 

@@ -509,7 +509,9 @@ def test_mcp_get_reports_a_tier_collision_as_a_conflict(monkeypatch):
 
 
 @pytest.mark.parametrize("verb,arguments", [("run", ["workflow"]), ("resume", ["run-1"])])
-def test_json_approval_refusals_match_the_mcp_envelope(monkeypatch, verb, arguments):
+def test_json_approval_refusals_keep_mcp_envelope_keys_and_human_guidance(
+    monkeypatch, verb, arguments
+):
     plan_id = "plan-v1:abc"
     response = _resp(
         403,
@@ -533,5 +535,9 @@ def test_json_approval_refusals_match_the_mcp_envelope(monkeypatch, verb, argume
         "ok": False,
         "class": "approval_required",
         "plan_id": plan_id,
-        "error": "Plan must be approved.",
+        "error": (
+            f"Plan '{plan_id}' needs human approval before it can run: "
+            + f"an operator approves it with `cao workflow approve {plan_id}`, then runs it again.\n"
+            + "Approval is a human decision; an agent must not grant it."
+        ),
     }

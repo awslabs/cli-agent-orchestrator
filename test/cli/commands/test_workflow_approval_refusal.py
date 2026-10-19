@@ -15,6 +15,7 @@ The two that carry the load:
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -63,8 +64,9 @@ def test_a_refusal_names_the_exact_approve_command(runner, monkeypatch):
 
     assert result.exit_code != 0
     assert PLAN_ID in result.output
-    assert f"cao workflow approve {PLAN_ID}" in result.output
-    assert "has not been approved" in result.output, "the server's own sentence is preserved"
+    assert "needs human approval" in result.output
+    assert "an operator approves it with" in result.output
+    assert "Approve it with:" not in result.output
 
 
 def test_a_refusal_says_the_grant_is_not_available_from_here(runner, monkeypatch):
@@ -134,3 +136,68 @@ def test_an_ordinary_error_is_unaffected(runner, monkeypatch):
 
     assert "workflow inputs exceed 65536 bytes" in result.output
     assert "cao workflow approve" not in result.output
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["run", "wf"],
+        ["run", "wf", "--wait"],
+        ["run", "wf", "--detach"],
+        ["resume", "wf"],
+        ["wait", "wf"],
+    ],
+)
+@pytest.mark.parametrize("as_json", [False, True])
+@pytest.mark.parametrize("server_variant", ["current", "old", "command-first"])
+def test_approval_output_has_one_human_command_for_all_paths(
+    runner, monkeypatch, args, server_variant, as_json
+):
+    command = f"cao workflow approve {PLAN_ID}"
+    human_message = (
+        f"Plan '{PLAN_ID}' needs human approval before it can run: "
+        + f"an operator approves it with `{command}`, then runs it again."
+    )
+    if server_variant == "current":
+        message = human_message
+    elif server_variant == "old":
+        message = f"Plan '{PLAN_ID}' has not been approved."
+    else:
+        message = f"{command}\nThen run again."
+    expected = human_message + "\nApproval is a human decision; an agent must not grant it."
+    payload = {"detail": {"kind": "approval_required", "plan_id": PLAN_ID, "message": message}}
+    response = SimpleNamespace(
+        status_code=403, json=lambda: payload, text=json.dumps(payload), headers={}
+    )
+    monkeypatch.setattr(wf.api_http, "post", lambda *a, **k: response)
+    monkeypatch.setattr(wf.api_http, "get", lambda *a, **k: response)
+
+    result = runner.invoke(wf.workflow, args + (["--json"] if as_json else []))
+
+    assert result.exit_code == 1
+    if as_json and args[0] != "wait":
+        assert json.loads(result.output) == {
+            "ok": False,
+            "class": "approval_required",
+            "plan_id": PLAN_ID,
+            "error": expected,
+        }
+    else:
+        assert result.output == "Error: " + expected + "\n"
+    assert result.output.count(command) == 1
+    assert "Approve it with:" not in result.output
+    for line in result.output.splitlines():
+        assert not line.removeprefix("Error: ").startswith("cao workflow approve")
+
+
+def test_both_skill_examples_frame_approval_as_a_user_decision():
+    root = Path(__file__).resolve().parents[3]
+    for path in [
+        root / "skills/cao-workflow/SKILL.md",
+        root / "src/cli_agent_orchestrator/skills/cao-workflow/SKILL.md",
+    ]:
+        source = path.read_text()
+        assert "(you must not; no tool does)" in source
+        assert "you cannot, and no tool can" not in source
+        assert "Approve it with:" not in source
+        assert "needs human approval before it can run: an operator approves it with" in source

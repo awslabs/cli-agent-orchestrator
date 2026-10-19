@@ -118,7 +118,7 @@ def _approval_refusal_envelope(response: api_http.Response) -> dict | None:
     if kind not in ("approval_required", "plan_identity_unavailable"):
         return None
     message = detail.get("message")
-    return {
+    refusal = {
         "ok": False,
         "class": kind,
         "plan_id": detail.get("plan_id"),
@@ -126,6 +126,9 @@ def _approval_refusal_envelope(response: api_http.Response) -> dict | None:
             message if isinstance(message, str) and message else f"status {response.status_code}"
         ),
     }
+    if kind == "approval_required" and refusal["plan_id"]:
+        refusal["error"] = _approval_refusal_message(refusal)
+    return refusal
 
 
 def _approval_refusal_message(refusal: dict) -> str:
@@ -137,8 +140,8 @@ def _approval_refusal_message(refusal: dict) -> str:
 
     THE TWO KINDS GET DIFFERENT REMEDIES AND MUST NOT BE CONFLATED:
 
-    * ``approval_required`` -> print the identifier and the exact ``cao workflow approve`` line, and
-      STOP. There is deliberately no retry: a loop around a human authorisation gate is a bypass by
+    * ``approval_required`` -> present the identifier and command as the human operator's action,
+      and STOP. There is deliberately no retry: a loop around a human authorisation gate is a bypass by
       repetition.
     * ``plan_identity_unavailable`` -> CAO could not complete its own freeze. There is NO identifier to
       approve, so presenting an approval prompt would send someone looking for a plan to grant when the
@@ -159,11 +162,20 @@ def _approval_refusal_message(refusal: dict) -> str:
         plan_id = refusal["plan_id"]
         if not plan_id:
             return ""
-        return (
-            f"{message}\n"
-            f"Approve it with:  cao workflow approve {plan_id}\n"
-            "Approval is a human decision and there is no way to grant it from here."
-        )
+        command = f"cao workflow approve {plan_id}"
+        if (
+            command not in message
+            or "human approval" not in message
+            or "Approve it with" in message
+        ):
+            message = (
+                f"Plan '{plan_id}' needs human approval before it can run: "
+                + f"an operator approves it with `{command}`, then runs it again."
+            )
+        footer = "Approval is a human decision; an agent must not grant it."
+        if not message.endswith(footer):
+            message += "\n" + footer
+        return str(message)
     return ""
 
 
@@ -878,6 +890,9 @@ def _poll_to_terminal(run_id, as_json):
         if response.status_code == 404:
             raise click.ClickException(f"unknown run '{run_id}'")
         if response.status_code != 200:
+            refusal = _approval_refusal_envelope(response)
+            if refusal:
+                raise click.ClickException(_approval_refusal_message(refusal))
             raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
 
         # A successful poll resets the bounded-retry budget.

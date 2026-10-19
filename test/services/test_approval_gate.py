@@ -115,7 +115,12 @@ def test_an_unapproved_plan_is_refused_and_the_refusal_carries_the_plan_id(
         ensure_plan_approved(tier="script", manifest_json=MANIFEST)
 
     assert excinfo.value.plan_id == PLAN
-    assert PLAN in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "\n" not in message
+    first_sentence = message.split(". ", 1)[0]
+    assert first_sentence.startswith(f"Plan '{PLAN}' needs human approval before it can run:")
+    assert f"an operator approves it with `cao workflow approve {PLAN}`" in first_sentence
+    assert "then runs it again" in first_sentence
 
 
 def test_an_approved_plan_proceeds(enforcement_on, approved):

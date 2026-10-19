@@ -197,8 +197,9 @@ def ensure_plan_approved(*, tier: str, manifest_json: Optional[str]) -> None:
     # digest, so logging it adds nothing sensitive.
     logger.warning("workflow approval gate: refusing unapproved plan_id %s", plan_id)
     raise PlanApprovalRequiredError(
-        f"Plan '{plan_id}' has not been approved. Approve this plan identifier and run again. "
-        "Note that a plan_id is computed at run start, so the first run of a new or changed "
-        "plan is refused by design.",
+        f"Plan '{plan_id}' needs human approval before it can run: "
+        + f"an operator approves it with `cao workflow approve {plan_id}`, then runs it again. "
+        + "A plan_id is computed at run start, so the first run of a new or changed plan "
+        + "is refused by design.",
         plan_id=plan_id,
     )
