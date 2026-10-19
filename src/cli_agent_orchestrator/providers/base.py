@@ -264,6 +264,10 @@ class BaseProvider(ABC):
     # grok_cli's _turn_activity_seen) would have that bookkeeping applied from a
     # frame the monitor then throws away. Providers that leave this False are
     # never probed: the terminal keeps the status the edges give it.
+    #
+    # Composes with ``assume_processing_on_dispatch``: the dispatch latch is an
+    # optimistic PROCESSING, not an observation, so the probe still runs until
+    # the turn's work is actually seen (#814).
     supports_midburst_processing_probe: bool = False
 
     def probe_processing_from_screen(self, screen_lines: List[str]) -> bool:
@@ -374,6 +378,11 @@ class BaseProvider(ABC):
         drive the transition. Full-screen TUIs that can remain visually
         unchanged just after submission opt in so callers cannot observe the
         previous turn's cached COMPLETED state as the new turn's result.
+
+        The published PROCESSING is an optimistic latch, NOT provider evidence:
+        it does not authorize stale-pane recovery for the new generation, and it
+        does not suppress the mid-burst processing probe, which is what earns
+        that evidence for a TUI whose screen never goes quiet (#814).
         """
         return False
 

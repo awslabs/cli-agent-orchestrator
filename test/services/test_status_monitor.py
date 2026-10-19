@@ -1600,6 +1600,10 @@ class TestMidBurstProcessingProbe:
     def test_no_probe_once_processing(self):
         sm = self._bursting_monitor()
         sm._last_status["t1"] = TerminalStatus.PROCESSING
+        # PROCESSING earned in this generation, which is what the skip means
+        # (#814). In production _apply_detection stamps this alongside the
+        # status; only the optimistic dispatch latch leaves it behind.
+        sm._processing_generation["t1"] = sm._capture_generation.get("t1", 0)
         provider = self._probing_provider([True])
         sm._bursting["t1"] = True
         sm._schedule_screen_detection("t1", provider)
@@ -1763,6 +1767,57 @@ class TestMidBurstProcessingProbe:
         sm._bursting["t1"] = True
         sm._schedule_screen_detection("t1", provider)
         assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+    def test_dispatch_latched_processing_is_still_probed(self):
+        """#814: ``assume_processing_on_dispatch`` must not disable the probe.
+
+        ``notify_input_sent(assume_processing=True)`` publishes PROCESSING
+        before the paste, deliberately WITHOUT evidence
+        (``processing_evidence=False``), so ``_processing_generation`` stays
+        behind the turn's ``_capture_generation``. Keyed on the status field
+        alone, the mid-burst probe then saw "already PROCESSING" and returned
+        for the whole window it exists to cover — the busy turn whose TUI never
+        goes quiet. The probe is what re-earns the evidence that authorizes the
+        stale-PROCESSING capture recovery for this generation, so skipping it
+        also leaves the turn unable to self-heal.
+        """
+        sm = self._bursting_monitor()
+        provider = self._probing_provider([True])
+        sm._detect_screen = lambda tid, prov: TerminalStatus.IDLE
+
+        sm._last_status["t1"] = TerminalStatus.COMPLETED  # previous turn
+        sm.notify_input_sent("t1", assume_processing=True)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        generation = sm._capture_generation["t1"]
+        # The optimistic latch is not evidence for this generation.
+        assert sm._processing_generation.get("t1") != generation
+
+        sm._bursting["t1"] = True
+        sm._schedule_screen_detection("t1", provider)
+
+        assert provider.probe_processing_from_screen.call_count == 1
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        # The spinner the probe saw is real evidence: the turn is now recorded
+        # as observed working in its own generation.
+        assert sm._processing_generation.get("t1") == generation
+
+    def test_evidence_backed_processing_is_not_reprobed(self):
+        """Once PROCESSING is earned in THIS generation the probe adds nothing.
+
+        The narrowing in #814 only distinguishes the optimistic dispatch latch
+        from earned PROCESSING; it does not make the probe run against a
+        terminal the edges already proved busy.
+        """
+        sm = self._bursting_monitor()
+        provider = self._probing_provider([True])
+
+        sm.notify_input_sent("t1")
+        sm._apply_detection("t1", TerminalStatus.PROCESSING)  # real evidence
+        assert sm._processing_generation["t1"] == sm._capture_generation["t1"]
+
+        sm._bursting["t1"] = True
+        sm._schedule_screen_detection("t1", provider)
+        assert provider.probe_processing_from_screen.call_count == 0
 
 
 class TestOutputGenerationIsOutputOnly:

@@ -652,13 +652,28 @@ class StatusMonitor:
         restricted to providers that opt in with
         ``supports_midburst_processing_probe`` and promise a side-effect-free
         predicate; everyone else keeps edge-only detection.
+
+        The "already PROCESSING, nothing to add" skip is keyed on PROCESSING
+        being EARNED in this turn's generation, not on the status field reading
+        PROCESSING. ``assume_processing_on_dispatch`` publishes PROCESSING from
+        the paste onward with ``processing_evidence=False`` — an optimistic
+        latch, not an observation — so keying on the field alone silently
+        disabled the probe for exactly the turn it covers (#814), and left the
+        turn without the current-generation evidence that authorizes
+        stale-PROCESSING capture recovery.
         """
         if provider is None or not getattr(provider, "supports_midburst_processing_probe", False):
             return
 
         now = time.monotonic()
         with self._lock:
-            if self._last_status.get(terminal_id) == TerminalStatus.PROCESSING:
+            if self._last_status.get(
+                terminal_id
+            ) == TerminalStatus.PROCESSING and self._processing_generation.get(
+                terminal_id
+            ) == self._capture_generation.get(
+                terminal_id, 0
+            ):
                 return
             last_probe = self._midburst_probe_at.get(terminal_id)
             if last_probe is not None and now - last_probe < PYTE_MIDBURST_PROBE_S:
