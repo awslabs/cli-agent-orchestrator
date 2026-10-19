@@ -640,8 +640,39 @@ class TmuxClient:
                 "; ".join(result.stderr) or f"tmux exited {result.returncode}",
             )
 
+    def _read_server_history_limit(self) -> Optional[int]:
+        """Read the shared server's current global ``history-limit``, if any.
+
+        Returns ``None`` on a clean socket (no server up yet to ask) or an
+        unparseable result, so the caller treats "nothing to preserve" the
+        same way as "could not tell" -- both fall back to CAO's own default
+        rather than risking a wrong floor.
+        """
+        try:
+            result = self.server.cmd("show-options", "-g", "history-limit")
+        except Exception:
+            return None
+        if result.returncode != 0:
+            return None
+        for line in result.stdout or []:
+            parts = line.split()
+            if len(parts) == 2:
+                try:
+                    return int(parts[1])
+                except ValueError:
+                    return None
+        return None
+
     def _set_server_history_limit(self) -> None:
-        """Give CAO's panes a scrollback deep enough to hold a worker's reply.
+        """Raise the shared tmux server's scrollback floor, never lower it.
+
+        CAO does not run its own tmux server -- :meth:`__init__` opens a plain
+        ``libtmux.Server()``, i.e. the operator's default shared server (see
+        the module-level note on ``kill_session``) -- so this is a FLOOR on
+        whatever ``history-limit`` the operator already has, not an
+        unconditional overwrite: an operator who set ``history-limit 100000``,
+        or a lower number on a memory-constrained box, must not have that
+        replaced by CAO's own default the first time a session launches.
 
         tmux keeps 2000 scrollback lines per pane by default -- shallower than
         the deepest rung of ``get_output``'s extraction escalation (5000 lines).
@@ -658,20 +689,33 @@ class TmuxClient:
         ``history-limit`` when it is created and never re-reads it, so setting
         it on the Session object afterwards (as ``mouse`` is set) would leave
         the session's own first pane -- which IS an agent terminal -- at 2000.
-        Setting it globally also covers every window ``create_window`` adds to
-        the session later.
+        Also called from :meth:`create_window` and :meth:`create_pane`, not
+        just :meth:`create_session`: a session that predates this fix (or one
+        a different process created) never had the global raised, so a worker
+        window added to it later would otherwise still inherit 2000.
 
         Same ``start-server ; set-option`` single-invocation idiom as
         :meth:`_set_server_exit_empty_off`, and for the same reason: on a clean
         socket a bare ``set-option`` finds no server and lands nowhere. Kept as
         a separate invocation from that one so neither option's failure can
-        swallow the other's. Best-effort: a shallower scrollback degrades
-        extraction, it does not prevent a launch.
+        swallow the other's. Retried once on a nonzero result for the same
+        reason documented there (a create right after an external
+        ``kill-server`` can reach the dying old server). Best-effort: a
+        shallower scrollback degrades extraction, it does not prevent a
+        launch.
         """
+        current = self._read_server_history_limit()
+        target = max(current, TMUX_HISTORY_LIMIT) if current is not None else TMUX_HISTORY_LIMIT
+
         try:
             result = self.server.cmd(
-                "start-server", ";", "set-option", "-g", "history-limit", str(TMUX_HISTORY_LIMIT)
+                "start-server", ";", "set-option", "-g", "history-limit", str(target)
             )
+            if result.returncode != 0:
+                time.sleep(self._EXIT_EMPTY_RETRY_DELAY_S)
+                result = self.server.cmd(
+                    "start-server", ";", "set-option", "-g", "history-limit", str(target)
+                )
         except Exception:
             logger.warning("failed to set tmux option 'history-limit'", exc_info=True)
             return
@@ -679,7 +723,7 @@ class TmuxClient:
         if result.returncode != 0:
             logger.warning(
                 "failed to set tmux option 'history-limit %d': %s",
-                TMUX_HISTORY_LIMIT,
+                target,
                 "; ".join(result.stderr) or f"tmux exited {result.returncode}",
             )
 
@@ -1322,6 +1366,12 @@ class TmuxClient:
         the web UI inherit the same context as the supervisor. See issue #248.
         """
         try:
+            # The session's global history-limit may still be at tmux's 2000
+            # default if this session predates the fix for #728 (or was
+            # created by a different process entirely) -- a new window reads
+            # the global at creation time, same as a new session's first pane.
+            self._set_server_history_limit()
+
             working_directory = self._resolve_and_validate_working_directory(working_directory)
 
             session = self._find_session(session_name)
@@ -1495,6 +1545,11 @@ class TmuxClient:
                     f"Unknown pane layout '{pane_layout}'; expected one of "
                     f"{', '.join(sorted(PANE_LAYOUTS))}"
                 )
+            # See create_window(): a split pane reads the global history-limit
+            # at creation too, so a session that predates the fix for #728
+            # needs the floor raised here as well.
+            self._set_server_history_limit()
+
             working_directory = self._resolve_and_validate_working_directory(working_directory)
 
             session = self._find_session(session_name)

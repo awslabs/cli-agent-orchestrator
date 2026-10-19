@@ -204,6 +204,19 @@ class TestCreatePane:
             call(TERMINAL_ID_OPTION, "tid"),
         ]
 
+    def test_raises_the_shared_servers_history_limit(self, tmux, tmp_path):
+        """A split pane reads ``history-limit`` at creation too, so a session
+        that predates this fix must still get the floor raised here (#728)."""
+        from cli_agent_orchestrator.constants import TMUX_HISTORY_LIMIT
+
+        self._session(tmux)
+
+        tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
+
+        tmux.server.cmd.assert_any_call(
+            "start-server", ";", "set-option", "-g", "history-limit", str(TMUX_HISTORY_LIMIT)
+        )
+
     def test_rebalances_the_window(self, tmux, tmp_path):
         _, host_window = self._session(tmux)
 

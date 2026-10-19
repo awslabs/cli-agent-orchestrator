@@ -69,7 +69,12 @@ DEFAULT_PROVIDER = ProviderType.KIRO_CLI.value
 # Higher values provide more context but increase memory usage
 TMUX_HISTORY_LINES = 200
 
-# Scrollback depth CAO asks its own tmux server to keep per pane.
+# Scrollback depth CAO asks the operator's shared tmux server to keep per pane.
+#
+# CAO does not run its own tmux server -- it shares the operator's default one
+# (see ``TmuxClient.__init__``) -- so this is set as a floor, never lowering a
+# value the operator already configured higher (see
+# ``_set_server_history_limit``).
 #
 # tmux's default is 2000 lines, which is SHALLOWER than the deepest rung of
 # ``get_output``'s extraction escalation (5000 lines, see
