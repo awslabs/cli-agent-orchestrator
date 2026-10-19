@@ -392,9 +392,11 @@ def _mutate_raw(update: Callable[[Dict[str, Any]], None]) -> None:
 
     try:
         locked_atomic_rewrite(settings_file, compute, mode=0o600)
-    except UnicodeDecodeError as e:
+    except (OSError, UnicodeDecodeError) as e:
         # locked_atomic_rewrite reads the file before calling compute, so
-        # undecodable bytes surface from there, ahead of our strict read.
+        # undecodable bytes or OS-level read failures (permission denied,
+        # the path being a directory, ...) surface from there, ahead of our
+        # strict read.
         raise settings_service.SettingsUnreadableError(settings_file, e) from e
 
 

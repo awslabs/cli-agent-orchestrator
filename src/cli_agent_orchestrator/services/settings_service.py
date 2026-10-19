@@ -212,9 +212,11 @@ def _mutate(update: Callable[[Dict[str, Any]], bool]) -> Dict[str, Any]:
         locked_atomic_rewrite(SETTINGS_FILE, compute, mode=0o600)
     except _NoWrite:
         pass
-    except UnicodeDecodeError as e:
+    except (OSError, UnicodeDecodeError) as e:
         # locked_atomic_rewrite reads the file itself before calling compute,
-        # so undecodable bytes surface from there, ahead of our own read.
+        # so undecodable bytes or OS-level read failures (permission denied,
+        # the path being a directory, ...) surface from there, ahead of our
+        # own read.
         raise SettingsUnreadableError(SETTINGS_FILE, e) from e
     return settings
 

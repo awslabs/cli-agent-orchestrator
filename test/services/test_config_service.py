@@ -470,6 +470,17 @@ class TestSetFailsClosedOverAnUnreadableFile:
             ConfigService.set("logging.level", "INFO")
         assert settings.read_text() == content
 
+    def test_settings_path_as_a_directory_is_refused_cleanly(self, _isolated_settings):
+        """OSError-shaped unreadability (e.g. the path being a directory, or
+        a permission fault) must translate to SettingsUnreadableError, not
+        escape as a bare OSError traceback. ``locked_atomic_rewrite``
+        pre-reads the target before ``_mutate_raw``'s own strict load runs."""
+        settings = _isolated_settings["settings"]
+        settings.mkdir()
+        with pytest.raises(SettingsUnreadableError):
+            ConfigService.set("logging.level", "INFO")
+        assert settings.is_dir()
+
     def test_the_cli_reports_it_and_exits_non_zero(self, _isolated_settings):
         """The pre-fix command echoed the new value and exited 0; the only
         trace was a logger.warning invisible at the default level."""

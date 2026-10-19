@@ -807,6 +807,18 @@ class TestWritersFailClosed:
         assert settings_file.read_bytes() == before
 
     @pytest.mark.parametrize("write", _WRITERS)
+    def test_an_oserror_shaped_target_is_refused_cleanly(self, settings_file, write):
+        """OSError-shaped unreadability (e.g. the path being a directory, or
+        a permission fault) must translate to SettingsUnreadableError like
+        UnicodeDecodeError does, not escape as a bare OSError traceback.
+        ``locked_atomic_rewrite`` pre-reads the target before ``_mutate``'s
+        own strict load ever runs."""
+        settings_file.mkdir()
+        with pytest.raises(settings_service.SettingsUnreadableError):
+            write()
+        assert settings_file.is_dir()
+
+    @pytest.mark.parametrize("write", _WRITERS)
     def test_an_absent_file_is_still_created(self, settings_file, write):
         """ "Absent" stays distinct from "unreadable": defaults are the right
         answer for a file nobody has written yet, so first-run writes work."""
