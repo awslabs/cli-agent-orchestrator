@@ -113,7 +113,8 @@ def test_renders_normal_frames_in_seq_order(runner, monkeypatch):
     monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "events-follow-token")
     with (
         patch(
-            "cli_agent_orchestrator.cli.commands.workflow.api_http.requests.get", return_value=stream
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.requests.get",
+            return_value=stream,
         ) as get,
         _HUMAN,
     ):
