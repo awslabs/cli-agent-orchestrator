@@ -47,7 +47,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
@@ -65,6 +72,7 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
     API_BASE_URL,
+    CALLBACK_TERMINAL_ID_ENV,
     CAO_HOME_DIR,
     CORS_ORIGINS,
     DEFAULT_PROVIDER,
@@ -285,6 +293,49 @@ class CreateTerminalBody(BaseModel):
     description: Optional[str] = None
     initial_message: Optional[str] = None
     initial_message_orchestration_type: Optional[str] = None
+
+
+#: Request keys that name a caller on the create routes. The operator form of
+#: the in-session create (``POST /sessions/{name}/terminals:operator``) refuses
+#: every one of them, in the query string or the body, so an agent client
+#: cannot fall into the operator branch while still carrying an identity.
+_CALLER_IDENTITY_KEYS = ("caller_id", "caller_ceiling", "delegating_terminal_id")
+
+
+class OperatorTerminalBody(BaseModel):
+    """Optional JSON body for ``POST /sessions/{name}/terminals:operator``.
+
+    Only ``description`` is read. ``extra="allow"`` is deliberate: the route
+    inspects unknown keys so a body that carries ``caller_id``,
+    ``caller_ceiling``, ``delegating_terminal_id`` or a callback environment is
+    REFUSED with 400 rather than silently dropped, which is what pydantic's
+    default ``extra="ignore"`` would do.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    description: Optional[str] = None
+
+
+def _caller_identity_in_operator_request(
+    request: Request, body: Optional[OperatorTerminalBody]
+) -> List[str]:
+    """Names of caller-identity fields present on an operator-form request.
+
+    The operator form exists so a first-party operator client (the Web UI) can
+    add a terminal to a session without a delegating terminal. A request that
+    uses the operator path AND names a caller is the laundering shape: an agent
+    asking to be recorded unbounded while still identifying itself. The route
+    refuses it outright; a caller-identified create belongs on the sibling
+    route, where the ceiling applies.
+    """
+    found = [key for key in _CALLER_IDENTITY_KEYS if key in request.query_params]
+    extra = (body.model_extra or {}) if body is not None else {}
+    found += [key for key in _CALLER_IDENTITY_KEYS if key in extra and key not in found]
+    env_vars = extra.get("env_vars")
+    if isinstance(env_vars, dict) and CALLBACK_TERMINAL_ID_ENV in env_vars:
+        found.append(f"env_vars.{CALLBACK_TERMINAL_ID_ENV}")
+    return found
 
 
 def _check_group_size(group: Optional[List[str]]) -> Optional[List[str]]:
@@ -3713,6 +3764,20 @@ async def create_session(
                 f"{idempotency_key}:memory-manager-sidecar" if idempotency_key else None
             )
 
+            # The sidecar is bounded by the primary's recorded ceiling (below), so
+            # under a narrow primary (one that lacks fs_list or @cao-mcp-server)
+            # the background create is refused. A refusal that only reaches
+            # logger.warning in a background task leaves the operator with a
+            # launch that reported success and no sidecar, so the bound is
+            # checked HERE, with the same comparator, and the outcome rides on
+            # the response as ``memory_manager`` for `cao launch` to print.
+            refusal = terminal_service.memory_sidecar_refusal(result, provider=sidecar_provider)
+            if refusal is not None:
+                logger.warning(f"memory_manager sidecar not launched: {refusal}")
+                result.memory_manager = {"state": "refused", "detail": refusal}
+                return result
+            result.memory_manager = {"state": "scheduled", "detail": None}
+
             async def _spawn_sidecar() -> None:
                 try:
                     from cli_agent_orchestrator.services import terminal_service
@@ -4049,6 +4114,117 @@ async def create_terminal_in_session(
         # use_worktree=true against a working_directory that isn't a git repo,
         # or the 'git worktree add' itself failed -- a client-input problem,
         # not a server crash.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create terminal: {str(e)}",
+        )
+
+
+@app.post(
+    "/sessions/{session_name}/terminals:operator",
+    response_model=Terminal,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_terminal_in_session_as_operator(
+    request: Request,
+    session_name: str,
+    agent_profile: str,
+    provider: Optional[str] = None,
+    working_directory: Optional[str] = None,
+    allowed_tools: Optional[str] = None,
+    engine: Optional[KiroEngine] = None,
+    model: Optional[str] = None,
+    use_worktree: bool = False,
+    idempotency_key: Optional[str] = None,
+    body: Optional[OperatorTerminalBody] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Terminal:
+    """Add a terminal to an EXISTING session as the operator.
+
+    The sibling ``POST /sessions/{name}/terminals`` is how a running terminal
+    adds a worker beside itself and requires ``caller_id`` (403 without it);
+    ``POST /sessions`` is the operator's launch but always starts a NEW
+    session. This is the operator's form of the in-session create: no
+    delegating terminal exists, so the new terminal records the profile's
+    declared ceiling exactly as a ``POST /sessions`` launch does. The Web UI's
+    "Add Agent" action uses it.
+
+    It is a distinct sub-path rather than a flag on the sibling so that no
+    request shape a client already sends can land here by accident: an older
+    agent client that omits ``caller_id`` on the sibling still gets its 403,
+    and nothing it sends is reinterpreted as an operator launch. A request
+    that reaches this path AND names a caller (``caller_id``,
+    ``caller_ceiling`` or ``delegating_terminal_id`` in the query or body, or
+    a body ``env_vars`` carrying the remote-assign callback environment) is
+    refused with 400: that is an agent asking to be recorded unbounded while
+    still identifying itself, and the caller-identified create belongs on the
+    sibling route where the ceiling applies.
+
+    Residual, shared with ``POST /sessions``: under the shared bearer the
+    server cannot tell an operator client from an agent's process that chooses
+    to send no identity at all (docs/tool-restrictions.md, "What the server can
+    and cannot know"); binding caller identity to an authenticated terminal is
+    the tracked follow-up. Synchronous only: no ``defer_init``, no initial
+    message; a message is sent to the created terminal afterwards.
+    """
+    try:
+        validate_tmux_name(session_name, "session_name")
+        if model is not None:
+            _validate_model_id(model)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    identity = _caller_identity_in_operator_request(request, body)
+    if identity:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "the operator form of the in-session create carries no caller identity, "
+                f"but this request names one ({', '.join(identity)}). A terminal created "
+                "on behalf of a delegating terminal uses POST /sessions/{name}/terminals "
+                "with caller_id, where the caller's recorded delegation ceiling applies."
+            ),
+        )
+    try:
+        if provider is None:
+            resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
+        else:
+            resolved_provider = provider
+        allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
+
+        # No caller_id, delegating_terminal_id or caller_ceiling: the operator
+        # branch of create_terminal, which records the profile's declared
+        # ceiling (test_launch_path_invariant.py classifies this site).
+        return await terminal_service.create_terminal(
+            provider=resolved_provider,
+            agent_profile=agent_profile,
+            session_name=session_name,
+            new_session=False,
+            working_directory=working_directory,
+            allowed_tools=allowed_tools_list,
+            registry=get_plugin_registry(request),
+            description=body.description if body else None,
+            engine=engine,
+            model=model,
+            use_worktree=use_worktree,
+            idempotency_key=idempotency_key,
+        )
+    except HTTPException:
+        raise
+    except IdempotencyKeyConflict as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except (KiroPhase0KASError, KiroCapabilityError, KiroAgentPathError) as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except TerminalLimitError as e:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+    except EphemeralPolicyError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
+    except DelegationCeilingError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e)) from None
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except WorktreeError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         raise HTTPException(

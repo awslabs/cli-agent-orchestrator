@@ -514,6 +514,23 @@ def launch(
         click.echo(f"Session created: {terminal['session_name']}")
         click.echo(f"Terminal created: {terminal['name']}")
 
+        # --memory-manager: the sidecar is bounded by the primary's recorded
+        # delegation ceiling, and under a narrow primary the server refuses it.
+        # The refusal rides on the response (``memory_manager``) so it is said
+        # here, where the operator is, instead of only in the server log; the
+        # primary itself launched.
+        sidecar = terminal.get("memory_manager") if isinstance(terminal, dict) else None
+        if memory and isinstance(sidecar, dict) and sidecar.get("state") == "refused":
+            click.echo(
+                click.style(
+                    "  WARNING: the memory_manager sidecar was NOT launched.\n"
+                    f"  {sidecar.get('detail') or 'the server refused it'}\n"
+                    "  See docs/tool-restrictions.md (`cao launch --memory` needs a primary "
+                    "ceiling covering @cao-mcp-server, fs_read, fs_list).\n",
+                    fg="yellow",
+                )
+            )
+
         # Attach to tmux session unless headless. Wait for the provider to
         # finish initializing first — otherwise tmux attach races with the
         # TUI's input handler wiring, resizes the pty mid-init, and the TUI

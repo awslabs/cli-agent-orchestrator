@@ -17,14 +17,26 @@ Two kinds of launch site are found under ``src/``:
   ``POST /sessions/{name}/terminals``, ``POST /terminals/run-step``, and the
   workflow run/submit/resume/replay routes, whose steps create terminals.
 
-A site THREADS a ceiling when the call passes ``caller_id``,
-``delegating_terminal_id`` or ``caller_ceiling``, or when the enclosing function
-(or a same-module helper it calls) names one of those keys, which is how the
-HTTP clients carry the caller. Every other site must appear in
+A site THREADS a ceiling when the key reaches THAT launch: an in-process call
+passes ``caller_id``, ``delegating_terminal_id`` or ``caller_ceiling`` as a
+keyword, or an HTTP post's payload (its ``json=``/``params=``/``data=``
+argument) carries one of those keys. The payload is followed by data flow
+inside the enclosing function: a dict literal with the key, a ``payload[key] =``
+store, ``payload.update({key: ...})``, or the payload handed to a same-module
+helper that does one of those to its parameter (``_attach_terminal_caller``).
+Naming a key elsewhere in the function does NOT count: ``caller_id`` is also the
+callback-routing field (#284), so a presence check would classify a new launch
+inside such a function as bounded without the key ever being sent (the first
+review of PR #948 showed exactly that gap). Every other site must appear in
 ``OPERATOR_PATHS`` below with a one-line justification saying why no ceiling
 applies (an operator, not an agent, is the authority there). A launch path added
 later fails this test until it threads a ceiling or is classified here, and a
 classified path that disappears fails it too, so the allowlist cannot go stale.
+
+This is a structural guard over the SHAPE of every site; the per-path mutation
+tests (``test_delegation_forwarding_invariant.py`` and the kwarg-drop tests in
+the workflow, handoff and script-tier suites) carry the behavioural guarantee
+that a forwarded key actually causes the refusal.
 """
 
 from __future__ import annotations
@@ -40,6 +52,7 @@ PACKAGES = (SRC / "cli_agent_orchestrator", SRC / "cao_workflow")
 LAUNCH_FUNCTIONS = {"create_terminal", "run_agent_step", "create_session"}
 CEILING_KEYS = {"caller_id", "delegating_terminal_id", "caller_ceiling"}
 HTTP_POST_HELPERS = {"post", "_post_json", "_post"}
+PAYLOAD_KEYWORDS = {"json", "params", "data"}
 ROUTE_CONSTANTS = {
     "_RUN_STEP_PATH": "/terminals/run-step",
     "TERMINALS_RUN_STEP_ROUTE": "/terminals/run-step",
@@ -72,6 +85,12 @@ OPERATOR_PATHS: Dict[str, str] = {
         "MCP Apps launch action is driven from the operator-facing widget; it "
         "posts an operator-shaped POST /sessions"
     ),
+    "cli_agent_orchestrator/api/main.py::create_terminal_in_session_as_operator": (
+        "the operator form of the in-session create (Web UI Add Agent): a distinct "
+        "sub-path that refuses any caller identity (400) and records the profile's "
+        "declared ceiling like POST /sessions; the sibling route keeps requiring "
+        "caller_id (test_delegation_api.py pins both)"
+    ),
     "cli_agent_orchestrator/utils/orchestration.py::_run_step_and_build_result": (
         "posts the payload _handoff_impl builds, which carries caller_id locally "
         "and caller_ceiling for target_host (test_handoff.py, test_remote_target.py, "
@@ -88,6 +107,7 @@ OPERATOR_PATHS: Dict[str, str] = {
 SENTINELS = {
     "cli_agent_orchestrator/services/agent_step.py::run_agent_step",
     "cli_agent_orchestrator/api/main.py::create_terminal_in_session",
+    "cli_agent_orchestrator/api/main.py::create_terminal_in_session_as_operator",
     "cli_agent_orchestrator/services/workflow_service.py::_run_step",
     "cli_agent_orchestrator/utils/orchestration.py::_assign_remote",
 }
@@ -186,22 +206,94 @@ def _http_launch_url(call: ast.Call, consts: Dict[str, object]) -> Optional[str]
     return rendered if LAUNCH_ROUTE.search(path) else None
 
 
-def _names_in(node: ast.AST) -> Set[str]:
-    found: Set[str] = set()
-    for sub in ast.walk(node):
-        if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
-            found.add(sub.value)
-        elif isinstance(sub, ast.keyword) and sub.arg:
-            found.add(sub.arg)
-    return found
+def _dict_ceiling_keys(node: ast.AST) -> Set[str]:
+    """Ceiling keys among the string keys of a dict literal (``{}`` or ``dict(...)``)."""
+    if isinstance(node, ast.Dict):
+        return {
+            k.value
+            for k in node.keys
+            if isinstance(k, ast.Constant) and isinstance(k.value, str) and k.value in CEILING_KEYS
+        }
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "dict":
+        return {kw.arg for kw in node.keywords if kw.arg in CEILING_KEYS}
+    return set()
 
 
-def _called_simple_names(node: ast.AST) -> Set[str]:
-    return {
-        sub.func.id
-        for sub in ast.walk(node)
-        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
-    }
+def _payload_names(expr: ast.AST) -> Set[str]:
+    """Variable names an argument expression reads (``payload``, ``body or None``)."""
+    return {n.id for n in ast.walk(expr) if isinstance(n, ast.Name)}
+
+
+def _writes_ceiling_key_into(function: ast.AST, names: Set[str]) -> bool:
+    """Does ``function`` put a ceiling key into any variable in ``names``?
+
+    ``name = {key: ...}``, ``name[key] = ...``, ``name.update({key: ...})`` and
+    ``name.setdefault(key, ...)`` all count; naming the key anywhere else does not.
+    """
+    for node in ast.walk(function):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id in names:
+                    if node.value is not None and _dict_ceiling_keys(node.value):
+                        return True
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in names
+                    and isinstance(target.slice, ast.Constant)
+                    and target.slice.value in CEILING_KEYS
+                ):
+                    return True
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            base = node.func.value
+            if isinstance(base, ast.Name) and base.id in names:
+                if node.func.attr == "update" and node.args and _dict_ceiling_keys(node.args[0]):
+                    return True
+                if (
+                    node.func.attr == "setdefault"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value in CEILING_KEYS
+                ):
+                    return True
+    return False
+
+
+def _http_payload_threads(
+    call: ast.Call, function: Optional[ast.AST], functions: Dict[str, ast.AST]
+) -> bool:
+    """Whether a ceiling key flows into THIS post call's payload.
+
+    Inline: the ``json=``/``params=``/``data=`` argument is a dict literal with the
+    key. By name: the argument reads variables that the enclosing function writes
+    the key into (``_writes_ceiling_key_into``), or that it passes positionally to
+    a same-module helper which writes the key into the matching parameter.
+    """
+    payload_args = [kw.value for kw in call.keywords if kw.arg in PAYLOAD_KEYWORDS]
+    if any(_dict_ceiling_keys(arg) for arg in payload_args):
+        return True
+    if function is None:
+        return False
+    names: Set[str] = set()
+    for arg in payload_args:
+        names |= _payload_names(arg)
+    if not names:
+        return False
+    if _writes_ceiling_key_into(function, names):
+        return True
+    for node in ast.walk(function):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+            continue
+        helper = functions.get(node.func.id)
+        if helper is None:
+            continue
+        params = [a.arg for a in helper.args.args]
+        for position, arg in enumerate(node.args):
+            if isinstance(arg, ast.Name) and arg.id in names and position < len(params):
+                if _writes_ceiling_key_into(helper, {params[position]}):
+                    return True
+    return False
 
 
 def _functions(tree: ast.Module) -> Dict[str, ast.AST]:
@@ -259,14 +351,11 @@ def launch_sites() -> Dict[str, dict]:
                     # delegating to its body) is not a new path.
                     continue
                 key = f"{rel}::{function}"
-                call_kwargs = {kw.arg for kw in call.keywords if kw.arg}
-                threads = bool(call_kwargs & CEILING_KEYS)
-                if not threads and function in functions:
-                    body = functions[function]
-                    names = _names_in(body)
-                    for helper in _called_simple_names(body) & set(functions):
-                        names |= _names_in(functions[helper])
-                    threads = bool(names & CEILING_KEYS)
+                if kind == "call":
+                    call_kwargs = {kw.arg for kw in call.keywords if kw.arg}
+                    threads = bool(call_kwargs & CEILING_KEYS)
+                else:
+                    threads = _http_payload_threads(call, functions.get(function), functions)
                 entry = sites.setdefault(
                     key, {"kinds": set(), "details": set(), "threads": False, "line": call.lineno}
                 )

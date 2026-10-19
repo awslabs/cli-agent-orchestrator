@@ -717,8 +717,14 @@ export const api = {
   },
   getWorkingDirectory: (id: string) =>
     fetchJSON<{ working_directory: string | null }>(`/terminals/${id}/working-directory`),
+  // The operator form of the in-session create. `POST /sessions/{name}/terminals`
+  // is the agents' route and requires caller_id (403 without it); the UI has no
+  // delegating terminal, so it uses the distinct `:operator` sub-path, which the
+  // server records like a `POST /sessions` launch. test/api/test_web_client_contract.py
+  // posts this exact shape at the real route, so a server-side tightening that
+  // breaks this button fails CI instead of the browser.
   addTerminalToSession: (sessionName: string, provider: string, agentProfile: string, workingDirectory?: string) =>
-    fetchJSON<Terminal>(`/sessions/${sessionName}/terminals?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: 90000 }),
+    fetchJSON<Terminal>(`/sessions/${sessionName}/terminals:operator?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: 90000 }),
 
   // Inbox
   getInboxMessages: (terminalId: string, limit?: number, status?: string) =>

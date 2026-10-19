@@ -839,14 +839,19 @@ def _request_fingerprint(
     claim_id: Optional[str] = None,
     description: Optional[str] = None,
     caller_ceiling: Optional[List[str]] = None,
+    delegating_terminal_id: Optional[str] = None,
 ) -> str:
     """Fingerprint the create-terminal request an idempotency key stands for.
 
     ``caller_ceiling`` (a remote caller's asserted delegation ceiling, see
-    ``create_terminal``) is appended ONLY when supplied, like ``claim_id``, so
-    every request that does not carry it keeps the digest it had before the
-    field existed. It is hashed because it decides the created terminal's
-    recorded ceiling, i.e. a privilege, exactly as ``allowed_tools`` does.
+    ``create_terminal``) and ``delegating_terminal_id`` (the terminal whose
+    recorded ceiling bounds the create when no ``caller_id`` names it: workflow
+    steps, the memory sidecar) are appended ONLY when supplied, like
+    ``claim_id``, so every request that does not carry them keeps the digest it
+    had before the fields existed. Both are hashed because each decides the
+    created terminal's recorded ceiling, i.e. a privilege, exactly as
+    ``allowed_tools`` does: two keyed creates that differ only in the bounding
+    terminal must collide (409), not resolve to the first one's terminal.
 
     Review on PR #634, issue #616. Stored alongside the key so a later call
     presenting the same key can be told apart: same fingerprint is a RETRY
@@ -1033,6 +1038,8 @@ def _request_fingerprint(
         parts.append(
             _FP_TOOLS_SET + "".join(_fingerprint_component(t) for t in sorted(caller_ceiling))
         )
+    if delegating_terminal_id is not None:
+        parts.extend(["delegating_terminal_id", delegating_terminal_id])
     return hashlib.sha256(
         "\x00".join(_fingerprint_component(part) for part in parts).encode("utf-8")
     ).hexdigest()
@@ -1414,6 +1421,7 @@ async def _create_terminal_unguarded(
             claim_id,
             description,
             caller_ceiling=caller_ceiling,
+            delegating_terminal_id=delegating_terminal_id,
         )
         existing_record = get_idempotency_record(idempotency_key)
         existing_terminal_id = existing_record.terminal_id if existing_record else None
@@ -1660,8 +1668,10 @@ async def _create_terminal_unguarded(
             # request would take the operator branch below and launch unbounded,
             # which is exactly what an older or edited client would produce. When
             # the callback terminal happens to have a row on THIS node (loopback,
-            # single-node fleets), the asserted ceiling must also fit inside what
-            # that row records; the row wins over the assertion.
+            # single-node fleets), the asserted ceiling must fit inside what that
+            # row records, and the ASSERTION then bounds the child: it is equal to
+            # or narrower than the row, so using it never widens, and a client
+            # that narrowed its own ceiling gets the narrower bound it asked for.
             remote_marker = (env_vars or {}).get(CALLBACK_TERMINAL_ID_ENV)
             if remote_marker and caller_ceiling is None:
                 raise DelegationCeilingError(
@@ -1731,7 +1741,22 @@ async def _create_terminal_unguarded(
             from cli_agent_orchestrator.utils.tool_mapping import kiro_agent_tools
 
             installed = installed_kiro_tools(agent_profile)
-            if installed is not None:
+            if installed is None:
+                # No readable agent file with a `tools` list: on Kiro the installed
+                # file IS the policy, so the server cannot say what this launch
+                # would run. A bounded create fails closed here rather than
+                # skipping the check; the operator path is untouched (Kiro would
+                # fail to start the agent anyway, this just names the reason).
+                raise InstalledPolicyExceedsAllowlistError(
+                    f"Delegation refused: no installed Kiro agent file with a `tools` list "
+                    f"was found for '{agent_profile}', so the policy this bounded launch "
+                    f"would run cannot be compared with the creator's delegation ceiling "
+                    f"[{', '.join(allowed_tools)}]. Remedy: `cao install {agent_profile} "
+                    f"--provider kiro_cli`, then retry.",
+                    parent_id=bounding_id,
+                    child_profile=agent_profile,
+                )
+            else:
                 permitted = set(kiro_agent_tools(allowed_tools))
                 wider = [tool for tool in installed if tool not in permitted]
                 if wider:
@@ -3884,6 +3909,56 @@ def _schedule_deferred_init(
 
     task.add_done_callback(_on_done)
     return task
+
+
+def memory_sidecar_refusal(
+    primary: Terminal, *, provider: str, sidecar_profile: str = "memory_manager"
+) -> Optional[str]:
+    """Why the ``memory_manager`` sidecar would be refused under ``primary``, or ``None``.
+
+    The sidecar is created with ``delegating_terminal_id=primary.id`` and so is
+    bounded by the primary's RECORDED ceiling in Step 0c. Its profile resolves
+    (``role: supervisor``, no ``allowedTools``) to ``@cao-mcp-server, fs_read,
+    fs_list``, which a narrow primary (``workflow_scout`` lacks ``fs_list``; a
+    profile with an explicit ``allowedTools`` list lacks ``@cao-mcp-server``)
+    does not cover. ``POST /sessions`` asks this BEFORE scheduling the
+    background create so the refusal reaches the operator in the response
+    instead of only a server log line. Same comparator, same text as the
+    refusal the create would raise. Returns ``None`` when the sidecar fits, and
+    also when the primary's ceiling is not readable from the response (no
+    ``delegate_tools`` and no ``allowed_tools``): then the create itself decides
+    and logs, exactly as before.
+    """
+    ceiling = (
+        primary.delegate_tools if primary.delegate_tools is not None else primary.allowed_tools
+    )
+    if ceiling is None:
+        return None
+    try:
+        profile, _ = agent_profiles.load_launch_profile(sidecar_profile)
+    except Exception:  # noqa: BLE001  (an unresolvable sidecar profile is the create's problem)
+        return None
+    if not isinstance(profile, AgentProfile):
+        return None
+    from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
+    from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+    sidecar_tools = resolve_allowed_tools(
+        profile.allowedTools, profile.role, grantable_server_names(profile)
+    )
+    excess = delegation.tools_exceeding(sidecar_tools, ceiling)
+    if not excess:
+        return None
+    return delegation.describe_rejection(
+        parent_id=primary.id,
+        parent_profile=primary.agent_profile,
+        child_profile=sidecar_profile,
+        excess=excess,
+        ceiling=ceiling,
+    ) + (
+        " The memory_manager sidecar (`cao launch --memory`, memory_manager=true) needs a primary whose delegation "
+        "ceiling covers @cao-mcp-server, fs_read and fs_list; it was not launched."
+    )
 
 
 def callback_terminal_id_for_session(session_name: Optional[str]) -> Optional[str]:

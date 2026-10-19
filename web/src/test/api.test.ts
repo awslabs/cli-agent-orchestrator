@@ -112,12 +112,28 @@ describe('API wrapper', () => {
     )
   })
 
-  it('addTerminalToSession sends POST with opencode_cli provider', async () => {
+  it('addTerminalToSession posts the operator form of the in-session create', async () => {
+    // `/sessions/{name}/terminals` requires caller_id since the delegation
+    // ceiling landed; the UI is the operator and must use `:operator`, and it
+    // must never send a caller identity (the server refuses that shape).
     const terminal = { id: 't3', name: 'dev', provider: 'opencode_cli', session_name: 's1' }
     mockResponse(terminal)
     await api.addTerminalToSession('s1', 'opencode_cli', 'developer')
     expect(mockFetch).toHaveBeenCalledWith(
-      expect.stringContaining('/sessions/s1/terminals?provider=opencode_cli&agent_profile=developer'),
+      expect.stringContaining('/sessions/s1/terminals:operator?provider=opencode_cli&agent_profile=developer'),
+      expect.objectContaining({ method: 'POST' })
+    )
+    const [url, opts] = mockFetch.mock.calls[0]
+    expect(url).not.toContain('caller_id')
+    expect(url).not.toContain('caller_ceiling')
+    expect(opts.body).toBeUndefined()
+  })
+
+  it('addTerminalToSession includes working directory when provided', async () => {
+    mockResponse({ id: 't3' })
+    await api.addTerminalToSession('s1', 'kiro_cli', 'developer', '/home/user/project')
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.stringMatching(/\/sessions\/s1\/terminals:operator\?.*working_directory=%2Fhome%2Fuser%2Fproject/),
       expect.objectContaining({ method: 'POST' })
     )
   })

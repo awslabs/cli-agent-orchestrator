@@ -459,3 +459,112 @@ def test_installed_opencode_permission_reader(tmp_path):
     assert installed_opencode_permission("developer", agents) == {"bash": "allow", "read": "allow"}
     (agents / "odd.md").write_text(frontmatter.dumps(frontmatter.Post("x", permission="allow")))
     assert installed_opencode_permission("odd", agents) is None
+
+
+# ---------------------------------------------------------------------------
+# Round 4: Kiro Step 0d fails closed on a missing agent file; the idempotency
+# fingerprint hashes the delegating terminal.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_kiro_bounded_launch_without_an_installed_agent_file_is_refused(launch, kiro_install):
+    """``installed_kiro_tools`` answers None for a missing or unreadable file. On Kiro
+    the installed file IS the policy, so a bounded create that cannot read it is
+    refused with the install remedy rather than skipping the comparison."""
+    from cli_agent_orchestrator.utils.delegation import InstalledPolicyExceedsAllowlistError
+
+    _seed("0000beef", "reviewer", REVIEWER, REVIEWER)
+    # No kiro_install(...): the agent directory holds no developer.json.
+    with pytest.raises(InstalledPolicyExceedsAllowlistError) as excinfo:
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-sess",
+            new_session=False,
+            caller_id="0000beef",
+            allowed_tools=["fs_read"],
+        )
+    message = str(excinfo.value)
+    assert "no installed Kiro agent file" in message
+    assert "cao install developer --provider kiro_cli" in message
+    assert excinfo.value.status_code == 403
+    assert excinfo.value.parent_id == "0000beef"
+
+
+@pytest.mark.asyncio
+async def test_kiro_bounded_launch_with_an_unreadable_agent_file_is_refused(
+    launch, kiro_install, tmp_path
+):
+    from cli_agent_orchestrator.utils.delegation import InstalledPolicyExceedsAllowlistError
+
+    _seed("0000beef", "reviewer", REVIEWER, REVIEWER)
+    (tmp_path / "developer.json").write_text("{not json")
+    with pytest.raises(InstalledPolicyExceedsAllowlistError):
+        await create_terminal(
+            "kiro_cli",
+            "developer",
+            session_name="cao-sess",
+            new_session=False,
+            caller_id="0000beef",
+            allowed_tools=["fs_read"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_kiro_operator_launch_without_an_installed_file_is_not_refused(launch, kiro_install):
+    """The operator path is untouched: no caller, no ceiling comparison to fail closed on."""
+    child = await create_terminal(
+        "kiro_cli",
+        "developer",
+        session_name="cao-sess",
+        new_session=False,
+        allowed_tools=["fs_read"],
+    )
+    assert child.allowed_tools == ["fs_read"]
+
+
+@pytest.mark.asyncio
+async def test_kiro_unrestricted_delegator_without_an_installed_file_is_not_refused(
+    launch, kiro_install
+):
+    """A ``*`` ceiling has nothing the installed file could exceed; the warning path stays."""
+    _seed("0000beef", "sup", SUPERVISOR, ["*"])
+    child = await create_terminal(
+        "kiro_cli",
+        "developer",
+        session_name="cao-sess",
+        new_session=False,
+        caller_id="0000beef",
+        allowed_tools=["fs_read"],
+    )
+    assert child.allowed_tools == ["fs_read"]
+
+
+def test_fingerprint_hashes_the_delegating_terminal():
+    """Two keyed creates differing only in the bounding terminal must not resolve to
+    one terminal: the bound decides the recorded ceiling, a privilege, like
+    ``allowed_tools``. Requests without the field keep their pre-existing digest."""
+    from cli_agent_orchestrator.services.terminal_service import _request_fingerprint
+
+    base = dict(
+        provider="claude_code",
+        agent_profile="memory_manager",
+        session_name="cao-sess",
+        working_directory=None,
+        caller_id=None,
+        model=None,
+        use_worktree=False,
+        engine=None,
+        allowed_tools=None,
+        env_vars=None,
+        resume_session_id=None,
+        initial_message=None,
+        initial_message_orchestration_type=None,
+    )
+    bound_a = _request_fingerprint(**base, delegating_terminal_id="0000beef")
+    bound_b = _request_fingerprint(**base, delegating_terminal_id="0000cafe")
+    unbound = _request_fingerprint(**base)
+    assert bound_a != bound_b
+    assert bound_a != unbound
+    assert unbound == _request_fingerprint(**base, delegating_terminal_id=None)
