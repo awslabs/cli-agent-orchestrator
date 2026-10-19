@@ -23,7 +23,7 @@ grant unlimited headroom); so does an allowlist row that no longer matches
 anything, so the tables can only shrink. The failure message names
 ``file:line`` and what to do.
 
-Cost: one ``ast.parse`` of every module under ``src/`` (276 files), cached
+Cost: one ``ast.parse`` of every module under ``src/`` (269 files), cached
 across the rules by ``callsite_lint.parse_sources``. Measured at well under a
 second on this tree; see the PR description for the number.
 """
@@ -258,7 +258,7 @@ def test_enum_subset_literals_are_deliberate() -> None:
 # attribute, a call or an arithmetic expression -- deriving the number is the
 # behaviour being asked for, so it has to pass silently.
 #
-# Every row below carries a one-line justification. Four are flagged as
+# Every row below carries a one-line justification. Five are flagged as
 # genuinely questionable rather than rubber-stamped; their reasons start with
 # "SUSPECT" and the PR description repeats them.
 
