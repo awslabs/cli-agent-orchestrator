@@ -455,10 +455,16 @@ def _read_agent_profile_source(agent_name: str) -> str:
 
 
 def installed_profile_exists(agent_name: str) -> bool:
-    """Probe installed stores without reserved-name routing or environment expansion."""
+    """Probe installed stores without reserved-name routing or environment expansion.
+
+    Catches ``ValueError`` as well as ``FileNotFoundError``: a listed name containing ``..`` (e.g. a
+    stray ``v1..v2`` directory under the agent store) makes ``_validate_agent_name`` raise rather than
+    return ``False``, which would otherwise propagate out of ``profile_set_digest`` and NULL every
+    manifest (issue #827 fixup).
+    """
     try:
         _read_installed_agent_profile_source(agent_name)
-    except FileNotFoundError:
+    except (FileNotFoundError, ValueError):
         return False
     return True
 
