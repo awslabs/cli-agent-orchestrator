@@ -35,9 +35,11 @@ to catch, so the assertions below are:
    Vite emits five (``index.html``, two favicons, one hashed CSS bundle, one hashed JS
    bundle); the set is read from the tree rather than hardcoded because the bundle names
    carry a content hash that changes on every web change.
-2. Every ``/assets/...`` URL that ``index.html`` itself references resolves to a wheel
-   member. This is the operator-visible property directly, and unlike (1) it also fails
-   for a wheel faithfully packaging an incomplete *source* build.
+2. Every root-relative local URL that ``index.html`` itself references (bundles AND
+   favicons) resolves to a wheel member. This is the operator-visible property directly,
+   and unlike (1) it also fails for a wheel faithfully packaging an incomplete *source*
+   build — including one that never wrote a referenced favicon, which (1) cannot catch
+   because it derives its expected set from files that are already present.
 
 Assertion (2) would be vacuously true for an ``index.html`` that references nothing, so
 the referenced-asset set is itself asserted non-empty.
@@ -63,10 +65,13 @@ WEB_UI_INDEX = WEB_UI_DIR / "index.html"
 WHEEL_WEB_UI_PREFIX = "cli_agent_orchestrator/web_ui/"
 WHEEL_MEMBER = WHEEL_WEB_UI_PREFIX + "index.html"
 
-# `src="/assets/index-<hash>.js"` / `href="/assets/index-<hash>.css"`. Vite writes these
-# as ROOT-RELATIVE URLs, which the StaticFiles mount at `/` serves out of the same
-# `web_ui/` directory — so the leading slash maps to WHEEL_WEB_UI_PREFIX.
-_ASSET_URL_RE = re.compile(r"""(?:src|href)=["'](/assets/[^"']+)["']""")
+# `src="/assets/index-<hash>.js"` / `href="/assets/index-<hash>.css"` / `href="/favicon.svg"`.
+# Vite writes these as ROOT-RELATIVE URLs, which the StaticFiles mount at `/` serves out of
+# the same `web_ui/` directory — so the leading slash maps to WHEEL_WEB_UI_PREFIX. Matches
+# any local root-relative reference (not just `/assets/*`) so dropped favicons are caught
+# too (issue #705 follow-up); excludes `?`/`#` so a querystring or fragment is not folded
+# into the file name.
+_ASSET_URL_RE = re.compile(r"""(?:src|href)=["'](/[^"':?#]+)["']""")
 
 
 def _built_web_ui_files() -> set[str]:
@@ -83,9 +88,38 @@ def _built_web_ui_files() -> set[str]:
 
 
 def _assets_referenced_by_index() -> set[str]:
-    """Wheel member names for the ``/assets/...`` URLs ``index.html`` loads."""
+    """Wheel member names for every root-relative local URL ``index.html`` loads."""
     html = WEB_UI_INDEX.read_text(encoding="utf-8")
     return {WHEEL_WEB_UI_PREFIX + url.lstrip("/") for url in _ASSET_URL_RE.findall(html)}
+
+
+def _build_wheel_members(tmp_path: Path) -> set[str]:
+    """Run the real ``uv build`` -> hatchling pipeline and return the wheel's member names."""
+    env = dict(os.environ)
+    # This test only cares about web_ui/; disable the TUI's own build-time autobuild so
+    # building one wheel here does not also trigger an unrelated `cargo build` (issue #610
+    # is unrelated to the Rust binary, and a cargo compile would make this test slow and
+    # dependent on a toolchain/network it does not need).
+    env["CAO_TUI_AUTOBUILD"] = "0"
+
+    result = subprocess.run(
+        ["uv", "build", "--wheel", "--out-dir", str(tmp_path)],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, (
+        f"uv build failed (exit {result.returncode}):\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+
+    wheels = sorted(tmp_path.glob("*.whl"))
+    assert wheels, f"uv build reported success but produced no .whl in {tmp_path}"
+
+    with zipfile.ZipFile(wheels[0]) as zf:
+        return set(zf.namelist())
 
 
 def web_ui_build_is_complete() -> bool:
@@ -123,38 +157,14 @@ def web_ui_build_is_complete() -> bool:
 )
 def test_wheel_ships_the_web_ui(tmp_path):
     """Building a wheel from a tree with web_ui/ present must include ALL of it."""
-    env = dict(os.environ)
-    # This test only cares about web_ui/; disable the TUI's own build-time autobuild so
-    # building one wheel here does not also trigger an unrelated `cargo build` (issue #610
-    # is unrelated to the Rust binary, and a cargo compile would make this test slow and
-    # dependent on a toolchain/network it does not need).
-    env["CAO_TUI_AUTOBUILD"] = "0"
-
-    result = subprocess.run(
-        ["uv", "build", "--wheel", "--out-dir", str(tmp_path)],
-        cwd=REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    assert result.returncode == 0, (
-        f"uv build failed (exit {result.returncode}):\n"
-        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    )
-
-    wheels = sorted(tmp_path.glob("*.whl"))
-    assert wheels, f"uv build reported success but produced no .whl in {tmp_path}"
-
-    with zipfile.ZipFile(wheels[0]) as zf:
-        names = set(zf.namelist())
+    names = _build_wheel_members(tmp_path)
 
     web_ui_members = sorted(n for n in names if n.startswith(WHEEL_WEB_UI_PREFIX))
 
     # The entry point, called out separately so its absence reads as issue #610 verbatim
     # rather than as one line in a set diff.
     assert WHEEL_MEMBER in names, (
-        f"{wheels[0].name} does not contain {WHEEL_MEMBER!r} — the web dashboard would "
+        f"the built wheel does not contain {WHEEL_MEMBER!r} — the web dashboard would "
         f"404 at GET / exactly as in issue #610. web_ui/ members found: "
         f"{web_ui_members or 'none'}"
     )
@@ -166,7 +176,7 @@ def test_wheel_ships_the_web_ui(tmp_path):
     built = _built_web_ui_files()
     missing = sorted(built - names)
     assert not missing, (
-        f"{wheels[0].name} is missing {len(missing)} of {len(built)} built web UI "
+        f"the built wheel is missing {len(missing)} of {len(built)} built web UI "
         f"files: {missing}. The `[tool.hatch.build] artifacts` glob for web_ui/ no "
         f"longer covers the whole build output — a wheel that ships index.html without "
         f"its bundles serves GET / as a blank page whose JS and CSS 404 (issues "
@@ -176,10 +186,20 @@ def test_wheel_ships_the_web_ui(tmp_path):
     # (2) The operator-visible property: what index.html loads is actually in the wheel.
     referenced = _assets_referenced_by_index()
     assert referenced, (
-        "index.html references no /assets/* URL, so there is nothing for this assertion "
-        "to check. Either the Vite build changed how it emits bundles (update "
-        "_ASSET_URL_RE) or the built index.html is not a real build product; a vacuous "
-        "pass here is the false assurance issue #705 reports."
+        "index.html references no local URL, so there is nothing for this assertion to "
+        "check. Either the Vite build changed how it emits bundles (update _ASSET_URL_RE) "
+        "or the built index.html is not a real build product; a vacuous pass here is the "
+        "false assurance issue #705 reports."
+    )
+    # A stripped index.html referencing only favicons would otherwise satisfy the
+    # non-vacuity check above without exercising the bundle it exists to protect.
+    assert any(name.endswith(".js") for name in referenced), (
+        "index.html references no .js bundle; _ASSET_URL_RE may need updating, or "
+        "index.html is not a real build product."
+    )
+    assert any(name.endswith(".css") for name in referenced), (
+        "index.html references no .css bundle; _ASSET_URL_RE may need updating, or "
+        "index.html is not a real build product."
     )
     unresolved = sorted(referenced - names)
     assert not unresolved, (
@@ -188,3 +208,47 @@ def test_wheel_ships_the_web_ui(tmp_path):
         f"those requests 404 — issue #610's symptom with the packaging check green "
         f"(#705). web_ui/ members found: {web_ui_members}"
     )
+
+
+@pytest.mark.skipif(
+    not (WEB_UI_DIR / "favicon.svg").is_file(),
+    reason="src/cli_agent_orchestrator/web_ui/favicon.svg does not exist — build the web UI first.",
+)
+def test_wheel_omitting_a_referenced_favicon_is_caught(tmp_path):
+    """Negative control for issue #705's favicon gap.
+
+    A source build that writes ``index.html`` with a ``<link rel="icon">`` to
+    ``favicon.svg`` but never emits that file (e.g. a Vite/``public/`` regression) must
+    fail assertion (2), not pass with ``favicon.svg`` silently absent from the wheel.
+    Before ``_ASSET_URL_RE`` covered non-``/assets/*`` references, this case produced a
+    false green.
+    """
+    favicon = WEB_UI_DIR / "favicon.svg"
+    moved_aside = Path(str(favicon) + ".movedforissue705test")
+    favicon.rename(moved_aside)
+    try:
+        assert not web_ui_build_is_complete(), (
+            "web_ui_build_is_complete() returned True with favicon.svg missing from the "
+            "source tree; it must fail closed on every local URL index.html references, "
+            "not just /assets/* bundles (issue #705 follow-up)."
+        )
+
+        names = _build_wheel_members(tmp_path)
+        referenced = _assets_referenced_by_index()
+        favicon_member = WHEEL_WEB_UI_PREFIX + "favicon.svg"
+        assert favicon_member in referenced, (
+            "index.html no longer references favicon.svg — fixture assumption broken, "
+            "update this test to match web/index.html."
+        )
+        assert favicon_member not in names, (
+            "favicon.svg was moved out of the source tree before packaging, so the "
+            "built wheel should not contain it; found it anyway."
+        )
+        unresolved = sorted(referenced - names)
+        assert favicon_member in unresolved, (
+            "index.html references favicon.svg, which is absent from both the source "
+            "tree and the wheel, but assertion (2)'s unresolved-reference check did not "
+            "flag it — this is exactly the false green issue #705 reports."
+        )
+    finally:
+        moved_aside.rename(favicon)
