@@ -96,7 +96,13 @@ MODULE_SCOPE = "<module>"
 # configured and only falls back to the in-process service for a local,
 # single-host install. The remote fallback is
 # ``services.memory_gateway`` (``remote_memory_url()`` gate + ``store_memory`` /
-# ``recall_memory`` / ``forget_memory``, which POST to the ``/memory`` routes).
+# ``recall_memory`` / ``forget_memory``, which POST to the
+# ``/internal/memory/{store,recall,forget}`` routes on the remote Backplane).
+#
+# Caveat worth knowing: ``memory_gateway`` itself imports ``MemoryService`` at
+# module scope (memory_gateway.py:15-19), so even the remote path still binds
+# ``clients.database`` into the MCP process. The gate proves intent, not
+# physical isolation; see the note in the PR for #9010.
 DUAL_MODE_ALLOWLIST: Dict[Tuple[str, str, str], str] = {
     (
         "mcp_server/server.py",
@@ -118,17 +124,25 @@ DUAL_MODE_ALLOWLIST: Dict[Tuple[str, str, str], str] = {
         "mcp_server/server.py",
         "memory_store",
         "cli_agent_orchestrator.services.memory_service",
-    ): "dual-mode: remote fallback is memory_gateway.store_memory (POST /memory)",
+    ): (
+        "dual-mode: remote fallback is memory_gateway.store_memory " "(POST /internal/memory/store)"
+    ),
     (
         "mcp_server/server.py",
         "memory_recall",
         "cli_agent_orchestrator.services.memory_service",
-    ): "dual-mode: remote fallback is memory_gateway.recall_memory (POST /memory/recall)",
+    ): (
+        "dual-mode: remote fallback is memory_gateway.recall_memory "
+        "(POST /internal/memory/recall)"
+    ),
     (
         "mcp_server/server.py",
         "memory_forget",
         "cli_agent_orchestrator.services.memory_service",
-    ): "dual-mode: remote fallback is memory_gateway.forget_memory (POST /memory/forget)",
+    ): (
+        "dual-mode: remote fallback is memory_gateway.forget_memory "
+        "(POST /internal/memory/forget)"
+    ),
     (
         "mcp_server/server.py",
         "memory_recall",
