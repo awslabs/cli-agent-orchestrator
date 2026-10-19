@@ -1,7 +1,7 @@
 """Provider manager as module singleton with direct terminal_id → provider mapping."""
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Type
 
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
@@ -34,6 +34,29 @@ class ProviderManager:
 
     def __init__(self) -> None:
         self._providers: Dict[str, BaseProvider] = {}
+
+    @classmethod
+    def provider_class(cls, provider: str) -> Type[BaseProvider]:
+        """Return the concrete provider class registered for ``provider``."""
+        provider_classes: Dict[str, Type[BaseProvider]] = {
+            ProviderType.KIRO_CLI.value: KiroCliProvider,
+            ProviderType.CLAUDE_CODE.value: ClaudeCodeProvider,
+            ProviderType.CODEX.value: CodexProvider,
+            ProviderType.COPILOT_CLI.value: CopilotCliProvider,
+            ProviderType.KIMI_CLI.value: KimiCliProvider,
+            ProviderType.OPENCODE_CLI.value: OpenCodeCliProvider,
+            ProviderType.OMP.value: OmpProvider,
+            ProviderType.HERMES.value: HermesProvider,
+            ProviderType.CURSOR_CLI.value: CursorCliProvider,
+            ProviderType.ANTIGRAVITY_CLI.value: AntigravityCliProvider,
+            ProviderType.GROK_CLI.value: GrokCliProvider,
+            ProviderType.MINIMAX_CODE.value: MiniMaxCodeProvider,
+            ProviderType.MOCK_CLI.value: MockCliProvider,
+        }
+        try:
+            return provider_classes[provider]
+        except KeyError as exc:
+            raise ValueError(f"Unknown provider type: {provider}") from exc
 
     def create_provider(
         self,

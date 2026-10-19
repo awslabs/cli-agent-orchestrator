@@ -172,6 +172,25 @@ class TestTransportErrorTaxonomy:
         assert exc_info.value.status == 500
         assert exc_info.value.body == "boom"
 
+    def test_non_200_kind_reaches_shim_http_error_message(self, full_env, monkeypatch):
+        body = json.dumps(
+            {
+                "detail": {
+                    "kind": "diverged",
+                    "message": "step 'review' no longer matches",
+                    "step_id": "review",
+                }
+            }
+        )
+        monkeypatch.setattr(cao_workflow, "_post", lambda *a, **k: _Response(status=409, body=body))
+
+        with pytest.raises(cao_workflow.ShimHTTPError) as exc_info:
+            cao_workflow.run_step("kiro_cli", "reviewer", "hi")
+
+        assert str(exc_info.value) == (
+            "run-step returned HTTP 409 (diverged): step 'review' no longer matches"
+        )
+
     def test_malformed_json_on_200_propagates_unwrapped(self, full_env, monkeypatch):
         monkeypatch.setattr(
             cao_workflow, "_post", lambda *a, **k: _Response(status=200, body="not json")

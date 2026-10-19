@@ -40,6 +40,45 @@ def _enable_agent_plugins_surface(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _allow_the_example_hosts_these_tests_clone_from(monkeypatch):
+    """The resolver clones only from allowlisted hosts (github.com by default).
+
+    Many tests here name ``example.test`` / ``example.invalid`` / ``example.com``
+    as a never-reached remote behind a mocked subprocess; allow those so the
+    tests keep exercising the argv, not the allowlist. Tests OF the allowlist
+    set or delete ``CAO_PLUGIN_ALLOWED_HOSTS`` themselves.
+    """
+    monkeypatch.setenv(
+        "CAO_PLUGIN_ALLOWED_HOSTS", "github.com,example.test,example.invalid,example.com"
+    )
+
+
+@pytest.fixture
+def allow_local_git_sources(monkeypatch):
+    """TEST-ONLY: let the resolver clone a repository from a local path.
+
+    Production refuses every source that is not https/ssh to an allowed host
+    before git runs, and pins ``GIT_ALLOW_PROTOCOL=https:ssh`` so git refuses
+    the ``file`` transport as well. The behaviours the real-clone tests pin --
+    the commit is recorded, submodules are not initialised, VCS metadata is
+    stripped, ref and failure reporting -- are transport-independent, and a
+    local bare repository is the only way to exercise them without a network.
+    This fixture opens exactly that door, for the tests that ask for it.
+    """
+    from cli_agent_orchestrator.agent_plugins import git_source, resolver
+
+    monkeypatch.setattr(git_source, "_validated_clone_target", lambda target: target)
+    real_env = resolver._git_env
+
+    def env_with_file_transport():
+        env = real_env()
+        env["GIT_ALLOW_PROTOCOL"] = "https:ssh:file"
+        return env
+
+    monkeypatch.setattr(resolver, "_git_env", env_with_file_transport)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_settings(monkeypatch):
     """Default settings to "no extra dirs, symlink projection" for every test.
 

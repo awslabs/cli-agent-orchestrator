@@ -25,6 +25,7 @@ import time
 from typing import Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
@@ -59,8 +60,10 @@ ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 # Additional escape sequences that may appear in terminal output
 ESCAPE_SEQUENCE_PATTERN = r"\[[?0-9;]*[a-zA-Z]"
 
-# Control characters to strip from final output
-CONTROL_CHAR_PATTERN = r"[\x00-\x1f\x7f-\x9f]"
+# Control characters to strip from final output. Tab and newline stay: they
+# are the layout of the reply, and without them a multi-line reply (a report
+# template from a handoff, for example) came back as one line.
+CONTROL_CHAR_PATTERN = r"[\x00-\x08\x0b-\x1f\x7f-\x9f]"
 
 # Legacy-UI IDLE prompt pattern for log files (with ANSI codes)
 IDLE_PROMPT_PATTERN_LOG = r"\x1b\[38;5;\d+m\[.+?\].*\x1b\[38;5;\d+m>\s*\x1b\[\d*m"
@@ -88,8 +91,39 @@ TUI_SEPARATOR_PATTERN = r"^[─]{20,}$"
 # regex can anchor on the raw ─── characters.
 _NON_SGR_CSI = re.compile(r"\x1b\[[0-9;?]*[^m]")
 
-# TUI Credits line: "▸ Credits: N.NN • Time: Ns" marks response completion
-TUI_CREDITS_PATTERN = r"▸\s*Credits:\s*[\d.]+"
+# TUI Credits line marks response completion. Two shapes so far:
+#   up to 2.2x:  "▸ Credits: 0.20 • Time: 29s"
+#   2.25.0:      "▸ Credits: turn 0.20 • session 0.20 | Time: 29s"
+# The 2.25 form put the word "turn" between "Credits:" and the number, which
+# the old pattern did not accept: every turn on 2.25 then fell through to the
+# separator fallback, and that fails too because the new "Trust All Tools
+# active" band sits between the last two separators with a single line of
+# content. Result was IDLE forever after a finished task (never COMPLETED),
+# reproduced against a live 2.25.0 pane on 2026-09-29. Accept an optional
+# "turn" (and any other single word) before the first number.
+TUI_CREDITS_PATTERN = r"▸\s*Credits:\s*(?:[A-Za-z]+\s+)?[\d.]+"
+
+# 2.25's turn/session form is adopted because that release also moved the
+# assistant text onto a bullet-prefixed line. Unlike the pre-2.25 layout, the
+# reply is not reliably separated from the echoed prompt by a blank line, so
+# extraction uses the credits anchors and the bullet line as the reply start.
+TUI_225_CREDITS_PATTERN = r"▸\s*Credits:\s*turn\s+[\d.]+"
+# A colored capture: bullet rows that carry a truecolor SGR.
+TUI_225_COLORED_BULLET_PATTERN = r"\x1b\[38;2;\d+;\d+;\d+m•"
+# A row at column 0 that starts with a bullet: a reply, a tool row, or a
+# reasoning row. An echoed prompt is indented, so its bullets do not match.
+TUI_225_REPLY_PATTERN = r"^•\s+\S"
+# Tool rows ("• Shell ...", "• assign") and reasoning rows ("• Thought for
+# 2s...") have child rows that start with "╰" (arguments, output, the thought).
+# The lines of a reply are plain indented text. The colors of the rows are not
+# a boundary: 2.25 drew the reply blue, and 2.29 draws it orange.
+TUI_225_CHILD_ROW_PATTERN = r"^\s+╰"
+# A reasoning row with its thought collapsed has no child row.
+TUI_225_THOUGHT_ROW_PATTERN = r"^•\s+Thought for \d"
+
+# Reading the pane command costs about 0.1 s of tmux calls; the exit check reads
+# it at most this often (see KiroCliProvider._exited_to_shell).
+EXIT_CHECK_INTERVAL_S = 2.0
 
 # TUI processing indicator: ghost text shown while agent is working.
 # kiro-cli 2.11+ replaced "Kiro is working" with "Thinking..." (with an
@@ -171,6 +205,15 @@ class KiroCliProvider(BaseProvider):
         _permission_prompt_pattern: Regex pattern for detecting permission prompts
     """
 
+    @classmethod
+    def honors_model(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+        requested_model: Optional[str],
+    ) -> bool:
+        return True
+
     def __init__(
         self,
         terminal_id: str,
@@ -197,6 +240,9 @@ class KiroCliProvider(BaseProvider):
         super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
         self._input_received = False
+        # The cached result of the exit check (see _exited_to_shell).
+        self._exit_checked_at: Optional[float] = None
+        self._exited = False
         self._agent_profile = agent_profile
         self._engine = resolve_kiro_engine(persisted=engine)
         self._model = model
@@ -230,6 +276,23 @@ class KiroCliProvider(BaseProvider):
         """Kiro 2.11's TUI needs a longer delay after bracketed paste before
         the Enter key registers as submit rather than being swallowed."""
         return 1.0
+
+    def _exited_to_shell(self) -> bool:
+        """Return True when the pane is back at the shell that ran before kiro-cli.
+
+        Read at most every EXIT_CHECK_INTERVAL_S: the lookup costs about 0.1 s
+        of tmux calls (more inside a PTY proxy), and get_status() reaches it on
+        every read of a busy frame. A stale "still running" only keeps the
+        terminal PROCESSING for up to that long after kiro-cli exits.
+        """
+        now = time.monotonic()
+        if self._exit_checked_at is None or now - self._exit_checked_at >= EXIT_CHECK_INTERVAL_S:
+            current_cmd = get_backend().get_pane_current_command(
+                self.session_name, self.window_name
+            )
+            self._exited = current_cmd == self.shell_baseline
+            self._exit_checked_at = now
+        return self._exited
 
     def mark_input_received(self) -> None:
         """Track that input was sent, enabling separator-free completion detection."""
@@ -577,12 +640,8 @@ class KiroCliProvider(BaseProvider):
         # immediately after launch, which lets pre-init pastes get absorbed
         # by Kiro's boot screen and silently dropped.
         if not has_idle_prompt and not has_new_tui_idle:
-            if self._initialized and self.shell_baseline:
-                current_cmd = get_backend().get_pane_current_command(
-                    self.session_name, self.window_name
-                )
-                if current_cmd == self.shell_baseline:
-                    return TerminalStatus.IDLE
+            if self._initialized and self.shell_baseline and self._exited_to_shell():
+                return TerminalStatus.IDLE
             return TerminalStatus.PROCESSING
 
         # Check 2: Look for known error messages in the output
@@ -732,7 +791,7 @@ class KiroCliProvider(BaseProvider):
 
         if not green_arrows:
             # Fallback: try TUI extraction (separator + Credits pattern)
-            return self._extract_tui_message(clean_output)
+            return self._extract_tui_message(clean_output, script_output)
 
         if not idle_prompts and not new_tui_idles:
             raise ValueError("Incomplete Kiro CLI response - no final prompt detected")
@@ -768,7 +827,65 @@ class KiroCliProvider(BaseProvider):
 
         return final_answer.strip()
 
-    def _extract_tui_message(self, clean_output: str) -> str:
+    def _extract_tui_225_message(
+        self, lines: list[str], credits_idx: int, raw_output: str | None = None
+    ) -> str | None:
+        """Extract a 2.25 TUI reply using turn anchors instead of paragraphs.
+
+        The pre-2.25 layout reliably places the echoed prompt in the first
+        paragraph inside the response box.  2.25 moved the assistant text to a
+        bullet-prefixed line and can render a one-word reply immediately below
+        the echoed prompt, so paragraph splitting cannot distinguish the two.
+        The reply is the last bullet row of the turn that is not a tool or
+        reasoning row (see TUI_225_CHILD_ROW_PATTERN), up to the next bullet
+        row or the Credits line. ``raw_output`` is not used; the parameter is
+        kept for callers.
+        """
+        prev_credits_idx = -1
+        for i in range(credits_idx - 1, -1, -1):
+            if re.search(TUI_CREDITS_PATTERN, lines[i]):
+                prev_credits_idx = i
+                break
+
+        reply_start = None
+        for i in range(credits_idx - 1, prev_credits_idx, -1):
+            if re.search(TUI_225_REPLY_PATTERN, lines[i]) and not self._is_tui_225_chrome_row(
+                lines, i, credits_idx
+            ):
+                reply_start = i
+                break
+
+        if reply_start is None:
+            return None
+
+        # Rows after the reply are tool or reasoning rows (the reply is the
+        # last bullet that is not one), so the reply ends at the next bullet.
+        reply_end = next(
+            (
+                i
+                for i in range(reply_start + 1, credits_idx)
+                if re.search(TUI_225_REPLY_PATTERN, lines[i])
+            ),
+            credits_idx,
+        )
+        response_lines = lines[reply_start:reply_end]
+        response_lines[0] = re.sub(r"^•\s+", "", response_lines[0], count=1)
+        final_answer = "\n".join(response_lines).strip()
+        final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, "", final_answer)
+        final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
+        return final_answer.strip()
+
+    @staticmethod
+    def _is_tui_225_chrome_row(lines: list[str], index: int, end: int) -> bool:
+        """Return True when the bullet row at ``index`` is a tool or reasoning row."""
+        if re.search(TUI_225_THOUGHT_ROW_PATTERN, lines[index]):
+            return True
+        for line in lines[index + 1 : end]:
+            if line.strip():
+                return bool(re.search(TUI_225_CHILD_ROW_PATTERN, line))
+        return False
+
+    def _extract_tui_message(self, clean_output: str, raw_output: str | None = None) -> str:
         """Extract agent response from pure TUI output (no green arrows).
 
         TUI format:
@@ -798,6 +915,13 @@ class KiroCliProvider(BaseProvider):
             if re.search(TUI_CREDITS_PATTERN, lines[i]):
                 credits_idx = i
                 break
+
+        if credits_idx is not None and re.search(TUI_225_CREDITS_PATTERN, lines[credits_idx]):
+            response = self._extract_tui_225_message(lines, credits_idx, raw_output)
+            if response is not None:
+                return response
+            if raw_output is not None and re.search(TUI_225_COLORED_BULLET_PATTERN, raw_output):
+                raise ValueError("No Kiro CLI assistant reply found in colored 2.25 TUI output")
 
         if credits_idx is None:
             # Kiro CLI 2.3.0+ may not emit a Credits line. Fall back to

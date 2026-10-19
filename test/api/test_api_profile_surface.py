@@ -568,6 +568,37 @@ def write_store(tmp_path, monkeypatch):
 class TestCreateAgentProfileEndpoint:
     """POST /agents/profiles -- create from a supplied document."""
 
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_swarm_options_validate_create_and_replace(self, client, write_store, enabled):
+        from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+
+        content = (
+            "---\nname: bounded-kimi\ndescription: A bounded native worker.\nprovider: kimi_cli\n"
+            f"kimiSwarm: {str(enabled).lower()}\nkimiSwarmMaxConcurrency: 4\n---\nReview the input."
+        )
+        validation = client.post("/agents/profiles/validate", json={"content": content})
+        assert validation.status_code == 200
+        assert validation.json()["valid"] is True
+        created = client.post("/agents/profiles", json={"name": "bounded-kimi", "content": content})
+        assert created.status_code == 201
+        assert (write_store / "bounded-kimi.md").read_text() == content
+        loaded = load_agent_profile("bounded-kimi")
+        assert loaded.kimiSwarm is enabled
+        assert loaded.kimiSwarmMaxConcurrency == 4
+
+        updated = content.replace("kimiSwarmMaxConcurrency: 4", "kimiSwarmMaxConcurrency: 1")
+        assert (
+            client.put("/agents/profiles/bounded-kimi", json={"content": updated}).status_code
+            == 200
+        )
+        assert load_agent_profile("bounded-kimi").kimiSwarmMaxConcurrency == 1
+        invalid = updated.replace("kimiSwarmMaxConcurrency: 1", "kimiSwarmMaxConcurrency: 11")
+        assert (
+            client.put("/agents/profiles/bounded-kimi", json={"content": invalid}).status_code
+            == 400
+        )
+        assert (write_store / "bounded-kimi.md").read_text() == updated
+
     def test_creates_a_profile_and_returns_201(self, client, write_store) -> None:
         response = client.post(
             "/agents/profiles",

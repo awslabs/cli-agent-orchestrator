@@ -72,7 +72,7 @@ def _live_cli_verbs() -> set[str]:
     from cli_agent_orchestrator.cli.main import cli
 
     assert isinstance(cli, click.Group)
-    workflow = cli.commands.get("workflow")
+    workflow = cli.get_command(click.Context(cli), "workflow")
     assert isinstance(workflow, click.Group), "`cao workflow` is no longer a Click group"
     return set(workflow.commands)
 

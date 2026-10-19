@@ -7,7 +7,7 @@ one. Every public function takes a name, never a caller-supplied path.
 Why names and not paths: the store is a fixed root joined with a single
 validated segment, which is safe to centralise. Filesystem handling of
 caller-supplied *paths* deliberately stays in the CLI (see
-``cli/commands/install.py::_copy_local_profile_to_store``) so that
+``cli/commands/install.py::_read_local_profile``) so that
 ``Path(user_input)`` never reaches the HTTP-reachable service layer -- the
 property that closed the recurring ``py/path-injection`` alerts. Callers keep
 their own input validation; this module validates the segment it is handed.
@@ -19,6 +19,7 @@ import re
 from pathlib import Path
 
 from cli_agent_orchestrator.constants import LOCAL_AGENT_STORE_DIR
+from cli_agent_orchestrator.utils import agent_profiles
 from cli_agent_orchestrator.utils.atomic_file import locked_atomic_delete, locked_atomic_write
 
 # A profile name becomes a single filesystem segment under
@@ -112,9 +113,13 @@ def write_profile(name: str, content: str, *, overwrite: bool = False) -> Path:
         The path written.
 
     Raises:
+        FileNotFoundError: If the name is reserved for an ephemeral profile.
         InvalidProfileNameError: If ``name`` is not a safe single segment.
         ProfileExistsError: If the profile exists and ``overwrite`` is False.
     """
+    if agent_profiles.routes_to_ephemeral_store(name):
+        raise FileNotFoundError(f"Reserved ephemeral profile name: {name}")
+
     # Inline guard: see _PROFILE_NAME_RE.
     if not _PROFILE_NAME_RE.fullmatch(name):
         raise InvalidProfileNameError(f"Profile name '{name}' must match [A-Za-z0-9_-]{{1,64}}.")
@@ -168,9 +173,13 @@ def replace_profile(name: str, content: str) -> Path:
         The path written.
 
     Raises:
+        FileNotFoundError: If the name is reserved for an ephemeral profile.
         InvalidProfileNameError: If ``name`` is not a safe single segment.
         ProfileNotFoundError: If the profile is not in the local store.
     """
+    if agent_profiles.routes_to_ephemeral_store(name):
+        raise FileNotFoundError(f"Reserved ephemeral profile name: {name}")
+
     # Inline guard: see _PROFILE_NAME_RE.
     if not _PROFILE_NAME_RE.fullmatch(name):
         raise InvalidProfileNameError(f"Profile name '{name}' must match [A-Za-z0-9_-]{{1,64}}.")

@@ -23,8 +23,20 @@ from pathlib import Path
 
 import pytest
 
+from cli_agent_orchestrator.clients.database import _migrate_workflow_index
 from cli_agent_orchestrator.models.workflow import StaleSpecError, TierCollisionError
 from cli_agent_orchestrator.services import workflow_spec_service as svc
+
+
+@pytest.fixture(autouse=True)
+def isolated_index(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise the real index against a fresh DB, independent of the CAO install."""
+    db_path = tmp_path_factory.mktemp("wf-index") / "wf.db"
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path)
+    _migrate_workflow_index()
+
 
 GOOD = "INPUTS = {'topic': {'type': 'string', 'required': True}}\n"
 REVISED = "INPUTS = {'topic': {'type': 'string'}}\n# revised\n"

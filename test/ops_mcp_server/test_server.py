@@ -1,5 +1,6 @@
 """Tests for the CAO operations MCP server."""
 
+import os
 from typing import TypedDict
 from unittest.mock import MagicMock, patch
 
@@ -323,7 +324,7 @@ class TestSessionLifecycleTools:
                 "session_name": "cao-generated",
                 "allowed_tools": "fs_read,execute_bash",
             },
-            json=None,
+            json={"description": None},
             timeout=_HTTP_TIMEOUT,
             headers=None,
         )
@@ -692,7 +693,10 @@ class TestSessionLifecycleTools:
 
     async def test_get_session_info_returns_payload(self) -> None:
         """Session details should be returned unchanged."""
-        payload = {"name": "cao-123", "terminals": [{"id": "term-1"}]}
+        payload = {
+            "name": "cao-123",
+            "terminals": [{"id": "term-1", "model": "model-x", "model_honored": True}],
+        }
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
             return_value=_response(json_data=payload),
@@ -969,6 +973,8 @@ class TestTerminalMonitoringTools:
             "provider": "claude_code",
             "session_name": "cao-abc",
             "agent_profile": "dev-sonnet",
+            "model": "model-x",
+            "model_honored": True,
             "status": "processing",
             "last_active": "2026-06-11T00:00:00",
         }
@@ -1055,12 +1061,13 @@ class TestTerminalMonitoringTools:
         }
 
 
-def test_main_runs_mcp_server() -> None:
-    """The module main entry point should call mcp.run()."""
+def test_main_runs_mcp_server_over_stdio_only() -> None:
+    """main() pins the transport; FASTMCP_TRANSPORT in the environment must not win."""
     with patch("cli_agent_orchestrator.ops_mcp_server.server.mcp.run") as mock_run:
-        main()
+        with patch.dict(os.environ, {"FASTMCP_TRANSPORT": "http"}):
+            main()
 
-    mock_run.assert_called_once_with()
+    mock_run.assert_called_once_with(transport="stdio")
 
 
 def test_plugin_mcp_surfaces_are_registered_on_ops_server() -> None:

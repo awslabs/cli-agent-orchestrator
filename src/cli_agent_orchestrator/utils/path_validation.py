@@ -15,7 +15,8 @@ import re
 # locations. Includes /private/* variants for macOS (where /etc ->
 # /private/etc, etc.). Only the exact listed paths are blocked — not their
 # subdirectories — so legitimate paths like /Volumes/workplace or
-# /var/folders (macOS temp) stay allowed.
+# /var/folders (macOS temp) stay allowed. Directories whose WHOLE subtree is
+# off limits are listed separately in BLOCKED_SYSTEM_SUBTREES below.
 BLOCKED_SYSTEM_DIRECTORIES = frozenset(
     {
         "/",
@@ -38,6 +39,60 @@ BLOCKED_SYSTEM_DIRECTORIES = frozenset(
         "/private/tmp",
     }
 )
+
+# Directories under which NOTHING is an acceptable working directory or
+# archive target, at any depth: system configuration, kernel and device
+# pseudo-filesystems, boot files, the system binaries and libraries, and the
+# per-user crontab spool. Distinct from the exact-match set above because
+# projects legitimately live beneath /tmp, /var/folders, /home or /Users, so
+# those stay exact-only. The paths are compared AFTER ``os.path.realpath``, so
+# every canonical spelling a root can resolve to must be listed: the macOS
+# ``/etc`` -> ``/private/etc``, and on usr-merged Linux ``/lib`` ->
+# ``/usr/lib`` and ``/lib64`` -> ``/usr/lib64``, where the ``/lib`` entries on
+# their own never fire. ``/root`` is a subtree too: ``/root/.ssh/authorized_keys``
+# and ``/root/.bashrc`` are persistence for whoever can reach the API of a
+# cao-server that runs as root, and nothing in the repository's container or
+# cluster manifests runs it as root with projects under ``/root``. A deployment
+# that does must keep its projects elsewhere (``/workspace``, ``/srv``).
+BLOCKED_SYSTEM_SUBTREES = frozenset(
+    {
+        "/bin",
+        "/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/etc",
+        "/dev",
+        "/proc",
+        "/sys",
+        "/boot",
+        "/root",
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/var/spool/cron",
+        "/private/etc",
+    }
+)
+
+
+# Subtrees carved back out of BLOCKED_SYSTEM_SUBTREES: /dev/shm is the
+# tmpfs scratch area on Linux and a legitimate archive or working location
+# in containers, unlike the device nodes around it.
+_BLOCKED_SUBTREE_EXCEPTIONS = ("/dev/shm",)
+
+
+def _blocked_reason(real_path: str) -> str:
+    """Return why ``real_path`` is refused, or an empty string if it is allowed."""
+    if real_path in BLOCKED_SYSTEM_DIRECTORIES:
+        return f"blocked system path {real_path}"
+    for allowed in _BLOCKED_SUBTREE_EXCEPTIONS:
+        if real_path == allowed or real_path.startswith(allowed + "/"):
+            return ""
+    for root in BLOCKED_SYSTEM_SUBTREES:
+        if real_path == root or real_path.startswith(root + "/"):
+            return f"path beneath blocked system path {root}"
+    return ""
 
 
 def resolve_and_validate_path(
@@ -68,7 +123,8 @@ def resolve_and_validate_path(
 
     Raises:
         ValueError: If the path is relative after canonicalization, is a
-            blocked system path, does not exist (without ``allow_create``),
+            blocked system path or lies inside a blocked system subtree, does
+            not exist (without ``allow_create``),
             or has no valid existing ancestor (with ``allow_create``).
     """
     # Expand ~ to the server's home directory so clients can use portable
@@ -86,11 +142,12 @@ def resolve_and_validate_path(
     if not real_path.startswith("/"):
         raise ValueError(f"{description} must be an absolute path: {path}")
 
-    # Step 3: Block sensitive system directories (exact matches only).
-    if real_path in BLOCKED_SYSTEM_DIRECTORIES:
-        raise ValueError(
-            f"{description} not allowed: {path} " f"(resolves to blocked system path {real_path})"
-        )
+    # Step 3: Block sensitive system directories: the exact-match set and
+    # everything beneath the subtree set, so /etc/passwd is refused even with
+    # allow_file and an existing /etc/ssh is refused as a working directory.
+    reason = _blocked_reason(real_path)
+    if reason:
+        raise ValueError(f"{description} not allowed: {path} (resolves to {reason})")
 
     # Step 4: Existence policy.
     if os.path.isdir(real_path):
@@ -114,10 +171,10 @@ def resolve_and_validate_path(
             break
         ancestor = parent
     ancestor_real = os.path.realpath(ancestor)
-    if ancestor_real in BLOCKED_SYSTEM_DIRECTORIES:
+    reason = _blocked_reason(ancestor_real)
+    if reason:
         raise ValueError(
-            f"{description} not allowed: {path} "
-            f"(nearest existing ancestor resolves to blocked system path {ancestor_real})"
+            f"{description} not allowed: {path} (nearest existing ancestor resolves to {reason})"
         )
     if not os.path.isdir(ancestor_real):
         raise ValueError(f"{description} has no existing ancestor directory: {path}")

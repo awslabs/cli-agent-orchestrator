@@ -11,7 +11,7 @@ import stat
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
@@ -22,7 +22,7 @@ from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError, TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
-from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils import agent_profiles
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -222,6 +222,32 @@ BACKGROUND_WAIT_PATTERN = re.compile(
     r"(?m)^[ \t\xa0]*[✶✢✽✻✳·*][ \t\xa0]+Waiting for\b"
     r"(?=[^\n]*\b(?:workflows?|tasks?|to finish|background)\b)"
 )
+# End-of-turn summary as the newest line above the input box (GH #865):
+# "✻ Worked for 4s · done 12:26 PM", or "✻ Crunched for " when the redraw clips
+# the duration. The newest TUI draws no spinner while response text streams, so
+# after a dispatch this line is the only evidence a turn ended; a box with
+# anything else above it is a turn still in flight. · and * are also markdown
+# bullets, so they count only with a full "for Ns" duration.
+NEW_TUI_BOX_SUMMARY_PATTERN = re.compile(
+    r"^[ \t]*(?:[✶✢✽✻✳][ \t]+(?!Waiting\b)\w+[ \t]+for\b"
+    r"|[·*][ \t]+\w+[ \t]+for[ \t]+\d+(?:\.\d+)?[ \t]*s\b)"
+)
+# Chrome the TUI paints between the newest conversation line and the box.
+NEW_TUI_BOX_CHROME_PATTERN = re.compile(r"^[ \t]*(?:⎿|tmux (?:detected|focus-events)\b)")
+# A gated frame unchanged for this long falls back to the legacy verdict, so an
+# end state that paints no summary (an operator's slash command, an exhausted
+# retry loop) costs one grace period rather than the step timeout. A streaming
+# answer repaints sub-second and a retry countdown every second.
+TURN_END_GRACE_S = 15.0
+# Rows above the input box the grace clock keys on. Small enough that every
+# view of the pane holds them (a 50-row capture-pane read with paragraph
+# spacing has ~20 non-blank rows above the box); see _turn_still_in_flight.
+TURN_END_GATE_ROWS = 8
+# Distinct gated frames remembered per detector path, oldest evicted first. Two
+# is what the composite/capture-pane pair needs; the rest is slack for a view
+# that wobbles between a few stable renderings. A streaming answer churns
+# through this in well under the grace period, so no stale frame can age.
+TURN_END_GATE_FRAMES = 4
 # The newest Claude Code TUI renders the ❯ input prompt BOXED between two
 # horizontal separator lines (the older TUI used a single separator ABOVE ❯).
 # Detecting this box GATES the new-TUI status logic so legacy output is
@@ -258,6 +284,15 @@ NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+\w*i
 class ClaudeCodeProvider(BaseProvider):
     """Provider for Claude Code CLI tool integration."""
 
+    @classmethod
+    def honors_model(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+        requested_model: Optional[str],
+    ) -> bool:
+        return not (profile and profile.native_agent)
+
     _TAIL_HASH_LINES = 30
 
     def __init__(
@@ -287,6 +322,10 @@ class ClaudeCodeProvider(BaseProvider):
         # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
         # lives on BaseProvider and is consumed by _resolve_native_status().
         self._input_generation: int = 0
+        # Turn-end gate: per detector path, the gated frames seen recently and when
+        # each was first seen (bounded by TURN_END_GATE_FRAMES).
+        self._turn_gate_frames: Dict[str, Dict[str, float]] = {}
+        self._turn_gate_clock: Callable[[], float] = time.monotonic
         self._snapshot_tail_hash: Optional[str] = None
         self._snapshot_last_response: Optional[str] = None
         self._snapshot_response_count: int = 0
@@ -340,7 +379,10 @@ class ClaudeCodeProvider(BaseProvider):
         if self._agent_profile is None:
             return None
         try:
-            return _with_plugin_mcp(load_agent_profile(self._agent_profile), "claude_code")
+            profile, source = agent_profiles.load_launch_profile(self._agent_profile)
+            if source == agent_profiles.ProfileSource.EPHEMERAL:
+                return profile
+            return _with_plugin_mcp(profile, "claude_code")
         except FileNotFoundError:
             return None
         except Exception as e:
@@ -1152,6 +1194,9 @@ class ClaudeCodeProvider(BaseProvider):
                 if NEW_TUI_BOX_SPINNER_PATTERN.search(line):
                     return TerminalStatus.PROCESSING
                 break
+            # No spinner is drawn while text streams; see NEW_TUI_BOX_SUMMARY_PATTERN.
+            if self._turn_still_in_flight("raw", above_lines):
+                return TerminalStatus.PROCESSING
 
         # COMPLETED: the finished turn left output behind — a "✻ <Verb>ed for Ns"
         # completion summary OR a start-of-line response marker (legacy ⏺ or the
@@ -1219,9 +1264,70 @@ class ClaudeCodeProvider(BaseProvider):
 
         return TerminalStatus.UNKNOWN
 
+    @staticmethod
+    def _turn_ended_above_box(above_lines: List[str]) -> bool:
+        """True when the newest conversation line above the input box is the
+        end-of-turn summary. Blank rows and box chrome are skipped on the way up.
+        """
+        for line in reversed(above_lines):
+            if (
+                not line.strip()
+                or NEW_TUI_BOX_CHROME_PATTERN.match(line)
+                or EFFORT_FOOTER_LINE_PATTERN.match(line)
+            ):
+                continue
+            return NEW_TUI_BOX_SUMMARY_PATTERN.match(line) is not None
+        return False
+
+    def _turn_still_in_flight(self, path: str, above_lines: List[str]) -> bool:
+        """After a dispatch, a box without the summary as its newest line above is
+        a running turn, until a frame first seen TURN_END_GRACE_S ago comes back
+        unchanged. ``path`` keeps the two detectors' frame clocks apart.
+
+        The clock is per frame, not per path. The "screen" path is fed by two
+        views of the same pane: the PYTE_SCREEN_ROWS-tall composite on every
+        poll and the pane-height capture-pane read of the stale re-check (#558).
+        The composite can hold rows the real pane has since cleared (a hook
+        spinner, a slash-command hint), so the two views need not agree on the
+        newest rows, and a single last-frame clock that each view restarts never
+        reaches the grace period while a waiter polls. Each distinct frame keeps
+        the time it was first seen; a view whose frame has not changed for the
+        grace period falls back regardless of what the other view shows. A
+        streaming answer and a retry countdown produce a new frame on every
+        repaint, so their frames never age. The newest TURN_END_GATE_ROWS
+        non-blank rows above the box are the frame, so a view's height does not
+        enter into it either.
+        """
+        if not self._task_dispatched:
+            return False
+        if self._turn_ended_above_box(above_lines):
+            self._turn_gate_frames.pop(path, None)
+            return False
+        newest = [ln.strip() for ln in above_lines if ln.strip()][-TURN_END_GATE_ROWS:]
+        frame = "\n".join(newest)
+        now = self._turn_gate_clock()
+        seen = self._turn_gate_frames.setdefault(path, {})
+        first_seen = seen.get(frame)
+        if first_seen is None:
+            seen[frame] = now
+            while len(seen) > TURN_END_GATE_FRAMES:
+                del seen[min(seen, key=seen.__getitem__)]
+            return True
+        if now - first_seen < TURN_END_GRACE_S:
+            return True
+        logger.info(
+            "claude_code %s: no end-of-turn summary above the input box on a frame "
+            "first seen %.0fs ago; falling back to the legacy ready verdict",
+            self.terminal_id,
+            now - first_seen,
+        )
+        return False
+
     # Opt in to pyte rendered-screen detection (gated by CAO_PYTE_STATUS). The
     # detector below is tuned for a COMPOSITED viewport, not the raw stream.
     supports_screen_detection = True
+    # The raw rolling window never holds this TUI's input box mid-turn (GH #865).
+    status_recheck_uses_screen = True
 
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         """Detect status from a pyte-composited viewport (escape-free rows).
@@ -1301,11 +1407,16 @@ class ClaudeCodeProvider(BaseProvider):
         # early-painted ──── rule, which a one-sided adjacency misread as a ready
         # prompt (premature IDLE on init — the first task then hits a not-ready
         # agent). The real box always has a rail above AND below the prompt.
-        boxed_prompt = any(
-            any(0 < pi - si <= 2 for si in sep_idx) and any(0 < si - pi <= 2 for si in sep_idx)
+        boxed_rows = [
+            pi
             for pi in prompt_idx
-        )
-        if boxed_prompt:
+            if any(0 < pi - si <= 2 for si in sep_idx) and any(0 < si - pi <= 2 for si in sep_idx)
+        ]
+        if boxed_rows:
+            # No spinner is drawn while text streams; see NEW_TUI_BOX_SUMMARY_PATTERN.
+            box_top = max(si for si in sep_idx if 0 < boxed_rows[-1] - si <= 2)
+            if self._turn_still_in_flight("screen", rows[:box_top]):
+                return TerminalStatus.PROCESSING
             if re.search(
                 GET_STATUS_COMPLETION_PATTERN, joined
             ) or EXTRACTION_RESPONSE_PATTERN.search(joined):
@@ -1340,8 +1451,9 @@ class ClaudeCodeProvider(BaseProvider):
         recognized choice-prompt, classifying it WAITING_USER_ANSWER instead of
         tearing the session down (see the WAITING_USER_ANSWER acceptance in
         initialize() above). Without this override, the deferred-init path
-        (_schedule_deferred_init -> send_input(initial_message)) would proceed
-        straight through send_input's guard (services/terminal_service.py) — which
+        (_schedule_deferred_init -> dispatch_input(initial_message)) would proceed
+        straight through dispatch_input's guard (services/terminal_service.py;
+        send_input is a thin wrapper over it) — which
         only fires when this property is True — and paste the assigned task text
         plus Enter into the live widget, auto-confirming whichever option happens
         to be highlighted. That is exactly the "auto-answer a prompt a human should
@@ -1366,6 +1478,7 @@ class ClaudeCodeProvider(BaseProvider):
         clean = self._strip_effort_footer_lines(re.sub(ANSI_CODE_PATTERN, "", output))
         self._snapshot_response_count = len(list(re.finditer(r"[⏺●]\s+", clean)))
         self._input_generation += 1
+        self._turn_gate_frames.clear()
         super().mark_input_received()
 
     def get_idle_pattern_for_log(self) -> str:

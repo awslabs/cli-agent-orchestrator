@@ -62,7 +62,7 @@ class TestMemoryFlag:
         from cli_agent_orchestrator.cli.commands.launch import launch
 
         runner = CliRunner()
-        with patch("cli_agent_orchestrator.cli.commands.launch.requests") as mock_requests:
+        with patch("cli_agent_orchestrator.cli.commands.launch.api_http") as mock_requests:
             mock_response = MagicMock()
             mock_response.status_code = 201
             mock_response.json.return_value = {

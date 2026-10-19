@@ -47,7 +47,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
@@ -148,6 +148,7 @@ from cli_agent_orchestrator.services.cleanup_service import (
     cleanup_old_data,
 )
 from cli_agent_orchestrator.services.config_service import ConfigService
+from cli_agent_orchestrator.services.ephemeral_service import EphemeralPolicyError
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.event_log_service import RING_CAPACITY
 from cli_agent_orchestrator.services.event_primitives import KINDS as EVENT_KINDS
@@ -155,11 +156,16 @@ from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import set_herdr_inbox_service
 from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
 from cli_agent_orchestrator.services.inbox_service import inbox_service
-from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
+from cli_agent_orchestrator.services.install_service import (
+    InstallResult,
+    KiroAgentPathError,
+    install_agent,
+)
 from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.profile_search import (
     DEFAULT_LIMIT as PROFILE_SEARCH_DEFAULT_LIMIT,
 )
+from cli_agent_orchestrator.services.provider_error_classifier import KIND_PROVIDER_ERROR
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import (
@@ -172,14 +178,11 @@ from cli_agent_orchestrator.services.terminal_service import (
 from cli_agent_orchestrator.services.workflow_journal import (
     _TERMINAL_RUN_STATES as _JOURNAL_TERMINAL_RUN_STATES,
 )
-from cli_agent_orchestrator.services.workflow_journal import (
-    EventRow,
-    GapMarker,
-    StepRow,
-)
+from cli_agent_orchestrator.services.workflow_journal import EventRow, GapMarker, StepRow
 from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.forwarded_env import ForwardedEnvError, validate_forwarded_env
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
@@ -276,6 +279,7 @@ class CreateTerminalBody(BaseModel):
     message content lives here.
     """
 
+    description: Optional[str] = None
     initial_message: Optional[str] = None
     initial_message_orchestration_type: Optional[str] = None
 
@@ -343,6 +347,25 @@ class CreateSessionBody(CreateTerminalBody):
     env_vars: Optional[Dict[str, str]] = None
     group: Optional[List[str]] = None
     metadata: Optional[Dict] = None
+
+    @field_validator("env_vars")
+    @classmethod
+    def validate_env_vars(cls, v: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+        """Apply the shared forwarded-env rules at the HTTP boundary.
+
+        ``cao launch --env`` and the ops-MCP tool already validate before
+        sending, but a direct HTTP caller reached ``TmuxClient._merge_extra_env``
+        unchecked, where a violating key was dropped with only a server-side
+        warning. Rejecting here makes the loader/shell/interpreter denylist
+        (``LD_PRELOAD``, ``BASH_ENV``, ...) a 422 instead of a silent drop.
+        The shared messages name the key and rule only, never the value.
+        """
+        if v is None:
+            return v
+        try:
+            return validate_forwarded_env(v)
+        except ForwardedEnvError as exc:
+            raise ValueError(str(exc)) from None
 
     @field_validator("group")
     @classmethod
@@ -433,9 +456,16 @@ class UpdateMetadataBody(BaseModel):
         return _check_metadata_size(v)
 
 
+class UpdateDescriptionBody(BaseModel):
+    """Require the key; explicit null clears the description, omission is invalid."""
+
+    description: Optional[str]
+
+
 class RunStepRequest(BaseModel):
     """Request body for the combined step-execution endpoint (N0, #312)."""
 
+    description: Optional[str] = None
     provider: str = Field(description="Provider type (e.g. 'kiro_cli', 'claude_code')")
     agent: str = Field(description="Agent profile name")
     prompt: str = Field(description="Prompt to send (caller applies any prompt shaping first)")
@@ -578,6 +608,8 @@ class RunStepRequest(BaseModel):
             raise ValueError("CAO_WORKFLOW_GENERATION requires CAO_WORKFLOW_RUN_ID (required pair)")
         if "CAO_WORKFLOW_STEP_ID" in keys and not has_run:
             raise ValueError("CAO_WORKFLOW_STEP_ID requires CAO_WORKFLOW_RUN_ID")
+        if self.claim_id is not None and self.reuse_terminal_id:
+            raise ValueError("claim_id cannot be used with reuse_terminal_id")
         if self.env_vars and self.reuse_terminal_id:
             # run_agent_step documents env injection as ignored on reused
             # terminals — a silently dropped RUN_ID/GENERATION fence token is
@@ -603,14 +635,16 @@ class RunStepRequest(BaseModel):
         ),
     )
 
-    @field_validator("job_id")
+    claim_id: Optional[str] = None
+
+    @field_validator("job_id", "claim_id")
     @classmethod
-    def _validate_job_id(cls, v: Optional[str]) -> Optional[str]:
+    def _validate_job_id(cls, v: Optional[str], info: ValidationInfo) -> Optional[str]:
         if v is None:
             return v
         if not re.fullmatch(r"[0-9a-f]{32}", v):
             raise ValueError(
-                "job_id must be a 32-character lowercase hex string (e.g. uuid4().hex)"
+                f"{info.field_name} must be a 32-character lowercase hex string (e.g. uuid4().hex)"
             )
         return v
 
@@ -1374,6 +1408,57 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("OTel telemetry init failed; continuing", exc_info=True)
     init_db()
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    agent_profiles.warn_reserved_installed_profiles()
+    # Deferred-init tasks are process-local.  Recover any external-owner rows
+    # left pending by a prior cao-server crash/restart into durable ERROR before
+    # background cleanup can mistake them for ordinary ghosts.
+    deferred_init_recovery_task: Optional[asyncio.Task] = None
+    recovery_complete = await terminal_service.recover_interrupted_deferred_init_external_owners()
+    # Likewise for the initial message a deferred-init terminal was created with:
+    # a row still ``pending`` belongs to a task the previous process owned, so
+    # settle it as failed/interrupted before any client can wait on it (#566).
+    initial_delivery_recovery_complete = (
+        await terminal_service.recover_interrupted_initial_deliveries()
+    )
+    if not initial_delivery_recovery_complete:
+        logger.warning(
+            "Initial-delivery restart sweep was incomplete; stranded pending rows may remain"
+        )
+    if not recovery_complete:
+        # A transient SQLite/read failure during startup used to strand the
+        # missed rows forever. Retry only until one complete scan succeeds.
+        # terminal_service's current-process fence prevents these retries from
+        # classifying newly-created live deferred inits as restart survivors.
+        deferred_init_recovery_task = asyncio.create_task(
+            terminal_service.retry_interrupted_deferred_init_external_owners()
+        )
+    from cli_agent_orchestrator.decisions.engine import DecisionEngine
+    from cli_agent_orchestrator.decisions.registry import DeciderRegistry
+    from cli_agent_orchestrator.decisions.settings import load_settings
+    from cli_agent_orchestrator.decisions.shadow import ShadowRunner
+    from cli_agent_orchestrator.decisions.store import DecisionStore
+
+    decision_settings = load_settings(environment=dict(os.environ))
+    decision_environment = dict(os.environ)
+    decision_store = DecisionStore()
+    decision_store.sweep()
+    decision_registry = DeciderRegistry()
+    decision_runner = ShadowRunner(
+        decision_store,
+        max_concurrent=decision_settings.max_concurrent,
+        max_pending=decision_settings.max_pending,
+    )
+    app.state.decision_engine = DecisionEngine(
+        decision_registry,
+        decision_store,
+        decision_runner,
+        settings_loader=lambda: load_settings(environment=decision_environment),
+    )
+    logger.info(
+        "Decision states: %s", {p: v.state.value for p, v in decision_settings.points.items()}
+    )
     _seed_default_skills_at_startup()
     _reconcile_memory_at_startup()
     registry = PluginRegistry()
@@ -1467,6 +1552,13 @@ async def lifespan(app: FastAPI):
         set_herdr_inbox_service(None)
         logger.info("Herdr inbox service stopped")
 
+    if deferred_init_recovery_task is not None:
+        deferred_init_recovery_task.cancel()
+        try:
+            await deferred_init_recovery_task
+        except asyncio.CancelledError:
+            pass
+
     # Cancel consumer tasks on shutdown
     status_monitor_task.cancel()
     log_writer_task.cancel()
@@ -1511,6 +1603,8 @@ async def lifespan(app: FastAPI):
     # asyncio.gather with the tasks above.
     fifo_manager.stop_watchdog()
 
+    await decision_runner.close()
+    await decision_registry.close()
     await registry.teardown()
     # OpenTelemetry (ported): flush + shut down exporters (no-op when disabled).
     try:
@@ -1841,6 +1935,33 @@ async def events_history(
     return {"events": events}
 
 
+async def _with_keepalive(events: Any, interval: float) -> Any:
+    """Yield items from ``events``, and ``None`` after each ``interval`` idle seconds.
+
+    The pending read is shielded across the timeout, as on the run plane, so a
+    keep-alive never cancels the source generator mid-step.
+    """
+    it = events.__aiter__()
+    pending: Optional["asyncio.Future[Any]"] = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(it.__anext__())
+            try:
+                item = await asyncio.wait_for(asyncio.shield(pending), timeout=interval)
+            except asyncio.TimeoutError:
+                yield None
+                continue
+            except StopAsyncIteration:
+                pending = None
+                return
+            pending = None
+            yield item
+    finally:
+        if pending is not None:
+            pending.cancel()
+
+
 @app.get("/agui/v1/stream")
 async def agui_stream(
     since: Optional[str] = Query(
@@ -1936,7 +2057,6 @@ async def agui_stream(
 
     from fastapi.responses import StreamingResponse
 
-    from cli_agent_orchestrator.clients.database import list_terminals_by_session
     from cli_agent_orchestrator.services import session_service
     from cli_agent_orchestrator.services.agui.lifecycle_tracker import ToolCallLifecycleTracker
     from cli_agent_orchestrator.services.agui_stream import (
@@ -1959,7 +2079,9 @@ async def agui_stream(
         terminals: List[Dict] = []
         for sess in sessions:
             try:
-                terminals.extend(list_terminals_by_session(sess["id"]))
+                terminals.extend(
+                    session_service.list_current_session_terminals(sess["id"], backend_exists=True)
+                )
             except Exception:
                 logger.debug("agui_stream: terminal listing failed for %s", sess.get("id"))
         return build_dashboard_snapshot(sessions, terminals, list(scopes))
@@ -2057,7 +2179,17 @@ async def agui_stream(
             # the stream cleanly in tests. On overflow the drain closes so the
             # client reconnects (F2); cancellation on client disconnect
             # propagates through the ``finally`` that unregisters the subscriber.
-            async for event in bus.drain(sub):
+            # An idle fleet sends nothing, so emit the run plane's SSE comment
+            # keep-alive on the same interval; otherwise a proxy with a read
+            # timeout (CloudFront defaults to 30s) closes the stream.
+            from cli_agent_orchestrator.services.agui import run_plane
+
+            async for event in _with_keepalive(
+                bus.drain(sub), run_plane.RUN_PLANE_HEARTBEAT_SECONDS
+            ):
+                if event is None:
+                    yield ":keep-alive\n\n"
+                    continue
                 rid = event.get("id")
                 # Skip the replay/live overlap so a reconnecting client that
                 # passed ``?since=`` never sees an event twice.
@@ -2301,7 +2433,6 @@ async def agui_run(
 
     # Build the snapshot function
     def _fleet_snapshot() -> Dict:
-        from cli_agent_orchestrator.clients.database import list_terminals_by_session
         from cli_agent_orchestrator.services import session_service
         from cli_agent_orchestrator.services.ui_state_service import build_dashboard_snapshot
 
@@ -2309,7 +2440,9 @@ async def agui_run(
         terminals: List[Dict] = []
         for sess in sessions:
             try:
-                terminals.extend(list_terminals_by_session(sess["id"]))
+                terminals.extend(
+                    session_service.list_current_session_terminals(sess["id"], backend_exists=True)
+                )
             except Exception:
                 pass
         return build_dashboard_snapshot(sessions, terminals, list(_scopes))
@@ -2353,6 +2486,78 @@ async def agui_run(
 # (no-op unless CAO_MCP_APPS_ENABLED is set) and idempotent, so re-importing this
 # module under dev/reload is safe.
 mount_widget_static(app)
+
+
+def _require_ephemeral_enabled(request: Request) -> Dict[str, Any]:
+    """Gate the opt-in surface before reading an untrusted body."""
+    from cli_agent_orchestrator.services import ephemeral_service
+
+    try:
+        settings = ephemeral_service.read_settings()
+        ephemeral_service.require_enabled(settings)
+        return settings
+    except ephemeral_service.EphemeralPolicyError as exc:
+        ephemeral_service.log_refusal(
+            exc.rule, request.query_params.get("caller_id"), None, exc.detail
+        )
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from None
+
+
+@app.post(
+    "/ephemeral-agents",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(_require_ephemeral_enabled)],
+)
+async def create_ephemeral_agent_endpoint(
+    request: Request,
+    caller_id: Optional[str] = None,
+    settings: Dict[str, Any] = Depends(_require_ephemeral_enabled),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Create an agent spec and files; raw input failures never echo submitted values."""
+    from cli_agent_orchestrator.services import ephemeral_service
+
+    try:
+        try:
+            raw = await request.json()
+        except (ValueError, UnicodeError):
+            error = ephemeral_service.EphemeralPolicyError(
+                "invalid_spec", "body: json_invalid", 422
+            )
+            ephemeral_service.log_refusal(error.rule, caller_id, None, error.detail)
+            raise HTTPException(status_code=422, detail=error.as_detail()) from None
+        return await asyncio.to_thread(
+            ephemeral_service.create_ephemeral_agent, raw, caller_id, settings
+        )
+    except ephemeral_service.EphemeralPolicyError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from None
+
+
+@app.post("/ephemeral-agents/{name}/claim", dependencies=[Depends(_require_ephemeral_enabled)])
+async def claim_ephemeral_agent_endpoint(
+    name: str,
+    request: Request,
+    caller_id: Optional[str] = None,
+    settings: Dict[str, Any] = Depends(_require_ephemeral_enabled),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Claim with a single settings snapshot and redacted body validation."""
+    from cli_agent_orchestrator.services import ephemeral_service
+
+    try:
+        try:
+            raw = await request.json()
+        except (ValueError, UnicodeError):
+            error = ephemeral_service.EphemeralPolicyError(
+                "invalid_request", "body: json_invalid", 422
+            )
+            ephemeral_service.log_refusal(error.rule, caller_id, None, error.detail)
+            raise HTTPException(status_code=422, detail=error.as_detail()) from None
+        return await asyncio.to_thread(
+            ephemeral_service.claim_ephemeral_agent, name, raw, caller_id, settings
+        )
+    except ephemeral_service.EphemeralPolicyError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from None
 
 
 @app.get("/agents/profiles")
@@ -2627,6 +2832,11 @@ def _validate_profile_for_write(name: str, content: str) -> List[ProfileValidati
 
     def _reject(message: str, findings: Sequence[Any] = ()) -> None:
         raise _profile_write_rejection(message, findings)
+
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    if agent_profiles.routes_to_ephemeral_store(name):
+        _reject(f"Reserved ephemeral profile name: {name}")
 
     # Parsed once here, then handed to validate_frontmatter as metadata.
     # validate_profile_text would parse it again: its docstring exists precisely
@@ -3402,6 +3612,11 @@ async def create_session(
             resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
+            **(
+                {"description": body.description}
+                if body and "description" in body.model_fields_set
+                else {}
+            ),
         )
 
         if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
@@ -3464,6 +3679,8 @@ async def create_session(
         # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
         # rejection, not a bad request: the caller should retry on another node.
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+    except EphemeralPolicyError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except WorktreeError as e:
@@ -3529,6 +3746,14 @@ async def delete_session(
         validate_tmux_name(session_name, "session_name")
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    # Same naming contract as POST /sessions: a bare name is the caller's alias
+    # for the prefixed CAO session, never a reference to a personal tmux session
+    # of that name. Canonicalise here so DELETE /sessions/dev tears down
+    # cao-dev and can never reach an operator's own "dev".
+    from cli_agent_orchestrator.constants import SESSION_PREFIX
+
+    if not session_name.startswith(SESSION_PREFIX):
+        session_name = f"{SESSION_PREFIX}{session_name}"
     try:
         # Off the event loop: teardown is fully synchronous (tmux kills, FIFO
         # cleanup, DB writes) and has wedged the whole server — /health
@@ -3581,6 +3806,7 @@ async def create_terminal_in_session(
     model: Optional[str] = None,
     use_worktree: bool = False,
     idempotency_key: Optional[str] = None,
+    claim_id: Optional[str] = Query(default=None, pattern=r"^[0-9a-f]{32}$"),
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -3691,10 +3917,12 @@ async def create_terminal_in_session(
             defer_init=defer_init,
             initial_message=initial_message,
             initial_message_orchestration_type=orch_type,
+            description=body.description if body else None,
             engine=engine,
             model=model,
             use_worktree=use_worktree,
             idempotency_key=idempotency_key,
+            claim_id=claim_id,
         )
         return result
     except HTTPException:
@@ -3708,9 +3936,9 @@ async def create_terminal_in_session(
         # that arm: IdempotencyKeyConflict is not a ValueError, so no reorder
         # of the ValueError family can shadow it.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except (KiroPhase0KASError, KiroCapabilityError) as e:
-        # Both subclass ValueError, so they must precede the generic arm below —
-        # a rejected engine is a bad request, not a missing resource. Matches
+    except (KiroPhase0KASError, KiroCapabilityError, KiroAgentPathError) as e:
+        # These subclass ValueError, so they must precede the generic arm below —
+        # a rejected configuration is a bad request, not a missing resource. Matches
         # POST /sessions, which already returns 400 for the identical failure.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except TerminalLimitError as e:
@@ -3718,6 +3946,8 @@ async def create_terminal_in_session(
         # rejection, not a bad request or a missing session: the caller should
         # retry on another node.
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+    except EphemeralPolicyError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except WorktreeError as e:
@@ -3756,9 +3986,11 @@ async def list_terminals_in_session(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
-        from cli_agent_orchestrator.clients.database import list_terminals_by_session
+        from cli_agent_orchestrator.services.session_service import (
+            list_current_session_terminals,
+        )
 
-        return list_terminals_by_session(session_name)
+        return list_current_session_terminals(session_name)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -3820,6 +4052,23 @@ async def update_terminal_group_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to update terminal group: {str(e)}",
         )
+
+
+@app.patch("/terminals/{terminal_id}/description", response_model=Terminal)
+async def update_terminal_description_endpoint(
+    terminal_id: TerminalId,
+    body: UpdateDescriptionBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Terminal:
+    try:
+        updated = await asyncio.to_thread(
+            terminal_service.update_description, terminal_id, body.description
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"Terminal '{terminal_id}' not found")
+    return Terminal(**await asyncio.to_thread(terminal_service.get_terminal, terminal_id))
 
 
 @app.patch("/terminals/{terminal_id}/metadata", response_model=Terminal)
@@ -4194,10 +4443,13 @@ async def _record_job_state(job_id: Optional[str], state: str, **fields: Any) ->
         "Failure contract: a non-2xx body is a structured object "
         "`{message, kind, terminal_id}`. **`kind` is authoritative** — "
         '`kind="error"` means the worker CRASHED (terminal reached ERROR), '
-        '`kind="timeout"` means it RAN LONG. The HTTP status mirrors `kind` '
-        "(502 = crashed, 504 = ran long) for transport-layer consumers, but a "
-        "caller MUST branch on `kind`, not the status code. `terminal_id` names "
-        "the live terminal (read it as a field; never regex-scrape `message`)."
+        '`kind="timeout"` means it RAN LONG, and `kind="provider_error"` means '
+        "the provider refused in band (the CLI exited cleanly with an error "
+        "payload sitting where the answer belongs). The HTTP status mirrors "
+        "`kind` (502 = crashed or provider refusal, 504 = ran long) for "
+        "transport-layer consumers, but a caller MUST branch on `kind`, not the "
+        "status code. `terminal_id` names the live terminal (read it as a field; "
+        "never regex-scrape `message`)."
     ),
 )
 async def run_step(
@@ -4221,13 +4473,17 @@ async def run_step(
     out, not just inferable from the handler):
 
     - A failed step returns a STRUCTURED detail object
-      ``{"message": str, "kind": "timeout"|"error", "terminal_id": str|None}``.
+      ``{"message": str, "kind": "timeout"|"error"|"provider_error",
+      "terminal_id": str|None}``.
     - ``kind`` is the AUTHORITATIVE discriminator. ``kind="error"`` => the worker
       CRASHED (the terminal reached ``TerminalStatus.ERROR``); ``kind="timeout"``
-      => the worker RAN LONG (readiness/completion wait elapsed). The HTTP status
-      is derived FROM ``kind`` (``error`` -> 502 Bad Gateway, ``timeout`` -> 504
-      Gateway Timeout) as a convenience for transport-layer consumers — a client
-      that can read the body MUST branch on ``kind``, not the status code.
+      => the worker RAN LONG (readiness/completion wait elapsed);
+      ``kind="provider_error"`` => the provider refused in band (issue #638: a
+      model/API error printed where the model's answer belongs). The HTTP status
+      is derived FROM ``kind`` (``error``/``provider_error`` -> 502 Bad Gateway,
+      ``timeout`` -> 504 Gateway Timeout) as a convenience for transport-layer
+      consumers — a client that can read the body MUST branch on ``kind``, not the
+      status code.
     - ``terminal_id`` names the live terminal the step ran on (when known) so a
       caller can report/clean it up without regex-scraping ``message``.
     - A bad terminal reference -> 404; any other failure -> 500 (plain-string
@@ -4288,6 +4544,7 @@ async def run_step(
         error: Optional[str],
         last_message: Optional[str] = None,
         response_status: Optional[str] = None,
+        error_kind: Optional[str] = None,
     ) -> None:
         # ``last_message`` is the step's own text result and defaults to None because
         # every FAILURE arm below has none to give: the step never produced one. Only
@@ -4298,7 +4555,7 @@ async def run_step(
         if on_step_settled is None:
             return
         try:
-            on_step_settled(terminal_id, error, last_message, response_status)
+            on_step_settled(terminal_id, error, last_message, response_status, error_kind)
         except Exception:  # noqa: BLE001 — step bookkeeping is best-effort; never fail the step
             logger.warning("run_step: script step completion bookkeeping failed", exc_info=True)
 
@@ -4509,6 +4766,7 @@ async def run_step(
             provider=body.provider,
             agent=body.agent,
             prompt=body.prompt,
+            description=body.description,
             session_name=body.session_name,
             reuse_terminal_id=body.reuse_terminal_id,
             teardown=body.teardown,
@@ -4528,6 +4786,7 @@ async def run_step(
             model=body.model,
             use_worktree=body.use_worktree,
             job_id=job_id,
+            claim_id=body.claim_id,
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure
@@ -4599,9 +4858,18 @@ async def run_step(
         # structured object carrying terminal_id, so callers read it as a field
         # rather than regex-scraping the message (the future engine reads it too).
         # Transition the script step RUNNING->FAILED (no-op for non-script callers).
-        _settle_step(e.terminal_id, str(e))
+        _settle_step(e.terminal_id, str(e), error_kind=e.kind)
         await _record_job_state(job_id, "error", terminal_id=e.terminal_id, error_message=str(e))
-        code = status.HTTP_502_BAD_GATEWAY if e.kind == "error" else status.HTTP_504_GATEWAY_TIMEOUT
+        # issue #638: kind="provider_error" (the upstream refused the call in
+        # band) is an UPSTREAM failure — 502, the same class as a crashed worker.
+        # Leaving it on the else arm would have reported a provider refusal as
+        # 504 Gateway Timeout, which tells the caller to wait longer for a step
+        # that will never answer.
+        code = (
+            status.HTTP_502_BAD_GATEWAY
+            if e.kind in ("error", KIND_PROVIDER_ERROR)
+            else status.HTTP_504_GATEWAY_TIMEOUT
+        )
         raise HTTPException(
             status_code=code,
             detail={"message": str(e), "kind": e.kind, "terminal_id": e.terminal_id},
@@ -4632,8 +4900,8 @@ async def run_step(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail={"message": str(e), "kind": "timeout", "terminal_id": None},
         )
-    except (KiroPhase0KASError, KiroCapabilityError) as e:
-        # Ordered before the ValueError arm they subclass: an engine rejection is
+    except (KiroPhase0KASError, KiroCapabilityError, KiroAgentPathError) as e:
+        # Ordered before the ValueError arm they subclass: a configuration rejection is
         # a bad request, not an unknown terminal.
         _settle_step(None, str(e))
         await _record_job_state(job_id, "error", error_message=str(e))
@@ -4660,6 +4928,11 @@ async def run_step(
             status_code=status.HTTP_409_CONFLICT,
             detail={"message": str(e), "kind": "plan_inputs_changed"},
         )
+
+    except EphemeralPolicyError as e:
+        _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
+        raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
         await _record_job_state(job_id, "error", error_message=str(e))
@@ -6891,31 +7164,26 @@ def _durable_error_kind(steps: List[Any]) -> Optional[str]:
 def _resolve_error_kind(row: Any, steps: List[Any]) -> Optional[str]:
     """Resolve the terminal ``kind`` for an assembled ``WorkflowRunResult`` (U4 seam).
 
-    U4 shipped the CALL SITE plus the ADR-5 inference FLOOR; U9 enriches this SAME
+    U4 shipped the CALL SITE plus the ADR-5 inference FLOOR; U9 enriched this SAME
     function with column-first precedence (kept a single module-level function so
-    the swap is confined, RP-5). Precedence:
+    the swap is confined, RP-5). Run state is now the OUTER decision, because a
+    completed script may retain a failed step it caught deliberately:
 
-    1. Column-first (RP-1): a durable ``error_kind`` on the step projection wins
-       authoritatively — the inference is NOT consulted. INERT until #504's column
-       lands (``_durable_error_kind`` returns ``None`` for pre-migration rows).
-    2. Inference fallback (RP-2, pre-migration rows only) — the RR-4 floor:
-
-       - CANCELLED run                                 -> ``"cancelled"``
-       - FAILED run with a step error matching /timeout/i -> ``"timeout"``
-       - FAILED run otherwise                          -> ``"error"``
-       - COMPLETED / RUNNING / anything else           -> ``None``
+    1. State-first (RP-4): COMPLETED or non-terminal -> ``None``; CANCELLED ->
+       ``"cancelled"``. A retained step kind never changes the run-level verdict.
+    2. FAILED, run-level column-first (PR #849 review): the terminal ``kind``
+       persisted by the finalizer is authoritative, so a later unrelated exit is
+       not misattributed to a caught provider_error/timeout step.
+    3. FAILED, step fallback (RP-1) for pre-kind rows: a durable ``error_kind`` on
+       the step projection wins authoritatively — the inference is NOT consulted.
+    4. FAILED, inference fallback (RP-2, pre-migration rows only) — the RR-4 floor:
+       a step error matching /timeout/i -> ``"timeout"``; otherwise ``"error"``.
 
     The timeout branch is a conservative case-insensitive substring match, never a
     parse, and no kind is ever fabricated for a completed/non-terminal run (RP-4).
     """
     from cli_agent_orchestrator.models.workflow_runtime import RunState
 
-    # Column-first (RP-1): authoritative when present; inert (None) pre-migration.
-    durable = _durable_error_kind(steps)
-    if durable is not None:
-        return durable
-
-    # Inference fallback (RP-2) — the ADR-5 floor for pre-migration rows.
     try:
         run_state = RunState(row.state)
     except ValueError:
@@ -6923,12 +7191,24 @@ def _resolve_error_kind(row: Any, steps: List[Any]) -> Optional[str]:
 
     if run_state == RunState.CANCELLED:
         return "cancelled"
-    if run_state == RunState.FAILED:
-        for s in steps:
-            if s.error and re.search(r"timeout", s.error, re.IGNORECASE):
-                return "timeout"
-        return "error"
-    return None
+    if run_state != RunState.FAILED:
+        return None
+
+    # FAILED only: the run-level terminal kind is authoritative when present.
+    run_kind = getattr(row, "kind", None)
+    if run_kind:
+        return str(run_kind)
+
+    # Legacy rows only: fall back to the durable step kind.
+    durable = _durable_error_kind(steps)
+    if durable is not None:
+        return durable
+
+    # Inference fallback (RP-2) — the ADR-5 floor for pre-migration rows.
+    for s in steps:
+        if s.error and re.search(r"timeout", s.error, re.IGNORECASE):
+            return "timeout"
+    return "error"
 
 
 #: Resolved ``error_kind`` values that mean "the artifact is fine, the moment was not" (issue #583
@@ -6954,7 +7234,7 @@ def _classify_failure(row: Any, error_kind: Optional[str]) -> Optional[str]:
 
     ``error_kind`` IS A CAUSE TAXONOMY AND THIS IS A NEXT-ACTION TAXONOMY, which is the whole reason
     the function exists rather than the endpoint simply surfacing ``error_kind``. Production persistors
-    emit ``error``, ``timeout``, or ``cancelled``; ``transient`` and ``artifact_defect`` describe what
+    emit ``error``, ``provider_error``, ``timeout``, or ``cancelled``; ``transient`` and ``artifact_defect`` describe what
     to do about those causes, and the mapping between them is a judgement rather than a rename.
 
     THE CANCELLED CHECK PRECEDES THE KIND, AND THE ORDER IS THE RULE. A run cancelled while a step was
@@ -6962,6 +7242,9 @@ def _classify_failure(row: Any, error_kind: Optional[str]) -> Optional[str]:
     would label a human's deliberate stop as a failure to diagnose — the conflation FR-10 forbids,
     arriving from a direction the requirement's wording does not anticipate. Ordered wrongly this
     returns a plausible ``transient`` rather than raising, so a test asserts the order by planting it.
+
+    ``provider_error`` also takes this conservative default: an in-band refusal
+    identifies a provider failure but does not establish that retrying is safe.
 
     A BARE ``error`` RESOLVES TO ``artifact_defect``, AND THAT IS A JUDGEMENT RATHER THAN A DEDUCTION.
     ``error`` is both the most common value and the least informative: a provider blip and a broken
@@ -7003,7 +7286,7 @@ def _classify_failure(row: Any, error_kind: Optional[str]) -> Optional[str]:
         return CLASSIFICATION_CANCELLED
     if error_kind in _TRANSIENT_ERROR_KINDS:
         return CLASSIFICATION_TRANSIENT
-    if error_kind is not None and error_kind != "error":
+    if error_kind is not None and error_kind not in {"error", "provider_error"}:
         # An UNRECOGNISED kind. The value returned is the same default a bare ``error`` gets, but the
         # reason is different and the difference must not be silent: under the CLI's action phrasing
         # this renders as "Fix the spec", a confident instruction derived from no evidence. A silent
@@ -7120,6 +7403,10 @@ async def get_workflow_run_result_endpoint(
             attempts=s.attempts,
             output=_json_or_none(s.output_json),
             error=s.error,
+            # Issue #638: carry the durable structured kind onto the RESULT too, so
+            # a cold read distinguishes a provider refusal from a crash or a
+            # timeout exactly as the live run and the failure envelope do.
+            error_kind=getattr(s, "error_kind", None),
         )
         for s in steps
     ]
@@ -7526,11 +7813,14 @@ async def export_graph_endpoint(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
-    # Credential gate (ADR-5): scan the serialized view; on a hit, reject
-    # before the sink writes anything. secret_gate returns the pattern NAME,
-    # never the matched bytes, so the detail is safe to surface.
-    serialized = json.dumps(view.to_dict())
-    hit = secret_gate.scan_for_secrets(serialized)
+    # Credential gate (ADR-5): scan the PARSED view; on a hit, reject before
+    # the sink writes anything. secret_gate returns the pattern NAME, never
+    # the matched bytes, so the detail is safe to surface. Not json.dumps then
+    # scan: the default ensure_ascii=True turns an invisible character hiding
+    # inside a credential prefix into a literal \u escape the gate cannot
+    # strip, and the structured scan also keeps the key context a
+    # SecretAccessKey value needs.
+    hit = secret_gate.scan_json_for_secrets(view.to_dict())
     if hit is not None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -9002,7 +9292,20 @@ def main():
         default=None,
         help="Terminal backend to use, overriding terminal_backend in config.json",
     )
+    parser.add_argument(
+        "--decision",
+        action="append",
+        default=[],
+        help="Point state override: <point>=off|shadow|on (repeatable)",
+    )
     args = parser.parse_args()
+    if args.decision:
+        from cli_agent_orchestrator.decisions.settings import apply_flags
+
+        try:
+            apply_flags(args.decision)
+        except ValueError as error:
+            parser.error(str(error))
 
     if args.agents_dir:
         os.environ["CAO_AGENTS_DIR"] = args.agents_dir

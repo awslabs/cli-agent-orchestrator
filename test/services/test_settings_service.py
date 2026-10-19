@@ -167,7 +167,7 @@ class TestSave:
         _save({"new": True})
         assert json.loads(settings_file.read_text()) == {"new": True}
 
-    def test_save_atomically_replaces_and_preserves_mode(self, settings_file, monkeypatch):
+    def test_save_atomically_replaces_and_enforces_private_mode(self, settings_file, monkeypatch):
         settings_file.write_text('{"old": true}')
         settings_file.chmod(0o640)
         monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
@@ -185,32 +185,32 @@ class TestSave:
         assert len(replacements) == 1
         assert replacements[0][1] == settings_file
         assert json.loads(settings_file.read_text()) == {"new": True}
-        assert settings_file.stat().st_mode & 0o777 == 0o640
+        assert settings_file.stat().st_mode & 0o777 == 0o600
 
-    def test_save_preserves_settings_symlink_and_target_mode(self, settings_file, monkeypatch):
+    def test_save_replaces_settings_symlink_and_preserves_target(self, settings_file, monkeypatch):
         target = settings_file.with_name("dotfiles-settings.json")
         target.write_text('{"old": true}')
         target.chmod(0o640)
         settings_file.symlink_to(target)
         monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
-        lock_path_before = atomic_file._lock_path_for(settings_file)
 
         _save({"new": True})
 
-        assert settings_file.is_symlink()
-        assert json.loads(target.read_text()) == {"new": True}
+        assert not settings_file.is_symlink()
+        assert json.loads(target.read_text()) == {"old": True}
+        assert json.loads(settings_file.read_text()) == {"new": True}
         assert target.stat().st_mode & 0o777 == 0o640
-        assert atomic_file._lock_path_for(settings_file) == lock_path_before
 
-    def test_save_through_dangling_settings_symlink(self, settings_file, monkeypatch):
+    def test_save_replaces_dangling_settings_symlink(self, settings_file, monkeypatch):
         target = settings_file.with_name("dotfiles-settings.json")
         settings_file.symlink_to(target)
         monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
 
         _save({"new": True})
 
-        assert settings_file.is_symlink()
-        assert json.loads(target.read_text()) == {"new": True}
+        assert not settings_file.is_symlink()
+        assert not target.exists()
+        assert json.loads(settings_file.read_text()) == {"new": True}
 
     def test_concurrent_writes_and_reads_surface_writer_errors(self, settings_file, monkeypatch):
         """Exercise concurrent access; replace and mode assertions pin atomicity."""
@@ -727,3 +727,44 @@ class TestWorkflowJournalSettingsWritePath:
         rather than being silently persisted as an unread setting."""
         with pytest.raises(ValueError, match="Unknown memory setting"):
             settings_service.set_memory_setting("workflow_journal_retention_dayz", 30)
+
+
+class TestSavePrivateAndSymlinkSafe:
+    """settings.json is CAO-owned and may hold credentials: 0600, never via a symlink."""
+
+    def _patched(self, tmp_path):
+        home = tmp_path / "cao-home"
+        settings = home / "settings.json"
+        return (
+            settings,
+            patch("cli_agent_orchestrator.services.settings_service.SETTINGS_FILE", settings),
+            patch("cli_agent_orchestrator.services.settings_service.CAO_HOME_DIR", home),
+        )
+
+    def test_save_creates_file_private(self, tmp_path):
+        settings, p1, p2 = self._patched(tmp_path)
+        with p1, p2:
+            _save({"k": "v"})
+        assert oct(settings.stat().st_mode & 0o777) == oct(0o600)
+
+    def test_save_tightens_an_existing_world_readable_file(self, tmp_path):
+        settings, p1, p2 = self._patched(tmp_path)
+        settings.parent.mkdir(parents=True)
+        settings.write_text("{}")
+        settings.chmod(0o644)
+        with p1, p2:
+            _save({"k": "v"})
+        assert oct(settings.stat().st_mode & 0o777) == oct(0o600)
+        assert json.loads(settings.read_text()) == {"k": "v"}
+
+    def test_save_does_not_follow_a_symlink(self, tmp_path):
+        settings, p1, p2 = self._patched(tmp_path)
+        settings.parent.mkdir(parents=True)
+        victim = tmp_path / "victim.txt"
+        victim.write_text("do not touch")
+        settings.symlink_to(victim)
+        with p1, p2:
+            _save({"k": "v"})
+        assert victim.read_text() == "do not touch"
+        assert not settings.is_symlink()
+        assert json.loads(settings.read_text()) == {"k": "v"}

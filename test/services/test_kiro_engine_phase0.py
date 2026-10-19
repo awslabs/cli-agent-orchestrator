@@ -44,7 +44,7 @@ async def test_capability_probe_does_not_block_event_loop():
 
     with (
         patch(
-            f"{_MODULE}.load_agent_profile",
+            f"{_MODULE}.agent_profiles.load_agent_profile",
             return_value=AgentProfile(
                 name="kas-profile",
                 description="KAS profile",
@@ -98,7 +98,7 @@ async def test_kas_probes_then_rejects_before_backend_or_persistence_allocation(
     )
 
     with (
-        patch(f"{_MODULE}.load_agent_profile", return_value=profile),
+        patch(f"{_MODULE}.agent_profiles.load_agent_profile", return_value=profile),
         patch(f"{_MODULE}.get_backend") as backend,
         patch(f"{_MODULE}.db_create_terminal") as db_create,
         patch(f"{_MODULE}.fifo_manager") as fifo,
@@ -126,7 +126,7 @@ async def test_explicit_and_profile_engines_conflict_before_probe_or_allocation(
     probe = Mock()
 
     with (
-        patch(f"{_MODULE}.load_agent_profile", return_value=profile),
+        patch(f"{_MODULE}.agent_profiles.load_agent_profile", return_value=profile),
         patch(f"{_MODULE}.get_backend") as backend,
         patch(f"{_MODULE}.db_create_terminal") as db_create,
     ):
@@ -159,7 +159,7 @@ async def test_omitted_engine_launches_as_explicitly_pinned_v2():
 
     with (
         patch(
-            f"{_MODULE}.load_agent_profile",
+            f"{_MODULE}.agent_profiles.load_agent_profile",
             return_value=AgentProfile(name="developer", description="Developer"),
         ),
         patch(f"{_MODULE}.get_backend") as backend,
@@ -208,7 +208,7 @@ async def test_explicit_model_override_is_probed_even_when_profile_has_none():
 
     with (
         patch(
-            f"{_MODULE}.load_agent_profile",
+            f"{_MODULE}.agent_profiles.load_agent_profile",
             return_value=AgentProfile(name="developer", description="Developer"),
         ),
         patch(f"{_MODULE}.get_backend") as backend,
@@ -265,7 +265,7 @@ async def test_v2_launches_on_a_wrapper_that_does_not_advertise_legacy_ui():
     provider.shell_baseline = None
 
     with (
-        patch(f"{_MODULE}.load_agent_profile", return_value=profile),
+        patch(f"{_MODULE}.agent_profiles.load_agent_profile", return_value=profile),
         patch(f"{_MODULE}.get_backend") as backend,
         patch(f"{_MODULE}.db_create_terminal"),
         patch(f"{_MODULE}.delete_terminals_by_session"),
@@ -311,7 +311,7 @@ async def test_yolo_v2_prose_only_trust_flag_rejects_before_allocation():
     profile = AgentProfile(name="developer", description="Developer")
 
     with (
-        patch(f"{_MODULE}.load_agent_profile", return_value=profile),
+        patch(f"{_MODULE}.agent_profiles.load_agent_profile", return_value=profile),
         patch(f"{_MODULE}.get_backend") as backend,
         patch(f"{_MODULE}.db_create_terminal") as db_create,
         patch(f"{_MODULE}.fifo_manager") as fifo,
@@ -356,7 +356,7 @@ async def test_yolo_v2_required_value_trust_flag_rejects_before_allocation():
     profile = AgentProfile(name="developer", description="Developer")
 
     with (
-        patch(f"{_MODULE}.load_agent_profile", return_value=profile),
+        patch(f"{_MODULE}.agent_profiles.load_agent_profile", return_value=profile),
         patch(f"{_MODULE}.get_backend") as backend,
         patch(f"{_MODULE}.db_create_terminal") as db_create,
         patch(f"{_MODULE}.fifo_manager") as fifo,
@@ -403,7 +403,7 @@ async def test_v2_agent_engine_value_exclusion_rejects_before_allocation():
     profile = AgentProfile(name="developer", description="Developer")
 
     with (
-        patch(f"{_MODULE}.load_agent_profile", return_value=profile),
+        patch(f"{_MODULE}.agent_profiles.load_agent_profile", return_value=profile),
         patch(f"{_MODULE}.get_backend") as backend,
         patch(f"{_MODULE}.db_create_terminal") as db_create,
         patch(f"{_MODULE}.fifo_manager") as fifo,

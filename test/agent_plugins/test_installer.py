@@ -181,8 +181,8 @@ class TestAffectedSessions:
             lambda: [{"id": "cao-work"}],
         )
         monkeypatch.setattr(
-            "cli_agent_orchestrator.clients.database.list_terminals_by_session",
-            lambda name: [{"id": "abcd1234", "agent_profile": "worker"}],
+            "cli_agent_orchestrator.services.session_service.list_current_session_terminals",
+            lambda name, **_kwargs: [{"id": "abcd1234", "agent_profile": "worker"}],
         )
         monkeypatch.setattr(
             "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile",
@@ -205,8 +205,8 @@ class TestAffectedSessions:
             lambda: [{"id": "cao-work"}],
         )
         monkeypatch.setattr(
-            "cli_agent_orchestrator.clients.database.list_terminals_by_session",
-            lambda name: [{"id": "abcd1234", "agent_profile": "worker"}],
+            "cli_agent_orchestrator.services.session_service.list_current_session_terminals",
+            lambda name, **_kwargs: [{"id": "abcd1234", "agent_profile": "worker"}],
         )
         monkeypatch.setattr(
             "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile",
@@ -225,8 +225,8 @@ class TestAffectedSessions:
             lambda: [{"id": "cao-work"}],
         )
         monkeypatch.setattr(
-            "cli_agent_orchestrator.clients.database.list_terminals_by_session",
-            lambda name: [{"id": "abcd1234", "agent_profile": "worker"}],
+            "cli_agent_orchestrator.services.session_service.list_current_session_terminals",
+            lambda name, **_kwargs: [{"id": "abcd1234", "agent_profile": "worker"}],
         )
         monkeypatch.setattr(
             "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile",

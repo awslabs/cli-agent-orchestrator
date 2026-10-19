@@ -29,7 +29,6 @@ from pathlib import Path
 from urllib.parse import quote
 
 import click
-import requests
 
 from cli_agent_orchestrator.constants import (
     API_BASE_URL,
@@ -42,7 +41,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_RUN_REQUEST_TIMEOUT,
     WORKFLOW_STEP_REQUEST_TIMEOUT,
 )
-from cli_agent_orchestrator.security.auth import get_local_bearer
+from cli_agent_orchestrator.utils import api_http
 from cli_agent_orchestrator.utils.workflow_events import SseFrame, parse_sse_frames
 
 # Whole-run states that end the follow/poll loop (mirror ``RunState``'s terminal
@@ -52,12 +51,11 @@ _TERMINAL_RUN_STATES = frozenset({"completed", "failed", "cancelled"})
 
 def _auth_headers() -> dict[str, str]:
     """Return the configured bearer header for the CLI-to-API hop, if any."""
-    token = get_local_bearer()
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    return api_http.auth_headers_for(API_BASE_URL)
 
 
 def _authentication_failure_detail(
-    response: requests.Response,
+    response: api_http.Response,
     auth_headers: dict[str, str] | None,
 ) -> str | None:
     """Explain a 401 without exposing the configured credential."""
@@ -104,7 +102,7 @@ def _render_lint_findings(findings: object) -> str:
     return "; ".join(lines)
 
 
-def _approval_refusal_envelope(response: requests.Response) -> dict | None:
+def _approval_refusal_envelope(response: api_http.Response) -> dict | None:
     """Return the MCP-compatible JSON envelope for an approval refusal, if present."""
     try:
         body = response.json()
@@ -169,7 +167,7 @@ def _approval_refusal_message(refusal: dict) -> str:
     return ""
 
 
-def _extract_detail(response: requests.Response, fallback: str) -> str:
+def _extract_detail(response: api_http.Response, fallback: str) -> str:
     """Pull a human-readable message out of a FastAPI error response.
 
     ``detail`` IS NOT ALWAYS A STRING on this API, and the object arm is why this function changed at
@@ -243,7 +241,7 @@ def _quoted_workflow_name(name: str, as_json: bool) -> str:
 
 
 def _authoring_failure(
-    response: requests.Response,
+    response: api_http.Response,
     as_json: bool,
     fallback: str,
     operation: str,
@@ -345,13 +343,12 @@ def create_cmd(name, from_file, as_json):
 
     auth_headers = _auth_headers() or None
     try:
-        response = requests.post(
+        response = api_http.post(
             f"{API_BASE_URL}/workflows",
             json={"name": name, "source": source},
-            headers=auth_headers,
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise _unreachable(e, as_json)
 
     if response.status_code not in (200, 201):
@@ -407,13 +404,12 @@ def update_cmd(name, from_file, expected_hash, as_json):
 
     auth_headers = _auth_headers() or None
     try:
-        response = requests.put(
+        response = api_http.put(
             f"{API_BASE_URL}/workflows/{quoted_name}",
             json={"source": source, "expected_hash": expected_hash},
-            headers=auth_headers,
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise _unreachable(e, as_json)
 
     if response.status_code != 200:
@@ -432,19 +428,21 @@ def update_cmd(name, from_file, expected_hash, as_json):
 def validate_cmd(file, as_json):
     """Validate a workflow spec file WITHOUT running it.
 
+    Requires a running cao-server.
+
+    \b
     Exit codes:
       0  spec is valid (pass or pass_reserved)
       1  spec failed validation, or the request errored
     """
     auth_headers = _auth_headers() or None
     try:
-        response = requests.post(
+        response = api_http.post(
             f"{API_BASE_URL}/workflows/validate",
             json={"path": file},
-            headers=auth_headers,
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise _unreachable(e, as_json)
 
     if response.status_code != 200:
@@ -478,18 +476,20 @@ def validate_cmd(file, as_json):
 @click.option("--dir", "scan_dir", default=None, help="Directory to scan for spec files.")
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the rows as JSON.")
 def list_cmd(scan_dir, as_json):
-    """List indexed workflows (rebuilt from the spec files on disk)."""
+    """List indexed workflows (rebuilt from the spec files on disk).
+
+    Requires a running cao-server.
+    """
     params = {}
     if scan_dir is not None:
         params["dir"] = scan_dir
     try:
-        response = requests.get(
+        response = api_http.get(
             f"{API_BASE_URL}/workflows",
             params=params,
-            headers=_auth_headers() or None,
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 400:
@@ -527,12 +527,11 @@ def get_cmd(name, as_json):
     quoted_name = _quoted_workflow_name(name, as_json)
     auth_headers = _auth_headers() or None
     try:
-        response = requests.get(
+        response = api_http.get(
             f"{API_BASE_URL}/workflows/{quoted_name}",
-            headers=auth_headers,
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     authentication_detail = _authentication_failure_detail(response, auth_headers)
@@ -576,7 +575,7 @@ def get_cmd(name, as_json):
     "--json", "as_json", is_flag=True, default=False, help="Emit the approval record as JSON."
 )
 def approve_cmd(plan_id, as_json):
-    """Approve a PLAN_ID so runs of that plan may start (issue #583 FR-8).
+    """Approve PLAN_ID so its runs may start.
 
     A plan identifier is computed at RUN START from the workflow's execution-affecting fields, so a
     NEW OR CHANGED PLAN IS REFUSED ONCE before it can be approved: run it, copy the plan_id from the
@@ -594,21 +593,23 @@ def approve_cmd(plan_id, as_json):
     The recorded approver is the local OS account. It is PROVENANCE, NOT IDENTITY — nothing verifies
     it, and CAO runs as the invoking user.
 
+    Requires a running cao-server.
+
+    \b
     Exit codes:
       0  the plan is approved (whether this call approved it or found it already approved)
       1  the request was rejected or the server could not be reached
     """
     auth_headers = _auth_headers() or None
     try:
-        response = requests.post(
+        response = api_http.post(
             f"{API_BASE_URL}/workflows/plans/approve",
             # plan_id rides the BODY, never the path: it contains a ':' and must reach the server
             # verbatim, because a normalisation is how two distinct plans could share one approval.
             json={"plan_id": plan_id},
-            headers=auth_headers,
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 400:
@@ -644,12 +645,11 @@ def delete_cmd(name, yes, as_json):
         click.confirm(f"Delete workflow '{name}'?", abort=True)
     auth_headers = _auth_headers() or None
     try:
-        response = requests.delete(
+        response = api_http.delete(
             f"{API_BASE_URL}/workflows/{quoted_name}",
-            headers=auth_headers,
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     authentication_detail = _authentication_failure_detail(response, auth_headers)
@@ -746,7 +746,8 @@ def _render_snapshot(snapshot):
     click.echo(f"State:   {snapshot.get('state')}")
     click.echo(f"Current: {snapshot.get('current_step_id') or '(none)'}")
     for step in snapshot.get("steps", []):
-        click.echo(f"  - {step['id']}: {step['state']} (attempts={step.get('attempts')})")
+        kind = f" [{step['error_kind']}]" if step.get("error_kind") else ""
+        click.echo(f"  - {step['id']}: {step['state']}{kind} (attempts={step.get('attempts')})")
 
 
 def _render_result(result):
@@ -858,12 +859,11 @@ def _poll_to_terminal(run_id, as_json):
     last_step = None
     while True:
         try:
-            response = requests.get(
+            response = api_http.get(
                 f"{API_BASE_URL}/workflows/runs/{run_id}",
-                headers=_auth_headers() or None,
                 timeout=MCP_REQUEST_TIMEOUT,
             )
-        except requests.exceptions.RequestException as e:
+        except api_http.exceptions.RequestException as e:
             transport_failures += 1
             if transport_failures > 1:
                 # One bounded retry exhausted — a lost socket is not a failed run.
@@ -892,7 +892,7 @@ def _poll_to_terminal(run_id, as_json):
         # goes silent until the run finishes — a 10-step, 40-minute workflow looked
         # identical to a hung one. ``current_step_id`` is already in the snapshot and
         # advances per step, so keying on the (state, step) PAIR turns the same poll
-        # into real per-step progress with no extra requests.
+        # into real per-step progress with no extra api_http.
         if not as_json and (state, current) != (last_state, last_step):
             click.echo(f"[{state}] current: {current}")
             last_state = state
@@ -929,14 +929,17 @@ def _poll_to_terminal(run_id, as_json):
 def run_cmd(name_or_path, inputs, run_id, working_directory, detach, wait, as_json):
     """Run a workflow.
 
-    By default (FR-4, issue #505) ``run`` SUBMITS the run asynchronously, prints
-    the run id immediately, then FOLLOWS it — polling status to a terminal state.
+    By default `run` SUBMITS the run asynchronously, prints the run id
+    immediately, then FOLLOWS it — polling status to a terminal state.
     Ctrl-C during the follow DETACHES (the run keeps running server-side; it is
-    never cancelled). ``--detach`` submits and returns the id without following.
-    ``--wait`` is the explicit blocking escape hatch (the retained inline path).
+    never cancelled). `--detach` submits and returns the id without following.
+    `--wait` is the explicit blocking escape hatch (the retained inline path).
 
-    Exit codes (identical on a TTY, a non-TTY, and under ``--json``):
-      0  run reached COMPLETED (or ``--detach`` submitted, or Ctrl-C detached)
+    Requires a running cao-server.
+
+    \b
+    Exit codes (identical on a TTY, a non-TTY, and under `--json`):
+      0  run reached COMPLETED (or `--detach` submitted, or Ctrl-C detached)
       1  run reached FAILED / CANCELLED, or the request errored
     """
     parsed = _parse_inputs(inputs)
@@ -955,13 +958,12 @@ def run_cmd(name_or_path, inputs, run_id, working_directory, detach, wait, as_js
     # MCP_REQUEST_TIMEOUT would report a still-running run as a failure.
     if wait:
         try:
-            response = requests.post(
+            response = api_http.post(
                 f"{API_BASE_URL}/workflows/runs",
                 json=payload,
-                headers=auth_headers,
                 timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
             )
-        except requests.exceptions.RequestException as e:
+        except api_http.exceptions.RequestException as e:
             raise click.ClickException(f"could not reach cao-server: {e}")
         if response.status_code == 404:
             raise click.ClickException(
@@ -985,13 +987,12 @@ def run_cmd(name_or_path, inputs, run_id, working_directory, detach, wait, as_js
 
     # --- default + --detach: submit asynchronously via the :submit spine. ----
     try:
-        response = requests.post(
+        response = api_http.post(
             f"{API_BASE_URL}/workflows/runs:submit",
             json=payload,
-            headers=auth_headers,
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 404:
@@ -1066,13 +1067,12 @@ def _resolve_latest_run_id():
     Returns ``None`` when no runs exist (the caller prints "no runs found").
     """
     try:
-        response = requests.get(
+        response = api_http.get(
             f"{API_BASE_URL}/workflows/runs",
             params={"limit": 1},
-            headers=_auth_headers() or None,
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
     if response.status_code != 200:
         raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
@@ -1088,8 +1088,10 @@ def _resolve_latest_run_id():
 def status_cmd(run_id, as_json):
     """Show a point-in-time status snapshot for a run.
 
-    With no RUN_ID (VR-4, FR-4.8) resolves the most-recently-started run and shows
-    that one; an empty run list prints "no runs found" and exits 0.
+    With no RUN_ID, resolves the most-recently-started run and shows that one;
+    an empty run list prints "no runs found" and exits 0.
+
+    Requires a running cao-server.
     """
     if run_id is None:
         run_id = _resolve_latest_run_id()
@@ -1098,12 +1100,11 @@ def status_cmd(run_id, as_json):
             return
 
     try:
-        response = requests.get(
+        response = api_http.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}",
-            headers=_auth_headers() or None,
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 404:
@@ -1123,11 +1124,13 @@ def status_cmd(run_id, as_json):
 @click.option("--limit", "limit", type=int, default=None, help="Max rows to return (server caps).")
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the rows as JSON.")
 def runs_cmd(state, limit, as_json):
-    """List workflow RUNS newest-first (distinct from ``list``, which lists specs).
+    """List workflow runs, newest first.
 
-    ``cao workflow runs`` shows submitted/finished runs and their state;
-    ``cao workflow list`` shows the indexed workflow SPECS on disk. Optional
-    ``--state`` filters by run state and ``--limit`` caps the row count.
+    `cao workflow runs` shows submitted/finished runs and their state;
+    `cao workflow list` shows the indexed workflow SPECS on disk. Optional
+    `--state` filters by run state and `--limit` caps the row count.
+
+    Requires a running cao-server.
     """
     params = {}
     if state is not None:
@@ -1135,13 +1138,12 @@ def runs_cmd(state, limit, as_json):
     if limit is not None:
         params["limit"] = limit
     try:
-        response = requests.get(
+        response = api_http.get(
             f"{API_BASE_URL}/workflows/runs",
             params=params,
-            headers=_auth_headers() or None,
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 400:
@@ -1172,9 +1174,14 @@ def runs_cmd(state, limit, as_json):
     "--json", "as_json", is_flag=True, default=False, help="Emit the terminal state as JSON."
 )
 def wait_cmd(run_id, as_json):
-    """Follow an existing run by polling its status until it reaches a terminal state.
+    """Wait for an existing run to finish.
 
-    Exit codes (identical on a TTY, a non-TTY, and under ``--json``):
+    Polls the run's status until it reaches a terminal state.
+
+    Requires a running cao-server.
+
+    \b
+    Exit codes (identical on a TTY, a non-TTY, and under `--json`):
       0  run reached COMPLETED (or contact with the server was lost mid-follow)
       1  run reached FAILED / CANCELLED, or the request errored
     """
@@ -1194,14 +1201,18 @@ def wait_cmd(run_id, as_json):
 @click.argument("run_id")
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
 def result_cmd(run_id, as_json):
-    """Show the complete retained result for a (finished or in-flight) run."""
+    """Show the retained result for a run.
+
+    Shows the complete retained result of a finished or in-flight run.
+
+    Requires a running cao-server.
+    """
     try:
-        response = requests.get(
+        response = api_http.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}/result",
-            headers=_auth_headers() or None,
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 404:
@@ -1231,7 +1242,9 @@ def result_cmd(run_id, as_json):
 )
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
 def resume_cmd(run_id, decide, as_json):
-    """Resume a crashed/failed run from its durable journal (blocks until done).
+    """Resume a crashed or failed run.
+
+    Re-drives the run from its durable journal and blocks until it is done.
 
     A script-tier resume RE-EXECUTES THE SCRIPT TOP-TO-BOTTOM; completed steps are
     NOT skipped. Each step is decided as it arrives and is either REPLAYED (its
@@ -1239,13 +1252,16 @@ def resume_cmd(run_id, decide, as_json):
     (CAO will not decide alone, so the run stops there and waits for a --decide).
     A step whose script changed at the same key DIVERGES and fails the run instead.
 
+    `--decide` carries a decision for a step the run halted on.
+    Each decision authorises exactly ONE attempt: if that attempt crashes before it
+    settles, the next resume asks again rather than re-executing on old consent.
+
+    Requires a running cao-server.
+
+    \b
     Exit codes:
       0  run reached COMPLETED
       1  run reached FAILED / CANCELLED, or the request errored
-
-    ``--decide`` carries a decision for a step the run halted on (issue #583, FR-7).
-    Each decision authorises exactly ONE attempt: if that attempt crashes before it
-    settles, the next resume asks again rather than re-executing on old consent.
     """
     decisions = _parse_decisions(decide)
     try:
@@ -1253,13 +1269,12 @@ def resume_cmd(run_id, decide, as_json):
         # worst-case-covering run timeout, not the flat MCP_REQUEST_TIMEOUT.
         # ``json=None`` sends NO body, so a decision-free resume is byte-identical to
         # the pre-#583 request.
-        response = requests.post(
+        response = api_http.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/resume",
             json={"decisions": decisions} if decisions else None,
-            headers=_auth_headers() or None,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 404:
@@ -1334,17 +1349,21 @@ def _render_step_replay(result):
 )
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
 def step_cmd(run_id, step_id, prompt_file, prompt_override, as_json):
-    """Re-execute ONE step of a recorded run, without re-running the workflow.
+    """Re-execute one step of a recorded run.
 
-    Resolves the step's prompt from the RECORDED run (journaled inputs + predecessor
-    outputs), runs it live, and prints the resolved prompt and the output. The source
-    run is left untouched, so a step can be re-probed as many times as it takes to
-    get its prompt right. YAML-tier runs only.
+    Does not re-run the workflow. Resolves the step's prompt from the RECORDED
+    run (journaled inputs + predecessor outputs), runs it live, and prints the
+    resolved prompt and the output. The source run is left untouched, so a step
+    can be re-probed as many times as it takes to get its prompt right.
+    YAML-tier runs only.
 
-    ``--prompt-file`` / ``--prompt-override`` replace the prompt TEMPLATE for this one
-    execution; ``{{workflow.inputs.*}}`` / ``{{steps.*.output.*}}`` references in the
+    `--prompt-file` / `--prompt-override` replace the prompt TEMPLATE for this one
+    execution; `{{workflow.inputs.*}}` / `{{steps.*.output.*}}` references in the
     replacement still resolve against the recorded run.
 
+    Requires a running cao-server.
+
+    \b
     Exit codes:
       0  the step ran
       1  the step failed, or the request errored
@@ -1378,13 +1397,12 @@ def step_cmd(run_id, step_id, prompt_file, prompt_override, as_json):
         # server-side at WORKFLOW_STEP_TIMEOUT, so it uses the single-step ceiling
         # rather than the multi-step WORKFLOW_RUN_REQUEST_TIMEOUT: a genuinely hung
         # server surfaces in minutes, not hours.
-        response = requests.post(
+        response = api_http.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/steps/{step_id}:replay",
             json=payload,
-            headers=_auth_headers() or None,
             timeout=WORKFLOW_STEP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 404:
@@ -1407,14 +1425,16 @@ def step_cmd(run_id, step_id, prompt_file, prompt_override, as_json):
 @workflow.command(name="cancel")
 @click.argument("run_id")
 def cancel_cmd(run_id):
-    """Cooperatively cancel a running workflow."""
+    """Cooperatively cancel a running workflow.
+
+    Requires a running cao-server.
+    """
     try:
-        response = requests.post(
+        response = api_http.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/cancel",
-            headers=_auth_headers() or None,
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 404:
@@ -1444,11 +1464,11 @@ def _open_events_stream(run_id: str, cursor):
     run from tripping a spurious read timeout between frames.
     """
     params = {}
-    headers = {**_auth_headers(), "Accept": "text/event-stream"}
+    headers = {"Accept": "text/event-stream"}
     if cursor is not None:
         params["after_seq"] = cursor
         headers["Last-Event-ID"] = str(cursor)
-    return requests.get(
+    return api_http.get(
         f"{API_BASE_URL}/workflows/runs/{run_id}/events",
         params=params,
         headers=headers,
@@ -1471,12 +1491,11 @@ def _events_route_or_run_missing(run_id: str) -> click.ClickException:
     than asserting a server capability it could not verify.
     """
     try:
-        probe = requests.get(
+        probe = api_http.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}",
-            headers=_auth_headers() or None,
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException:
+    except api_http.exceptions.RequestException:
         return click.ClickException(f"unknown run '{run_id}'")
     if probe.status_code == 200:
         return click.ClickException(
@@ -1590,12 +1609,15 @@ def _final_events_status(run_id: str):
     socket is never reported as a failed run.
     """
     try:
-        response = requests.get(
+        response = api_http.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}",
-            headers=_auth_headers() or None,
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException:
+    except api_http.AuthNotConfiguredError as exc:
+        # A missing credential is not a lost socket: surface it (exit 1) rather
+        # than answering "not terminal" and letting the follow end with exit 0.
+        raise click.ClickException(str(exc)) from exc
+    except api_http.exceptions.RequestException:
         return None
     if response.status_code != 200:
         return None
@@ -1614,13 +1636,12 @@ def _events_batch_read(run_id: str, after_seq, as_json: bool) -> None:
     if after_seq is not None:
         params["after_seq"] = after_seq
     try:
-        response = requests.get(
+        response = api_http.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}/events",
             params=params,
-            headers=_auth_headers() or None,
             timeout=MCP_REQUEST_TIMEOUT,
         )
-    except requests.exceptions.RequestException as e:
+    except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 404:
@@ -1659,17 +1680,21 @@ def _events_batch_read(run_id: str, after_seq, as_json: bool) -> None:
 )
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit each frame as JSON.")
 def events_cmd(run_id, follow, after_seq, as_json):
-    """Follow a run's live event stream, rendering per-run ordered progress.
+    """Follow a run's live event stream.
 
-    Consumes #504's events-follow SSE route (``Accept: text/event-stream``). Each
-    normal frame renders as a progress line (or a JSON line under ``--json`` /
-    non-TTY); a server-DECLARED ``event: gap`` frame is rendered verbatim (the gap
-    is DATA the server sends — the follower never computes one from seq numbering).
-    On a dropped connection the follow reconnects, resuming exactly via
-    ``?after_seq=<last-seen seq>`` so no event is re-delivered. Ctrl-C DETACHES
-    (prints the handle + a hint, exits 0, never cancels).
+    Renders per-run ordered progress from the server's events-follow SSE route
+    (`Accept: text/event-stream`). Each normal frame renders as a progress line
+    (or a JSON line under `--json` / non-TTY); a server-DECLARED `event: gap`
+    frame is rendered verbatim (the gap is DATA the server sends — the follower
+    never computes one from seq numbering). On a dropped connection the follow
+    reconnects, resuming exactly via `?after_seq=<last-seen seq>` so no event is
+    re-delivered. Ctrl-C DETACHES (prints the handle + a hint, exits 0, never
+    cancels).
 
-    Exit codes (identical on a TTY, a non-TTY, and under ``--json``):
+    Requires a running cao-server.
+
+    \b
+    Exit codes (identical on a TTY, a non-TTY, and under `--json`):
       0  run reached COMPLETED — or Ctrl-C detached, or the stream ended without a
          terminal (a final status check confirms the run is not yet terminal)
       1  run reached FAILED / CANCELLED
@@ -1703,7 +1728,13 @@ def events_cmd(run_id, follow, after_seq, as_json):
                         terminal_state = frame.terminal_state
                         saw_terminal = True
                         break
-            except requests.exceptions.RequestException:
+            except api_http.AuthNotConfiguredError as exc:
+                # Not a dropped connection: the server wants a bearer and this
+                # shell has none to send. Retrying cannot change that, and the
+                # final status read would swallow it into ``stream_ended`` with
+                # exit 0. Fail loudly with the actionable message instead.
+                raise click.ClickException(str(exc)) from exc
+            except api_http.exceptions.RequestException:
                 # A dropped connection is not run death — reconnect from the last
                 # seen seq (exact resume), bounded so a flapping stream cannot spin
                 # forever. Budget exhausted -> fall through to the final status read.

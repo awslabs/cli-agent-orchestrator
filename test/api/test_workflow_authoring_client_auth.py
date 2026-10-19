@@ -150,10 +150,10 @@ def client_boundary(monkeypatch):
     monkeypatch.setattr(mcp_server.requests, "get", adapter.get)
     monkeypatch.setattr(mcp_server.requests, "post", adapter.post)
     monkeypatch.setattr(mcp_server.requests, "put", adapter.put)
-    monkeypatch.setattr(cli_workflow.requests, "get", adapter.get)
-    monkeypatch.setattr(cli_workflow.requests, "post", adapter.post)
-    monkeypatch.setattr(cli_workflow.requests, "put", adapter.put)
-    monkeypatch.setattr(cli_workflow.requests, "delete", adapter.delete)
+    monkeypatch.setattr(cli_workflow.api_http.requests, "get", adapter.get)
+    monkeypatch.setattr(cli_workflow.api_http.requests, "post", adapter.post)
+    monkeypatch.setattr(cli_workflow.api_http.requests, "put", adapter.put)
+    monkeypatch.setattr(cli_workflow.api_http.requests, "delete", adapter.delete)
     return adapter
 
 
@@ -350,7 +350,7 @@ def test_local_token_crosses_cli_and_mcp_run_and_start_boundaries(monkeypatch):
             json=lambda: {"run_id": "run-1", "state": "completed", "steps": []},
         )
 
-    monkeypatch.setattr(cli_workflow.requests, "get", _get)
+    monkeypatch.setattr(cli_workflow.api_http.requests, "get", _get)
     monkeypatch.setattr(mcp_server.requests, "get", _get)
 
     mcp_run = asyncio.run(_mcp_tool("workflow_run")(name_or_path="wf"))
@@ -488,9 +488,23 @@ def test_every_registered_workflow_mcp_http_hop_forwards_auth():
 def test_every_workflow_cli_http_hop_forwards_auth():
     """CLI workflow functions authenticate every direct requests hop in this module."""
     failures, inspected = _request_auth_failures(cli_workflow)
-    assert inspected
-    assert len(inspected) >= 21
+    assert inspected == []
     assert failures == []
+    tree = ast.parse(inspect.getsource(cli_workflow))
+    calls = [
+        call
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "api_http"
+        and call.func.attr in {"get", "post", "put", "delete"}
+    ]
+    assert len(calls) >= 21
+    # The shared transport attaches auth; callers must not derive a second header.
+    for call in calls:
+        headers = next((kw.value for kw in call.keywords if kw.arg == "headers"), None)
+        assert headers is None or not _contains_auth_derivation(headers, set())
 
 
 @pytest.mark.parametrize(
@@ -529,8 +543,8 @@ def test_remaining_workflow_cli_verbs_forward_auth(monkeypatch, args):
             body = {"run_id": "run-1", "state": "completed"}
         return SimpleNamespace(status_code=200, json=lambda: body)
 
-    monkeypatch.setattr(cli_workflow.requests, "get", _response)
-    monkeypatch.setattr(cli_workflow.requests, "post", _response)
+    monkeypatch.setattr(cli_workflow.api_http.requests, "get", _response)
+    monkeypatch.setattr(cli_workflow.api_http.requests, "post", _response)
 
     result = CliRunner().invoke(cli_workflow.workflow, args)
 
@@ -565,14 +579,26 @@ def test_mcp_run_authenticates_terminal_root_lookup_and_first_post(
         )
 
     monkeypatch.setattr(script_runner, "run_script_workflow", _run)
+    monkeypatch.setattr(
+        api_main.terminal_service,
+        "get_terminal",
+        lambda tid: {
+            "id": tid,
+            "name": "tester",
+            "agent_profile": "tester",
+            "provider": "codex",
+            "session_name": "cao-test",
+            "allowed_tools": ["*"],
+        },
+    )
 
     result = asyncio.run(_mcp_tool("workflow_run")(name_or_path="wf"))
 
     assert result["ok"] is True
-    assert [headers["Authorization"] for headers in client_boundary.seen_headers] == [
-        f"Bearer {token}",
-        f"Bearer {token}",
-    ]
+    assert len(client_boundary.seen_headers) >= 2
+    assert all(
+        headers == {"Authorization": f"Bearer {token}"} for headers in client_boundary.seen_headers
+    )
 
 
 def test_auth_off_sends_no_header_and_both_client_types_still_work(

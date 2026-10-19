@@ -19,6 +19,7 @@ from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as
 from cli_agent_orchestrator.agent_plugins.mcp_mapping import PROVIDER_SERVER_NAME_PATTERNS
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR, SECURITY_PROMPT
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
@@ -46,7 +47,8 @@ _COMPLETION_PATTERN = re.compile(r"(?:^|\n)[^\S\n]*└\s+Completed in\s+\d", re.
 # overlapped the following `.*` on every whitespace character outside ASCII, which
 # reads as re-guessable backtracking (CWE-1333); ^-anchoring means CPython never
 # actually walked it, but the narrower classes say what the line really looks like.
-_ASSISTANT_LINE_PATTERN = re.compile(r"^(?P<indent>[^\S\n]*)●[^\S\n]+(?P<text>\S.*)$")
+ASSISTANT_MARKER_PATTERN = re.compile(r"^(?P<indent>[^\S\n]*)●[^\S\n]+")
+_ASSISTANT_LINE_PATTERN = re.compile(ASSISTANT_MARKER_PATTERN.pattern + r"(?P<text>\S.*)$")
 _READY_ASSISTANT_LINE_PATTERN = re.compile(r"^\s*●\s+Ready\s*$")
 _WAITING_PATTERN = re.compile(
     r"Approval needed|Run this command\?|Allow for this conversation|"
@@ -106,6 +108,15 @@ class ProviderError(Exception):
 
 class MiniMaxCodeProvider(BaseProvider):
     """Provider for the interactive ``mcode`` terminal UI."""
+
+    @classmethod
+    def honors_model(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+        requested_model: Optional[str],
+    ) -> bool:
+        return True
 
     def __init__(
         self,

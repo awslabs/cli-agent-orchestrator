@@ -1,6 +1,6 @@
 [project]
 name = "cli-agent-orchestrator"
-version = "2.5.0"
+version = "2.5.4"
 description = "CLI Agent Orchestrator"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,8 +37,8 @@ dependencies = [
     "fastapi>=0.104.0",
     # Upper bound: ext_apps/sep2133.advertise_capability monkey-patches a FastMCP
     # internal (create_initialization_options); cap the major to avoid silent
-    # breakage on a new major release. Tested against 3.x.
-    "fastmcp>=2.14.0,<4.0.0",
+    # breakage on a new major release. Tested against 3.x and 4.x.
+    "fastmcp>=3.2.0,<5.0.0",
     "mcp>=1.23.0",
     "pydantic>=2.10.6",
     "apscheduler>=3.10.4",
@@ -64,6 +64,7 @@ dependencies = [
     "requests>=2.32.0",
     "rank-bm25>=0.2.2",
     "pyte>=0.8.2",
+    "wcwidth>=0.2.13",
     # JWT/JWKS verification for the default-off OAuth 2.1 auth layer (RS256 via
     # JWKS). The [crypto] extra pulls in `cryptography` for RSA signature
     # verification and provides `jwt.PyJWKClient`. See spec task 9.1 research note.
@@ -105,6 +106,7 @@ dependencies = [
     # not just a dev dependency — or every `cao` command would fail to import.
     "tomli>=2.0.0; python_version < '3.11'",
     "psutil>=7.0.0",
+    "tomlkit>=0.13.3,<1.0.0",
 ]
 
 [project.optional-dependencies]
@@ -135,6 +137,9 @@ kiro_cli_memory = "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory:KiroCl
 codex_memory = "cli_agent_orchestrator.plugins.builtin.codex_memory:CodexMemoryPlugin"
 event_log_publisher = "cli_agent_orchestrator.plugins.builtin.event_log_publisher:EventLogPublisher"
 mcp_apps = "cli_agent_orchestrator.plugins.builtin.mcp_apps:McpAppsPlugin"
+
+[project.entry-points."cao.deciders"]
+fixed_table = "cli_agent_orchestrator.decisions.fixed_table:FixedTableDecider"
 
 [project.urls]
 Homepage = "https://github.com/awslabs/cli-agent-orchestrator"
@@ -384,6 +389,9 @@ dev = [
     # with authlib; runtime verification needs only pyjwt[crypto].
     "authlib>=1.7.1",
     "types-psutil>=7.0.0",
+    # Tests import httpx directly; fastmcp 4 / mcp 2 use httpx2 and no longer
+    # pull httpx in transitively.
+    "httpx>=0.28.1",
 ]
 
 [tool.black]

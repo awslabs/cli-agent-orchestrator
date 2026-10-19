@@ -2,6 +2,30 @@
 
 A single-page dashboard for managing CLI Agent Orchestrator sessions, agents, flows, and settings from the browser.
 
+## Dependency security
+
+Use npm 10+ and `npm ci` with install scripts enabled. All `braces` consumers
+resolve the published guarded fork `@dieub/braces-depth-guard@3.0.3-pn.3` through
+the private local `braces-compat` adapter, which only re-exports the canonical
+dependency. The unchanged fork tarball is [vendored in the repository](../vendor/README.md),
+so its registry availability is not required for a cold install. Keep `.npmrc`'s
+`install-links=false` setting and include `braces-compat/` and `../vendor/`
+when installing the project. Its fail-on-error `postinstall` applies
+[`../patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch`](../patches/@dieub+braces-depth-guard+3.0.3-pn.3.patch), shared
+with the docs and MCP Apps toolchains, to additionally bound acyclic AST
+ancestor traversal. `npm run test:dependencies` checks the installed implementation
+and its consumers; `npm run build` runs these checks automatically.
+
+This replaces the affected original with a reviewed third-party implementation;
+it is not an official fixed release or a scanner exemption. See
+[Dependency Security](../SECURITY.md#full-dependency-gate) for full-graph CI
+coverage, the strict HIGH/CRITICAL gate, and the separate mitigation status.
+
+The lockfile also includes `source-map-js` 1.2.2 and overrides
+`postcss-selector-parser` to `^7.1.6`, since its v6 consumer ranges have no fixed
+release for CVE-2026-104844. Keep the Tailwind/PostCSS build checks when updating
+this override; see [upstream security releases](../SECURITY.md#additional-upstream-security-releases).
+
 ## Architecture
 
 ```

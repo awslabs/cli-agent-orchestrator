@@ -220,7 +220,7 @@ class TestSetAndPath:
         on_disk = json.loads(_isolated_settings["settings"].read_text())
         assert on_disk["terminal"]["backend"] == "herdr"
 
-    def test_set_atomically_replaces_settings_and_preserves_mode(
+    def test_set_atomically_replaces_settings_and_enforces_private_mode(
         self, _isolated_settings, monkeypatch
     ):
         settings_file = _isolated_settings["settings"]
@@ -241,25 +241,26 @@ class TestSetAndPath:
         assert len(replacements) == 1
         assert replacements[0][1] == settings_file
         assert json.loads(settings_file.read_text())["workflow"]["require_approval"] is False
-        assert settings_file.stat().st_mode & 0o777 == 0o640
+        assert settings_file.stat().st_mode & 0o777 == 0o600
 
-    def test_set_preserves_settings_symlink_and_target_mode(self, _isolated_settings, monkeypatch):
+    def test_set_replaces_settings_symlink_and_preserves_target(
+        self, _isolated_settings, monkeypatch
+    ):
         settings_file = _isolated_settings["settings"]
         target = settings_file.with_name("dotfiles-settings.json")
         target.write_text('{"workflow": {"require_approval": true}}')
         target.chmod(0o640)
         settings_file.symlink_to(target)
         monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
-        lock_path_before = atomic_file._lock_path_for(settings_file)
 
         ConfigService.set("workflow.require_approval", False)
 
-        assert settings_file.is_symlink()
-        assert json.loads(target.read_text())["workflow"]["require_approval"] is False
+        assert not settings_file.is_symlink()
+        assert json.loads(settings_file.read_text())["workflow"]["require_approval"] is False
+        assert json.loads(target.read_text()) == {"workflow": {"require_approval": True}}
         assert target.stat().st_mode & 0o777 == 0o640
-        assert atomic_file._lock_path_for(settings_file) == lock_path_before
 
-    def test_set_through_dangling_settings_symlink(self, _isolated_settings, monkeypatch):
+    def test_set_replaces_dangling_settings_symlink(self, _isolated_settings, monkeypatch):
         settings_file = _isolated_settings["settings"]
         target = settings_file.with_name("dotfiles-settings.json")
         settings_file.symlink_to(target)
@@ -267,8 +268,9 @@ class TestSetAndPath:
 
         ConfigService.set("workflow.require_approval", False)
 
-        assert settings_file.is_symlink()
-        assert json.loads(target.read_text())["workflow"]["require_approval"] is False
+        assert not settings_file.is_symlink()
+        assert json.loads(settings_file.read_text())["workflow"]["require_approval"] is False
+        assert not target.exists()
 
     def test_config_and_settings_writers_share_lock_through_symlinked_home(
         self, tmp_path, monkeypatch
@@ -344,3 +346,35 @@ class TestListAll:
         assert "memory.compile_mode" in result
         assert "server.mcp_request_timeout" in result
         assert result["terminal.backend"] == "tmux"
+
+
+class TestSavePrivateAndSymlinkSafe:
+    """``cao config set`` is the second writer of settings.json and must match the
+    first: 0600, atomic, never through a symlink. ``ConfigService.set`` reaches
+    ``_save_raw`` for every key settings_service does not own (``terminal.backend``
+    here), so this pins that path rather than the settings_service one."""
+
+    def test_set_creates_file_private(self, _isolated_settings):
+        settings = _isolated_settings["settings"]
+        ConfigService.set("terminal.backend", "tmux")
+        assert oct(settings.stat().st_mode & 0o777) == oct(0o600)
+        assert json.loads(settings.read_text())["terminal"]["backend"] == "tmux"
+
+    def test_set_tightens_an_existing_world_readable_file(self, _isolated_settings):
+        settings = _isolated_settings["settings"]
+        settings.write_text(json.dumps({"terminal": {"backend": "herdr"}}))
+        settings.chmod(0o644)
+        ConfigService.set("terminal.backend", "tmux")
+        assert oct(settings.stat().st_mode & 0o777) == oct(0o600)
+        assert json.loads(settings.read_text())["terminal"]["backend"] == "tmux"
+
+    def test_set_does_not_follow_a_symlink(self, _isolated_settings, tmp_path):
+        settings = _isolated_settings["settings"]
+        victim = tmp_path / "victim.txt"
+        victim.write_text("do not touch")
+        settings.symlink_to(victim)
+        ConfigService.set("terminal.backend", "tmux")
+        assert victim.read_text() == "do not touch"
+        assert not settings.is_symlink()
+        assert oct(settings.stat().st_mode & 0o777) == oct(0o600)
+        assert json.loads(settings.read_text())["terminal"]["backend"] == "tmux"

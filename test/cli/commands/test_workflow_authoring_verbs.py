@@ -61,7 +61,7 @@ def test_create_posts_the_source_text_and_reports_the_hash(monkeypatch, source_f
             201, {"name": "authored", "path": "/x/authored.py", "content_hash": "sha256:aa"}
         )
 
-    monkeypatch.setattr("cli_agent_orchestrator.cli.commands.workflow.requests.post", fake_post)
+    monkeypatch.setattr("cli_agent_orchestrator.cli.commands.workflow.api_http.post", fake_post)
 
     result = CliRunner().invoke(workflow, ["create", "authored", "--from-file", str(source_file)])
 
@@ -77,7 +77,7 @@ def test_create_posts_the_source_text_and_reports_the_hash(monkeypatch, source_f
 def test_authoring_json_success_envelopes_include_ok(monkeypatch, source_file, verb):
     response = _resp(201 if verb == "create" else 200, {"name": "wf", "content_hash": "sha256:new"})
     monkeypatch.setattr(
-        "cli_agent_orchestrator.cli.commands.workflow.requests."
+        "cli_agent_orchestrator.cli.commands.workflow.api_http."
         + ("post" if verb == "create" else "put"),
         lambda *args, **kwargs: response,
     )
@@ -105,7 +105,7 @@ def test_create_requires_from_file(monkeypatch):
     def unreachable(*a, **k):  # pragma: no cover - must not be called
         raise AssertionError("no request may be issued when a required option is missing")
 
-    monkeypatch.setattr("cli_agent_orchestrator.cli.commands.workflow.requests.post", unreachable)
+    monkeypatch.setattr("cli_agent_orchestrator.cli.commands.workflow.api_http.post", unreachable)
 
     result = CliRunner().invoke(workflow, ["create", "authored"])
 
@@ -119,7 +119,7 @@ def test_update_requires_expected_hash(monkeypatch, source_file):
     def unreachable(*a, **k):  # pragma: no cover
         raise AssertionError("no request may be issued without an asserted hash")
 
-    monkeypatch.setattr("cli_agent_orchestrator.cli.commands.workflow.requests.put", unreachable)
+    monkeypatch.setattr("cli_agent_orchestrator.cli.commands.workflow.api_http.put", unreachable)
 
     result = CliRunner().invoke(workflow, ["update", "wf", "--from-file", str(source_file)])
 
@@ -137,7 +137,7 @@ def test_update_passes_the_hash_through_verbatim(monkeypatch, source_file):
         captured["json"] = json
         return _resp(200, {"name": "wf", "path": "/x/wf.py", "content_hash": "sha256:new"})
 
-    monkeypatch.setattr("cli_agent_orchestrator.cli.commands.workflow.requests.put", fake_put)
+    monkeypatch.setattr("cli_agent_orchestrator.cli.commands.workflow.api_http.put", fake_put)
 
     result = CliRunner().invoke(
         workflow,
@@ -159,7 +159,9 @@ def test_path_like_names_are_rejected_before_any_request(
         raise AssertionError("invalid workflow names must not reach requests")
 
     monkeypatch.setattr(
-        workflow_module.requests, verb if verb != "update" else "put", request_must_not_happen
+        workflow_module.api_http.requests,
+        verb if verb != "update" else "put",
+        request_must_not_happen,
     )
     arguments = [verb, name]
     if verb == "update":
@@ -196,7 +198,9 @@ def test_write_verbs_forward_the_local_bearer(monkeypatch, source_file, verb):
 
     monkeypatch.setenv("AUTH0_DOMAIN", "auth.test")
     monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "test-token")
-    monkeypatch.setattr(workflow_module.requests, "post" if verb == "create" else "put", capture)
+    monkeypatch.setattr(
+        workflow_module.api_http.requests, "post" if verb == "create" else "put", capture
+    )
     arguments = (
         [verb, "wf", "--from-file", str(source_file)]
         if verb == "create"
@@ -231,7 +235,9 @@ def test_write_verbs_omit_authorization_without_a_local_bearer(monkeypatch, sour
     monkeypatch.delenv("AUTH0_DOMAIN", raising=False)
     monkeypatch.delenv("CAO_AUTH_JWKS_URI", raising=False)
     monkeypatch.delenv("CAO_AUTH_LOCAL_TOKEN", raising=False)
-    monkeypatch.setattr(workflow_module.requests, "post" if verb == "create" else "put", capture)
+    monkeypatch.setattr(
+        workflow_module.api_http.requests, "post" if verb == "create" else "put", capture
+    )
     arguments = (
         [verb, "wf", "--from-file", str(source_file)]
         if verb == "create"
@@ -265,7 +271,7 @@ def test_each_refusal_carries_its_class_in_json_mode(
     monkeypatch, source_file, verb, status, expected_class
 ):
     monkeypatch.setattr(
-        "cli_agent_orchestrator.cli.commands.workflow.requests."
+        "cli_agent_orchestrator.cli.commands.workflow.api_http."
         + ("post" if verb == "create" else "put"),
         lambda url, json=None, headers=None, timeout=None: _resp(
             status, {"detail": "the server's own words"}
@@ -303,7 +309,7 @@ def test_a_transport_failure_is_not_a_refusal(monkeypatch, source_file):
     def boom(*a, **k):
         raise _requests.exceptions.ConnectionError("connection refused")
 
-    monkeypatch.setattr("cli_agent_orchestrator.cli.commands.workflow.requests.post", boom)
+    monkeypatch.setattr("cli_agent_orchestrator.cli.commands.workflow.api_http.post", boom)
 
     result = CliRunner().invoke(
         workflow, ["create", "authored", "--from-file", str(source_file), "--json"]
@@ -320,7 +326,7 @@ def test_the_source_is_never_echoed(monkeypatch, tmp_path):
     src = tmp_path / "secretish.py"
     src.write_text(SECRET_ISH)
     monkeypatch.setattr(
-        "cli_agent_orchestrator.cli.commands.workflow.requests.post",
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.post",
         lambda url, json=None, headers=None, timeout=None: _resp(
             201, {"name": "s", "path": "/x/s.py", "content_hash": "sha256:bb"}
         ),
@@ -351,7 +357,9 @@ def test_plain_authoring_success_renders_warning_findings(monkeypatch, source_fi
         },
     )
     monkeypatch.setattr(
-        workflow_module.requests, "post" if verb == "create" else "put", lambda *a, **k: response
+        workflow_module.api_http.requests,
+        "post" if verb == "create" else "put",
+        lambda *a, **k: response,
     )
     arguments = [verb, "warned", "--from-file", str(source_file)]
     if verb == "update":
@@ -365,7 +373,7 @@ def test_plain_authoring_success_renders_warning_findings(monkeypatch, source_fi
 
 def test_validate_json_http_failure_uses_the_authoring_envelope(monkeypatch):
     monkeypatch.setattr(
-        workflow_module.requests,
+        workflow_module.api_http.requests,
         "post",
         lambda *a, **k: _resp(400, {"detail": "path is outside the workflow directory"}),
     )
@@ -387,7 +395,7 @@ def test_validate_json_transport_failure_uses_the_authoring_envelope(monkeypatch
     def unreachable(*args, **kwargs):
         raise _requests.exceptions.ConnectionError("connection refused")
 
-    monkeypatch.setattr(workflow_module.requests, "post", unreachable)
+    monkeypatch.setattr(workflow_module.api_http.requests, "post", unreachable)
 
     result = CliRunner().invoke(workflow, ["validate", "draft.py", "--json"])
 
@@ -407,7 +415,7 @@ def test_get_shows_the_hash_for_a_script_spec(monkeypatch):
         content_hash="sha256:cc",
     ).model_dump()
     monkeypatch.setattr(
-        "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
         lambda url, headers=None, timeout=None: _resp(200, script),
     )
 
@@ -423,7 +431,7 @@ def test_get_shows_the_hash_for_a_script_spec(monkeypatch):
 def test_get_omits_the_hash_for_yaml(monkeypatch):
     """The other half of the pair: a YAML spec carries no hash, so the line must be absent."""
     monkeypatch.setattr(
-        "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
         lambda url, headers=None, timeout=None: _resp(
             200, {"name": "y", "mode": "sequential", "steps": []}
         ),
@@ -514,7 +522,7 @@ def test_json_approval_refusals_match_the_mcp_envelope(monkeypatch, verb, argume
         },
     )
     monkeypatch.setattr(
-        "cli_agent_orchestrator.cli.commands.workflow.requests.post",
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.post",
         lambda *args, **kwargs: response,
     )
 

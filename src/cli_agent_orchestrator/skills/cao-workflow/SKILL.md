@@ -53,7 +53,9 @@ Its public surface:
 - `emit_output(value)` — print the run-level `CAO_WORKFLOW_OUTPUT:` sentinel (the run's return).
 - `ShimError` (and `ShimIdentityError`, `ShimTransportError`, `ShimHTTPError`) — the failure
   hierarchy `step` and `run_step` raise. Failures surface **unchanged** — the shim never
-  retries.
+  retries. A structured HTTP error with a non-empty string `detail.kind` prints as
+  `run-step returned HTTP <status> (<kind>): <message>` (without the message suffix when
+  absent); an unstructured error keeps the original `run-step returned HTTP <status>` text.
 
 ## Declaring a recovery policy
 
@@ -200,21 +202,31 @@ Announce the run-id before you start so the user can cancel it:
 Choose the invocation by how the run is triggered, because the two paths have very
 different client-side ceilings:
 
-- **`cao workflow run` (CLI)** uses a client socket timeout of **~8820s (~2.45h)** — the CLI
-  itself won't give up early.
-- **`workflow_run` MCP tool** is bounded by the **MCP host's own per-tool-call timeout** — a
-  host-dependent, much-shorter limit that can **drop a long blocking call and lose its return
+- **`cao workflow run` (CLI)** submits the run, prints the run id, then follows it by
+  polling until it finishes. It exits 0 on `completed` and 1 on `failed` or `cancelled`.
+  No single request has to last the whole run. **Ctrl-C detaches and never cancels**: the
+  run keeps going server-side, and `cao workflow wait <id>` picks it up again.
+  - `--detach` submits, prints the id, and exits 0 without following.
+  - `--wait` is the fully blocking path. It holds one request open until the run finishes,
+    with a client socket timeout of **~8820s (~2.45h)**, and is the only `run` form whose
+    `--json` returns the full `WorkflowRunResult`.
+- **`workflow_run` MCP tool** blocks, and is bounded by the **MCP host's own per-tool-call
+  timeout** — a host-dependent, much-shorter limit that can **drop a long blocking call and lose its return
   value even though the server run keeps going**.
 
 So:
 
 - **Short runs**: call the `workflow_run` MCP tool (blocking) and read the result directly.
-- **Long runs**: background the run and poll, rather than blocking on it —
+- **Long runs from an agent**: submit without blocking, then poll. Over MCP, call
+  `workflow_start` with the pre-announced run id, then `workflow_status` or
+  `workflow_wait`, then `workflow_result`. From a shell:
   ```
-  cao workflow run <name> --run-id <id> --json &
+  cao workflow run <name> --run-id <id> --detach
+  cao workflow status <id>
+  cao workflow result <id> --json
   ```
-  Backgrounding keeps the run alive server-side without a short MCP host timeout silently
-  dropping the return.
+- **Long runs from a user's terminal**: plain `cao workflow run <name> --run-id <id>` is
+  fine; it follows the run and Ctrl-C only detaches.
 
 ### f. RESUME
 
@@ -238,10 +250,11 @@ step b) resume clean; nondeterministic ones diverge.
 #### Resolving a halt
 
 A halt reaches your script as a `ShimHTTPError` whose `.status` is `409` and whose `.body` names
-`kind: "decision_required"`, the `step_id`, and which condition halted it. A step halts when its
-outcome is genuinely unknown or unverifiable: it was dispatched and never settled and no declared
-policy permits re-execution; its stored result is unreadable; its recorded provenance cannot be
-verified under the current scheme; or its author declared `recovery="manual"` and asked to see it.
+`kind: "decision_required"`, the `step_id`, and which condition halted it; `str(exc)` now shows
+`(decision_required)` and the message too. A step halts when its outcome is genuinely unknown or
+unverifiable: it was dispatched and never settled and no declared policy permits re-execution; its
+stored result is unreadable; its recorded provenance cannot be verified under the current scheme;
+or its author declared `recovery="manual"` and asked to see it.
 
 Resolve it by naming a decision per halted step and resuming again:
 
@@ -273,15 +286,15 @@ class from the message, the state, or the status:
 | `classification` | What it means | What to do |
 | --- | --- | --- |
 | `transient` | a persisted timeout; the artifact may still be usable | **Retry — transient failure**: resume the same run |
-| `artifact_defect` | the persisted generic `error` currently maps here conservatively; no finer production provider-error taxonomy exists, so a provider error is not automatically transient | **Fix the spec — artifact defect**: inspect and repair the script before authoring a new run |
+| `artifact_defect` | the persisted generic `error` currently maps here conservatively; in-band provider refusals persist as `provider_error` at the step level and remain conservative artifact defects; they are not automatically transient | **Fix the spec — artifact defect**: inspect and repair the script before authoring a new run |
 | `cancelled` | the run was deliberately cancelled | **Cancelled by a human**: inspect the intent before taking another action; no automatic retry is promised |
 
 `plan_inputs_changed` surfaces later, from an agent step's `POST /terminals/run-step`, rather than
 from the initial run attempt. It reaches your script as a `ShimHTTPError` whose `.status` is `409`
 and whose `.body` names `kind: "plan_inputs_changed"` and the reason; no step is recorded. The run
 record does not carry that `kind`: if the script lets the error escape, the run ends `FAILED` with
-kind `error` (classified `artifact_defect` above) and its stderr tail shows only
-`run-step returned HTTP 409`. While approval enforcement is on, it means the recorded profile or
+kind `error` (classified `artifact_defect` above) and its stderr tail shows
+`run-step returned HTTP 409 (plan_inputs_changed): <message>`. While approval enforcement is on, it means the recorded profile or
 memory setting changed, the launch state is unreadable, or approval settings could not be read. It
 also means approval enforcement was turned on after this run started. Start a new run for changed
 inputs, unreadable launch state, or newly enabled enforcement. If approval settings could not be
@@ -468,7 +481,8 @@ cao workflow run summarize_dir --run-id sum-1 --input target_dir=./reports
 cao workflow approve plan-v1:9f3c…
 
 # e. run for real, with the run-id announced first
-cao workflow run summarize_dir --run-id sum-1 --input target_dir=./reports --json &
+cao workflow run summarize_dir --run-id sum-1 --input target_dir=./reports --detach
+cao workflow wait sum-1
 
 # g. observe; on failure read failure_envelope.classification for resume-vs-repair
 cao workflow result sum-1 --json

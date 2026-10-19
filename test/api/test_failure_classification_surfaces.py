@@ -93,8 +93,9 @@ def test_the_two_classes_differ_over_http(client):
     )
 
 
-def test_an_error_kind_is_an_artifact_defect_over_http(client):
-    _failed_run("run-error", "error")
+@pytest.mark.parametrize("error_kind", ["error", "provider_error"])
+def test_an_error_kind_is_an_artifact_defect_over_http(client, error_kind):
+    _failed_run("run-error", error_kind)
     assert _envelope(client, "run-error")["classification"] == "artifact_defect"
 
 
@@ -139,7 +140,7 @@ def test_the_cli_and_the_mcp_tool_agree(client, monkeypatch):
 
     # The CLI renders the same value as an action phrase.
     monkeypatch.setattr(
-        cli_workflow.requests,
+        cli_workflow.api_http,
         "get",
         lambda url, timeout=None, headers=None: client.get("/workflows/runs/run-agree/result"),
     )

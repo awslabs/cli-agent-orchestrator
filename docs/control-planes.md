@@ -45,8 +45,19 @@ and frontend-development details live in the [Web UI guide](web-ui.md).
 
 Use `cao session` commands for scripts, CI, cron, or any caller that can execute
 shell commands. `cao launch` creates sessions and `cao shutdown` removes them.
-The canonical command reference and agent-facing procedure are in the
-[session-management skill](../skills/cao-session-management/SKILL.md#commands).
+`cao --skill` prints the agent-facing operating guide (preflight, launch, session
+commands, statuses, delegation, and safety), and `cao <group> --help` gives exact
+syntax. The [session-management skill](../skills/cao-session-management/SKILL.md)
+adds profile discovery and worker communication.
+
+For in-session delegation, `cao agent assign --description "Review tests"` and
+`cao agent handoff --description "Review tests"` optionally label the new worker's
+responsibility. The in-session MCP tools `assign`, `handoff`, and `assign_elastic`
+accept the same optional `description` parameter. It is set on creation,
+normalized, and truncated to 64 Unicode code points; later tasks and terminal
+reuse do not overwrite it. Operators can edit it in Home or Agents. See the
+[canonical description contract](api.md#terminal-descriptions) for normalization,
+omission versus `null`, editing, and idempotency.
 
 ## Remote fleets
 
@@ -171,6 +182,6 @@ scaffolding.
 - [Web UI](web-ui.md)
 - [HTTP API and PTY WebSocket](api.md)
 - [Event Plugin guide](plugins.md)
-- [Session-management commands](../skills/cao-session-management/SKILL.md#commands)
+- [Session-management skill](../skills/cao-session-management/SKILL.md)
 - [In-session MCP tools](../skills/cao-supervisor-protocols/SKILL.md#core-mcp-tools)
 - [Assign and handoff selection](../skills/cao-supervisor-protocols/SKILL.md#choosing-between-assign-and-handoff)

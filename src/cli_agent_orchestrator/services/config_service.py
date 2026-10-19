@@ -32,7 +32,7 @@ from pydantic import BaseModel, Field
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.services.vault.config import VaultConfig
-from cli_agent_orchestrator.utils import atomic_file
+from cli_agent_orchestrator.utils.atomic_file import locked_atomic_write
 
 logger = logging.getLogger(__name__)
 
@@ -307,8 +307,18 @@ def _load_raw() -> Dict[str, Any]:
 
 
 def _save_raw(data: Dict[str, Any]) -> None:
-    settings_file = _settings_file().resolve()
-    atomic_file.locked_atomic_write(settings_file, json.dumps(data, indent=2))
+    """Write the unified settings file.
+
+    Same writer, same lock and same 0600 mode as ``settings_service._save``:
+    ``cao config set`` is the second writer of ``settings.json`` (every key the
+    settings service does not own, e.g. ``terminal.backend``), so it must give
+    the same guarantees. The file is published atomically and private, a
+    symlink planted at the path is replaced rather than followed, and the two
+    writers serialize on the one lock instead of clobbering each other.
+    """
+    settings_file = _settings_file()
+    settings_file.parent.mkdir(parents=True, exist_ok=True)
+    locked_atomic_write(settings_file, json.dumps(data, indent=2), mode=0o600)
 
 
 def _get_from_file(path: str) -> Any:

@@ -15,6 +15,7 @@ from cli_agent_orchestrator.constants import (
     COPILOT_AGENTS_DIR,
 )
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.utils import agent_profiles
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite
 from cli_agent_orchestrator.utils.path_validation import (
@@ -69,6 +70,10 @@ def refresh_agent_md_prompt(md_path: Path, profile: AgentProfile) -> bool:
     interleave temp files or publish a half-written file — the same failure
     mode fixed for the memory plugins in ``plugins/builtin/*_memory.py``.
     """
+    for name in (profile.name, md_path.name.removesuffix(".agent.md")):
+        if agent_profiles.routes_to_ephemeral_store(name):
+            raise FileNotFoundError(f"Reserved ephemeral profile name: {name}")
+
     if not md_path.exists():
         return False
 
@@ -119,6 +124,17 @@ def refresh_all_cao_managed_agents() -> List[Path]:
         if not _is_cao_managed_copilot_agent(profile_name):
             continue
 
+        if any(
+            agent_profiles.routes_to_ephemeral_store(name)
+            for name in (md_path.name.removesuffix(".agent.md"), profile_name)
+        ):
+            logger.warning(
+                "Skipping CAO-managed Copilot agent '%s' at %s: reserved ephemeral profile name",
+                profile_name,
+                md_path,
+            )
+            continue
+
         try:
             profile = load_agent_profile(profile_name)
         except Exception as exc:
@@ -128,6 +144,14 @@ def refresh_all_cao_managed_agents() -> List[Path]:
                 profile_name,
                 md_path,
                 exc,
+            )
+            continue
+
+        if agent_profiles.routes_to_ephemeral_store(profile.name):
+            logger.warning(
+                "Skipping CAO-managed Copilot agent '%s' at %s: reserved ephemeral profile name",
+                profile.name,
+                md_path,
             )
             continue
 
@@ -157,5 +181,16 @@ def _is_cao_managed_copilot_agent(name: str) -> bool:
         safe_name = validate_path_component(name, description="agent name")
     except ValueError:
         return False
-    context_file = AGENT_CONTEXT_DIR / f"{safe_name}.md"
-    return context_file.exists()
+    # Same directories the install writer and the ownership guard use: the
+    # configured ``agents.dirs.cao_installed`` when it departs from its default,
+    # plus the default itself while an override is active, because copies
+    # written before the writer honoured the setting live there (see
+    # settings_service.installed_context_lookup_dirs).
+    from cli_agent_orchestrator.services.settings_service import (
+        installed_context_lookup_dirs,
+    )
+
+    return any(
+        (context_dir / f"{safe_name}.md").exists()
+        for context_dir in installed_context_lookup_dirs(AGENT_CONTEXT_DIR)
+    )

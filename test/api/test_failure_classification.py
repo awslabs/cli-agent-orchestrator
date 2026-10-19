@@ -126,14 +126,15 @@ def test_an_unrecognised_kind_defaults_and_logs(caplog):
     assert "brand_new_kind" in message and "run-xyz" in message
 
 
-def test_a_bare_error_logs_nothing(caplog):
+@pytest.mark.parametrize("error_kind", ["error", "provider_error"])
+def test_a_known_error_logs_nothing(caplog, error_kind):
     """The assertion that keeps REL-3's record meaningful.
 
     ``error`` is the most common failure value. If the fallback logged for it too, the record would fire
     on the ordinary case and an engineer scanning for the unrecognised-kind signal would find noise.
     """
     with caplog.at_level(logging.WARNING, logger=api_main.logger.name):
-        assert api_main._classify_failure(_row("failed"), "error") == "artifact_defect"
+        assert api_main._classify_failure(_row("failed"), error_kind) == "artifact_defect"
 
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
@@ -170,7 +171,7 @@ def test_the_classification_is_reproducible():
     assert [api_main._classify_failure(row, "error") for _ in range(5)] == ["artifact_defect"] * 5
 
 
-def test_the_known_kind_set_is_closed_and_excludes_the_unproduced_provider_error():
+def test_the_transient_kind_set_excludes_provider_errors():
     """``diverged`` and ``decision_required`` are NOT classifications (BR-5, BR-9).
 
     Both are returned as a ``kind`` on a 409 from the step-execution route and neither is persisted, so

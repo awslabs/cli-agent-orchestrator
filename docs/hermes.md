@@ -155,10 +155,18 @@ output, but they do not currently expose the same structured
 `WAITING_USER_ANSWER` behavior. When CAO adds that behavior to another
 provider, this document should be updated with that provider's prompt contract.
 
-Any agent with access to `cao-mcp-server` and a target terminal ID can answer a
-waiting Hermes prompt. CAO does not currently enforce a parent/supervisor
-relationship for `answer_user_prompt`, so profile authors should expose the MCP
-server only to agents that are trusted to coordinate the session.
+`answer_user_prompt` is bound to the caller's place in the assign/handoff
+tree. A terminal identified by `CAO_TERMINAL_ID` can answer its own prompt or a
+prompt on a terminal it created via `assign` or `handoff`; any other target is
+refused before the answer is sent. An external MCP client with no
+`CAO_TERMINAL_ID` (the operator's own shell) is not bound. The same rule covers
+`delete_terminal` (locally or on a `target_host` node, which recognises the
+creator through the callback id it recorded) and `send_message` with an explicit
+`receiver_id`, which may also name the caller's own creator or, when the profile
+grants `discovery`, a sibling that `list_siblings` returns. The check runs in the MCP server next to
+the agent; the HTTP API still authorises by scope only, so profile authors
+should still expose the MCP server only to agents trusted to coordinate the
+session.
 
 ## Tool Restrictions
 

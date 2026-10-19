@@ -286,7 +286,7 @@ never settled and no declared recovery policy permits re-execution; its stored r
 unreadable; its recorded provenance cannot be verified under the current scheme; or its
 author declared `recovery="manual"` and asked to see it. Inside the script the halt arrives
 as a `409` — a `ShimHTTPError` whose body names `kind: "decision_required"`, the `step_id`,
-and which condition fired.
+and which condition fired; `str(exc)` now shows `(decision_required)` and the message too.
 
 Resolve it by naming a decision per halted step and resuming again:
 

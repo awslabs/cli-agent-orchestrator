@@ -54,7 +54,7 @@ def test_a_refusal_names_the_exact_approve_command(runner, monkeypatch):
     workflow -- not an edge case.
     """
     monkeypatch.setattr(
-        wf.requests,
+        wf.api_http,
         "post",
         lambda *a, **k: _refusal_response(403, "approval_required", PLAN_ID),
     )
@@ -71,7 +71,7 @@ def test_a_refusal_says_the_grant_is_not_available_from_here(runner, monkeypatch
     """So an operator (or an agent reading the terminal) does not go hunting for a flag that grants it.
     There is deliberately no such flag and no such tool."""
     monkeypatch.setattr(
-        wf.requests,
+        wf.api_http,
         "post",
         lambda *a, **k: _refusal_response(403, "approval_required", PLAN_ID),
     )
@@ -85,7 +85,7 @@ def test_a_failed_freeze_does_not_offer_an_approval(runner, monkeypatch):
     """503, ``plan_id: None`` -- there is nothing to approve, and saying otherwise is the misleading
     failure this distinction exists to prevent."""
     monkeypatch.setattr(
-        wf.requests,
+        wf.api_http,
         "post",
         lambda *a, **k: _refusal_response(503, "plan_identity_unavailable", None),
     )
@@ -105,7 +105,7 @@ def test_the_resume_verb_reports_a_refusal_the_same_way(runner, monkeypatch):
     """Resume is gated too -- the fifth check in ``resume_script_run``'s admission ladder -- and an
     operator resuming a run should not have to learn a second vocabulary for the same refusal."""
     monkeypatch.setattr(
-        wf.requests,
+        wf.api_http,
         "post",
         lambda *a, **k: _refusal_response(403, "approval_required", PLAN_ID),
     )
@@ -123,7 +123,7 @@ def test_an_ordinary_error_is_unaffected(runner, monkeypatch):
     """
     payload = {"detail": "workflow inputs exceed 65536 bytes"}
     monkeypatch.setattr(
-        wf.requests,
+        wf.api_http,
         "post",
         lambda *a, **k: SimpleNamespace(
             status_code=400, json=lambda: payload, text=json.dumps(payload), headers={}

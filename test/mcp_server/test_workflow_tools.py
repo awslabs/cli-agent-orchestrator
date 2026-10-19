@@ -56,6 +56,10 @@ class TestWorkflowRun:
 
         with (
             patch.dict("os.environ", {"CAO_TERMINAL_ID": "term/one"}),
+            # Root forwarding is tested after the independently covered caller gate.
+            patch(
+                "cli_agent_orchestrator.mcp_server.server._tool_denied_reason", return_value=None
+            ),
             patch("cli_agent_orchestrator.mcp_server.server.mcp_utils.get_json", _root),
             patch("cli_agent_orchestrator.mcp_server.server.requests.post", _post),
         ):
@@ -76,6 +80,9 @@ class TestWorkflowRun:
     def test_failed_terminal_root_lookup_omits_field_and_posts_once(self):
         with (
             patch.dict("os.environ", {"CAO_TERMINAL_ID": "term-one"}),
+            patch(
+                "cli_agent_orchestrator.mcp_server.server._tool_denied_reason", return_value=None
+            ),
             patch(
                 "cli_agent_orchestrator.mcp_server.server.mcp_utils.get_json",
                 side_effect=requests.ConnectionError("down"),

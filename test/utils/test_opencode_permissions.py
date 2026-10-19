@@ -27,16 +27,25 @@ class TestAllToolsUnrestricted:
 
 
 class TestBuiltinShorthand:
-    """'@builtin' expands to the four standard CAO categories."""
+    """'@builtin' is a selector, not a grant: on its own it enables no tool.
 
-    def test_builtin_allows_fs_and_bash(self):
+    ``utils/tool_mapping.py`` skips every ``@``-prefixed entry when computing a
+    provider's native deny list, so ``@builtin`` grants nothing on Claude Code,
+    Copilot or Grok.  OpenCode must agree, otherwise the shipped ``reviewer``
+    role — ``["@builtin", "fs_read", "fs_list", "@cao-mcp-server"]`` — is
+    read-only everywhere except OpenCode, where it would get bash and write.
+    """
+
+    def test_builtin_alone_grants_no_vocabulary_tool(self):
         result = cao_tools_to_opencode_permission(["@builtin"])
-        assert result["bash"] == "allow"
-        assert result["read"] == "allow"
-        assert result["edit"] == "allow"
-        assert result["write"] == "allow"
-        assert result["glob"] == "allow"
-        assert result["grep"] == "allow"
+        for tool in ("bash", "read", "edit", "write", "glob", "grep"):
+            assert result[tool] == "deny", f"@builtin must not enable {tool}"
+
+    def test_builtin_matches_empty_list(self):
+        # Same output as no allowlist at all: the selector carries no grant.
+        assert cao_tools_to_opencode_permission(["@builtin"]) == cao_tools_to_opencode_permission(
+            []
+        )
 
     def test_builtin_hardcoded_denies(self):
         result = cao_tools_to_opencode_permission(["@builtin"])
@@ -54,6 +63,36 @@ class TestBuiltinShorthand:
     def test_builtin_result_covers_all_13_tools(self):
         result = cao_tools_to_opencode_permission(["@builtin"])
         assert set(result.keys()) == set(ALL_OPENCODE_TOOLS)
+
+
+class TestShippedRoleDefaults:
+    """The role defaults in constants.py must mean the same thing on OpenCode."""
+
+    def test_reviewer_default_is_read_only(self):
+        from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS
+
+        result = cao_tools_to_opencode_permission(list(ROLE_TOOL_DEFAULTS["reviewer"]))
+        assert result["read"] == "allow"
+        assert result["glob"] == "allow"
+        assert result["grep"] == "allow"
+        assert result["bash"] == "deny"
+        assert result["edit"] == "deny"
+        assert result["write"] == "deny"
+
+    def test_developer_default_keeps_full_access(self):
+        from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS
+
+        result = cao_tools_to_opencode_permission(list(ROLE_TOOL_DEFAULTS["developer"]))
+        for tool in ("bash", "read", "edit", "write", "glob", "grep"):
+            assert result[tool] == "allow", f"developer must keep {tool}"
+
+    def test_supervisor_default_has_no_shell_or_writes(self):
+        from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS
+
+        result = cao_tools_to_opencode_permission(list(ROLE_TOOL_DEFAULTS["supervisor"]))
+        assert result["bash"] == "deny"
+        assert result["edit"] == "deny"
+        assert result["write"] == "deny"
 
 
 class TestExplicitCategories:
