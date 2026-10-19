@@ -357,6 +357,19 @@ PROFILE_SET_DIGEST_PREFIX = "sha256:"
 # the caller that folds this into ``plan_id``, means one profile set executing under another's approval.
 _PROFILE_FRAME_SEP = ":"
 
+_UNLOADABLE_SENTINEL = "\x02unloadable-profile-entry"
+"""Digested in place of source text for an entry ``list_agent_profiles()`` already marked
+``loadable: False`` (issue #827 fixup).
+
+A directory listed without an ``agent.md`` (e.g. a stray ``old-backups/`` folder) is exactly the case
+the lister itself already decided never to recommend or load — ``load_agent_profile()`` raises
+``FileNotFoundError`` for it by design, not by accident. Calling ``_read_agent_profile_source`` on it
+anyway turned a benign, pre-classified "not loadable" entry into a digest-wide exception, which NULLs
+every manifest and refuses every script run with enforcement on. The sentinel still makes the entry's
+presence, absence, and NAME part of the digest (so adding/removing such a stray entry still moves the
+identifier), it just does not attempt to read content the lister already said cannot be loaded.
+"""
+
 
 def profile_set_digest() -> str:
     """Digest the FULL installed agent profile set — every name and its raw source text (issue #827).
@@ -376,15 +389,26 @@ def profile_set_digest() -> str:
     exception. ``resolve_env_vars`` is deliberately NOT applied: it would pull the launching process's
     environment into the digest, so an unrelated variable change would invalidate every approval.
 
-    RAISES rather than skipping an unreadable profile, which is the fail-closed direction and the whole
-    point. A profile that vanishes between the scan and the read leaves the SET INDETERMINATE; silently
-    omitting it would let a digest describe a profile set that is not the one on disk, and the caller
-    (``manifest_freeze``) turns an exception here into a NULL manifest, which the approval gate refuses.
+    AN ENTRY ALREADY MARKED ``loadable: False`` BY THE LISTER digests as its name plus a fixed sentinel
+    rather than its (unreadable-by-design) source — see :data:`_UNLOADABLE_SENTINEL`. For every other
+    entry this RAISES rather than skipping, which is the fail-closed direction: a profile that vanishes
+    between the scan and the read (a race, not a classification) leaves the SET INDETERMINATE, and
+    silently omitting it would let a digest describe a profile set that is not the one on disk. The
+    caller (``manifest_freeze``) turns that exception into a NULL manifest, which the approval gate
+    refuses. This covers per-entry read failures; it does not make the upstream LISTING itself
+    fail-closed — ``_list_installed_profiles`` already swallows a built-in-store enumeration failure
+    into a smaller valid-looking set (unchanged by this issue), so this digest can be a coherent hash of
+    whatever that scan returned without being a guarantee that the scan itself never dropped anything.
     """
-    names = sorted({profile["name"] for profile in list_agent_profiles()})
     digest = hashlib.sha256()
-    for name in names:
-        for component in (name, _read_agent_profile_source(name)):
+    for profile in sorted(list_agent_profiles(), key=lambda p: p["name"]):
+        name = profile["name"]
+        source = (
+            _UNLOADABLE_SENTINEL
+            if not profile.get("loadable", True)
+            else _read_agent_profile_source(name)
+        )
+        for component in (name, source):
             encoded = component.encode("utf-8")
             digest.update(f"{len(encoded)}{_PROFILE_FRAME_SEP}".encode("utf-8"))
             digest.update(encoded)

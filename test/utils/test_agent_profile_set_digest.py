@@ -128,6 +128,27 @@ def test_an_unreadable_profile_raises_rather_than_being_skipped(store, monkeypat
         agent_profiles.profile_set_digest()
 
 
+def test_a_stray_unloadable_directory_does_not_raise(tmp_path, monkeypatch):
+    """A directory without ``agent.md`` is listed with ``loadable: False``, not skipped (GH #827 fixup).
+
+    Before this fix, ``profile_set_digest`` called ``_read_agent_profile_source`` on every listed name,
+    including ones the lister itself already marked ``loadable: False`` — e.g. a stray folder with no
+    ``agent.md`` dropped into the agent store. That raised ``FileNotFoundError`` on every freeze, which
+    NULLs the manifest and refuses every script-tier run with enforcement on, from a benign ``mkdir``.
+    """
+    root = tmp_path / "agent-store"
+    root.mkdir()
+    monkeypatch.setattr(agent_profiles, "LOCAL_AGENT_STORE_DIR", root)
+    (root / "reviewer.md").write_text("---\nname: reviewer\n---\nHello.", encoding="utf-8")
+
+    before = agent_profiles.profile_set_digest()
+
+    (root / "old-backups").mkdir()
+    after = agent_profiles.profile_set_digest()
+
+    assert before != after
+
+
 def test_the_digest_ignores_the_launching_process_environment(store, monkeypatch):
     """``resolve_env_vars`` is deliberately not applied to the raw source.
 
