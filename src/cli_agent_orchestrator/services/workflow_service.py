@@ -525,10 +525,10 @@ def _substitute(template: str, record: RunRecord) -> str:
     return _PLACEHOLDER_RE.sub(_resolve, template)
 
 
-def _reprompt_prompt(step: WorkflowStep) -> str:
+def _reprompt_prompt(step: WorkflowStep, prompt: str) -> str:
     """A corrective prompt restating the schema and asking for a valid return (§3)."""
     return (
-        f"{step.prompt}\n\n"
+        f"{prompt}\n\n"
         "Your previous turn did not produce a valid structured output for this "
         "workflow step. Call the `workflow_return` tool with output that matches "
         f"this JSON-Schema:\n{step.output_schema}"
@@ -644,7 +644,9 @@ def _topological_order(spec: WorkflowSpec) -> List[WorkflowStep]:
     return [by_id[sid] for sid in order]
 
 
-async def _collect_structured_output(record: RunRecord, step: WorkflowStep) -> StepState:
+async def _collect_structured_output(
+    record: RunRecord, step: WorkflowStep, prompt: str
+) -> StepState:
     """Collect the structured return for a COMPLETED step; reprompt once (§3).
 
     - No ``output_schema`` -> free-form, trivially ``COMPLETED``.
@@ -684,7 +686,7 @@ async def _collect_structured_output(record: RunRecord, step: WorkflowStep) -> S
         result = await run_agent_step(
             provider=step.provider,
             agent=step.agent,
-            prompt=_reprompt_prompt(step),
+            prompt=_reprompt_prompt(step, prompt),
             teardown=True,
             timeout=WORKFLOW_STEP_TIMEOUT,
             engine=step.engine,
@@ -784,7 +786,7 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
             # Resolve the structured return INSIDE the try so a crash during the
             # reprompt (§3 re-raises StepExecutionError) is caught below and
             # consumes an attempt (Q6=A, Trace C).
-            outcome = await _collect_structured_output(record, step)
+            outcome = await _collect_structured_output(record, step, prompt)
         except StepCancelledError as exc:
             # An in-flight cancel (#409b) is NOT a run-failure: do NOT consume the
             # rest of the retry budget and do NOT mark the step FAILED. Settle the

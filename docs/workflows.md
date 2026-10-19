@@ -622,7 +622,9 @@ from what was reviewed and still match the same `plan_id`:
 - **Repository changes after admission.** The repository state is read once, when the run is
   admitted. Changes made after that, including while a submitted run waits for a free slot, are not
   detected.
-- **Agents a step delegates to** with assign or handoff. They run with their current profiles.
+- **Agents a step delegates to** with assign or handoff. They run with their current profiles,
+  including creator-owned ephemeral agents through that separate claim/launch path. Fresh agent steps
+  in an approved script run still refuse reserved ephemeral profiles until their definitions are bound.
 
 With API authentication off, which is the default, any process running as you can change these inputs,
 and can also run `cao workflow approve`. The gate makes sure that a changed script, changed inputs or

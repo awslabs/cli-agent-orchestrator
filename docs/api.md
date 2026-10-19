@@ -50,7 +50,7 @@ See [AG-UI](agui.md) for enablement, event shapes, and privacy boundaries.
   `unknown_ephemeral` (404), including on `POST /sessions`.
 - `POST /terminals/run-step` accepts `claim_id` for a newly created terminal; combining it with
   `reuse_terminal_id` gives 422. Policy refusals use `{kind: "ephemeral_policy", rule, message}`.
-  `assign` and `handoff` still refuse ephemeral names.
+  `assign` and `handoff` launch creator-owned ephemeral names from the creator terminal.
 - `GET /agents/profiles` and `GET /agents/profiles/{name}` list and inspect
   installed profiles.
 - `GET /agents/profiles/search` ranks installed, loadable profiles by capability

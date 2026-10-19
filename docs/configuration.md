@@ -123,8 +123,8 @@ Override via REST API, Web UI Settings page, `cao config set agents.dirs.<provid
 
 ### Ephemeral agents (`ephemeral`)
 
-Creation and owner-only HTTP launch are opt-in. `assign` and `handoff` still refuse
-ephemeral names.
+Creation and creator-owned launches are opt-in. `assign` and `handoff` launch
+creator-owned ephemeral names from the creator terminal.
 Only JSON `true` enables the tool, and agent terminals must restart to see it.
 
 | Setting | Default | Description |

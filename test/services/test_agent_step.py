@@ -1151,6 +1151,36 @@ class TestOutputExtractionTeardown:
         m_exit.assert_not_called()
 
 
+@pytest.mark.parametrize("rejected", [False, True])
+def test_extraction_error_prefix_preserves_type_cause_and_owned_teardown(rejected):
+    from cli_agent_orchestrator.providers.base import (
+        OutputExtractionError,
+        OutputExtractionRejected,
+    )
+
+    error_type = OutputExtractionRejected if rejected else OutputExtractionError
+    original = error_type("no publishable response")
+    create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer(
+        final_status=TerminalStatus.COMPLETED,
+    )
+    with (
+        create,
+        send,
+        delete as deleted,
+        exit_cli as exited,
+        wait,
+        status,
+        patch(f"{_MODULE}.terminal_service.get_output", side_effect=original),
+    ):
+        with pytest.raises(error_type) as raised:
+            asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
+    assert type(raised.value) is error_type
+    assert str(raised.value) == "terminal abc12345: no publishable response"
+    assert raised.value.__cause__ is original
+    exited.assert_called_once_with("abc12345")
+    deleted.assert_called_once_with("abc12345", registry=None)
+
+
 class TestInBandProviderError:
     """Issue #638: the RUNTIME — not the workflow author — classifies an in-band
     provider error. A provider that cannot load a model answers the transport
