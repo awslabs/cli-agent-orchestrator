@@ -2882,6 +2882,46 @@ def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
         return [row[0] for row in rows]
 
 
+def fail_orphaned_pending_messages(min_age_seconds: int) -> List[str]:
+    """Fail PENDING messages whose receiver terminal row is gone (#708).
+
+    The counterpart to the join in ``list_pending_receiver_ids_older_than``:
+    that join drops these rows so the sweep does not retry deliveries to
+    deleted agents, which leaves them claiming PENDING forever with no log
+    line, no state change, and nothing to tell them apart from a message that
+    is about to be delivered. They are not pending -- they are undeliverable,
+    and this says so.
+
+    ``create_inbox_message`` rejects an unknown receiver and there is no path
+    that transiently removes a live terminal's row (session teardown deletes
+    rows only after the kill is CONFIRMED, and retention now retains live rows
+    -- see ``cleanup_service.stale_terminal_runtime_is_live``), so a missing
+    receiver row is a settled fact rather than a race. The same
+    ``min_age_seconds`` grace window as the sweep still applies.
+
+    Returns the ids of the messages that were failed, for logging.
+    """
+    cutoff = _utcnow() - timedelta(seconds=min_age_seconds)
+    with SessionLocal() as db:
+        orphaned = (
+            db.query(InboxModel)
+            .outerjoin(TerminalModel, TerminalModel.id == InboxModel.receiver_id)
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.created_at < cutoff,
+                TerminalModel.id.is_(None),
+            )
+            .all()
+        )
+        failed_ids = []
+        for message in orphaned:
+            message.status = MessageStatus.FAILED.value
+            failed_ids.append(str(message.id))
+        if failed_ids:
+            db.commit()
+        return failed_ids
+
+
 def delete_terminal(terminal_id: str) -> bool:
     """Delete terminal metadata."""
     with SessionLocal() as db:

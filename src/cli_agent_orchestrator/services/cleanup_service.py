@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     IdempotencyKeyModel,
     InboxModel,
@@ -24,6 +25,54 @@ from cli_agent_orchestrator.services.memory_format import parse_index_entry
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
 logger = logging.getLogger(__name__)
+
+
+def stale_terminal_runtime_is_live(terminal: TerminalModel) -> bool:
+    """Is the agent behind this aged-out registry row still running? (#708)
+
+    Retention selects rows on ``last_active``, which is written ONLY on input
+    delivery (``send_input`` / ``send_special_key``), so a perfectly healthy
+    agent that nobody has messaged for ``RETENTION_DAYS`` is indistinguishable
+    by that column from an abandoned one. Deleting its row does not stop it --
+    ``delete_terminal_row`` drops the registry record without killing the tmux
+    window or the provider process -- but it does make it permanently
+    UNADDRESSABLE: ``create_inbox_message`` rejects a receiver with no row, and
+    ``list_pending_receiver_ids_older_than`` inner-joins ``terminals``, so every
+    message already PENDING for that receiver silently leaves the
+    reconciliation sweep forever while still reporting PENDING.
+
+    Fails CLOSED. When liveness cannot be established the row is reported live
+    and retained, because a wrong "gone" is irreversible and silent whereas a
+    wrong "live" only defers the row's deletion to the next sweep.
+    """
+    backend = get_backend()
+    session_name = terminal.tmux_session
+    window_name = terminal.tmux_window
+    try:
+        if not backend.session_exists_strict(session_name):
+            return False
+    except Exception as exc:  # noqa: BLE001 — unanswerable liveness fails closed
+        logger.warning(
+            "Could not establish liveness for stale terminal %s (session %s); " "retaining it: %s",
+            terminal.id,
+            session_name,
+            exc,
+        )
+        return True
+
+    # The session is alive; this terminal's window may still have been killed
+    # individually. A resolvable pane is the window-level liveness signal.
+    try:
+        return backend.get_pane_current_command(session_name, window_name) is not None
+    except Exception as exc:  # noqa: BLE001 — unanswerable liveness fails closed
+        logger.warning(
+            "Could not establish pane liveness for stale terminal %s (%s:%s); " "retaining it: %s",
+            terminal.id,
+            session_name,
+            window_name,
+            exc,
+        )
+        return True
 
 
 def cleanup_old_data():
@@ -64,6 +113,14 @@ def cleanup_old_data():
                     "retaining it: %s",
                     terminal_id,
                     exc,
+                )
+                continue
+
+            # Age is not death (#708). A live agent's row is the only thing
+            # that makes it addressable, so never age one out.
+            if stale_terminal_runtime_is_live(terminal):
+                logger.info(
+                    "Retaining aged-out terminal %s: its runtime is still live", terminal_id
                 )
                 continue
 

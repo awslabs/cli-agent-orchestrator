@@ -11,6 +11,7 @@ from typing import Dict
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
+    fail_orphaned_pending_messages,
     get_pending_messages,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
@@ -200,7 +201,24 @@ class InboxService:
         Only messages older than ``INBOX_RECONCILE_GRACE_SECONDS`` are considered,
         so the sweep never competes with the fast paths for freshly queued
         messages — it only adopts ones they have already missed.
+
+        Messages whose receiver terminal row is gone are not retried — but they
+        are no longer left claiming PENDING either (#708): they are failed and
+        logged, so an operator can tell an undeliverable message apart from one
+        that is about to be delivered.
         """
+        try:
+            orphaned = fail_orphaned_pending_messages(INBOX_RECONCILE_GRACE_SECONDS)
+            if orphaned:
+                logger.warning(
+                    "Failed %d pending inbox message(s) whose receiver terminal no longer "
+                    "exists: %s",
+                    len(orphaned),
+                    ", ".join(orphaned),
+                )
+        except Exception as e:
+            logger.error(f"Failed to sweep orphaned inbox messages: {e}")
+
         for terminal_id in list_pending_receiver_ids_older_than(INBOX_RECONCILE_GRACE_SECONDS):
             try:
                 self.deliver_pending(terminal_id, registry=registry)

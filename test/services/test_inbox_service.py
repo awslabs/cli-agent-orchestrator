@@ -783,8 +783,46 @@ class TestPollOpenCodePendingMessages:
 class TestReconcileOrphanedMessages:
     """Tests for the provider-agnostic inbox reconciliation sweep (issue #131)."""
 
+    @patch("cli_agent_orchestrator.services.inbox_service.fail_orphaned_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_older_than")
-    def test_reconciles_stale_receivers(self, mock_list_receivers):
+    def test_sweep_fails_and_logs_messages_whose_receiver_row_is_gone(
+        self, mock_list_receivers, mock_fail_orphans, caplog
+    ):
+        """An undeliverable message stops claiming PENDING and says so (#708)."""
+        mock_list_receivers.return_value = []
+        mock_fail_orphans.return_value = ["msg-1", "msg-2"]
+
+        svc = InboxService()
+        svc.deliver_pending = MagicMock()
+        with caplog.at_level("WARNING", logger="cli_agent_orchestrator.services.inbox_service"):
+            svc.reconcile_orphaned_messages()
+
+        mock_fail_orphans.assert_called_once_with(INBOX_RECONCILE_GRACE_SECONDS)
+        svc.deliver_pending.assert_not_called()
+        assert "msg-1, msg-2" in caplog.text
+        assert "receiver terminal no longer exists" in caplog.text
+
+    @patch("cli_agent_orchestrator.services.inbox_service.fail_orphaned_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_older_than")
+    def test_sweep_still_delivers_when_the_orphan_pass_fails(
+        self, mock_list_receivers, mock_fail_orphans
+    ):
+        """The orphan pass is bookkeeping; it must never block delivery."""
+        mock_list_receivers.return_value = ["receiver-1"]
+        mock_fail_orphans.side_effect = RuntimeError("db locked")
+
+        svc = InboxService()
+        svc.deliver_pending = MagicMock()
+        svc.reconcile_orphaned_messages()
+
+        svc.deliver_pending.assert_called_once_with("receiver-1", registry=None)
+
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.fail_orphaned_pending_messages",
+        return_value=[],
+    )
+    @patch("cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_older_than")
+    def test_reconciles_stale_receivers(self, mock_list_receivers, mock_fail_orphans):
         """Sweep attempts delivery for each receiver with an orphaned message."""
         mock_list_receivers.return_value = ["receiver-1", "receiver-2"]
 
@@ -798,8 +836,12 @@ class TestReconcileOrphanedMessages:
             call("receiver-2", registry=None),
         ]
 
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.fail_orphaned_pending_messages",
+        return_value=[],
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_older_than")
-    def test_survives_per_receiver_failure(self, mock_list_receivers):
+    def test_survives_per_receiver_failure(self, mock_list_receivers, mock_fail_orphans):
         """One failed receiver does not stop the sweep."""
         mock_list_receivers.return_value = ["receiver-1", "receiver-2"]
 
