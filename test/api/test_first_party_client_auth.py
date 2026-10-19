@@ -190,7 +190,13 @@ class _FakeUrlopenResult:
 
 @pytest.fixture
 def boundary(monkeypatch):
-    """Auth on (local-token mode), and every client's HTTP wired to the real app."""
+    """Auth on (local-token mode), and every client's HTTP wired to the real app.
+
+    Local-token mode, not the ``auth_enabled_env`` fixture's Auth0 mode: in Auth0 mode
+    ``get_local_bearer()`` returns ``None``, so every client would attach nothing and every
+    surface would 401 -- the gate would have no signal to tell a correct client from a broken
+    one.
+    """
     for var in ("AUTH0_DOMAIN", "AUTH0_AUDIENCE", "CAO_AUTH_JWKS_URI", "CAO_AUTH_ISSUER"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", LOCAL_TOKEN)
@@ -206,7 +212,6 @@ def boundary(monkeypatch):
     for verb in ("get", "post", "put", "patch", "delete", "request"):
         monkeypatch.setattr(requests, verb, getattr(adapter, verb))
     monkeypatch.setattr(shim_transport, "urlopen", adapter.urlopen)
-    monkeypatch.setattr(app_tools, "_is_enabled", lambda: True)
     yield adapter
     auth_module.get_jwks_cache().clear()
 
