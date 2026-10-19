@@ -20,6 +20,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from cli_agent_orchestrator.constants import SCRIPT_LINT_MAX_SOURCE_CHARS
 from cli_agent_orchestrator.models.workflow import LintFinding, ScriptValidationResult
 from cli_agent_orchestrator.services import script_lint as script_lint_module
 from cli_agent_orchestrator.services.script_lint import lint_script
@@ -79,12 +80,20 @@ class TestSyntaxRule:
         assert result.findings[0].line == 1
 
     def test_deeply_nested_expression_is_total(self):
-        # Deep attribute chains MAY overflow the parser's recursion (3.10/3.11)
-        # or MAY parse cleanly (3.12+ raised its limits, and CPython's C parser
-        # is not gated by sys.setrecursionlimit). Per the never-assert-which-arm
-        # rule (gh-96670), assert only totality: a result is returned, the status
-        # is in-domain, and any failure is fail-closed as a syntax ERROR.
-        source = "a" + ".b" * 200_000 + "\n"
+        # Deep attribute chains MAY overflow the parser's recursion or MAY parse
+        # cleanly, depending on the CPython minor (3.12+ raised its limits) and
+        # on the C stack, which sys.setrecursionlimit does not gate. Per the
+        # never-assert-which-arm rule (gh-96670), assert only totality: a result
+        # is returned, the status is in-domain, and any failure is fail-closed
+        # as a syntax ERROR.
+        #
+        # The depth here MUST stay under SCRIPT_LINT_MAX_SOURCE_CHARS, or the
+        # oversize guard answers instead and this stops testing the parse path.
+        # It used to be 200_000, which is past the guard AND past the point
+        # where ast.parse segfaults on 3.10 — see
+        # test_pathological_nesting_does_not_crash_the_interpreter below.
+        source = "a" + ".b" * 20_000 + "\n"
+        assert len(source) <= SCRIPT_LINT_MAX_SOURCE_CHARS  # still the parse path
         result = lint_script(source, "deep.py")
         assert isinstance(result, ScriptValidationResult)
         assert result.status in ("pass", "fail")
@@ -108,6 +117,70 @@ class TestSyntaxRule:
         assert f.rule_id == "syntax"
         assert f.severity == "error"
         assert f.line == 1
+
+
+class TestOversizeSourceGuard:
+    """The pre-parse length cap — a crash guard, not a style limit.
+
+    On CPython <=3.11 the AST build inside ``ast.parse`` recurses in C once per
+    nesting level with no recursion gate, so a deeply nested source overflows
+    the C stack and SEGFAULTS: no exception is raised, so none of
+    ``lint_script``'s three except arms can convert it into a finding and the
+    whole test process dies mid-run. These tests are the regression guard for
+    that crash class; the first one took the interpreter down before the cap
+    existed.
+    """
+
+    def test_pathological_nesting_does_not_crash_the_interpreter(self):
+        # The exact input that used to segfault pytest: ~400 KB of attribute
+        # chain, 200_000 levels deep. The ONLY thing asserted is that control
+        # returns at all with a fail-closed verdict — that is the whole point.
+        source = "a" + ".b" * 200_000 + "\n"
+        result = lint_script(source, "pathological.py")
+        assert isinstance(result, ScriptValidationResult)
+        assert result.status == "fail"
+        f = result.findings[0]
+        assert f.rule_id == "syntax"
+        assert f.severity == "error"
+        assert f.line == 1
+
+    def test_oversize_source_is_rejected_before_ast_parse(self, monkeypatch):
+        # Ordering is the invariant: the cap is worthless if the parse has
+        # already run by the time it is checked. A parse that raises loudly
+        # proves it was never reached.
+        def _must_not_run(*args, **kwargs):  # pragma: no cover - asserts absence
+            raise AssertionError("ast.parse ran on a source over the cap")
+
+        monkeypatch.setattr(script_lint_module.ast, "parse", _must_not_run)
+        source = "#" + "x" * SCRIPT_LINT_MAX_SOURCE_CHARS + "\n"
+        result = lint_script(source, "big.py")
+        assert result.status == "fail"
+        assert [f.rule_id for f in result.findings] == ["syntax"]
+        assert str(SCRIPT_LINT_MAX_SOURCE_CHARS) in result.findings[0].message
+        # ERRORs are mirrored into the legacy list (Q5=A), warnings never are.
+        assert len(result.errors) == 1
+
+    def test_source_at_the_cap_parses_without_crashing(self):
+        # Pins the safety MARGIN, so raising SCRIPT_LINT_MAX_SOURCE_CHARS
+        # without re-measuring the segfault cliff turns this red instead of
+        # turning the suite into a core dump. A source that is nothing but
+        # nesting is the deepest AST the cap can admit (depth <= len(source)).
+        depth = (SCRIPT_LINT_MAX_SOURCE_CHARS - 2) // 2
+        source = "a" + ".b" * depth + "\n"
+        assert len(source) <= SCRIPT_LINT_MAX_SOURCE_CHARS
+        result = lint_script(source, "at_cap.py")
+        assert isinstance(result, ScriptValidationResult)
+        assert result.status in ("pass", "fail")
+
+    def test_source_just_under_the_cap_still_reaches_the_rules(self):
+        # The cap must not swallow a large-but-legitimate script: the repo's
+        # own biggest workflow example is ~58 KB, well inside this.
+        padding = "# pad\n" * 2_000
+        source = padding + "import cli_agent_orchestrator\n"
+        assert len(source) <= SCRIPT_LINT_MAX_SOURCE_CHARS
+        result = lint_script(source, "large_but_fine.py")
+        assert result.status == "fail"
+        assert _findings_by_rule(result, "disallowed-import")
 
 
 class TestDisallowedImportRule:

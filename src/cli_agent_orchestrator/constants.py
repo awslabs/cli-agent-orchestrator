@@ -1005,6 +1005,30 @@ SCRIPT_LINT_DISALLOWED_IMPORT_PREFIXES = frozenset({"cli_agent_orchestrator"})
 # — no call-site analysis. A warning never fails a script (FR-1.7).
 SCRIPT_LINT_NONDETERMINISM_MODULES = frozenset({"random", "secrets", "uuid", "time", "datetime"})
 
+# Pre-parse source-length cap for the linter, in characters. This is a CRASH
+# guard, not a style limit. On CPython <=3.11 the AST build inside ``ast.parse``
+# recurses in C once per nesting level with no ``_Py_EnterRecursiveCall`` gate,
+# so deeply nested input overflows the C stack and SEGFAULTS the interpreter —
+# ``sys.setrecursionlimit`` does not reach it and no ``RecursionError`` is ever
+# raised, so ``lint_script``'s except arms cannot save it. (CPython added the
+# guards in 3.12; the CI floor is 3.10, so this cap is load-bearing.)
+#
+# Why a LENGTH cap bounds DEPTH: every AST node needs at least one source
+# character, so max AST depth <= len(source). That makes the bound sound
+# without a second traversal, which matters for a module contracted to do one
+# ``ast.parse`` and one ``ast.walk``.
+#
+# Why 128 KiB specifically — do not raise it without re-measuring BOTH numbers:
+#   - Measured segfault cliff on x86_64 Linux / 8 MiB stack: between 150_000
+#     and 200_000 nesting levels (~50 bytes of C stack per level). The worst
+#     case admitted here is 65_536 levels, ~2.6x below that cliff.
+#   - Largest workflow script shipped in this repo is
+#     ``examples/workflows/pr-health/pr_health.py`` at ~58 KiB, so this leaves
+#     ~2.3x headroom for a legitimately large hand-written script.
+# ``test_source_at_the_cap_parses_without_crashing`` pins the first number by
+# actually parsing a worst-case source at the cap.
+SCRIPT_LINT_MAX_SOURCE_CHARS = 128 * 1024
+
 # Env-var injection allowlist for POST /terminals/run-step (Bolt 2, U2/C6,
 # NFR-SEC-4 BINDING). Deny-by-default: the injection surface into a tmux
 # terminal environment is exactly these three documented identity keys.

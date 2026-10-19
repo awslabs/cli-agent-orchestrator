@@ -13,6 +13,10 @@ error is a finding, not an exception (U1-BR-6).
 
 Rule catalogue — eight rules:
 - ``syntax`` (ERROR) — ``ast.parse`` failed; anchored at ``e.lineno`` or 1.
+  Also carries the pre-parse oversize verdict: a source over
+  ``SCRIPT_LINT_MAX_SOURCE_CHARS`` is refused WITHOUT being parsed, because on
+  CPython <=3.11 a deeply nested source segfaults ``ast.parse`` outright rather
+  than raising anything the arms below could catch.
 - ``disallowed-import`` (ERROR) — static or literal-string dynamic import
   whose first dotted segment is in ``SCRIPT_LINT_DISALLOWED_IMPORT_PREFIXES``
   (scripts reach CAO over HTTP only; the ``cao_workflow`` shim is the
@@ -84,6 +88,7 @@ from typing import List, Literal, Sequence
 
 from cli_agent_orchestrator.constants import (
     SCRIPT_LINT_DISALLOWED_IMPORT_PREFIXES,
+    SCRIPT_LINT_MAX_SOURCE_CHARS,
     SCRIPT_LINT_NONDETERMINISM_MODULES,
     WORKFLOW_NAME_RE,
 )
@@ -99,8 +104,38 @@ def lint_script(source: str, display_path: str) -> ScriptValidationResult:
     The only operation that can raise on input content is ``ast.parse``; it is
     wrapped once with exactly three narrow arms (no broad except — totality by
     construction, proven by the hypothesis property test).
+
+    Totality needs ONE thing the except arms cannot provide. On CPython <=3.11
+    ``ast.parse`` segfaults on deeply nested input instead of raising — the C
+    recursion is ungated, so there is no exception to narrow. The oversize
+    pre-check below is what keeps the never-raises contract true on the 3.10
+    floor: it runs BEFORE the parse and bounds AST depth by source length. See
+    ``SCRIPT_LINT_MAX_SOURCE_CHARS``.
     """
     findings: List[LintFinding] = []
+    if len(source) > SCRIPT_LINT_MAX_SOURCE_CHARS:
+        # Fail closed as a syntax ERROR rather than a new rule_id: from the
+        # caller's side this is the same verdict as unparsable input, and the
+        # ``syntax`` arm already owns "this source was never walked".
+        logger.warning(
+            "source for %s exceeds the %d-character lint cap (%d); refusing to parse",
+            display_path,
+            SCRIPT_LINT_MAX_SOURCE_CHARS,
+            len(source),
+        )
+        findings.append(
+            LintFinding(
+                rule_id="syntax",
+                severity="error",
+                line=1,
+                message=(
+                    f"source is {len(source)} characters, over the "
+                    f"{SCRIPT_LINT_MAX_SOURCE_CHARS}-character limit; split it into "
+                    "smaller scripts"
+                ),
+            )
+        )
+        return _build_result(findings)
     try:
         tree = ast.parse(source, filename=display_path)
     except SyntaxError as e:
