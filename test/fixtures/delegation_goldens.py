@@ -11,6 +11,7 @@ GOLDEN_RESULTS = {
     "handoff": {
         "success": True,
         "message": "Successfully handed off to developer (codex) in 0.00s",
+        "rule": None,
         "output": "worker result",
         "terminal_id": "worker-fixed",
         "job_id": None,
@@ -37,6 +38,6 @@ GOLDEN_RESULTS = {
 }
 
 # Agent tool definitions captured from main 11f164da (#942 descriptions);
-# output models captured before delegation wiring.
+# Output models include main's optional ephemeral refusal rule (#905).
 TOOL_DEFINITIONS_SHA256 = "3e144811fd442f49805146bcf9dbd6708e93a7915338ba04317576a8dfac445f"
-TOOL_MODELS_SHA256 = "6b9c510f965a658909efa356cb18d8a2009bd5fe7f58ad2e56c87fda3a7523c2"
+TOOL_MODELS_SHA256 = "c2611fc69ad1a6835369af9c43f6c40289561ec53c39f9cfea369e9f12973a73"

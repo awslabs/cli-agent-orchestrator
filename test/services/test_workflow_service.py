@@ -18,6 +18,7 @@ import pytest
 
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.models.workflow import (
+    InputDecl,
     NotBuiltYetError,
     RunState,
     StepState,
@@ -998,3 +999,26 @@ async def test_provider_error_retries_do_not_leak_terminals(monkeypatch):
     # Every one was reclaimed (exit-then-delete), not just the last.
     assert sorted(deleted) == sorted(created)
     assert sorted(exited) == sorted(created)
+
+
+@pytest.mark.asyncio
+async def test_reprompt_keeps_the_rendered_attempt_prompt(monkeypatch):
+    prompts = []
+
+    async def execute(**kwargs):
+        prompts.append(kwargs["prompt"])
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", execute)
+    spec = _spec(schema=_SCHEMA)
+    spec.inputs = {"pr_number": InputDecl(type="int", required=True)}
+    spec.steps[0].prompt = "Review PR {{workflow.inputs.pr_number}}"
+
+    result = await ws.start_run(spec, {"pr_number": 869}, "rendered-reprompt")
+
+    assert result.steps[0].state == StepState.COMPLETED_UNVALIDATED
+    assert len(prompts) == 2
+    assert prompts[0] == "Review PR 869"
+    assert prompts[1].startswith("Review PR 869\n\n")
+    assert "workflow_return" in prompts[1]
+    assert "{{" not in prompts[1]
