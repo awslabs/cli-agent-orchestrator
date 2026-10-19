@@ -26,6 +26,7 @@ which is exactly the state this Bolt shipped in before the fix.
 from __future__ import annotations
 
 import re
+from inspect import getclosurevars
 from pathlib import Path
 
 import click
@@ -163,3 +164,41 @@ def test_every_mcp_tool_has_a_row_and_every_row_has_a_tool():
     live = _live_mcp_workflow_tools()
     assert not (live - documented), f"MCP tools with no table row: {sorted(live - documented)}"
     assert not (documented - live), f"table rows with no MCP tool: {sorted(documented - live)}"
+
+
+def test_api_documents_spec_authoring_routes():
+    """The REST reference must describe the spec authoring and draft-validation surface."""
+    import cli_agent_orchestrator.api.main as api_main
+
+    source = (DOC.parent / "api.md").read_text()
+    section = source.split("### Workflows\n", 1)[1].split("\n### ", 1)[0]
+    wanted = {
+        ("POST", "/workflows"),
+        ("PUT", "/workflows/{name}"),
+        ("DELETE", "/workflows/{name}"),
+        ("POST", "/workflows/validate"),
+    }
+    seen = set()
+    for route in api_main.app.routes:
+        for method in getattr(route, "methods", set()) or set():
+            key = (method, getattr(route, "path", None))
+            if key not in wanted:
+                continue
+            seen.add(key)
+            entry = f"`{method} {route.path}`"
+            lines = section.split("\n- ")
+            matches = [line for line in lines if entry in line]
+            assert len(matches) == 1, f"missing or duplicate REST documentation: {entry}"
+            text = matches[0]
+            assert f"`{route.status_code or 200}`" in text
+            scope_deps = [
+                dep.call
+                for dep in route.dependant.dependencies
+                if "require_any_scope" in getattr(dep.call, "__qualname__", "")
+            ]
+            assert len(scope_deps) == 1, f"missing scope dependency: {entry}"
+            scopes = getclosurevars(scope_deps[0]).nonlocals["required"]
+            assert set(re.findall(r"`(cao:[a-z]+)`", text)) == set(scopes)
+            if key == ("POST", "/workflows/validate"):
+                assert "`source`" in text and "`path`" in text
+    assert seen == wanted

@@ -277,7 +277,22 @@ than calling these routes directly.
 
 ### Workflows
 
-- `/workflows*` validates and inspects workflow specifications.
+- `/workflows*` creates, updates, deletes, validates and inspects workflow specifications.
+- `POST /workflows` creates a Python spec (`201`); requires `cao:write` or `cao:admin`.
+  Invalid specs or refused paths return `400`, existing names or tier collisions `409`,
+  and storage failures `500`.
+- `PUT /workflows/{name}` replaces a Python spec (`200`) using a required `expected_hash`;
+  requires `cao:write` or `cao:admin`. Unknown names return `404`, stale hashes or tier
+  collisions `409`, invalid specs or refused paths `400`, and storage failures `500`.
+- `DELETE /workflows/{name}` deletes a spec and its index row (`200`); requires `cao:admin`.
+  An unknown or already-deleted name returns `404`; invalid paths return `400`.
+- `POST /workflows/validate` accepts exactly one of `path` or `source` (`200`);
+  requires `cao:read`, `cao:write` or `cao:admin`. The `source` form lints a Python draft
+  without writing a file; lint or size failures are reported in the `200` result.
+  Supplying both forms or neither returns `400`.
+
+The spec-route scope checks apply when authentication is enabled.
+
 - `POST /workflows/runs` starts a run **inline** and holds the connection until it
   finishes, returning the complete result. Its optional `working_directory` field selects
   the script run's project root; it is ignored for YAML workflows.
