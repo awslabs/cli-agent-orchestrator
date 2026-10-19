@@ -1022,3 +1022,11 @@ def test_step_unreachable_server(runner):
         result = runner.invoke(workflow, ["step", "run1", "s2"])
     assert result.exit_code != 0
     assert "could not reach cao-server" in result.output
+
+
+def test_approve_help_does_not_offer_an_agent_off_switch(runner):
+    result = runner.invoke(workflow, ["approve", "--help"])
+    assert result.exit_code == 0
+    assert "workflow.require_approval" not in result.output
+    assert "settings.json" not in result.output
+    assert "operator" in result.output and "disabled enforcement" in result.output

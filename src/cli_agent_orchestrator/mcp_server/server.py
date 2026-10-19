@@ -2774,8 +2774,8 @@ async def workflow_plan_approval(
 
     Approval enforcement is **on by default** since issue #583 Bolt 3, so ``approved: false`` here
     normally DOES predict that a run of this plan will be refused. It is informational rather than
-    predictive only where ``workflow.require_approval: false`` in the server's ``settings.json`` has
-    turned the gate off. An unreadable or invalid settings file leaves enforcement ON.
+    predictive only where an operator has disabled enforcement. An unreadable or invalid settings
+    file leaves enforcement ON.
 
     ``plan_id`` is ``null`` for a YAML run (which never freezes a manifest) and for a script run whose
     freeze failed. That is reported distinctly from "not approved", because the two call for entirely

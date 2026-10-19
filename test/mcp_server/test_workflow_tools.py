@@ -777,3 +777,12 @@ def test_approval_refusal_preserves_human_remedy_for_agents(monkeypatch, tool):
     assert "\n" not in out["error"]
     assert "needs human approval" in out["error"]
     assert f"an operator approves it with `cao workflow approve {plan_id}`" in out["error"]
+
+
+def test_plan_approval_description_does_not_offer_an_agent_off_switch():
+    from cli_agent_orchestrator.mcp_server.server import workflow_plan_approval
+
+    description = workflow_plan_approval.__doc__
+    assert "workflow.require_approval" not in description
+    assert "settings.json" not in description
+    assert "operator" in description and "disabled enforcement" in description

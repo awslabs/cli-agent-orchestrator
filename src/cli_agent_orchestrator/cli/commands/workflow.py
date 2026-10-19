@@ -605,8 +605,8 @@ def approve_cmd(plan_id, as_json):
 
     A plan identifier is computed at RUN START from the workflow's execution-affecting fields, so a
     NEW OR CHANGED PLAN IS REFUSED ONCE before it can be approved: run it, copy the plan_id from the
-    refusal, approve it here, run again. Approval enforcement is on by default for script workflows, so this command is consequential in a default installation; only setting
-    `workflow.require_approval` to false in `settings.json` turns the gate off.
+    refusal, and have an operator record approval here before running again. Approval enforcement is
+    on by default for script workflows unless an operator has disabled enforcement.
 
     Approving twice is harmless and changes nothing: the original approver and timestamp are kept and
     reported back, so "already approved" is distinguishable from "just approved by me".
