@@ -1,4 +1,5 @@
-"""Guard tests: every parser call on untrusted text stays behind a length bound (#9001).
+"""Guard tests: every parser call on untrusted text, reachable by import-resolved dotted
+name, stays behind a length bound (#9001).
 
 The defect class, not the instance. A function contracted to be total ("never raises
 on input content") reaches an UNGATED NATIVE-RECURSION primitive -- CPython's C parser
@@ -13,6 +14,13 @@ executor: it called ``lint_script`` IN-PROCESS, and the failure mode under test 
 asserting process. A regression therefore produced a truncated run, never a red test.
 Hence the rule these tests encode: a test that asserts "this does not crash the
 interpreter" MUST NOT run its subject in the interpreter running the test.
+
+Scope limit: the enumeration test is a static scan. It resolves ``import``/``from...import``
+aliases, so a rename like ``import ast as _ast`` is still caught, but it does NOT follow
+assignment or attribute indirection -- ``p = ast.parse; p(src)`` or
+``getattr(ast, "parse")(src)`` is invisible to it. That is a known, accepted gap (a static
+scan loses any indirection arms race); the mechanism this file leans on is the child-process
+crash probe below, which measures the real interpreter regardless of how the call got there.
 
 Same family as ``test/test_http_only_boundary.py`` and ``test/test_no_ffi_guard.py``:
 AST-scan ``src/`` and lock an invariant the codebase already satisfies.
@@ -38,23 +46,36 @@ _REPO_ROOT = _SRC_ROOT.parent
 # AST in C; ``ast.literal_eval`` walks one; ``exec``/``eval`` compile first.
 _PARSER_CALLS = frozenset({"ast.parse", "ast.literal_eval", "compile", "exec", "eval"})
 
-# Every parser call in ``src/``, keyed by (path relative to src/, enclosing qualname), with
-# the bound that keeps its input finite. A NEW entry means a parser call landed with no
-# length bound in front of it -- add the bound first, then the row.
-_ALLOWED_PARSER_CALLS: Dict[Tuple[str, str], str] = {
+# Every parser call in ``src/``, keyed by (path relative to src/, enclosing qualname, call
+# target) -- the target is part of the key so a SECOND, different parser call added inside an
+# already-allowlisted function is still caught -- with the bound that keeps its input finite.
+# A NEW entry means a parser call landed with no length bound in front of it -- add the bound
+# first, then the row.
+_ALLOWED_PARSER_CALLS: Dict[Tuple[str, str, str], str] = {
     (
         "cli_agent_orchestrator/services/script_lint.py",
         "lint_script",
+        "ast.parse",
     ): "SCRIPT_LINT_MAX_SOURCE_CHARS, checked before the parse in the same function",
     (
         "cli_agent_orchestrator/services/workflow_spec_service.py",
         "_extract_inputs",
+        "ast.parse",
     ): (
         "NO BOUND OF ITS OWN -- borrows lint_script's. Both callers run lint_script first "
         "and bail on its oversize finding: _read_script_spec (:1012) skips extraction when "
         "a rule_id == 'syntax' finding exists, _validated_script_spec (:1087) raises on "
         "status == 'fail'. test_oversize_rejection_keeps_the_rule_id_extract_inputs_skips_on "
         "pins that coupling; giving the oversize rejection its own rule_id reopens #9001."
+    ),
+    (
+        "cli_agent_orchestrator/services/workflow_spec_service.py",
+        "_extract_inputs",
+        "ast.literal_eval",
+    ): (
+        "Same shield as the ast.parse row above: these calls only run on sub-nodes of the "
+        "tree that call already produced, so they inherit its coupling to lint_script's "
+        "oversize rejection rather than needing a bound of their own."
     ),
 }
 
@@ -116,21 +137,21 @@ def _qualname_of_parser_calls(tree: ast.Module) -> List[Tuple[str, str]]:
 def test_every_ast_parse_site_is_allowlisted_with_a_length_bound() -> None:
     """Enumerate the class, not the instance: no unbounded parser call may exist in src/."""
 
-    seen: Set[Tuple[str, str]] = set()
+    seen: Set[Tuple[str, str, str]] = set()
     for path in sorted(_SRC_ROOT.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         rel = path.relative_to(_SRC_ROOT).as_posix()
-        for _target, qualname in _qualname_of_parser_calls(tree):
-            seen.add((rel, qualname))
+        for target, qualname in _qualname_of_parser_calls(tree):
+            seen.add((rel, qualname, target))
 
     expected = set(_ALLOWED_PARSER_CALLS)
-    unbounded = sorted(f"{p}::{q}" for p, q in seen - expected)
+    unbounded = sorted(f"{p}::{q}::{t}" for p, q, t in seen - expected)
     assert not unbounded, (
         "new parser call on possibly-untrusted text with no recorded length bound: "
         f"{unbounded}. Bound the input BEFORE the parse (see SCRIPT_LINT_MAX_SOURCE_CHARS "
         "and #9001), then add the site to _ALLOWED_PARSER_CALLS."
     )
-    stale = sorted(f"{p}::{q}" for p, q in expected - seen)
+    stale = sorted(f"{p}::{q}::{t}" for p, q, t in expected - seen)
     assert not stale, f"_ALLOWED_PARSER_CALLS has rotted; these sites are gone: {stale}"
 
 
