@@ -21,6 +21,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import inspect
+import os
 import uuid
 from pathlib import Path
 
@@ -452,3 +453,42 @@ def test_delete_refusals_match_authoring_shape_and_hide_paths(spec_dir, monkeypa
     assert submitted not in deleted.text
     assert server_path not in deleted.text
     assert str(spec_dir) not in deleted.text
+
+
+@pytest.mark.parametrize("failure", ["permissions", "remove"])
+def test_delete_remove_storage_failure_is_fixed_500_and_preserves_file(
+    client, spec_dir, tmp_path, monkeypatch, failure
+):
+    import errno
+
+    from cli_agent_orchestrator.api.main import _WORKFLOW_AUTHORING_STORAGE_DETAIL
+    from cli_agent_orchestrator.clients.database import _migrate_workflow_index
+
+    if failure == "permissions" and os.geteuid() == 0:
+        pytest.skip("root can remove files from a chmod 0500 directory")
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", tmp_path / "delete.db")
+    _migrate_workflow_index()
+    spec = svc.create_workflow("victim", GOOD)
+    path = Path(spec.path)
+    submitted = "/workflows/victim"
+    original_remove = svc.os.remove
+    if failure == "permissions":
+        spec_dir.chmod(0o500)
+    else:
+
+        def fail_remove(target, *args, **kwargs):
+            if os.fspath(target) == str(path):
+                raise OSError(errno.EIO, f"failed remove for {submitted}", str(path))
+            return original_remove(target, *args, **kwargs)
+
+        monkeypatch.setattr(svc.os, "remove", fail_remove)
+    try:
+        response = client.delete(submitted)
+        assert response.status_code == 500, response.text
+        assert response.json()["detail"] == _WORKFLOW_AUTHORING_STORAGE_DETAIL
+        assert str(path) not in response.text and str(spec_dir) not in response.text
+        assert submitted not in response.text
+        assert path.is_file()
+        assert path.read_bytes() == GOOD.encode("utf-8")
+    finally:
+        spec_dir.chmod(0o700)

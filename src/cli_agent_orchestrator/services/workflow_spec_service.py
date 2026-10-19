@@ -1325,6 +1325,7 @@ def delete_workflow(name: str, scan_dir: Optional[str] = None) -> None:
     cannot interleave. An unknown name
     raises ``KeyError`` -> 404; a repeat delete of an already-removed name is a
     404, not a silent success (the unknown name is surfaced, not masked).
+    Other filesystem errors propagate as OSError for the API's fixed storage refusal.
     ``_resolve_source_path`` returns a raw string pulled out of SQLite — the
     SAME shape of value ``_read_script_spec`` re-validates before its own
     sink — so this function re-validates it through ``_safe_spec_path`` too
@@ -1348,8 +1349,6 @@ def delete_workflow(name: str, scan_dir: Optional[str] = None) -> None:
                 conn.execute("DELETE FROM workflow_index WHERE name = ?", (name,))
                 conn.commit()
             raise KeyError(name)
-        except OSError as e:
-            raise ValueError(f"could not delete workflow '{name}': {e}") from e
         with _connect() as conn:
             conn.execute("DELETE FROM workflow_index WHERE name = ?", (name,))
             conn.commit()
