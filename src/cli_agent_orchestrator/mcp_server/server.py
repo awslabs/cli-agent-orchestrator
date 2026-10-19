@@ -1514,6 +1514,16 @@ def _caller_has_store_lesson_capability(caller_profile: Optional[str]) -> bool:
 
 CAO_MCP_SERVER_SELECTOR = "@cao-mcp-server"
 
+#: ``list_siblings``/``update_metadata`` are gated by their own live
+#: ``discovery`` check (``_require_discovery_marker`` above), not by
+#: ``@cao-mcp-server`` -- docs/tool-restrictions.md: "A profile with
+#: @cao-mcp-server does not automatically get sibling discovery, and vice
+#: versa." Letting the two tools in this set through on ``discovery`` alone
+#: (in addition to ``*``/``@cao-mcp-server``) keeps that documented,
+#: independently-grantable surface reachable; ``_require_discovery_marker``
+#: still does the real enforcement when the tool actually runs.
+DISCOVERY_GATED_TOOLS = frozenset({"list_siblings", "update_metadata"})
+
 
 def _tool_denied_reason(tool_name: str) -> Optional[str]:
     """Reason the calling terminal's allowlist bars ``tool_name``, or None to allow.
@@ -1533,6 +1543,9 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
     profile resolution that ``None`` stands for, and these operations are
     granted by the documented ``@cao-mcp-server`` server selector or by ``*``.
     Bare tool names are provider-native vocabulary and never name an MCP tool.
+    ``DISCOVERY_GATED_TOOLS`` is the one exception: those two tools also pass
+    on the ``discovery`` grant alone, because that grant is documented as
+    independent of ``@cao-mcp-server``.
 
     Fails closed. An unset ``CAO_TERMINAL_ID`` is the supported operator
     context (``cao assign`` and ``cao handoff`` run with no caller identity)
@@ -1594,6 +1607,9 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
         return f"cannot authorize '{tool_name}': the caller's allowed tools could not be resolved"
 
     if "*" in allowed or CAO_MCP_SERVER_SELECTOR in allowed:
+        return None
+
+    if tool_name in DISCOVERY_GATED_TOOLS and has_discovery_grant(allowed):
         return None
 
     return (

@@ -243,3 +243,46 @@ class TestInstallation:
 
         with pytest.raises(RuntimeError):
             server._install_allowlist_middleware(_NoMiddleware())
+
+
+class TestDiscoveryCarveOut:
+    """``discovery`` is a separate per-tool grant (docs/tool-restrictions.md:120-124).
+
+    The gate must not require ``@cao-mcp-server`` for the two tools that grant
+    already covers independently -- ``_require_discovery_marker`` still does the
+    real, live-looked-up enforcement when the tool runs.
+    """
+
+    @pytest.mark.parametrize("tool", sorted(server.DISCOVERY_GATED_TOOLS))
+    def test_the_discovery_grant_alone_passes_the_gate(self, tool):
+        mcp = _server([tool])
+        with patch.dict(os.environ, BOUND):
+            with patch.object(
+                server, "_get_terminal_context_from_env", return_value=_ctx(["discovery"])
+            ):
+                assert _call(mcp, tool) == {"reached": tool}
+
+    @pytest.mark.parametrize("tool", sorted(server.DISCOVERY_GATED_TOOLS))
+    def test_neither_discovery_nor_cao_mcp_server_is_still_denied(self, tool):
+        mcp = _server([tool])
+        with patch.dict(os.environ, BOUND):
+            with patch.object(
+                server, "_get_terminal_context_from_env", return_value=_ctx(["fs_read"])
+            ):
+                with pytest.raises(Exception) as excinfo:
+                    _call(mcp, tool)
+        assert "@cao-mcp-server" in str(excinfo.value)
+
+    def test_the_carve_out_does_not_widen_to_other_tools(self):
+        """``discovery`` grants only the two tools in ``DISCOVERY_GATED_TOOLS``."""
+        mcp = _server(["memory_store"])
+        with patch.dict(os.environ, BOUND):
+            with patch.object(
+                server, "_get_terminal_context_from_env", return_value=_ctx(["discovery"])
+            ):
+                with pytest.raises(Exception) as excinfo:
+                    _call(mcp, "memory_store")
+        assert "@cao-mcp-server" in str(excinfo.value)
+
+    def test_the_set_is_exactly_the_two_documented_tools(self):
+        assert server.DISCOVERY_GATED_TOOLS == frozenset({"list_siblings", "update_metadata"})
