@@ -140,10 +140,15 @@ jobs:
       # job's existing in-file pattern: a Node build plus setup-uv/uv sync plus ONE
       # targeted pytest file.
       #
-      # SCOPE: the pytest step names test_wheel_contents.py EXPLICITLY, so it closes the
-      # gap for THAT FILE and not for the class. Another web_ui-dependent test added
-      # elsewhere under test/ would still skip in `Unit Tests` and would not be collected
-      # here; wiring it in means naming it in this step too.
+      # SCOPE: the pytest step names its files EXPLICITLY, so it closes the gap for THOSE
+      # FILES and not for the class. Another web_ui-dependent test added elsewhere under
+      # test/ would still skip in `Unit Tests` and would not be collected here; wiring it
+      # in means naming it in this step too.
+      #
+      # test_hatch_artifacts_guard.py is listed alongside it, but is NOT dependent on this
+      # job: it never skips, so `Unit Tests` already runs it on 3.10/3.11/3.12. It is named
+      # here because this is the only job where `web_ui/` exists on disk, which is the only
+      # place its whole-directory wheel assertion can cover THAT root rather than skipping it.
       # =================================================================================
       - name: Install uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
@@ -185,7 +190,7 @@ jobs:
             echo "this job green with the packaging assertion unexecuted (issues #610, #705)." >&2
             exit 1
           }
-          uv run pytest test/test_wheel_contents.py --no-cov -q
+          uv run pytest test/test_wheel_contents.py test/test_hatch_artifacts_guard.py --no-cov -q
 
   aidlc-portfolio-example:
     name: AI-DLC Portfolio Example
