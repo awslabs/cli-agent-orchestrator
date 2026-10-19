@@ -175,13 +175,26 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   without it) and checks the requested `allowed_tools` (client string or profile
   resolution) against that caller's recorded ceiling, answering `403` when they
   exceed it; the message names the parent, the child, the exceeding tools and
-  the remedy. `POST /sessions` and `POST /terminals/run-step` accept
+  the remedy. An **operator** adding a terminal to an existing session (the Web
+  UI's Add Agent button) uses `POST /sessions/{session_name}/terminals:operator`
+  instead: same query parameters minus `caller_id`/`defer_init`, an optional
+  `{"description": ...}` body, and the new terminal records the profile's
+  declared ceiling exactly as `POST /sessions` does. It is a distinct sub-path
+  so no existing request can land on it by accident, and it answers `400` when
+  the request also names a caller (`caller_id`, `caller_ceiling`,
+  `delegating_terminal_id`, or a body `env_vars` carrying
+  `CAO_CALLBACK_TERMINAL_ID`). `POST /sessions?memory_manager=true` reports the
+  sidecar's outcome on the response as `memory_manager`
+  (`{"state": "scheduled" | "refused", "detail"}`); a primary whose ceiling does
+  not cover the sidecar's `@cao-mcp-server, fs_read, fs_list` gets `refused` and
+  no sidecar. `POST /sessions` and `POST /terminals/run-step` accept
   `caller_ceiling` in the JSON body for a caller on another node (remote
   `assign`/`handoff`); it is rejected together with a local `caller_id`, it is
   required when the body's `env_vars` carry `CAO_CALLBACK_TERMINAL_ID` (the
   remote-assign shape), and when that callback terminal has a local row the
   asserted ceiling must fit inside the row's. `caller_id` and `caller_ceiling`
-  remain client assertions under the shared bearer; see
+  remain client assertions under the shared bearer (per-terminal credentials are
+  tracked in [#965](https://github.com/awslabs/cli-agent-orchestrator/issues/965)); see
   [Tool Restrictions](tool-restrictions.md#cross-provider-inheritance) for what
   that does and does not guarantee.
 - `GET /terminals/{terminal_id}/output?mode=full` returns the StatusMonitor

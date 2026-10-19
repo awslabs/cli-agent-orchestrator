@@ -49,7 +49,6 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
 )
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
-from cli_agent_orchestrator.utils.description import normalize_description
 from cli_agent_orchestrator.utils.delegation import (
     REMOTE_FEATURE,
     DelegationCeilingError,
@@ -57,6 +56,7 @@ from cli_agent_orchestrator.utils.delegation import (
     describe_rejection,
     tools_exceeding,
 )
+from cli_agent_orchestrator.utils.description import normalize_description
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_session_name_for_key,
@@ -542,14 +542,22 @@ def _resolve_child_allowed_tools(
     parent_id: Optional[str] = None,
     parent_profile: Optional[str] = None,
 ) -> Optional[str]:
-    """Resolve allowed_tools for a child terminal via intersection.
+    """Resolve the child's allowed_tools and precheck them against the parent's ceiling.
 
-    The child gets at most the union of: what the parent allows + what the
-    child profile specifies. If the parent is unrestricted ("*"), the child
-    profile's allowedTools are used as-is.
+    The child's list is its OWN profile resolution (role default or
+    ``allowedTools``), never widened; a child with no profile inherits the
+    parent's list. It is then checked against ``parent_ceiling`` -- the
+    parent's RECORDED ``delegate_tools``, or for a pre-migration row its own
+    allowlist -- and a child whose list exceeds that ceiling raises
+    ``DelegationCeilingError`` with the same text the server produces, so the
+    agent sees the refusal before the HTTP round trip. The server re-checks
+    against the stored row and stays authoritative (``utils/delegation.py``).
+    A parent with no identity and no recorded list (``None``) is the operator,
+    whose ceiling is ``*``; an identified parent recording neither is refused.
 
     Returns:
-        Comma-separated string of allowed tools, or None for unrestricted.
+        Comma-separated string of the child's allowed tools, or None for an
+        unrestricted child under an unrestricted parent.
     """
     from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
     from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile

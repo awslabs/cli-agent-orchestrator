@@ -22,8 +22,9 @@ defaults to the agent's own allowedTools. The ceiling always includes the
 agent's own effective allowlist: an agent may hand down what it holds.
 
 This module is the ONE comparator for "does this list exceed that one". The
-ephemeral path (``ephemeral_service.prepare_ephemeral_launch``) and the
-installed-profile path (``terminal_service.create_terminal``) both call
+ephemeral path (``ephemeral_service.create_ephemeral_agent``, which bounds a
+new ephemeral profile by its creator's row) and the installed-profile path
+(``terminal_service.create_terminal``, Step 0c) both call
 :func:`tools_exceeding`, and the MCP-side precheck in ``utils/orchestration``
 reuses :func:`describe_rejection` so the early error reads the same as the
 server's authoritative one.

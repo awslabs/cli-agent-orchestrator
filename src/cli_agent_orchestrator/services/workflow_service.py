@@ -211,12 +211,16 @@ class RunRecord:
     # constructed here; it binds to the running loop lazily on first await, so
     # building a RunRecord outside a loop (unit tests) is safe.
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
-    # The terminal that started (or resumed) this run, when an agent did
-    # (``WorkflowRunRequest.caller_id``, sent by the MCP workflow tools). Every
-    # step's worker is created with ``delegating_terminal_id=caller_id`` so its
-    # tools are bounded by that terminal's RECORDED delegation ceiling
-    # (utils/delegation.py). In-memory only: a resume re-binds it to whoever
-    # resumes. None for operator-started runs (CLI, curl), which are unbounded.
+    # The terminal that started this run, when an agent did
+    # (``WorkflowRunRequest.caller_id``, sent by the MCP workflow tools and by
+    # ``cao workflow`` from inside a terminal). Every step's worker is created
+    # with ``delegating_terminal_id=caller_id`` so its tools are bounded by that
+    # terminal's RECORDED delegation ceiling (utils/delegation.py). Persisted on
+    # the journal row (``workflow_run.caller_id``) at start, so a resume or a
+    # recovery after a restart re-binds to the ORIGINAL starter through
+    # ``bound_caller`` and never widens; only a run started with no caller
+    # takes the resumer's bound. None for operator-started runs (CLI, curl),
+    # which are unbounded.
     caller_id: Optional[str] = None
 
 
@@ -1571,9 +1575,11 @@ async def resume_from_last_completed(
 ) -> WorkflowRunResult:
     """Resume a crashed/failed run from its durable journal (§3, FR-6.2, N6).
 
-    ``caller_id`` is the terminal resuming the run, if an agent is; the re-run
-    steps are bounded by ITS delegation ceiling (the journal does not carry the
-    original starter, and the resumer is who dispatches now).
+    ``caller_id`` is the terminal resuming the run, if an agent is. The re-run
+    steps are bounded by the ORIGINAL starter's ceiling when the journal row
+    carries one (``workflow_run.caller_id``, see ``bound_caller``): an operator
+    or a wider agent resuming a reviewer's run cannot widen its steps. Only a
+    run that was started with no caller is bounded by the resumer.
 
     Un-reserves the B3-BR-10 stub. The algorithm (business-logic-model §3):
 
