@@ -282,13 +282,24 @@ NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+\w*i
 # Live spinner under Claude Code's prefersReducedMotion setting (GH #908): the
 # animated glyph is replaced by a static "●", e.g. "● Leavening… (running
 # UserPromptSubmit hook)" or "● Sublimating… (12s · ↓ 300 tokens)". "●" is also
-# the response marker, so the glyph alone proves nothing. Anchor on the whole
-# spinner shape instead: ONE word, the ellipsis straight after it, then " (".
-# A response like "● Analyzing… the diff is fine" (no parenthesis) and the
-# tool-call line "● Calling cao-mcp-server… (ctrl+o to expand)" (more than one
-# word) do not match.
+# the response marker, so the glyph alone proves nothing, and the message before
+# the ellipsis can be anything: a default verb ("Dilly-dallying", "Beboppin'"),
+# a custom spinnerVerbs entry, or the in-progress task's activeForm ("Running
+# the test suite"). Anchor on the status in the parentheses instead, which only
+# the spinner prints: it opens with the hook suffix ("running … hook"), the
+# elapsed time ("12s", "1m 3s"), the token count ("↓ 300 tokens"), "thinking" /
+# "thought for Ns", or the older "esc to interrupt". A response like
+# "● Analyzing… the diff is fine" and the tool-call line
+# "● Calling cao-mcp-server… (ctrl+o to expand)" do not match.
+_REDUCED_MOTION_STATUS = (
+    r"(?:running[ \t][^)\n]*\bhooks?\b"
+    r"|\d+(?:\.\d+)?[smhd]\b"
+    r"|(?:[↓↑][ \t]*)?[\d.,]+[kmb]?[ \t]+tokens\b"
+    r"|thinking\b|thought[ \t]+for\b"
+    r"|esc[ \t]+to[ \t]+interrupt\b)"
+)
 REDUCED_MOTION_SPINNER_PATTERN = re.compile(
-    r"^[ \t]*(?:\x1b\[[0-9;]*m)*●(?:\x1b\[[0-9;]*m)*[ \t]+\w+…[ \t]+\(", re.MULTILINE
+    r"^[ \t]*●[ \t]+[^\n]*…[ \t]+\(" + _REDUCED_MOTION_STATUS, re.MULTILINE
 )
 
 

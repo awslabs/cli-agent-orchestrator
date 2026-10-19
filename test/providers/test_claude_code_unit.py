@@ -3103,6 +3103,19 @@ class TestClaudeCodeReducedMotionSpinner:
         [
             "● Leavening… (running UserPromptSubmit hook)",
             "● Sublimating… (12s · ↓ 300 tokens · esc to interrupt)",
+            # The in-progress task's activeForm replaces the verb.
+            "● Running the test suite… (12s · ↓ 300 tokens)",
+            # Default verbs with "-" or "'".
+            "● Dilly-dallying… (12s · ↓ 300 tokens)",
+            "● Beboppin'… (thinking)",
+            # A multi-word spinnerVerbs entry, past a minute.
+            "● Reticulating splines… (1m 3s · ↑ 1.2k tokens)",
+            # Before the elapsed time shows, and a hook suffix with its own "…".
+            "● Leavening… (↓ 40 tokens · thought for 2s)",
+            "● Leavening… (thought for 2s)",
+            "● Leavening… (running stop hooks… 1/3)",
+            # The status a teammate's spinner shows.
+            "● Leavening… (esc to interrupt reviewer)",
         ],
     )
     def test_reduced_motion_spinner_is_processing(self, line):
@@ -3121,8 +3134,9 @@ class TestClaudeCodeReducedMotionSpinner:
         [
             # A response that opens with a gerund and an ellipsis, no "(".
             "● Analyzing… the diff is fine, approved.",
-            # The MCP tool-call line: more than one word before the ellipsis.
+            # The MCP tool-call line: its parentheses hold no spinner status.
             "● Calling cao-mcp-server… (ctrl+o to expand)",
+            "● Fixed the flaky test… (see the notes below)",
             "● Done. Approved.",
         ],
     )
@@ -3141,8 +3155,16 @@ class TestClaudeCodeReducedMotionSpinner:
         )
         assert self._p().get_status(output) == TerminalStatus.PROCESSING
 
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "● Leavening… (running UserPromptSubmit hook)",
+            "● Running the test suite… (12s · ↓ 300 tokens)",
+            "● Dilly-dallying… (12s · ↓ 300 tokens)",
+        ],
+    )
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_static_reduced_motion_spinner_outlasts_turn_end_grace(self, mock_backend):
+    def test_static_reduced_motion_spinner_outlasts_turn_end_grace(self, mock_backend, line):
         """After a dispatch, the turn-end gate holds a frame with no summary at
         PROCESSING for TURN_END_GRACE_S and then gives the legacy verdict. A hook
         spinner does not repaint, so without its own match the "●" frame read
@@ -3157,7 +3179,7 @@ class TestClaudeCodeReducedMotionSpinner:
         provider.mark_input_received()
         clock = {"now": 1000.0}
         provider._turn_gate_clock = lambda: clock["now"]
-        screen = self._screen("● Leavening… (running UserPromptSubmit hook)")
+        screen = self._screen(line)
 
         for _ in range(2):
             assert provider.get_status_from_screen(screen) == TerminalStatus.PROCESSING
