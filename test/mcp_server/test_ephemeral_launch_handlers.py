@@ -3,6 +3,8 @@
 import json
 import sys
 import threading
+from contextlib import contextmanager
+from pathlib import Path
 from test.services.test_ephemeral_bind import (  # noqa: F401
     CHILD,
     assert_released,
@@ -315,39 +317,98 @@ async def test_mcp_caller_sees_normal_claim_result(launch_http, tool, enabled):
         assert orchestration._delete_terminal_impl(CHILD)["success"]
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("path", ["assign", "default"])
-async def test_ephemeral_launch_does_not_ask_decider(launch_http, path):
-    import sys
-    import threading
-    from pathlib import Path
+@contextmanager
+def record_decision_calls():
+    """Observe every binding, including calls in the HTTP portal thread."""
+    calls = []
+    previous, previous_thread = sys.getprofile(), threading.getprofile()
 
-    targets = Path(__file__).parents[2] / "src/cli_agent_orchestrator/decisions/targets.py"
-    if not targets.exists():
-        pytest.skip("decision module absent: delegation decision sites have not landed")
-    # Until the delegation sites exist this check is deliberately vacuous.
-    # Observe calls in the route thread as well as the handler thread so a future
-    # decision call cannot hide behind asyncio.to_thread or the TestClient portal.
-    previous = sys.getprofile()
-    previous_thread = threading.getprofile()
-
-    def no_decider(frame, event, arg):
+    def observe(frame, event, arg):
         if event == "call":
             module = frame.f_globals.get("__name__", "")
             function = frame.f_code.co_name
             if module.startswith("cli_agent_orchestrator.decisions.") and (
-                function.startswith("decide") or "decider" in function
+                function in ("prepare_launch", "_ask") or function.startswith("decide")
             ):
-                raise AssertionError("ephemeral launch must not ask a decider")
+                calls.append(f"{module}.{function}")
 
-    sys.setprofile(no_decider)
-    threading.setprofile(no_decider)
+    sys.setprofile(observe)
+    threading.setprofile(observe)
     try:
-        result = await invoke(path, launch_http[0][1])
-        assert result["success"], result
+        yield calls
     finally:
         sys.setprofile(previous)
         threading.setprofile(previous_thread)
+
+
+@pytest.fixture
+def askable_decisions(launch_http, tmp_path, monkeypatch):
+    targets = Path(__file__).parents[2] / "src/cli_agent_orchestrator/decisions/targets.py"
+    if not targets.exists():
+        pytest.skip("decision module absent: delegation decision sites have not landed")
+
+    # Reuse main's engine/profile/store fixture after the absence gate.
+    from test.decisions.test_engine import setup_engine
+
+    from cli_agent_orchestrator.api.main import app
+    from cli_agent_orchestrator.decisions.fixed_table import FixedTableDecider
+    from cli_agent_orchestrator.decisions.registry import DeciderRegistry
+    from cli_agent_orchestrator.decisions.settings import (
+        load_settings,
+        set_point,
+        set_table,
+        set_tier,
+    )
+    from cli_agent_orchestrator.decisions.types import PointState
+    from cli_agent_orchestrator.services import settings_service
+
+    engine, req, _, store, _, _ = setup_engine.__wrapped__(tmp_path, monkeypatch)
+    for key in ("CAO_DECISION_MODEL_ROUTE", "CAO_DECISION_EFFORT_ROUTE"):
+        monkeypatch.delenv(key, raising=False)
+    set_point("model.route", "on", "fixed_table")
+    set_tier("codex", "small", "model-x")
+    set_table("model.route", "small", profile=req.agent_profile)
+    settings = load_settings()
+    assert settings.points["model.route"].state == PointState.ON
+    assert settings.points["model.route"].decider == "fixed_table"
+    assert (
+        json.loads(settings_service.SETTINGS_FILE.read_text())["decisions"]["points"][
+            "model.route"
+        ]["state"]
+        == "on"
+    )
+    engine.settings_loader = load_settings
+    engine.registry = DeciderRegistry({"fixed_table": FixedTableDecider})
+    monkeypatch.setattr(app.state, "decision_engine", engine, raising=False)
+    return req, store
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default"])
+async def test_ephemeral_launch_does_not_ask_decider(launch_http, askable_decisions, path):
+    # No launch path on main calls the decision module, so this holds trivially
+    # today. The positive control proves the recorder works; this becomes a real
+    # guard when #954's delegation sites land. Observe both handler and portal threads.
+    with record_decision_calls() as calls:
+        result = await invoke(path, launch_http[0][1])
+    assert result["success"], result
+    assert calls == [], calls
+
+
+@pytest.mark.asyncio
+async def test_no_decider_recorder_captures_real_fixed_table_launch(askable_decisions):
+    from cli_agent_orchestrator.decisions.engine import prepare_launch
+
+    req, store = askable_decisions
+    with record_decision_calls() as calls:
+        plan = await prepare_launch(req)
+    assert {
+        "cli_agent_orchestrator.decisions.engine.prepare_launch",
+        "cli_agent_orchestrator.decisions.engine._ask",
+        "cli_agent_orchestrator.decisions.fixed_table.decide",
+    } <= set(calls), calls
+    assert plan.model == "model-x"
+    assert store.list()[0]["outcome"] == "applied"
 
 
 @pytest.mark.asyncio
