@@ -358,8 +358,8 @@ PROFILE_SET_DIGEST_PREFIX = "sha256:"
 _PROFILE_FRAME_SEP = ":"
 
 _UNLOADABLE_SENTINEL = "\x02unloadable-profile-entry"
-"""Digested in place of source text for an entry ``list_agent_profiles()`` already marked
-``loadable: False`` (issue #827 fixup).
+"""Digested in place of source text for an entry that is genuinely unservable — not merely one
+``list_agent_profiles()`` marked ``loadable: False`` (issue #827 fixup).
 
 A directory listed without an ``agent.md`` (e.g. a stray ``old-backups/`` folder) is exactly the case
 the lister itself already decided never to recommend or load — ``load_agent_profile()`` raises
@@ -368,6 +368,14 @@ anyway turned a benign, pre-classified "not loadable" entry into a digest-wide e
 every manifest and refuses every script run with enforcement on. The sentinel still makes the entry's
 presence, absence, and NAME part of the digest (so adding/removing such a stray entry still moves the
 identifier), it just does not attempt to read content the lister already said cannot be loaded.
+
+``loadable`` ALONE IS THE WRONG PROXY, though: in the default directory topology ``claude_code`` and
+``codex`` alias ``LOCAL_AGENT_STORE_DIR`` (see ``settings_service.py`` vs ``constants.py``), so the local
+scan claims that path first and a nested ``<name>/agent.md`` entry is listed ``loadable: False`` — yet
+the reader's fall-through to ``usable_agent_dirs()`` resolves it fine at launch. Trusting ``loadable``
+verbatim would hash the sentinel for a profile that is actually served, leaving its content outside plan
+identity. ``profile_set_digest`` therefore falls back to ``installed_profile_exists`` before treating an
+entry as unservable.
 """
 
 
@@ -389,9 +397,10 @@ def profile_set_digest() -> str:
     exception. ``resolve_env_vars`` is deliberately NOT applied: it would pull the launching process's
     environment into the digest, so an unrelated variable change would invalidate every approval.
 
-    AN ENTRY ALREADY MARKED ``loadable: False`` BY THE LISTER digests as its name plus a fixed sentinel
-    rather than its (unreadable-by-design) source — see :data:`_UNLOADABLE_SENTINEL`. For every other
-    entry this RAISES rather than skipping, which is the fail-closed direction: a profile that vanishes
+    AN ENTRY THE LISTER MARKED ``loadable: False`` AND THAT IS ALSO UNREACHABLE VIA
+    ``installed_profile_exists`` digests as its name plus a fixed sentinel rather than its
+    (unreadable-by-design) source — see :data:`_UNLOADABLE_SENTINEL`. For every other entry this RAISES
+    rather than skipping, which is the fail-closed direction: a profile that vanishes
     between the scan and the read (a race, not a classification) leaves the SET INDETERMINATE, and
     silently omitting it would let a digest describe a profile set that is not the one on disk. The
     caller (``manifest_freeze``) turns that exception into a NULL manifest, which the approval gate
@@ -403,11 +412,8 @@ def profile_set_digest() -> str:
     digest = hashlib.sha256()
     for profile in sorted(list_agent_profiles(), key=lambda p: p["name"]):
         name = profile["name"]
-        source = (
-            _UNLOADABLE_SENTINEL
-            if not profile.get("loadable", True)
-            else _read_agent_profile_source(name)
-        )
+        servable = profile.get("loadable", True) or installed_profile_exists(name)
+        source = _read_agent_profile_source(name) if servable else _UNLOADABLE_SENTINEL
         for component in (name, source):
             encoded = component.encode("utf-8")
             digest.update(f"{len(encoded)}{_PROFILE_FRAME_SEP}".encode("utf-8"))
