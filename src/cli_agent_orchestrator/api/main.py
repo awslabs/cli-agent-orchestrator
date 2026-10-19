@@ -5011,7 +5011,14 @@ async def validate_workflow_endpoint(
         from cli_agent_orchestrator.models.workflow import ScriptValidationResult
         from cli_agent_orchestrator.services.script_lint import lint_script
 
-        if len(body.source.encode("utf-8")) > WORKFLOW_MAX_SPEC_BYTES:
+        try:
+            source_size = len(body.source.encode("utf-8"))
+        except UnicodeError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="workflow source must be valid UTF-8",
+            ) from None
+        if source_size > WORKFLOW_MAX_SPEC_BYTES:
             # The same cap the write path enforces, checked here too so a caller cannot learn the
             # limit only by trying to create. Message names the limit (unit 2's PERF-3 discipline).
             return ScriptValidationResult(

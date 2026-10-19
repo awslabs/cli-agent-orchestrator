@@ -12,6 +12,7 @@ wants. Two properties carry the change:
 
 from __future__ import annotations
 
+import json
 import uuid
 from pathlib import Path
 
@@ -113,3 +114,25 @@ def test_an_oversize_draft_returns_a_fail_verdict_and_names_the_limit(client):
     assert any(
         str(WORKFLOW_MAX_SPEC_BYTES) in error for error in resp.json()["errors"]
     ), resp.json()["errors"]
+
+
+def test_lone_surrogate_source_validate_matches_authoring_4xx(spec_dir):
+    client = TestClient(app, base_url="http://localhost", raise_server_exceptions=False)
+    created = client.post("/workflows", json={"name": "valid", "source": CLEAN})
+    assert created.status_code == 201, created.text
+    invalid = "\ud800"
+    headers = {"Content-Type": "application/json"}
+    post = client.post(
+        "/workflows", content=json.dumps({"name": "invalid", "source": invalid}), headers=headers
+    )
+    put = client.put(
+        "/workflows/valid",
+        content=json.dumps({"source": invalid, "expected_hash": created.json()["content_hash"]}),
+        headers=headers,
+    )
+    validate = client.post(
+        "/workflows/validate", content=json.dumps({"source": invalid}), headers=headers
+    )
+    assert post.status_code == put.status_code == validate.status_code == 400
+    assert "UTF-8" in validate.json()["detail"]
+    assert invalid not in validate.text

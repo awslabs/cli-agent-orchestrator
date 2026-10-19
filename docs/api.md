@@ -289,7 +289,7 @@ than calling these routes directly.
 - `POST /workflows/validate` accepts exactly one of `path` or `source` (`200`);
   requires `cao:read`, `cao:write` or `cao:admin`. The `source` form lints a Python draft
   without writing a file; lint or size failures are reported in the `200` result.
-  Supplying both forms or neither returns `400`.
+  Supplying both forms or neither, or source that cannot be encoded as UTF-8, returns `400`.
 
 The spec-route scope checks apply when authentication is enabled.
 
