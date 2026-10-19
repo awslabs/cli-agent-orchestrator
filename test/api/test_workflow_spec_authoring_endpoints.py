@@ -398,4 +398,23 @@ def test_transient_kinds_are_constructed_by_runtime_step_emitters():
         and isinstance(keyword.value.value, str)
     }
 
+    # #849 emits the provider match's kind rather than a string literal. Pin
+    # both that forwarding expression and the actual producer's default kind.
+    from cli_agent_orchestrator.services.provider_error_classifier import (
+        KIND_PROVIDER_ERROR,
+        ProviderErrorMatch,
+    )
+
+    forwarded_provider_kind = [
+        keyword.value
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "StepExecutionError"
+        for keyword in call.keywords
+        if keyword.arg == "kind" and ast.unparse(keyword.value) == "provider_error.kind"
+    ]
+    assert len(forwarded_provider_kind) == 1
+    assert ProviderErrorMatch._field_defaults["kind"] == KIND_PROVIDER_ERROR
+    emitted_kinds.add(KIND_PROVIDER_ERROR)
     assert api.main._TRANSIENT_ERROR_KINDS <= emitted_kinds
