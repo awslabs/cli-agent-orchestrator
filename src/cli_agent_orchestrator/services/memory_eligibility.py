@@ -98,6 +98,11 @@ class EligibilityCheck:
         self._memo: dict[MemoryIdentity, tuple[str, ...]] = {}
         self._origins: dict[MemoryIdentity, set[str]] = {}
 
+    def fail_open_source(self, name: str, count: int) -> None:
+        """Report an already failed source read and avoid retrying it in this check."""
+        _failed_open(name, self.request, count, self.errors)
+        self._sources = tuple(source for source in self._sources if source.name != name)
+
     def use_superseded_snapshot(self, snapshot: set) -> None:
         """Use a call-local supersedes snapshot for diagnostic verdicts, not a fresh read."""
         self._sources = tuple(

@@ -2112,6 +2112,34 @@ class MemoryService:
                 out.add((g_scope, g_scope_id, k))
         return out
 
+    def _superseded_keys_with_status(self, memories: list[Memory]) -> tuple[set, bool]:
+        """Diagnostic snapshot with a failure bit; the frozen score reader stays unchanged."""
+        if not memories:
+            return set(), False
+        try:
+            from cli_agent_orchestrator.services.memory_relationship_service import (
+                MemoryRelationshipService,
+            )
+
+            service = MemoryRelationshipService()
+        except Exception:
+            return set(), True
+        groups: dict[tuple[str, Optional[str]], list[str]] = {}
+        for memory in memories:
+            groups.setdefault((memory.scope, self._effective_scope_id(memory)), []).append(
+                memory.key
+            )
+        snapshot: set = set()
+        failed = False
+        for (scope, scope_id), keys in groups.items():
+            try:
+                targets = service.superseded_targets(scope, scope_id, keys)
+            except Exception:
+                failed = True
+                continue
+            snapshot.update((scope, scope_id, key) for key in targets)
+        return snapshot, failed
+
     def _is_superseded(self, m, superseded: set) -> bool:
         """The demotion predicate recall's sort key applies to ONE memory.
 
@@ -2546,7 +2574,12 @@ class MemoryService:
                     for primary, targets in target_plan
                     for key in targets
                 )
-            superseded_snapshot = self._superseded_keys(snapshot_rows)
+            if check is not None:
+                superseded_snapshot, failed = self._superseded_keys_with_status(snapshot_rows)
+                if failed:
+                    check.fail_open_source("lifecycle.supersedes", len(snapshot_rows))
+            else:
+                superseded_snapshot = self._superseded_keys(snapshot_rows)
         if (
             pool.effective_sort == "relevance"
             or check is not None
@@ -2652,10 +2685,9 @@ class MemoryService:
         snapshot_rows = {self._identity(memory): memory for memory in relevance_pool.rows}
         for memory in default_pool.rows:
             snapshot_rows.setdefault(self._identity(memory), memory)
-        try:
-            superseded = self._superseded_keys(list(snapshot_rows.values()))
-        except Exception:
-            superseded = set()
+        superseded, superseded_failed = self._superseded_keys_with_status(
+            list(snapshot_rows.values())
+        )
         default_rows = self._order_candidates(
             default_pool.rows,
             scope,
@@ -2689,12 +2721,18 @@ class MemoryService:
         union = {self._identity(m): m for m in relevance_rows[:limit]}
         for memory in default_rows:
             union.setdefault(self._identity(memory), memory)
-        check = memory_eligibility.begin_check(
-            memory_eligibility.EligibilityRequest.from_context("injected_context", terminal_context)
+        request = memory_eligibility.EligibilityRequest.from_context(
+            "injected_context", terminal_context
         )
+        check = memory_eligibility.begin_check(request)
+        if superseded_failed:
+            if check is None:
+                check = memory_eligibility.EligibilityCheck(request, [])
+            check.fail_open_source("lifecycle.supersedes", len(snapshot_rows))
         verdicts: dict[tuple, tuple[str, ...]] = {}
         if check is not None:
-            check.use_superseded_snapshot(superseded)
+            if not superseded_failed:
+                check.use_superseded_snapshot(superseded)
             verdicts = {
                 tuple(identity): reasons
                 for identity, reasons in check.reasons(

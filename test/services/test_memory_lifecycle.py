@@ -412,3 +412,52 @@ def test_recall_reuses_snapshot_for_primary_and_related_labels(lifecycle, monkey
     assert calls[0] == {"active", "replacement", "blocked"}
     assert [row.key for row in rows] == ["active", "replacement", "blocked"]
     assert rows[-1].lifecycle_status == "superseded"
+
+
+@pytest.mark.parametrize("late_failure", [False, True])
+def test_curated_store_failure_is_observed(lifecycle, monkeypatch, caplog, late_failure):
+    from cli_agent_orchestrator.services import memory_eligibility
+
+    service, _, ctx = lifecycle
+    begin = memory_eligibility.begin_check
+    checks = []
+
+    def capture(request):
+        check = begin(request)
+        checks.append(check)
+        return check
+
+    monkeypatch.setattr(memory_eligibility, "begin_check", capture)
+    calls = []
+
+    def broken(self, scope, scope_id, keys):
+        calls.append(set(keys))
+        if late_failure and len(calls) == 1:
+            return set()
+        raise OSError("/PATH_SENTINEL/KEY_SENTINEL.md")
+
+    monkeypatch.setattr(
+        memory_relationship_service.MemoryRelationshipService, "superseded_targets", broken
+    )
+    caplog.clear()
+    rows = _run(
+        service.recall(
+            scope="global",
+            search_mode="metadata",
+            limit=10,
+            terminal_context=dict(ctx, agent_profile="memory_manager"),
+        )
+    )
+    assert [row.key for row in rows] == ["blocked", "active", "replacement"]
+    assert checks[0].errors == ["lifecycle.supersedes"]
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "memory_eligibility_failed_open" in record.getMessage()
+    ]
+    assert warnings
+    assert all("purpose=curated_recall" in warning for warning in warnings)
+    assert all(
+        "PATH_SENTINEL" not in warning and "KEY_SENTINEL" not in warning for warning in warnings
+    )
+    assert len(calls) == 2

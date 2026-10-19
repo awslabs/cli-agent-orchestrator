@@ -310,3 +310,54 @@ def test_explain_snapshot_includes_default_only_rows(explained, monkeypatch):
     default_only = next(row for row in result["candidates"] if row["key"] == "weak-new")
     assert default_only["relevance_rank"] is None
     assert default_only["superseded"] is True
+
+
+@pytest.mark.parametrize("lifecycle_enabled", [False, True])
+@pytest.mark.parametrize("partial_failure", [False, True])
+def test_builtin_store_failure_is_visible_once(
+    explained, monkeypatch, caplog, lifecycle_enabled, partial_failure
+):
+    from cli_agent_orchestrator.services.memory_relationship_service import (
+        MemoryRelationshipService,
+    )
+
+    service, args = explained
+    monkeypatch.setenv("CAO_MEMORY_LIFECYCLE_ENABLED", str(lifecycle_enabled).lower())
+    if partial_failure:
+        _run(
+            service.store(
+                key="project-row",
+                content="kafka streams",
+                scope="project",
+                terminal_context=args["terminal_context"],
+            )
+        )
+        args = dict(args, scope=None)
+    calls = []
+
+    def broken(self, scope, scope_id, keys):
+        calls.append((scope, set(keys)))
+        if not partial_failure or scope == "project":
+            raise OSError("/PATH_SENTINEL/KEY_SENTINEL.md")
+        return {"strong-old"}
+
+    monkeypatch.setattr(MemoryRelationshipService, "superseded_targets", broken)
+    caplog.clear()
+    result = _run(service.recall_explain(**dict(args, limit=3)))
+    assert result["eligibility_errors"] == ["lifecycle.supersedes"]
+    assert len(calls) == (2 if partial_failure else 1)
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "memory_eligibility_failed_open" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "source=lifecycle.supersedes purpose=injected_context" in warnings[0]
+    assert "PATH_SENTINEL" not in warnings[0]
+    assert "KEY_SENTINEL" not in warnings[0]
+    assert all(row["injection"] == "eligible" for row in result["candidates"])
+    if partial_failure:
+        assert (
+            next(row for row in result["candidates"] if row["key"] == "strong-old")["superseded"]
+            is True
+        )
