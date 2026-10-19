@@ -21,9 +21,14 @@ rewriting that text must move the ``plan_id`` of a freshly frozen run. And for e
 identity scan lists at all, servable or not, its PRESENCE must move the ``plan_id``, because an entry
 appearing or disappearing changes which name resolves to what.
 
-The assertions run through the real ``manifest_freeze.build_manifest_json``, not through
-``profile_set_digest`` directly. That is deliberate: #827 was a gap BETWEEN modules (a digest that
-existed nowhere), so a guard that only exercised the digest function would have passed on the defect.
+The assertions run through the real ``manifest_freeze.freeze_manifest`` — the function both
+production callers (``api/main.py``, ``script_runner.py``) call directly — not through
+``build_manifest_json`` (a compatibility wrapper no production path uses) and not through
+``profile_set_digest`` directly. Asserting through the wrapper would stay green even if a future
+change wired the profile digest into the wrapper instead of ``freeze_manifest`` itself, which would
+silently un-fix #827 for both real callers while this file kept passing. Asserting through the digest
+function alone would miss the opposite gap: #827 was a gap BETWEEN modules (a digest that existed
+nowhere), so a guard that only exercised the digest function would have passed on the defect.
 
 Also guards the fixup's own risk direction (commit ``90f7baee``): the ``loadable: False`` sentinel
 exists so a stray directory cannot NULL every manifest, but widening it to an entry that IS servable
@@ -116,10 +121,12 @@ def roots(tmp_path, monkeypatch) -> List[_Root]:
 
 
 def _plan_id() -> str:
-    """Freeze a run the way ``script_runner`` does and read the identifier out of the envelope."""
-    frozen = manifest_freeze.build_manifest_json(source_hash="guard", inputs={})
-    assert frozen is not None, "freeze returned None; this guard cannot observe plan identity"
-    return json.loads(frozen)["plan_id"]
+    """Freeze a run the way the real production callers do and read the identifier out of the envelope."""
+    frozen = manifest_freeze.freeze_manifest(source_hash="guard", inputs={})
+    assert (
+        frozen.manifest_json is not None
+    ), "freeze returned no manifest; this guard cannot observe plan identity"
+    return json.loads(frozen.manifest_json)["plan_id"]
 
 
 def test_a_servable_profiles_content_is_covered_by_plan_identity(roots):

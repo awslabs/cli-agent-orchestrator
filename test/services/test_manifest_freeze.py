@@ -265,7 +265,7 @@ def test_non_git_plan_ids_bind_root_and_git_golden_is_unchanged(tmp_path, monkey
     )
     assert (
         _frozen()["plan_id"]
-        == "plan-v2:PLACEHOLDER_RECOMPUTE_AFTER_REBASE"
+        == "plan-v2:f388e14e1f0a7b24472daf237adf9d9e586070f1c7c6a3105558f06409fab3e7"
     )
 
 
