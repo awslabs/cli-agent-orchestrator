@@ -144,6 +144,26 @@ ERROR_CELL_PATTERN = r"^■\s"
 # ("• Ran ...", "└ ..."), the reply, or an error cell.
 TURN_ACTIVITY_PATTERN = r"^[^\S\n]*[•◦└■]"
 
+# Codex refuses to start when `--profile <name>` is combined with the legacy
+# `[profiles.<name>]` table (or a top-level `profile = "<name>"` selector) in
+# config.toml: since the CONFIG_PROFILE_V2 relocation, profile settings must
+# live in their own `$CODEX_HOME/<name>.config.toml`. The process exits before
+# drawing a banner, so without this pattern the only symptom CAO could report
+# was a generic `provider_init_timeout` expiry -- an operator who had followed
+# CAO's own (previously wrong) docs got a message pointing at host slowness
+# rather than at the config line they needed to move (#9002). Matched on the
+# distinguishing phrase rather than the whole sentence because codex
+# interpolates absolute CODEX_HOME paths into it and the pane wraps them.
+# Verified against codex-cli 0.162.1.
+CONFIG_PROFILE_ERROR_PATTERN = r"cannot be used while.*contains legacy"
+# How many pane rows the wrapped rejection message may span. Observed at 6 rows
+# on an 80-column pane with a short CODEX_HOME; the cap keeps the reassembled
+# string from absorbing the shell prompt codex exits back to.
+CONFIG_ERROR_MESSAGE_ROWS = 8
+# A row that is nothing but the shell prompt codex exits back to. Marks the end
+# of the wrapped rejection message.
+SHELL_PROMPT_ONLY_PATTERN = r"^[$%#>❯›»]\s*$"
+
 # Workspace trust/approval prompt shown when Codex opens a new directory.
 # Two known variants:
 #   v0.98+: "allow Codex to work in this folder"
@@ -412,6 +432,37 @@ def _banner_version(text: str) -> tuple[int, int, int]:
         return (0, 0, 0)
     major, minor, patch = (int(part) for part in matches[-1])
     return (major, minor, patch)
+
+
+def _find_config_rejection(clean_output: str) -> Optional[str]:
+    """Return codex's config-rejection message from a pane capture, or None.
+
+    Codex prints this and exits before any banner, so the pane text is the ONLY
+    evidence of the failure that reaches CAO -- there is no exit status to read
+    back through tmux. Reassembled across rows because the message is one long
+    logical line that the pane hard-wraps, and the part an operator actually
+    needs (the ``<name>.config.toml`` path to move settings into) is at the far
+    end of it.
+    """
+    rows = [line.strip() for line in clean_output.splitlines() if line.strip()]
+    for index, row in enumerate(rows):
+        # Anchor on the row that OPENS the message, not on the row carrying the
+        # distinguishing phrase: the pane wraps "cannot be used while" and
+        # "contains legacy" onto different rows, so the phrase only exists once
+        # the rows are rejoined.
+        if not re.match(ERROR_PATTERN, row):
+            continue
+        message_rows = [row]
+        for continuation in rows[index + 1 : index + CONFIG_ERROR_MESSAGE_ROWS]:
+            # Stop at the prompt codex exits back to, so the operator-facing
+            # string cannot absorb it or anything typed after it.
+            if re.match(SHELL_PROMPT_ONLY_PATTERN, continuation):
+                break
+            message_rows.append(continuation)
+        joined = " ".join(message_rows)
+        if re.search(CONFIG_PROFILE_ERROR_PATTERN, joined):
+            return joined
+    return None
 
 
 def _is_completion_footer(row: str, version: tuple[int, int, int]) -> bool:
@@ -1368,8 +1419,10 @@ class CodexProvider(BaseProvider):
         # --yolo (alias for --dangerously-bypass-approvals-and-sandbox)
         # is the default because CAO runs codex non-interactively in tmux
         # where approval prompts would block handoff/assign. Profiles can
-        # opt out via `codexProfile` (names a [profiles.<name>] block in
-        # ~/.codex/config.toml), unless unrestricted allowed tools are enabled.
+        # opt out via `codexProfile` (names a $CODEX_HOME/<name>.config.toml
+        # file, NOT a [profiles.<name>] table inside config.toml -- codex
+        # rejects --profile outright when that legacy table is present, #9002),
+        # unless unrestricted allowed tools are enabled.
         # In practice, allowed_tools containing "*" is treated as yolo mode
         # and overrides codexProfile in the same way as an explicit yolo launch.
         yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
@@ -1413,7 +1466,8 @@ class CodexProvider(BaseProvider):
                     "settings in ~/.codex/config.toml, including "
                     "[sandbox_workspace_write].network_access, do NOT apply. Set "
                     "codexProfile on the agent profile to launch under a named "
-                    "[profiles.<name>] block instead.",
+                    "profile config file ($CODEX_HOME/<name>.config.toml, by "
+                    "default ~/.codex/<name>.config.toml) instead.",
                     self.terminal_id,
                 )
             command_parts = ["codex", "--yolo"]
@@ -1849,6 +1903,33 @@ class CodexProvider(BaseProvider):
         )
         return "blocked" if blocked else "unresolved"
 
+    async def _find_startup_config_error(self) -> Optional[str]:
+        """Operator-facing message when the pane shows codex rejecting its config.
+
+        Returns None when the pane shows anything else, so every caller keeps
+        its existing failure. Called only from paths that are already failing.
+        """
+        output = await asyncio.to_thread(
+            get_backend().get_history, self.session_name, self.window_name
+        )
+        if not output:
+            return None
+        clean_output = strip_terminal_escapes(re.sub(ANSI_CODE_PATTERN, "", output))
+        rejection = _find_config_rejection(clean_output)
+        if not rejection:
+            return None
+        detail = (
+            f"Codex refused to start and exited: {rejection}"
+            " -- CAO launched `codex --profile` because the agent profile sets"
+            " codexProfile; see 'Custom Codex Profile' in docs/codex-cli.md."
+        )
+        # Logged as well as raised: the raised text reaches the caller that
+        # requested this terminal, but an operator debugging a failed fleet
+        # launch reads the server log, and this is the only record of why the
+        # pane is empty.
+        logger.error("Terminal %s: %s", self.terminal_id, detail)
+        return detail
+
     async def _current_startup_state(self) -> Optional[str]:
         """Resolve the startup state of the pane as it is right now."""
         output = await asyncio.to_thread(
@@ -1947,6 +2028,16 @@ class CodexProvider(BaseProvider):
                 f"Codex startup prompt could not be dismissed within {init_timeout}s: "
                 "a trust or update dialog is still on screen"
             )
+        if outcome == "unresolved":
+            # The handler ran to its cap having seen neither a prompt nor a
+            # welcome banner. That is exactly what a codex process which
+            # rejected its own config and exited looks like from here, so this
+            # is the one place worth paying for an extra capture: the pane still
+            # holds codex's error text (#9002). Checked here rather than on a
+            # poll during startup so the happy path reads no extra frames.
+            config_error = await self._find_startup_config_error()
+            if config_error:
+                raise ProviderError(config_error)
 
         # WAITING_USER_ANSWER is included here specifically for the first-run login/auth
         # menu (see LOGIN_MENU_PATTERN's own comment) — an account with no credentials
@@ -1970,6 +2061,12 @@ class CodexProvider(BaseProvider):
             timeout=float(init_timeout),
             polling_interval=1.0,
         ):
+            # A readiness wait that expired can also be a codex that never
+            # started: when the pane carries codex's own config rejection, that
+            # text is what the operator needs, not the elapsed seconds (#9002).
+            config_error = await self._find_startup_config_error()
+            if config_error:
+                raise ProviderError(config_error)
             # Interpolated, not the old hard-coded "60 seconds": the bound is
             # ``provider_init_timeout``, so an operator who changed it was told
             # a number the code never used.
