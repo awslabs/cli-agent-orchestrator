@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
-import math
 from typing import Any, Dict, Optional
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -18,7 +16,6 @@ from cli_agent_orchestrator.services.agui.base import (
 )
 from cli_agent_orchestrator.services.agui_stream import (
     _MAX_GENERATIVE_PROPS_BYTES,
-    GENERATIVE_UI_COMPONENTS,
 )
 
 # ---------------------------------------------------------------------------

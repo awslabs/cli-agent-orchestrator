@@ -2,8 +2,6 @@
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from cli_agent_orchestrator.utils.orchestration import _resolve_child_allowed_tools
 
 

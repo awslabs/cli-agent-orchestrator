@@ -392,6 +392,7 @@ dev = [
     # Tests import httpx directly; fastmcp 4 / mcp 2 use httpx2 and no longer
     # pull httpx in transitively.
     "httpx>=0.28.1",
+    "ruff>=0.17.1",
 ]
 
 [tool.black]
@@ -401,6 +402,55 @@ target-version = ['py310']
 [tool.isort]
 profile = "black"
 line_length = 100
+
+# ---------------------------------------------------------------------------------------
+# ruff — the dead-code gate black, isort and mypy all miss (#9003).
+#
+# WHY: issue #752's root cause was a computed status value that nothing ever read. black
+# and isort only reformat; mypy is `continue-on-error: true` in the Code Quality job and
+# does not report unread locals under any setting. So an assignment whose result is
+# dropped had NO gate in this repo at all.
+#
+# SELECTION IS DELIBERATELY NARROW. Measured on this tree at ruff 0.17.1 over
+# src/ test/ examples/:
+#
+#     F401 unused import        165      selected  (165 of them autofixable)
+#     F841 unused local          27      selected  (the #752 class exactly)
+#     F811 redefinition         105      NOT selected -- see below, and see #9003
+#     ARG  unused argument     3718      NOT selected
+#     B    flake8-bugbear        609      NOT selected (B904 346, B008 204, B905 23 ...)
+#
+# ARG and B are follow-ups, not noise to be waved through: 3718 and 609 findings cannot be
+# triaged honestly in the change that introduces the gate, and a gate that lands with
+# thousands of blanket noqa comments is worse than no gate. Enabling either is its own PR
+# with its own triage, and B904/B008 in particular are worth it.
+#
+# F811 IS NOT MERELY NOISY -- IT IS THE MOST VALUABLE RULE HERE AND IT IS STILL OFF.
+# 105 findings in 18 files. The large majority are a known ruff/pytest interaction: a
+# module does `from conftest import setup_engine` and then writes
+# `def test_x(setup_engine)`, and ruff reads the fixture PARAMETER as a redefinition of
+# the import. Those are false positives.
+#
+# But six are real, and each one is a test that silently never runs, because Python keeps
+# only the second definition and pytest collects only what Python kept:
+#
+#   test/utils/test_opencode_config.py:28 vs :57   class TestToOpencodeAgentId
+#       -- the shadowed copy is the GHSA-6m35-gcf5-xm75 path-traversal regression
+#          (5 parametrized hostile names). VERIFIED not collected before #9003.
+#   test/providers/test_kiro_cli_unit.py:758/772/792/808 shadowed by :830/844/864/880
+#   test/services/agui/test_edit_sanitization.py:47 shadowed by :67
+#
+# Turning F811 on means (a) suppressing the fixture-parameter pattern in those 18 files
+# via per-file-ignores and (b) un-shadowing six tests that have never executed and may
+# well fail. Both belong in a change that can take the failures seriously rather than
+# riding along with a tooling PR. Tracked on #9003.
+# ---------------------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["F401", "F841"]
 
 [tool.mypy]
 python_version = "3.10"

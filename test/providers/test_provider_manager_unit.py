@@ -373,7 +373,6 @@ def test_cleanup_provider_retains_restored_grok_metadata_when_cleanup_is_deferre
 
 def test_list_providers():
     """Test list_providers returns correct mapping."""
-    from cli_agent_orchestrator.providers.codex import CodexProvider
 
     manager = ProviderManager()
     manager.create_provider(

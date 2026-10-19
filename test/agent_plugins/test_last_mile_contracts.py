@@ -13,8 +13,6 @@ Grouped by the guarantee each one backs:
 
 from __future__ import annotations
 
-import shutil
-
 import pytest
 from click.testing import CliRunner
 

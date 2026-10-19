@@ -1,7 +1,6 @@
 """Tests for the init CLI command."""
 
 import errno
-import shutil
 import uuid
 from pathlib import Path
 from unittest.mock import patch

@@ -1,7 +1,8 @@
 import dataclasses
 from dataclasses import replace
-from test.decisions.test_engine import setup_engine
-from unittest.mock import Mock
+from test.decisions.test_engine import (  # noqa: F401  # pytest fixture, injected by name into the tests below
+    setup_engine,
+)
 
 import pytest
 

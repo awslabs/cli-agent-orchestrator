@@ -1,6 +1,5 @@
 """Security tests for DNS rebinding protection and host validation."""
 
-import pytest
 from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.api.main import app

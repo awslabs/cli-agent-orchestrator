@@ -15,11 +15,10 @@ itself refuses the transports if anything ever reaches it another way.
 from __future__ import annotations
 
 import subprocess
-from pathlib import Path
 
 import pytest
 
-from cli_agent_orchestrator.agent_plugins import git_source, resolver
+from cli_agent_orchestrator.agent_plugins import resolver
 from cli_agent_orchestrator.agent_plugins.git_source import (
     ALLOWED_HOSTS_ENV,
     DEFAULT_ALLOWED_HOSTS,

@@ -14,7 +14,6 @@ from unittest.mock import patch
 
 import pytest
 
-from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
     read_output_range,

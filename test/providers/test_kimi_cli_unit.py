@@ -936,7 +936,7 @@ class TestKimiCliProviderBuildCommand:
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
 
         with patch("cli_agent_orchestrator.providers.kimi_cli.Path.home", return_value=tmp_path):
-            command = provider._build_kimi_command()
+            _command = provider._build_kimi_command()
 
         # Config file should remain unchanged
         assert "tool_call_timeout_ms = 60000" in config_file.read_text()

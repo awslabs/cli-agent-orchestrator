@@ -7,7 +7,7 @@ import stat
 from enum import Enum
 from importlib import resources
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Set
 
 import frontmatter
 

@@ -14,7 +14,6 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from cli_agent_orchestrator.agent_plugins.installer import PluginInstallError
 from cli_agent_orchestrator.agent_plugins.validation import validate_plugin
 
 from .conftest import build_plugin

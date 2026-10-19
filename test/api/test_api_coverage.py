@@ -4,11 +4,11 @@ Covers: WebSocket localhost guard, list_all_terminals endpoint,
 flow path traversal validation, and remaining error branches.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
-from cli_agent_orchestrator.api.main import CreateFlowRequest, app
+from cli_agent_orchestrator.api.main import CreateFlowRequest
 
 
 class TestFlowNameValidation:

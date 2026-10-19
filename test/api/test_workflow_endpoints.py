@@ -6,7 +6,6 @@ that a schema-invalid output is stored with a 200 + unvalidated state (does NOT
 500).
 """
 
-import sqlite3
 import uuid
 from pathlib import Path
 

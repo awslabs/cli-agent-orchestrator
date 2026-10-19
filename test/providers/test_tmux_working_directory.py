@@ -1,7 +1,6 @@
 """Unit tests for TMux client working directory methods."""
 
 import os
-from pathlib import Path
 from unittest.mock import MagicMock, Mock, PropertyMock, patch
 
 import pytest

@@ -10,7 +10,6 @@ terminal the caller created, or (for ``send_message``) the caller's creator.
 import os
 from unittest.mock import MagicMock, patch
 
-import pytest
 import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL

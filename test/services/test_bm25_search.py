@@ -9,10 +9,8 @@ Covers:
 """
 
 import asyncio
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -354,7 +352,7 @@ class TestMcpRecallSearchMode:
         instance = MockService.return_value
         instance.recall = AsyncMock(return_value=[])
 
-        result = run_async(memory_recall(query="test", search_mode="bm25"))
+        _result = run_async(memory_recall(query="test", search_mode="bm25"))
 
         call_kwargs = instance.recall.call_args.kwargs
         assert call_kwargs["search_mode"] == "bm25"
@@ -368,7 +366,7 @@ class TestMcpRecallSearchMode:
         instance = MockService.return_value
         instance.recall = AsyncMock(return_value=[])
 
-        result = run_async(memory_recall(query="test"))
+        _result = run_async(memory_recall(query="test"))
 
         call_kwargs = instance.recall.call_args.kwargs
         assert call_kwargs["search_mode"] == "hybrid"

@@ -142,7 +142,7 @@ class TestAFailedCopyLeavesNothingBehind:
         # copytree raise mid-tree -- and it is what leaves a live SKILL.md with no
         # marker. Failing at the marker write instead would not reproduce it,
         # because the tree is complete by then.
-        real_copytree = projection_mod.shutil.copytree
+        _real_copytree = projection_mod.shutil.copytree
 
         def partial_then_fail(src, dst, *args, **kwargs):
             dst_path = Path(dst)

@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import copy
 
-import pytest
-
 from cli_agent_orchestrator.services.agui.base import RecordingUiEmitter
 from cli_agent_orchestrator.services.agui.supervisor_dashboard import (
     SupervisorDashboardStream,

@@ -1,7 +1,6 @@
 """Tests for the database client."""
 
 import sqlite3
-import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -14,7 +13,6 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients import database as db_mod
 from cli_agent_orchestrator.clients.database import (
     Base,
-    FlowModel,
     IdempotencyKeyModel,
     InboxModel,
     MemoryMetadataModel,
@@ -29,8 +27,6 @@ from cli_agent_orchestrator.clients.database import (
     delete_terminals_by_session,
     get_flow,
     get_idempotency_record,
-    get_inbox_messages,
-    get_pending_messages,
     get_terminal_group,
     get_terminal_metadata,
     init_db,
@@ -1502,8 +1498,6 @@ class TestFlowOperations:
             flow.enabled = True
 
         mock_session.refresh.side_effect = mock_refresh
-
-        from cli_agent_orchestrator.clients.database import get_flows_to_run
 
         next_run = datetime.now()
         result = create_flow(

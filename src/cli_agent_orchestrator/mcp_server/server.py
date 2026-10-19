@@ -15,7 +15,6 @@ from fastmcp.tools import Tool, ToolResult
 from pydantic import Field, WithJsonSchema
 
 from cli_agent_orchestrator.constants import (
-    ADVERTISED_URL_ENV,
     API_BASE_URL,
     DISCOVERY_TOOL_MARKER,
     ELASTIC_CALLBACK_URL_ENV,
@@ -30,12 +29,9 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.mcp_server import utils as mcp_utils
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
-from cli_agent_orchestrator.mcp_server.utils import _auth_headers, _auth_headers_for
+from cli_agent_orchestrator.mcp_server.utils import _auth_headers_for
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck, parse_decision
-from cli_agent_orchestrator.services.elastic_worker_gateway import (
-    elastic_worker_gateway_headers,
-)
 from cli_agent_orchestrator.services.memory_service import (
     MEMORY_DISABLED_MESSAGE,
     MemoryDisabledError,

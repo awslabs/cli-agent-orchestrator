@@ -26,22 +26,18 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
-import logging
-import os
-import re
 import subprocess
-from datetime import datetime, timedelta, timezone
-from typing import Any, List, Optional
+from datetime import datetime, timezone
+from typing import Optional
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients.database import Base, MemoryMetadataModel
-from cli_agent_orchestrator.services import wiki_compiler, wiki_lint
+from cli_agent_orchestrator.services import wiki_lint
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.wiki_lint import (
-    DEFAULT_MAX_PAIRS,
     DESCRIPTION_MAX_CHARS,
     ISSUE_CAPS,
     SYMBOL_RE,
@@ -53,7 +49,6 @@ from cli_agent_orchestrator.services.wiki_lint import (
     _detect_orphan_pages,
     _detect_poison_frequency,
     _detect_stale_claims,
-    _extract_path_candidates,
     _extract_symbol_candidates,
     _get_contradiction_semaphore,
     _make_issue,

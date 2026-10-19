@@ -13,7 +13,6 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import shutil
-import time
 from pathlib import Path
 from test.conftest import mint_test_token
 from test.fixtures.cao_server import (

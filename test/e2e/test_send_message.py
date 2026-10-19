@@ -28,7 +28,6 @@ from test.e2e.conftest import (
     cleanup_terminal,
     create_terminal,
     get_terminal_status,
-    wait_for_status,
 )
 
 import pytest

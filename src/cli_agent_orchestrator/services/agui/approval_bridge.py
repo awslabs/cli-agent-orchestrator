@@ -16,8 +16,6 @@ from typing import Optional
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.agui.handoff_approval import (
     AgentHandoffWithApproval,
-    AnswerDelivery,
-    RecordingUiEmitter,
 )
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic

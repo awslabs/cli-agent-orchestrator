@@ -19,8 +19,6 @@ IDLE is a valid completion signal alongside COMPLETED), NOT a second
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
-
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.agent_step import run_agent_step
 from cli_agent_orchestrator.services.terminal_service import OutputMode

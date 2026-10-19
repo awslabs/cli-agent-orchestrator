@@ -17,7 +17,7 @@ from cli_agent_orchestrator.models.agent_profile import (
     ContainerConfig,
     ContainerPathMap,
 )
-from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError, TerminalStatus
+from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider, ProviderError
 
 

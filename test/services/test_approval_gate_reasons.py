@@ -1,7 +1,5 @@
 """Cause-specific, path-free plan-identity refusal contract."""
 
-import json
-
 import pytest
 
 from cli_agent_orchestrator.services import approval_gate, manifest_freeze

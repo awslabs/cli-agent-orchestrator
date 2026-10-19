@@ -1,11 +1,8 @@
 """Tests for logging utility."""
 
-import logging
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from cli_agent_orchestrator.utils.logging import setup_logging
 

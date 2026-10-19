@@ -471,7 +471,6 @@ class CursorCliProvider(BaseProvider):
             Absolute path to the file. Pass this to
             ``--system-prompt <path>``.
         """
-        import os
 
         prompt_path = self._cao_tmp_dir() / f"{self.terminal_id}-system-prompt.md"
         prompt_path.write_text(system_prompt, encoding="utf-8")
@@ -694,7 +693,6 @@ class CursorCliProvider(BaseProvider):
         processing_indicator_in_tail = (
             re.search(TUI_PROCESSING_INDICATOR_PATTERN, tail, re.IGNORECASE) is not None
         )
-        placeholder_in_tail = re.search(TUI_PLACEHOLDER_PATTERN, tail, re.IGNORECASE) is not None
 
         if processing_indicator_in_tail:
             # Primary v2026+ PROCESSING signal: the "ctrl+c to stop"

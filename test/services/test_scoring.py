@@ -26,10 +26,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients.database import Base, MemoryMetadataModel
-from cli_agent_orchestrator.services import memory_scoring
 from cli_agent_orchestrator.services.memory_scoring import (
     SCOPE_RANK,
-    USAGE_NORMALISER,
     W_BM25,
     W_RECENCY,
     W_USAGE,

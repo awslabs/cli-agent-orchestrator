@@ -18,9 +18,9 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol
 
-from cli_agent_orchestrator.services.agui.base import AguiConstruct, RecordingUiEmitter, UiEmitter
+from cli_agent_orchestrator.services.agui.base import AguiConstruct, UiEmitter
 
 logger = logging.getLogger(__name__)
 

@@ -16,7 +16,6 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
-    Annotated,
     Any,
     AsyncIterator,
     Dict,
@@ -31,7 +30,6 @@ from typing import (
 import yaml
 from fastapi import (
     BackgroundTasks,
-    Body,
     Depends,
     FastAPI,
     Header,
@@ -122,7 +120,6 @@ from cli_agent_orchestrator.security.auth import (
     _extract_bearer,
     extract_scopes_from_token,
     get_authorization_servers,
-    get_current_scopes,
     is_auth_enabled,
     is_idp_configured,
     require_any_scope,
