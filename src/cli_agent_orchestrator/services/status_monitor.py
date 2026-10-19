@@ -936,13 +936,13 @@ class StatusMonitor:
     def status_generation(self, terminal_id: str) -> Optional[int]:
         """Return the output generation ``_last_status`` was last EARNED at.
 
-        The read-only half of :meth:`status_observation`, for a caller that has
-        already obtained the status itself and only needs its recency —
-        ``get_terminal``, which publishes the pair over
-        ``GET /terminals/{id}`` so an HTTP client can tell a status earned for the
-        send it made from one that was already on screen (#735). Kept separate so
-        that endpoint does not run ``get_status`` twice: call ``get_status`` first,
-        then this, so any fresh verdict it applied is already stamped.
+        The read-only half of :meth:`status_observation`. ``get_terminal`` does
+        not call this: it reads the (status, generation) pair atomically via
+        ``status_observation`` instead, because two separate lock acquisitions
+        would let a detector apply a fresh verdict in between and pair the
+        previous turn's COMPLETED with the new turn's generation (#735). This
+        method remains for a caller that genuinely only needs the generation on
+        its own, with no corresponding status read to keep in sync with it.
 
         Returns None for event-inbox backends (herdr), which derive status on demand
         and never advance the generation, matching ``status_observation``.
