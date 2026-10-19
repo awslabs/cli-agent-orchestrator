@@ -102,7 +102,7 @@ def lint_script(source: str, display_path: str) -> ScriptValidationResult:
     """Lint a workflow script's source text. Total: never raises on input content.
 
     The only operation that can raise on input content is ``ast.parse``; it is
-    wrapped once with exactly three narrow arms (no broad except — totality by
+    wrapped once with four narrow arms (no broad except — totality by
     construction, proven by the hypothesis property test).
 
     Totality needs ONE thing the except arms cannot provide. On CPython <=3.11
@@ -174,6 +174,22 @@ def lint_script(source: str, display_path: str) -> ScriptValidationResult:
                 severity="error",
                 line=1,
                 message="source is too deeply nested to parse",
+            )
+        )
+        return _build_result(findings)
+    except MemoryError:
+        # The length cap above bounds AST *depth* (one node per character) but
+        # not the parser's separate allocation behavior: a denser grammar
+        # construct (e.g. a long chain of unary operators) can exhaust memory
+        # well under the cap without ever hitting the C-stack limit the cap
+        # exists for. Same fail-closed shape as the three arms above.
+        logger.warning("out of memory parsing %s", display_path)
+        findings.append(
+            LintFinding(
+                rule_id="syntax",
+                severity="error",
+                line=1,
+                message="source is too complex to parse",
             )
         )
         return _build_result(findings)

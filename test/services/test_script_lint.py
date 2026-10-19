@@ -125,7 +125,7 @@ class TestOversizeSourceGuard:
     On CPython <=3.11 the AST build inside ``ast.parse`` recurses in C once per
     nesting level with no recursion gate, so a deeply nested source overflows
     the C stack and SEGFAULTS: no exception is raised, so none of
-    ``lint_script``'s three except arms can convert it into a finding and the
+    ``lint_script``'s except arms can convert it into a finding and the
     whole test process dies mid-run. These tests are the regression guard for
     that crash class; the first one took the interpreter down before the cap
     existed.
@@ -181,6 +181,21 @@ class TestOversizeSourceGuard:
         result = lint_script(source, "large_but_fine.py")
         assert result.status == "fail"
         assert _findings_by_rule(result, "disallowed-import")
+
+    def test_dense_unary_chain_under_the_cap_is_fail_closed_not_memoryerror(self):
+        # The length cap bounds AST depth for a 2-bytes-per-level attribute
+        # chain, but a denser construct hits a DIFFERENT crash mode well under
+        # the cap: a long chain of unary minus allocates one AST node per
+        # character and raises MemoryError from inside ast.parse, not a
+        # SyntaxError/ValueError/RecursionError. 10_000 levels (~10 KB, two
+        # orders of magnitude under the 128 KiB cap) is enough to reproduce it.
+        source = "-" * 10_000 + "1"
+        result = lint_script(source, "unary.py")
+        assert isinstance(result, ScriptValidationResult)
+        assert result.status == "fail"
+        f = result.findings[0]
+        assert f.rule_id == "syntax"
+        assert f.severity == "error"
 
 
 class TestDisallowedImportRule:
