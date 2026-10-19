@@ -457,15 +457,18 @@ class TestSetFailsClosedOverAnUnreadableFile:
             ConfigService.set(path, value)
         assert settings.read_bytes() == before
 
-    def test_a_json_scalar_is_refused_too(self, _isolated_settings):
+    @pytest.mark.parametrize("content", ['"just a string"', "null", "42", "[1, 2, 3]"])
+    def test_a_json_scalar_is_refused_too(self, _isolated_settings, content):
         """A file holding a valid JSON non-object parsed fine and was ignored,
         so the write replaced it with an object. Unknown content is unknown
-        content: refuse."""
+        content: refuse. Includes JSON ``null``, which used to slip through
+        because ``elif loaded is not None`` treated it as "nothing parsed"
+        rather than "not a dict"."""
         settings = _isolated_settings["settings"]
-        settings.write_text('"just a string"')
+        settings.write_text(content)
         with pytest.raises(SettingsUnreadableError):
             ConfigService.set("logging.level", "INFO")
-        assert settings.read_text() == '"just a string"'
+        assert settings.read_text() == content
 
     def test_the_cli_reports_it_and_exits_non_zero(self, _isolated_settings):
         """The pre-fix command echoed the new value and exited 0; the only

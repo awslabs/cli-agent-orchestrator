@@ -306,7 +306,7 @@ def _load_raw(*, strict: bool = False) -> Dict[str, Any]:
             loaded, unreadable = None, True
         if isinstance(loaded, dict):
             data = loaded
-        elif loaded is not None:
+        else:
             e2 = TypeError(f"expected a JSON object, got {type(loaded).__name__}")
             if strict:
                 raise settings_service.SettingsUnreadableError(settings_file, e2)
