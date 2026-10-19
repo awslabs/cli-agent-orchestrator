@@ -17,9 +17,11 @@ Each rule closes one half of a defect class the repo has already paid for:
   screen can report "done" for a turn that had not started. The fix is a
   generation/sequence floor at every call site.
 
-All three rules are **ratchets**. A new unexplained call site fails; so does an
-allowlist row that no longer matches anything, so the tables can only shrink.
-The failure message names ``file:line`` and what to do.
+All three rules are **ratchets**. A new unexplained call site fails; so does a
+site beyond its row's reviewed occurrence count (a key collision does not
+grant unlimited headroom); so does an allowlist row that no longer matches
+anything, so the tables can only shrink. The failure message names
+``file:line`` and what to do.
 
 Cost: one ``ast.parse`` of every module under ``src/`` (276 files), cached
 across the rules by ``callsite_lint.parse_sources``. Measured at well under a
@@ -88,7 +90,7 @@ ENUM_SUBSET_ALLOWLIST = {
         "cli_agent_orchestrator/services/inbox_service.py",
         "TerminalStatus",
         "COMPLETED, IDLE",
-    ): "delivery is allowed only into a settled terminal",
+    ): (2, "delivery is allowed only into a settled terminal"),
     (
         "cli_agent_orchestrator/services/memory_service.py",
         "TerminalStatus",
@@ -98,7 +100,7 @@ ENUM_SUBSET_ALLOWLIST = {
         "cli_agent_orchestrator/services/status_monitor.py",
         "TerminalStatus",
         "COMPLETED, IDLE",
-    ): "settled-status pair; the monitor's idle/completed transitions",
+    ): (4, "settled-status pair; the monitor's idle/completed transitions"),
     # ---- terminal lifecycle: "the agent is busy" ----
     # The complement pair. #896 lives here: WAITING_USER_ANSWER must never be
     # treated as merely slow, so it is named alongside PROCESSING on purpose.
@@ -111,7 +113,7 @@ ENUM_SUBSET_ALLOWLIST = {
         "cli_agent_orchestrator/services/status_monitor.py",
         "TerminalStatus",
         "PROCESSING, WAITING_USER_ANSWER",
-    ): "busy pair (#896): a dialog is not a delivery window",
+    ): (2, "busy pair (#896): a dialog is not a delivery window"),
     (
         "cli_agent_orchestrator/utils/terminal.py",
         "TerminalStatus",
@@ -130,7 +132,7 @@ ENUM_SUBSET_ALLOWLIST = {
         "cli_agent_orchestrator/api/main.py",
         "RunState",
         "CANCELLED, COMPLETED, FAILED",
-    ): "every terminal RunState (the complement of RUNNING)",
+    ): (2, "every terminal RunState (the complement of RUNNING)"),
     (
         "cli_agent_orchestrator/api/main.py",
         "RunState",
@@ -155,24 +157,24 @@ ENUM_SUBSET_ALLOWLIST = {
         "cli_agent_orchestrator/services/workflow_service.py",
         "RunState",
         "CANCELLED, FAILED",
-    ): "unsuccessful terminal states; COMPLETED is handled separately",
+    ): (2, "unsuccessful terminal states; COMPLETED is handled separately"),
     (
         "cli_agent_orchestrator/services/workflow_service.py",
         "StepState",
         "COMPLETED, COMPLETED_UNVALIDATED",
-    ): "both 'the step ran' states; validation status is a separate axis",
+    ): (3, "both 'the step ran' states; validation status is a separate axis"),
     # ---- memory scope ----
     # MemoryScope has five members. Both subsets are real partitions of it.
     (
         "cli_agent_orchestrator/api/main.py",
         "MemoryScope",
         "AGENT, SESSION",
-    ): "the two scopes that require an owning id in the request",
+    ): (2, "the two scopes that require an owning id in the request"),
     (
         "cli_agent_orchestrator/services/memory_service.py",
         "MemoryScope",
         "AGENT, SESSION",
-    ): "the two scopes that require an owning id",
+    ): (7, "the two scopes that require an owning id"),
     (
         "cli_agent_orchestrator/services/memory_service.py",
         "MemoryScope",
@@ -193,7 +195,7 @@ ENUM_SUBSET_ALLOWLIST = {
         "cli_agent_orchestrator/providers/kimi_transcript.py",
         "KimiLineKind",
         "LIVE_SWARM_PROGRESS, SWARM_PROGRESS",
-    ): "both swarm-progress spellings; neither is transcript content",
+    ): (4, "both swarm-progress spellings; neither is transcript content"),
     # ---- misc ----
     (
         "cli_agent_orchestrator/backends/base.py",
@@ -282,8 +284,11 @@ BARE_TIMEOUT_ALLOWLIST = {
     (
         "cli_agent_orchestrator/services/herdr_inbox_service.py",
         "run(timeout=10)",
-    ): "SUSPECT: `herdr api` reads inside the socket loop. 10s is three "
-    "independent literals in one module with no shared constant.",
+    ): (
+        3,
+        "SUSPECT: `herdr api` reads inside the socket loop. 10s is three "
+        "independent literals in one module with no shared constant.",
+    ),
     (
         "cli_agent_orchestrator/services/herdr_inbox_service.py",
         "run(timeout=5)",
@@ -301,8 +306,11 @@ BARE_TIMEOUT_ALLOWLIST = {
     (
         "cli_agent_orchestrator/utils/terminal.py",
         "get(timeout=5)",
-    ): "per-request cap inside a polling loop that has its own outer budget; "
-    "the comment at the first site states the relationship",
+    ): (
+        3,
+        "per-request cap inside a polling loop that has its own outer budget; "
+        "the comment at the first site states the relationship",
+    ),
     (
         "cli_agent_orchestrator/cli/commands/launch.py",
         "get(timeout=5)",
@@ -366,7 +374,7 @@ BARE_TIMEOUT_ALLOWLIST = {
     (
         "cli_agent_orchestrator/services/fifo_reader.py",
         "join(timeout=2)",
-    ): "thread join on shutdown; a join timeout is a give-up, not a budget",
+    ): (2, "thread join on shutdown; a join timeout is a give-up, not a budget"),
     (
         "cli_agent_orchestrator/decisions/shadow.py",
         "wait(timeout=0.5)",
@@ -406,7 +414,11 @@ def test_suspect_timeout_rows_are_named_not_buried() -> None:
     pins that count so removing the marker without fixing the site is a visible
     edit, and so fixing one of them (which deletes its row) shows up here.
     """
-    suspects = sorted(k for k, v in BARE_TIMEOUT_ALLOWLIST.items() if v.startswith("SUSPECT"))
+    suspects = sorted(
+        k
+        for k, v in BARE_TIMEOUT_ALLOWLIST.items()
+        if cl.row_count_and_reason(v)[1].startswith("SUSPECT")
+    )
     assert len(suspects) == 5, (
         "The SUSPECT set changed. If you fixed a site, drop its row and this "
         f"count. Current: {[k[0] + ' ' + k[1] for k in suspects]}"
@@ -437,7 +449,10 @@ STALENESS_CALL_SITES = {
         "`cao session send` wait for the agent to settle"
     ),
     ("cli_agent_orchestrator/cli/commands/worker.py", STALENESS_FUNC): (
-        "worker-loop waits (two sites) for the assigned turn to finish"
+        2,
+        "worker-loop waits (two sites, `send` and the interactive loop) for "
+        "the assigned turn to finish -- reviewed as exactly two; a third "
+        "caller here needs its own review",
     ),
 }
 
@@ -455,7 +470,9 @@ def test_poll_until_done_call_site_census_is_complete() -> None:
     """A new ``poll_until_done`` caller must be reviewed for staleness (#735).
 
     Line-free keys, so one row covers both ``worker.py`` sites and neither row
-    is invalidated by reformatting.
+    is invalidated by reformatting -- but the row says ``2``, so a third
+    ``worker.py`` caller is still a new, unreviewed obligation rather than a
+    free pass through an existing key.
     """
     cl.check_against_allowlist(
         rule="staleness-census",

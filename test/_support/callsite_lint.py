@@ -18,9 +18,11 @@ This module is the shared half of those walks:
   off the flagged line (or the line that opens the statement).
 * :func:`check_against_allowlist` -- the ratchet. Compare the sites a rule found
   against an explicit allowlist and raise ``AssertionError`` with a message that
-  names ``file:line`` and says what to do. It fails in *both* directions: a new
-  unexplained site is a violation, and an allowlist row that no longer matches
-  anything is also a violation, so the allowlist can only ever shrink.
+  names ``file:line`` and says what to do. It fails in *three* directions: a new
+  unexplained site is a violation, a site beyond a row's reviewed occurrence
+  count is a violation, and an allowlist row that no longer matches anything is
+  also a violation -- so a row can cover repeats of one idiom in one module,
+  but only as many as were actually reviewed.
 
 Nothing here imports ``cli_agent_orchestrator`` at module scope beyond locating
 the package directory, and nothing here executes product code -- these are
@@ -33,7 +35,7 @@ import ast
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import cli_agent_orchestrator
 
@@ -216,26 +218,44 @@ def inline_marker(module: Module, lineno: int, prefix: str) -> Optional[str]:
 # The ratchet
 # ---------------------------------------------------------------------------
 
+#: An allowlist row is either a bare reason (occurrence count defaults to 1)
+#: or an explicit ``(count, reason)`` pair for a row that a human reviewed as
+#: covering more than one call site under the same key.
+AllowlistRow = Union[str, Tuple[int, str]]
+
+
+def row_count_and_reason(row: AllowlistRow) -> Tuple[int, str]:
+    """Unpack an :data:`AllowlistRow` into its reviewed count and reason."""
+    if isinstance(row, tuple):
+        return row
+    return 1, row
+
 
 def check_against_allowlist(
     *,
     rule: str,
     sites: Iterable[Site],
-    allowlist: Mapping[Tuple[str, ...], str],
+    allowlist: Mapping[Tuple[str, ...], AllowlistRow],
     remedy: str,
     marked: Optional[Mapping[Tuple[str, ...], str]] = None,
 ) -> None:
     """Fail unless every flagged site is explained and every row still matches.
 
     Allowlist keys are the line-free :attr:`Site.key`, so one row can cover the
-    repetitions of a single idiom inside one module (for example the six
+    repetitions of a single idiom inside one module (for example the four
     ``TerminalStatus in {COMPLETED, IDLE}`` tests in ``status_monitor.py``) and
-    reformatting never invalidates a reviewed row.
+    reformatting never invalidates a reviewed row -- but only up to the
+    occurrence count a human actually reviewed. A plain string reason implies a
+    reviewed count of 1; a row that covers more than one site under its key
+    must spell the count out as ``(count, reason)``, or an (N+1)th call site
+    added to a module that already has a one-occurrence row would pass with
+    zero signal.
 
     Args:
         rule: Short rule name, used in the message header.
         sites: Every site the rule flagged.
-        allowlist: ``{key: reason}`` rows a human reviewed and accepted.
+        allowlist: ``{key: row}`` rows a human reviewed and accepted. See
+            :data:`AllowlistRow`.
         remedy: What the author of a *new* violation should do, in one or two
             sentences. This is the whole value of the rule, so it is required.
         marked: ``{key: reason}`` for sites that carried an inline marker.
@@ -243,18 +263,32 @@ def check_against_allowlist(
             stale inline marker is not blamed on the table.
 
     Raises:
-        AssertionError: On any unexplained site, or any row that matched nothing.
+        AssertionError: On any unexplained site, any site beyond its row's
+            reviewed count, or any row that matched nothing.
     """
     sites = list(sites)
     marked = {} if marked is None else marked
+    marked_keys = set(marked)
     seen = {site.key for site in sites}
-    explained = set(allowlist) | set(marked)
 
-    unexplained = [site for site in sites if site.key not in explained]
+    unexplained: List[Site] = []
+    overflow: List[Site] = []
+    consumed: Dict[Tuple[str, ...], int] = {}
+    for site in sites:
+        if site.key in marked_keys:
+            continue
+        if site.key not in allowlist:
+            unexplained.append(site)
+            continue
+        allowed_count, _ = row_count_and_reason(allowlist[site.key])
+        consumed[site.key] = consumed.get(site.key, 0) + 1
+        if consumed[site.key] > allowed_count:
+            overflow.append(site)
+
     stale_rows = sorted(key for key in allowlist if key not in seen)
-    stale_marks = sorted(key for key in marked if key not in seen)
+    stale_marks = sorted(key for key in marked_keys if key not in seen)
 
-    if not (unexplained or stale_rows or stale_marks):
+    if not (unexplained or overflow or stale_rows or stale_marks):
         return
 
     problems: List[str] = [f"call-site lint [{rule}] failed."]
@@ -267,6 +301,20 @@ def check_against_allowlist(
         problems.append("")
         problems.append(f"What to do: {remedy}")
 
+    if overflow:
+        problems.append("")
+        problems.append(
+            f"{len(overflow)} call site(s) exceed their allowlist row's reviewed "
+            "occurrence count:"
+        )
+        for site in overflow:
+            allowed_count, reason = row_count_and_reason(allowlist[site.key])
+            problems.append(
+                f"  {site.where}  {site.detail}  (row allows {allowed_count}, reviewed as: {reason})"
+            )
+        problems.append("")
+        problems.append(f"What to do: {remedy}")
+
     if stale_rows:
         problems.append("")
         problems.append(
@@ -275,7 +323,8 @@ def check_against_allowlist(
             "shrink; that is the point."
         )
         for key in stale_rows:
-            problems.append(f"  {' | '.join(key)}   (reason was: {allowlist[key]})")
+            _, reason = row_count_and_reason(allowlist[key])
+            problems.append(f"  {' | '.join(key)}   (reason was: {reason})")
 
     if stale_marks:
         problems.append("")

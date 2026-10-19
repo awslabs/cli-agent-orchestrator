@@ -414,11 +414,58 @@ def test_check_against_allowlist_reports_every_problem_at_once() -> None:
     assert "1 allowlist row(s)" in message
 
 
-def test_one_row_covers_repeated_sites_with_the_same_key() -> None:
-    """Six copies of one idiom in one module need one reviewed row, not six."""
+def test_one_row_covers_repeated_sites_up_to_its_reviewed_count() -> None:
+    """Three copies of one idiom in one module need one row, not three --
+
+    but the row must say ``3``, not just a bare reason.
+    """
     cl.check_against_allowlist(
         rule="r",
         sites=[_site("a", line=n) for n in (1, 2, 3)],
+        allowlist={("pkg/mod.py", "a"): (3, "reviewed as three sites")},
+        remedy="do the thing",
+    )
+
+
+def test_a_bare_reason_row_implies_a_reviewed_count_of_one() -> None:
+    """A plain string reason is shorthand for ``(1, reason)``, not "any number"."""
+    cl.check_against_allowlist(
+        rule="r",
+        sites=[_site("a", line=1)],
         allowlist={("pkg/mod.py", "a"): "reviewed once"},
         remedy="do the thing",
     )
+
+
+def test_a_second_unreviewed_site_under_an_existing_key_is_not_silent() -> None:
+    """The gap #9008's reviewers found: a key collision must not hide growth.
+
+    ``worker.py`` holding two ``poll_until_done`` calls behind one row is the
+    live example this guards against -- a third call there must fail until the
+    row's count is bumped, not pass because the key already has a row.
+    """
+    with pytest.raises(AssertionError) as exc:
+        cl.check_against_allowlist(
+            rule="r",
+            sites=[_site("a", line=1), _site("a", line=2)],
+            allowlist={("pkg/mod.py", "a"): "reviewed once"},
+            remedy="bump the reviewed count or split the site",
+        )
+    message = str(exc.value)
+    assert "exceed their allowlist row's reviewed occurrence count" in message
+    assert "pkg/mod.py:2" in message
+    assert "row allows 1" in message
+
+
+def test_an_explicit_count_row_still_fails_past_its_reviewed_count() -> None:
+    with pytest.raises(AssertionError) as exc:
+        cl.check_against_allowlist(
+            rule="r",
+            sites=[_site("a", line=n) for n in (1, 2, 3)],
+            allowlist={("pkg/mod.py", "a"): (2, "reviewed as two sites")},
+            remedy="bump the reviewed count or split the site",
+        )
+    message = str(exc.value)
+    assert "1 call site(s) exceed" in message
+    assert "pkg/mod.py:3" in message
+    assert "row allows 2" in message
