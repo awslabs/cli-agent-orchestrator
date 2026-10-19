@@ -184,7 +184,7 @@ from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.forwarded_env import ForwardedEnvError, validate_forwarded_env
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
-from cli_agent_orchestrator.utils.path_validation import BLOCKED_SYSTEM_DIRECTORIES
+from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
     load_skill_content,
@@ -5789,12 +5789,13 @@ def _script_root(value: Optional[str]) -> str:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="working_directory must name an existing directory",
         )
-    if root in BLOCKED_SYSTEM_DIRECTORIES:
+    try:
+        return resolve_and_validate_path(root, description="working_directory")
+    except ValueError:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="working_directory must not be a blocked system directory",
-        )
-    return root
+        ) from None
 
 
 @app.post("/workflows/runs")

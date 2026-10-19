@@ -2345,3 +2345,134 @@ def test_failure_envelope_json_shape_stable_across_surfaces(client, read_surface
         "next_command",
     }
     assert env["next_command"] == "cao workflow result shape"
+
+
+_ROOT_POLICY_CASES = ("root", "etc", "private-etc", "usr-lib", "subtree", "symlink")
+
+
+def _root_policy_path(tmp_path, case):
+    if case == "normal":
+        path = tmp_path / "normal-project"
+        path.mkdir(exist_ok=True)
+        return str(path)
+    if case == "symlink":
+        path = tmp_path / "system-alias"
+        path.symlink_to("/etc", target_is_directory=True)
+        return str(path)
+    path = {
+        "root": "/",
+        "etc": "/etc",
+        "private-etc": "/private/etc",
+        "usr-lib": "/usr/lib",
+        "subtree": "/etc/ssh",
+    }[case]
+    if not os.path.isdir(path):
+        pytest.skip(f"policy test directory is absent: {path}")
+    return path
+
+
+@pytest.mark.parametrize("endpoint", ["/workflows/runs", "/workflows/runs:submit"])
+@pytest.mark.parametrize("case", _ROOT_POLICY_CASES)
+def test_script_root_shared_policy_refuses_before_drive_and_journal(
+    client, request, tmp_path, endpoint, case
+):
+    is_submit = endpoint.endswith(":submit")
+    env = request.getfixturevalue("async_script_env" if is_submit else "script_run_env")
+    root = _root_policy_path(tmp_path, case)
+    run_id = f"root-policy-{case}"
+    response = client.post(
+        endpoint,
+        json={
+            "name_or_path": "scr",
+            "inputs": {} if is_submit else {"topic": "birds"},
+            "run_id": run_id,
+            "working_directory": root,
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == "working_directory must not be a blocked system directory"
+    assert root not in response.text
+    assert env["prepared" if is_submit else "spy"]["called"] is False
+    assert workflow_journal.get_run(run_id) is None
+
+
+@pytest.mark.parametrize("case", (*_ROOT_POLICY_CASES, "normal"))
+def test_script_root_policy_matches_shared_validator(tmp_path, case):
+    from fastapi import HTTPException
+
+    from cli_agent_orchestrator.api.main import _script_root
+    from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
+
+    root = _root_policy_path(tmp_path, case)
+    try:
+        expected = resolve_and_validate_path(root, description="working_directory")
+    except ValueError:
+        with pytest.raises(HTTPException) as refused:
+            _script_root(root)
+        assert refused.value.status_code == 422
+        assert refused.value.detail == "working_directory must not be a blocked system directory"
+        assert root not in refused.value.detail
+    else:
+        assert _script_root(root) == expected
+
+
+def test_script_root_any_validator_valueerror_is_path_free(
+    client, script_run_env, tmp_path, monkeypatch
+):
+    import cli_agent_orchestrator.api.main as api_main
+
+    root = tmp_path / "normal"
+    root.mkdir()
+
+    def refuse(path, **kwargs):
+        assert path == os.path.realpath(root)
+        assert kwargs == {"description": "working_directory"}
+        raise ValueError(f"sensitive validator reason for {path}")
+
+    monkeypatch.setattr(api_main, "resolve_and_validate_path", refuse, raising=False)
+    response = client.post(
+        "/workflows/runs",
+        json={
+            "name_or_path": "scr",
+            "inputs": {"topic": "birds"},
+            "run_id": "validator-valueerror",
+            "working_directory": str(root),
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "working_directory must not be a blocked system directory"
+    assert str(root) not in response.text
+    assert "sensitive validator reason" not in response.text
+    assert script_run_env["spy"]["called"] is False
+    assert workflow_journal.get_run("validator-valueerror") is None
+
+
+def test_omitted_script_root_checks_shared_policy(client, script_run_env, monkeypatch):
+    monkeypatch.chdir("/etc")
+    response = client.post(
+        "/workflows/runs",
+        json={"name_or_path": "scr", "inputs": {"topic": "birds"}, "run_id": "blocked-default"},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "working_directory must not be a blocked system directory"
+    assert "/etc" not in response.text
+    assert script_run_env["spy"]["called"] is False
+    assert workflow_journal.get_run("blocked-default") is None
+
+
+@pytest.mark.parametrize("endpoint", ["/workflows/runs", "/workflows/runs:submit"])
+def test_shared_policy_accepts_normal_temp_subdirectory(client, request, tmp_path, endpoint):
+    is_submit = endpoint.endswith(":submit")
+    env = request.getfixturevalue("async_script_env" if is_submit else "script_run_env")
+    root = _root_policy_path(tmp_path, "normal")
+    response = client.post(
+        endpoint,
+        json={
+            "name_or_path": "scr",
+            "inputs": {} if is_submit else {"topic": "birds"},
+            "run_id": "normal-root-policy",
+            "working_directory": root,
+        },
+    )
+    assert response.status_code == (202 if is_submit else 200), response.text
+    assert env["prepared" if is_submit else "spy"]["working_directory"] == os.path.realpath(root)
