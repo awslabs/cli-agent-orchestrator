@@ -1602,6 +1602,82 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
     )
 
 
+#: CAO MCP tools a bound terminal must reach whatever its allowlist says.
+#:
+#: These are the callback protocol, not capabilities. ``skills/cao-worker-protocols``
+#: tells an ASSIGNED worker to report its result with ``send_message`` and no
+#: ``receiver_id`` ("The requesting terminal depends on ``send_message`` to receive
+#: the result"), and ``_resolve_child_allowed_tools`` gives a child whose profile
+#: declares ``tools: [fs_read]`` exactly ``["fs_read"]``. Gating these on
+#: ``@cao-mcp-server`` would therefore leave a restricted worker unable to report
+#: and its supervisor waiting forever — CAO would deadlock its own orchestration to
+#: enforce a restriction the operator asked for on the worker's *capabilities*.
+#:
+#: Each entry answers upward to the terminal that created the caller, carries no
+#: authority over any other identity, and cannot mint one. Keep this set this small:
+#: a tool belongs here only if a worker CANNOT COMPLETE ITS OWN ASSIGNED WORK
+#: without it. "It would be convenient" is what produced #671.
+CALLBACK_EXEMPT_TOOLS = frozenset(
+    {
+        "send_message",
+        "complete_assignment",
+        "workflow_return",
+        "answer_user_prompt",
+    }
+)
+
+
+def _install_allowlist_middleware(server: Any) -> None:
+    """Gate every CAO MCP tool on the caller's allowlist (#671).
+
+    #769 and #811 put ``_tool_denied_reason`` on the tools that mint a new agent
+    identity. That closed the escalation path and left the rest of the surface
+    open: a bound terminal whose effective allowlist omits ``@cao-mcp-server``
+    could still call ``memory_store``, ``memory_forget``, ``delete_terminal``,
+    ``update_metadata``, ``workflow_cancel`` and the rest, because the only other
+    enforcement mechanism — the provider-native deny flags built by
+    ``utils/tool_mapping`` — cannot name an MCP tool at all:
+    ``get_disallowed_tools`` skips every ``@``-prefixed entry, so it emits no
+    ``mcp__`` name on any provider.
+
+    One rule, applied here rather than at 26 more call sites, because per-site
+    guards are exactly how the surface drifted in the first place and a tool added
+    tomorrow would be ungated by default. The policy is unchanged:
+    ``_tool_denied_reason`` is the single source of it, so an operator context
+    (no ``CAO_TERMINAL_ID``) still allows, ``*`` or ``@cao-mcp-server`` still
+    grants, and every failure to resolve a claimed identity still denies.
+
+    Registered AFTER the MCP Apps surface so an app-only tool is reported as
+    unknown by its own filter rather than as unauthorized by this one — the
+    existence of a hidden tool is not something to leak through an authz error.
+
+    The inline ``_tool_denied_reason`` calls in the delegation tools are left in
+    place. They are redundant with this middleware over MCP but are NOT dead:
+    they return a structured ``{"success": False, "error": ...}`` envelope that
+    agents handle better than a protocol error, and they keep working for any
+    caller that reaches those functions without passing through FastMCP dispatch.
+    """
+    add_middleware = getattr(server, "add_middleware", None)
+    if not callable(add_middleware):  # pragma: no cover - FastMCP build without middleware
+        logger.warning("FastMCP build has no add_middleware; CAO MCP tools are not allowlist-gated")
+        return
+
+    from fastmcp.exceptions import ToolError
+    from fastmcp.server.middleware import Middleware
+
+    class _AllowlistGate(Middleware):
+        async def on_call_tool(self, context: Any, call_next: Any) -> Any:
+            tool_name = context.message.name
+            if tool_name in CALLBACK_EXEMPT_TOOLS:
+                return await call_next(context)
+            denied = await asyncio.to_thread(_tool_denied_reason, tool_name)
+            if denied:
+                raise ToolError(denied)
+            return await call_next(context)
+
+    add_middleware(_AllowlistGate())
+
+
 async def create_ephemeral_agent(
     purpose: Annotated[Any, WithJsonSchema({"type": "string"})],
     brief: Annotated[Any, WithJsonSchema({"type": "string"})],
@@ -3107,6 +3183,10 @@ async def workflow_events(
 from cli_agent_orchestrator.plugins.registry import register_mcp_server_surfaces  # noqa: E402
 
 register_mcp_server_surfaces(mcp)
+
+# Last, so it wraps every tool registered above — CAO's own 33 and anything a
+# plugin's on_mcp_server hook added (#671).
+_install_allowlist_middleware(mcp)
 
 
 def main():
