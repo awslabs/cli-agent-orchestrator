@@ -704,8 +704,8 @@ class CursorCliProvider(BaseProvider):
         placeholder_in_tail = re.search(TUI_PLACEHOLDER_PATTERN, tail, re.IGNORECASE) is not None
 
         # The indicator is rendered ON the input-box line, next to the
-        # placeholder. Anchor the check to the LAST input-box line in
-        # the tail rather than searching the whole window: the
+        # placeholder. Anchor the check to the tail starting at the LAST
+        # input-box line rather than searching the whole window: the
         # pipe-pane buffer is an append-only stream of every TUI
         # redraw, so a working frame's "ctrl+c to stop" is still
         # sitting in the window after the agent finishes. A finished
@@ -714,15 +714,28 @@ class CursorCliProvider(BaseProvider):
         # whole-window search keeps the terminal pinned at PROCESSING
         # for the rest of the session (issue #752).
         #
+        # The input-box line is matched STRUCTURALLY on Cursor's input
+        # arrow (``→``) immediately before the placeholder, not just on
+        # the placeholder phrase appearing anywhere in a line: ordinary
+        # response prose can contain "Add a follow-up" or "Plan,
+        # search, build anything" without the arrow, and matching that
+        # as the "last input-box line" would let response text
+        # impersonate the input box and report a still-working agent
+        # as COMPLETED.
+        #
+        # We search from the START of that last structural match to the
+        # END of the tail (not just that one line) because the
+        # indicator can wrap onto the line immediately after the
+        # placeholder in a narrow pane; the stale frame's indicator
+        # always sits BEFORE the final input-box line, never after it,
+        # since the finished frame is appended last.
+        #
         # Builds that never render a placeholder (older text-mode
         # Cursor) have no input-box line to anchor to; fall back to the
         # whole-window search there so their behaviour is unchanged.
-        input_box_lines = [
-            line
-            for line in tail.splitlines()
-            if re.search(TUI_PLACEHOLDER_PATTERN, line, re.IGNORECASE)
-        ]
-        indicator_haystack = input_box_lines[-1] if input_box_lines else tail
+        _input_box_line_re = re.compile(r"→\s*" + TUI_PLACEHOLDER_PATTERN, re.IGNORECASE)
+        _input_box_matches = list(_input_box_line_re.finditer(tail))
+        indicator_haystack = tail[_input_box_matches[-1].start() :] if _input_box_matches else tail
         processing_indicator_in_tail = (
             re.search(TUI_PROCESSING_INDICATOR_PATTERN, indicator_haystack, re.IGNORECASE)
             is not None
