@@ -101,7 +101,6 @@ class EligibilityCheck:
     ):
         self.request = request
         self._sources = tuple(sources)
-        self._failed_sources: set[str] = set()
         self.errors = list(errors or [])
         self._memo: dict[MemoryIdentity, tuple[str, ...]] = {}
         self._origins: dict[MemoryIdentity, set[str]] = {}
@@ -111,11 +110,6 @@ class EligibilityCheck:
     ) -> None:
         """Observe one failed read without disabling independent later candidate batches."""
         _failed_open(name, self.request, count, self.errors, purpose=purpose)
-
-    def fail_open_source(self, name: str, count: int) -> None:
-        """Report an already failed source read and avoid retrying it in this check."""
-        self.report_source_failure(name, count)
-        self._failed_sources.add(name)
 
     def use_superseded_snapshot(
         self, snapshot: set, *, failed_groups: Optional[set] = None
@@ -139,8 +133,6 @@ class EligibilityCheck:
         if pending:
             verdicts: dict[MemoryIdentity, list[str]] = {identity: [] for identity in pending}
             for source in self._sources:
-                if source.name in self._failed_sources:
-                    continue
                 try:
                     excluded = dict(source.excluded(self.request, pending))
                     if any(

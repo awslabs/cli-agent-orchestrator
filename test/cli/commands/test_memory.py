@@ -930,7 +930,11 @@ class TestMemoryListExplain:
         assert "KEY_SENTINEL" not in result.stdout
         assert ("PATH_SENTINEL" in result.stderr) is debug
         assert ("KEY_SENTINEL" in result.stderr) is debug
-        assert "re-run with CAO_LOG_LEVEL=DEBUG for details" in result.stderr
+        if debug:
+            assert "Explain failed (PermissionError); details above" in result.stderr
+            assert "re-run with CAO_LOG_LEVEL=DEBUG" not in result.stderr
+        else:
+            assert "re-run with CAO_LOG_LEVEL=DEBUG for details" in result.stderr
 
 
 class TestNonAccessingInspection:

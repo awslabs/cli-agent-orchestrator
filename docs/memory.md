@@ -323,8 +323,10 @@ the lifecycle flag adds no new authorization boundary.
 Lifecycle changes do not retract provider memory blocks already persisted
 in `<cwd>/.claude/CLAUDE.md`, `<cwd>/AGENTS.md` or Kiro's
 `<cwd>/.kiro/steering/cao-memory.md`. Claude Code, Codex and Kiro memory
-handlers refresh those files at the next terminal creation in that cwd,
-when retrieval returns a nonempty block and the write succeeds. Empty
+handlers refresh only their own provider's file when a terminal of that
+provider is created in that cwd: `claude_code` writes `.claude/CLAUDE.md`,
+`codex` writes `AGENTS.md`, and `kiro_cli` writes `.kiro/steering/cao-memory.md`.
+Retrieval must return a nonempty block and the write must succeed. Empty
 retrieval, fetch failures or write failures leave the previous block in place.
 Kiro owns its steering file and replaces the whole file; Claude Code and Codex
 replace only their delimited blocks. Kiro also validates the cwd and target
@@ -399,7 +401,8 @@ group read adds `lifecycle.supersedes` to the errors and emits the same
 content-free failed-open warning as injection. The healthy partial snapshot
 is used for ordering, labels and injection verdicts without another read.
 With lifecycle enabled, only rows in failed scope groups report injection
-`unknown`; healthy groups keep their actual eligible/excluded verdicts.
+`unknown` unless another source already excludes them. Known exclusions take
+precedence; healthy groups keep their actual eligible/excluded verdicts.
 With lifecycle off, the failure warning uses purpose `relevance_demotion`;
 injection does not consult the disabled built-in source.
 A late curator ordering-snapshot failure reaches its check errors and warning

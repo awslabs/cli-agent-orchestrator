@@ -452,3 +452,25 @@ def test_explain_failure_is_visible_without_excluding_recall(seeded, registry, c
         row["key"] == "blocked" and row["injection"] == "excluded" for row in result["candidates"]
     )
     assert "secret body" not in caplog.text
+
+
+def test_known_exclusion_precedes_unknown_supersedes_group(seeded, registry, monkeypatch):
+    service, _, ctx = seeded
+    registry.register_source(FixtureSource())
+    registry.register_source(registry.SupersedesSource())
+    monkeypatch.setenv("CAO_MEMORY_LIFECYCLE_ENABLED", "true")
+
+    def broken(*args, **kwargs):
+        raise OSError("/PATH_SENTINEL/KEY_SENTINEL.md")
+
+    monkeypatch.setattr(
+        memory_relationship_service.MemoryRelationshipService, "superseded_targets", broken
+    )
+    result = _run(
+        service.recall_explain(query="kafka streams", scope="global", limit=3, terminal_context=ctx)
+    )
+    by_key = {row["key"]: row for row in result["candidates"]}
+    assert by_key["blocked"]["injection"] == "excluded"
+    assert by_key["blocked"]["exclusion_reasons"] == ["promoted"]
+    assert by_key["survivor"]["injection"] == "unknown"
+    assert result["eligibility_errors"] == ["lifecycle.supersedes"]

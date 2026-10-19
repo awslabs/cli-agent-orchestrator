@@ -357,9 +357,11 @@ API authentication is off by default.
 
 Lifecycle changes do not retract memory blocks already written into
 `<cwd>/.claude/CLAUDE.md`, `<cwd>/AGENTS.md` or Kiro's
-`<cwd>/.kiro/steering/cao-memory.md`. They refresh on the next terminal
-creation in that cwd only when a nonempty memory block is retrieved and
-successfully written. Empty retrieval and failed refreshes leave old blocks
+`<cwd>/.kiro/steering/cao-memory.md`. Each file refreshes only when a terminal
+of its provider is created in that cwd: `claude_code` writes `.claude/CLAUDE.md`,
+`codex` writes `AGENTS.md`, and `kiro_cli` writes `.kiro/steering/cao-memory.md`.
+The memory block must be nonempty and successfully written. Empty retrieval
+and failed refreshes leave old blocks
 in place. Kiro replaces its whole owned steering file after validating the cwd
 and target; Claude Code and Codex replace delimited blocks. Missing cwd or
 failed validation also leaves Kiro's existing file unchanged. Frozen workflow replays keep their recorded block without a

@@ -2772,9 +2772,13 @@ class MemoryService:
                     "recovered": rank is not None and rank <= limit and default_rank is None,
                     "superseded": self._is_superseded(memory, superseded),
                     "injection": (
-                        "unknown"
-                        if lifecycle_on and (identity[1], identity[2]) in superseded_failed
-                        else "excluded" if identity in verdicts else "eligible"
+                        "excluded"
+                        if identity in verdicts
+                        else (
+                            "unknown"
+                            if lifecycle_on and (identity[1], identity[2]) in superseded_failed
+                            else "eligible"
+                        )
                     ),
                     "exclusion_reasons": list(verdicts.get(identity, ())),
                 }
