@@ -467,7 +467,9 @@ class TestHerdrInboxServiceReconcile:
             patch.object(service, "_connect", lambda: _record("connect")),
             patch.object(service, "_reconcile", lambda: _record("reconcile")),
             patch.object(service, "_subscribe_all_events", lambda: _record("subscribe")),
-            patch.object(service, "_deliver_settled_panes", lambda: _record("sweep")),
+            # create=True so a service that lost the sweep entirely fails on the
+            # ORDER assertion (missing "sweep") rather than on a patch error.
+            patch.object(service, "_deliver_settled_panes", lambda: _record("sweep"), create=True),
             patch.object(service, "_event_loop", _event_loop),
             patch("asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)),
         ):
