@@ -59,6 +59,7 @@ from cli_agent_orchestrator.services.ui_state_service import (
     build_agent_detail_snapshot,
     build_dashboard_snapshot,
 )
+from cli_agent_orchestrator.utils.init_allowance import synchronous_create_timeout
 from cli_agent_orchestrator.utils.orchestration import _mcp_timeout
 
 logger = logging.getLogger(__name__)
@@ -141,19 +142,29 @@ def _extract_error_detail(response: "requests.Response", fallback: str) -> str:
     return detail if isinstance(detail, str) and detail else fallback
 
 
-def _post_json(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+def _post_json(
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    timeout: Optional[Any] = None,
+) -> Any:
     """POST ``{API_BASE_URL}{path}`` with query params and return parsed JSON.
 
     The Backplane mutation endpoints (``/sessions``, ``/terminals/*/input``,
     ``/terminals/*/key``, ``/terminals/*/inbox/messages``) take their arguments as
     query parameters, mirroring how ``mcp_server/server.py`` already calls them.
+
+    ``timeout``: ``None`` (default) uses ``_mcp_timeout()``, right for every
+    mutation the server answers immediately. ``POST /sessions`` is the exception
+    -- it does not answer until ``provider.initialize()`` returns -- and passes
+    ``synchronous_create_timeout`` instead (issue #710).
     """
 
     response = requests.post(
         f"{API_BASE_URL}{path}",
         params={k: v for k, v in (params or {}).items() if v is not None} or None,
         headers=_auth_headers() or None,
-        timeout=_mcp_timeout(),
+        timeout=_mcp_timeout() if timeout is None else timeout,
     )
     response.raise_for_status()
     try:
@@ -402,7 +413,18 @@ def _route_command(kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                 "working_directory": payload.get("working_directory"),
                 "allowed_tools": payload.get("allowed_tools"),
             }
-            result = _post_json("/sessions", params)
+            # This gesture carries no ``initial_message``, and ``POST /sessions``
+            # only defers initialization when one is present -- so the server
+            # holds the response until ``provider.initialize()`` returns. On
+            # ``_mcp_timeout()`` (30s by default, against a 60s-and-up init
+            # budget) a perfectly successful create came back as a transport
+            # timeout while cao-server went on to finish the session, so the
+            # operator saw a failure for a session that exists (issue #710).
+            result = _post_json(
+                "/sessions",
+                params,
+                timeout=synchronous_create_timeout(payload.get("agent_profile")),
+            )
             return {
                 "success": True,
                 "kind": kind,

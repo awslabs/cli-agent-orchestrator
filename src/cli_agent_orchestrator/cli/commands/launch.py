@@ -30,6 +30,10 @@ from cli_agent_orchestrator.utils.forwarded_env import (
     ForwardedEnvError,
     validate_forwarded_env,
 )
+from cli_agent_orchestrator.utils.init_allowance import (
+    init_allowance,
+    synchronous_create_timeout,
+)
 from cli_agent_orchestrator.utils.terminal import (
     poll_until_done,
     sync_backend_from_server,
@@ -70,19 +74,6 @@ _READINESS_WAIT_TIMEOUT = 120
 # so a retry duplicated the work (PR #566 review, haofeif).
 _HEADLESS_TASK_TIMEOUT = 300
 
-# Worst case of the server's confirm-and-resubmit loop after the send
-# (``_DEFERRED_SUBMIT_CONFIRM_TIMEOUT`` x (1 + ``_DEFERRED_SUBMIT_MAX_RESUBMITS``)
-# = 32s) with headroom for the pre-dispatch work (memory injection) and polling.
-_DELIVERY_CONFIRM_ALLOWANCE = 60
-
-# Provider init is not one wait of ``provider_init_timeout`` (T). A successful
-# path legitimately spans several T-bounded phases: Claude's shell wait +
-# startup-prompt handler + readiness wait is 3T (+ settle), Kimi's is up to
-# T + 2*max(120, T), Kiro's legacy fallback 4T. The client allowance has to
-# cover the longest of those or a valid init blows the deadline while the
-# server later runs the task anyway.
-_INIT_PHASES = 4
-
 
 def _init_allowance(agent_profile: str, settings: dict) -> int:
     """Client-side allowance for server-side provider init plus delivery confirmation.
@@ -92,17 +83,12 @@ def _init_allowance(agent_profile: str, settings: dict) -> int:
     prefers it), else the server setting. A profile that cannot be loaded here
     falls back to the server default rather than failing the launch -- the
     server resolves the real profile itself; this only sizes the wait.
-    """
-    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
-    base = int(settings["provider_init_timeout"])
-    try:
-        profile = load_agent_profile(agent_profile)
-    except (FileNotFoundError, RuntimeError):
-        profile = None
-    if profile is not None and profile.provider_init_timeout is not None:
-        base = int(profile.provider_init_timeout)
-    return _INIT_PHASES * base + _DELIVERY_CONFIRM_ALLOWANCE
+    Thin wrapper over ``utils.init_allowance``, which is where the phase count
+    and the delivery-confirmation headroom now live so every client-side
+    allowance for server-side init reads the same derivation (issue #710).
+    """
+    return init_allowance(agent_profile, settings)
 
 
 def _is_waiting_on_user(terminal_id: str) -> bool:
@@ -484,7 +470,25 @@ def launch(
         # MESSAGE rides in the body for the same reason, plus URL-length. See
         # issue #248 and ``CreateSessionBody``.
         settings = get_server_settings()
-        post_kwargs: dict = {"params": params, "timeout": settings["mcp_request_timeout"]}
+        # Two different waits behind one POST, so two different budgets (issue
+        # #710). With ``initial_message`` in the body the server returns BEFORE
+        # init starts, so this is an ordinary request and stays on
+        # ``mcp_request_timeout`` -- widening it there would only slow down
+        # reporting a dead server. Without it (the non-headless path, which
+        # attaches instead of sending) ``POST /sessions`` initializes
+        # synchronously and does not answer until ``provider.initialize()``
+        # returns; 30s against a 60s-and-up init budget meant a successful
+        # launch surfaced as a ReadTimeout while cao-server went on building the
+        # session -- see the Codex login-menu case in
+        # ``providers/codex.py``. The synchronous budget is derived from the
+        # profile's own ``provider_init_timeout``, and only its READ half is
+        # widened, so connect failures still report in 5s.
+        create_timeout = (
+            settings["mcp_request_timeout"]
+            if server_delivers_message
+            else synchronous_create_timeout(agents, settings)
+        )
+        post_kwargs: dict = {"params": params, "timeout": create_timeout}
         body: dict = {}
         if forwarded_env:
             body["env_vars"] = forwarded_env

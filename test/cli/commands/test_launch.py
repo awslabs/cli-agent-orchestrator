@@ -1302,6 +1302,83 @@ def test_launch_create_call_keeps_mcp_request_timeout():
         assert mock_get.call_args_list[-1].kwargs["timeout"] == 30
 
 
+def test_launch_non_headless_create_covers_synchronous_provider_init():
+    """Issue #710: the create the server answers only AFTER init needs an
+    init-sized budget, not ``mcp_request_timeout``.
+
+    Non-headless sends no ``initial_message`` (it attaches instead), and
+    ``POST /sessions`` defers initialization only when one is present -- so this
+    POST does not come back until ``provider.initialize()`` returns. At 30s
+    against a 60s-and-up init budget a successful launch surfaced as a
+    ReadTimeout while cao-server went on building the session; the Codex
+    first-run login menu is the case that forced a provider-side workaround for
+    it (see ``providers/codex.py``).
+
+    Only the READ half is widened: ``timeout=`` as a scalar covers connect too,
+    so a dead server would otherwise take minutes to report -- the objection
+    recorded in ``test_launch_create_call_keeps_mcp_request_timeout``, which
+    pins the deferred (headless) path at 30s and must keep passing.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_server_settings") as mock_settings,
+    ):
+        mock_settings.return_value = {"mcp_request_timeout": 30, "provider_init_timeout": 60}
+        mock_post.return_value = _create_session_response()
+        mock_wait.return_value = True
+        mock_get_backend.return_value.attach_session.return_value = None
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        timeout = mock_post.call_args.kwargs["timeout"]
+        assert isinstance(timeout, tuple), f"expected a (connect, read) tuple, got {timeout!r}"
+        connect, read = timeout
+        assert connect == 5.0
+        # Must exceed a single provider_init_timeout, because a successful init
+        # spans several of them.
+        assert read > 60
+
+
+def test_launch_non_headless_create_timeout_follows_provider_init_timeout():
+    """Raising ``provider_init_timeout`` must move the client budget with it.
+
+    The property that distinguishes a derivation from a second hard-coded
+    constant -- which is the drift issue #710 asked to remove.
+    """
+    runner = CliRunner()
+
+    reads = []
+    for init_timeout in (60, 240):
+        with (
+            patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+            patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
+            patch(
+                "cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status"
+            ) as mock_wait,
+            patch(
+                "cli_agent_orchestrator.cli.commands.launch.get_server_settings"
+            ) as mock_settings,
+        ):
+            mock_settings.return_value = {
+                "mcp_request_timeout": 30,
+                "provider_init_timeout": init_timeout,
+            }
+            mock_post.return_value = _create_session_response()
+            mock_wait.return_value = True
+            mock_get_backend.return_value.attach_session.return_value = None
+
+            result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+            assert result.exit_code == 0
+            reads.append(mock_post.call_args.kwargs["timeout"][1])
+
+    assert reads[1] > reads[0]
+
+
 def test_launch_headless_message_travels_in_body_not_query_string():
     """MESSAGE must not land in the URL: prompts are large (414 risk) and are
     routinely captured verbatim in HTTP access logs and traces. Same reason
