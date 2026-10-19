@@ -84,7 +84,13 @@ def check(run_id: Optional[str], agent: str) -> None:
         raise
     except (TypeError, KeyError, AttributeError):
         raise PlanInputsChangedError(_UNREADABLE_MESSAGE) from None
-    if profiles.get(agent) != _profile_digest(agent):
+    current = _profile_digest(agent)
+    if current is None:
+        raise PlanInputsChangedError(
+            f"Agent profile '{agent}' was not recorded at this run's approval check or "
+            "cannot be read now; start a new run."
+        )
+    if profiles.get(agent) != current:
         raise PlanInputsChangedError(
             f"Agent profile '{agent}' changed after this run was approved; start a new run."
         )

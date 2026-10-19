@@ -301,3 +301,25 @@ def test_check_rejects_corrupt_launch_guards_when_approval_is_on(monkeypatch, gu
 
     with pytest.raises(launch_guard.PlanInputsChangedError, match="unreadable"):
         launch_guard.check("run-1", "worker")
+
+
+@pytest.mark.parametrize("agent", ["unreadable", "Task-worker-abcd"])
+@pytest.mark.parametrize("recorded", [{}, {"unreadable": None, "Task-worker-abcd": None}])
+def test_check_refuses_none_profile_digest(monkeypatch, agent, recorded):
+    row = _script_row(json.dumps({"launch_guard": {"profiles": recorded, "memory_enabled": False}}))
+    monkeypatch.setattr(
+        launch_guard.settings_service, "resolve_workflow_approval_posture", lambda: _posture(True)
+    )
+    monkeypatch.setattr(launch_guard.workflow_journal, "get_run", lambda run_id: row)
+    read_source = launch_guard.agent_profiles._read_agent_profile_source
+
+    def unreadable(name):
+        if name == "unreadable":
+            raise OSError("profile unreadable")
+        return read_source(name)  # the real reserved-name reader refuses ephemeral names
+
+    monkeypatch.setattr(launch_guard.agent_profiles, "_read_agent_profile_source", unreadable)
+    assert launch_guard._profile_digest(agent) is None
+    monkeypatch.setattr(launch_guard.settings_service, "is_memory_enabled", lambda: False)
+    with pytest.raises(launch_guard.PlanInputsChangedError, match="not recorded.*cannot be read"):
+        launch_guard.check("run-1", agent)
