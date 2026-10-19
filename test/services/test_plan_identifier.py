@@ -28,6 +28,7 @@ def _fields(**overrides) -> PlanFields:
         permissions={},
         limits={},
         retry_policy={},
+        profile_set="sha256:deadbeef",
     )
     return dataclasses.replace(base, **overrides) if overrides else base
 
@@ -45,7 +46,7 @@ def test_the_digest_of_a_known_field_set_is_pinned():
     just been invalidated. Update the literal ONLY together with a scheme-version bump.
     """
     assert compute(_fields()) == (
-        "plan-v1:0743b0b78d9c2a75c770a6aad22caa4681d5e4705d155e0ab98482bb2cf728d0"
+        "plan-v2:ec6beef6ea6aa9dc7bdde5a5e922aa8e74028ae1133e80c6104956432e1a1081"
     )
 
 
@@ -66,9 +67,10 @@ def test_changing_each_field_in_turn_changes_the_value():
         "permissions": {"write": True},
         "limits": {"steps": 5},
         "retry_policy": {"retries": 2},
+        "profile_set": "sha256:cafe",
     }
     assert set(altered) == {f.name for f in dataclasses.fields(PlanFields)}, (
-        "every one of the nine fields must be exercised; this guard catches a field added to "
+        "every one of the ten fields must be exercised; this guard catches a field added to "
         "PlanFields without being added here"
     )
     for name, value in altered.items():
@@ -79,9 +81,9 @@ def test_the_output_shape_is_fixed_regardless_of_input_size():
     """72 characters, no user bytes: neither an injection nor a growth vector."""
     for inputs in ({}, {"k": "v"}, {"big": "x" * 100_000}):
         value = compute(_fields(inputs=inputs))
-        assert value.startswith("plan-v1:")
+        assert value.startswith("plan-v2:")
         assert len(value) == 72
-        hex_part = value[len("plan-v1:") :]
+        hex_part = value[len("plan-v2:") :]
         assert len(hex_part) == 64
         assert hex_part == hex_part.lower()
         assert all(c in "0123456789abcdef" for c in hex_part)
@@ -122,7 +124,7 @@ def test_distinct_large_integers_have_distinct_plan_ids():
 
 
 def test_an_oversized_integer_can_be_hashed():
-    assert compute(_fields(inputs={"n": 10**400})).startswith("plan-v1:")
+    assert compute(_fields(inputs={"n": 10**400})).startswith("plan-v2:")
 
 
 def test_booleans_are_not_normalised_into_numbers():
@@ -150,16 +152,28 @@ def test_framing_is_injective_where_a_naive_join_would_collide():
 # ---------------------------------------------------------------------------
 
 
-def test_scheme_of_reports_three_states():
-    assert scheme_of(compute(_fields())) == "plan-v1"
+def test_scheme_of_reports_four_states():
+    assert scheme_of(compute(_fields())) == "plan-v2"
+    assert scheme_of("plan-v1:" + "a" * 64) == "plan-v1"
     assert scheme_of("v2:" + "a" * 64) == "unknown"
     assert scheme_of(None) == "absent"
     assert scheme_of("") == "absent"
 
 
+def test_a_superseded_scheme_is_not_reported_as_unknown():
+    """Issue #827's migration, classified. A pre-#827 row is EXPECTED, not corrupt.
+
+    The two answers carry different remedies — ``plan-v1`` means "re-approve, the rules changed",
+    ``unknown`` means "nobody can say what computed this" — so collapsing the first into the second
+    would make a routine migration look like database damage on every pre-#827 run row.
+    """
+    assert scheme_of("plan-v1:" + "0" * 64) == "plan-v1"
+    assert scheme_of("plan-v1:" + "0" * 64) != scheme_of("v9:" + "0" * 64)
+
+
 def test_scheme_of_never_raises():
     for value in (None, "", "plan-v1:", "garbage", "\x00", "plan-v2:abc", "a" * 10_000):
-        assert scheme_of(value) in {"plan-v1", "unknown", "absent"}
+        assert scheme_of(value) in {"plan-v2", "plan-v1", "unknown", "absent"}
 
 
 def test_absent_is_distinguishable_from_unknown():

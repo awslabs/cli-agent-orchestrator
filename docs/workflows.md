@@ -453,9 +453,24 @@ default.
 For a working directory outside any Git repository, the plan identifier records the directory's canonical path and nothing about its contents.
 
 A script-tier run freezes an **execution manifest** at run start — the workflow's source hash, its
-resolved inputs, and the repository/worktree baseline — and derives a **plan identifier** (`plan_id`,
-of the form `plan-v1:<digest>`) from the execution-affecting fields. Change any of them and the
-`plan_id` changes, which is the mechanism by which a changed plan needs its own approval.
+resolved inputs, the repository/worktree baseline, and a digest of the installed agent profile set —
+and derives a **plan identifier** (`plan_id`, of the form `plan-v2:<digest>`) from the
+execution-affecting fields. Change any of them and the `plan_id` changes, which is the mechanism by
+which a changed plan needs its own approval.
+
+> **The agent profile set is part of plan identity, and the whole set is.** A step's behaviour and tool
+> policy come from whichever agent profile it names, resolved from a file outside the script at launch
+> time, so editing a profile changes how an approved plan executes. Script-tier steps are discovered by
+> executing the Python, so at approval time there is no list of which profiles a run will name — the
+> digest therefore covers **every installed profile**, not just the ones a script happens to use. The
+> practical consequence: `cao agent install <anything>`, or editing any profile in your agent store,
+> invalidates every existing approval and the next run of each plan is refused until re-approved.
+
+> **Migration: `plan-v1` approvals do not carry over.** Approvals recorded before the profile set
+> became part of plan identity are keyed by a `plan-v1:` digest that can no longer be produced, so the
+> first run of every plan after upgrading is refused with a new `plan-v2:` identifier to approve. This
+> is intentional: a `plan-v1` approval attested to a plan whose agent profiles were never examined.
+> Re-approve once per plan.
 
 ### It is on by default
 
@@ -552,7 +567,7 @@ been approved yet**. The loop is:
 
 ```bash
 cao workflow run my-script          # refused; the error carries the plan_id
-cao workflow approve plan-v1:<digest>
+cao workflow approve plan-v2:<digest>
 cao workflow run my-script          # starts
 ```
 

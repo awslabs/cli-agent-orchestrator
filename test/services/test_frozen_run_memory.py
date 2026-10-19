@@ -154,7 +154,7 @@ def test_filling_the_record_does_not_change_the_plan_id(journalled_run, resolves
         retry_policy=None,
     )
     assert "memory" not in plan_identifier.PlanFields.__dataclass_fields__
-    assert plan_identifier.compute(fields).startswith("plan-v1:")
+    assert plan_identifier.compute(fields).startswith("plan-v2:")
 
 
 # ---------------------------------------------------------------------------
