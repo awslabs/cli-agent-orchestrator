@@ -71,6 +71,28 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
         ],
         "web_fetch": ["WebFetch", "WebSearch"],
     },
+    # Kiro CLI. The agent JSON's ``tools`` field is AVAILABILITY (a tool not
+    # listed does not exist for the agent); ``allowedTools`` only names tools
+    # that run without an approval prompt. CAO writes the resolved policy into
+    # ``tools`` at install time (``kiro_agent_tools``). Both spellings of each
+    # built-in are listed: kiro-cli 2.25 names them read/write/shell/glob/grep
+    # and still accepts the older fs_read/fs_write/execute_bash as aliases;
+    # 2.22 documented the older names. A name a version does not know is
+    # silently ignored, so listing both keeps the grant identical on either.
+    # Privilege-equivalence, as for Claude Code above: ``subagent`` spawns an
+    # agent with its own tool set and ``use_aws`` runs AWS CLI calls, so both
+    # gate with execute_bash; ``code`` can write files (pattern_rewrite), so it
+    # gates with fs_write; ``knowledge`` reads and indexes files, so fs_read.
+    # goal/introspect/todo_list are the harmless chrome ``@builtin`` grants
+    # (KIRO_BUILTIN_CHROME). Measured on kiro-cli 2.25.0, 2026-09-29.
+    "kiro_cli": {
+        "execute_bash": ["execute_bash", "shell", "subagent", "use_aws"],
+        "fs_read": ["fs_read", "read", "knowledge"],
+        "fs_write": ["fs_write", "write", "code"],
+        "fs_list": ["glob", "grep"],
+        "fs_*": ["fs_read", "read", "knowledge", "fs_write", "write", "code", "glob", "grep"],
+        "web_fetch": ["web_fetch", "web_search"],
+    },
     # Antigravity CLI (agy) shares Google's gemini-style tool vocabulary
     # (write_file/read_file/run_shell_command/...). Restrictions are enforced
     # softly via the injected security prompt (see SOFT_ENFORCEMENT_PROVIDERS).
@@ -101,14 +123,19 @@ for _provider, _mapping in TOOL_MAPPING.items():
 
 
 def _get_role_defaults(role: str) -> List[str] | None:
-    """Look up allowedTools for a role (built-in or custom from settings)."""
+    """Look up allowedTools for a role: settings.json first, then the built-ins.
+
+    Operator configuration outranks shipped defaults, the same rule by which an
+    explicit ``allowedTools`` outranks ``role``. The order matters when a name
+    exists in both places: a saved ``workflow_scout`` policy of ``["fs_read",
+    "fs_list"]`` must keep resolving to that list after CAO ships a built-in of
+    the same name, not gain ``execute_bash`` on upgrade. A settings role that
+    shadows a built-in is logged by name so the override is visible.
+
+    Every role resolution now reads settings.json, where built-ins used to
+    resolve without touching disk; custom roles already paid that read.
+    """
     from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS
-
-    # Check built-in roles first
-    if role in ROLE_TOOL_DEFAULTS:
-        return list(ROLE_TOOL_DEFAULTS[role])
-
-    # Check custom roles from settings.json
     from cli_agent_orchestrator.services.settings_service import _load
 
     settings = _load()
@@ -119,8 +146,16 @@ def _get_role_defaults(role: str) -> List[str] | None:
     else:
         # Legacy flat format: {"roles": {...}}
         custom_roles = settings.get("roles", {})
-    if role in custom_roles:
+    if isinstance(custom_roles, dict) and role in custom_roles:
+        if role in ROLE_TOOL_DEFAULTS:
+            logger.warning(
+                f"Role {role!r} is defined in settings.json and shadows the built-in "
+                "role of the same name; the settings.json definition is used."
+            )
         return list(custom_roles[role])
+
+    if role in ROLE_TOOL_DEFAULTS:
+        return list(ROLE_TOOL_DEFAULTS[role])
 
     return None
 
@@ -134,8 +169,11 @@ def resolve_allowed_tools(
 
     Resolution order:
     1. profile_allowed_tools (explicit in profile or --allowed-tools CLI)
-    2. Role-based defaults (built-in or custom from settings.json)
-    3. Unrestricted ["*"] (backward compatible — no role/allowedTools = no restrictions)
+    2. Role defaults: a custom role from settings.json, else the built-in of that name
+    3. Developer defaults when role and allowedTools are both omitted
+
+    An unrecognized role raises ValueError. A typo must not be more
+    privileged than omitting the field.
 
     MCP server names are appended as ``@server_name`` to a list CAO chose, so
     declaring a server in ``mcpServers`` is enough to use it. They are NOT
@@ -154,12 +192,10 @@ def resolve_allowed_tools(
         if role_defaults is not None:
             allowed = role_defaults
         else:
-            logger.warning(
-                "Unknown role '%s' — falling back to unrestricted. "
-                "Define custom roles in settings.json under 'roles'.",
-                role,
+            raise ValueError(
+                f"Unknown role {role!r}. Define it in settings.json under "
+                "'roles', or omit role for developer defaults."
             )
-            allowed = ["*"]
     else:
         # No role, no allowedTools — default to developer (secure default)
         from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS
@@ -251,6 +287,38 @@ def granted_mcp_servers(
             name for name in names if name == pattern or fnmatch.fnmatchcase(name, pattern)
         )
     return sorted(granted)
+
+
+#: Kiro built-ins that ``@builtin`` grants on the ``tools`` axis: the ones that
+#: can neither run commands, write files nor reach the network. On Kiro a bare
+#: ``@builtin`` in ``tools`` means EVERY built-in, shell included, so it must
+#: not pass through as written (the reviewer default would gain a shell).
+KIRO_BUILTIN_CHROME: List[str] = ["goal", "introspect", "todo_list"]
+
+
+def kiro_agent_tools(allowed: List[str]) -> List[str]:
+    """Translate a resolved CAO allowlist into Kiro's ``tools`` availability list.
+
+    ``["*"]`` stays ``["*"]``. Otherwise each CAO capability becomes the Kiro
+    built-ins it maps to (both spellings, see ``TOOL_MAPPING["kiro_cli"]``),
+    ``@builtin`` becomes the harmless chrome only, and any other ``@`` entry
+    (``@server`` or ``@server/tool``) passes through: Kiro reads those forms
+    itself. An empty allowlist yields an empty ``tools`` list, which in Kiro
+    is an agent with no tools -- the deny-everything a profile asked for.
+    Sorted, so two installs of the same profile write the same bytes.
+    """
+    if "*" in allowed:
+        return ["*"]
+    mapping = TOOL_MAPPING["kiro_cli"]
+    tools: Set[str] = set()
+    for cao_tool in allowed:
+        if cao_tool == "@builtin":
+            tools.update(KIRO_BUILTIN_CHROME)
+        elif cao_tool.startswith("@"):
+            tools.add(cao_tool)
+        else:
+            tools.update(mapping.get(cao_tool, ()))
+    return sorted(tools)
 
 
 def get_disallowed_tools(provider: str, allowed: List[str]) -> List[str]:

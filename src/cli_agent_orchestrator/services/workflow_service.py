@@ -161,6 +161,11 @@ class StepRunState:
     output: Optional[StepOutputRecord] = None
     terminal_id: Optional[str] = None
     error: Optional[str] = None
+    # Structured failure kind, mirrored from ``StepExecutionError.kind`` on a
+    # failed attempt and cleared when the step later settles (issue #638). Carried
+    # in memory so ``_build_result`` can surface it on the run's result envelope;
+    # the DURABLE copy is the ``workflow_run_step.error_kind`` column.
+    error_kind: Optional[str] = None
     # In-memory carrier for the step's ``v2`` call fingerprint (issue #583, unit
     # ``settlement-rewire``, BR-2/TD-3). ``run_agent_step`` COMPUTES the value in the one
     # window BR-5 permits — after working-directory resolution, before terminal creation —
@@ -520,10 +525,10 @@ def _substitute(template: str, record: RunRecord) -> str:
     return _PLACEHOLDER_RE.sub(_resolve, template)
 
 
-def _reprompt_prompt(step: WorkflowStep) -> str:
+def _reprompt_prompt(step: WorkflowStep, prompt: str) -> str:
     """A corrective prompt restating the schema and asking for a valid return (§3)."""
     return (
-        f"{step.prompt}\n\n"
+        f"{prompt}\n\n"
         "Your previous turn did not produce a valid structured output for this "
         "workflow step. Call the `workflow_return` tool with output that matches "
         f"this JSON-Schema:\n{step.output_schema}"
@@ -639,7 +644,9 @@ def _topological_order(spec: WorkflowSpec) -> List[WorkflowStep]:
     return [by_id[sid] for sid in order]
 
 
-async def _collect_structured_output(record: RunRecord, step: WorkflowStep) -> StepState:
+async def _collect_structured_output(
+    record: RunRecord, step: WorkflowStep, prompt: str
+) -> StepState:
     """Collect the structured return for a COMPLETED step; reprompt once (§3).
 
     - No ``output_schema`` -> free-form, trivially ``COMPLETED``.
@@ -679,7 +686,7 @@ async def _collect_structured_output(record: RunRecord, step: WorkflowStep) -> S
         result = await run_agent_step(
             provider=step.provider,
             agent=step.agent,
-            prompt=_reprompt_prompt(step),
+            prompt=_reprompt_prompt(step, prompt),
             teardown=True,
             timeout=WORKFLOW_STEP_TIMEOUT,
             engine=step.engine,
@@ -779,7 +786,7 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
             # Resolve the structured return INSIDE the try so a crash during the
             # reprompt (§3 re-raises StepExecutionError) is caught below and
             # consumes an attempt (Q6=A, Trace C).
-            outcome = await _collect_structured_output(record, step)
+            outcome = await _collect_structured_output(record, step, prompt)
         except StepCancelledError as exc:
             # An in-flight cancel (#409b) is NOT a run-failure: do NOT consume the
             # rest of the retry budget and do NOT mark the step FAILED. Settle the
@@ -791,6 +798,9 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
             if exc.terminal_id is not None:
                 st.terminal_id = exc.terminal_id
             st.state = StepState.SKIPPED
+            # A cancelled step settled SKIPPED, not failed — never report a kind
+            # carried over from an earlier failed attempt of the same step.
+            st.error_kind = None
             await _ajournal(_journal_step, record, step.id)
             # U2 emission (BR-7): a cancellation settles the step SKIPPED — NEVER a
             # failure event. The run converges CANCELLED at the drive-loop finalize.
@@ -812,6 +822,7 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
         except StepExecutionError as exc:
             st.error = str(exc)
             last_error_kind = exc.kind
+            st.error_kind = exc.kind
             if exc.terminal_id is not None:
                 st.terminal_id = exc.terminal_id
             # BR-6: persist the structured error kind onto the step projection now
@@ -834,6 +845,9 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
             continue  # consume an attempt, retry the same prompt
         # Settled (COMPLETED or COMPLETED_UNVALIDATED) — neither is a run-failure.
         st.state = outcome
+        # A retried step that finally settled is not failed any more; clear the
+        # carried kind so the result envelope cannot report a stale failure.
+        st.error_kind = None
         # §1: persist settled state + output + attempts (error_kind cleared to NULL).
         await _ajournal(_journal_step, record, step.id)
         # U2 emission: a validated/collected output was received (validation_result
@@ -935,6 +949,7 @@ def _build_result(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRe
                 attempts=st.attempts,
                 output=st.output.output if st.output is not None else None,
                 error=st.error,
+                error_kind=st.error_kind,
             )
         )
     return WorkflowRunResult(

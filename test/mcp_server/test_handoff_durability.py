@@ -222,6 +222,27 @@ class TestGetHandoffResultAuthAndPlacement:
 
         assert mock_get.call_args[0][0] == f"{API_BASE_URL}/handoff-results/{self.JOB}"
 
+    def test_remote_retrieval_carries_no_bearer(self):
+        """``CAO_AUTH_LOCAL_TOKEN`` is this node's credential. The result row for
+        a remote handoff lives on ``target_host``, so the GET goes there, but the
+        bearer must not: whoever answers at that host would receive it. The
+        pending-handoff message tells the agent to call this tool with
+        ``target_host``, so a scoped run-step must not be followed by an
+        unscoped result fetch."""
+        with (
+            patch("cli_agent_orchestrator.mcp_server.server.requests.get") as mock_get,
+            patch(
+                "cli_agent_orchestrator.mcp_server.utils.get_local_bearer",
+                return_value="tok-123",
+            ),
+        ):
+            self._ok_get(mock_get)
+            result = get_handoff_result(self.JOB, target_host="worker-7")
+
+        assert result["success"] is True
+        assert mock_get.call_args[0][0] == f"http://worker-7:9889/handoff-results/{self.JOB}"
+        assert mock_get.call_args.kwargs["headers"] is None
+
     def test_remote_retrieval_targets_the_node_that_ran_the_step(self):
         """handoff(target_host=...) persists the row in THAT node's database, so
         querying the supervisor's own base URL is a false not-found."""

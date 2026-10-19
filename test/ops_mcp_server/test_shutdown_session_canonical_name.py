@@ -124,7 +124,7 @@ def routed_requests(monkeypatch):
         # The helpers build f"{API_BASE_URL}{path}"; TestClient wants the path.
         path = "/" + str(url).split("://", 1)[1].split("/", 1)[1]
         calls.append((method.lower(), path))
-        return client.request(method.upper(), path, params=params, json=json)
+        return client.request(method.upper(), path, params=params, json=json, headers=headers)
 
     monkeypatch.setattr(ops_server.requests, "request", _dispatch)
     return calls

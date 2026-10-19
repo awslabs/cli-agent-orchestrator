@@ -594,6 +594,19 @@ def test_a_settle_makes_exactly_one_settle_step_call(monkeypatch: pytest.MonkeyP
 # ---------------------------------------------------------------------------
 # BR-7 / SR-8 — the returned bool is logged as an OBSERVATION, never a conclusion
 # ---------------------------------------------------------------------------
+def test_a_failed_settle_persists_provider_error_kind():
+    _script_record("run-provider-error")
+    settle = record_step_completion(_env("run-provider-error", "s1"))
+    assert settle is not None
+
+    settle("term-provider", "provider error (api_error)", None, None, "provider_error")
+
+    row = workflow_journal.get_step("run-provider-error", "s1")
+    assert row is not None
+    assert row.state == "failed"
+    assert row.error_kind == "provider_error"
+
+
 def test_a_settle_with_no_prior_row_logs_the_exact_observation(caplog: pytest.LogCaptureFixture):
     """The wording is BINDING (unit 6 TD-2a), not advisory.
 

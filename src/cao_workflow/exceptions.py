@@ -14,6 +14,8 @@ DIVERGENCE as well as ordinary failures — both arrive as ``.status == 409``
 
 from __future__ import annotations
 
+import json
+
 
 class ShimError(Exception):
     """Base for all cao_workflow-raised errors.
@@ -37,9 +39,29 @@ class ShimTransportError(ShimError):
 
 
 class ShimHTTPError(ShimError):
-    """Non-200 response. Carries .status and .body verbatim for author diagnosis."""
+    """Non-200 response. Carries .status and .body verbatim for author diagnosis.
+
+    A non-empty string ``detail.kind`` renders beside the status, followed by a
+    non-empty string ``detail.message`` when present; otherwise the exact fallback
+    is ``run-step returned HTTP <status>``. The original ``.body`` is never altered.
+    """
 
     def __init__(self, status: int, body: str) -> None:
         self.status = status
         self.body = body
-        super().__init__(f"run-step returned HTTP {status}")
+        message = f"run-step returned HTTP {status}"
+        try:
+            payload = json.loads(body)
+        except (ValueError, TypeError, RecursionError):
+            # Invalid JSON, a non-string body, or excessive nesting all use the fallback.
+            payload = None
+        if isinstance(payload, dict):
+            detail = payload.get("detail")
+            if isinstance(detail, dict):
+                kind = detail.get("kind")
+                if isinstance(kind, str) and kind:
+                    message += f" ({kind})"
+                    detail_message = detail.get("message")
+                    if isinstance(detail_message, str) and detail_message:
+                        message += f": {detail_message}"
+        super().__init__(message)

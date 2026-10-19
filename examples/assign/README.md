@@ -163,26 +163,31 @@ to reach a different terminal.
 cao-server
 ```
 
-2. Install the agent profiles:
+2. Install the agent profiles for the provider that you will use:
 ```bash
-cao install examples/assign/analysis_supervisor.md
-cao install examples/assign/data_analyst.md
-cao install examples/assign/report_generator.md
+PROVIDER=kiro_cli  # or claude_code, codex, antigravity_cli, copilot_cli, cursor_cli, kimi_cli, grok_cli
+for profile in analysis_supervisor data_analyst report_generator; do
+  cao install examples/assign/$profile.md --provider $PROVIDER
+done
 ```
 
-3. Launch the supervisor:
-```bash
-# Using default provider (kiro_cli)
-cao launch --agents analysis_supervisor
+`cao install` records the provider in the installed profile. A worker that
+the supervisor starts with `assign` or `handoff` uses the provider of its
+own profile, not the provider of the supervisor. Without `--provider`, the
+profiles record `kiro_cli`, so a supervisor that you launch on Codex starts
+Kiro CLI workers.
 
-# Or specify a different provider
-cao launch --agents analysis_supervisor --provider claude_code
-cao launch --agents analysis_supervisor --provider codex
-cao launch --agents analysis_supervisor --provider copilot_cli
-cao launch --agents analysis_supervisor --provider cursor_cli
-cao launch --agents analysis_supervisor --provider kimi_cli
-cao launch --agents analysis_supervisor --provider grok_cli
+3. In the same shell, launch the supervisor with the same provider:
+```bash
+cao launch --agents analysis_supervisor --provider $PROVIDER
 ```
+
+Provider notes:
+
+- `antigravity_cli`: every `agy` process reads the MCP servers of all CAO
+  terminals from one file, `~/.gemini/config/mcp_config.json`. A worker can
+  therefore call a CAO tool through the server of another terminal
+  ([#532](https://github.com/awslabs/cli-agent-orchestrator/issues/532)).
 
 ## Usage
 

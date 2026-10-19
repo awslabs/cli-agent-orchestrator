@@ -56,8 +56,12 @@ emit_output({"reviewed": True})
 - **Errors are typed and never retried:** `ShimIdentityError` (identity env
   missing — nothing was attempted), `ShimTransportError` (network failure,
   wraps the underlying `urllib` error), `ShimHTTPError` (non-2xx response,
-  carries `.status`/`.body`). All four (`ShimError` plus these three
-  subclasses) are importable from `cao_workflow` directly:
+  carries `.status`/`.body`). When the response has a non-empty string
+  `detail.kind`, `str(ShimHTTPError)` prints
+  `run-step returned HTTP <status> (<kind>): <message>` (omitting the message
+  suffix when absent); unstructured responses keep the original
+  `run-step returned HTTP <status>` text. All four (`ShimError` plus these
+  three subclasses) are importable from `cao_workflow` directly:
   `from cao_workflow import run_step, ShimHTTPError`.
 - **`step_id` is required for concurrent fan-out.** If you call `step` or
   `run_step` from more than one thread (e.g. via `concurrent.futures`), pass an
@@ -243,8 +247,8 @@ it.
 
 Inside your script a halt arrives as a `ShimHTTPError` with `.status == 409`,
 whose `.body` names `kind: "decision_required"`, the `step_id`, and which
-condition fired. Resolve it by naming a decision per halted step and resuming
-again:
+condition fired; `str(exc)` now shows `(decision_required)` and the message too.
+Resolve it by naming a decision per halted step and resuming again:
 
 ```bash
 cao workflow resume <run-id> --decide <step_id>=rerun   # re-execute that step
@@ -260,9 +264,10 @@ consent. **Consent does not persist across resumes** — one `rerun` is never
 standing authorisation for a later one, and must never be presented to a user
 as though it were.
 
-A divergence arrives the same way, as a `409` with `kind: "diverged"`, but it
-has a different remedy: there is no decision to make, because the fix is to
-look at what changed in the script at that step key.
+A divergence arrives the same way, as a `409` with `kind: "diverged"`, and
+`str(exc)` shows `(diverged)` too, but it has a different remedy: there is no
+decision to make, because the fix is to look at what changed in the script at
+that step key.
 
 **Do not let a blanket `except ShimError` swallow either one.**
 `ShimHTTPError` is a `ShimError`, so a catch-all written for per-unit timeout

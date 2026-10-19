@@ -22,6 +22,21 @@ def test_grok_uses_runtime_skills_with_native_tool_enforcement():
     assert "grok_cli" not in SOFT_ENFORCEMENT_PROVIDERS
 
 
+def test_none_enforcement_providers_are_in_the_soft_set():
+    """hermes and cursor_cli apply no restriction, so the create-terminal warning
+    must fire for a restricted profile on them, and must not for a provider that
+    enforces natively. kiro_cli (the default provider) left this set when
+    `cao install` started writing the policy into the agent JSON's `tools`; a
+    profile installed before that is caught by the stale-install warning instead
+    (see kiro_install_predates_native_enforcement)."""
+    from cli_agent_orchestrator.services.terminal_service import SOFT_ENFORCEMENT_PROVIDERS
+
+    assert {"hermes", "cursor_cli"} <= SOFT_ENFORCEMENT_PROVIDERS
+    assert {"claude_code", "copilot_cli", "opencode_cli", "grok_cli", "kiro_cli"}.isdisjoint(
+        SOFT_ENFORCEMENT_PROVIDERS
+    )
+
+
 def test_minimax_code_uses_runtime_skills_with_soft_tool_enforcement():
     from cli_agent_orchestrator.services.terminal_service import (
         RUNTIME_SKILL_PROMPT_PROVIDERS,
@@ -424,6 +439,9 @@ class TestListSiblingsDepthClamping:
         assert result == [
             {"id": "sib-1", "group": ["tenant_1"], "metadata": None, "status": "idle"}
         ]
+        assert set(result[0]) == {"id", "group", "metadata", "status"}
+        assert "model" not in result[0]
+        assert "model_honored" not in result[0]
 
     @patch(f"{_TS}.status_monitor")
     @patch(f"{_TS}.list_siblings_by_group_prefix")

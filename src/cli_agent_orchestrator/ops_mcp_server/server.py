@@ -334,6 +334,9 @@ async def _launch_session_impl(
         if validated_env:
             body["env_vars"] = validated_env
 
+    if not session_name:
+        body = {**(body or {}), "description": None}
+
     session_data, error = _request_json(
         "post", "/sessions", params=params, json=body, operation="Launch session"
     )
@@ -918,18 +921,28 @@ async def shutdown_session(
     return {"success": False, "message": "Shutdown session failed: invalid response payload"}
 
 
+from cli_agent_orchestrator.ops_mcp_server.decision_tools import (  # noqa: E402
+    register_decision_tools,
+)
+
 # Plugins may add operator-facing tools here too (the cao_quota plugin's
 # provider_availability / record_provider_refusal, for example): an external
 # coordinator that only speaks to cao-ops otherwise has no way to reach them.
 # Same best-effort entry-point registration the in-session server performs.
 from cli_agent_orchestrator.plugins.registry import register_mcp_server_surfaces  # noqa: E402
 
+register_decision_tools(mcp)
 register_mcp_server_surfaces(mcp)
 
 
 def main() -> None:
-    """Run the operations MCP server."""
-    mcp.run()
+    """Run the operations MCP server over stdio.
+
+    The transport is pinned: FastMCP otherwise honours ``FASTMCP_TRANSPORT`` from
+    the environment, and an ``http`` value would turn this stdio tool into a
+    network listener with no MCP-level authentication in front of the API hop.
+    """
+    mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

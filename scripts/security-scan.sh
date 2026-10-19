@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Local mirror of the `security` and `codeql` CI jobs so contributors can catch
+# Local mirror of the `dependency-security`, `security`, and `codeql` CI jobs.
+# Contributors can catch
 # SSRF/path-injection/SCA/secret findings before pushing. Exits non-zero on any
 # scanner failure so it's safe to wire into pre-push hooks or Makefile targets.
 #
 # Usage:
-#   scripts/security-scan.sh                 # run every available scanner
+#   scripts/security-scan.sh                 # full dependency gate, then available other scanners
 #   scripts/security-scan.sh trivy           # just Trivy
+#   scripts/security-scan.sh dependencies    # full locked dependency gate
 #   scripts/security-scan.sh codeql          # just CodeQL (python)
 #   scripts/security-scan.sh gitleaks        # just gitleaks (secret scan, #457)
 #
@@ -129,11 +131,13 @@ run_gitleaks() {
 }
 
 case "$target" in
+    dependencies) python3 scripts/dependency_security.py || exit_code=1 ;;
     trivy)    run_trivy ;;
     codeql)   run_codeql ;;
     gitleaks) run_gitleaks ;;
-    all)      run_trivy; run_codeql; run_gitleaks ;;
-    *)        echo "Unknown target: $target (use trivy|codeql|gitleaks|all)"; exit 2 ;;
+    all)      python3 scripts/dependency_security.py || exit_code=1
+              run_trivy; run_codeql; run_gitleaks ;;
+    *)        echo "Unknown target: $target (use dependencies|trivy|codeql|gitleaks|all)"; exit 2 ;;
 esac
 
 exit "$exit_code"

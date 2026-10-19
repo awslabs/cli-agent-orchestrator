@@ -844,7 +844,8 @@ class TestReferencedPathsExist:
 
     @pytest.mark.parametrize("quoted", re.findall(EXAMPLE_PATH_PATTERN, SKILL.read_text()))
     def test_every_referenced_example_path_exists(self, quoted: str):
-        path = REPO_ROOT / quoted.rstrip("/")
+        # A workflow path filter such as `examples/x/images/**` names its folder.
+        path = REPO_ROOT / quoted.removesuffix("**").rstrip("/")
         assert path.exists(), (
             f"The skill references {quoted}, which does not exist. "
             "Paths in a skill are instructions an agent will follow literally."
@@ -991,6 +992,15 @@ class TestOtherPrGatingWorkflowsAreDocumented:
             f"{workflow!r} is {'path-filtered' if filtered else 'run on every PR'}, "
             f"but the skill says it runs on: {runs_on!r}."
         )
+
+    def test_docs_trigger_summary_lists_every_input_path(self):
+        spec = yaml.safe_load((WORKFLOWS_DIR / "gh-pages.yml").read_text())
+        file_cell, _, runs_on, _ = _other_workflow_rows()[spec["name"]]
+        documented = set(re.findall(r"`([^`]+)`", runs_on))
+        documented.add(f".github/workflows/{file_cell}")
+        trigger = _pull_request_trigger(spec)
+        assert isinstance(trigger, dict)
+        assert documented == set(trigger["paths"])
 
     @pytest.mark.parametrize("workflow", sorted(_pr_gating_workflows()))
     def test_the_verdict_matches_job_level_continue_on_error(self, workflow: str):

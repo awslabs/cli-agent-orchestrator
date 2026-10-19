@@ -65,6 +65,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import cao_workflow
 from cli_agent_orchestrator.clients.database import (
     _migrate_workflow_run,
     _migrate_workflow_run_step,
@@ -452,6 +453,7 @@ class TestDivergedArm:
         detail = resp.json()["detail"]
         assert detail["kind"] == "diverged"
         assert detail["step_id"] == "s1"
+        assert "(diverged)" in str(cao_workflow.ShimHTTPError(resp.status_code, resp.text))
         # BR-7: no ``rule`` key AT ALL — divergence is always the same condition,
         # and a constant attribute is the inert-field trap.
         assert "rule" not in detail
@@ -473,6 +475,7 @@ class TestDecisionRequiredArm:
         assert detail["kind"] == "decision_required"
         assert detail["step_id"] == "s1"
         assert detail["rule"] == HaltRule.INTERRUPTED_NO_POLICY.value
+        assert "(decision_required)" in str(cao_workflow.ShimHTTPError(resp.status_code, resp.text))
         m_run.assert_not_awaited()
 
     def test_the_two_kinds_are_distinguishable_from_the_fence_and_each_other(self, client):
@@ -500,6 +503,10 @@ class TestDecisionRequiredArm:
         # The fence's detail is a plain string, so it can never be mistaken for
         # either structured kind.
         assert isinstance(r_fence.json()["detail"], str)
+        assert (
+            str(cao_workflow.ShimHTTPError(r_fence.status_code, r_fence.text))
+            == "run-step returned HTTP 409"
+        )
 
 
 # ---------------------------------------------------------------------------

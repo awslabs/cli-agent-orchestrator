@@ -594,7 +594,7 @@ def test_u10_live_event_following_renders_ordered_progress_and_declared_gap():
     # to assert the interactive progress + gap lines.
     with (
         mock.patch(
-            "cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream
         ),
         mock.patch(
             "cli_agent_orchestrator.cli.commands.workflow._machine_mode", return_value=False
@@ -626,7 +626,7 @@ def test_u10_follower_does_not_infer_gap_from_seq_numbering():
         _u10_event_frame(23, "run.completed", None, "completed"),
     )
     with mock.patch(
-        "cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream
     ):
         result = CliRunner().invoke(workflow, ["events", "run1"])
     assert result.exit_code == 0

@@ -18,18 +18,30 @@
  * A relative `--base` such as `./` cannot work for runtime calls and is not
  * supported; use an absolute prefix.
  */
+import { tokenQuery, withAuth } from './auth'
+
 const BASE = import.meta.env.BASE_URL.replace(/\/$/, '')
 
-/** URL for the terminal's xterm WebSocket, honouring BASE. */
+/**
+ * URL for the terminal's xterm WebSocket, honouring BASE. Carries the stored
+ * bearer as `?token=` when one is set: a browser cannot put a header on a
+ * WebSocket handshake, and the server accepts the token from that query
+ * parameter (and redacts it from its access log).
+ */
 export function terminalSocketUrl(terminalId: string): string {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${protocol}//${location.host}${BASE}/terminals/${terminalId}/ws`
+  return `${protocol}//${location.host}${BASE}/terminals/${terminalId}/ws${tokenQuery('token', false)}`
 }
 
-/** URL for a workflow run's SSE event stream, honouring BASE. */
+/**
+ * URL for a workflow run's SSE event stream, honouring BASE. Carries the stored
+ * bearer as `?access_token=` when one is set, which is what the route accepts
+ * for clients that cannot send headers; the `fetch`-based follower sends the
+ * header as well.
+ */
 export function eventStreamUrl(runId: string, afterSeq?: number): string {
   const q = afterSeq != null ? `?after_seq=${afterSeq}` : ''
-  return `${BASE}/workflows/runs/${encodeURIComponent(runId)}/events${q}`
+  return `${BASE}/workflows/runs/${encodeURIComponent(runId)}/events${q}${tokenQuery('access_token', q !== '')}`
 }
 
 /**
@@ -50,7 +62,7 @@ async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: numb
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), opts?.timeoutMs ?? 10000)
   try {
-    const res = await fetch(`${BASE}${url}`, { ...opts, signal: controller.signal })
+    const res = await fetch(`${BASE}${url}`, { ...opts, headers: withAuth(opts?.headers), signal: controller.signal })
     if (!res.ok) {
       // Best-effort read of the JSON error body to expose the server's
       // `detail` without leaking a full response. A non-JSON body is fine —
@@ -97,6 +109,7 @@ export interface Session {
 }
 
 export interface Terminal {
+  description: string | null
   id: string
   name: string
   provider: string
@@ -112,7 +125,9 @@ export interface SessionDetail {
 }
 
 export interface TerminalMeta {
+  description: string | null
   id: string
+  pending_inbox_count?: number
   tmux_session: string
   tmux_window: string
   provider: string
@@ -574,6 +589,9 @@ export interface PluginInstallBody {
   force?: boolean
 }
 
+export let sessionDescriptionRevision = 0
+export const SESSION_DESCRIPTION_READ_ATTEMPTS = 3
+
 export const api = {
   // Agent Profiles & Providers
   listProfiles: () => fetchJSON<AgentProfileInfo[]>('/agents/profiles'),
@@ -646,7 +664,16 @@ export const api = {
 
   // Sessions
   listSessions: () => fetchJSON<Session[]>('/sessions'),
-  getSession: (name: string) => fetchJSON<SessionDetail>(`/sessions/${name}`),
+  getSession: async (name: string): Promise<SessionDetail> => {
+    // Never return a pre-edit response, but let a future poll recover if edits
+    // keep invalidating every read instead of keeping this request alive forever.
+    for (let attempt = 0; attempt < SESSION_DESCRIPTION_READ_ATTEMPTS; attempt++) {
+      const revision = sessionDescriptionRevision
+      const detail = await fetchJSON<SessionDetail>(`/sessions/${name}`)
+      if (revision === sessionDescriptionRevision) return detail
+    }
+    throw new Error('Session descriptions kept changing; retry on the next poll')
+  },
   createSession: (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string) =>
     fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: 90000 }),
   deleteSession: async (name: string) => {
@@ -661,6 +688,15 @@ export const api = {
   },
 
   // Terminals
+  updateTerminalDescription: async (id: string, description: string | null) => {
+    const terminal = await fetchJSON<Terminal>(`/terminals/${encodeURIComponent(id)}/description`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ description }),
+    })
+    sessionDescriptionRevision++
+    return terminal
+  },
   getTerminalStatus: (id: string) =>
     fetchJSON<Terminal>(`/terminals/${id}`).then(t => t.status),
   getTerminalOutput: (id: string, mode: 'full' | 'last' = 'full') =>

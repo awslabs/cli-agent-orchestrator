@@ -58,17 +58,14 @@ class TestCleanupOldData:
         mock_session_local.return_value.__enter__.return_value = mock_db
         old_terminal = MagicMock(id="retained-grok", provider="grok_cli")
         old_terminal_query = MagicMock()
-        terminal_delete_query = MagicMock()
         inbox_query = MagicMock()
         idempotency_query = MagicMock()
         mock_db.query.side_effect = [
             old_terminal_query,
-            terminal_delete_query,
             inbox_query,
             idempotency_query,
         ]
         old_terminal_query.filter.return_value.all.return_value = [old_terminal]
-        terminal_delete_query.filter.return_value.filter.return_value.delete.return_value = 0
         inbox_query.filter.return_value.delete.return_value = 0
         idempotency_query.filter.return_value.delete.return_value = 0
         mock_provider_manager.cleanup_provider.return_value = False
@@ -78,7 +75,6 @@ class TestCleanupOldData:
         cleanup_old_data()
 
         mock_provider_manager.cleanup_provider.assert_called_once_with("retained-grok")
-        terminal_delete_query.filter.return_value.filter.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.cleanup_service.status_monitor")
     @patch("cli_agent_orchestrator.services.cleanup_service.fifo_manager")
@@ -109,11 +105,86 @@ class TestCleanupOldData:
         cleanup_old_data()
 
         # Verify cleanup was called:
-        # Session 1: query.all() for terminal iteration + query.delete() for terminal deletion
-        # Session 2: query.delete() for inbox deletion
-        # Session 3: query.delete() for idempotency-key deletion
+        # Session 1: terminal iteration. No old rows => no terminal row delete.
+        # Sessions 2/3: inbox and idempotency-key deletes.
         assert mock_db.query.call_count >= 2
-        assert mock_db.commit.call_count == 3
+        assert mock_db.commit.call_count == 2
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.should_retain_deferred_failure_tombstone",
+        return_value=True,
+    )
+    @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
+    @patch("cli_agent_orchestrator.services.cleanup_service.TERMINAL_LOG_DIR")
+    @patch("cli_agent_orchestrator.services.cleanup_service.LOG_DIR")
+    @patch("cli_agent_orchestrator.services.cleanup_service.RETENTION_DAYS", 7)
+    def test_cleanup_old_data_never_ages_out_external_failure_tombstone(
+        self,
+        mock_log_dir,
+        mock_terminal_log_dir,
+        mock_session_local,
+        mock_retain,
+        mock_delete_row,
+    ):
+        mock_db = MagicMock()
+        mock_session_local.return_value.__enter__.return_value = mock_db
+        old_terminal = MagicMock(id="failed-kimi", provider="kimi_cli")
+        terminal_query = MagicMock()
+        inbox_query = MagicMock()
+        idempotency_query = MagicMock()
+        mock_db.query.side_effect = [terminal_query, inbox_query, idempotency_query]
+        terminal_query.filter.return_value.all.return_value = [old_terminal]
+        inbox_query.filter.return_value.delete.return_value = 0
+        idempotency_query.filter.return_value.delete.return_value = 0
+        mock_log_dir.exists.return_value = False
+        mock_terminal_log_dir.exists.return_value = False
+
+        cleanup_old_data()
+
+        mock_retain.assert_called_once_with("failed-kimi")
+        mock_delete_row.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.delete_terminal_row", return_value=True
+    )
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.should_retain_deferred_failure_tombstone",
+        return_value=False,
+    )
+    @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
+    @patch("cli_agent_orchestrator.services.cleanup_service.TERMINAL_LOG_DIR")
+    @patch("cli_agent_orchestrator.services.cleanup_service.LOG_DIR")
+    @patch("cli_agent_orchestrator.services.cleanup_service.RETENTION_DAYS", 7)
+    def test_cleanup_old_data_deletes_normal_old_row_through_lifecycle_row_delete(
+        self,
+        mock_log_dir,
+        mock_terminal_log_dir,
+        mock_session_local,
+        mock_retain,
+        mock_delete_row,
+        mock_get_meta,
+    ):
+        mock_db = MagicMock()
+        mock_session_local.return_value.__enter__.return_value = mock_db
+        old_terminal = MagicMock(id="old-normal", provider="kimi_cli")
+        terminal_query = MagicMock()
+        inbox_query = MagicMock()
+        idempotency_query = MagicMock()
+        mock_db.query.side_effect = [terminal_query, inbox_query, idempotency_query]
+        terminal_query.filter.return_value.all.return_value = [old_terminal]
+        inbox_query.filter.return_value.delete.return_value = 0
+        idempotency_query.filter.return_value.delete.return_value = 0
+        mock_get_meta.return_value = {"id": "old-normal", "tmux_session": "cao-old"}
+        mock_log_dir.exists.return_value = False
+        mock_terminal_log_dir.exists.return_value = False
+
+        cleanup_old_data()
+
+        mock_delete_row.assert_called_once_with(
+            "old-normal", mock_get_meta.return_value, registry=None
+        )
 
     @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
     @patch("cli_agent_orchestrator.services.cleanup_service.RETENTION_DAYS", 7)

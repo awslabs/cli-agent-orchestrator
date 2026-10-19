@@ -80,6 +80,8 @@ _UNQUALIFIED_PLUGIN = re.compile(r"(?<![\w-])(?<!agent )(?<!event )plugins?\b", 
 #: vocabulary backlog, brought in line: every occurrence was an event-plugin
 #: reference and now says so.
 _UNSCOPED_DOCS = [
+    # #801 ephemeral agents: one agent-plugin reference, in the honesty statement.
+    "ephemeral-agents.md",
     "skills.md",
     "control-planes.md",
     "codex-cli.md",

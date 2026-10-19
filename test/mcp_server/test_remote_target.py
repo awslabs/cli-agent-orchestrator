@@ -18,6 +18,7 @@ from cli_agent_orchestrator.mcp_server.server import delete_terminal
 from cli_agent_orchestrator.utils.orchestration import (
     REMOTE_CONNECT_TIMEOUT,
     _assign_impl,
+    _auth_headers_for,
     _handoff_impl,
     _mcp_timeout,
     _resolve_remote_provider,
@@ -538,3 +539,110 @@ class TestDeleteTerminalRemote:
         assert result["success"] is False
         assert "not found" in result["message"]
         assert "cao-worker-1" in result["message"]
+
+
+class TestBearerStaysOnTheLocalNode:
+    """``CAO_AUTH_LOCAL_TOKEN`` authenticates this node's API hop and nothing else.
+
+    Every request whose base URL came from ``target_host`` or ``CAO_CALLBACK_URL``
+    goes to another host. Sending the local bearer there disclosed it to whoever
+    answers at that URL, and bought nothing: a remote node has its own token.
+    """
+
+    _CB_ENV = {
+        "CAO_TERMINAL_ID": "feed0001",
+        "CAO_CALLBACK_URL": "http://cao-supervisor:9889",
+        "CAO_CALLBACK_TERMINAL_ID": "a1b2c3d4",
+    }
+
+    @patch(f"{_SRV}.get_local_bearer", return_value="tok")
+    def test_helper_attaches_only_for_the_local_api(self, _bearer):
+        assert _auth_headers_for(API_BASE_URL) == {"Authorization": "Bearer tok"}
+        assert _auth_headers_for(API_BASE_URL + "/") == {"Authorization": "Bearer tok"}
+        assert _auth_headers_for("http://cao-worker-1:9889") == {}
+        # Same port, different host name: not provably this node, so no token.
+        assert _auth_headers_for("http://localhost:9889") == {}
+
+    @patch(f"{_SRV}._get_cleanup_nudge", return_value="")
+    @patch(f"{_SRV}._resolve_remote_provider", return_value="mock_cli")
+    @patch(f"{_SRV}.get_local_bearer", return_value="tok")
+    @patch(f"{_SRV}.requests")
+    def test_remote_run_step_carries_no_bearer(self, mock_requests, _bearer, _prov, _nudge):
+        mock_requests.post.return_value = _response(
+            200, {"terminal_id": "beef0002", "last_message": "done", "status": "completed"}
+        )
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}, clear=False):
+            asyncio.run(_handoff_impl("developer", "Build it", target_host="cao-worker-1"))
+        args, kwargs = mock_requests.post.call_args
+        assert args[0] == "http://cao-worker-1:9889/terminals/run-step"
+        assert kwargs["headers"] is None
+
+    @patch(f"{_SRV}._get_cleanup_nudge", return_value="")
+    @patch(f"{_SRV}._resolve_handoff_provider")
+    @patch(f"{_SRV}.get_local_bearer", return_value="tok")
+    @patch(f"{_SRV}.requests")
+    def test_local_run_step_still_carries_bearer(self, mock_requests, _bearer, mock_ctx, _nudge):
+        from cli_agent_orchestrator.utils.orchestration import HandoffContext
+
+        mock_ctx.return_value = HandoffContext(
+            provider="mock_cli", session_name="cao-s", caller_id="a1b2c3d4", allowed_tools=None
+        )
+        mock_requests.post.return_value = _response(
+            200, {"terminal_id": "t", "last_message": "ok", "status": "completed"}
+        )
+        asyncio.run(_handoff_impl("developer", "Do it"))
+        args, kwargs = mock_requests.post.call_args
+        assert args[0] == f"{API_BASE_URL}/terminals/run-step"
+        assert kwargs["headers"] == {"Authorization": "Bearer tok"}
+
+    @patch(f"{_SRV}.get_local_bearer", return_value="tok")
+    @patch(f"{_SRV}.requests")
+    def test_callback_inbox_post_carries_no_bearer(self, mock_requests, _bearer):
+        mock_requests.post.return_value = _response(200, {"success": True})
+        with patch.dict(os.environ, self._CB_ENV, clear=False):
+            _send_to_inbox("a1b2c3d4", "results")
+        args, kwargs = mock_requests.post.call_args
+        assert args[0] == "http://cao-supervisor:9889/terminals/a1b2c3d4/inbox/messages"
+        assert kwargs["headers"] is None
+
+    @patch(f"{_SRV}.get_local_bearer", return_value="tok")
+    @patch(f"{_SRV}.requests")
+    def test_local_inbox_post_still_carries_bearer(self, mock_requests, _bearer):
+        mock_requests.post.return_value = _response(200, {"success": True})
+        env = {"CAO_TERMINAL_ID": "feed0001"}
+        with patch.dict(os.environ, env, clear=True):
+            _send_to_inbox("b2c3d4e5", "results")
+        args, kwargs = mock_requests.post.call_args
+        assert args[0] == f"{API_BASE_URL}/terminals/b2c3d4e5/inbox/messages"
+        assert kwargs["headers"] == {"Authorization": "Bearer tok"}
+
+    @patch(f"{_SRV}.get_local_bearer", return_value="tok")
+    @patch(f"{_SRV}.requests")
+    def test_404_retry_to_callback_node_drops_the_bearer(self, mock_requests, _bearer):
+        """The local attempt carries the token; the cross-node retry must not."""
+        mock_requests.post.side_effect = [_response(404), _response(200, {"success": True})]
+        with patch.dict(os.environ, self._CB_ENV, clear=False):
+            _send_to_inbox("c3d4e5f6", "results")  # not the callback terminal → local first
+        first, second = mock_requests.post.call_args_list
+        assert first.args[0] == f"{API_BASE_URL}/terminals/c3d4e5f6/inbox/messages"
+        assert first.kwargs["headers"] == {"Authorization": "Bearer tok"}
+        assert second.args[0] == "http://cao-supervisor:9889/terminals/c3d4e5f6/inbox/messages"
+        assert second.kwargs["headers"] is None
+
+    @patch(f"{_SRV}.get_local_bearer", return_value="tok")
+    @patch(f"{_SRV}.requests")
+    def test_remote_delete_carries_no_bearer(self, mock_requests, _bearer):
+        mock_requests.delete.return_value = _response(200)
+        delete_terminal("beef0003", target_host="cao-worker-0")
+        args, kwargs = mock_requests.delete.call_args
+        assert args[0] == "http://cao-worker-0:9889/terminals/beef0003"
+        assert kwargs["headers"] is None
+
+    @patch(f"{_SRV}.get_local_bearer", return_value="tok")
+    @patch(f"{_SRV}.requests")
+    def test_local_delete_still_carries_bearer(self, mock_requests, _bearer):
+        mock_requests.delete.return_value = _response(200)
+        delete_terminal("beef0004")
+        args, kwargs = mock_requests.delete.call_args
+        assert args[0] == f"{API_BASE_URL}/terminals/beef0004"
+        assert kwargs["headers"] == {"Authorization": "Bearer tok"}

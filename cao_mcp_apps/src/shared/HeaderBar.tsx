@@ -15,7 +15,7 @@ export function HeaderBar({
   title,
   sessions,
   terminals,
-}: HeaderBarProps): JSX.Element {
+}: HeaderBarProps): React.JSX.Element {
   return (
     <header className="cao-header">
       <h1 className="cao-header-title">{title}</h1>

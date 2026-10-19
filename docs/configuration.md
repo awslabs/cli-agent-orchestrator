@@ -119,7 +119,26 @@ Override via REST API, Web UI Settings page, `cao config set agents.dirs.<provid
 
 `agents.disabled_dirs` lists configured directories (defaults or extras) the user has toggled **off**: a disabled directory stays listed in Settings but is skipped when scanning for and loading agent profiles, so its profiles leave the active set without removing the path (GH #280/#281). Only paths that match a configured directory are accepted; entries are validated with the same path normalization the scanner uses (`~`, trailing slashes, and symlinks all match). Manage it via the Web UI Settings toggles, `cao config set agents.disabled_dirs '[...]'`, or `settings.json`.
 
-`agents.roles` defines custom [role](../CODEBASE.md) → `allowedTools` bundles, layered on top of the built-in `supervisor` / `reviewer` / `developer` roles.
+`agents.roles` defines custom [role](../CODEBASE.md) → `allowedTools` bundles, layered on top of the built-in `supervisor` / `reviewer` / `developer` / `workflow_scout` roles.
+
+### Ephemeral agents (`ephemeral`)
+
+Creation and creator-owned launches are opt-in. `assign` and `handoff` launch
+creator-owned ephemeral names from the creator terminal.
+Only JSON `true` enables the tool, and agent terminals must restart to see it.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `false` | Enable ephemeral creation, claims and owner-only HTTP launch. |
+| `allowed_providers` | `["claude_code"]` | Providers permitted for creation; re-checked at every claim. Codex is an operator opt-in. |
+| `max_brief_bytes` | `8192` | Maximum UTF-8 bytes after brief normalization. |
+| `pending_ttl_seconds` | `900` | Checked at claim; expired names are collected when touched. |
+| `claim_lease_seconds` | `60` | Lease from claim to terminal creation. |
+| `max_depth` | `1` | Only integer 1 is supported; ephemeral callers cannot create ephemerals. |
+| `child_may_delegate` | `false` | Permit the existing ephemeral delegation/workflow tools; never permits ephemeral creation by an ephemeral caller. |
+
+See [Ephemeral agents](ephemeral-agents.md) for policy limits, ignored tier/effort keys,
+and the lifecycle residue warning. Keep the feature disabled outside testing.
 
 ### Skills (`skills`)
 
@@ -138,8 +157,8 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 |---------|---------|--------------|
 | `mcp_request_timeout` | `30` | Seconds to wait for HTTP calls between the MCP server process and the CAO API. |
 | `event_bus_max_queue_size` | `1024` | Max events buffered per subscriber queue in the internal event bus. |
-| `provider_init_timeout` | `60` | Seconds to wait for a CLI agent to reach IDLE. Also the hard outer cap on total time a startup-prompt handler (Claude Code, Kimi, Antigravity) may run. Overridable per-profile via `provider_init_timeout` in the agent profile — see [Agent Profile Format](agent-profile.md#optional-fields). |
-| `startup_prompt_handler_timeout` | `20` | Idle gap, in seconds, between consecutive startup prompts (e.g. workspace trust / bypass dialogs, Kimi's upgrade dialog, Antigravity's trust/survey dialogs). The handler polls and resets this timer each time it answers a prompt; it only starts counting once the FIRST prompt has been handled, so a first dialog arriving later than this value (e.g. a cold/containerized start) is still caught — before any prompt is seen, only `provider_init_timeout` bounds the wait. Once at least one prompt has been handled, the handler exits after this many seconds pass with no further prompt. |
+| `provider_init_timeout` | `60` | Seconds to wait for a CLI agent to reach IDLE. Also the hard outer cap on total time a startup-prompt handler (Claude Code, Kimi, Antigravity, Codex) may run; Codex fails initialisation if a trust or update dialog (or a startup modal still mid-redraw after a short ride-out) is on screen when the cap is reached or after the readiness wait. Overridable per-profile via `provider_init_timeout` in the agent profile — see [Agent Profile Format](agent-profile.md#optional-fields). |
+| `startup_prompt_handler_timeout` | `20` | Idle gap, in seconds, between consecutive startup prompts (e.g. workspace trust / bypass dialogs, Kimi's upgrade dialog, Antigravity's trust/survey dialogs, Codex's trust and update dialogs). The handler polls and resets this timer each time it answers a prompt; it only starts counting once the FIRST prompt has been handled, so a first dialog arriving later than this value (e.g. a cold/containerized start) is still caught — before any prompt is seen, only `provider_init_timeout` bounds the wait. Once at least one prompt has been handled, the handler exits after this many seconds pass with no further prompt. |
 | `state_buffer_max` | `32768` | Bytes of raw terminal output `StatusMonitor` keeps per terminal for raw-path status detection and `GET /terminals/{id}/output` (`mode=full`). Not unbounded scrollback — a long, chatty session is truncated to this trailing window; raise it if a still-pending prompt is getting evicted before it's read back. |
 
 ### Memory (`memory`)
@@ -298,6 +317,20 @@ every lookup resolves through it. Set that option only at pane scope — pane
 options inherit from window options, and a value set globally would make every
 pane answer to the same name.
 
+That name is also what the window shows. The first pane terminal turns on
+`pane-border-status` for `pane_window` and formats the border with the mark, so
+every pane is captioned with the terminal running in it. The caption reads the
+mark rather than the pane title because a program in the pane can set its own
+title: an agent whose TUI does that turns a title-based caption into whatever
+the agent wants, while the mark is out of its reach.
+
+Both options are set on `pane_window` alone, and only when that window carries
+no `pane-border-status` of its own -- so a window you arranged yourself keeps
+its borders, `pane-border-status off` stays off, and a window CAO opened before
+this existed is captioned on the next spawn into it rather than never. A pane
+you split by hand carries no mark and is captioned with its index. The captions
+cost one row per pane, which counts against the capacity above.
+
 `pane_window` does not have to exist: the first pane-mode terminal in a session
 creates it and takes its first pane, and the ones after it split that window.
 
@@ -357,7 +390,7 @@ Default-off auth core; see [security/auth.py](../src/cli_agent_orchestrator/secu
 
 > **Default posture.** With none of the three variables set, the API performs no authentication or authorization at all: every scope dependency returns the full scope set and never inspects the request. The server binds to loopback by default, so the trust boundary is *the host*, not *the user* — any other process or local account on the machine can reach every endpoint, including keystroke injection into agent terminals. That is intentional for a single-user workstation and it is why the local-token mode exists for anything else. A few routes stay open in every mode because they carry no session or terminal state: `/health`, the API documentation (`/docs`, `/redoc`, `/openapi.json`), the OAuth discovery document, the agent-profile schema and template metadata and their validate/preview endpoints, and the static topology-widget assets.
 >
-> Two clients do not yet present a bearer in **either** auth mode and therefore cannot be used against an auth-enabled server without further work: the bundled Web UI, and the `cao` CLI's own HTTP calls (`cao launch`, `cao session`, `cao terminal`, `cao workflow`, `cao info`, `cao shutdown`). The `cao agent` subcommands, the MCP servers and the workflow orchestration helpers do forward `CAO_AUTH_LOCAL_TOKEN`.
+> **Clients.** Every CAO client presents the bearer in either mode. The `cao agent` subcommands, the MCP servers and the workflow orchestration helpers forward `CAO_AUTH_LOCAL_TOKEN` on their internal calls; the `cao` CLI's own HTTP calls (`cao launch`, `cao session`, `cao terminal`, `cao workflow`, `cao info`, `cao shutdown` and the polling behind them) go through `utils/api_http.py`, which attaches `CAO_AUTH_LOCAL_TOKEN` from the CLI's environment to requests aimed at this node's `API_BASE_URL` and to nothing else, and turns a `401` with no token configured into an error that names the variable. Export the same `CAO_AUTH_LOCAL_TOKEN` the server was started with (local-token mode), or a machine token from the IdP with the scopes the command needs, in the shell that runs `cao`. The bundled Web UI takes its token from the URL fragment (`http://127.0.0.1:9889/#token=<token>`; the fragment is moved into `sessionStorage` and stripped from the address bar before anything renders, so it never reaches the server as part of a URL) or from the **Server Access Token** field on the Settings page; it is held for that browser tab only, sent as `Authorization: Bearer` on every request, as `?token=` on the terminal WebSocket handshake and as `?access_token=` on the workflow event stream (both query parameters are redacted from the access log). With no token set, every client sends exactly what it sent before.
 
 | Env var | Description |
 |---------|--------------|
@@ -412,6 +445,16 @@ These map to `network.*` / `auth.*` schema paths for documentation purposes, but
 | `CAO_CORS_ORIGINS` | `network.cors_origins` | comma-separated list |
 | `CAO_WS_ALLOWED_CLIENTS` | `network.ws_allowed_clients` | comma-separated list |
 | `CAO_WS_ALLOWED_ORIGINS` | `network.ws_allowed_origins` | comma-separated list |
+
+### Launch decisions
+
+`CAO_DECISION_MODEL_ROUTE`, `CAO_DECISION_EFFORT_ROUTE`, `CAO_DECISION_ON_TIMEOUT_MS` and
+`CAO_DECISION_CONFIDENCE_THRESHOLD` are read by the decision settings loader, not through
+`ConfigService`, and override the `decisions` block of `settings.json`. The chain above does not
+apply as written: `cao-server --decision <point>=<state>` sets the matching point-state variable
+(`CAO_DECISION_MODEL_ROUTE` or `CAO_DECISION_EFFORT_ROUTE`), so the flag and that variable are one
+layer, and the server keeps the values it started with until it restarts.
+See [Launch decisions](decisions.md#settings).
 
 ### Not yet routed through ConfigService
 

@@ -124,7 +124,7 @@ class TestClaudeCodeProviderInitialization:
 
     @pytest.mark.asyncio
     @_PATCH_SETTINGS
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -156,7 +156,7 @@ class TestClaudeCodeProviderInitialization:
 
     @pytest.mark.asyncio
     @_PATCH_SETTINGS
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -190,7 +190,7 @@ class TestClaudeCodeProviderInitialization:
     @pytest.mark.asyncio
     @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_initialize_with_broken_profile_raises_provider_error(
         self, mock_tmux, mock_load, mock_wait_shell, _
@@ -204,7 +204,7 @@ class TestClaudeCodeProviderInitialization:
         with pytest.raises(ProviderError, match="Failed to load agent profile"):
             await provider.initialize()
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_uses_native_agent_from_profile(self, mock_load):
         """Test profile with native_agent field uses --agent passthrough."""
         mock_profile = MagicMock()
@@ -221,7 +221,7 @@ class TestClaudeCodeProviderInitialization:
 
     @pytest.mark.asyncio
     @_PATCH_SETTINGS
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.backends.registry._backend")
@@ -1436,7 +1436,7 @@ class TestClaudeCodeProviderMisc:
 
         assert "--resume" not in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_claude_command_with_system_prompt(self, mock_load):
         """Test building Claude command with system prompt."""
         mock_profile = MagicMock()
@@ -1452,7 +1452,7 @@ class TestClaudeCodeProviderMisc:
         assert "claude" in command
         assert "--append-system-prompt-file" in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_mcp_injects_terminal_id(self, mock_load):
         """Test that _build_claude_command injects CAO_TERMINAL_ID into MCP server env."""
         mock_profile = MagicMock()
@@ -1472,7 +1472,7 @@ class TestClaudeCodeProviderMisc:
         server_env = mcp_data["mcpServers"]["cao-mcp-server"]["env"]
         assert server_env["CAO_TERMINAL_ID"] == "term-42"
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_resolves_bundled_mcp_command(self, mock_load):
         """The bare cao-mcp-server command is resolved to a PATH-independent
         invocation in the written MCP config (wiring guard: a refactor that
@@ -1497,7 +1497,7 @@ class TestClaudeCodeProviderMisc:
         mcp_data = _extract_mcp_config(command)
         assert mcp_data["mcpServers"]["cao-mcp-server"]["command"] == "/venv/bin/cao-mcp-server"
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_mcp_preserves_existing_env(self, mock_load):
         """Test that existing env vars in MCP config are preserved when injecting CAO_TERMINAL_ID."""
         mock_profile = MagicMock()
@@ -1523,7 +1523,7 @@ class TestClaudeCodeProviderMisc:
         # CAO_TERMINAL_ID added
         assert server_env["CAO_TERMINAL_ID"] == "term-99"
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load):
         """Test that an existing CAO_TERMINAL_ID in MCP env is NOT overwritten."""
         mock_profile = MagicMock()
@@ -1557,7 +1557,7 @@ class TestClaudeCodeProviderContainerPathTranslation:
     --mcp-config arguments.
     """
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_temp_file_paths_translated_to_guest(self, mock_load, tmp_path):
         """host CAO_HOME_DIR prefix -> guest path in both temp-file CLI args."""
         # Map the (patched) CAO_HOME_DIR host prefix to a container guest path.
@@ -1586,7 +1586,7 @@ class TestClaudeCodeProviderContainerPathTranslation:
         assert str(tmp_path) not in prompt_arg
         assert str(tmp_path) not in mcp_arg
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_temp_file_paths_unchanged_without_container(self, mock_load, tmp_path):
         """No container -> paths are the real host paths (translation is a no-op).
 
@@ -1617,7 +1617,7 @@ class TestClaudeCodeProviderContainerPathTranslation:
 class TestClaudeCodeProviderModelFlag:
     """Tests that profile.model is forwarded to Claude Code via --model."""
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_appends_model_when_set(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = "sonnet"
@@ -1631,7 +1631,7 @@ class TestClaudeCodeProviderModelFlag:
 
         assert "--model sonnet" in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_omits_model_when_unset(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -1645,7 +1645,7 @@ class TestClaudeCodeProviderModelFlag:
 
         assert "--model" not in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_explicit_model_override_wins_over_profile_model(self, mock_load):
         """An explicit per-call model (handoff/assign's own `model` param)
         takes precedence over the profile's own static model field."""
@@ -1662,7 +1662,7 @@ class TestClaudeCodeProviderModelFlag:
         assert "--model fable-5" in command
         assert "--model sonnet" not in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_explicit_model_override_applies_with_no_profile_model(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -1676,7 +1676,7 @@ class TestClaudeCodeProviderModelFlag:
 
         assert "--model fable-5" in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_model_override_ignored_for_native_agent_profile(self, mock_load):
         """A profile that maps to a native Claude Code agent handles its own
         model config -- an explicit override is not applied there (by
@@ -1700,7 +1700,7 @@ class TestClaudeCodeProviderModelFlag:
         provider = ClaudeCodeProvider("tid", "sess", "win", "agent", model="fable-5")
         # profile is None on this path (agent_profile has no CAO profile file).
         with patch(
-            "cli_agent_orchestrator.providers.claude_code.load_agent_profile",
+            "cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile",
             side_effect=FileNotFoundError,
         ):
             command = provider._build_claude_command()
@@ -1712,7 +1712,7 @@ class TestClaudeCodeProviderModelFlag:
 class TestClaudeCodeProviderClaudeConfig:
     """Tests that profile.claudeConfig maps to Claude Code CLI flags."""
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_appends_effort_from_claude_config(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -1727,7 +1727,7 @@ class TestClaudeCodeProviderClaudeConfig:
 
         assert "--effort xhigh" in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_appends_fallback_model_from_claude_config(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -1742,7 +1742,7 @@ class TestClaudeCodeProviderClaudeConfig:
 
         assert "--fallback-model sonnet" in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_build_command_omits_effort_when_claude_config_absent(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -1760,7 +1760,7 @@ class TestClaudeCodeProviderClaudeConfig:
 
 class TestClaudeCodeProviderPermissionMode:
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_uses_permission_mode_when_set_and_not_yolo(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -1775,7 +1775,7 @@ class TestClaudeCodeProviderPermissionMode:
         assert "--permission-mode auto" in command
         assert "--dangerously-skip-permissions" not in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_permission_mode_takes_priority_over_yolo(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -1790,7 +1790,7 @@ class TestClaudeCodeProviderPermissionMode:
         assert "--permission-mode auto" in command
         assert "--dangerously-skip-permissions" not in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_legacy_profile_without_permission_mode(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -1805,7 +1805,7 @@ class TestClaudeCodeProviderPermissionMode:
         assert "--dangerously-skip-permissions" in command
         assert "--permission-mode" not in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     def test_empty_allowlist_emits_disallowed_tools(self, mock_load):
         """allowed_tools=[] must deny natives, not skip --disallowedTools."""
         mock_profile = MagicMock()
@@ -1829,7 +1829,7 @@ class TestClaudeCodeProviderYoloRootRegression:
     when running as root, and does not break normal non-root yolo launches.
     """
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.os")
     def test_yolo_non_root_includes_dangerously_skip_permissions(self, mock_os, mock_load):
         """yolo + no permissionMode + non-root => includes --dangerously-skip-permissions."""
@@ -1847,7 +1847,7 @@ class TestClaudeCodeProviderYoloRootRegression:
         assert "--dangerously-skip-permissions" in command
         assert "--permission-mode" not in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.os")
     def test_yolo_root_omits_dangerously_skip_permissions(self, mock_os, mock_load):
         """yolo + no permissionMode + root => omits --dangerously-skip-permissions."""
@@ -1865,7 +1865,7 @@ class TestClaudeCodeProviderYoloRootRegression:
         assert "--dangerously-skip-permissions" not in command
         assert "--permission-mode" not in command
 
-    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.os")
     def test_yolo_with_permission_mode_uses_permission_mode_flag(self, mock_os, mock_load):
         """yolo + permissionMode => uses --permission-mode <value>, omits --dangerously-skip-permissions."""
@@ -2778,3 +2778,410 @@ class TestBlocksOrchestratedInputWhileWaitingUserAnswer:
     def test_blocks_orchestrated_input_while_waiting_user_answer(self):
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.blocks_orchestrated_input_while_waiting_user_answer is True
+
+
+class TestClaudeCodeTurnEndGate:
+    """GH #865: a dispatched turn is finished only when the end-of-turn summary is
+    the newest line above the input box.
+
+    The newest TUI draws no spinner while response text streams. A settled
+    mid-answer frame is therefore "boxed ❯ + response text above it", which the
+    detectors read as COMPLETED (a ⏺/● still on screen) or IDLE (every marker
+    scrolled off). Both verdicts end ``run_step``/``handoff`` and tear the worker
+    down mid-answer. The ``claude_code_865_*`` fixtures are real
+    ``tmux capture-pane -p`` frames (180x50) from Claude Code 2.1.288, scrubbed.
+    """
+
+    FIXTURES = Path(__file__).parent / "fixtures"
+
+    @classmethod
+    def _frame(cls, name: str) -> list:
+        return (
+            (cls.FIXTURES / f"claude_code_865_{name}.txt").read_text(encoding="utf-8").split("\n")
+        )
+
+    @staticmethod
+    def _dispatched(mock_backend) -> ClaudeCodeProvider:
+        """A provider that has had one task sent to it (what every run-step/handoff
+        worker looks like after ``send_input``). The snapshot history is empty so the
+        paste-echo tail-hash guard cannot be the reason a frame reads PROCESSING."""
+        mock_backend.get_native_status.return_value = None
+        mock_backend.supports_event_inbox.return_value = False
+        mock_backend.get_history.return_value = ""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider.mark_input_received()
+        return provider
+
+    @staticmethod
+    def _both(provider: ClaudeCodeProvider, lines: list) -> tuple:
+        """(rendered-screen verdict, raw-stream verdict) for one frame. While the
+        cached status is PROCESSING the run-step wait re-reads the raw window with
+        the pyte path off and the composite with it on, so both must agree."""
+        return (
+            provider.get_status_from_screen(lines),
+            provider.get_status("\n".join(lines)),
+        )
+
+    # --- real frames -------------------------------------------------------
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_streaming_with_markers_on_screen_is_processing(self, mock_backend):
+        """Mid-answer, ⏺ BEGIN and the PREVIOUS turn's summary still on screen,
+        no spinner. Read COMPLETED before the fix. The old summary sits above the
+        new prompt echo, not directly above the box, so it does not count."""
+        provider = self._dispatched(mock_backend)
+        frame = self._frame("streaming_markers_visible")
+        assert self._both(provider, frame) == (TerminalStatus.PROCESSING, TerminalStatus.PROCESSING)
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_streaming_with_markers_scrolled_off_is_processing(self, mock_backend):
+        """Mid-answer, every ⏺ scrolled off the top: only list text above the box.
+        Read IDLE before the fix, which ``_wait_for_completion`` accepts as done
+        after three polls once it has seen PROCESSING."""
+        provider = self._dispatched(mock_backend)
+        frame = self._frame("streaming_markers_scrolled_off")
+        assert self._both(provider, frame) == (TerminalStatus.PROCESSING, TerminalStatus.PROCESSING)
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_stop_hooks_spinner_is_processing(self, mock_backend):
+        """The spinner returns for the Stop hooks at the end of the answer."""
+        provider = self._dispatched(mock_backend)
+        frame = self._frame("stop_hooks_spinner")
+        assert self._both(provider, frame) == (TerminalStatus.PROCESSING, TerminalStatus.PROCESSING)
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_turn_ended_summary_above_box_is_completed(self, mock_backend):
+        """'✻ Baked for 12s · done 12:27 PM' painted directly above the box."""
+        provider = self._dispatched(mock_backend)
+        frame = self._frame("turn_ended")
+        assert self._both(provider, frame) == (TerminalStatus.COMPLETED, TerminalStatus.COMPLETED)
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_short_turn_summary_above_blank_rows_is_completed(self, mock_backend):
+        """A one-word reply: the TUI pins the box to the bottom and leaves ~30
+        empty rows between the summary and the box. The walk must skip them."""
+        provider = self._dispatched(mock_backend)
+        frame = self._frame("short_turn_ended")
+        assert self._both(provider, frame) == (TerminalStatus.COMPLETED, TerminalStatus.COMPLETED)
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_api_retry_notice_above_box_is_processing(self, mock_backend):
+        """'✻ Connection refused … · Retrying in 14s · attempt 6/10' above the box,
+        no spinner, no summary: the turn is still running. Read IDLE before the fix."""
+        provider = self._dispatched(mock_backend)
+        frame = self._frame("api_retry")
+        assert self._both(provider, frame) == (TerminalStatus.PROCESSING, TerminalStatus.PROCESSING)
+
+    def test_startup_frame_before_any_dispatch_is_idle(self):
+        """Pre-dispatch the gate is inert: the settled startup frame still reads
+        IDLE so ``initialize()`` and the readiness wait are unchanged."""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        frame = self._frame("startup_idle")
+        assert provider.get_status_from_screen(frame) == TerminalStatus.IDLE
+
+    def test_streaming_frame_before_any_dispatch_keeps_legacy_verdict(self):
+        """Documents the boundary: with no dispatch recorded, the mid-answer frame
+        keeps its pre-fix COMPLETED reading. The gate keys off ``_task_dispatched``."""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        frame = self._frame("streaming_markers_visible")
+        assert provider.get_status_from_screen(frame) == TerminalStatus.COMPLETED
+
+    # --- shape of the summary line ----------------------------------------
+
+    @staticmethod
+    def _boxed(*above: str) -> str:
+        rail = "─" * 40
+        return "\n".join(above) + "\n" + rail + "\n❯ \n" + rail + "\n"
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_interim_summary_followed_by_new_marker_is_processing(self, mock_backend):
+        """Claude prints interim summaries mid-turn ('✻ Pondered for 8s') and keeps
+        working; the newer ● line below it means the turn has not ended."""
+        provider = self._dispatched(mock_backend)
+        output = self._boxed("● Looking into it", "✻ Pondered for 8s", "● Calling cao-mcp-server")
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_markdown_bullet_with_for_is_not_a_summary(self, mock_backend):
+        """A streamed '* … for …' bullet directly above the box must not count:
+        the · and * glyphs only qualify with a full 'for Ns' duration."""
+        provider = self._dispatched(mock_backend)
+        output = self._boxed("● Options:", "* Use Redis for caching")
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_summary_on_dot_glyph_with_duration_is_completed(self, mock_backend):
+        """The TUI cycles the glyph; a summary that lands on · still ends the turn."""
+        provider = self._dispatched(mock_backend)
+        output = self._boxed("● def greet(name):", "· Worked for 3s")
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_summary_above_tip_and_effort_footer_is_completed(self, mock_backend):
+        """Chrome between the summary and the box (⎿ tip, own-line effort footer,
+        tmux hint) is skipped by the walk."""
+        provider = self._dispatched(mock_backend)
+        output = self._boxed(
+            "● done",
+            "✻ Worked for 4s · done 12:26 PM",
+            "  ⎿  Tip: Use git worktrees to run multiple Claude sessions in parallel.",
+            "● high · /effort",
+            "            tmux detected · scroll with PgUp/PgDn · or add 'set -g mouse on' to ~/.tmux.conf",
+        )
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    # --- grace valve --------------------------------------------------------
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_unchanged_frame_without_summary_falls_back_after_grace(self, mock_backend):
+        """An end state the gate does not know (here an operator's '/compact', which
+        paints no summary) is PROCESSING while the frame keeps changing and for
+        TURN_END_GRACE_S after it stops, then falls back to the legacy verdict."""
+        from cli_agent_orchestrator.providers.claude_code import TURN_END_GRACE_S
+
+        provider = self._dispatched(mock_backend)
+        clock = {"now": 1000.0}
+        provider._turn_gate_clock = lambda: clock["now"]
+        frame = self._boxed(
+            "● PONG",
+            "✻ Brewed for 4s · done 12:32 PM",
+            "❯ /compact",
+            "  ⎿  Compacted (ctrl+o to see full summary)",
+        ).split("\n")
+
+        assert self._both(provider, frame) == (TerminalStatus.PROCESSING, TerminalStatus.PROCESSING)
+        clock["now"] += TURN_END_GRACE_S - 0.1
+        assert self._both(provider, frame) == (TerminalStatus.PROCESSING, TerminalStatus.PROCESSING)
+        clock["now"] += 0.2
+        assert self._both(provider, frame) == (TerminalStatus.COMPLETED, TerminalStatus.COMPLETED)
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_frame_change_restarts_grace(self, mock_backend):
+        """A streaming answer repaints sub-second; each repaint is a new frame with
+        a fresh clock, so the valve never fires while output is still arriving."""
+        from cli_agent_orchestrator.providers.claude_code import TURN_END_GRACE_S
+
+        provider = self._dispatched(mock_backend)
+        clock = {"now": 1000.0}
+        provider._turn_gate_clock = lambda: clock["now"]
+        for i in range(5):
+            frame = self._boxed("⏺ BEGIN", *[f"  {n} element" for n in range(1, i + 2)]).split("\n")
+            assert provider.get_status_from_screen(frame) == TerminalStatus.PROCESSING
+            clock["now"] += TURN_END_GRACE_S - 1.0
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_new_dispatch_resets_grace(self, mock_backend):
+        """A new send starts a new turn: the previous gated frame's clock is dropped."""
+        from cli_agent_orchestrator.providers.claude_code import TURN_END_GRACE_S
+
+        provider = self._dispatched(mock_backend)
+        clock = {"now": 1000.0}
+        provider._turn_gate_clock = lambda: clock["now"]
+        frame = self._boxed("⏺ partial answer").split("\n")
+        assert provider.get_status_from_screen(frame) == TerminalStatus.PROCESSING
+        clock["now"] += TURN_END_GRACE_S - 1.0
+        provider.mark_input_received()
+        clock["now"] += 2.0
+        assert provider.get_status_from_screen(frame) == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_alternating_composite_and_capture_views_fall_back_after_grace(self, mock_backend):
+        """With pyte on, the "screen" detector is fed by two views of the same pane:
+        the 400x200 composite (the per-poll re-check) and the 50-row capture-pane
+        read (the #558 stale re-check, every 3 s). A no-summary end state under a
+        long answer with paragraph spacing shows fewer non-blank rows above the box
+        in the short view than in the tall one. With a single last-frame clock
+        keyed on more rows than the short view holds, each alternation restarts
+        the clock and the valve never fires."""
+        from cli_agent_orchestrator.providers.claude_code import TURN_END_GRACE_S
+
+        provider = self._dispatched(mock_backend)
+        clock = {"now": 1000.0}
+        provider._turn_gate_clock = lambda: clock["now"]
+
+        body = ["⏺ Here is the answer"]
+        for i in range(60):
+            body += [f"  paragraph {i} of the answer", ""]
+        body += ["❯ /compact", "  ⎿  Compacted (ctrl+o to see full summary)"]
+        full = self._boxed(*body).split("\n")
+        composite, capture = full[-200:], full[-50:]
+        assert (
+            len([ln for ln in capture if ln.strip()])
+            < 40
+            < len([ln for ln in composite if ln.strip()])
+        )
+
+        fell_back_at = None
+        for t in range(1, 61):
+            clock["now"] = 1000.0 + t
+            verdicts = [provider.get_status_from_screen(composite)]
+            if t % 3 == 0:
+                verdicts.append(provider.get_status_from_screen(capture))
+            if any(v != TerminalStatus.PROCESSING for v in verdicts):
+                fell_back_at = t
+                break
+        assert fell_back_at is not None, "valve never fired: the two views reset each other's clock"
+        assert TURN_END_GRACE_S <= fell_back_at <= TURN_END_GRACE_S + 3
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_views_that_disagree_on_a_stale_row_still_fall_back(self, mock_backend):
+        """The composite can keep a row the real pane has cleared (recorded live:
+        the slash-command hint and the hook spinner of a `/compact` sent through
+        run_step), so the two views disagree on the newest rows, not just on how
+        many they hold. Each view's frame is stable, so each must age on its own
+        clock; a single last-frame clock that the views restart in turn never
+        reaches the grace period while a waiter polls every second."""
+        from cli_agent_orchestrator.providers.claude_code import TURN_END_GRACE_S
+
+        provider = self._dispatched(mock_backend)
+        clock = {"now": 1000.0}
+        provider._turn_gate_clock = lambda: clock["now"]
+
+        pane = ["❯ /compact", "  ⎿  Not enough messages to compact."]
+        capture = self._boxed(*pane).split("\n")
+        composite = self._boxed(
+            *pane, "  ❯ /compact        Free up context by summarizing the conversation so far"
+        ).split("\n")
+        assert capture != composite
+
+        fell_back_at = None
+        for t in range(1, 61):
+            clock["now"] = 1000.0 + t
+            verdicts = [provider.get_status_from_screen(composite)]
+            if t % 3 == 0:
+                verdicts.append(provider.get_status_from_screen(capture))
+            if any(v != TerminalStatus.PROCESSING for v in verdicts):
+                fell_back_at = t
+                break
+        assert fell_back_at is not None, "valve never fired: the two views reset each other's clock"
+        assert TURN_END_GRACE_S <= fell_back_at <= TURN_END_GRACE_S + 3
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_streaming_frames_never_age(self, mock_backend):
+        """A streaming answer produces a new frame on every repaint. Frames are
+        remembered per path, so an old one must be evicted before it can come
+        back and read as aged; here every frame is new for well over the grace
+        period and the valve never fires."""
+        from cli_agent_orchestrator.providers.claude_code import TURN_END_GRACE_S
+
+        provider = self._dispatched(mock_backend)
+        clock = {"now": 1000.0}
+        provider._turn_gate_clock = lambda: clock["now"]
+        body = ["⏺ BEGIN"]
+        for t in range(1, int(TURN_END_GRACE_S) * 3):
+            clock["now"] = 1000.0 + t
+            body.append(f"  {t} element")
+            frame = self._boxed(*body).split("\n")
+            assert provider.get_status_from_screen(frame) == TerminalStatus.PROCESSING
+
+    def test_claude_opts_into_screen_status_poll(self):
+        """The poll re-check must read Claude from the composite: the raw rolling
+        window never holds this TUI's input box mid-turn."""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.supports_screen_detection is True
+        assert provider.status_recheck_uses_screen is True
+
+
+class TestClaudeCodeReducedMotionSpinner:
+    """GH #908: with prefersReducedMotion the spinner glyph is a static "●".
+
+    "●" is also the response marker, so before the fix both status paths read
+    the live spinner as a finished response and returned COMPLETED about 2s
+    after the task was sent, which made handoff tear the worker down.
+    """
+
+    BOX = "─" * 60
+
+    def _p(self):
+        return ClaudeCodeProvider("test123", "test-session", "window-0")
+
+    def _screen(self, line):
+        return ["❯ review the diff", line, self.BOX, "❯ ", self.BOX, "  ? for shortcuts"]
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "● Leavening… (running UserPromptSubmit hook)",
+            "● Sublimating… (12s · ↓ 300 tokens · esc to interrupt)",
+            # The in-progress task's activeForm replaces the verb.
+            "● Running the test suite… (12s · ↓ 300 tokens)",
+            # Default verbs with "-" or "'".
+            "● Dilly-dallying… (12s · ↓ 300 tokens)",
+            "● Beboppin'… (thinking)",
+            # A multi-word spinnerVerbs entry, past a minute.
+            "● Reticulating splines… (1m 3s · ↑ 1.2k tokens)",
+            # Before the elapsed time shows, and a hook suffix with its own "…".
+            "● Leavening… (↓ 40 tokens · thought for 2s)",
+            "● Leavening… (thought for 2s)",
+            "● Leavening… (running stop hooks… 1/3)",
+            # The status a teammate's spinner shows.
+            "● Leavening… (esc to interrupt reviewer)",
+        ],
+    )
+    def test_reduced_motion_spinner_is_processing(self, line):
+        screen = self._screen(line)
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+        assert self._p().get_status("\n".join(screen)) == TerminalStatus.PROCESSING
+
+    def test_styled_reduced_motion_spinner_is_processing_on_raw_path(self):
+        output = "\n".join(
+            self._screen("\x1b[2m●\x1b[0m Leavening… (running UserPromptSubmit hook)")
+        )
+        assert self._p().get_status(output) == TerminalStatus.PROCESSING
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            # A response that opens with a gerund and an ellipsis, no "(".
+            "● Analyzing… the diff is fine, approved.",
+            # The MCP tool-call line: its parentheses hold no spinner status.
+            "● Calling cao-mcp-server… (ctrl+o to expand)",
+            "● Fixed the flaky test… (see the notes below)",
+            "● Done. Approved.",
+        ],
+    )
+    def test_response_marker_lines_stay_completed(self, line):
+        screen = self._screen(line)
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+        assert self._p().get_status("\n".join(screen)) == TerminalStatus.COMPLETED
+
+    def test_reduced_motion_spinner_after_interim_summary_is_processing(self):
+        """Mirrors test_live_spinner_after_interim_summary_in_tail_is_processing."""
+        box = "─" * 30
+        output = (
+            "● Working on the report…\n"
+            "● Misting… (10s · ↑ 12 tokens)\n" + box + "\n✻ Pondered for 8s\n"
+            "● Churning… (2s · ↑ 4 tokens)\n❯ \n"
+        )
+        assert self._p().get_status(output) == TerminalStatus.PROCESSING
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "● Leavening… (running UserPromptSubmit hook)",
+            "● Running the test suite… (12s · ↓ 300 tokens)",
+            "● Dilly-dallying… (12s · ↓ 300 tokens)",
+        ],
+    )
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_static_reduced_motion_spinner_outlasts_turn_end_grace(self, mock_backend, line):
+        """After a dispatch, the turn-end gate holds a frame with no summary at
+        PROCESSING for TURN_END_GRACE_S and then gives the legacy verdict. A hook
+        spinner does not repaint, so without its own match the "●" frame read
+        COMPLETED once the grace ran out, while the same frame with "✻" stays
+        PROCESSING."""
+        from cli_agent_orchestrator.providers.claude_code import TURN_END_GRACE_S
+
+        mock_backend.get_native_status.return_value = None
+        mock_backend.supports_event_inbox.return_value = False
+        mock_backend.get_history.return_value = ""
+        provider = self._p()
+        provider.mark_input_received()
+        clock = {"now": 1000.0}
+        provider._turn_gate_clock = lambda: clock["now"]
+        screen = self._screen(line)
+
+        for _ in range(2):
+            assert provider.get_status_from_screen(screen) == TerminalStatus.PROCESSING
+            assert provider.get_status("\n".join(screen)) == TerminalStatus.PROCESSING
+            clock["now"] += TURN_END_GRACE_S + 1
