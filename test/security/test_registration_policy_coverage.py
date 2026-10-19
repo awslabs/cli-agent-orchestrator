@@ -17,7 +17,10 @@ Those enumerating tests existed, but the knowledge was split three ways:
   asserts enforcement for a **hard-coded list** of six delegation tools and never
   looks at the MCP tool registry.
 
-Nothing enumerated the MCP registries at all, which is exactly how the MCP
+No existing test enumerated an MCP registry for policy coverage. A few tests
+call ``list_tools()`` for other reasons (auth-client checks, ephemeral-agent
+tests, operator decisions), but none of them checks a tool against a caller
+policy, and none touches the ops registry — which is exactly how the MCP
 surface got missed in the first place, and why nobody noticed that the
 ``cao-ops-mcp-server`` tools are not gated at all.
 
@@ -32,8 +35,10 @@ with a reason per entry) and gets the same two assertions:
   ungated registration is removed, so a stale entry cannot pre-authorize a
   future registration that reuses the name.
 
-Plus ``test_the_table_names_every_known_surface``, so adding a *whole new*
-surface (a second MCP server, a new router family) is a visible diff here.
+Plus ``test_the_table_names_every_known_surface``, a consistency check between
+``SURFACES`` and the separately hand-maintained ``EXPECTED_SURFACES`` literal:
+it catches a one-sided edit to either list, not the arrival of a new surface
+that nobody wrote a row for in the first place.
 
 RELATIONSHIP TO THE EXISTING TWO FILES: this module does not replace them and
 deliberately does not copy their data. The HTTP rows *import* ``_EXEMPT`` and
@@ -424,18 +429,18 @@ SURFACES: Tuple[Surface, ...] = (
     ),
     Surface(
         name="websocket-routes",
-        mechanism="an is_auth_enabled() scope check closing the handshake with 4401 before accept",
+        mechanism="an is_auth_enabled() scope check and a 4401 close present in the handler body",
         registrations=_ws_registrations,
     ),
     Surface(
         name="cao-mcp-tools",
-        mechanism="a _tool_denied_reason() call before dispatch",
+        mechanism="a call to _tool_denied_reason() somewhere in the tool body",
         registrations=_cao_mcp_registrations,
         exempt=_CAO_MCP_EXEMPT,
     ),
     Surface(
         name="ops-mcp-tools",
-        mechanism="a _tool_denied_reason() call before dispatch",
+        mechanism="a call to _tool_denied_reason() somewhere in the tool body",
         registrations=_ops_mcp_registrations,
         xfail_reason=_OPS_XFAIL,
     ),
@@ -541,11 +546,14 @@ def test_every_exemption_carries_a_reason(surface: Surface):
 
 
 def test_the_table_names_every_known_surface():
-    """Adding a whole new registration surface is a visible diff in this file.
+    """``SURFACES`` and ``EXPECTED_SURFACES`` must name the same rows.
 
-    Without this, the failure mode #9006 describes recurs one level up: someone
-    mounts a second MCP server or a new router family, writes no row for it, and
-    the table stays green while the new surface is entirely unexamined.
+    ``EXPECTED_SURFACES`` is a second hand-written literal, not derived from
+    the registries under test, so this only catches a one-sided edit between
+    the two lists in this file — e.g. a row added to ``SURFACES`` without
+    updating ``EXPECTED_SURFACES``, or vice versa. It does not discover a new
+    registration surface (a mounted MCP server, a new router family) on its
+    own; that still requires a human to write both entries.
     """
     declared = {surface.name for surface in SURFACES}
     assert declared == set(EXPECTED_SURFACES), (
