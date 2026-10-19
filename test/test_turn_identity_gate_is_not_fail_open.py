@@ -130,6 +130,19 @@ def _wait_calls(nodes):
                 yield inner, n
 
 
+def _names_a_live_boundary(call):
+    """True if ``call`` passes a boundary keyword with a value other than a
+    literal ``None`` -- spelling the keyword with a disabling constant must not
+    read as gated."""
+    for kw in call.keywords:
+        if kw.arg not in BOUNDARY_KWARGS:
+            continue
+        if isinstance(kw.value, ast.Constant) and kw.value.value is None:
+            continue
+        return True
+    return False
+
+
 def test_every_dispatch_then_wait_site_consults_a_turn_boundary():
     """Enumerate the dispatch-then-wait sites in src/ and require a boundary.
 
@@ -146,7 +159,7 @@ def test_every_dispatch_then_wait_site_consults_a_turn_boundary():
             continue
         site = (rel, fn.name)
         seen.add(site)
-        gated = any({kw.arg for kw in call.keywords} & BOUNDARY_KWARGS for _, call in waits)
+        gated = any(_names_a_live_boundary(call) for _, call in waits)
         if not gated and site not in UNGATED_WAITS:
             offenders.append(f"{rel}:{fn.lineno} {fn.name}()")
 
