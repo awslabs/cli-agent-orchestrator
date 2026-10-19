@@ -855,6 +855,7 @@ class WorkflowRunRequest(BaseModel):
         if not value or "\x00" in value or value.startswith("~") or not os.path.isabs(value):
             raise ValueError("working_directory must be a non-empty absolute path without NUL or ~")
         return value
+
     caller_id: Optional[TerminalId] = Field(
         default=None,
         description=(

@@ -233,14 +233,15 @@ class TestRoutesCarryTheCaller:
             json={"name_or_path": "scriptwf", "inputs": {}, "caller_id": "a1b2c3d4"},
         )
         assert resp.status_code == 200
-        assert seen == {"caller_id": "a1b2c3d4"}
+        # #699 added working_directory to the same call; only the caller is under test.
+        assert seen["caller_id"] == "a1b2c3d4"
 
     def test_run_script_workflow_records_the_caller(self, monkeypatch, isolated_journal):
         """The service puts caller_id on the record the run-step handler will read."""
         spec = _script_spec()
         captured = {}
 
-        async def _drive(record, spec_path, env):
+        async def _drive(record, spec_path, env, **_kwargs):
             captured["record"] = record
             return WorkflowRunResult(
                 run_id=record.run_id,
@@ -308,7 +309,8 @@ class TestRoutesCarryTheCaller:
         monkeypatch.setattr(script_runner, "resume_script_run", _fake_resume)
         resp = client.post("/workflows/runs/run1/resume", json={"caller_id": "a1b2c3d4"})
         assert resp.status_code == 200
-        assert seen == {"caller_id": "a1b2c3d4"}
+        # #699 added working_directory to the same call; only the caller is under test.
+        assert seen["caller_id"] == "a1b2c3d4"
 
 
 class TestCallerBindingSurvivesRestart:
@@ -379,7 +381,7 @@ class TestCallerBindingSurvivesRestart:
         spec = _script_spec()
         captured = {}
 
-        async def _drive(record, spec_path, env):
+        async def _drive(record, spec_path, env, **_kwargs):
             captured["record"] = record
             workflow_journal.update_run_state(record.run_id, RunState.FAILED.value, "t")
             return WorkflowRunResult(
