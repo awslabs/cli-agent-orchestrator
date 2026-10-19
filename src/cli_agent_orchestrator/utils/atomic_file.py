@@ -313,6 +313,7 @@ def locked_atomic_rewrite(
     *,
     encoding: str = "utf-8",
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+    mode: Optional[int] = None,
 ) -> None:
     """Read-modify-write ``target`` atomically and safely across processes.
 
@@ -334,6 +335,11 @@ def locked_atomic_rewrite(
             ``LockTimeoutError``. Use a bounded timeout (rather than an
             indefinite block) so a crashed holder or a genuine deadlock
             surfaces as a clear error instead of hanging the caller.
+        mode: Explicit permission bits for the published file, same meaning
+            as :func:`locked_atomic_write`'s ``mode``. Without it an existing
+            target keeps its own bits and a NEW file gets the umask default —
+            which is wrong for a file the caller owns and needs private
+            (``settings.json`` must be 0600 whether or not it already exists).
 
     Raises:
         LockTimeoutError: If the lock is not acquired within
@@ -355,7 +361,7 @@ def locked_atomic_rewrite(
 
     with _file_lock(lock_path, lock_timeout):
         existing = target.read_text(encoding=encoding) if target.exists() else ""
-        _atomic_publish(target, compute_new_content(existing), encoding)
+        _atomic_publish(target, compute_new_content(existing), encoding, mode=mode)
 
 
 def locked_atomic_write(
