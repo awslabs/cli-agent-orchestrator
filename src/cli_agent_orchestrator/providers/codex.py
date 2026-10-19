@@ -71,7 +71,14 @@ IDLE_PROMPT_STRICT_PATTERN = r"^\s*(?:❯|›|»|codex>)\s*$"
 
 PROCESSING_PATTERN = r"\b(thinking|working|running|executing|processing|analyzing)\b"
 WAITING_PROMPT_PATTERN = r"^(?:Approve|Allow)\b.*\b(?:y/n|yes/no|yes|no)\b"
-ERROR_PATTERN = r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|panic:)"
+# "Error loading config.toml:" is the prefix codex 0.162.1 prints for the same
+# config-rejection failure when its stdout is not a tty (e.g. piped/redirected,
+# never the case for CAO's tmux-launched panes, which always see "Error:").
+# Kept as a second anchor so this still fires if codex is ever invoked outside
+# a pty.
+ERROR_PATTERN = (
+    r"^(?:Error:|ERROR:|Error loading config\.toml:|Traceback \(most recent call last\):|panic:)"
+)
 
 # Codex TUI footer indicators (status bar below the idle prompt).
 # Used to detect when the bottom lines contain TUI chrome rather than user input.

@@ -977,6 +977,22 @@ class TestCodexConfigRejectionDiagnostic:
         pane = "Error: something else entirely went wrong\n$ "
         assert _find_config_rejection(pane) is None
 
+    def test_rejection_is_found_without_a_tty(self):
+        """codex 0.162.1 prefixes the same rejection "Error loading config.toml:"
+        when its stdout is not a terminal; the detector must still anchor on it."""
+        pane = (
+            "Error loading config.toml: --profile `cao_reviewer` cannot be used while\n"
+            '/home/op/.codex/config.toml contains legacy `profile = "cao_reviewer"` or\n'
+            "`[profiles.cao_reviewer]` config; move those settings into\n"
+            "/home/op/.codex/cao_reviewer.config.toml and remove the legacy profile\n"
+            "selector/table.\n"
+        )
+
+        message = _find_config_rejection(pane)
+
+        assert message is not None
+        assert "cao_reviewer.config.toml" in message
+
     def test_stale_scrollback_rejection_does_not_shadow_the_current_one(self):
         """tmux retains history: an old rejection must not outrank the latest one."""
         pane = (
