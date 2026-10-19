@@ -151,7 +151,7 @@ TURN_ACTIVITY_PATTERN = r"^[^\S\n]*[•◦└■]"
 # drawing a banner, so without this pattern the only symptom CAO could report
 # was a generic `provider_init_timeout` expiry -- an operator who had followed
 # CAO's own (previously wrong) docs got a message pointing at host slowness
-# rather than at the config line they needed to move (#9002). Matched on the
+# rather than at the config line they needed to move (#967). Matched on the
 # distinguishing phrase rather than the whole sentence because codex
 # interpolates absolute CODEX_HOME paths into it and the pane wraps them.
 # Verified against codex-cli 0.162.1.
@@ -1421,7 +1421,7 @@ class CodexProvider(BaseProvider):
         # where approval prompts would block handoff/assign. Profiles can
         # opt out via `codexProfile` (names a $CODEX_HOME/<name>.config.toml
         # file, NOT a [profiles.<name>] table inside config.toml -- codex
-        # rejects --profile outright when that legacy table is present, #9002),
+        # rejects --profile outright when that legacy table is present, #967),
         # unless unrestricted allowed tools are enabled.
         # In practice, allowed_tools containing "*" is treated as yolo mode
         # and overrides codexProfile in the same way as an explicit yolo launch.
@@ -2033,7 +2033,7 @@ class CodexProvider(BaseProvider):
             # welcome banner. That is exactly what a codex process which
             # rejected its own config and exited looks like from here, so this
             # is the one place worth paying for an extra capture: the pane still
-            # holds codex's error text (#9002). Checked here rather than on a
+            # holds codex's error text (#967). Checked here rather than on a
             # poll during startup so the happy path reads no extra frames.
             config_error = await self._find_startup_config_error()
             if config_error:
@@ -2063,7 +2063,7 @@ class CodexProvider(BaseProvider):
         ):
             # A readiness wait that expired can also be a codex that never
             # started: when the pane carries codex's own config rejection, that
-            # text is what the operator needs, not the elapsed seconds (#9002).
+            # text is what the operator needs, not the elapsed seconds (#967).
             config_error = await self._find_startup_config_error()
             if config_error:
                 raise ProviderError(config_error)

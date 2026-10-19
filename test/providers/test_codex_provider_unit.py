@@ -866,7 +866,7 @@ def toml_blocks(markdown: str) -> list[str]:
 
 
 class TestCodexProfileDocumentedForm:
-    """#9002: pin the profile layout codex actually accepts.
+    """#967: pin the profile layout codex actually accepts.
 
     ``codexProfile`` is the ONLY route to a sandboxed Codex worker under CAO --
     every other launch is ``--yolo`` -- and the docs had it pointing at a
@@ -957,7 +957,7 @@ $ """
 
 
 class TestCodexConfigRejectionDiagnostic:
-    """#9002: a rejected config must not surface as a generic init timeout."""
+    """#967: a rejected config must not surface as a generic init timeout."""
 
     def test_rejection_is_found_and_reassembled_across_wrapped_rows(self):
         message = _find_config_rejection(CONFIG_REJECTION_PANE)

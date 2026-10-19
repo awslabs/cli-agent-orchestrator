@@ -83,7 +83,7 @@ class AgentProfile(BaseModel):
     # ~/.codex/<name>.config.toml), which codex layers on top of the base user
     # config. NOT a [profiles.<name>] table inside config.toml -- that was the
     # older layout and codex now refuses to start at all when --profile is
-    # combined with it (#9002).
+    # combined with it (#967).
     # Used as --profile <name> when yolo mode is not active; unrestricted
     # allowed tools still force --yolo. min_length=1 prevents an explicit
     # empty string from silently degrading to --yolo, since this is a
