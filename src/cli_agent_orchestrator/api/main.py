@@ -9284,10 +9284,13 @@ class LessonCreateBody(BaseModel):
     """A retrospective lesson destined for a NAMED profile's agent scope.
 
     Unlike ``/internal/memory/store`` this route takes no ``terminal_context``:
-    the target scope is an argument (``target_agent_profile``), and everything
-    about the CALLER is resolved here from its own terminal record. A
-    client-supplied caller identity would be the thing the capability check
-    below is meant to bind, so it is not accepted on the wire at all.
+    the target scope is an argument (``target_agent_profile``), and the
+    caller's PROFILE is resolved here from its terminal record rather than
+    accepted as a tool argument, so a caller cannot simply name the profile it
+    wants to authorize as. ``source_terminal_id`` itself is still
+    client-chosen, same as ``POST /outcomes`` — this route does not bind the
+    caller to a request-authenticated principal, it only stops the capability
+    list from coming from the agent process.
     """
 
     target_agent_profile: str

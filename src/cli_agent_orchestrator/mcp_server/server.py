@@ -2293,10 +2293,14 @@ async def store_lesson(
 
     # The terminal ID only; cao-server resolves the record, the caller's
     # profile and the capability check itself. This tool deliberately does NOT
-    # call _get_terminal_context_from_env() and forward the resolved context:
-    # the caller profile is the authorization input, so letting the agent
-    # process supply it would make the check self-attested. Fail closed —
-    # without an ID there is no identity to authorize.
+    # call _get_terminal_context_from_env() and forward a resolved profile
+    # directly: the caller profile is the authorization input, so letting the
+    # agent process name it outright would make the check self-attested. The
+    # terminal ID that selects the record is still client-chosen (same
+    # CAO_TERMINAL_ID source as every other tool here, and the same shape as
+    # POST /outcomes) — this only stops the capability list itself from being
+    # agent-supplied, it does not bind the caller to an authenticated
+    # principal. Fail closed — without an ID there is no identity to authorize.
     try:
         terminal_id = _current_terminal_id()
     except ValueError as e:
