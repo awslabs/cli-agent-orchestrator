@@ -163,6 +163,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parentheses (a running hook, the elapsed time, the token count or `thinking`)
   is now treated as a live spinner, whatever the message before it (#908).
 
+- `store_lesson` no longer decides the learning gate, authorizes itself, or opens
+  SQLite inside the agent's process. It writes through a new `POST /lessons`
+  route, finishing the boundary move #734 started for `report_outcome` and
+  `list_outcomes`: an unreadable `settings.json` now surfaces as a plain error
+  (503) instead of `disabled: true`, which `skills/cao-learning` tells agents to
+  skip silently — so a filesystem fault used to swallow the lesson with no trace.
+  A missing route or unreachable server is likewise an explicit failure, never
+  `disabled`: only a 404 carrying `cao.learning_disabled` reads as the gate. The
+  caller's profile and its `store_lesson` capability are now resolved on the
+  server from the terminal record and profile frontmatter, so the check no longer
+  depends on the agent process being able to read the profile store (#744).
 - Kiro profile installation now preserves profile-defined `resources` alongside
   CAO's default context and skill resources. Reinstall existing profiles to
   include their configured resources in the generated Kiro agent configuration

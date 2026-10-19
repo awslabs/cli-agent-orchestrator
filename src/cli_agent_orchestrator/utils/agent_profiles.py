@@ -461,6 +461,28 @@ def load_agent_profile(agent_name: str) -> AgentProfile:
         raise RuntimeError(f"Failed to load agent profile '{agent_name}': {e}")
 
 
+def profile_declares_capability(profile_name: Optional[str], capability: str) -> bool:
+    """True when ``profile_name``'s frontmatter declares ``capability``.
+
+    The capability list comes from the profile FILE — an operator-owned
+    artifact an agent cannot edit through MCP — so this is usable as an
+    authorization input. It lives here rather than in the MCP server because
+    the profile store is on the cao-server node: an agent process that does
+    not share a filesystem with the server cannot read it, so the check has
+    to run server-side.
+
+    Fails closed on any lookup error: an unknown answer must not authorize.
+    """
+    if not profile_name:
+        return False
+    try:
+        profile = load_agent_profile(profile_name)
+        return capability in (profile.capabilities or [])
+    except Exception as e:  # noqa: BLE001 — authz check fails closed
+        logger.warning(f"capability lookup failed for profile {profile_name!r}: {e}")
+        return False
+
+
 def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
     """Resolve the provider to use for an agent profile.
 
