@@ -443,8 +443,14 @@ def _find_config_rejection(clean_output: str) -> Optional[str]:
     logical line that the pane hard-wraps, and the part an operator actually
     needs (the ``<name>.config.toml`` path to move settings into) is at the far
     end of it.
+
+    Scans the whole scrollback and keeps the LAST match, not the first: tmux
+    retains history across restarts, so an old rejection from a previous
+    launch can sit above a current, unrelated failure. The most recent launch
+    is what the caller is being asked to explain.
     """
     rows = [line.strip() for line in clean_output.splitlines() if line.strip()]
+    rejection = None
     for index, row in enumerate(rows):
         # Anchor on the row that OPENS the message, not on the row carrying the
         # distinguishing phrase: the pane wraps "cannot be used while" and
@@ -461,8 +467,8 @@ def _find_config_rejection(clean_output: str) -> Optional[str]:
             message_rows.append(continuation)
         joined = " ".join(message_rows)
         if re.search(CONFIG_PROFILE_ERROR_PATTERN, joined):
-            return joined
-    return None
+            rejection = joined
+    return rejection
 
 
 def _is_completion_footer(row: str, version: tuple[int, int, int]) -> bool:

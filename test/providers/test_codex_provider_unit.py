@@ -977,6 +977,20 @@ class TestCodexConfigRejectionDiagnostic:
         pane = "Error: something else entirely went wrong\n$ "
         assert _find_config_rejection(pane) is None
 
+    def test_stale_scrollback_rejection_does_not_shadow_the_current_one(self):
+        """tmux retains history: an old rejection must not outrank the latest one."""
+        pane = (
+            CONFIG_REJECTION_PANE.replace("cao_reviewer", "stale_profile")
+            + "\n"
+            + CONFIG_REJECTION_PANE
+        )
+
+        message = _find_config_rejection(pane)
+
+        assert message is not None
+        assert "cao_reviewer.config.toml" in message
+        assert "stale_profile" not in message
+
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
