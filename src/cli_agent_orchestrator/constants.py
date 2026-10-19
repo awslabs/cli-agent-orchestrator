@@ -1027,6 +1027,13 @@ SCRIPT_LINT_NONDETERMINISM_MODULES = frozenset({"random", "secrets", "uuid", "ti
 #     ~2.3x headroom for a legitimately large hand-written script.
 # ``test_source_at_the_cap_parses_without_crashing`` pins the first number by
 # actually parsing a worst-case source at the cap.
+#
+# Deliberately BELOW ``WORKFLOW_MAX_SPEC_BYTES`` (256 KiB, above) rather than
+# matching it: that cap is sized for a legitimate spec's byte budget, not for
+# ast.parse's C-stack behaviour, and 256 KiB of a dense attribute chain is
+# close enough to the measured segfault cliff that reusing it here would
+# reopen this crash. Do not "harmonise" the two values without re-measuring
+# the cliff on the target runner.
 SCRIPT_LINT_MAX_SOURCE_CHARS = 128 * 1024
 
 # Env-var injection allowlist for POST /terminals/run-step (Bolt 2, U2/C6,
