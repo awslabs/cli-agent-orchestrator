@@ -433,7 +433,7 @@ def test_curated_store_failure_is_observed(lifecycle, monkeypatch, caplog, late_
     def broken(self, scope, scope_id, keys):
         calls.append(set(keys))
         if late_failure and len(calls) == 1:
-            return set()
+            return {"blocked"}
         raise OSError("/PATH_SENTINEL/KEY_SENTINEL.md")
 
     monkeypatch.setattr(
@@ -448,7 +448,9 @@ def test_curated_store_failure_is_observed(lifecycle, monkeypatch, caplog, late_
             terminal_context=dict(ctx, agent_profile="memory_manager"),
         )
     )
-    assert [row.key for row in rows] == ["blocked", "active", "replacement"]
+    assert [row.key for row in rows] == (
+        ["active", "replacement"] if late_failure else ["blocked", "active", "replacement"]
+    )
     assert checks[0].errors == ["lifecycle.supersedes"]
     warnings = [
         record.getMessage()
@@ -461,3 +463,9 @@ def test_curated_store_failure_is_observed(lifecycle, monkeypatch, caplog, late_
         "PATH_SENTINEL" not in warning and "KEY_SENTINEL" not in warning for warning in warnings
     )
     assert len(calls) == 2
+    assert checks[0].exclusion_summary_for_scope("global") == (
+        (1, ["lifecycle.supersedes"]) if late_failure else (0, [])
+    )
+    assert checks[0].exclusion_summary("global", None) == (
+        (1, ["lifecycle.supersedes"]) if late_failure else (0, [])
+    )
