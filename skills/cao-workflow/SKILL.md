@@ -187,8 +187,10 @@ for a tool that grants one — **there deliberately isn't one.** An agent that c
 just wrote would make the check decorative in exactly the case it exists for. Approving is a human act
 at a human's terminal.
 
-Once approved, run again and it proceeds. Approval binds *that* plan: change anything that affects
-execution and the next run needs its own approval.
+Once approved, run again and it proceeds. Approval binds the script, its inputs and the working
+directory's state: change any of them and the next run needs its own approval. Edits to agent profiles
+or CAO memory don't change the `plan_id`, so a later run of the same plan uses them without asking
+again. Tell the user whenever you change either.
 
 > **This pause is not a defect, and it does not fail FR-10.** The requirement's failure condition is
 > *asking the user to choose a format* — which never happens, since Python is the format. A human

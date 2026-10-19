@@ -572,7 +572,9 @@ validate it, present it for review, make the plan-discovery run above, and surfa
   nothing verifies it.
 - **A same-user local control, not a privilege boundary.** CAO runs as the invoking user, so a
   determined local script can edit the settings or the approval record directly. What the gate provides
-  is that a changed plan cannot execute *unnoticed* under an approval granted for a different plan.
+  is that a changed script, changed inputs or a changed repository state cannot execute unnoticed
+  under an approval granted for a different plan. It does not bind agent profiles or memory content;
+  see [What an approval does not cover](#what-an-approval-does-not-cover).
 - **Fail-closed while enabled**: a run whose manifest is missing or unreadable is refused rather than
   admitted.
 
@@ -596,9 +598,36 @@ One consequence is worth stating plainly, because it differs from a non-workflow
 The recorded hash covers the full resolved content, taken **before** redaction, so it identifies what was resolved
 rather than what survived the redaction rules of the day.
 
-### One thing not yet recorded
+### What an approval does not cover
 
-Stated here because its absence is easy to assume away:
+An approval binds three things: the script source, its resolved inputs, and the state of the run's
+working directory when the run is admitted. For a Git repository that state is the commit and the
+worktree changes, not the path, so two checkouts in the same state share one approval. For a directory
+outside any Git repository it is only the directory's canonical path.
+
+Everything else is read when a step runs, so a new run of an approved plan can do something different
+from what was reviewed and still match the same `plan_id`:
+
+- **Agent profiles.** A step's system prompt, tools and model come from the profile it names, read
+  when the step launches. If that profile is edited after approval, the next run uses the edited
+  profile under the original `plan_id`. Within one run, CAO refuses further agent launches once a
+  profile changes (`plan_inputs_changed`); a new run is not refused. Tracked in #827.
+- **Memory content.** CAO memory is resolved at a run's first agent terminal and is not part of the
+  `plan_id`. Memory added or edited after approval, including through the `memory_store` tool, reaches
+  the next run's steps under the original `plan_id`. Only the memory-enabled setting is checked, and
+  only within a run. Tracked in #828.
+- **Files in a non-Git working directory.** The `plan_id` records the directory's path, not its
+  contents. Files added, changed or removed there after approval are used by the next run under the
+  original `plan_id`.
+- **Repository changes after admission.** The repository state is read once, when the run is
+  admitted. Changes made after that, including while a submitted run waits for a free slot, are not
+  detected.
+- **Agents a step delegates to** with assign or handoff. They run with their current profiles.
+
+With API authentication off, which is the default, any process running as you can change these inputs,
+and can also run `cao workflow approve`. The gate makes sure that a changed script, changed inputs or
+changed repository state can't run unnoticed under an approval granted for something else. It doesn't
+detect changes to the inputs listed above.
 
 1. **Six manifest fields are omitted rather than recorded** — provider, model, profile, permissions,
    limits and retry policy. Script-tier steps are discovered by executing the Python, so those values

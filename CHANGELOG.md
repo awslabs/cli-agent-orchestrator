@@ -9,10 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Breaking / migration:** workflow approval enforcement now defaults ON for script-tier runs
   (#583 Bolt 3) (#699). The first run of each script plan is refused until
-  `cao workflow approve <plan_id>`; to keep the previous behaviour set
+  an operator runs `cao workflow approve <plan_id>`; operators choosing the previous behaviour set
   `workflow.require_approval: false` in `settings.json`. Script runs journaled before this upgrade
   cannot launch further agent steps while approval enforcement is on; start a new run. With
   approval enforcement off, those runs continue. Plan identifiers keep the `plan-v1:` scheme.
+
+- **Breaking / migration:** a fresh script run now executes a private copy of the approved source.
+  Modules beside the spec are not importable and `__file__` names the copy; this matches resume.
+- **Breaking / migration:** while approval is enabled, agent steps refuse reserved ephemeral profile
+  names until #827 binds their definitions.
+- **Breaking / migration:** non-Git roots now bind the directory's canonical path into `plan_id`.
+  Moving or renaming such a directory requires a new approval; Git-repository plan identifiers are
+  unchanged.
+- **Breaking / migration:** plan approval binds the script source, its resolved inputs and the working
+  directory's state (the Git commit and worktree, or the canonical path of a non-Git directory). It
+  does not bind the content of agent profiles or memory: a later run of an approved plan uses their
+  current content (#827, #828).
 
 ### Added
 
