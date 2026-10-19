@@ -53,6 +53,12 @@ jobs:
           version: v0.70.0
 
       - name: Run unit tests with coverage
+        # CAO_MUST_RUN names the assurance gates this leg owns; a `must_run`
+        # test for a listed gate that skips or gets deselected fails the session
+        # instead of passing silently (see test/_must_run.py). Only the 3.12 leg
+        # installs Trivy, so only the 3.12 leg claims the "unit" gate.
+        env:
+          CAO_MUST_RUN: ${{ matrix.python-version == '3.12' && 'unit' || '' }}
         run: |
           if [ "${{ matrix.python-version }}" = "3.12" ]; then
             trivy --version
