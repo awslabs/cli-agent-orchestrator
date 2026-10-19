@@ -443,8 +443,14 @@ def _is_pre_turn_startup_frame(clean_output: str) -> bool:
     Fails toward today's behaviour: a shell prompt glyph that USER_PREFIX_PATTERN
     happens to match, or a banner scrolled out of the buffer, returns False and
     leaves the old conservative readings in place.
+
+    Anchored on BANNER_VERSION_PATTERN rather than the bare "OpenAI Codex"
+    substring: a reply that merely quotes the product name (e.g. "I'm OpenAI
+    Codex, here is...") would otherwise also read as pre-turn (#739 review).
+    The versioned banner line ("OpenAI Codex (v0.153.2)") is startup chrome
+    the model does not render into a reply.
     """
-    if not re.search(CODEX_WELCOME_PATTERN, clean_output):
+    if not re.search(BANNER_VERSION_PATTERN, clean_output):
         return False
     all_lines = clean_output.splitlines()
     if any(re.search(TUI_FOOTER_PATTERN, line) for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]):

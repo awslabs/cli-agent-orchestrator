@@ -6300,3 +6300,21 @@ class TestCodexAccountNoticeAtStartup:
         )
         provider = CodexProvider("test1234", "test-session", "window-0")
         assert provider.get_status(pane) == TerminalStatus.COMPLETED
+
+    def test_a_reply_that_merely_names_the_product_is_still_completed(self):
+        """A reply mentioning "OpenAI Codex" must not read as the startup banner.
+
+        ``_is_pre_turn_startup_frame`` anchors on BANNER_VERSION_PATTERN, not
+        the bare "OpenAI Codex" substring: the versioned banner line is
+        startup chrome the model does not render into a reply, so a reply
+        that merely names the product does not flip this COMPLETED to IDLE.
+        """
+        pane = (
+            "• Sure, I'm OpenAI Codex and I finished the refactor.\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol default · /tmp/cao/work\n"
+        )
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(pane) == TerminalStatus.COMPLETED
