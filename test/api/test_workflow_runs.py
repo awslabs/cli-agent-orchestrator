@@ -2772,6 +2772,7 @@ def test_unreadable_untracked_file_is_deterministic_path_free_503(
     client, async_script_env, tmp_path, monkeypatch, endpoint
 ):
     import subprocess
+
     from cli_agent_orchestrator.services import approval_gate
     from cli_agent_orchestrator.utils import git_baseline
 
@@ -2819,3 +2820,28 @@ def test_unreadable_untracked_file_is_deterministic_path_free_503(
         assert workflow_journal.get_run("permission-refused") is None
     finally:
         path.chmod(0o600)
+
+
+@pytest.mark.parametrize("endpoint", ["/workflows/runs", "/workflows/runs:submit"])
+@pytest.mark.parametrize(
+    "value",
+    ["relative/PRIVATE_ROOT_MARKER", "~PRIVATE_ROOT_MARKER", "/PRIVATE_ROOT_MARKER\x00", ""],
+)
+def test_working_directory_field_422_drops_input_and_context(client, endpoint, value):
+    response = client.post(endpoint, json={"name_or_path": "scr", "working_directory": value})
+    assert response.status_code == 422
+    errors = response.json()["detail"]
+    assert errors
+    for error in errors:
+        assert error["loc"] == ["body", "working_directory"]
+        assert "input" not in error and "ctx" not in error
+    assert "PRIVATE_ROOT_MARKER" not in response.text
+
+
+def test_working_directory_sanitizer_leaves_other_fields_stock(client):
+    invalid = {"not_a_string": True}
+    response = client.post("/workflows/runs", json={"name_or_path": invalid})
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert error["loc"] == ["body", "name_or_path"]
+    assert error["input"] == invalid

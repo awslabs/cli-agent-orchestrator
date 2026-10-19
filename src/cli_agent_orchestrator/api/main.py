@@ -1724,14 +1724,15 @@ app.add_middleware(
 async def _redact_env_vars_validation_error(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
-    """Redact ``env_vars`` VALUES from 422 bodies (U2, NFR-SEC-4).
+    """Redact selected sensitive inputs from 422 bodies (U2, NFR-SEC-4).
 
     FastAPI's default 422 envelope echoes the offending ``input`` back to the
     caller. For ``env_vars`` violations the values are agent- or
     attacker-supplied and must never round-trip into a response body — the
     validator messages already name only the key and the rule, so the echoed
-    ``input``/``ctx`` are dropped for those entries. Every other field's 422
-    keeps FastAPI's stock shape byte-identical.
+    ``input``/``ctx`` are dropped for those entries. Script-start working_directory
+    field errors use the same redaction; validation and fixed messages remain unchanged.
+    Other fields keep FastAPI's stock shape.
     """
     errors = []
     for err in exc.errors():
@@ -1741,7 +1742,11 @@ async def _redact_env_vars_validation_error(
         echoes_env_vars = "env_vars" in err.get("loc", ()) or (
             isinstance(err.get("input"), dict) and "env_vars" in err["input"]
         )
-        if echoes_env_vars:
+        echoes_working_directory = getattr(request.scope.get("route"), "path", None) in {
+            "/workflows/runs",
+            "/workflows/runs:submit",
+        } and tuple(err.get("loc", ())) == ("body", "working_directory")
+        if echoes_env_vars or echoes_working_directory:
             err = {k: v for k, v in err.items() if k not in ("input", "ctx")}
         errors.append(err)
     return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
