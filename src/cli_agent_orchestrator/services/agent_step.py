@@ -34,7 +34,7 @@ from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStat
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
-from cli_agent_orchestrator.services import frozen_run_memory, terminal_service
+from cli_agent_orchestrator.services import frozen_run_memory, launch_guard, terminal_service
 from cli_agent_orchestrator.services.provider_error_classifier import (
     classify_provider_error,
 )
@@ -594,6 +594,11 @@ async def run_agent_step(
     terminal_id = reuse_terminal_id
 
     if created_here:
+        await asyncio.to_thread(
+            launch_guard.check,
+            (env_vars or {}).get("CAO_WORKFLOW_RUN_ID"),
+            agent,
+        )
         # Inherit working directory from supervisor when not explicitly set.
         # Without this, a handoff worker starts in the cao-server process CWD
         # instead of the supervisor's project directory. Best-effort: if

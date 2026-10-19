@@ -277,9 +277,25 @@ than calling these routes directly.
 
 ### Workflows
 
-- `/workflows*` validates and inspects workflow specifications.
+- `/workflows*` creates, updates, deletes, validates and inspects workflow specifications.
+- `POST /workflows` creates a Python spec (`201`); requires `cao:write` or `cao:admin`.
+  Invalid specs or refused paths return `400`, existing names or tier collisions `409`,
+  and storage failures `500`.
+- `PUT /workflows/{name}` replaces a Python spec (`200`) using a required `expected_hash`;
+  requires `cao:write` or `cao:admin`. Unknown names return `404`, stale hashes or tier
+  collisions `409`, invalid specs or refused paths `400`, and storage failures `500`.
+- `DELETE /workflows/{name}` deletes a spec and its index row (`200`); requires `cao:admin`.
+  An unknown or already-deleted name returns `404`; invalid paths return `400`.
+- `POST /workflows/validate` accepts exactly one of `path` or `source` (`200`);
+  requires `cao:read`, `cao:write` or `cao:admin`. The `source` form lints a Python draft
+  without writing a file; lint or size failures are reported in the `200` result.
+  Supplying both forms or neither, or source that cannot be encoded as UTF-8, returns `400`.
+
+The spec-route scope checks apply when authentication is enabled.
+
 - `POST /workflows/runs` starts a run **inline** and holds the connection until it
-  finishes, returning the complete result.
+  finishes, returning the complete result. Its optional `working_directory` field selects
+  the script run's project root; it is ignored for YAML workflows.
 - `POST /workflows/runs:submit` starts a run **asynchronously**: it returns `202` with
   `{run_id, state, links}` as soon as the run is durably journaled, then drives the run in
   the background. The `links` map always carries `self`/`status`/`result`/`cancel`;
@@ -311,7 +327,8 @@ than calling these routes directly.
   terminal-layer failures too, not only step timeouts: a provider that never initializes
   and a completed step whose output cannot be extracted are both reported as data, since
   neither says the request was bad. The 4xx/422 list is exactly the preflight checks —
-  every one of them is decided before the step runs.
+  every one of them is decided before the step runs. Approval-relevant profile or memory
+  drift returns `409` with `detail.kind: "plan_inputs_changed"` before the step launches.
 - `GET /workflows/runs/{run_id}/events` returns the run's ordered event timeline with
   any **declared** gaps. One content-negotiated path, two arms: send
   `Accept: text/event-stream` (or `?stream=true`) for a live SSE follow, otherwise a

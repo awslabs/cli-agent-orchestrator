@@ -287,14 +287,27 @@ def test_the_gate_dependency_is_real_when_enforcement_is_on(tmp_path, monkeypatc
     approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)  # must not raise
 
 
-def test_enforcement_off_is_the_default_so_the_scenario_above_needs_no_approval(
+def test_enforcement_is_the_default_so_the_scenario_above_now_does_need_an_approval(
     monkeypatch, tmp_path
 ):
-    """Why the main scenario does not grant an approval: with the default, nothing is gated."""
+    """INVERTED at issue #583 Bolt 3 (``approval-enforcement-default``).
+
+    Was ``test_enforcement_off_is_the_default_so_the_scenario_above_needs_no_approval``, whose whole
+    point was that the default gated nothing. The default now gates, so the same setup asserts the
+    opposite: with NO settings file at all, this plan is refused until it is approved.
+
+    Kept rather than deleted, because its documentary job survives the inversion — it is what tells a
+    reader of ``test_the_gate_dependency_is_real_when_enforcement_is_on`` above why that test writes a
+    settings file, and now the answer is "for explicitness, not necessity".
+    """
     monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
     monkeypatch.setattr(settings_service, "SETTINGS_FILE", tmp_path / "absent.json")
     _freeze_a_run()
+    manifest_json = workflow_journal.get_run(RUN_ID).manifest_json
 
-    approval_gate.ensure_plan_approved(
-        tier="script", manifest_json=workflow_journal.get_run(RUN_ID).manifest_json
-    )
+    with pytest.raises(approval_gate.PlanApprovalRequiredError) as excinfo:
+        approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)
+    assert excinfo.value.plan_id == "plan-v1:frozen-proof"
+
+    approval_store.grant("plan-v1:frozen-proof", "test-account")
+    approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)  # must not raise

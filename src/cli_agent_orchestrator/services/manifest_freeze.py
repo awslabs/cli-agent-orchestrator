@@ -17,7 +17,8 @@ produce a run row whose ``manifest_json`` is NULL, INDISTINGUISHABLE from a YAML
 freeze, so nothing could tell a crashed freeze from a benign absence. Eliminating the interval eliminates the
 state.
 
-BEST-EFFORT AND TOTAL: every failure returns ``None`` after a ``warning``, and the run continues. This
+BEST-EFFORT AND TOTAL: freeze_manifest returns a JSON value or a closed unavailable reason; the
+build_manifest_json compatibility wrapper returns None on failure. The approval gate decides admission. This
 matches ``_journal_insert_run``'s stated posture ("journal write is best-effort; in-memory floor still serves
 live reads") and INV-4 — a journal concern must never reach into a running step. It is safe because the
 failure direction is FAIL-CLOSED: a ``None`` becomes a NULL manifest, which the Bolt 2 approval gate reads as
@@ -50,10 +51,11 @@ the YAML tier at all.
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from cli_agent_orchestrator.services import execution_manifest, plan_identifier
-from cli_agent_orchestrator.utils.git_baseline import derive_baseline
+from cli_agent_orchestrator.utils.git_baseline import derive_baseline, normalize_unavailable_reason
 
 logger = logging.getLogger(__name__)
 
@@ -70,29 +72,34 @@ most likely misread as missing data.
 """
 
 
-def build_manifest_json(
+@dataclass(frozen=True)
+class FrozenManifest:
+    manifest_json: Optional[str]
+    unavailable_reason: Optional[str] = None
+
+
+def freeze_manifest(
     *,
     source_hash: str,
     inputs: Any,
     cwd: Optional[str] = None,
-) -> Optional[str]:
-    """Freeze the manifest for a script-tier run and return the value to store, or ``None``.
+) -> FrozenManifest:
+    """Freeze the manifest and retain a closed, path-free reason when identity is unavailable.
 
     Called ONCE per run, at run-row creation, before any step executes — ``plan_id`` must exist before
     execution for an approval to be checked against it, so a manifest assembled later could only describe
     what already ran.
 
     TOTAL: raises nothing. Any failure logs a ``warning`` and returns ``None``, which the caller passes to
-    ``insert_run`` as a NULL manifest. The exception text is logged; NO FIELD VALUE IS, because ``inputs``
+    ``insert_run`` as a NULL manifest. Only the closed reason is logged; no exception text or field value, because ``inputs``
     is exactly where a credential appears in practice.
     """
     try:
         baseline: Dict[str, Any] = derive_baseline(cwd or os.getcwd())
         if not baseline.get("available"):
-            logger.warning(
-                "manifest freeze unavailable repository baseline (run continues, manifest absent)"
-            )
-            return None
+            reason = normalize_unavailable_reason(baseline.get("reason"))
+            logger.warning("manifest freeze unavailable repository baseline: reason=%s", reason)
+            return FrozenManifest(None, reason)
 
         # Six of FR-8's nine fields are None here because they have no run-level source in this tier
         # (see the module docstring). ``plan_identifier`` renders a None scalar as a distinct
@@ -135,9 +142,14 @@ def build_manifest_json(
             memory_content="",
             memory_source="",
         )
-        return execution_manifest.serialise(envelope)
-    except (
-        Exception
-    ) as e:  # noqa: BLE001 — best-effort; the run must not fail because of the manifest
-        logger.warning("manifest freeze failed (run continues, manifest absent): %s", e)
-        return None
+        return FrozenManifest(execution_manifest.serialise(envelope))
+    except Exception:  # noqa: BLE001 - freeze failure refuses admission, never exposes inputs
+        logger.warning("manifest freeze failed: reason=internal")
+        return FrozenManifest(None, "internal")
+
+
+def build_manifest_json(
+    *, source_hash: str, inputs: Any, cwd: Optional[str] = None
+) -> Optional[str]:
+    """Compatibility wrapper for callers that only need the frozen JSON value."""
+    return freeze_manifest(source_hash=source_hash, inputs=inputs, cwd=cwd).manifest_json

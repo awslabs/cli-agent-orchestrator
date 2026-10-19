@@ -120,6 +120,18 @@ def journal_db(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+    # issue #583 Bolt 3 (``approval-enforcement-default``): approval enforcement defaults ON, so an
+    # unapproved script-tier plan is refused with 403 before any lifecycle behaviour happens. These
+    # tests are about the LIFECYCLE -- compose, drive, cancel, detached observation -- so the gate is
+    # turned off through the real setting rather than by patching the gate out.
+    import json as _json
+
+    from cli_agent_orchestrator.services import settings_service as _settings
+
+    _gate_off = tmp_path / "settings.json"
+    _gate_off.write_text(_json.dumps({"workflow": {"require_approval": False}}))
+    monkeypatch.setattr(_settings, "SETTINGS_FILE", _gate_off)
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
     workflow_service.run_registry.clear()
     workflow_service._active_drives.clear()
     yield db_path

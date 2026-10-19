@@ -23,6 +23,7 @@ self-contained. Run with: ``uv run pytest -m e2e test/e2e/test_script_runner_e2e
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import time
@@ -92,6 +93,13 @@ def _temp_db(tmp_path, monkeypatch):
     )
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+    # These subprocess proofs exercise the runner, independently of plan approval.
+    from cli_agent_orchestrator.services import settings_service
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"workflow": {"require_approval": False}}))
+    monkeypatch.setattr(settings_service, "SETTINGS_FILE", settings)
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
     workflow_service.run_registry.clear()
     workflow_service._active_drives.clear()
     yield
@@ -263,3 +271,72 @@ async def test_real_shim_http_error_kind_reaches_stderr_tail(tmp_path):
     assert row is not None
     assert row.error is not None
     assert "run-step returned HTTP 409 (diverged): step changed" in row.error
+
+
+async def test_approved_script_imports_real_sdk_despite_sibling_shadow(monkeypatch, tmp_path):
+    """Both fresh start and resume import the SDK despite an authored cao_workflow.py."""
+    from pathlib import Path
+
+    import cao_workflow
+    from cli_agent_orchestrator.clients.database import _migrate_workflow_index
+    from cli_agent_orchestrator.services import (
+        approval_gate,
+        approval_store,
+        launch_guard,
+        settings_service,
+        workflow_service,
+        workflow_spec_service,
+    )
+
+    monkeypatch.setattr(approval_store, "DATABASE_FILE", tmp_path / "wf.db")
+    _migrate_workflow_index()
+    settings_service.SETTINGS_FILE.write_text('{"workflow": {"require_approval": true}}')
+    monkeypatch.setattr(launch_guard.agent_profiles, "list_agent_profiles", lambda: [])
+    monkeypatch.setattr(launch_guard.settings_service, "is_memory_enabled", lambda: False)
+    specs = tmp_path / "specs"
+    specs.mkdir()
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_SCRATCH_DIR", tmp_path / "scratch")
+    marker = tmp_path / "shadow-imported"
+    sdk_record = root / "imported-sdk"
+    source = (
+        "import cao_workflow, json, os, sys\n"
+        f"open({str(sdk_record)!r}, 'w').write(cao_workflow.__file__)\n"
+        "print('CAO_WORKFLOW_OUTPUT:' + json.dumps({'sdk': cao_workflow.__file__}))\n"
+        "sys.exit(0 if os.environ.get('CAO_WORKFLOW_RESUME') else 1)\n"
+    )
+    spec = workflow_spec_service.create_workflow("sdkproof", source, scan_dir=str(specs))
+    with pytest.raises(approval_gate.PlanApprovalRequiredError) as refusal:
+        await run_script_workflow(spec, {}, "sdk-refused", working_directory=str(root))
+    approval_store.grant(refusal.value.plan_id, "test-operator")
+    workflow_spec_service.create_workflow(
+        "cao_workflow",
+        f"open({str(marker)!r}, 'w').write('shadow imported')\n",
+        scan_dir=str(specs),
+    )
+    assert (specs / "cao_workflow.py").is_file()
+    paths = []
+    spawn = script_runner.asyncio.create_subprocess_exec
+
+    async def observe_spawn(*args, **kwargs):
+        paths.append(Path(args[1]))
+        return await spawn(*args, **kwargs)
+
+    monkeypatch.setattr(script_runner.asyncio, "create_subprocess_exec", observe_spawn)
+    try:
+        fresh = await run_script_workflow(spec, {}, "sdk-proof", working_directory=str(root))
+        assert fresh.state == RunState.FAILED
+        assert not marker.exists(), "fresh run imported the authored SDK shadow"
+        assert Path(sdk_record.read_text()).resolve() == Path(cao_workflow.__file__).resolve()
+        assert not paths[-1].exists()
+        resumed = await script_runner.resume_script_run("sdk-proof")
+        assert resumed.state == RunState.COMPLETED
+        assert Path(resumed.output["sdk"]).resolve() == Path(cao_workflow.__file__).resolve()
+        assert not marker.exists()
+        assert paths[0].name == "start-sdk-proof.py"
+        assert paths[1].name == "resume-sdk-proof.py"
+        assert all(not path.exists() for path in paths)
+    finally:
+        workflow_service.run_registry.clear()
+        workflow_service._active_drives.clear()

@@ -264,12 +264,10 @@ def _load_raw() -> Dict[str, Any]:
     ``terminal`` and the move is logged. ``config.json`` itself is left on
     disk (untouched) but is no longer read once migrated.
 
-    This is a plain read-modify-write with no file lock: it assumes a single
-    CAO process touches ``settings.json`` at a time (the same assumption
-    ``settings_service._load``/``_save`` already make). A concurrent ``set()``
-    from a second process during migration could be lost. Acceptable for a
-    single-operator local tool; would need a lock (e.g. ``filelock``) if CAO
-    ever supports multiple concurrent writers to the same settings file.
+    Publication uses the same target-derived lock and atomic replace as
+    ``settings_service._save``. The read and write are still separate
+    operations, so a concurrent ``set()`` from a second process during
+    migration could be lost.
     """
     global _migration_logged
 

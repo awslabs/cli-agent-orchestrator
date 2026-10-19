@@ -8,6 +8,7 @@ the non-zero exit on a non-COMPLETED run. ``requests`` is mocked — no server.
 from __future__ import annotations
 
 import json
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -302,6 +303,9 @@ def test_run_detach_exits_0_after_submit_no_follow(runner):
     assert result.exit_code == 0
     assert "run1" in result.output
     mock_req.get.assert_not_called()
+    assert mock_req.post.call_args.kwargs["json"]["working_directory"] == os.path.abspath(
+        os.getcwd()
+    )
 
 
 def test_run_wait_uses_blocking_route_and_long_timeout(runner):
@@ -317,6 +321,27 @@ def test_run_wait_uses_blocking_route_and_long_timeout(runner):
     assert not args[0].endswith(":submit")
     assert kwargs["timeout"] == WORKFLOW_RUN_REQUEST_TIMEOUT
     assert WORKFLOW_RUN_REQUEST_TIMEOUT > MCP_REQUEST_TIMEOUT
+
+
+@pytest.mark.parametrize("mode", ("--detach", "--wait"))
+def test_run_sends_explicit_root_on_first_request(runner, tmp_path, mode):
+    status_code = 202 if mode == "--detach" else 200
+    response = (
+        _submit_resp()
+        if mode == "--detach"
+        else _resp(200, {"run_id": "run1", "state": "completed", "steps": []})
+    )
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
+        mock_req.post.return_value = response
+        result = runner.invoke(
+            workflow,
+            ["run", "wf", mode, "--working-directory", str(tmp_path)],
+        )
+
+    assert result.exit_code == 0
+    assert mock_req.post.call_count == 1
+    assert mock_req.post.call_args.kwargs["json"]["working_directory"] == os.path.abspath(tmp_path)
+    assert mock_req.post.return_value.status_code == status_code
 
 
 def test_run_unknown_workflow_404(runner):
@@ -990,9 +1015,18 @@ def test_step_failed_step_exits_1(runner):
 
 
 def test_step_unreachable_server(runner):
-    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http") as mock_req:
-        mock_req.exceptions = requests.exceptions
-        mock_req.post.side_effect = requests.exceptions.ConnectionError("refused")
+    with patch(
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.post",
+        side_effect=requests.exceptions.ConnectionError("refused"),
+    ):
         result = runner.invoke(workflow, ["step", "run1", "s2"])
     assert result.exit_code != 0
     assert "could not reach cao-server" in result.output
+
+
+def test_approve_help_does_not_offer_an_agent_off_switch(runner):
+    result = runner.invoke(workflow, ["approve", "--help"])
+    assert result.exit_code == 0
+    assert "workflow.require_approval" not in result.output
+    assert "settings.json" not in result.output
+    assert "operator" in result.output and "disabled enforcement" in result.output
