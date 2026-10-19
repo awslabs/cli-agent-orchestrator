@@ -161,7 +161,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so `handoff` and workflow steps tore the worker down about 2s after sending the
   task. A `●` line whose ellipsis is followed by the spinner's status in
   parentheses (a running hook, the elapsed time, the token count or `thinking`)
-  is now treated as a live spinner, whatever the message before it (#908).
+  is now treated as a live spinner, whatever the message before it (#908). That
+  match additionally requires the first word after the `●` to be a gerund, so a
+  finished response that reports its own timing — `● Done. The fix is in place…
+  (3m 12s)` — is no longer held at processing until the step times out (#9011).
 
 - Kiro profile installation now preserves profile-defined `resources` alongside
   CAO's default context and skill resources. Reinstall existing profiles to

@@ -18,7 +18,11 @@ from cli_agent_orchestrator.models.agent_profile import (
     ContainerPathMap,
 )
 from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError, TerminalStatus
-from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider, ProviderError
+from cli_agent_orchestrator.providers.claude_code import (
+    NEW_TUI_BOX_SPINNER_PATTERN,
+    ClaudeCodeProvider,
+    ProviderError,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -3185,3 +3189,98 @@ class TestClaudeCodeReducedMotionSpinner:
             assert provider.get_status_from_screen(screen) == TerminalStatus.PROCESSING
             assert provider.get_status("\n".join(screen)) == TerminalStatus.PROCESSING
             clock["now"] += TURN_END_GRACE_S + 1
+
+
+class TestClaudeCodeReducedMotionFinishedResponse:
+    """GH #9011 (follow-up to #908 / #956): the reduced-motion pattern anchored
+    only on the parenthesised status, so a FINISHED response whose first line
+    ends in a duration or token parenthetical read PROCESSING on both status
+    paths. ``get_status_from_screen`` scans the bottom 25 rows for any match with
+    no separator scoping, so that settled line pinned PROCESSING for good and
+    ``_wait_for_completion`` saw neither COMPLETED nor IDLE until its timeout.
+    """
+
+    BOX = "─" * 60
+
+    def _p(self):
+        return ClaudeCodeProvider("test123", "test-session", "window-0")
+
+    def _screen(self, *lines):
+        return [
+            "❯ review the diff",
+            *lines,
+            self.BOX,
+            "❯ ",
+            self.BOX,
+            "  ? for shortcuts",
+        ]
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            # A finished response that happens to report its own elapsed time.
+            "● Done. The fix is in place… (3m 12s)",
+            "● Approved the plan… (↓ 1.2k tokens)",
+            "● Ran the suite… (12s)",
+            "● Rebased onto main… (2 files, 1.2k tokens)",
+            "● Handed the work back… (thinking it through below)",
+            # Past tense, not a gerund, with the exact spinner status shape.
+            "● Thought about it… (esc to interrupt)",
+        ],
+    )
+    def test_finished_response_with_status_parenthetical_is_completed(self, line):
+        screen = self._screen(line)
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+        assert self._p().get_status("\n".join(screen)) == TerminalStatus.COMPLETED
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            # Every shape the #908 repro table lists must still read PROCESSING.
+            "● Leavening… (running UserPromptSubmit hook)",
+            "● Sublimating… (12s · ↓ 300 tokens · esc to interrupt)",
+            "● Running the test suite… (12s · ↓ 300 tokens)",
+            "● Dilly-dallying… (12s · ↓ 300 tokens)",
+            "● Beboppin'… (thinking)",
+            "● Beboppin’… (thinking)",
+            "● Reticulating splines… (1m 3s · ↑ 1.2k tokens)",
+            "● Leavening… (↓ 40 tokens · thought for 2s)",
+            "● Leavening… (thought for 2s)",
+            "● Leavening… (running stop hooks… 1/3)",
+            "● Leavening… (esc to interrupt reviewer)",
+        ],
+    )
+    def test_gerund_anchor_keeps_every_908_spinner_shape_processing(self, line):
+        screen = self._screen(line)
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+        assert self._p().get_status("\n".join(screen)) == TerminalStatus.PROCESSING
+
+    def test_hyphen_and_contraction_verbs_match_on_the_animated_glyph_too(self):
+        """The same widened verb class fixes NEW_TUI_BOX_SPINNER_PATTERN, which
+        had the identical "\\w*ing" gap for the default verbs carrying "-"/"'"."""
+        for line in ("✢ Dilly-dallying… (12s)", "✻ Beboppin'… (12s)"):
+            assert NEW_TUI_BOX_SPINNER_PATTERN.search(line), line
+        # Still rejects a response bullet / the version footer above the box.
+        for line in ("* Remember to deploy…", "· latest: 2.1.0 — run /update…"):
+            assert not NEW_TUI_BOX_SPINNER_PATTERN.search(line), line
+
+    def test_finished_response_does_not_pin_the_screen_path_processing(self):
+        """The screen path has no separator scoping: the settled response line
+        sits in the bottom rows for the rest of the session, so a match there is
+        a permanent PROCESSING, not a one-poll blip."""
+        screen = self._screen(
+            "● Done. The fix is in place… (3m 12s)",
+            "",
+            "⎿ Tip: press ctrl+o to expand",
+        )
+        for _ in range(3):
+            assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
+    def test_live_spinner_below_a_finished_response_still_wins(self):
+        """A new turn started under the old response: PROCESSING, not COMPLETED."""
+        screen = self._screen(
+            "● Done. The fix is in place… (3m 12s)",
+            "● Sublimating… (4s · ↓ 12 tokens)",
+        )
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+        assert self._p().get_status("\n".join(screen)) == TerminalStatus.PROCESSING

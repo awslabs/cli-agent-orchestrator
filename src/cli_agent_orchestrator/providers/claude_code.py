@@ -278,7 +278,17 @@ NEW_TUI_SPINNER_PATTERN = r"[✶✢✽✻✳·*][^\n]*ing…"
 # Requiring the gerund as the FIRST word rejects a response bullet
 # ("* Remember to deploy…") or the version footer ("· latest: … update…")
 # sitting directly above the box from being misread as a live spinner.
-NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+\w*ing\b.*…")
+#
+# "Gerund" has to allow the punctuation Claude Code's own default verb list
+# carries: a hyphen inside the word ("Dilly-dallying") and the dropped-g
+# contraction ("Beboppin'", with either ASCII ' or the typographic ’). A plain
+# "\w*ing\b" rejects both — \w spans no "-" and no "'" — which is why #956
+# dropped the first-word anchor entirely rather than widening it, and that is
+# what left the reduced-motion pattern matching finished responses (GH #9011).
+# No "\b" after the contraction: the next character is the "…", so there is no
+# word boundary to assert there.
+_SPINNER_VERB = r"[\w'’-]*(?:ing\b|in['’])"
+NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+" + _SPINNER_VERB + r".*…")
 # Live spinner under Claude Code's prefersReducedMotion setting (GH #908): the
 # animated glyph is replaced by a static "●", e.g. "● Leavening… (running
 # UserPromptSubmit hook)" or "● Sublimating… (12s · ↓ 300 tokens)". "●" is also
@@ -291,6 +301,19 @@ NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+\w*i
 # "thought for Ns", or the older "esc to interrupt". A response like
 # "● Analyzing… the diff is fine" and the tool-call line
 # "● Calling cao-mcp-server… (ctrl+o to expand)" do not match.
+#
+# GH #9011: the status anchor alone is NOT enough, because a finished response
+# can carry a duration or token parenthetical of its own — "● Done. The fix is
+# in place… (3m 12s)", "● Approved the plan… (↓ 1.2k tokens)" — and "●" is the
+# response marker. That read PROCESSING on both status paths, and on the
+# get_status_from_screen() path (which scans the bottom 25 rows for ANY match,
+# with no separator scoping and no "newer output below" escape) the settled
+# line pinned PROCESSING for good: _wait_for_completion then saw neither
+# COMPLETED nor IDLE and burned its whole budget as a timeout. So ALSO require
+# the gerund as the first word, exactly as NEW_TUI_BOX_SPINNER_PATTERN does for
+# the animated glyphs and for the same reason. The task row ("Running the test
+# suite") and the "-"/"'" verbs that made #956 give up on a first-word anchor
+# all pass _SPINNER_VERB; "Done.", "Approved", "Ran" and "Fixed" do not.
 _REDUCED_MOTION_STATUS = (
     r"(?:running[ \t][^)\n]*\bhooks?\b"
     r"|\d+(?:\.\d+)?[smhd]\b"
@@ -299,7 +322,8 @@ _REDUCED_MOTION_STATUS = (
     r"|esc[ \t]+to[ \t]+interrupt\b)"
 )
 REDUCED_MOTION_SPINNER_PATTERN = re.compile(
-    r"^[ \t]*●[ \t]+[^\n]*…[ \t]+\(" + _REDUCED_MOTION_STATUS, re.MULTILINE
+    r"^[ \t]*●[ \t]+" + _SPINNER_VERB + r"[^\n]*…[ \t]+\(" + _REDUCED_MOTION_STATUS,
+    re.MULTILINE,
 )
 
 
