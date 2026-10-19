@@ -80,6 +80,7 @@ def _patched_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_SCRATCH_DIR", tmp_path / "scratch")
     # issue #583 Bolt 3 (``approval-enforcement-default``): the approval gate now defaults ON, and
     # every test in this module drives a script run whose plan is not approved. These are tests of the
     # RUNNER -- spawn, reap, sentinel scanning, resume admission, TOCTOU -- not of approval, so the
@@ -1663,7 +1664,7 @@ async def test_run_script_workflow_prepared_drives_without_reinsert(
 
     env = build_env("run-prep-script", "1", {})
     result = await run_script_workflow_prepared(
-        record, "/tmp/wf.py", env, working_directory="/prepared/root"
+        record, source="print('x')\n", env=env, working_directory="/prepared/root"
     )
 
     assert result.state == RunState.COMPLETED
@@ -1683,7 +1684,7 @@ async def test_run_script_workflow_prepared_marks_then_clears_active_drive(
 
     observed = {"live": None}
 
-    async def _fake_drive(record, script_path, env):
+    async def _fake_drive(record, script_path, env, *, working_directory=None):
         observed["live"] = record.run_id in workflow_service._active_drives
         return WorkflowRunResult(
             run_id=record.run_id,
@@ -1694,6 +1695,213 @@ async def test_run_script_workflow_prepared_marks_then_clears_active_drive(
 
     monkeypatch.setattr(script_runner, "_drive_process", _fake_drive)
     record = _make_record("run-prep-live", process=None, generation="1")
-    await run_script_workflow_prepared(record, "/tmp/wf.py", build_env("run-prep-live", "1", {}))
+    await run_script_workflow_prepared(
+        record, source="print('x')\n", env=build_env("run-prep-live", "1", {})
+    )
     assert observed["live"] is True
     assert "run-prep-live" not in workflow_service._active_drives
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_fresh_run_executes_approved_bytes_after_mid_start_update(monkeypatch, tmp_path):
+    """Admission, the journal and the interpreter must all use the approved source."""
+    import hashlib
+
+    from cli_agent_orchestrator.clients.database import _migrate_workflow_index
+    from cli_agent_orchestrator.services import (
+        approval_gate,
+        approval_store,
+        launch_guard,
+        settings_service,
+        workflow_spec_service,
+    )
+
+    _migrate_workflow_index()
+    settings_service.SETTINGS_FILE.write_text('{"workflow": {"require_approval": true}}')
+    monkeypatch.setattr(approval_store, "DATABASE_FILE", tmp_path / "wf.db")
+    monkeypatch.setattr(launch_guard.agent_profiles, "list_agent_profiles", lambda: [])
+    monkeypatch.setattr(launch_guard.settings_service, "is_memory_enabled", lambda: False)
+    spec_dir = tmp_path / "specs"
+    spec_dir.mkdir()
+    source_a = 'print(\'CAO_WORKFLOW_OUTPUT:{"ran": "A-approved-é"}\')\r\n'
+    source_b = 'print(\'CAO_WORKFLOW_OUTPUT:{"ran": "B-never-approved"}\')\n'
+    spec = workflow_spec_service.create_workflow("fresh", source_a, scan_dir=str(spec_dir))
+    with pytest.raises(approval_gate.PlanApprovalRequiredError) as refusal:
+        await run_script_workflow(spec, {}, "fresh-refused", working_directory=str(tmp_path))
+    approval_store.grant(refusal.value.plan_id, "test-operator")
+
+    capture = launch_guard.capture
+
+    def update_in_window():
+        workflow_spec_service.update_workflow(
+            spec.name, source_b, spec.content_hash, scan_dir=str(spec_dir)
+        )
+        return capture()
+
+    monkeypatch.setattr(launch_guard, "capture", update_in_window)
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_SCRATCH_DIR", scratch)
+    materialize = script_runner._materialize_snapshot
+    staged = {}
+
+    def observe_snapshot(*args, **kwargs):
+        path = materialize(*args, **kwargs)
+        staged["path"] = path
+        staged["hash"] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        return path
+
+    monkeypatch.setattr(script_runner, "_materialize_snapshot", observe_snapshot)
+    result = await run_script_workflow(spec, {}, "fresh-approved", working_directory=str(tmp_path))
+    assert result.state == RunState.COMPLETED
+    assert result.output == {"ran": "A-approved-é"}
+    row = workflow_journal.get_run("fresh-approved")
+    snapshot = json.loads(row.spec_snapshot)
+    manifest = json.loads(row.manifest_json)
+    assert (
+        staged["hash"] == manifest["source_hash"] == snapshot["content_hash"] == spec.content_hash
+    )
+    assert manifest["plan_id"] == refusal.value.plan_id
+    assert Path(spec.path).read_text() == source_b
+    assert not Path(staged["path"]).exists()
+
+
+def test_prepared_source_is_keyword_only():
+    import inspect
+
+    signature = inspect.signature(run_script_workflow_prepared)
+    assert "spec_path" not in signature.parameters
+    assert signature.parameters["source"].kind == inspect.Parameter.KEYWORD_ONLY
+    with pytest.raises(TypeError):
+        run_script_workflow_prepared(
+            _make_record("old-caller", process=None, generation="1"), "/tmp/wf.py", {}
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prepared", [False, True], ids=["blocking", "prepared"])
+@pytest.mark.parametrize(
+    "outcome", ["success", "failure", "timeout", "cancel", "spawn-failure", "exception"]
+)
+async def test_fresh_snapshot_lifecycle(monkeypatch, tmp_path, outcome, prepared):
+    """Private source exists during the drive and is removed on every exit path."""
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_SCRATCH_DIR", scratch)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 0.01)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.01)
+    spec = _FakeScriptSpec(source="print('approved')\n", path=str(tmp_path / "author.py"))
+    Path(spec.path).write_text(spec.source)
+    run_id = "snapshot-lifecycle"
+    seen = []
+
+    def observe(path):
+        staged = Path(path)
+        assert staged != Path(spec.path)
+        assert staged.read_text() == spec.source
+        assert staged.stat().st_mode & 0o777 == 0o600
+        assert scratch.stat().st_mode & 0o777 == 0o700
+        assert not staged.stem.isidentifier()
+        assert staged.name == f"start-{run_id}.py"
+        seen.append(staged)
+
+    proc = _FakeProcess(exit_rc=1 if outcome == "failure" else 0, hang=outcome == "timeout")
+
+    async def spawn(*args, **kwargs):
+        observe(args[1])
+        if outcome == "spawn-failure":
+            raise OSError("spawn refused")
+        if outcome == "cancel":
+            script_runner.run_registry[run_id].cancelled = True
+        return proc
+
+    async def raising_drive(record, path, env, *, working_directory=None):
+        observe(path)
+        raise RuntimeError("drive exception")
+
+    monkeypatch.setattr(script_runner.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    if outcome == "exception":
+        monkeypatch.setattr(script_runner, "_drive_process", raising_drive)
+
+    async def start():
+        if not prepared:
+            return await run_script_workflow(spec, {}, run_id)
+        _seed_script_run(run_id)
+        record = _make_record(run_id, process=None, generation="1")
+        script_runner.run_registry[run_id] = record
+        return await run_script_workflow_prepared(record, source=spec.source, env={})
+
+    if outcome == "exception":
+        with pytest.raises(RuntimeError, match="drive exception"):
+            await start()
+    else:
+        result = await start()
+        state = {"success": RunState.COMPLETED, "cancel": RunState.CANCELLED}.get(
+            outcome, RunState.FAILED
+        )
+        kind = {"success": None, "cancel": "cancelled", "timeout": "timeout"}.get(outcome, "error")
+        assert result.state == state
+        assert result.kind == kind
+        assert workflow_journal.get_run(run_id).state == state.value
+    assert seen and not seen[0].exists()
+    assert run_id not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prepared", [False, True], ids=["blocking", "prepared"])
+async def test_fresh_materialize_oserror_settles_failed(monkeypatch, tmp_path, prepared):
+    def cannot_stage(*args, **kwargs):
+        raise OSError(28, "No space left on device", "/private/engine/source.py")
+
+    async def must_not_drive(*args, **kwargs):
+        pytest.fail("materialization failure must not spawn")
+
+    monkeypatch.setattr(script_runner, "_materialize_snapshot", cannot_stage)
+    monkeypatch.setattr(script_runner, "_drive_process", must_not_drive)
+    run_id = "stage-failure"
+    if prepared:
+        _seed_script_run(run_id)
+        record = _make_record(run_id, process=None, generation="1")
+        result = await run_script_workflow_prepared(record, source="print('approved')", env={})
+    else:
+        result = await run_script_workflow(_FakeScriptSpec(), {}, run_id)
+    assert result.state == RunState.FAILED
+    assert result.kind == "error"
+    assert result.warnings == [
+        "could not stage the approved script source: No space left on device"
+    ]
+    assert workflow_journal.get_run(run_id).state == "failed"
+    assert run_id not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["fdopen", "write"])
+async def test_partial_start_snapshot_deleted_on_materialize_error(monkeypatch, tmp_path, failure):
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_SCRATCH_DIR", scratch)
+    fdopen = script_runner.os.fdopen
+
+    class FailingWriter:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.stream.close()
+
+        def write(self, source):
+            self.stream.write(source[:5])
+            raise OSError(28, "No space left on device")
+
+    def fail_materialize(fd, *args, **kwargs):
+        if failure == "fdopen":
+            raise OSError(24, "Too many open files")
+        return FailingWriter(fdopen(fd, *args, **kwargs))
+
+    monkeypatch.setattr(script_runner.os, "fdopen", fail_materialize)
+    result = await run_script_workflow(_FakeScriptSpec(), {}, "partial-stage-failure")
+    assert result.state == RunState.FAILED
+    assert not (scratch / "start-partial-stage-failure.py").exists()
+    assert "partial-stage-failure" not in script_runner._active_drives

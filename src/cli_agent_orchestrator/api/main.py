@@ -5549,8 +5549,8 @@ async def _run_in_background(
                 env = script_runner.build_env(run_id, "1", inputs)
                 await script_runner.run_script_workflow_prepared(
                     record,
-                    spec.path,
-                    env,
+                    source=spec.source,
+                    env=env,
                     working_directory=working_directory,
                 )
     except asyncio.CancelledError:

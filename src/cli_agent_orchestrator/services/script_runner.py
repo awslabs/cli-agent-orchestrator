@@ -959,7 +959,7 @@ def record_step_completion(
 # ---------------------------------------------------------------------------
 # _materialize_snapshot (BR-30) — engine-owned temp file, 0o600 under 0o700 root
 # ---------------------------------------------------------------------------
-def _materialize_snapshot(run_id: str, source: str) -> str:
+def _materialize_snapshot(run_id: str, source: str, *, prefix: str = "resume") -> str:
     """Write the frozen ``spec_snapshot.source`` to an engine-owned temp file (BR-30).
 
     Resume re-drives the FROZEN snapshot, not the author's on-disk file (INV-7),
@@ -978,7 +978,7 @@ def _materialize_snapshot(run_id: str, source: str) -> str:
     except OSError as exc:
         # Non-fatal: the dir exists; log if we could not tighten its mode.
         logger.warning("script scratch dir '%s' chmod 0o700 failed: %s", scratch, exc)
-    path = scratch / f"resume-{run_id}.py"
+    path = scratch / f"{prefix}-{run_id}.py"
     # Open with O_CREAT|O_EXCL-free write but an explicit restrictive mode: create
     # owner-only, truncating any stale file from a prior aborted resume.
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
@@ -988,9 +988,14 @@ def _materialize_snapshot(run_id: str, source: str) -> str:
         # os.fdopen failed to wrap the fd, so it never took ownership — close the
         # raw fd ourselves to avoid a descriptor leak, then re-raise.
         os.close(fd)
+        _delete_temp_file(str(path))
         raise
-    with fh:
-        fh.write(source)
+    try:
+        with fh:
+            fh.write(source)
+    except OSError:
+        _delete_temp_file(str(path))
+        raise
     # Re-assert 0o600 in case an inherited umask widened O_CREAT's mode.
     try:
         os.chmod(path, 0o600)
@@ -1133,8 +1138,8 @@ async def _drive_process(
     """Spawn, drain both pipes concurrently, reap under the bound, interpret exit.
 
     THE single execution path for both a fresh run (A1) and a resume (A2) — the
-    only difference is the env (``CAO_WORKFLOW_RESUME``) and the script path
-    (author file vs materialized snapshot). Never ``shell=True`` (C-2).
+    only difference is the env (``CAO_WORKFLOW_RESUME``). Both execute an
+    engine-owned source snapshot. Never ``shell=True`` (C-2).
     """
     try:
         record.process = await asyncio.create_subprocess_exec(
@@ -1236,6 +1241,29 @@ async def _drive_process(
     )
 
 
+async def _drive_frozen(
+    record: ScriptRunRecord,
+    source: str,
+    env: Dict[str, str],
+    *,
+    working_directory: Optional[str],
+) -> WorkflowRunResult:
+    """Execute the admitted source from a private copy, even after a queued start."""
+    try:
+        path = _materialize_snapshot(record.run_id, source, prefix="start")
+    except OSError as exc:
+        return await _finalize(
+            record,
+            state=RunState.FAILED,
+            kind="error",
+            error=f"could not stage the approved script source: {exc.strerror or 'unknown OS error'}",
+        )
+    try:
+        return await _drive_process(record, path, env, working_directory=working_directory)
+    finally:
+        _delete_temp_file(path)
+
+
 async def _persist_generation_best_effort(record: ScriptRunRecord) -> None:
     """Persist a bumped generation on the timeout arm (best-effort, INV-4/INV-6).
 
@@ -1272,7 +1300,7 @@ async def run_script_workflow(
 
     ``spec`` is the resolved ``ScriptSpec`` (U5/C4) — duck-typed here (U5 owns the
     concrete model): it exposes ``.source`` (script text), ``.path`` (display path
-    for lint messages + exec), ``.name``, and optionally ``.content_hash``.
+    for lint messages), ``.name``, and optionally ``.content_hash``.
 
     Steps: (0) lint gate — a ``fail`` raises ``ScriptLintError`` before any journal
     row or subprocess (BR-1); (1) journal the run row (tier=script, gen=1) +
@@ -1381,23 +1409,23 @@ async def run_script_workflow(
     env = build_env(run_id, "1", inputs, resume=False)
     _active_drives.add(run_id)
     try:
-        return await _drive_process(record, spec.path, env, working_directory=root)
+        return await _drive_frozen(record, spec.source, env, working_directory=root)
     finally:
         _active_drives.discard(run_id)
 
 
 async def run_script_workflow_prepared(
     record: ScriptRunRecord,
-    spec_path: str,
-    env: Dict[str, str],
     *,
+    source: str,
+    env: Dict[str, str],
     working_directory: Optional[str] = None,
 ) -> WorkflowRunResult:
     """Drive an already-linted, already-journaled, already-registered script run (U2, ADR-3).
 
     The DEDICATED prepared entry the async submission path's background task
     (``_run_in_background``) invokes for the script tier. It is the EXACT tail of
-    :func:`run_script_workflow` (the ``_active_drives.add`` -> ``_drive_process``
+    :func:`run_script_workflow` (the ``_active_drives.add`` -> ``_drive_frozen``
     -> ``finally discard`` block) with the pre-drive key-validate, lint gate,
     record build, registration, and durable insert REMOVED — the async handler
     (C1) has already done all of those BEFORE acking with 202.
@@ -1413,9 +1441,7 @@ async def run_script_workflow_prepared(
     """
     _active_drives.add(record.run_id)
     try:
-        if working_directory is None:
-            return await _drive_process(record, spec_path, env)
-        return await _drive_process(record, spec_path, env, working_directory=working_directory)
+        return await _drive_frozen(record, source, env, working_directory=working_directory)
     finally:
         _active_drives.discard(record.run_id)
 

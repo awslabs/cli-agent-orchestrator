@@ -1032,7 +1032,7 @@ def async_script_env(client, monkeypatch, tmp_path):
 
     prepared = {"called": False}
 
-    async def _fake_prepared(record, spec_path, env, *, working_directory=None):
+    async def _fake_prepared(record, *, source, env, working_directory=None):
         prepared["called"] = True
         prepared["working_directory"] = working_directory
         workflow_journal.update_run_state(
@@ -2476,3 +2476,113 @@ def test_shared_policy_accepts_normal_temp_subdirectory(client, request, tmp_pat
     )
     assert response.status_code == (202 if is_submit else 200), response.text
     assert env["prepared" if is_submit else "spy"]["working_directory"] == os.path.realpath(root)
+
+
+@pytest.mark.asyncio
+async def test_submit_queued_run_executes_admitted_bytes(monkeypatch, tmp_path):
+    """A spec update while submit waits for a permit cannot change admitted bytes."""
+    import hashlib
+    from pathlib import Path
+
+    import httpx
+
+    from cli_agent_orchestrator.api import main as api_main
+    from cli_agent_orchestrator.clients.database import (
+        _migrate_workflow_index,
+        _migrate_workflow_run,
+        _migrate_workflow_run_step,
+    )
+    from cli_agent_orchestrator.services import (
+        approval_store,
+        launch_guard,
+        script_runner,
+        settings_service,
+        workflow_journal,
+        workflow_spec_service,
+    )
+
+    db = tmp_path / "queued.db"
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db)
+    monkeypatch.setattr(approval_store, "DATABASE_FILE", db)
+    _migrate_workflow_run()
+    _migrate_workflow_run_step()
+    _migrate_workflow_index()
+    settings_service.SETTINGS_FILE.write_text('{"workflow": {"require_approval": true}}')
+    monkeypatch.setattr(launch_guard.agent_profiles, "list_agent_profiles", lambda: [])
+    monkeypatch.setattr(launch_guard.settings_service, "is_memory_enabled", lambda: False)
+    specs = tmp_path / "specs"
+    specs.mkdir()
+    monkeypatch.setattr(workflow_spec_service, "WORKFLOW_SPEC_DIR", specs)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_SCRATCH_DIR", tmp_path / "scratch")
+    source_a = 'print(\'CAO_WORKFLOW_OUTPUT:{"ran": "A"}\')\n'
+    source_b = 'print(\'CAO_WORKFLOW_OUTPUT:{"ran": "B"}\')\n'
+    spec = workflow_spec_service.create_workflow("queued", source_a)
+    semaphore = asyncio.Semaphore(1)
+    await semaphore.acquire()
+    monkeypatch.setattr(api_main, "_drive_semaphore", semaphore)
+    observed = {}
+
+    async def drive(record, path, env, *, working_directory=None):
+        observed["bytes"] = Path(path).read_bytes()
+        observed["path"] = path
+        return await script_runner._finalize(record, state=RunState.COMPLETED, kind=None)
+
+    monkeypatch.setattr(script_runner, "_drive_process", drive)
+    workflow_service.run_registry.clear()
+    workflow_service._active_drives.clear()
+    body = {
+        "name_or_path": spec.name,
+        "inputs": {},
+        "run_id": "queued-approved",
+        "working_directory": str(tmp_path),
+    }
+    tasks = []
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api_main.app), base_url="http://localhost"
+        ) as client:
+            refusal = await client.post("/workflows/runs:submit", json=body)
+            assert refusal.status_code == 403
+            plan_id = refusal.json()["detail"]["plan_id"]
+            approval_store.grant(plan_id, "test-operator")
+            response = await client.post("/workflows/runs:submit", json=body)
+            assert response.status_code == 202
+            tasks = [
+                task
+                for task in api_main._background_drives
+                if task.get_name() == "workflow-drive-queued-approved"
+            ]
+            assert len(tasks) == 1
+            await asyncio.sleep(0)  # let the scheduled drive reach the held semaphore
+            assert not tasks[0].done()
+            assert not observed
+            update = await client.put(
+                f"/workflows/{spec.name}",
+                json={"source": source_b, "expected_hash": spec.content_hash},
+            )
+            assert update.status_code == 200
+            assert Path(spec.path).read_text() == source_b
+            semaphore.release()
+            await asyncio.wait_for(tasks[0], timeout=5)
+        assert observed["bytes"] == source_a.encode("utf-8")
+        row = workflow_journal.get_run(body["run_id"])
+        manifest = json.loads(row.manifest_json)
+        snapshot = json.loads(row.spec_snapshot)
+        assert (
+            hashlib.sha256(observed["bytes"]).hexdigest()
+            == manifest["source_hash"]
+            == snapshot["content_hash"]
+            == spec.content_hash
+        )
+        assert manifest["plan_id"] == plan_id
+        assert row.state == "completed"
+        assert not Path(observed["path"]).exists()
+    finally:
+        if semaphore.locked():
+            semaphore.release()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        workflow_service.run_registry.clear()
+        workflow_service._active_drives.clear()

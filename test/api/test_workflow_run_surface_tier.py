@@ -352,7 +352,7 @@ class TestSubmitTierDispatch:
 
         called = {"hit": False}
 
-        async def _prepared(record, spec_path, env, *, working_directory=None):
+        async def _prepared(record, *, source, env, working_directory=None):
             called["hit"] = True
             workflow_journal.update_run_state(record.run_id, RunState.COMPLETED.value, "t")
             from cli_agent_orchestrator.models.workflow_runtime import WorkflowRunResult
