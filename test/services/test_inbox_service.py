@@ -232,6 +232,168 @@ def _make_message(id=1, receiver_id="term-1", message="hello", status=MessageSta
     )
 
 
+class TestInboxSubmitConfirmation:
+    """Issue #78: an inbox message whose submitting Enter was swallowed.
+
+    ``send_input`` pastes, sleeps a fixed submit delay, then sends Enter. When
+    the receiving TUI swallows that Enter the message sits unsubmitted in the
+    composer: nothing raises, the receiver still reads ready, and the inbox has
+    already marked the message DELIVERED — so before this fix no path ever
+    retried and the sender waited forever.
+    """
+
+    @staticmethod
+    def _fast_confirm():
+        """Shrink the confirmation budget so these tests don't sleep for real."""
+        return (
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRM_TIMEOUT", 0.0
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_MAX_RESUBMITS", 1),
+        )
+
+    def test_swallowed_enter_is_recovered_with_a_bare_enter(self):
+        """No pickup after the send → the real recovery path sends a bare Enter."""
+        from types import SimpleNamespace
+
+        from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+        # The receiver never leaves IDLE and never earns a post-boundary stamp:
+        # exactly what a swallowed Enter looks like from the monitor's side.
+        sm = MagicMock()
+        sm.get_status.return_value = TerminalStatus.IDLE
+        sm.output_generation.return_value = 7
+        sm.status_observation.return_value = StatusObservation(TerminalStatus.IDLE, 7)
+
+        enters = []
+        timeout_patch, resubmit_patch = self._fast_confirm()
+        with (
+            timeout_patch,
+            resubmit_patch,
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", sm),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+                return_value=[_make_message()],
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.update_message_status"),
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service.send_input"),
+            # Exercise the real decision helper, stubbing only its two sinks: the
+            # pane render it reads and the key it sends.
+            patch.object(terminal_service, "_message_visible_in_box", return_value=True),
+            patch.object(
+                terminal_service,
+                "send_special_key",
+                side_effect=lambda tid, key: enters.append((tid, key)),
+            ),
+            patch.object(
+                terminal_service.provider_manager,
+                "get_provider",
+                return_value=SimpleNamespace(supports_direct_status_probe=False),
+            ),
+            patch.object(terminal_service, "status_monitor", sm),
+        ):
+            InboxService().deliver_pending("term-1")
+
+        assert enters == [("term-1", "Enter")]
+
+    def test_confirmed_pickup_sends_no_recovery(self):
+        """A receiver that picks the message up must not be poked again."""
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+        sm = MagicMock()
+        sm.get_status.return_value = TerminalStatus.IDLE
+        sm.output_generation.return_value = 7
+        # PROCESSING earned at a generation past the delivery boundary: real
+        # evidence that this delivery was accepted.
+        sm.status_observation.return_value = StatusObservation(TerminalStatus.PROCESSING, 8)
+
+        timeout_patch, resubmit_patch = self._fast_confirm()
+        with (
+            timeout_patch,
+            resubmit_patch,
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", sm),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+                return_value=[_make_message()],
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.update_message_status"),
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service.send_input"),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.terminal_service"
+                ".redeliver_dropped_message_with_boundary"
+            ) as redeliver,
+        ):
+            InboxService().deliver_pending("term-1")
+
+        redeliver.assert_not_called()
+
+    def test_stale_completed_from_a_previous_turn_is_not_pickup_evidence(self):
+        """A COMPLETED latched before the send must not confirm this delivery."""
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+        sm = MagicMock()
+        sm.get_status.return_value = TerminalStatus.COMPLETED
+        sm.output_generation.return_value = 7
+        # Right status, pre-boundary stamp — the PR #566 trap.
+        sm.status_observation.return_value = StatusObservation(TerminalStatus.COMPLETED, 5)
+
+        timeout_patch, resubmit_patch = self._fast_confirm()
+        with (
+            timeout_patch,
+            resubmit_patch,
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", sm),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+                return_value=[_make_message()],
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.update_message_status"),
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service.send_input"),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.terminal_service"
+                ".redeliver_dropped_message_with_boundary",
+                return_value=(False, None),
+            ) as redeliver,
+        ):
+            InboxService().deliver_pending("term-1")
+
+        redeliver.assert_called_once()
+
+    def test_eager_delivery_skips_confirmation(self):
+        """Eager delivery (#251) targets a PROCESSING receiver; "left ready" proves nothing."""
+        from types import SimpleNamespace
+
+        sm = MagicMock()
+        sm.get_status.return_value = TerminalStatus.PROCESSING
+        sm.output_generation.return_value = 7
+
+        timeout_patch, resubmit_patch = self._fast_confirm()
+        with (
+            timeout_patch,
+            resubmit_patch,
+            patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True),
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", sm),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
+                return_value=SimpleNamespace(accepts_input_while_processing=True),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+                return_value=[_make_message()],
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.update_message_status"),
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service.send_input"),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.terminal_service"
+                ".redeliver_dropped_message_with_boundary"
+            ) as redeliver,
+        ):
+            InboxService().deliver_pending("term-1")
+
+        sm.status_observation.assert_not_called()
+        redeliver.assert_not_called()
+
+
 class TestCodexEmptyTurnInboxIntegration:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("word_wrapped", [False, True])
@@ -296,6 +458,11 @@ class TestCodexEmptyTurnInboxIntegration:
 
         service = InboxService()
         with (
+            # This test is about empty-turn ack ORDERING, not submit confirmation
+            # (#78). Its StatusMonitor runs on a frozen fake clock and produces no
+            # output chunks, so no post-boundary status stamp can ever be earned
+            # and every delivery would pay the full confirmation timeout.
+            patch("cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", False),
             patch("cli_agent_orchestrator.services.inbox_service.bus", event_bus),
             patch("cli_agent_orchestrator.services.inbox_service.status_monitor", status_monitor),
             patch(

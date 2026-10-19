@@ -307,6 +307,32 @@ INBOX_RECONCILE_INTERVAL = 30  # seconds between reconciliation sweeps
 # and missed.
 INBOX_RECONCILE_GRACE_SECONDS = 30
 
+# Inbox submit confirmation (issue #78). send_input delivers a message as
+# paste-buffer -> fixed submit delay -> Enter. That delay only GUESSES when the
+# receiving TUI is input-ready; when it guesses wrong the TUI swallows the Enter
+# and the message sits unsubmitted in the composer. Nothing raises, the receiver
+# stays IDLE, and the inbox has already marked the message DELIVERED — so no
+# path ever retries and the sender waits on a reply that cannot come. Worse, the
+# receiver still READS ready, so the next message is pasted on top of the first
+# ({MSG1}{MSG2} in the issue). Confirm the receiver actually began processing
+# THIS delivery, and re-submit if it did not.
+#
+# The confirmation is synchronous inside the delivery (holding the per-terminal
+# delivery lock on purpose: that is what stops a second paste landing on top of
+# an unsubmitted first). It costs one or two status reads on a healthy delivery
+# and up to INBOX_SUBMIT_CONFIRM_TIMEOUT on a dropped one.
+INBOX_SUBMIT_CONFIRMATION = (
+    os.environ.get("CAO_INBOX_SUBMIT_CONFIRMATION", "true").lower() == "true"
+)
+
+# Per-attempt wait for evidence that the receiver began processing this delivery.
+INBOX_SUBMIT_CONFIRM_TIMEOUT = 8.0
+
+# Re-submit attempts after the first unconfirmed wait. Kept lower than the
+# deferred-init path's 3: inbox messages are not a session's only work, and the
+# reconcile sweep is not a second chance here (the message is already DELIVERED).
+INBOX_SUBMIT_MAX_RESUBMITS = 2
+
 # =============================================================================
 # Cleanup Service Configuration
 # =============================================================================
