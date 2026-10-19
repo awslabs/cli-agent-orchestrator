@@ -3955,7 +3955,17 @@ def dispatch_input(
             if (
                 provider.blocks_orchestrated_input_while_waiting_user_answer is True
                 and orchestration_value
-                in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
+                in {
+                    OrchestrationType.ASSIGN.value,
+                    OrchestrationType.HANDOFF.value,
+                    # send_message too (#896): an inbox delivery is just as much
+                    # machine-originated input as an assign, and the dialog
+                    # cannot tell them apart -- it ate the paste and the trailing
+                    # Enter answered the question. Only a real answer_user_prompt
+                    # call or the operator typing by hand (no orchestration type,
+                    # so not in this set) may resolve a prompt.
+                    OrchestrationType.SEND_MESSAGE.value,
+                }
                 and current_status == TerminalStatus.WAITING_USER_ANSWER
             ):
                 raise TerminalInputBlockedError(

@@ -22,7 +22,17 @@ By default, messages are only delivered when the terminal status is **IDLE** or 
 
 Some providers (e.g., Claude Code) have TUIs that buffer pasted input even while processing. For these providers, waiting for IDLE introduces unnecessary latency between agent turns.
 
-Eager delivery allows messages to be delivered during **PROCESSING** and **WAITING_USER_ANSWER** states, eliminating the inter-turn gap.
+Eager delivery allows messages to be delivered during **PROCESSING**, eliminating the
+inter-turn gap. It also covers **WAITING_USER_ANSWER**, but only for providers whose
+`blocks_orchestrated_input_while_waiting_user_answer` is False.
+
+A provider that sets that property (Claude Code, MiniMax Code) is declaring that its
+choice widget consumes pasted text as the answer to the open dialog. Delivering there
+loses the message — it is marked DELIVERED but never reaches the agent — and the
+trailing Enter submits whichever option is highlighted, so an inbox message would
+answer a question reserved for a human (issue #896). For those providers the message
+stays PENDING and is delivered by the normal IDLE/COMPLETED consumer, or by the
+reconcile sweep, once the dialog closes.
 
 ### Enabling
 

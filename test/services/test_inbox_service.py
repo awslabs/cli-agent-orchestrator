@@ -9,7 +9,7 @@ import pytest
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS, INBOX_RECONCILE_INTERVAL
-from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
+from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.event_bus import EventBus
 from cli_agent_orchestrator.services.inbox_service import InboxService
@@ -77,7 +77,7 @@ class TestCopilotQuietInboxRecovery:
                 "cli_agent_orchestrator.services.inbox_service.terminal_service.send_input"
             ) as send,
         ):
-            send.side_effect = lambda *args: loop.call_soon_threadsafe(delivered.set)
+            send.side_effect = lambda *args, **kwargs: loop.call_soon_threadsafe(delivered.set)
             svc = InboxService()
             subscriber = asyncio.create_task(svc.run())
             try:
@@ -88,7 +88,9 @@ class TestCopilotQuietInboxRecovery:
                 clock["now"] = sm._pending_stale_capture["term-1"][1] + delay
                 confirm(*args)
                 await asyncio.wait_for(delivered.wait(), timeout=2)
-                send.assert_called_once_with("term-1", "hello")
+                send.assert_called_once_with(
+                    "term-1", "hello", orchestration_type=OrchestrationType.SEND_MESSAGE
+                )
                 update.assert_called_once_with(1, MessageStatus.DELIVERED)
             finally:
                 subscriber.cancel()
@@ -213,7 +215,9 @@ class TestCopilotQuietInboxRecovery:
                 assert sm._last_status["term-1"] == TerminalStatus.IDLE
                 publish.assert_called_with("terminal.term-1.status", {"status": "idle"})
                 svc.deliver_pending("term-1")
-                send.assert_called_once_with("term-1", "hello")
+                send.assert_called_once_with(
+                    "term-1", "hello", orchestration_type=OrchestrationType.SEND_MESSAGE
+                )
                 update.assert_called_once_with(1, MessageStatus.DELIVERED)
             else:
                 assert sm._last_status.get("term-1") != TerminalStatus.IDLE
@@ -285,7 +289,7 @@ class TestCodexEmptyTurnInboxIntegration:
         backend = MagicMock()
         backend.get_history.side_effect = lambda *args, **kwargs: current_capture["text"]
 
-        def send_input(_terminal_id, message):
+        def send_input(_terminal_id, message, **_kwargs):
             delivered_texts.append(message)
             status_monitor.notify_input_sent("term-1")
             provider.notify_status_buffer_reset(len(delivered_texts))
@@ -369,7 +373,9 @@ class TestDeliverPending:
         svc = InboxService()
         svc.deliver_pending("term-1")
 
-        mock_term_svc.send_input.assert_called_once_with("term-1", "hello")
+        mock_term_svc.send_input.assert_called_once_with(
+            "term-1", "hello", orchestration_type=OrchestrationType.SEND_MESSAGE
+        )
         mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
@@ -385,7 +391,9 @@ class TestDeliverPending:
         svc = InboxService()
         svc.deliver_pending("term-1")
 
-        mock_term_svc.send_input.assert_called_once_with("term-1", "hello")
+        mock_term_svc.send_input.assert_called_once_with(
+            "term-1", "hello", orchestration_type=OrchestrationType.SEND_MESSAGE
+        )
         mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
@@ -446,7 +454,9 @@ class TestDeliverPending:
         svc.deliver_pending("term-1", num_messages=2)
 
         mock_get.assert_called_once_with("term-1", limit=2)
-        mock_term_svc.send_input.assert_called_once_with("term-1", "hello\nworld")
+        mock_term_svc.send_input.assert_called_once_with(
+            "term-1", "hello\nworld", orchestration_type=OrchestrationType.SEND_MESSAGE
+        )
         assert mock_update.call_count == 2
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
@@ -464,7 +474,9 @@ class TestDeliverPending:
         svc.deliver_pending("term-1", num_messages=0)
 
         mock_get.assert_called_once_with("term-1", limit=100)
-        mock_term_svc.send_input.assert_called_once_with("term-1", "msg0\nmsg1\nmsg2")
+        mock_term_svc.send_input.assert_called_once_with(
+            "term-1", "msg0\nmsg1\nmsg2", orchestration_type=OrchestrationType.SEND_MESSAGE
+        )
         assert mock_update.call_count == 3
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
