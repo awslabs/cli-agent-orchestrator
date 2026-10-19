@@ -22,6 +22,11 @@ test named their sites by hand.
 
 Add a ``Contract`` entry whenever CAO documents the layout of a config file
 owned by another CLI.
+
+Scope, stated honestly: ``CONTRACTS`` is a hand-maintained table of one entry,
+and each entry's oracle is lexical, not semantic -- it catches the rejected
+layout and the verbs an operator is likely to write, not every possible
+paraphrase.
 """
 
 from __future__ import annotations
@@ -82,11 +87,11 @@ class Contract:
 CONTRACTS: Tuple[Contract, ...] = (
     Contract(
         knob="codexProfile",
-        rejected=re.compile(r"\[profiles\."),
+        rejected=re.compile(r"\[profiles\.|(?<![\w./-])profiles\.[\w<>-]+\."),
         accepted=re.compile(r"[\w<>.*-]+\.config\.toml"),
         defines_knob=re.compile(
-            r"codexProfile.*\b(?:Names|names|points|block|table|inside)\b"
-            r"|\b(?:Names|names|points)\b.*codexProfile"
+            r"codexProfile.*\b(?:Names|names|points|block|table|inside|selects|reads|resolves|refers|maps)\b"
+            r"|\b(?:Names|names|points|selects|reads|resolves|refers|maps)\b.*codexProfile"
         ),
         why=(
             "codex-cli 0.162+ loads profile settings only from "
