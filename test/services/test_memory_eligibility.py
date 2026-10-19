@@ -391,7 +391,9 @@ def test_internal_context_supplies_same_request_fields(seeded, registry, monkeyp
     assert source.requests[-1] == local_request
 
 
-def test_bm25_corpus_unfiltered_idf_unchanged(seeded, registry):
+def test_bm25_corpus_unfiltered_idf_unchanged(seeded, registry, monkeypatch):
+    import rank_bm25
+
     service, _, ctx = seeded
     for i in range(4):
         _run(
@@ -402,14 +404,15 @@ def test_bm25_corpus_unfiltered_idf_unchanged(seeded, registry):
                 terminal_context=ctx,
             )
         )
-    rows = _run(
-        service._metadata_recall(query="kafka streams", scope="global", terminal_context=ctx)
-    )
-    before = service._bm25_relevance("kafka streams", rows, ctx, "global", False)
-    source = FixtureSource()
-    registry.register_source(source)
-    check = registry.begin_check(registry.EligibilityRequest.from_context("curated_recall", ctx))
-    filtered = service._bm25_search(
+    corpora = []
+    original = rank_bm25.BM25Okapi
+
+    def observe(corpus, *args, **kwargs):
+        corpora.append([list(tokens) for tokens in corpus])
+        return original(corpus, *args, **kwargs)
+
+    monkeypatch.setattr(rank_bm25, "BM25Okapi", observe)
+    args = dict(
         query="kafka streams",
         scope="global",
         scope_id=None,
@@ -417,14 +420,18 @@ def test_bm25_corpus_unfiltered_idf_unchanged(seeded, registry):
         limit=10,
         exclude_keys=set(),
         terminal_context=ctx,
-        eligibility=check,
         scan_all=False,
     )
-    after = service._bm25_relevance("kafka streams", filtered, ctx, "global", False)
-    survivor = ("survivor", "global", None, "native")
-    assert before[survivor] > 0
-    assert after[survivor] == before[survivor]
+    unfiltered = service._bm25_search(**args)
+    registry.register_source(FixtureSource())
+    check = registry.begin_check(registry.EligibilityRequest.from_context("curated_recall", ctx))
+    filtered = service._bm25_search(**args, eligibility=check)
+    assert len(corpora) == 2
+    assert len(corpora[0]) == 7
+    assert corpora[1] == corpora[0]
+    assert "blocked" in [m.key for m in unfiltered]
     assert "blocked" not in [m.key for m in filtered]
+    assert "survivor" in [m.key for m in filtered]
 
 
 def test_explain_failure_is_visible_without_excluding_recall(seeded, registry, caplog):
