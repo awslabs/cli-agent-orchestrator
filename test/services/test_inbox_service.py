@@ -10,7 +10,11 @@ import pytest
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS, INBOX_RECONCILE_INTERVAL
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import (
+    TerminalInputBlockedError,
+    TerminalInputBlockedReason,
+    TerminalStatus,
+)
 from cli_agent_orchestrator.services.event_bus import EventBus
 from cli_agent_orchestrator.services.inbox_service import InboxService
 from cli_agent_orchestrator.services.status_monitor import (
@@ -826,6 +830,59 @@ class TestEagerInboxDelivery:
             svc.deliver_pending("t1")
 
         mock_term_svc.send_input.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_send_input_blocked_dialog_refusal_stays_pending_without_resampling_status(
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
+    ):
+        """send_input's dialog guard refuses mid-send -> PENDING, decided from the
+        exception's own reason rather than a second status read (#896).
+
+        Before this fix the except branch re-sampled status_monitor.get_status()
+        to decide PENDING vs FAILED. On herdr that call shells out to the herdr
+        CLI and returns UNKNOWN on any error, which would misclassify this exact,
+        provably-transient refusal as FAILED and strand the message permanently
+        -- the outcome the handler exists to prevent. Call count asserted at 1
+        proves the decision no longer depends on that second, unreliable read.
+        """
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_term_svc.send_input.side_effect = TerminalInputBlockedError(
+            "Terminal t1 is waiting for a user answer.",
+            reason=TerminalInputBlockedReason.WAITING_USER_ANSWER,
+        )
+
+        svc = InboxService()
+        svc.deliver_pending("t1")
+
+        assert mock_monitor.get_status.call_count == 1
+        mock_update.assert_called_with(1, MessageStatus.PENDING)
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_send_input_blocked_provider_error_refusal_still_fails(
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
+    ):
+        """send_input's dead-provider guard refuses mid-send -> FAILED (terminal,
+        no sweep can ever deliver it), decided from the exception's reason."""
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_term_svc.send_input.side_effect = TerminalInputBlockedError(
+            "Terminal t1 provider is in ERROR state.",
+            reason=TerminalInputBlockedReason.PROVIDER_ERROR,
+        )
+
+        svc = InboxService()
+        svc.deliver_pending("t1")
+
+        mock_update.assert_called_with(1, MessageStatus.FAILED)
 
 
 class TestPollOpenCodePendingMessages:

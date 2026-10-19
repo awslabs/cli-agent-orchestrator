@@ -84,6 +84,7 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
     Terminal,
     TerminalInputBlockedError,
+    TerminalInputBlockedReason,
     TerminalLimitError,
     TerminalStatus,
 )
@@ -3949,7 +3950,8 @@ def dispatch_input(
             if current_status == TerminalStatus.ERROR:
                 raise TerminalInputBlockedError(
                     f"Terminal {terminal_id} provider is in ERROR state "
-                    "(provider process may have exited). Refusing to deliver input."
+                    "(provider process may have exited). Refusing to deliver input.",
+                    reason=TerminalInputBlockedReason.PROVIDER_ERROR,
                 )
 
             if (
@@ -3971,7 +3973,8 @@ def dispatch_input(
                 raise TerminalInputBlockedError(
                     f"Terminal {terminal_id} is waiting for a user answer. "
                     "Use answer_user_prompt to submit a selection or approval before "
-                    f"sending {orchestration_value} input."
+                    f"sending {orchestration_value} input.",
+                    reason=TerminalInputBlockedReason.WAITING_USER_ANSWER,
                 )
 
         # Inject memory context into the very first user message after init.

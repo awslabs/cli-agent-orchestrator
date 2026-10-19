@@ -22,6 +22,18 @@ class TerminalStatus(str, Enum):
     ERROR = "error"
 
 
+class TerminalInputBlockedReason(str, Enum):
+    """Machine-readable cause of a ``TerminalInputBlockedError``.
+
+    Lets a catcher like inbox_service's delivery loop decide PENDING-vs-FAILED from the raise
+    site's own classification instead of taking a second, possibly stale or unreliable (e.g.
+    herdr's CLI-backed ``get_status`` returning UNKNOWN on any error) status read (#896).
+    """
+
+    PROVIDER_ERROR = "provider_error"
+    WAITING_USER_ANSWER = "waiting_user_answer"
+
+
 class TerminalInputBlockedError(Exception):
     """Raised when a terminal is alive but blocked on an interactive prompt that needs a human
     (or an explicit answer_user_prompt call) to proceed -- never auto-answered.
@@ -37,7 +49,8 @@ class TerminalInputBlockedError(Exception):
     Three distinct raise sites share this one exception:
     1. services/terminal_service.py's send_input(): the terminal's provider process has exited
        (status ERROR) -- refuse to type into what is now a bare shell, since queued input would
-       execute as arbitrary commands.
+       execute as arbitrary commands. Raised with
+       ``reason=TerminalInputBlockedReason.PROVIDER_ERROR``.
     2. services/terminal_service.py's send_input(), separately: an orchestrated (assign/handoff)
        message would answer a prompt still showing WAITING_USER_ANSWER -- refuse, since only a
        real answer_user_prompt call (or the operator themselves) should resolve it. This guard
@@ -46,15 +59,21 @@ class TerminalInputBlockedError(Exception):
        providers/base.py) -- claude_code did not opt in until PR #539's round-2 fix, so before
        that an orchestrated message reaching a claude_code terminal parked on
        WAITING_USER_ANSWER was NOT refused here; it was pasted straight into the live prompt.
+       Raised with ``reason=TerminalInputBlockedReason.WAITING_USER_ANSWER``.
     3. providers/*.py's own initialize(): the CLI reached a real, alive, interactive state that
        isn't {IDLE, COMPLETED} but IS a recognized "something is asking a question" signal
        (WAITING_USER_ANSWER) -- or, for the outermost fallback, genuinely never resolved within
        the init timeout despite the terminal staying alive and producing output the whole time.
+       Raised with ``reason=None``; nothing downstream of initialize() needs the distinction.
     All three are "this terminal needs a human, not a teardown" -- see terminal_service.py's own
     _schedule_deferred_init, which catches this exception specifically to leave the terminal
     running instead of tearing it down the way any other exception from initialize() (or from the
     send_input it triggers on the deferred-init path) would.
     """
+
+    def __init__(self, message: str, reason: Optional[TerminalInputBlockedReason] = None) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class TerminalLimitError(Exception):

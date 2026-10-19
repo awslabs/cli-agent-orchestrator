@@ -22,7 +22,11 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
-from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError, TerminalStatus
+from cli_agent_orchestrator.models.terminal import (
+    TerminalInputBlockedError,
+    TerminalInputBlockedReason,
+    TerminalStatus,
+)
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import terminal_service
@@ -199,7 +203,12 @@ class InboxService:
                 # which would strand the message permanently (#896). The other
                 # raise site (provider process gone, status ERROR) is terminal:
                 # keep FAILED there, since no later sweep can ever deliver it.
-                if status_monitor.get_status(terminal_id) == TerminalStatus.WAITING_USER_ANSWER:
+                #
+                # Branch on the exception's own reason, not a second status read:
+                # on herdr, status_monitor.get_status() shells out to the herdr CLI
+                # and returns UNKNOWN on any error, which would misclassify a
+                # provably-transient dialog refusal as FAILED and strand it anyway.
+                if e.reason == TerminalInputBlockedReason.WAITING_USER_ANSWER:
                     for message in batch:
                         update_message_status(message.id, MessageStatus.PENDING)
                     logger.warning(
