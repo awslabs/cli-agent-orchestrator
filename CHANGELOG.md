@@ -29,7 +29,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#605), malformed-Origin (#656) and scheme-aware same-origin (#658) guards, and
   filesystem invariants for the per-terminal FIFO path (#823) and atomic-file
   modes under a concurrent writer (#821). `test/security/`. (#938)
-- Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `assign` and `handoff` still refuse them. `ephemeral.enabled` stays off by default.
 - Simulation-only cross-zone robot transport example (#845): existing CAO CLI
   supervisor, zone-operation, and checker agents share a persistent MuJoCo
   kinematic world through scoped MCP tools. Includes measured custody handoffs,
