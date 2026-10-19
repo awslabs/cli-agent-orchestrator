@@ -23,7 +23,11 @@ in:
 
 - ``DECLARATION``  the declaring module's own ``name: bool = False`` / ``def name``
 - ``OVERRIDE``     an assignment or ``def`` of the same name in an implementation
-- ``CONSUMER``     any other read: ``self.name``, ``backend.name()``, ``"post_x"``
+- ``CONSUMER``     any other read: ``self.name``, ``backend.name()``, or a string
+  literal in a call/decorator argument, dict-key, or comparison position --
+  e.g. ``getattr(x, "name", default)``, ``@hook("post_x")``, ``{"post_x": ...}``.
+  A bare string assignment like ``LABEL = "name"`` does NOT count: it shares
+  the name without reading it.
 
 Only a CONSUMER proves the capability reaches a decision. An OVERRIDE with no
 CONSUMER anywhere is precisely the #752/#814 shape.
@@ -274,10 +278,39 @@ def _docstring_nodes(tree: ast.AST) -> set[int]:
     return out
 
 
+def _parent_map(tree: ast.AST) -> dict[int, ast.AST]:
+    """Map each node's ``id`` to its parent, for position-sensitive checks."""
+    parents: dict[int, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+    return parents
+
+
+def _is_proving_literal_position(node: ast.Constant, parent: ast.AST | None) -> bool:
+    """True when a string literal sits where a decision path would read it.
+
+    Call/decorator argument -- ``getattr(provider, "name", default)``,
+    ``@hook("post_create_terminal")``; dict key -- an event-type lookup table
+    like ``{"post_create_terminal": "launch"}``; comparison -- ``event_type ==
+    "post_create_session"``. Anything else -- most commonly a bare assignment
+    RHS like ``LABEL = "name"`` -- is a label that merely shares the
+    capability's name, not a read of it, and must not count as a consumer.
+    """
+    if isinstance(parent, ast.Call):
+        return node in parent.args or any(node is kw.value for kw in parent.keywords)
+    if isinstance(parent, ast.Dict):
+        return node in parent.keys
+    if isinstance(parent, ast.Compare):
+        return node is parent.left or node in parent.comparators
+    return False
+
+
 def _used_names(tree: ast.AST, *, include_strings: bool) -> Iterator[tuple[str, int]]:
-    """Names this module READS: attribute access, bare identifiers, literals."""
+    """Names this module READS: attribute access, bare identifiers, proving literals."""
     declared = {(name, line) for name, line in _declared_names(tree)}
     docstrings = _docstring_nodes(tree) if include_strings else set()
+    parents = _parent_map(tree) if include_strings else {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute):
             if (node.attr, node.lineno) not in declared:
@@ -286,7 +319,9 @@ def _used_names(tree: ast.AST, *, include_strings: bool) -> Iterator[tuple[str, 
             if (node.id, node.lineno) not in declared:
                 yield node.id, node.lineno
         elif include_strings and isinstance(node, ast.Constant) and isinstance(node.value, str):
-            if id(node) not in docstrings:
+            if id(node) not in docstrings and _is_proving_literal_position(
+                node, parents.get(id(node))
+            ):
                 yield node.value, node.lineno
 
 

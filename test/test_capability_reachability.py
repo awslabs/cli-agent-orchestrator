@@ -29,6 +29,7 @@ from test.support.capability_scan import (
     REPO_ROOT,
     SRC_ROOT,
     declared_capabilities,
+    find_references,
     python_files,
     scan_surface,
 )
@@ -186,6 +187,59 @@ class TestNoStaleCapabilityReads:
             f"just always takes the fallback branch: {orphans}. Fix the name, declare the "
             "capability, or add a NON_CAPABILITY_READS entry with a reason."
         )
+
+
+class TestConsumerLiteralPrecision:
+    """A string literal only proves a decision-path read in a proving position.
+
+    Regression for the false negative both reviewers independently built: a
+    bare ``LABEL = "supports_x"`` assignment used to count as a CONSUMER
+    merely because its value matched a capability name, letting a declared,
+    provider-overridden, never-consulted capability (the #814/#752 shape)
+    pass the guard undetected.
+    """
+
+    def test_bare_literal_assignment_is_not_a_consumer(self, tmp_path):
+        declaring = tmp_path / "base.py"
+        declaring.write_text("class Base:\n    supports_probe: bool = False\n")
+        decoy = tmp_path / "decoy.py"
+        decoy.write_text('PROBE_LABEL = "supports_probe"\n')
+
+        refs = find_references(
+            ["supports_probe"],
+            declaring_module=declaring,
+            implementation_files=[],
+            search_files=[declaring, decoy],
+            include_strings=True,
+        )
+        assert not refs["supports_probe"].consumers, (
+            "a bare string-literal assignment must not count as a consumer -- "
+            "it shares the capability's name without reading it"
+        )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            'getattr(provider, "supports_probe", False)\n',
+            '@hook("supports_probe")\ndef on_probe():\n    pass\n',
+            '_MAP = {"supports_probe": "launch"}\n',
+            'if event_type == "supports_probe":\n    pass\n',
+        ],
+    )
+    def test_literal_in_a_proving_position_is_a_consumer(self, tmp_path, source):
+        declaring = tmp_path / "base.py"
+        declaring.write_text("class Base:\n    supports_probe: bool = False\n")
+        reader = tmp_path / "reader.py"
+        reader.write_text(source)
+
+        refs = find_references(
+            ["supports_probe"],
+            declaring_module=declaring,
+            implementation_files=[],
+            search_files=[declaring, reader],
+            include_strings=True,
+        )
+        assert refs["supports_probe"].consumers, f"expected a consumer for: {source!r}"
 
 
 class TestScanItselfIsWired:
