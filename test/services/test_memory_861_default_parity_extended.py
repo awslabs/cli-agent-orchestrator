@@ -138,6 +138,26 @@ NATIVE_ROWS = {
 }
 
 
+BM25_CELLS = {
+    "related-store": ("new", [("global-new", False), ("global-old", True)], {"global-new": 1}),
+    "related-legacy": ("old", [("global-old", False), ("global-extra", True)], {"global-old": 1}),
+    "curator": (
+        "pin",
+        [("global-old", False), ("global-extra", False)],
+        {"global-old": 1, "global-extra": 1},
+    ),
+    "memory-type": ("pin", [("global-extra", False)], {"global-extra": 1}),
+    "current-project": ("pin", [("project-pin", False)], {"project-pin": 1}),
+    "scan-all": ("pin", [("project-pin", False)], {"project-pin": 1}),
+    "truncating-slice": (
+        "pin",
+        [("global-old", False), ("global-extra", False)],
+        {"global-old": 1, "global-extra": 1},
+    ),
+}
+
+
+@pytest.mark.parametrize("search_mode", ["metadata", "hybrid", "bm25"])
 @pytest.mark.parametrize(
     "cell,kwargs,expected,deltas",
     [
@@ -185,12 +205,15 @@ NATIVE_ROWS = {
         ),
     ],
 )
-def test_default_recall_cells(extended, cell, kwargs, expected, deltas):
+def test_default_recall_cells(extended, cell, kwargs, expected, deltas, search_mode):
     service, engine, factory = extended
     with factory() as db:
         before = {r.key: r.access_count for r in db.query(MemoryMetadataModel)}
         assert db.query(MemoryMetadataModel).filter_by(scope="global").count() == 4
-    args = {"scope": "global", "search_mode": "metadata", "terminal_context": CTX, **kwargs}
+    args = {"scope": "global", "search_mode": search_mode, "terminal_context": CTX, **kwargs}
+    if search_mode == "bm25":
+        query, expected, deltas = BM25_CELLS[cell]
+        args["query"] = query
     rows = asyncio.run(service.recall(**args))
     assert [(m.key, m.is_related) for m in rows] == expected
     assert [
@@ -346,8 +369,9 @@ def test_default_serialized_dict_and_json(extended, monkeypatch, surface):
     normalized = json.loads(json.dumps(actual).replace(str(service.base_dir), "<ROOT>"))
     assert normalized == expected
     assert json.loads(serialized) == expected
-    assert json.dumps(json.loads(serialized), sort_keys=True) == json.dumps(
-        expected, sort_keys=True
+    # Preserve recursive key order as well as primitive JSON types.
+    assert json.dumps(json.loads(serialized), separators=(",", ":")) == json.dumps(
+        expected, separators=(",", ":")
     )
     assert _row(engine, "global-new").access_count == 8
     assert _row(engine, "global-old").access_count == 3
