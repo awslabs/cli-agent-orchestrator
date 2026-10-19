@@ -524,9 +524,11 @@ def missing_kwarg_sites(
 ) -> List[Site]:
     """Flag calls to ``func_name`` that do not pass ``kwarg`` explicitly.
 
-    A ``**kwargs`` splat counts as passing it: the rule cannot see inside a
-    dict, and failing on a splat would push authors to spell the splat out for
-    the linter's benefit rather than the reader's.
+    A ``**kwargs`` splat is also flagged, not exempted: the rule cannot see
+    inside a dict, so it cannot tell whether the splat carries ``kwarg``, and
+    treating "cannot tell" as "passes" would let a splat silently satisfy a
+    gate it never verified. A splat site must carry a reviewed opt-out row
+    just like any other site that cannot derive the gate.
     """
     srcs = parse_sources() if sources is None else sources
     out: List[Site] = []
@@ -535,13 +537,27 @@ def missing_kwarg_sites(
             if not isinstance(node, ast.Call) or _callee_name(node) != func_name:
                 continue
             names = {kw.arg for kw in node.keywords}
-            if kwarg in names or None in names:
+            if kwarg in names:
+                continue
+            key = (module.relpath, func_name, kwarg)
+            if None in names:
+                out.append(
+                    Site(
+                        relpath=module.relpath,
+                        line=node.lineno,
+                        key=key,
+                        detail=(
+                            f"{func_name}(...) passes **kwargs; cannot verify "
+                            f"{kwarg}= statically"
+                        ),
+                    )
+                )
                 continue
             out.append(
                 Site(
                     relpath=module.relpath,
                     line=node.lineno,
-                    key=(module.relpath, func_name, kwarg),
+                    key=key,
                     detail=f"{func_name}(...) does not pass {kwarg}=",
                 )
             )

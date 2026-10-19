@@ -305,7 +305,7 @@ def test_poll_until_done_has_no_min_generation_on_this_tree() -> None:
     assert "min_generation" not in declared
 
 
-def test_missing_kwarg_sites_flag_a_caller_that_omits_it() -> None:
+def test_missing_kwarg_sites_flags_an_omission_and_a_splat_but_not_an_explicit_pass() -> None:
     mod = _module("""
         poll_until_done(tid)
         poll_until_done(tid, min_generation=4)
@@ -313,9 +313,10 @@ def test_missing_kwarg_sites_flag_a_caller_that_omits_it() -> None:
         """)
     sites = cl.missing_kwarg_sites("poll_until_done", "min_generation", [mod])
     # Line 1 is the blank line the dedented triple-quote leaves behind, so the
-    # bare call is on line 2.
-    assert [s.line for s in sites] == [2], "a splat and an explicit pass must both be silent"
+    # bare call is on line 2 and the splat is on line 4.
+    assert [s.line for s in sites] == [2, 4], "only the explicit pass on line 3 may be silent"
     assert sites[0].detail == "poll_until_done(...) does not pass min_generation="
+    assert "cannot verify" in sites[1].detail
 
 
 def test_call_sites_records_the_keywords_actually_passed() -> None:
