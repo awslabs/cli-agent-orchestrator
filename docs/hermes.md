@@ -54,9 +54,10 @@ test-worker`.
 
 Keep this field separate from `codexProfile`. Codex profiles name a
 `$CODEX_HOME/<name>.config.toml` file (`~/.codex/<name>.config.toml` by
-default) and are passed as `codex --profile <name>`. Hermes profile aliases are executable wrapper
-commands, so CAO launches the alias directly as `<alias> chat ...`. Using a
-Hermes-specific field keeps that command-wrapper behavior explicit.
+default) and are passed as `codex --profile <name>`. Hermes profile aliases
+are executable wrapper commands, so CAO launches the alias directly as
+`<alias> chat ...`. Using a Hermes-specific field keeps that command-wrapper
+behavior explicit.
 
 ## Launch
 
