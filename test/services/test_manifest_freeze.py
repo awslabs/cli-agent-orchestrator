@@ -21,6 +21,7 @@ from cli_agent_orchestrator.services import (
     approval_store,
     execution_manifest,
     manifest_freeze,
+    settings_service,
 )
 from cli_agent_orchestrator.utils import agent_profiles
 
@@ -279,7 +280,14 @@ def _store(tmp_path, monkeypatch, **profiles) -> None:
     Patches the module-global the real scan and the real read both consult, so these tests exercise
     ``_list_installed_profiles`` and ``_read_agent_profile_source`` rather than a stub of them. The
     built-in packaged store is still scanned and is identical across the cases, so it cancels out.
+
+    Provider and extra directories are pinned to empty so a stray entry in a real
+    ``~/.claude/agents``-style directory on the machine running the tests cannot change which assertions
+    pass.
     """
+    monkeypatch.setattr(settings_service, "usable_agent_dirs", lambda: {})
+    monkeypatch.setattr(settings_service, "get_extra_agent_dirs", lambda: [])
+    monkeypatch.setattr(settings_service, "get_disabled_agent_dirs", lambda: [])
     store = tmp_path / "agent-store"
     store.mkdir(exist_ok=True)
     for stale in store.glob("*.md"):

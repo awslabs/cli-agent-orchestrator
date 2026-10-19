@@ -9,7 +9,23 @@ tests below pin both directions and the fail-closed path between them.
 
 import pytest
 
+from cli_agent_orchestrator.services import settings_service
 from cli_agent_orchestrator.utils import agent_profiles
+
+
+def _pin_provider_and_extra_dirs(monkeypatch) -> None:
+    """Isolate the scan to the local store + built-in store only.
+
+    ``_list_installed_profiles`` also scans provider directories (``usable_agent_dirs()``) and any
+    user-added extras, which default to real paths under the invoking user's home (e.g.
+    ``~/.claude/agents``, ``~/.codex``). Without pinning these, a stray entry already sitting in one of
+    those real directories — exactly the GH #827 fixup scenario this file tests for the local store —
+    would make these tests pass or fail depending on the machine they run on rather than on the fixture
+    under test.
+    """
+    monkeypatch.setattr(settings_service, "usable_agent_dirs", lambda: {})
+    monkeypatch.setattr(settings_service, "get_extra_agent_dirs", lambda: [])
+    monkeypatch.setattr(settings_service, "get_disabled_agent_dirs", lambda: [])
 
 
 @pytest.fixture
@@ -21,6 +37,7 @@ def store(tmp_path, monkeypatch):
     to either one's lookup order is visible here. The packaged built-in store is still scanned and is
     identical across every case in this file, so it contributes a constant and cancels out.
     """
+    _pin_provider_and_extra_dirs(monkeypatch)
     root = tmp_path / "agent-store"
     root.mkdir()
     monkeypatch.setattr(agent_profiles, "LOCAL_AGENT_STORE_DIR", root)
@@ -136,6 +153,7 @@ def test_a_stray_unloadable_directory_does_not_raise(tmp_path, monkeypatch):
     ``agent.md`` dropped into the agent store. That raised ``FileNotFoundError`` on every freeze, which
     NULLs the manifest and refuses every script-tier run with enforcement on, from a benign ``mkdir``.
     """
+    _pin_provider_and_extra_dirs(monkeypatch)
     root = tmp_path / "agent-store"
     root.mkdir()
     monkeypatch.setattr(agent_profiles, "LOCAL_AGENT_STORE_DIR", root)
