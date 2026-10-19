@@ -776,3 +776,31 @@ class TestSendDispatchBoundary:
         _, kwargs = mock_poll.call_args
         assert kwargs["min_generation"] is None
         mock_time.sleep.assert_called_once_with(3)
+
+    @patch("cli_agent_orchestrator.cli.commands.session.poll_until_done")
+    @patch("cli_agent_orchestrator.cli.commands.session.time")
+    @patch("cli_agent_orchestrator.cli.commands.session.api_http.post")
+    @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
+    def test_send_handles_a_non_dict_json_body(
+        self, mock_get, mock_post, mock_time, mock_poll, runner
+    ):
+        """A malformed (non-dict) JSON body from the POST response must not
+        crash with a raw AttributeError from ``.get()`` on a list/scalar --
+        it should be treated as naming no boundary, same as an older server."""
+        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        pre_send_status_resp = MagicMock(status_code=200)
+        pre_send_status_resp.json.return_value = {"status": "idle"}
+        output_resp = MagicMock(status_code=200)
+        output_resp.json.return_value = {"output": "done"}
+        mock_get.side_effect = [resolve_resp, pre_send_status_resp, output_resp]
+        post_resp = MagicMock(status_code=200, json=lambda: [1, 2, 3])
+        mock_post.return_value = post_resp
+        mock_time.sleep = MagicMock()
+
+        result = runner.invoke(session, ["send", "cao-test", "question"])
+
+        assert result.exit_code == 0
+        mock_poll.assert_called_once()
+        _, kwargs = mock_poll.call_args
+        assert kwargs["min_generation"] is None
+        mock_time.sleep.assert_called_once_with(3)
