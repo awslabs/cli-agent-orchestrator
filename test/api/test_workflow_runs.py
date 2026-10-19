@@ -326,6 +326,39 @@ def test_script_request_rejects_non_directory_root(client, script_run_env, tmp_p
     assert str(root) not in response.text
 
 
+@pytest.mark.parametrize("root", ("/", "/etc"))
+def test_script_request_refuses_blocked_root_before_runner(client, script_run_env, root):
+    response = client.post(
+        "/workflows/runs",
+        json={
+            "name_or_path": "scr",
+            "inputs": {"topic": "birds"},
+            "working_directory": root,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "working_directory must not be a blocked system directory"
+    assert script_run_env["spy"]["called"] is False
+
+
+def test_script_request_accepts_normal_temp_subdirectory(client, script_run_env, tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    response = client.post(
+        "/workflows/runs",
+        json={
+            "name_or_path": "scr",
+            "inputs": {"topic": "birds"},
+            "working_directory": str(root),
+        },
+    )
+
+    assert response.status_code == 200
+    assert script_run_env["spy"]["called"] is True
+    assert script_run_env["spy"]["working_directory"] == os.path.realpath(root)
+
+
 def test_script_request_canonicalizes_root_before_runner(client, script_run_env, tmp_path):
     real_root = tmp_path / "real"
     real_root.mkdir()
