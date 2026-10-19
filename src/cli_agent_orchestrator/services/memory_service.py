@@ -59,6 +59,15 @@ HYBRID_CANDIDATE_MULTIPLIER = 3
 HYBRID_CANDIDATE_MAX = 200
 
 
+@dataclass
+class RecallPool:
+    """Selected rows and the all-term tier from the same search snapshot."""
+
+    rows: list[Memory]
+    all_term_identities: set[tuple]
+    effective_sort: str
+
+
 def _matches_all_terms(query: str, content: str) -> bool:
     """Use metadata recall's case-insensitive, all-term substring predicate."""
     content_lower = content.lower()
@@ -2422,145 +2431,24 @@ class MemoryService:
             terminal_id=terminal_id,
         )
 
-        if search_mode == "bm25":
-            if not query:
-                return []
-            scope_id = self._bm25_scope_id(scope, terminal_context)
-            bm25_only = self._bm25_search(
-                query=query,
-                scope=scope,
-                scope_id=scope_id,
-                memory_type=memory_type,
-                limit=limit,
-                exclude_keys=set(),
-                terminal_context=terminal_context,
-                scan_all=scan_all,
-                policy=recall_policy,
-            )
-            return self._apply_sort_and_increment(
-                bm25_only,
-                scope,
-                sort_by,
-                limit,
-                include_related=include_related,
-                query=query,
-                terminal_context=terminal_context,
-                scan_all=scan_all,
-                policy=recall_policy,
-            )
+        if search_mode == "bm25" and not query:
+            return []
 
-        widen_candidates = search_mode == "hybrid" and bool(query) and sort_by in {"score", "usage"}
-        candidate_limit = (
-            max(
-                limit,
-                min(
-                    HYBRID_CANDIDATE_MAX,
-                    max(HYBRID_CANDIDATE_MIN, HYBRID_CANDIDATE_MULTIPLIER * limit),
-                ),
-            )
-            if widen_candidates
-            else limit
-        )
-
-        metadata_results = await self._metadata_recall(
-            query=query,
-            scope=scope,
-            memory_type=memory_type,
-            limit=candidate_limit,
-            terminal_context=terminal_context,
-            scan_all=scan_all,
-            policy=recall_policy,
-        )
-
-        if search_mode == "metadata" or not query:
-            return self._apply_sort_and_increment(
-                metadata_results,
-                scope,
-                sort_by,
-                limit,
-                include_related=include_related,
-                query=query,
-                terminal_context=terminal_context,
-                scan_all=scan_all,
-                policy=recall_policy,
-            )
-
-        if widen_candidates:
-            by_identity: dict[tuple, Memory] = {}
-            for memory in metadata_results:
-                by_identity.setdefault(self._identity(memory), memory)
-            # An untruncated metadata scan is a census of index-listed rows.
-            # Check possible truncation or a shortfall after identity deduplication.
-            if len(metadata_results) == candidate_limit or len(by_identity) < limit:
-                all_term_identities: set[tuple] = set()
-                bm25_results = self._bm25_search(
-                    query=query,
-                    scope=scope,
-                    scope_id=self._bm25_scope_id(scope, terminal_context),
-                    memory_type=memory_type,
-                    limit=candidate_limit,
-                    exclude_keys=set(),
-                    terminal_context=terminal_context,
-                    scan_all=scan_all,
-                    policy=recall_policy,
-                    all_terms_first=True,
-                    all_term_identities=all_term_identities,
-                )
-                partial_results = []
-                for memory in bm25_results:
-                    if self._identity(memory) in all_term_identities:
-                        by_identity.setdefault(self._identity(memory), memory)
-                    else:
-                        partial_results.append(memory)
-                if len(by_identity) < limit:
-                    for memory in partial_results:
-                        by_identity.setdefault(self._identity(memory), memory)
-                        if len(by_identity) >= limit:
-                            break
-            return self._apply_sort_and_increment(
-                list(by_identity.values()),
-                scope,
-                sort_by,
-                limit,
-                include_related=include_related,
-                query=query,
-                terminal_context=terminal_context,
-                scan_all=scan_all,
-                policy=recall_policy,
-            )
-
-        # hybrid: top up with BM25 hits not already in metadata results
-        exclude_keys = {m.key for m in metadata_results}
-        remaining = max(0, limit - len(metadata_results))
-        if remaining == 0:
-            return self._apply_sort_and_increment(
-                metadata_results,
-                scope,
-                sort_by,
-                limit,
-                include_related=include_related,
-                query=query,
-                terminal_context=terminal_context,
-                scan_all=scan_all,
-                policy=recall_policy,
-            )
-
-        scope_id = self._bm25_scope_id(scope, terminal_context)
-        bm25_results = self._bm25_search(
-            query=query,
-            scope=scope,
-            scope_id=scope_id,
-            memory_type=memory_type,
-            limit=remaining,
-            exclude_keys=exclude_keys,
-            terminal_context=terminal_context,
-            scan_all=scan_all,
-            policy=recall_policy,
+        pool = await self._recall_pool(
+            query,
+            scope,
+            memory_type,
+            limit,
+            terminal_context,
+            scan_all,
+            search_mode,
+            sort_by,
+            recall_policy,
         )
         return self._apply_sort_and_increment(
-            metadata_results + bm25_results,
+            pool.rows,
             scope,
-            sort_by,
+            pool.effective_sort,
             limit,
             include_related=include_related,
             query=query,
@@ -2568,6 +2456,136 @@ class MemoryService:
             scan_all=scan_all,
             policy=recall_policy,
         )
+
+    async def _recall_pool(
+        self,
+        query: Optional[str],
+        scope: Optional[str],
+        memory_type: Optional[str],
+        limit: int,
+        terminal_context: Optional[dict],
+        scan_all: bool,
+        search_mode: str,
+        sort_by: str,
+        policy: Optional[VaultInjectionPolicy],
+    ) -> RecallPool:
+        """Select candidates without ordering, access increments or expansion."""
+        if search_mode == "bm25":
+            if not query:
+                return RecallPool([], set(), sort_by)
+            rows = self._bm25_search(
+                query=query,
+                scope=scope,
+                scope_id=self._bm25_scope_id(scope, terminal_context),
+                memory_type=memory_type,
+                limit=limit,
+                exclude_keys=set(),
+                terminal_context=terminal_context,
+                scan_all=scan_all,
+                policy=policy,
+            )
+            return RecallPool(rows, set(), sort_by)
+
+        widen_candidates = search_mode == "hybrid" and bool(query) and sort_by in {"score", "usage"}
+        candidate_limit = self._candidate_limit(limit) if widen_candidates else limit
+        metadata_results = await self._metadata_recall(
+            query=query,
+            scope=scope,
+            memory_type=memory_type,
+            limit=candidate_limit,
+            terminal_context=terminal_context,
+            scan_all=scan_all,
+            policy=policy,
+        )
+        if search_mode == "metadata" or not query:
+            return RecallPool(metadata_results, set(), sort_by)
+        if widen_candidates:
+            rows, all_terms = self._widened_hybrid_pool(
+                metadata_results,
+                query,
+                scope,
+                memory_type,
+                limit,
+                candidate_limit,
+                terminal_context,
+                scan_all,
+                policy,
+            )
+            return RecallPool(rows, all_terms, sort_by)
+
+        # Legacy hybrid: metadata first, BM25 only fills remaining slots.
+        exclude_keys = {m.key for m in metadata_results}
+        remaining = max(0, limit - len(metadata_results))
+        if remaining == 0:
+            return RecallPool(metadata_results, set(), sort_by)
+        bm25_results = self._bm25_search(
+            query=query,
+            scope=scope,
+            scope_id=self._bm25_scope_id(scope, terminal_context),
+            memory_type=memory_type,
+            limit=remaining,
+            exclude_keys=exclude_keys,
+            terminal_context=terminal_context,
+            scan_all=scan_all,
+            policy=policy,
+        )
+        return RecallPool(metadata_results + bm25_results, set(), sort_by)
+
+    @staticmethod
+    def _candidate_limit(limit: int) -> int:
+        return max(
+            limit,
+            min(
+                HYBRID_CANDIDATE_MAX, max(HYBRID_CANDIDATE_MIN, HYBRID_CANDIDATE_MULTIPLIER * limit)
+            ),
+        )
+
+    def _widened_hybrid_pool(
+        self,
+        metadata_results: list[Memory],
+        query: str,
+        scope: Optional[str],
+        memory_type: Optional[str],
+        limit: int,
+        candidate_limit: int,
+        terminal_context: Optional[dict],
+        scan_all: bool,
+        policy: Optional[VaultInjectionPolicy],
+    ) -> tuple[list[Memory], set[tuple]]:
+        """#961's identity merge and partial-fill contract, before final ranking."""
+        by_identity: dict[tuple, Memory] = {}
+        for memory in metadata_results:
+            by_identity.setdefault(self._identity(memory), memory)
+        metadata_identities = set(by_identity)
+        all_term_identities: set[tuple] = set()
+        # An untruncated metadata scan is a census of index-listed rows.
+        # Check possible truncation or a shortfall after identity deduplication.
+        if len(metadata_results) == candidate_limit or len(by_identity) < limit:
+            bm25_results = self._bm25_search(
+                query=query,
+                scope=scope,
+                scope_id=self._bm25_scope_id(scope, terminal_context),
+                memory_type=memory_type,
+                limit=candidate_limit,
+                exclude_keys=set(),
+                terminal_context=terminal_context,
+                scan_all=scan_all,
+                policy=policy,
+                all_terms_first=True,
+                all_term_identities=all_term_identities,
+            )
+            partial_results = []
+            for memory in bm25_results:
+                if self._identity(memory) in all_term_identities:
+                    by_identity.setdefault(self._identity(memory), memory)
+                else:
+                    partial_results.append(memory)
+            if len(by_identity) < limit:
+                for memory in partial_results:
+                    by_identity.setdefault(self._identity(memory), memory)
+                    if len(by_identity) >= limit:
+                        break
+        return list(by_identity.values()), metadata_identities | all_term_identities
 
     def _apply_sort_and_increment(
         self,
@@ -2584,16 +2602,43 @@ class MemoryService:
         max_body_chars: int = 4096,
         policy: Optional[VaultInjectionPolicy] = None,
     ) -> list:
-        """Apply sort mode, slice, then best-effort access bump.
+        """Compatibility wrapper: order, then slice and perform side effects."""
+        ordered = self._order_candidates(
+            results,
+            scope,
+            sort_by,
+            query=query,
+            terminal_context=terminal_context,
+            scan_all=scan_all,
+            vault_candidates=vault_candidates,
+            max_body_chars=max_body_chars,
+            policy=policy,
+        )
+        return self._finish_recall(
+            ordered,
+            scope,
+            limit,
+            include_related=include_related,
+            terminal_context=terminal_context,
+            policy=policy,
+        )
 
-        ``recency`` is the byte-identical Phase 1/2 path: the per-source
-        sorts in ``_metadata_recall``/``_bm25_search`` already produced that
-        order, so we leave ``results`` untouched and only slice. ``score``/
-        ``usage`` enrich ``access_count`` from SQLite (recall builds Memory
-        objects from wiki files, which carry no usage data), compute the
-        composite, then apply a stable scope-precedence pass so scope
-        dominance holds in every mode.
-        """
+    def _order_candidates(
+        self,
+        results: list,
+        scope: Optional[str],
+        sort_by: str,
+        query: Optional[str] = None,
+        terminal_context: Optional[dict] = None,
+        scan_all: bool = False,
+        *,
+        vault_candidates: Optional[Sequence[VaultCandidate]] = None,
+        max_body_chars: int = 4096,
+        policy: Optional[VaultInjectionPolicy] = None,
+        all_term_identities: Optional[set[tuple]] = None,
+        now: Optional[datetime] = None,
+    ) -> list:
+        """Order candidates only; never increment access or expand related rows."""
         from cli_agent_orchestrator.services.memory_scoring import (
             SCOPE_PRECEDENCE,
             normalise_bm25_scores,
@@ -2602,7 +2647,7 @@ class MemoryService:
 
         if sort_by != "recency":
             self._enrich_access_counts(results)
-            now_utc = datetime.now(timezone.utc)
+            now_utc = now if now is not None else datetime.now(timezone.utc)
             if sort_by == "usage":
                 results.sort(
                     key=lambda m: (
@@ -2667,6 +2712,19 @@ class MemoryService:
                 # within-scope ordering while enforcing scope dominance.
                 results.sort(key=lambda m: SCOPE_PRECEDENCE.get(m.scope, 99))
 
+        return results
+
+    def _finish_recall(
+        self,
+        results: list,
+        scope: Optional[str],
+        limit: int,
+        include_related: bool = False,
+        terminal_context: Optional[dict] = None,
+        *,
+        policy: Optional[VaultInjectionPolicy] = None,
+    ) -> list:
+        """Slice, bump only returned primaries, and optionally append related rows."""
         sliced = results[:limit]
 
         # Best-effort access_count increment (non-blocking).

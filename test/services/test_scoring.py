@@ -1897,3 +1897,19 @@ class TestHybridScoredTextSnapshot:
             ("partial", "global", None, "native"),
         }
         assert len(identities) == 2
+
+
+def test_order_candidates_has_no_side_effects(svc, hybrid_starvation_corpus, monkeypatch):
+    rows = _run(svc._metadata_recall(query="kafka streams", scope="global", limit=10))
+
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("ordering must not increment access or expand related")
+
+    monkeypatch.setattr(svc, "_increment_access_count", forbidden)
+    monkeypatch.setattr(svc, "_expand_related", forbidden)
+    for sort_by in ["recency", "score", "usage"]:
+        assert svc._order_candidates(list(rows), "global", sort_by, query="kafka streams")
+    assert calls == []
