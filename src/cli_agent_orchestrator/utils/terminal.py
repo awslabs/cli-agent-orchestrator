@@ -280,8 +280,11 @@ def poll_until_done(
     Omitted — or when the server reports no ``status_generation``, which is the
     case for an older cao-server and for event-inbox backends (herdr) whose status
     is derived on demand — the wait degrades to the frame-based behaviour above
-    rather than hanging. ERROR is honoured regardless of generation: a dead
-    provider is not a stale frame.
+    rather than hanging. The same degraded behaviour kicks in if a reported
+    generation ever comes back BELOW the boundary: generations are process-local,
+    so that only happens after a cao-server restart mid-wait, and the boundary
+    could never be exceeded again. ERROR is honoured regardless of generation: a
+    dead provider is not a stale frame.
 
     ``read_status`` overrides only WHERE the status is read from, returning the
     same string ``GET /terminals/{id}`` puts in its ``status`` field. It exists so
@@ -323,6 +326,20 @@ def poll_until_done(
                 raw_generation = payload.get("status_generation")
                 generation = raw_generation if isinstance(raw_generation, int) else None
             if (
+                min_generation is not None
+                and generation is not None
+                and generation < min_generation
+                and status != TerminalStatus.ERROR.value
+            ):
+                # The reported generation is BELOW the boundary we recorded: the
+                # in-process counter restarted (cao-server restart mid-wait) and
+                # can never exceed the stale boundary again. Gating on it would
+                # pin a genuine completion to the timeout, so stop gating and
+                # fall through to the frame-based evaluation below for this and
+                # every later reading -- the same degraded behaviour as when the
+                # server never names a generation at all.
+                min_generation = None
+            elif (
                 min_generation is not None
                 and generation is not None
                 and generation <= min_generation

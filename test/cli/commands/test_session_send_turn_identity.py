@@ -168,6 +168,33 @@ def test_poll_until_done_still_returns_on_a_genuine_completion(get_backend, moni
 
 
 @patch("cli_agent_orchestrator.backends.registry.get_backend")
+def test_poll_until_done_stops_gating_after_a_server_restart(get_backend, monitor):
+    """A cao-server restart mid-wait resets generations near zero in-process.
+    The boundary recorded before the restart can then never be exceeded again,
+    so the gate must stop gating (fall back to frame-based evaluation) instead
+    of pinning a genuine completion to the full timeout (#735 synthesis item 3).
+    """
+    get_backend.return_value = _tmux_backend()
+    boundary = monitor.output_generation(TERMINAL_ID)  # 8
+    monitor.notify_input_sent(TERMINAL_ID)
+
+    def script(n):
+        if n == 1:
+            # Server restarted: generation counters reset near zero, but the
+            # turn genuinely completed under the new process.
+            _latch(monitor, TerminalStatus.COMPLETED, 1)
+
+    reads, get = _http_reader(monitor, boundary, script)
+    with patch("cli_agent_orchestrator.utils.terminal.api_http.get", side_effect=get):
+        poll_until_done(TERMINAL_ID, timeout=5.0, polling_interval=0.01, min_generation=boundary)
+
+    assert len(reads) == 1, (
+        "a reported generation below the dispatch boundary must stop the gate "
+        "immediately rather than waiting out the timeout"
+    )
+
+
+@patch("cli_agent_orchestrator.backends.registry.get_backend")
 def test_poll_until_done_degrades_when_the_server_names_no_generation(get_backend, monitor):
     """An older cao-server (or herdr) reports no ``status_generation``; the wait
     must fall back to today's frame-based behaviour, never hang."""
