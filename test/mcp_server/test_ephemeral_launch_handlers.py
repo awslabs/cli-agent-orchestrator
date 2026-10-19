@@ -319,7 +319,7 @@ async def test_mcp_caller_sees_normal_claim_result(launch_http, tool, enabled):
 
 @contextmanager
 def record_decision_calls():
-    """Observe every binding, including calls in the HTTP portal thread."""
+    """Observe every decision-package call, including calls in the HTTP portal thread."""
     calls = []
     previous, previous_thread = sys.getprofile(), threading.getprofile()
 
@@ -347,10 +347,12 @@ def askable_decisions(launch_http, tmp_path, monkeypatch):
     if not targets.exists():
         pytest.skip("decision module absent: delegation decision sites have not landed")
 
-    # Reuse main's engine/profile/store fixture after the absence gate.
-    from test.decisions.test_engine import setup_engine
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
 
     from cli_agent_orchestrator.api.main import app
+    from cli_agent_orchestrator.clients.database import DecisionRecordModel
+    from cli_agent_orchestrator.decisions.engine import DecisionEngine, DelegationRequest
     from cli_agent_orchestrator.decisions.fixed_table import FixedTableDecider
     from cli_agent_orchestrator.decisions.registry import DeciderRegistry
     from cli_agent_orchestrator.decisions.settings import (
@@ -359,10 +361,26 @@ def askable_decisions(launch_http, tmp_path, monkeypatch):
         set_table,
         set_tier,
     )
+    from cli_agent_orchestrator.decisions.shadow import ShadowRunner
+    from cli_agent_orchestrator.decisions.store import DecisionStore
     from cli_agent_orchestrator.decisions.types import PointState
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
     from cli_agent_orchestrator.services import settings_service
 
-    engine, req, _, store, _, _ = setup_engine.__wrapped__(tmp_path, monkeypatch)
+    db = create_engine("sqlite:///" + str(tmp_path / "decisions.db"))
+    DecisionRecordModel.__table__.create(db)
+    store = DecisionStore(
+        sessionmaker(bind=db), tmp_path / "decision-hash.key", emit=lambda _e: None
+    )
+    engine = DecisionEngine(
+        DeciderRegistry({"fixed_table": FixedTableDecider}),
+        store,
+        ShadowRunner(store),
+        settings_loader=load_settings,
+        profile_loader=lambda _: AgentProfile(name="worker", description="worker", model="model-y"),
+        honors_model=lambda *args: True,
+    )
+    req = DelegationRequest("assign", "codex", "worker", None, "sentinel-body")
     for key in ("CAO_DECISION_MODEL_ROUTE", "CAO_DECISION_EFFORT_ROUTE"):
         monkeypatch.delenv(key, raising=False)
     set_point("model.route", "on", "fixed_table")
@@ -377,10 +395,9 @@ def askable_decisions(launch_http, tmp_path, monkeypatch):
         ]["state"]
         == "on"
     )
-    engine.settings_loader = load_settings
-    engine.registry = DeciderRegistry({"fixed_table": FixedTableDecider})
     monkeypatch.setattr(app.state, "decision_engine", engine, raising=False)
-    return req, store
+    yield req, store
+    db.dispose()
 
 
 @pytest.mark.asyncio
