@@ -50,11 +50,15 @@ PLAN_SCHEME_PREFIX = "plan-v2:"
 
 ``plan-v2:`` SINCE ISSUE #827, which added a tenth component (``profile_set``). The bump is the
 versioning in this docstring doing its stated job — "the version is kept so a later change to the field
-set has a way to announce itself" — and it INVALIDATES EVERY STORED ``plan-v1`` APPROVAL by
-construction, because an approval is a row keyed by the digest and no ``plan-v1`` digest can be
-produced again. That is the intended and only safe direction: a ``plan-v1`` approval attested to a plan
-whose agent profile set was never examined, so honouring it under ``plan-v2`` rules would be asserting
-a review that did not happen. Operators re-approve once; see ``docs/workflows.md``.
+set has a way to announce itself" — and it means every FRESH computation of a ``plan_id`` after the
+upgrade produces a ``plan-v2:`` value that no stored ``plan-v1`` approval row can match, because no
+``plan-v1`` digest can be produced again. A ``plan-v1`` approval attested to a plan whose agent profile
+set was never examined, so a fresh run matching it would be asserting a review that did not happen —
+hence a fresh run always re-checks. This module does NOT by itself reach a run that was already frozen
+and approved before the upgrade and left resumable: ``approval_gate.ensure_plan_approved`` queries the
+stored ``plan_id`` verbatim and resume reuses a run's frozen ``plan_id`` rather than recomputing it, so
+such a resume still proceeds on its original ``plan-v1`` approval today. Operators re-approve once per
+plan on its next fresh run; see ``docs/workflows.md``.
 
 NAMED RATHER THAN INLINED because ``compute`` writes it and ``scheme_of`` reads it: two literals is the
 drift that would let one side stop recognising the other's output.
@@ -272,9 +276,14 @@ def scheme_of(stored: Optional[str]) -> Literal["plan-v2", "plan-v1", "unknown",
     before #827 carries one. ``unknown`` stays reserved for a value matching neither prefix.
 
     This function reports provenance and decides nothing. What a ``plan-v1`` or ``unknown`` value MEANS
-    for a run is ``approval-gate``'s call — and today it needs no new branch there, because a pre-#827
-    digest simply has no approval row under the current scheme and the existing ABSENT path refuses it
-    with the right remedy already in the message ("Approve this plan identifier and run again").
+    for a run is ``approval-gate``'s call, and it needs no new branch for a FRESH ``plan_id`` lookup —
+    ``compute`` never emits ``plan-v1:``, so a freshly computed identifier simply has no ``plan-v1`` row
+    to match and the existing ABSENT path refuses it with the right remedy already in the message
+    ("Approve this plan identifier and run again"). That is NOT the whole story for RESUME: resume
+    extracts and re-checks a run's already-frozen ``plan_id`` verbatim rather than recomputing it, so a
+    run frozen and approved under ``plan-v1`` before the upgrade and left resumable still has a matching
+    approval row and resumes on it. ``scheme_of`` lets a caller DETECT that case; today nothing in
+    ``approval-gate`` acts on the detection to refuse it (see ``docs/workflows.md``'s migration note).
     """
     if not stored:
         return "absent"

@@ -456,7 +456,9 @@ A script-tier run freezes an **execution manifest** at run start — the workflo
 resolved inputs, the repository/worktree baseline, and a digest of the installed agent profile set —
 and derives a **plan identifier** (`plan_id`, of the form `plan-v2:<digest>`) from the
 execution-affecting fields. Change any of them and the `plan_id` changes, which is the mechanism by
-which a changed plan needs its own approval.
+which a changed plan needs its own approval. What the manifest actually persists is the resulting
+opaque `plan_id`, not the profile-set digest itself — the digest is computed, folded into `plan_id`,
+and discarded; it is never written to the manifest as its own value.
 
 > **The agent profile set is part of plan identity, and the whole set is.** A step's behaviour and tool
 > policy come from whichever agent profile it names, resolved from a file outside the script at launch
@@ -466,11 +468,13 @@ which a changed plan needs its own approval.
 > practical consequence: `cao agent install <anything>`, or editing any profile in your agent store,
 > invalidates every existing approval and the next run of each plan is refused until re-approved.
 
-> **Migration: `plan-v1` approvals do not carry over.** Approvals recorded before the profile set
-> became part of plan identity are keyed by a `plan-v1:` digest that can no longer be produced, so the
-> first run of every plan after upgrading is refused with a new `plan-v2:` identifier to approve. This
-> is intentional: a `plan-v1` approval attested to a plan whose agent profiles were never examined.
-> Re-approve once per plan.
+> **Migration: new runs move to `plan-v2`; approved `plan-v1` resumes still pass.** A `plan_id` computed after
+> upgrading always uses the new `plan-v2:` scheme, so the first NEW run of every plan is refused until
+> re-approved under its `plan-v2:` identifier — a `plan-v1` approval attested to a plan whose agent
+> profiles were never examined, so it cannot satisfy the new scheme. This does **not** reach a run that
+> was already frozen and approved before the upgrade and left resumable: resume reuses that run's
+> frozen `plan_id` verbatim rather than recomputing it, so an approved `plan-v1` resume still proceeds
+> on its original approval. Re-approve each plan once it is run fresh.
 
 ### It is on by default
 
