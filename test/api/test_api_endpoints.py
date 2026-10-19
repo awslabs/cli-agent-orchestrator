@@ -1519,6 +1519,29 @@ class TestSendTerminalInput:
             orchestration_type="assign",
         )
 
+    def test_send_input_reports_no_boundary_for_event_inbox_backends(self, client):
+        """An event-inbox backend (herdr) never advances the output generation,
+        so ``dispatch_input`` always returns the meaningless int 0. Naming it
+        would make `cao session send` skip its 3-second grace sleep while the
+        GET-side gate stays inert for herdr (status_generation is None there)
+        -- the pre-#735 stale window, widened. The endpoint must report no
+        boundary at all so the CLI falls back to the flat sleep (#735 synthesis
+        item 2)."""
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch("cli_agent_orchestrator.api.main.get_backend") as mock_get_backend,
+        ):
+            mock_svc.dispatch_input.return_value = 0
+            mock_get_backend.return_value.supports_event_inbox.return_value = True
+
+            response = client.post(
+                "/terminals/abcd1234/input",
+                params={"message": "hello world"},
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {"success": True, "dispatch_boundary": None}
+
     def test_send_input_terminal_not_found(self, client):
         """POST /terminals/{id}/input returns 404 for nonexistent terminal."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:

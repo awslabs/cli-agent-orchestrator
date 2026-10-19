@@ -4163,6 +4163,13 @@ async def send_terminal_input(
             sender_id=sender_id,
             orchestration_type=orchestration_type,
         )
+        # Event-inbox backends (herdr) never advance the output generation, so
+        # dispatch_input's boundary is always the meaningless int 0 for them —
+        # naming it would make the CLI skip its 3-second grace sleep while
+        # GET /terminals/{id}'s status_generation (None, for the same reason)
+        # never engages the poll gate either. Report no boundary at all.
+        if get_backend().supports_event_inbox():
+            boundary = None
         return {"success": True, "dispatch_boundary": boundary}
     except TerminalInputBlockedError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
