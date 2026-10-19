@@ -249,11 +249,11 @@ _CAO_MCP_EXEMPT: Dict[str, str] = {
     "workflow_plan_approval": _IDENTITY_LOCAL,
     # delete_terminal and the ephemeral tools do their own, narrower checks:
     # delete_terminal refuses a terminal the caller does not own
-    # (_own_terminal_id_or_error), and create_ephemeral_agent IS guarded but is
+    # (_target_binding_denial), and create_ephemeral_agent IS guarded but is
     # registered conditionally (CAO_EPHEMERAL_ENABLED), so it only appears in the
     # registry on some configs; it is not listed here because this map must not
     # carry a name that is sometimes covered.
-    "delete_terminal": "ownership-checked in-handler via _own_terminal_id_or_error",
+    "delete_terminal": "ownership-checked in-handler via _target_binding_denial",
 }
 
 
