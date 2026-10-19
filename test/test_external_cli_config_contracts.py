@@ -87,8 +87,13 @@ class Contract:
 CONTRACTS: Tuple[Contract, ...] = (
     Contract(
         knob="codexProfile",
-        rejected=re.compile(r"\[profiles\.|(?<![\w./-])profiles\.[\w<>-]+\."),
-        accepted=re.compile(r"[\w<>.*-]+\.config\.toml"),
+        rejected=re.compile(
+            r"\[profiles\.|(?<![\w./-])profiles\.[\w<>-]+\."
+            r"|(?<![\w.])profile\s*=\s*[\"']"  # top-level legacy selector, also rejected by codex-cli 0.162+
+        ),
+        accepted=re.compile(
+            r"(?:\$CODEX_HOME|~/\.codex|\$\{?CODEX_HOME\}?)/[\w<>.*-]+\.config\.toml"
+        ),  # tied to the codex home so an unrelated *.config.toml cannot satisfy the witness
         defines_knob=re.compile(
             r"codexProfile.*\b(?:Names|names|points|block|table|inside|selects|reads|resolves|refers|maps)\b"
             r"|\b(?:Names|names|points|selects|reads|resolves|refers|maps)\b.*codexProfile"
