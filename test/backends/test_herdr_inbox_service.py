@@ -441,13 +441,108 @@ class TestHerdrInboxServiceKiroSupplement:
 class TestHerdrInboxServiceReconcile:
     """Test _reconcile() prunes stale panes and cleans up DB/workspace."""
 
-    def test_reconcile_is_called_before_subscribe(self):
-        """_reconcile must be awaited before _subscribe_all_events in _socket_loop
-        so the combined subscription only covers live panes."""
-        # Structural test: confirms both are async coroutines.
+    def test_subscribe_happens_before_snapshot(self):
+        """_socket_loop must subscribe BEFORE _reconcile takes its snapshot (#755).
+
+        herdr 0.9.0 removed retained-history replay on subscribe, so any event
+        emitted between a snapshot and a later subscribe is lost permanently.
+        The settled-pane sweep must then run last, after _reconcile has
+        refreshed the pane map.
+        """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         assert inspect.iscoroutinefunction(service._reconcile)
         assert inspect.iscoroutinefunction(service._subscribe_all_events)
+
+        order = []
+
+        async def _record(name):
+            order.append(name)
+
+        async def _event_loop():
+            order.append("event_loop")
+            raise ConnectionError("stop the loop")
+
+        service.register_terminal("tid1", "pane-1")
+        with (
+            patch.object(service, "_connect", lambda: _record("connect")),
+            patch.object(service, "_reconcile", lambda: _record("reconcile")),
+            patch.object(service, "_subscribe_all_events", lambda: _record("subscribe")),
+            patch.object(service, "_deliver_settled_panes", lambda: _record("sweep")),
+            patch.object(service, "_event_loop", _event_loop),
+            patch("asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                _run_async(service._socket_loop())
+
+        assert order == ["connect", "subscribe", "reconcile", "sweep", "event_loop"]
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_settled_pane_is_delivered_without_an_event(self, mock_snap):
+        """A managed pane already idle at subscribe time is delivered (#755).
+
+        The broadcast subscription reports transitions only, so this pane emits
+        no further event and the sweep is the only thing that can deliver.
+        """
+        delivered = []
+        service = HerdrInboxService(
+            socket_path="/tmp/test.sock", delivery_callback=delivered.append
+        )
+        service.register_terminal("tid1", "pane-1")
+        service.register_terminal("tid2", "pane-2")
+        service._working_since["tid1"] = time.time()
+
+        mock_snap.return_value = {
+            "panes": [
+                {"pane_id": "pane-1", "agent_status": "idle"},
+                {"pane_id": "pane-2", "agent_status": "done"},
+            ]
+        }
+
+        _run_async(service._deliver_settled_panes())
+
+        assert sorted(delivered) == ["tid1", "tid2"]
+        # The working latch is cleared, same as the live-event path.
+        assert "tid1" not in service._working_since
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_settled_sweep_skips_unmanaged_and_working_panes(self, mock_snap):
+        """Only managed panes in idle/done are delivered."""
+        delivered = []
+        service = HerdrInboxService(
+            socket_path="/tmp/test.sock", delivery_callback=delivered.append
+        )
+        service.register_terminal("tid1", "pane-1")
+
+        mock_snap.return_value = {
+            "panes": [
+                {"pane_id": "pane-1", "agent_status": "working"},
+                {"pane_id": "pane-unmanaged", "agent_status": "idle"},
+                {"pane_id": "pane-1", "agent_status": "unknown"},
+                "not-a-dict",
+                {"agent_status": "idle"},
+            ]
+        }
+
+        _run_async(service._deliver_settled_panes())
+
+        assert delivered == []
+
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_settled_sweep_survives_snapshot_failure(self, mock_snap):
+        """A failed snapshot degrades to a no-op, never an exception.
+
+        _socket_loop would otherwise treat it as a disconnect and back off.
+        """
+        delivered = []
+        service = HerdrInboxService(
+            socket_path="/tmp/test.sock", delivery_callback=delivered.append
+        )
+        service.register_terminal("tid1", "pane-1")
+        mock_snap.return_value = None
+
+        _run_async(service._deliver_settled_panes())
+
+        assert delivered == []
 
     @patch.object(HerdrInboxService, "_fetch_snapshot")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")

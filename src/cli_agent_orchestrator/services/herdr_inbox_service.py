@@ -561,14 +561,34 @@ class HerdrInboxService:
             try:
                 await self._connect()
 
-                # Reconcile map against live herdr state before subscribing
+                # Subscribe BEFORE taking any snapshot. herdr 0.9.0 stopped
+                # replaying retained history on subscribe, so every event
+                # emitted between a snapshot and a later subscribe is lost
+                # permanently — a dropped idle/done means _deliver() never
+                # fires for that transition (#755). Replay is what used to
+                # close that window on 0.8.x, which is why this was latent.
+                #
+                # The old reconcile-first ordering was never required:
+                # _subscribe_all_events sends NO pane_id, so the subscription
+                # does not depend on _pane_to_terminal (see its docstring).
+                #
+                # Everything goes in ONE events.subscribe call: a single
+                # broadcast pane.updated plus the lifecycle events. herdr
+                # resets the connection on a second events.subscribe.
+                await self._subscribe_all_events()
+
+                # Reconcile map against live herdr state. Events emitted while
+                # this runs buffer on the socket and are read by _event_loop.
                 await self._reconcile()
 
-                # Subscribe to everything in ONE events.subscribe call: a single
-                # broadcast pane.updated (no pane_id) plus the lifecycle events.
-                # herdr resets the connection on a second events.subscribe, so
-                # this must be a single combined call.
-                await self._subscribe_all_events()
+                # A subscription only reports TRANSITIONS. A pane that settled
+                # into idle/done before the subscribe existed — during the
+                # deferred-connect wait above, or across a reconnect — emits
+                # nothing further, so the subscription alone can never deliver
+                # for it. Close that with a snapshot-driven sweep. This also
+                # covers a buffered event whose pane_id _reconcile just
+                # renumbered, which would miss the post-reconcile map.
+                await self._deliver_settled_panes()
 
                 self._backoff = _BACKOFF_BASE  # Reset backoff after successful setup
 
@@ -890,6 +910,47 @@ class HerdrInboxService:
             remapped,
             deleted,
         )
+
+    async def _deliver_settled_panes(self) -> None:
+        """Deliver to managed panes already settled in idle/done at subscribe time.
+
+        The broadcast pane.updated subscription reports transitions only, so a
+        pane that reached idle/done BEFORE the subscription existed never
+        produces an event we can act on. That window is not just the old
+        snapshot/subscribe gap (#755): _socket_loop defers connecting until the
+        first terminal registers, and every reconnect reopens it too.
+
+        Called once per successful connection, after _reconcile has refreshed
+        _pane_to_terminal, so the pane_ids read here match the current map.
+
+        Delivery is idempotent — _deliver routes to inbox_service.deliver_pending,
+        which re-reads PENDING rows under a per-terminal lock and re-checks
+        status — so a pane that ALSO emits a live event costs nothing.
+
+        A failed snapshot is not an error: the reconciliation sweep remains the
+        backstop, so log and move on rather than tearing down the connection.
+        """
+        snapshot = self._fetch_snapshot()
+        if snapshot is None:
+            logger.warning("Settled-pane sweep: no snapshot, skipping")
+            return
+
+        delivered = 0
+        for pane in snapshot.get("panes", []):
+            if not isinstance(pane, dict):
+                continue
+            terminal_id = self._pane_to_terminal.get(pane.get("pane_id") or "")
+            if not terminal_id:
+                continue
+            if pane.get("agent_status") in ("idle", "done"):
+                self._working_since.pop(terminal_id, None)
+                self._deliver(terminal_id)
+                delivered += 1
+
+        if delivered:
+            logger.info("Settled-pane sweep: triggered delivery for %d pane(s)", delivered)
+        else:
+            logger.debug("Settled-pane sweep: no settled managed panes")
 
     async def _connect(self) -> None:
         """Connect to the herdr socket."""
