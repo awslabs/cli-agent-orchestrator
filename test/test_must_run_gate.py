@@ -241,13 +241,25 @@ def test_marker_without_a_gate_name_is_reported_as_misuse(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _strip_line_comments(text: str) -> str:
+    """Drop everything from a bare ``#`` to end of line.
+
+    Both the files this is applied to — ``test/*.py`` markers and
+    ``.github/workflows/*.yml`` env lines — never need a literal ``#`` inside
+    a ``must_run`` gate name or a ``CAO_MUST_RUN`` value, so a commented-out
+    marker or env line must not be mistaken for a live one.
+    """
+    return re.sub(r"#.*", "", text)
+
+
 def _gates_used_in_the_suite() -> set[str]:
     pattern = re.compile(rf"{MARKER}\(\s*((?:\"[^\"]+\"\s*,?\s*)+)\)")
     gates: set[str] = set()
     for path in sorted((REPO_ROOT / "test").rglob("*.py")):
         if path.name in {"_must_run.py", Path(__file__).name}:
             continue
-        for match in pattern.finditer(path.read_text()):
+        text = _strip_line_comments(path.read_text())
+        for match in pattern.finditer(text):
             gates.update(re.findall(r"\"([^\"]+)\"", match.group(1)))
     return gates
 
@@ -255,7 +267,8 @@ def _gates_used_in_the_suite() -> set[str]:
 def _gates_enforced_by_workflows() -> set[str]:
     gates: set[str] = set()
     for path in sorted(WORKFLOWS_DIR.glob("*.yml")):
-        for value in re.findall(rf"{ENV_VAR}:\s*(.+)", path.read_text()):
+        text = _strip_line_comments(path.read_text())
+        for value in re.findall(rf"{ENV_VAR}:\s*(.+)", text):
             # Tolerate the matrix-conditional expression form in ci.yml by
             # harvesting every quoted literal in the value.
             gates.update(token for token in re.findall(r"'([a-z0-9_-]+)'", value))
@@ -263,6 +276,21 @@ def _gates_enforced_by_workflows() -> set[str]:
             if re.fullmatch(r"[a-z0-9_,\- ]+", bare):
                 gates.update(t.strip() for t in bare.split(",") if t.strip())
     return gates
+
+
+def test_strip_line_comments_hides_a_commented_out_marker():
+    text = '# @pytest.mark.must_run("unit")\n'
+    pattern = re.compile(rf"{MARKER}\(\s*((?:\"[^\"]+\"\s*,?\s*)+)\)")
+    assert pattern.search(_strip_line_comments(text)) is None
+    # Sanity check: without stripping, the regex does find it — this is the
+    # exact gap a commented-out marker would otherwise exploit.
+    assert pattern.search(text) is not None
+
+
+def test_strip_line_comments_hides_a_commented_out_env_line():
+    text = f"      # {ENV_VAR}: gitleaks\n"
+    assert re.search(rf"{ENV_VAR}:\s*(.+)", _strip_line_comments(text)) is None
+    assert re.search(rf"{ENV_VAR}:\s*(.+)", text) is not None
 
 
 def test_every_must_run_gate_is_enforced_by_a_workflow():
