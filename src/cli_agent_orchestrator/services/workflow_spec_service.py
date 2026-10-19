@@ -378,12 +378,12 @@ def _write_contained_spec_bytes(
 
     1. **Containment guard.** The SafeAccessCheck, dominating every sink below.
     2. **Reject a symlink target after containment** (SR-3A2-2). ``realpath``
-       collapses links, so this check must remain on the caller's original path
-       rather than the resolved path — and following a link on a WRITE means the
+       collapses links, so this check must remain on the caller's path anchored
+       to the validated base, before resolving links, rather than the realpath — and following a link on a WRITE means the
        caller's bytes land in a spec it did not name, which containment cannot
        catch because both paths are inside the base. This is the one operation
-       here that legitimately reads the caller's own string rather than the
-       resolved path; it neither opens nor writes.
+       here that reads the unresolved target rather than the realpath; it
+       neither opens nor writes.
     3. **Size cap BEFORE any file is created** (SR-3A2-3). An oversized payload
        must not leave a temp file behind, and the bound is the SAME constant the
        read path enforces so this cannot write a spec ``load_and_validate``
@@ -435,9 +435,11 @@ def _write_contained_spec_bytes(
 
     safe_base = _safe_dir(base_dir)
 
-    # Capture the CALLER's path before resolution. ``realpath`` does not mutate it,
-    # so it still detects a caller-supplied symlink after containment succeeds.
+    # Anchor relative paths to the same base as containment, without resolving
+    # links: the symlink check must inspect the named target, not its realpath.
     user_path = os.fspath(path)
+    if not os.path.isabs(user_path):
+        user_path = os.path.join(safe_base, user_path)
 
     real_path = _resolve_contained_spec_path(path, safe_base)
     # (1) SafeAccessCheck — single positive containment guard, colocated with every
@@ -445,7 +447,7 @@ def _write_contained_spec_bytes(
     if not real_path.startswith(safe_base + os.sep):
         raise SpecPathRefusedError(f"workflow spec path '{path}' escapes its validated directory")
 
-    # (2) Symlink check on the CALLER's original path, after containment and before
+    # (2) Symlink check on the base-anchored caller path, after containment and before
     # any sink. Checking real_path would miss a symlink realpath already collapsed.
     if os.path.islink(user_path):
         raise SpecPathRefusedError(

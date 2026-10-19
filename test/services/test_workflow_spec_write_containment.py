@@ -324,3 +324,29 @@ def test_no_temp_file_survives_a_failure_at_any_step(
 
     leftovers = [e for e in _dir_entries(tmp_path) if e != "wf.py"]
     assert leftovers == [], f"temp file orphaned after {failing} failure: {leftovers}"
+
+
+@pytest.mark.parametrize("link_under_base", [False, True])
+def test_relative_write_checks_symlink_under_base_not_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, link_under_base: bool
+) -> None:
+    base = tmp_path / "specs"
+    cwd = tmp_path / "cwd"
+    base.mkdir()
+    cwd.mkdir()
+    link_dir = base if link_under_base else cwd
+    (link_dir / "real.py").write_bytes(b"original\n")
+    (link_dir / "relative.py").symlink_to(link_dir / "real.py")
+    monkeypatch.chdir(cwd)
+
+    if link_under_base:
+        with pytest.raises(svc.SpecPathRefusedError, match="symlink"):
+            svc._write_contained_spec_bytes("relative.py", b"new\n", base_dir=str(base))
+        assert (base / "real.py").read_bytes() == b"original\n"
+        assert (base / "relative.py").is_symlink()
+    else:
+        result = svc._write_contained_spec_bytes("relative.py", b"new\n", base_dir=str(base))
+        assert result == str(base / "relative.py")
+        assert (base / "relative.py").read_bytes() == b"new\n"
+        assert (cwd / "real.py").read_bytes() == b"original\n"
+        assert (cwd / "relative.py").is_symlink()
