@@ -320,14 +320,14 @@ if ENABLE_WORKING_DIRECTORY:
         description: Annotated[
             Optional[str],
             Field(
-                description="Optional operator-facing description of the child responsibility (64 Unicode codepoints; truncated on creation)"
+                description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
             ),
         ] = None,
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
 
         Optionally supply description: a short phrase for the operator identifying
-        the child responsibility (64 Unicode codepoints, truncated on creation).
+        the child responsibility (64 Unicode code points, truncated on creation).
 
         This tool allows handing off tasks to other agents by creating a new terminal
         in the same session. It sends the message, waits for completion, and captures the output.
@@ -436,14 +436,14 @@ else:
         description: Annotated[
             Optional[str],
             Field(
-                description="Optional operator-facing description of the child responsibility (64 Unicode codepoints; truncated on creation)"
+                description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
             ),
         ] = None,
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
 
         Optionally supply description: a short phrase for the operator identifying
-        the child responsibility (64 Unicode codepoints, truncated on creation).
+        the child responsibility (64 Unicode code points, truncated on creation).
 
         This tool allows handing off tasks to other agents by creating a new terminal
         in the same session. It sends the message, waits for completion, and captures the output.
@@ -561,7 +561,7 @@ call delete_terminal(terminal_id) to free system resources.
 
 Args:
     agent_profile: Agent profile for the worker terminal
-    description: Optional operator-facing description of the child responsibility (64 Unicode codepoints; truncated on creation)
+    description: Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)
     message: Task message (include callback instructions)"""
 
     if enable_workdir:
@@ -621,7 +621,7 @@ if ENABLE_WORKING_DIRECTORY:
         description: Annotated[
             Optional[str],
             Field(
-                description="Optional operator-facing description of the child responsibility (64 Unicode codepoints; truncated on creation)"
+                description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
             ),
         ] = None,
     ) -> Dict[str, Any]:
@@ -666,7 +666,7 @@ else:
         description: Annotated[
             Optional[str],
             Field(
-                description="Optional operator-facing description of the child responsibility (64 Unicode codepoints; truncated on creation)"
+                description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
             ),
         ] = None,
     ) -> Dict[str, Any]:
@@ -746,14 +746,14 @@ async def assign_elastic(
     description: Annotated[
         Optional[str],
         Field(
-            description="Optional operator-facing description of the child responsibility (64 Unicode codepoints; truncated on creation)"
+            description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
         ),
     ] = None,
 ) -> Dict[str, Any]:
     """Provision one elastic worker and assign one task to it.
 
     Optionally supply description: an operator-facing phrase identifying the
-    child responsibility (64 Unicode codepoints, truncated on creation).
+    child responsibility (64 Unicode code points, truncated on creation).
 
     The worker must call ``complete_assignment`` exactly once after producing
     its final result. That tool durably delivers the callback before releasing

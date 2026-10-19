@@ -1186,7 +1186,6 @@ class CodexProvider(BaseProvider):
         self._logical_dispatch_id = 0
         self._buffer_epoch: Optional[int] = None
         self._dispatch_message: Optional[str] = None
-        self._previous_dispatch_message: Optional[str] = None
         self._pre_dispatch_body: Optional[tuple[str, ...]] = None
         self._attribution_available = False
 
@@ -1227,7 +1226,6 @@ class CodexProvider(BaseProvider):
         super().mark_input_received()
         with self._dispatch_lock:
             self._logical_dispatch_id += 1
-            self._previous_dispatch_message = self._dispatch_message
             self._dispatch_message = None
             self._pre_dispatch_body = None
             self._attribution_available = False
@@ -1286,20 +1284,26 @@ class CodexProvider(BaseProvider):
             return None
         baseline_echoes = _dispatched_echoes(list(baseline), message)
         if baseline_echoes:
-            # Repeated identical dispatches are attributable only when the
-            # new occurrence follows the prior occurrence's rendered footer.
+            # Map the old footer into this capture before comparing locations.
+            # Pane scroll and resize change row numbers, so baseline coordinates
+            # are never meaningful in the current frame.
             prior_end = baseline_echoes[-1][1]
             prior_footer = next(
                 (
-                    index
-                    for index in range(prior_end, len(baseline))
-                    if _is_completion_footer(baseline[index], self._codex_version)
+                    i
+                    for i in range(prior_end, len(baseline))
+                    if _is_completion_footer(baseline[i], self._codex_version)
                 ),
                 None,
             )
-            if prior_footer is None:
+            mapped_footer = (
+                self._map_baseline_row(baseline, rows, prior_footer)
+                if prior_footer is not None
+                else None
+            )
+            if mapped_footer is None:
                 return None
-            current_echoes = [item for item in echoes if item[0] > prior_footer]
+            current_echoes = [item for item in echoes if item[0] > mapped_footer]
         else:
             current_echoes = echoes
         if len(current_echoes) != 1:
@@ -1312,6 +1316,30 @@ class CodexProvider(BaseProvider):
                 and self._dispatch_message == message
             )
         return echo_end if current else None
+
+    def _map_baseline_row(
+        self, baseline: tuple[str, ...], current: list[str], index: int
+    ) -> Optional[int]:
+        """Map a row only when its strongest exact context has one location.
+
+        SequenceMatcher chooses one alignment among possible alignments; that
+        choice alone is not evidence that a repeated footer belongs to the same
+        historical occurrence. Grow a local exact context around the row and
+        reject ties at the strongest context length.
+        """
+        best_candidates = []
+        for radius in range(0, min(len(baseline), len(current))):
+            start = max(0, index - radius)
+            end = min(len(baseline), index + radius + 1)
+            context = list(baseline[start:end])
+            candidates = [
+                offset + index - start
+                for offset in range(len(current) - len(context) + 1)
+                if current[offset : offset + len(context)] == context
+            ]
+            if candidates:
+                best_candidates = candidates
+        return best_candidates[0] if len(best_candidates) == 1 else None
 
     def _has_dispatch_attribution(self) -> bool:
         """Whether a successful baseline was installed for the current send."""
@@ -2069,19 +2097,71 @@ class CodexProvider(BaseProvider):
         body = clean_output[:body_end]
         if self._empty_current_dispatch(body):
             return True
+        if not self._has_current_turn_activity(clean_output):
+            return False
         user = None
         for user in re.finditer(USER_PREFIX_PATTERN, body, re.IGNORECASE | re.MULTILINE):
             pass
-        # The fallback has no status bar to distinguish a stale footer from
-        # one rendered for this dispatch. Require the same fresh echo as the
-        # primary classifier even when the user row has scrolled out of view.
-        if self._has_dispatch_attribution() and self._current_dispatch_echo_end(body) is None:
-            return False
         return _turn_ended_with_footer(
             body[user.start() if user else 0 :],
             self._codex_version,
             from_user_message=user is not None,
         )
+
+    def _has_visible_unattributed_reply(
+        self, output: str, baseline: Optional[tuple[str, ...]]
+    ) -> bool:
+        """Find current reply evidence when the dispatched echo is not visible."""
+        if _find_assistant_marker(output) is not None:
+            return True
+        rows = _body_rows(output)
+        if not rows or not _is_completion_footer(rows[-1], self._codex_version):
+            return False
+        baseline_rows = set(baseline or ())
+        return rows[-1] not in baseline_rows and any(
+            row.strip() and row not in baseline_rows for row in rows[:-1]
+        )
+
+    def _has_current_turn_activity(self, frame: str) -> bool:
+        """Apply the shared activity policy for attributed footer completions.
+
+        A visible dispatch echo is direct evidence. Without one, ordinary reply
+        evidence is accepted unless the previous turn's footer can be aligned in
+        this frame; in that case only assistant activity after that boundary can
+        belong to the current turn. If the boundary is no longer visible, retain
+        the existing permissive behavior for long replies whose echo scrolled off.
+        """
+        if not self._has_dispatch_attribution():
+            return True
+        if self._current_dispatch_echo_end(frame) is not None:
+            return True
+
+        with self._dispatch_lock:
+            baseline = self._pre_dispatch_body
+        has_activity = self._has_visible_unattributed_reply(frame, baseline)
+
+        prior_footer = None
+        if baseline:
+            prior_footer = next(
+                (
+                    index
+                    for index in range(len(baseline) - 1, -1, -1)
+                    if _is_completion_footer(baseline[index], self._codex_version)
+                ),
+                None,
+            )
+        current_rows = _body_rows(frame)
+        mapped_footer = (
+            self._map_baseline_row(baseline, current_rows, prior_footer)
+            if baseline is not None and prior_footer is not None
+            else None
+        )
+        if mapped_footer is not None:
+            has_activity = any(
+                re.match(ASSISTANT_PREFIX_PATTERN, row, re.MULTILINE)
+                for row in current_rows[mapped_footer + 1 :]
+            )
+        return has_activity
 
     def _status_of_frame(self, output: str, *, footer_mode: bool) -> TerminalStatus:
         """Classify one frame of Codex output (_get_status() adds the exit check)."""
@@ -2208,17 +2288,10 @@ class CodexProvider(BaseProvider):
         # current turn: from the last user message, or the whole frame when
         # that message has scrolled away.
         turn_text = clean_output[last_user.start() if last_user else 0 : cutoff_pos]
-        dispatch_attributed = footer_mode and self._has_dispatch_attribution()
-        current_echo_end = (
-            self._current_dispatch_echo_end(clean_output) if dispatch_attributed else None
-        )
-        # Once an orchestrated dispatch has a recorded baseline, an old footer
-        # in a truncated viewport is not evidence that this dispatch finished.
-        footer_after_current_echo = not dispatch_attributed or current_echo_end is not None
         turn_ended = footer_mode and (
             self._empty_current_dispatch(clean_output)
             or (
-                footer_after_current_echo
+                self._has_current_turn_activity(clean_output)
                 and _turn_ended_with_footer(
                     turn_text,
                     self._codex_version,
@@ -2527,7 +2600,6 @@ class CodexProvider(BaseProvider):
         self._initialized = False
         with self._dispatch_lock:
             self._dispatch_message = None
-            self._previous_dispatch_message = None
             self._pre_dispatch_body = None
             self._attribution_available = False
         # Remove the developer_instructions temp file written by _build_codex_command, if any --
