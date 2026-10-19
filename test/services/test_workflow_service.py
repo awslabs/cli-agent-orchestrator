@@ -12,7 +12,7 @@ no-secret-leak), and the reserved seams raising ``NotBuiltYetError``.
 from __future__ import annotations
 
 from typing import List
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -173,6 +173,8 @@ async def test_trace_b_worker_crashes_twice_then_succeeds(monkeypatch):
     assert res.state == RunState.COMPLETED
     assert res.steps[0].state == StepState.COMPLETED
     assert res.steps[0].attempts == 3
+    # The attempt-1 failure kind is cleared when a retry settles successfully.
+    assert res.steps[0].error_kind is None
 
 
 @pytest.mark.asyncio
@@ -525,6 +527,34 @@ async def test_cancel_interrupts_in_flight_wait_converges_cancelled(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_cancel_clears_a_prior_retry_error_kind(monkeypatch):
+    """Cancellation settles SKIPPED and must not retain the failed attempt's kind."""
+    from cli_agent_orchestrator.services.agent_step import StepCancelledError
+
+    calls = {"n": 0}
+
+    async def _side(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise StepExecutionError("provider refused", kind="provider_error", terminal_id="tp")
+        ws.cancel_run(kwargs["env_vars"]["CAO_WORKFLOW_RUN_ID"])
+        await kwargs["cancel_event"].wait()
+        raise StepCancelledError(terminal_id="tc")
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    res = await ws.start_run(
+        _spec(steps=[WorkflowStep(id="s1", provider="p", agent="g", prompt="a")]),
+        {},
+        "runCancelKind",
+    )
+
+    assert res.state == RunState.CANCELLED
+    assert res.steps[0].state == StepState.SKIPPED
+    assert res.steps[0].attempts == 2
+    assert res.steps[0].error_kind is None
+
+
+@pytest.mark.asyncio
 async def test_cancel_sets_event_on_record(monkeypatch):
     """cancel_run fires the record's cancel_event (the interrupt seam) in addition
     to flagging cancelled — so an in-flight wait can observe it immediately."""
@@ -865,3 +895,106 @@ async def test_drive_failure_journals_generic_error_resolver_infers_error(monkey
     row = workflow_journal.get_run("u9-error")
     steps = workflow_journal.get_steps("u9-error")
     assert _resolve_error_kind(row, steps) == "error"
+
+
+# ---------------------------------------------------------------------------
+# issue #638 — an in-band provider error is a step FAILURE, never a replayable
+# COMPLETED row. The engine classifies, journals honestly, and halts.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_provider_error_step_fails_and_journals_no_replayable_output(monkeypatch):
+    """The load-bearing half of #638 is what is NOT written.
+
+    A ``completed`` journal row is what a replay-safe resume serves WITHOUT launching
+    a terminal, so persisting a provider refusal as one would make the fault permanent
+    and free. The row must read ``failed`` with NO output, which forces re-execution.
+    """
+    from cli_agent_orchestrator.services import workflow_journal
+
+    refusal = "API Error (openai.gpt-5.6-terra): 400 Invocation of model ID is not supported."
+    monkeypatch.setattr(
+        ws,
+        "run_agent_step",
+        AsyncMock(
+            side_effect=StepExecutionError(
+                f"provider error (model_not_available) from codex: {refusal}",
+                kind="provider_error",
+                terminal_id="t-provider",
+            )
+        ),
+    )
+
+    res = await ws.start_run(_spec(retries=0, on_failure="halt"), {}, "runProviderErr")
+
+    assert res.state == RunState.FAILED
+    step = res.steps[0]
+    # Criterion 5: the RESULT distinguishes a provider refusal from a worker crash
+    # (``error``) and a timeout (``timeout``) without scraping text; criterion 2
+    # keeps the raw provider text retrievable.
+    assert (step.state, step.error_kind) == (StepState.FAILED, "provider_error")
+    assert refusal in (step.error or "")
+
+    row = workflow_journal.get_step("runProviderErr", "s1")
+    assert row is not None
+    assert (row.state, row.error_kind, row.output_json) == ("failed", "provider_error", None)
+
+
+# ---------------------------------------------------------------------------
+# issue #638 second review (fanhongy P2-2) — the provider_error failure path
+# must reclaim the terminal it created, or every retry leaks a live/idle CLI.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_provider_error_retries_do_not_leak_terminals(monkeypatch):
+    """Drive the REAL ``run_agent_step`` (only its terminal layer is mocked) through
+    the YAML retry loop and assert every attempt's terminal is reclaimed.
+
+    A step with default retries calls ``run_agent_step(teardown=True)`` once per
+    attempt with a FRESH terminal, and the drive loop overwrites ``st.terminal_id``
+    each time -- so any attempt whose terminal is not torn down becomes an
+    unreferenced live CLI (fanhongy P2-2). Before the fix the created and deleted
+    counts were 3 and 0; now both must be 3.
+    """
+    import cli_agent_orchestrator.services.agent_step as agent_step
+    from cli_agent_orchestrator.services import terminal_service as ts
+
+    refusal = (
+        "API Error: 400 invalid params, messages.4.content.1.tool_use.input: "
+        "Input should be a valid dictionary (2013)"
+    )
+    context = f"⏺ {refusal}\n❯"
+
+    created: List[str] = []
+    deleted: List[str] = []
+    exited: List[str] = []
+
+    async def _create_terminal(*args, **kwargs):
+        terminal = MagicMock()
+        terminal.id = f"t{len(created) + 1}"
+        created.append(terminal.id)
+        return terminal
+
+    monkeypatch.setattr(ts, "create_terminal", AsyncMock(side_effect=_create_terminal))
+    monkeypatch.setattr(ts, "send_input", MagicMock(return_value=True))
+    monkeypatch.setattr(ts, "get_output", MagicMock(return_value=refusal))
+    monkeypatch.setattr(ts, "get_output_context", MagicMock(return_value=context))
+    monkeypatch.setattr(
+        ts, "exit_terminal_cli", MagicMock(side_effect=lambda tid: exited.append(tid))
+    )
+    monkeypatch.setattr(
+        ts,
+        "delete_terminal",
+        MagicMock(side_effect=lambda tid, registry=None: deleted.append(tid)),
+    )
+    monkeypatch.setattr(agent_step, "wait_until_status", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        agent_step.status_monitor, "get_status", MagicMock(return_value=TerminalStatus.COMPLETED)
+    )
+
+    res = await ws.start_run(_spec(retries=2, on_failure="halt"), {}, "runProviderLeak")
+
+    assert res.state == RunState.FAILED
+    # retries=2 -> 3 attempts, each on its own fresh terminal.
+    assert len(created) == 3
+    # Every one was reclaimed (exit-then-delete), not just the last.
+    assert sorted(deleted) == sorted(created)
+    assert sorted(exited) == sorted(created)

@@ -990,10 +990,16 @@ class TestGetSession:
     """Tests for GET /sessions/{session_name} endpoint."""
 
     def test_get_session_success(self, client):
-        """GET /sessions/{name} returns session details."""
+        """GET /sessions/{name} returns session details.
+
+        Serialize and transport pending counts supplied by the mocked service.
+        """
         mock_session = {
             "session": {"id": "test-session"},
-            "terminals": [{"id": "abcd1234"}],
+            "terminals": [
+                {"id": "abcd1234", "pending_inbox_count": 123},
+                {"id": "def56789", "pending_inbox_count": 0},
+            ],
         }
         with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
             mock_svc.get_session.return_value = mock_session
@@ -1004,6 +1010,8 @@ class TestGetSession:
         data = response.json()
         assert data["session"]["id"] == "test-session"
         assert data["terminals"][0]["id"] == "abcd1234"
+        assert [t["pending_inbox_count"] for t in data["terminals"]] == [123, 0]
+        assert all(type(t["pending_inbox_count"]) is int for t in data["terminals"])
         mock_svc.get_session.assert_called_once_with("test-session")
 
     def test_get_session_not_found(self, client):

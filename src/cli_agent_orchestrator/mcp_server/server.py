@@ -317,8 +317,17 @@ if ENABLE_WORKING_DIRECTORY:
             ),
         ),
         target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
+        description: Annotated[
+            Optional[str],
+            Field(
+                description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
+            ),
+        ] = None,
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
+
+        Optionally supply description: a short phrase for the operator identifying
+        the child responsibility (64 Unicode code points, truncated on creation).
 
         This tool allows handing off tasks to other agents by creating a new terminal
         in the same session. It sends the message, waits for completion, and captures the output.
@@ -390,6 +399,7 @@ if ENABLE_WORKING_DIRECTORY:
             model=model,
             use_worktree=use_worktree,
             target_host=target_host,
+            description=description,
         )
 
 else:
@@ -423,8 +433,17 @@ else:
             ),
         ),
         target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
+        description: Annotated[
+            Optional[str],
+            Field(
+                description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
+            ),
+        ] = None,
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
+
+        Optionally supply description: a short phrase for the operator identifying
+        the child responsibility (64 Unicode code points, truncated on creation).
 
         This tool allows handing off tasks to other agents by creating a new terminal
         in the same session. It sends the message, waits for completion, and captures the output.
@@ -484,6 +503,7 @@ else:
             model=model,
             use_worktree=use_worktree,
             target_host=target_host,
+            description=description,
         )
 
 
@@ -541,6 +561,7 @@ call delete_terminal(terminal_id) to free system resources.
 
 Args:
     agent_profile: Agent profile for the worker terminal
+    description: Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)
     message: Task message (include callback instructions)"""
 
     if enable_workdir:
@@ -597,6 +618,12 @@ if ENABLE_WORKING_DIRECTORY:
             ),
         ),
         target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
+        description: Annotated[
+            Optional[str],
+            Field(
+                description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
+            ),
+        ] = None,
     ) -> Dict[str, Any]:
         denied = _tool_denied_reason("assign")
         if denied:
@@ -609,6 +636,7 @@ if ENABLE_WORKING_DIRECTORY:
             model=model,
             use_worktree=use_worktree,
             target_host=target_host,
+            description=description,
         )
 
 else:
@@ -635,6 +663,12 @@ else:
             ),
         ),
         target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
+        description: Annotated[
+            Optional[str],
+            Field(
+                description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
+            ),
+        ] = None,
     ) -> Dict[str, Any]:
         denied = _tool_denied_reason("assign")
         if denied:
@@ -647,6 +681,7 @@ else:
             model=model,
             use_worktree=use_worktree,
             target_host=target_host,
+            description=description,
         )
 
 
@@ -708,8 +743,17 @@ async def assign_elastic(
     ),
     engine: Optional[str] = Field(default=None, description="Optional Kiro engine override"),
     model: Optional[str] = Field(default=None, description=_model_field_desc),
+    description: Annotated[
+        Optional[str],
+        Field(
+            description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
+        ),
+    ] = None,
 ) -> Dict[str, Any]:
     """Provision one elastic worker and assign one task to it.
+
+    Optionally supply description: an operator-facing phrase identifying the
+    child responsibility (64 Unicode code points, truncated on creation).
 
     The worker must call ``complete_assignment`` exactly once after producing
     its final result. That tool durably delivers the callback before releasing
@@ -813,6 +857,7 @@ async def assign_elastic(
             ready_wait_seconds=_elastic_ready_wait(),
             callback_url=os.environ.get(ELASTIC_CALLBACK_URL_ENV) or None,
             remote_session_name=str(lease["session_name"]),
+            description=description,
         )
         result["worker_id"] = worker_id
         result["elastic"] = True

@@ -31,6 +31,7 @@ to use.
 | `src/cli_agent_orchestrator/mcp_server/` | In-session orchestration MCP tools |
 | `src/cli_agent_orchestrator/ops_mcp_server/` | External operations MCP tools |
 | `src/cli_agent_orchestrator/services/` | Session, terminal, inbox, workflow, memory, event, configuration, and plugin services |
+| `src/cli_agent_orchestrator/decisions/` | Launch-decision platform: points, policy, settings, deciders, records, shadow runner, telemetry, and operator access ([docs](docs/decisions.md)) |
 | `src/cli_agent_orchestrator/backends/` | Terminal-backend abstraction and tmux/herdr implementations |
 | `src/cli_agent_orchestrator/clients/` | SQLite and tmux clients used by services and backends |
 | `src/cli_agent_orchestrator/providers/` | Provider adapters for interactive agent CLIs |

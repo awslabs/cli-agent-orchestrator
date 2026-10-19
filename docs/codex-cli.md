@@ -68,11 +68,11 @@ The `USER_PREFIX_PATTERN` uses `[^\S\n]` (horizontal whitespace only) to prevent
 
 **Completion footer (Codex 0.155 and later).** Codex streams the final answer with no spinner, so a frame of a streaming answer looks like a finished turn. From 0.155, Codex ends each successful turn with a dim footer under the final message: `Worked for 32s • 4:19 PM` (0.159 and later), `Worked for 1m 5s · done 4:19 PM` or `done 4:19 PM` (0.155), and a bare `4:19 PM` for short turns on 0.156 to 0.158. The footer always has the time. When `initialize()` reads such a release in the startup banner, and the status bar is one that `TUI_FOOTER_PATTERN` knows, the rendered screen follows these rules:
 
-- A turn is COMPLETED only when the last row above the composer is the footer, under a reply or tool row. An error cell (`■ ...`) also ends a turn.
+- A turn is COMPLETED when the last row above the composer is the footer, under a reply or tool row. An empty turn is also COMPLETED when CAO recorded the exact dispatched message, its full rendered echo is visible after a pre-dispatch screen capture, and a valid footer follows it with no response rows in between. Without that attribution, an empty-looking frame remains UNKNOWN. An error cell (`■ ...`) also ends a turn.
 - A user message with rows under it and no footer is PROCESSING. A user message with nothing under it is UNKNOWN, which keeps the last status.
 - A frame without the status bar is a redraw in progress: UNKNOWN, unless a spinner or the footer decides.
 - A spinner above the footer of a finished turn is history (for example, a spinner line that a tool result quotes).
-- Extraction removes the footer row from the reply.
+- Extraction removes the footer row from the reply. For an attributed empty turn it returns `""`; manual input, incomplete echoes, stale screens, and ambiguous captures do not imply an empty answer.
 
 The raw stream (`CAO_PYTE_STATUS=false`) keeps the older rules, because it keeps every redraw. A provider rebuilt after a cao-server restart does not run `initialize()` and also keeps the older rules.
 
