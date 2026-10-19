@@ -168,30 +168,33 @@ def test_poll_until_done_still_returns_on_a_genuine_completion(get_backend, moni
 
 
 @patch("cli_agent_orchestrator.backends.registry.get_backend")
-def test_poll_until_done_stops_gating_after_a_server_restart(get_backend, monitor):
-    """A cao-server restart mid-wait resets generations near zero in-process.
-    The boundary recorded before the restart can then never be exceeded again,
-    so the gate must stop gating (fall back to frame-based evaluation) instead
-    of pinning a genuine completion to the full timeout (#735 synthesis item 3).
+def test_poll_until_done_refuses_an_ordinary_repaint_of_a_stale_completion(get_backend, monitor):
+    """An ordinary repaint must not be mistaken for a cao-server restart.
+
+    One more chunk lands and bumps ``output_generation`` without re-stamping the
+    still-COMPLETED status -- ``_apply_detection_locked`` deliberately does not
+    re-stamp an unchanged re-detection (status_monitor.py:388-396). So
+    ``status_generation < boundary`` is the ordinary steady state after any
+    repaint, not evidence of a restart. An earlier version of this gate inferred
+    "generation went backwards means the server restarted" and disengaged
+    itself here, which reopens #735 in the common case: the previous turn's
+    stale COMPLETED must still be refused.
     """
     get_backend.return_value = _tmux_backend()
-    boundary = monitor.output_generation(TERMINAL_ID)  # 8
+    with monitor._lock:
+        monitor._output_generation[TERMINAL_ID] += 1  # repaint, no re-stamp
+    boundary = monitor.output_generation(TERMINAL_ID)
+    assert boundary == 9
     monitor.notify_input_sent(TERMINAL_ID)
 
-    def script(n):
-        if n == 1:
-            # Server restarted: generation counters reset near zero, but the
-            # turn genuinely completed under the new process.
-            _latch(monitor, TerminalStatus.COMPLETED, 1)
-
-    reads, get = _http_reader(monitor, boundary, script)
+    reads, get = _http_reader(monitor, boundary, lambda n: None)
     with patch("cli_agent_orchestrator.utils.terminal.api_http.get", side_effect=get):
-        poll_until_done(TERMINAL_ID, timeout=5.0, polling_interval=0.01, min_generation=boundary)
+        with pytest.raises(click.ClickException, match="Timed out"):
+            poll_until_done(
+                TERMINAL_ID, timeout=0.2, polling_interval=0.01, min_generation=boundary
+            )
 
-    assert len(reads) == 1, (
-        "a reported generation below the dispatch boundary must stop the gate "
-        "immediately rather than waiting out the timeout"
-    )
+    assert len(reads) > 1
 
 
 @patch("cli_agent_orchestrator.backends.registry.get_backend")
