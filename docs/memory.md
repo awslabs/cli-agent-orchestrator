@@ -320,6 +320,22 @@ it does **not** undo score/relevance demotion. Supersedes cycles exclude both
 ends, and a persistent curator can still restate guidance recalled earlier.
 The diagnostic includes `lifecycle_enabled` to identify the active flag state.
 
+### Non-accessing operator inspection (opt-in)
+
+`cao config set memory.non_accessing_inspection true` or
+`CAO_MEMORY_NON_ACCESSING_INSPECTION=true` makes CLI list/show and HTTP
+`GET /memory`, `GET /memory/{key}` pass `record_access=False`. Environment
+beats file; the default and read-error fallback are false. Results and related
+expansion are unchanged, but these operator views no longer increase
+`access_count` or `last_accessed_at`. Agent feedback lessons therefore cannot
+become promotion-eligible merely from repeated operator inspection.
+
+MCP `memory_recall` and `/internal/memory/recall` retain the default
+`record_access=True` regardless of this switch. CLI clear and HTTP DELETE are
+outside its scope. Disabling it restores existing operator access counting.
+The service's keyword-only `record_access` parameter defaults to true; explain
+continues to avoid access bookkeeping independently of this flag.
+
 ### On-demand relevance explain
 
 `cao memory list --query Q --explain` compares default recency recall with

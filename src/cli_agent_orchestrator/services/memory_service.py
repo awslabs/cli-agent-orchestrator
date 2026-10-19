@@ -2435,6 +2435,8 @@ class MemoryService:
         search_mode: str = "hybrid",
         sort_by: str = "recency",
         include_related: bool = False,
+        *,
+        record_access: bool = True,
     ) -> list[Memory]:
         """Recall memories matching query and filters.
 
@@ -2452,6 +2454,8 @@ class MemoryService:
           - ``usage``: most-accessed first.
           - ``relevance``: all-term tier, lexical relevance, bounded project-native age.
             With no query, behaves exactly as recency.
+
+        ``record_access``: False skips reinforcement bookkeeping (operator inspection).
 
         ``include_related``: when True, each result's
         ``related_keys`` cross-references are loaded (one level, same scope)
@@ -2513,7 +2517,12 @@ class MemoryService:
             recall_policy,
             **eligibility_kwargs,
         )
-        if pool.effective_sort == "relevance" or check is not None or lifecycle_on:
+        if (
+            pool.effective_sort == "relevance"
+            or check is not None
+            or lifecycle_on
+            or not record_access
+        ):
             ordered = self._order_candidates(
                 pool.rows,
                 scope,
@@ -2535,6 +2544,7 @@ class MemoryService:
                 policy=recall_policy,
                 **eligibility_kwargs,
                 lifecycle_on=lifecycle_on,
+                record_access=record_access,
             )
         return self._apply_sort_and_increment(
             pool.rows,
@@ -3099,6 +3109,7 @@ class MemoryService:
         policy: Optional[VaultInjectionPolicy] = None,
         eligibility: Optional[memory_eligibility.EligibilityCheck] = None,
         lifecycle_on: bool = False,
+        record_access: bool = True,
     ) -> list:
         """Slice, bump only returned primaries, and optionally append related rows."""
         eligibility_kwargs: dict[str, Any] = (
@@ -3106,16 +3117,17 @@ class MemoryService:
         )
         sliced = results[:limit]
 
-        # Best-effort access_count increment (non-blocking).
-        try:
-            self._increment_access_count(sliced)
-        except Exception as e:  # noqa: BLE001 — non-blocking promise
-            logger.warning(
-                "memory_increment_failed attempted=%d scope=%s",
-                len(sliced),
-                scope or "<all>",
-            )
-            logger.debug(f"recall increment failure detail: {e}")
+        if record_access:
+            # Best-effort access_count increment (non-blocking).
+            try:
+                self._increment_access_count(sliced)
+            except Exception as e:  # noqa: BLE001 — non-blocking promise
+                logger.warning(
+                    "memory_increment_failed attempted=%d scope=%s",
+                    len(sliced),
+                    scope or "<all>",
+                )
+                logger.debug(f"recall increment failure detail: {e}")
 
         # Opt-in cross-reference expansion, appended AFTER the
         # limit slice (the caller asked for related; we deliver in addition).

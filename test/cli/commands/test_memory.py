@@ -868,3 +868,31 @@ class TestMemoryListExplain:
             )
             assert result.exit_code == 2
         service.recall_explain.assert_not_called()
+
+
+class TestNonAccessingInspection:
+    def _assert_record_access(self, monkeypatch, enabled):
+        service = MagicMock()
+        service.recall = AsyncMock(
+            return_value=[_make_memory(key="inspection-key", scope="global")]
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.memory._get_memory_service", lambda: service
+        )
+        if enabled:
+            monkeypatch.setenv("CAO_MEMORY_NON_ACCESSING_INSPECTION", "true")
+        else:
+            monkeypatch.delenv("CAO_MEMORY_NON_ACCESSING_INSPECTION", raising=False)
+        for command, args in [
+            (list_memories, ["--scope", "global"]),
+            (show, ["inspection-key", "--scope", "global"]),
+        ]:
+            result = CliRunner().invoke(command, args)
+            assert result.exit_code == 0, result.output
+            assert service.recall.await_args.kwargs["record_access"] is (not enabled)
+
+    def test_on_passes_false(self, monkeypatch):
+        self._assert_record_access(monkeypatch, True)
+
+    def test_default_passes_true(self, monkeypatch):
+        self._assert_record_access(monkeypatch, False)

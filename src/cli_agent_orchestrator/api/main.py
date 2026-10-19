@@ -8786,6 +8786,8 @@ async def list_memories_endpoint(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[MemorySummary]:
     """List stored memories across all projects (mirrors `cao memory list --all`)."""
+    from cli_agent_orchestrator.services.settings_service import is_non_accessing_inspection_enabled
+
     _require_memory_enabled()
     svc = _get_memory_service()
     try:
@@ -8798,6 +8800,7 @@ async def list_memories_endpoint(
             limit=1000,
             scan_all=True,
             search_mode="metadata",
+            record_access=not is_non_accessing_inspection_enabled(),
         )
         if scope_id is not None:
             memories = [m for m in memories if _memory_matches_scope_id(m, scope_id, svc.base_dir)]
@@ -9077,6 +9080,8 @@ async def get_memory_endpoint(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> MemoryDetail:
     """Show a memory by key (mirrors `cao memory show`; first match wins)."""
+    from cli_agent_orchestrator.services.settings_service import is_non_accessing_inspection_enabled
+
     _require_memory_enabled()
     svc = _get_memory_service()
     try:
@@ -9086,6 +9091,7 @@ async def get_memory_endpoint(
             limit=1000,
             scan_all=True,
             search_mode="metadata",
+            record_access=not is_non_accessing_inspection_enabled(),
         )
         for mem in memories:
             if mem.key != key:

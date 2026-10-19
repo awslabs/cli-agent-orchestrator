@@ -557,6 +557,7 @@ def get_memory_settings() -> Dict[str, Any]:
         "learning_enabled": False,
         "instruction_promotion_enabled": False,
         "explain_enabled": True,
+        "non_accessing_inspection": False,
         "lifecycle": {"enabled": False},
     }
     saved = settings.get("memory", {})
@@ -581,6 +582,10 @@ def get_memory_settings() -> Dict[str, Any]:
             **(lifecycle if isinstance(lifecycle, dict) else {}),
             "enabled": env_lifecycle.strip().lower() in ("1", "true", "yes"),
         }
+
+    env_inspection = os.environ.get("CAO_MEMORY_NON_ACCESSING_INSPECTION")
+    if env_inspection is not None and env_inspection.strip():
+        result["non_accessing_inspection"] = env_inspection.strip().lower() in ("1", "true", "yes")
 
     # Env-var overlay: CAO_MEMORY_EXPLAIN_ENABLED beats settings.json.
     env_explain = os.environ.get("CAO_MEMORY_EXPLAIN_ENABLED")
@@ -686,6 +691,15 @@ def is_memory_lint_enabled(settings: Optional[Dict[str, Any]] = None) -> bool:
     except Exception as e:
         logger.warning(f"Failed to read memory.lint_enabled, defaulting to True: {e}")
         return True
+
+
+def is_non_accessing_inspection_enabled() -> bool:
+    """Opt-in operator inspection: env > file > False; read errors stay off."""
+    try:
+        return bool(get_memory_settings().get("non_accessing_inspection", False))
+    except Exception:
+        logger.warning("Failed to read memory.non_accessing_inspection; defaulting to False")
+        return False
 
 
 def is_memory_lifecycle_enabled() -> bool:
@@ -998,6 +1012,7 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         ``enabled`` (bool) — master switch for the memory subsystem.
         ``explain_enabled`` (bool) — on-demand CLI relevance diagnostic.
         ``lifecycle.enabled`` (bool) — opt-in supersedes lifecycle.
+        ``non_accessing_inspection`` (bool) — opt-in operator reads without access bumps.
         ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
         ``lint_enabled`` (bool) — expensive wiki lint enrichment switch.
         ``learning_enabled`` (bool) — workflow self-learning (outcome capture).
@@ -1042,9 +1057,9 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         if not isinstance(lifecycle, dict):
             lifecycle = {}
         memory[key.split(".")[0]] = {**lifecycle, "enabled": value}
-    elif key == "explain_enabled":
+    elif key in {"explain_enabled", "non_accessing_inspection"}:
         if not isinstance(value, bool):
-            raise ValueError(f"explain_enabled must be a bool, got {type(value).__name__}")
+            raise ValueError(f"{key} must be a bool, got {type(value).__name__}")
         memory[key] = value
     elif key == "flush_threshold":
         fval = float(value)

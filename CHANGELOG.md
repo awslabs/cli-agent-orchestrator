@@ -37,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run-step transport does not yet receive that credential; subprocess credential delivery
   remains a separate security-boundary decision.
 
+- Opt-in non-accessing inspection for CLI memory list/show and HTTP GET
+  memory views. Agent recall still reinforces access counts; repeated
+  operator views cannot make lessons promotion-eligible. Part of #861.
+
 - Opt-in `memory.lifecycle.enabled` excludes active supersedes targets from
   injection and adds transient recall labels/demotion. Defaults and canonical
   Markdown remain unchanged; score/relevance demotion is always on. Part of #861.

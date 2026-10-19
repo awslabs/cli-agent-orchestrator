@@ -12,6 +12,7 @@ import click
 from cli_agent_orchestrator.constants import MEMORY_ARCHIVE_DEFAULT_FORMAT
 from cli_agent_orchestrator.models.memory import MemoryScope, MemoryType
 from cli_agent_orchestrator.services.memory_service import MemoryDisabledError, MemoryService
+from cli_agent_orchestrator.services.settings_service import is_non_accessing_inspection_enabled
 
 
 def _get_memory_service() -> MemoryService:
@@ -458,6 +459,7 @@ def list_memories(scope, memory_type, scan_all, query, explain, limit, output_fo
                 limit=100,
                 terminal_context=terminal_context,
                 scan_all=scan_all,
+                record_access=not is_non_accessing_inspection_enabled(),
             )
         )
     except Exception as e:
@@ -515,7 +517,12 @@ def show(key, scope):
     try:
         memories = _run_async(
             svc.recall(
-                query=key, scope=scope, limit=100, terminal_context=_cwd_context(), scan_all=True
+                query=key,
+                scope=scope,
+                limit=100,
+                terminal_context=_cwd_context(),
+                scan_all=True,
+                record_access=not is_non_accessing_inspection_enabled(),
             )
         )
     except Exception as e:
