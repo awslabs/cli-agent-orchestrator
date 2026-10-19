@@ -586,8 +586,10 @@ def test_mcp_run_authenticates_terminal_root_lookup_and_first_post(
         api_main.terminal_service, "get_working_directory", lambda tid: str(tmp_path)
     )
 
-    async def _run(spec, inputs, run_id, *, working_directory=None):
+    async def _run(spec, inputs, run_id, caller_id=None, *, working_directory=None):
         assert working_directory == str(tmp_path)
+        # The MCP tool names its terminal; the route forwards it (delegation ceiling).
+        assert caller_id == os.environ["CAO_TERMINAL_ID"]
         return SimpleNamespace(
             model_dump=lambda: {
                 "run_id": run_id,
