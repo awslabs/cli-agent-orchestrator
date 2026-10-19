@@ -712,18 +712,84 @@ class TestEagerInboxDelivery:
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_delivery_waiting_user_answer_with_eager_enabled_and_capable_provider(
+    def test_delivery_waiting_user_answer_holds_for_dialog_blocking_provider(
         self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
     ):
-        """WAITING_USER_ANSWER + eager ON + capable provider -> delivers."""
+        """WAITING_USER_ANSWER + eager ON + dialog-blocking provider -> holds (#896).
+
+        Claude Code's WAITING_USER_ANSWER means an AskUserQuestion/approval
+        dialog is open; its Ink Select widget consumes pasted text as the answer
+        and the trailing Enter submits the highlighted option. Eagerly
+        delivering there loses the message AND answers a question a human was
+        supposed to answer, so the message must stay PENDING for the IDLE /
+        COMPLETED consumer (or the reconcile sweep) to pick up later.
+        """
         mock_get.return_value = [_make_message()]
         mock_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
         provider = MagicMock()
         provider.accepts_input_while_processing = True
+        provider.blocks_orchestrated_input_while_waiting_user_answer = True
         mock_pm.get_provider.return_value = provider
 
         with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True):
             svc = InboxService()
+            svc.deliver_pending("t1")
+
+        mock_term_svc.send_input.assert_not_called()
+        # Held, not consumed: the optimistic DELIVERED mark must not be written.
+        mock_update.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_delivery_waiting_user_answer_delivers_for_non_blocking_provider(
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
+    ):
+        """WAITING_USER_ANSWER + eager ON + provider that does NOT block -> delivers.
+
+        The gate is the provider's own
+        ``blocks_orchestrated_input_while_waiting_user_answer`` capability, not a
+        blanket ban: a TUI that keeps a separate input box alive next to its
+        prompt can still take the message mid-dialog.
+        """
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+        provider = MagicMock()
+        provider.accepts_input_while_processing = True
+        provider.blocks_orchestrated_input_while_waiting_user_answer = False
+        mock_pm.get_provider.return_value = provider
+
+        with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True):
+            svc = InboxService()
+            svc.deliver_pending("t1")
+
+        mock_term_svc.send_input.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_held_dialog_message_delivers_once_the_terminal_is_idle(
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
+    ):
+        """A message held during WAITING_USER_ANSWER is delivered on the next attempt."""
+        mock_get.return_value = [_make_message()]
+        provider = MagicMock()
+        provider.accepts_input_while_processing = True
+        provider.blocks_orchestrated_input_while_waiting_user_answer = True
+        mock_pm.get_provider.return_value = provider
+
+        with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True):
+            svc = InboxService()
+            mock_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+            svc.deliver_pending("t1")
+            mock_term_svc.send_input.assert_not_called()
+
+            # Human answered the dialog; the terminal finished its turn.
+            mock_monitor.get_status.return_value = TerminalStatus.IDLE
             svc.deliver_pending("t1")
 
         mock_term_svc.send_input.assert_called_once()

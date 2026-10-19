@@ -2589,6 +2589,40 @@ class TestSendInput:
         mock_tmux.send_keys.assert_not_called()
         mock_update.assert_not_called()
 
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_blocks_send_message_when_provider_waits_for_user_answer(
+        self, mock_get_metadata, mock_tmux, mock_pm, mock_update, mock_status_monitor
+    ):
+        """Inbox (send_message) text must not answer an active provider prompt either (#896).
+
+        Before this fix the guard only covered ASSIGN/HANDOFF, so an inbox
+        delivery was pasted into an open AskUserQuestion dialog: the dialog ate
+        the text and the trailing Enter selected whichever option was
+        highlighted, while the message was marked DELIVERED.
+        """
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.blocks_orchestrated_input_while_waiting_user_answer = True
+        mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+
+        with pytest.raises(TerminalInputBlockedError, match="waiting for a user answer") as exc:
+            send_input(
+                "test1234",
+                "inbox message",
+                orchestration_type=OrchestrationType.SEND_MESSAGE,
+            )
+
+        assert "sending send_message input" in str(exc.value)
+        mock_tmux.send_keys.assert_not_called()
+        mock_update.assert_not_called()
+
     @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
