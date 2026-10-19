@@ -46,14 +46,14 @@ def stale_terminal_runtime_is_live(terminal: TerminalModel) -> bool:
     wrong "live" only defers the row's deletion to the next sweep.
     """
     backend = get_backend()
-    session_name = terminal.tmux_session
-    window_name = terminal.tmux_window
+    session_name = str(terminal.tmux_session)
+    window_name = str(terminal.tmux_window)
     try:
         if not backend.session_exists_strict(session_name):
             return False
     except Exception as exc:  # noqa: BLE001 — unanswerable liveness fails closed
         logger.warning(
-            "Could not establish liveness for stale terminal %s (session %s); " "retaining it: %s",
+            "Could not establish liveness for stale terminal %s (session %s); retaining it: %s",
             terminal.id,
             session_name,
             exc,
@@ -66,7 +66,7 @@ def stale_terminal_runtime_is_live(terminal: TerminalModel) -> bool:
         return backend.get_pane_current_command(session_name, window_name) is not None
     except Exception as exc:  # noqa: BLE001 — unanswerable liveness fails closed
         logger.warning(
-            "Could not establish pane liveness for stale terminal %s (%s:%s); " "retaining it: %s",
+            "Could not establish pane liveness for stale terminal %s (%s:%s); retaining it: %s",
             terminal.id,
             session_name,
             window_name,

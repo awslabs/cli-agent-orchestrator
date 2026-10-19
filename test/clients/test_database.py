@@ -410,9 +410,7 @@ class TestTerminalOperations:
             failed_ids = fail_orphaned_pending_messages(30)
 
         with test_db() as check:
-            by_message = {
-                m.message: m.status for m in check.query(InboxModel).all()  # type: ignore[attr-defined]
-            }
+            by_message = {m.message: m.status for m in check.query(InboxModel).all()}
 
         assert len(failed_ids) == 1
         assert by_message["ghost"] == MessageStatus.FAILED.value
