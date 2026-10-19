@@ -17,8 +17,11 @@ and load-bearing in another — ``test_gitleaks_config.py`` has no gitleaks bina
 in the pip-only Unit Tests job but is the whole point of the gitleaks job in
 ``secret-scan.yml``. So the marker names a gate, and a run enforces only the
 gates listed in the ``CAO_MUST_RUN`` environment variable (comma-separated).
-With ``CAO_MUST_RUN`` unset — every ordinary local run — the gate only prints a
-note, so a developer without cargo/trivy/gitleaks installed is not blocked.
+With ``CAO_MUST_RUN`` unset — every ordinary local run — a *well-formed*
+marker is a no-op; the gate only prints a note, so a developer without
+cargo/trivy/gitleaks installed is not blocked. A bare ``@pytest.mark.must_run``
+with no gate name is a misuse and still fails the session regardless of
+``CAO_MUST_RUN``, because that is broken code that should never reach main.
 
 Which jobs set which gates is itself asserted by ``test_must_run_gate.py``;
 without that, a gate that no job enforces would be exactly the dead guard this
@@ -100,9 +103,31 @@ class MustRunGate:
                     "job is supposed to enforce."
                 )
 
+    def pytest_collection_modifyitems(
+        self, session: pytest.Session, config: pytest.Config, items: Sequence[pytest.Item]
+    ) -> None:
+        """Catch a gate with no owned test at all: deleted, renamed, or misspelled.
+
+        ``pytest_itemcollected`` has already fired for every collected item by
+        the time this runs, so ``self._gates_by_nodeid`` is complete regardless
+        of any later deselection. A gate in ``CAO_MUST_RUN`` with no matching
+        marker anywhere asserts nothing — the exact silent-skip failure mode
+        this module exists to prevent, just one step earlier.
+        """
+        del session, config, items
+        seen = {gate for gates in self._gates_by_nodeid.values() for gate in gates}
+        for gate in sorted(self.gates - seen):
+            self.violations.append(
+                f"gate {gate!r}: no must_run test was collected for it, but "
+                f"{ENV_VAR} enforces it. The marked test may have been deleted, "
+                "renamed, or misspelled."
+            )
+
     # -- execution --------------------------------------------------------
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
-        if report.when != "setup" or not report.skipped:
+        if report.when not in ("setup", "call") or not report.skipped:
+            return
+        if getattr(report, "wasxfail", None) is not None:
             return
         gates = self._gates_by_nodeid.get(report.nodeid, ())
         if not self._owned(gates):

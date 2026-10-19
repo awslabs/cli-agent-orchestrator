@@ -130,8 +130,23 @@ def test_skipped_must_run_test_is_tolerated_when_its_gate_is_not_enforced(tmp_pa
     assert "VIOLATION" not in result.stdout
 
 
+TWO_GATE_TEST = """
+    import pytest
+
+    @pytest.mark.must_run("unit")
+    @pytest.mark.skipif(True, reason="precondition vanished")
+    def test_assurance():
+        assert True
+
+    @pytest.mark.must_run("gitleaks")
+    def test_other():
+        assert True
+"""
+
+
 def test_a_different_gate_does_not_enforce_this_one(tmp_path):
-    _scratch_session(tmp_path, SKIPPING_TEST)
+    """A skip under an un-enforced gate must not fail a run that owns another gate."""
+    _scratch_session(tmp_path, TWO_GATE_TEST)
     result = _run(tmp_path, gates="gitleaks")
 
     assert result.returncode == 0, result.stdout + result.stderr
@@ -152,6 +167,55 @@ def test_clean_run_passes_and_says_so(tmp_path):
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "must_run: 1 test(s) for gate(s) ['unit'] ran as required" in result.stdout
+
+
+def test_enforced_gate_with_no_owned_test_fails_the_session(tmp_path):
+    """Delete/rename/mistype the marked test and the gate must not go quiet."""
+    _scratch_session(tmp_path, PASSING_TEST)
+    result = _run(tmp_path, gates="unit,ghost")
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "must_run: VIOLATION" in result.stdout
+    assert "gate 'ghost'" in result.stdout
+    assert "no must_run test was collected" in result.stdout
+
+
+CALL_PHASE_SKIP_TEST = """
+    import pytest
+
+    @pytest.mark.must_run("unit")
+    def test_assurance():
+        pytest.skip("precondition vanished at runtime")
+"""
+
+
+def test_call_phase_skip_fails_the_session_when_its_gate_is_enforced(tmp_path):
+    """A ``pytest.skip()`` inside the test body, not just a ``skipif`` decorator."""
+    _scratch_session(tmp_path, CALL_PHASE_SKIP_TEST)
+    result = _run(tmp_path, gates="unit")
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "must_run: VIOLATION" in result.stdout
+    assert "SKIPPED (precondition vanished at runtime)" in result.stdout
+
+
+XFAIL_TEST = """
+    import pytest
+
+    @pytest.mark.must_run("unit")
+    @pytest.mark.xfail(reason="known broken", strict=False)
+    def test_assurance():
+        assert False
+"""
+
+
+def test_xfail_is_not_reported_as_a_must_run_violation(tmp_path):
+    """xfail is a known-failure marker, not the silent-skip hazard this gate targets."""
+    _scratch_session(tmp_path, XFAIL_TEST)
+    result = _run(tmp_path, gates="unit")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "VIOLATION" not in result.stdout
 
 
 def test_marker_without_a_gate_name_is_reported_as_misuse(tmp_path):
