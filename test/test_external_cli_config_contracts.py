@@ -1,0 +1,149 @@
+"""Guard test: when CAO restates an external CLI's config-file contract, every
+operator-facing surface must carry the layout that CLI actually accepts.
+
+#967 was a documentation-contract drift, not a logic bug. ``codexProfile`` is
+the only route to a sandboxed Codex worker, and CAO told operators to put the
+settings in a ``[profiles.<name>]`` table inside ``~/.codex/config.toml`` --
+the layout codex-cli 0.162 refuses outright. The flag CAO *builds*
+(``--profile <name>``) never changed, every provider test asserts on that argv,
+so the whole suite stayed green while the instructions for the file the flag
+*reads* went stale at eight independent sites: ``docs/codex-cli.md`` (x3),
+``docs/hermes.md``, the ``codexProfile`` field comment, two comments in
+``providers/codex.py``, and the published ``docusaurus/docs`` mirror.
+
+The class is "the same external-tool contract is restated in prose at N
+hand-counted sites with no single source of truth". The cure is to stop
+counting by hand: this test enumerates operator-facing files *mechanically*, so
+a surface nobody remembered -- including one added after the fix -- is covered
+without anyone adding it to a list. The first fix for #967 did rewrite seven
+sites and ship a regression test, and still missed
+``docusaurus/docs/features/profiles.md`` precisely because both the fix and the
+test named their sites by hand.
+
+Add a ``Contract`` entry whenever CAO documents the layout of a config file
+owned by another CLI.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterator, Tuple
+
+import pytest
+
+import cli_agent_orchestrator
+
+_REPO_ROOT = Path(cli_agent_orchestrator.__file__).parents[2]
+
+# Operator-facing text. ``test/`` is excluded on purpose: a test legitimately
+# names the rejected layout in order to assert against it, and CHANGELOG.md is
+# a historical record of what the docs used to say.
+_TEXT_SUFFIXES = frozenset({".md", ".mdx", ".py", ".ts", ".tsx", ".txt"})
+_PRUNED_DIRS = frozenset(
+    {
+        ".git",
+        ".sweep",
+        ".venv",
+        ".mypy_cache",
+        ".pytest_cache",
+        "__pycache__",
+        "build",
+        "dist",
+        "node_modules",
+        "test",
+        "vendor",
+    }
+)
+_EXCLUDED_FILES = frozenset({"CHANGELOG.md"})
+
+# How many lines count as "next to". A stale instruction stands alone; a
+# correct warning about the rejected layout always sits beside the real one.
+_WINDOW = 6
+
+
+@dataclass(frozen=True)
+class Contract:
+    """An external CLI's config-file layout that CAO restates to operators."""
+
+    knob: str
+    # The layout the external CLI rejects (or no longer reads).
+    rejected: "re.Pattern[str]"
+    # The layout it does read. Must appear within _WINDOW lines of any
+    # mention of ``rejected``, and of any line that defines ``knob``.
+    accepted: "re.Pattern[str]"
+    # A line that tells an operator what ``knob`` points at.
+    defines_knob: "re.Pattern[str]"
+    why: str
+
+
+CONTRACTS: Tuple[Contract, ...] = (
+    Contract(
+        knob="codexProfile",
+        rejected=re.compile(r"\[profiles\."),
+        accepted=re.compile(r"[\w<>.*-]+\.config\.toml"),
+        defines_knob=re.compile(
+            r"codexProfile.*\b(?:Names|names|points|block|table|inside)\b"
+            r"|\b(?:Names|names|points)\b.*codexProfile"
+        ),
+        why=(
+            "codex-cli 0.162+ loads profile settings only from "
+            "$CODEX_HOME/<name>.config.toml; with a legacy [profiles.<name>] table "
+            "present, `codex --profile <name>` exits 1 before drawing a banner (#967)"
+        ),
+    ),
+)
+
+
+def _operator_facing_files() -> Iterator[Path]:
+    for dirpath, dirnames, filenames in os.walk(_REPO_ROOT):
+        dirnames[:] = [d for d in dirnames if d not in _PRUNED_DIRS]
+        for filename in filenames:
+            if filename in _EXCLUDED_FILES:
+                continue
+            path = Path(dirpath) / filename
+            if path.suffix in _TEXT_SUFFIXES:
+                yield path
+
+
+def _violations(contract: Contract, trigger: "re.Pattern[str]") -> list[str]:
+    """Lines matching ``trigger`` with no accepted layout within the window."""
+    found: list[str] = []
+    for path in _operator_facing_files():
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):  # pragma: no cover - binary/unreadable
+            continue
+        for index, line in enumerate(lines):
+            if not trigger.search(line):
+                continue
+            window = "\n".join(
+                lines[max(0, index - _WINDOW) : min(len(lines), index + _WINDOW + 1)]
+            )
+            if not contract.accepted.search(window):
+                rel = path.relative_to(_REPO_ROOT)
+                found.append(f"{rel}:{index + 1}: {line.strip()[:120]}")
+    return found
+
+
+@pytest.mark.parametrize("contract", CONTRACTS, ids=lambda c: c.knob)
+def test_no_surface_restates_the_rejected_layout_alone(contract: Contract) -> None:
+    """Naming the rejected layout is fine; naming it without the real one is not."""
+    offenders = _violations(contract, contract.rejected)
+    assert not offenders, (
+        f"{contract.knob}: these surfaces mention the rejected config layout with no "
+        f"mention of {contract.accepted.pattern} within {_WINDOW} lines, so an operator "
+        f"copies the layout that fails -- {contract.why}:\n  " + "\n  ".join(offenders)
+    )
+
+
+@pytest.mark.parametrize("contract", CONTRACTS, ids=lambda c: c.knob)
+def test_every_surface_defining_the_knob_names_the_file_it_reads(contract: Contract) -> None:
+    """A field table that says what the knob names must say which file to create."""
+    offenders = _violations(contract, contract.defines_knob)
+    assert not offenders, (
+        f"{contract.knob}: these surfaces say what the knob points at without naming "
+        f"{contract.accepted.pattern} -- {contract.why}:\n  " + "\n  ".join(offenders)
+    )
