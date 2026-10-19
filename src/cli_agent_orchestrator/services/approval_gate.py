@@ -69,7 +69,7 @@ _IDENTITY_PREFIX = (
 )
 _IDENTITY_MESSAGES = {
     "untracked_too_large": "The working directory has more than 64 MiB of untracked files that are not gitignored, which is more than CAO fingerprints. Gitignore or commit them, or run from a different working directory. Repeating the run will not help.",
-    "untracked_unsupported": "Its untracked files include an entry CAO cannot fingerprint (a FIFO, socket or device, or a path under a symlinked directory). Remove or gitignore it. Repeating the run will not help.",
+    "untracked_unsupported": "Its untracked files include an unreadable or unsupported entry (a FIFO, socket or device, or a path under a symlinked directory). Remove or gitignore it. Repeating the run will not help.",
     "repository_unreadable": "Git could not read the repository there. It may have no commits yet, or git may refuse it (for example a safe.directory check). Make sure `git rev-parse HEAD` succeeds in that directory. Repeating the run will not help.",
     "git_unavailable": "Git could not be run in the working directory (git is missing, or the server cannot read the directory). Repeating the run will not help.",
     "git_timeout": "A git command there did not finish within 10 seconds. Retry once; if it fails again, run from a smaller working directory.",

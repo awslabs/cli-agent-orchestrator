@@ -23,6 +23,7 @@ overlooked. **IF A THIRD CALLER EVER NEEDS A NEVER-RAISES GIT WRAPPER, CONSOLIDA
 decided on.
 """
 
+import errno
 import hashlib
 import logging
 import os
@@ -32,8 +33,6 @@ from typing import Any, Dict, Optional, Union
 
 logger = logging.getLogger(__name__)
 
-# Bounded so a hung git process cannot delay run start. Generous relative to the work — two local
-# invocations that read refs — because the point is to fail eventually, not quickly.
 UNAVAILABLE_REASONS = frozenset(
     {
         "untracked_too_large",
@@ -54,6 +53,8 @@ def normalize_unavailable_reason(reason: Optional[str]) -> str:
     return reason if reason is not None and reason in UNAVAILABLE_REASONS else "internal"
 
 
+# Bounded so a hung git process cannot delay run start. Generous relative to the work — two local
+# invocations that read refs — because the point is to fail eventually, not quickly.
 _GIT_TIMEOUT_SECONDS = 10
 _HASH_CHUNK_BYTES = 64 * 1024
 _UNTRACKED_HASH_BUDGET_BYTES = 64 * 1024 * 1024  # 64 MiB
@@ -270,7 +271,12 @@ def _worktree_state(cwd: str, environment: Dict[str, str]) -> Dict[str, str]:
                 return {"status": "unavailable", "reason": "changed_during_snapshot"}
     except OSError as e:
         logger.debug("git_baseline: untracked entry unavailable (baseline recorded absent): %s", e)
-        return {"status": "unavailable", "reason": "changed_during_snapshot"}
+        reason = (
+            "untracked_unsupported"
+            if isinstance(e, PermissionError) or e.errno in {errno.EACCES, errno.EPERM}
+            else "changed_during_snapshot"
+        )
+        return {"status": "unavailable", "reason": reason}
 
     return {"status": "dirty", "digest": f"sha256:{digest.hexdigest()}"}
 

@@ -2764,3 +2764,58 @@ def test_each_freeze_reason_has_fixed_path_free_503(
     assert "retry-after" not in response.headers
     assert str(tmp_path) not in response.text
     assert workflow_journal.get_run("reason-refused") is None
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read chmod 000 files")
+@pytest.mark.parametrize("endpoint", ["/workflows/runs", "/workflows/runs:submit"])
+def test_unreadable_untracked_file_is_deterministic_path_free_503(
+    client, async_script_env, tmp_path, monkeypatch, endpoint
+):
+    import subprocess
+    from cli_agent_orchestrator.services import approval_gate
+    from cli_agent_orchestrator.utils import git_baseline
+
+    root = tmp_path / "permission-repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "--no-gpg-sign",
+            "-qm",
+            "init",
+        ],
+        cwd=root,
+        check=True,
+    )
+    path = root / "unreadable-private-marker.bin"
+    path.write_bytes(b"build output")
+    path.chmod(0)
+    monkeypatch.setattr(approval_gate, "is_workflow_approval_required", lambda: True)
+    try:
+        response = client.post(
+            endpoint,
+            json={
+                "name_or_path": "scr",
+                "inputs": {},
+                "run_id": "permission-refused",
+                "working_directory": str(root),
+            },
+        )
+        assert response.status_code == 503, response.text
+        detail = response.json()["detail"]
+        assert set(detail) == {"kind", "plan_id", "message"}
+        assert detail["kind"] == "plan_identity_unavailable" and detail["plan_id"] is None
+        assert "Retry" not in detail["message"]
+        assert "unreadable" in detail["message"]
+        assert str(root) not in response.text and str(path) not in response.text
+        assert git_baseline.derive_baseline(str(root))["reason"] == "untracked_unsupported"
+        assert workflow_journal.get_run("permission-refused") is None
+    finally:
+        path.chmod(0o600)
