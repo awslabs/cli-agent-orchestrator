@@ -1658,9 +1658,14 @@ def _install_allowlist_middleware(server: Any) -> None:
     caller that reaches those functions without passing through FastMCP dispatch.
     """
     add_middleware = getattr(server, "add_middleware", None)
-    if not callable(add_middleware):  # pragma: no cover - FastMCP build without middleware
-        logger.warning("FastMCP build has no add_middleware; CAO MCP tools are not allowlist-gated")
-        return
+    if not callable(add_middleware):
+        # Fail closed: a FastMCP build that cannot install this gate must not
+        # start ungated and silent. Raising here aborts module import (the
+        # call site below is module-level), the loudest failure available.
+        raise RuntimeError(
+            "FastMCP build has no add_middleware; cannot install the CAO MCP "
+            "tool allowlist gate (#671)"
+        )
 
     from fastmcp.exceptions import ToolError
     from fastmcp.server.middleware import Middleware

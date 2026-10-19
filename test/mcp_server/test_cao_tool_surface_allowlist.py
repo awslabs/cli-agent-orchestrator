@@ -235,13 +235,11 @@ class TestInstallation:
         assert middlewares is not None
         assert any(type(m).__name__ == "_AllowlistGate" for m in middlewares)
 
-    def test_a_build_without_middleware_degrades_loudly(self):
-        """A FastMCP without ``add_middleware`` must warn, not raise."""
+    def test_a_build_without_middleware_fails_closed(self):
+        """A FastMCP without ``add_middleware`` must raise, not silently start ungated."""
 
         class _NoMiddleware:
             pass
 
-        with patch.object(server.logger, "warning") as warn:
+        with pytest.raises(RuntimeError):
             server._install_allowlist_middleware(_NoMiddleware())
-        warn.assert_called_once()
-        assert "allowlist-gated" in warn.call_args[0][0]
