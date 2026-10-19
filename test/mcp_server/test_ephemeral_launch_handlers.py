@@ -765,3 +765,99 @@ async def test_claimed_handoff_legacy_worker_status_is_not_launch_failure(
         if status == 504
         else "Handoff failed: worker errored (legacy worker failure)"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["assign", "default", "nowait", "early"])
+async def test_claimed_launch_persists_description(launch_http, monkeypatch, path):
+    runtime, _, calls, _, _ = launch_http
+    env, name, _, _ = runtime
+    description = "Inspect the merge boundary"
+    snapshots = []
+    delete = terminal_service.delete_terminal
+
+    def observe_delete(terminal_id, **kwargs):
+        snapshots.append(database.get_terminal_metadata(terminal_id))
+        return delete(terminal_id, **kwargs)
+
+    monkeypatch.setattr(terminal_service, "delete_terminal", observe_delete)
+    result = await invoke(path, name, description=description)
+    assert result["success"], result
+    launches = [c for c in calls if c[0] == "post" and not c[1].endswith("/claim")]
+    fresh = launches[0][2]
+    claim_payload = fresh["json"] if path == "default" else fresh["params"]
+    assert claim_payload["claim_id"]
+    assert fresh["json"]["description"] == description
+    if path in ["assign", "nowait"]:
+        assert database.get_terminal_metadata(CHILD)["description"] == description
+        assert database.get_ephemeral_agent(name)["state"] == "launched"
+        assert orchestration._delete_terminal_impl(CHILD)["success"]
+    assert snapshots and all(row["description"] == description for row in snapshots)
+    assert_released(env, name, "terminal_deleted")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["assign", "handoff"])
+async def test_mcp_ephemeral_description_reaches_child(launch_http, monkeypatch, tool):
+    runtime, _, _, _, _ = launch_http
+    snapshots = []
+    delete = terminal_service.delete_terminal
+
+    def observe_delete(terminal_id, **kwargs):
+        snapshots.append(database.get_terminal_metadata(terminal_id))
+        return delete(terminal_id, **kwargs)
+
+    monkeypatch.setattr(terminal_service, "delete_terminal", observe_delete)
+    kwargs = dict(
+        engine=None, model=None, use_worktree=False, target_host=None, description="Review worker"
+    )
+    if tool == "handoff":
+        kwargs["timeout"] = 600
+    if server.ENABLE_WORKING_DIRECTORY:
+        kwargs["working_directory"] = "/workspace"
+    result = await getattr(server, tool)(runtime[1], "inspect", **kwargs)
+    data = result if isinstance(result, dict) else result.model_dump()
+    assert data["success"], data
+    if tool == "assign":
+        assert database.get_terminal_metadata(CHILD)["description"] == "Review worker"
+        assert orchestration._delete_terminal_impl(CHILD)["success"]
+    assert snapshots[0]["description"] == "Review worker"
+
+
+@pytest.mark.asyncio
+async def test_claimed_provider_error_preserves_handoff_and_releases(launch_http, monkeypatch):
+    runtime, _, calls, _, _ = launch_http
+    env, name, _, _ = runtime
+    error = "API Error: 400 model is unavailable"
+    monkeypatch.setattr(terminal_service, "get_output", lambda *a: error)
+    monkeypatch.setattr(terminal_service, "get_output_context", lambda *a: "⏺ " + error)
+    post = orchestration.requests.post
+    responses = []
+
+    def observe_post(url, **kwargs):
+        response = post(url, **kwargs)
+        if url.endswith("/run-step"):
+            responses.append(response)
+        return response
+
+    monkeypatch.setattr(orchestration.requests, "post", observe_post)
+    result = await invoke("default", name)
+    response = responses[-1]
+    assert response.status_code == 502
+    assert response.json()["detail"]["kind"] == "provider_error"
+    assert response.json()["detail"]["terminal_id"] == CHILD
+    assert not result["success"] and result["rule"] is None
+    assert result["terminal_id"] == CHILD
+    assert result["message"].startswith("Handoff failed: provider error (api_error)")
+    assert "ephemeral launch failed" not in result["message"]
+    # The no-claim response mapper must retain exactly the same established result.
+    monkeypatch.setattr(orchestration.requests, "post", lambda *a, **kw: response)
+    unclaimed = await orchestration._run_step_and_build_result({}, name, "claude_code", 600, 0)
+    assert (unclaimed.message, unclaimed.terminal_id, unclaimed.rule) == (
+        result["message"],
+        CHILD,
+        None,
+    )
+    assert database.get_terminal_metadata(CHILD) is None
+    assert_released(env, name, "terminal_deleted")
+    assert database.get_ephemeral_agent(name)["state"] == "gc"
