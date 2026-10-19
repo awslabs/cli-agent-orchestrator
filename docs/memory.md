@@ -230,8 +230,9 @@ memory_recall(
 BM25 relevance + recency + usage), or `usage` (most accessed). When no `scope` is
 given, results follow scope precedence: `session` > `project` > `global`.
 
-`relevance` is opt-in and needs a query; without one it follows the exact
-`recency` path. Hybrid relevance uses the existing widened pool; metadata and
+`relevance` is opt-in and needs a query; omitted, empty and whitespace-only
+queries follow the exact `recency` path. Other sort modes keep their existing
+query handling. Hybrid relevance uses the existing widened pool; metadata and
 BM25 relevance widen their single source too. Each source considers
 `max(limit, min(200, max(50, 3 * limit)))` rows. Partial BM25 matches fill only
 slots left by all-term matches, and all-term matches rank first.

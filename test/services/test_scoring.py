@@ -2036,16 +2036,24 @@ class TestRelevanceRecall:
         assert svc._order_candidates(rows, "project", "relevance", now=now)[0].key == expected
 
     @pytest.mark.parametrize("search_mode", ["hybrid", "metadata", "bm25"])
-    def test_no_query_is_exactly_recency(
-        self, svc, db_engine, hybrid_starvation_corpus, search_mode
-    ):
+    @pytest.mark.parametrize("query", [None, "", "   "])
+    def test_no_query_is_exactly_recency(self, svc, db_engine, search_mode, query):
+        ctx = _ctx(caller_scope="global")
+        now = datetime.now(timezone.utc)
+        for key, days in [("a-old", 10), ("z-new", 1)]:
+            _run(
+                svc.store(key=key, content="query-free body", scope="global", terminal_context=ctx)
+            )
+            _stamp_updated_at(db_engine, key, "global", now - timedelta(days=days))
         snapshots = []
         for sort_by in ["recency", "relevance"]:
             with sessionmaker(bind=db_engine)() as db:
                 db.query(MemoryMetadataModel).update({"access_count": 0, "last_accessed_at": None})
                 db.commit()
             rows = _run(
-                svc.recall(scope="global", limit=1, search_mode=search_mode, sort_by=sort_by)
+                svc.recall(
+                    query=query, scope="global", limit=1, search_mode=search_mode, sort_by=sort_by
+                )
             )
             with sessionmaker(bind=db_engine)() as db:
                 snapshots.append(

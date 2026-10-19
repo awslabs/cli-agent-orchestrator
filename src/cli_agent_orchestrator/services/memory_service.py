@@ -2490,7 +2490,7 @@ class MemoryService:
         from cli_agent_orchestrator.services.memory_scoring import validate_sort_by
 
         validate_sort_by(sort_by)
-        if sort_by == "relevance" and not query:
+        if sort_by == "relevance" and (not query or not query.strip()):
             sort_by = "recency"
         terminal_id = (terminal_context or {}).get("terminal_id")
         recall_policy = _resolve_injection_policy(

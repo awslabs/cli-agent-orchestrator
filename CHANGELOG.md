@@ -174,6 +174,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Whitespace-only relevance queries follow the exact recency path, including
+  source selection and access deltas; legacy sort modes are unchanged. Part of #861.
+
 - Memory explain and lifecycle recall use one supersedes snapshot for
   ordering and status labels, including related targets and default-only
   diagnostic rows, so concurrent graph changes cannot contradict ranks.
