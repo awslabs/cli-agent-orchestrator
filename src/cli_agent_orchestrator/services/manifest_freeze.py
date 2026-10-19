@@ -55,6 +55,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from cli_agent_orchestrator.services import execution_manifest, plan_identifier
+from cli_agent_orchestrator.utils.agent_profiles import profile_set_digest
 from cli_agent_orchestrator.utils.git_baseline import derive_baseline, normalize_unavailable_reason
 
 logger = logging.getLogger(__name__)
@@ -62,7 +63,9 @@ logger = logging.getLogger(__name__)
 OMITTED_FIELDS_NOTE = (
     "provider, model, profile, permissions, limits and retry_policy are omitted: they have no "
     "run-level source in the script tier (each is a per-step argument to step()). They are covered "
-    "transitively by source_hash, because the script's own source chooses them."
+    "transitively by source_hash, because the script's own source chooses them. The profile NAME is "
+    "covered that way; the profile's CONTENT is not, and is covered instead by the profile_set digest "
+    "folded into plan_id under scheme plan-v2 (issue #827)."
 )
 """Recorded IN the envelope, not only in the design documents.
 
@@ -101,6 +104,17 @@ def freeze_manifest(
             logger.warning("manifest freeze unavailable repository baseline: reason=%s", reason)
             return FrozenManifest(None, reason)
 
+        # issue #827: the ONE thing neither the source hash nor the repository baseline can cover. A
+        # step's behaviour and tool policy come from its agent profile's CONTENT, resolved from a file
+        # outside the script at launch time, so the transitive-coverage argument below does not reach
+        # it: rewriting a profile changed no byte of the script and therefore no byte of the plan_id.
+        #
+        # RAISES ON AN UNREADABLE PROFILE, and the outer ``except`` is what makes that correct rather
+        # than merely tolerable: an indeterminate profile set becomes a None manifest, which becomes a
+        # NULL column, which the approval gate refuses. The failure direction is the same fail-closed
+        # one the module docstring already claims for an unavailable baseline.
+        profile_set = profile_set_digest()
+
         # Six of FR-8's nine fields are None here because they have no run-level source in this tier
         # (see the module docstring). ``plan_identifier`` renders a None scalar as a distinct
         # not-supplied sentinel, so their absence is part of the identity rather than invisible to it.
@@ -114,6 +128,7 @@ def freeze_manifest(
             permissions=None,
             limits=None,
             retry_policy=None,
+            profile_set=profile_set,
         )
         plan_id = plan_identifier.compute(fields)
 

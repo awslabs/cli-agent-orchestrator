@@ -22,6 +22,7 @@ from cli_agent_orchestrator.services import (
     execution_manifest,
     manifest_freeze,
 )
+from cli_agent_orchestrator.utils import agent_profiles
 
 SECRET = "AKIAIOSFODNN7EXAMPLE"  # matches secret_gate's ``aws_access_key`` pattern
 
@@ -86,7 +87,7 @@ def test_the_three_recorded_fields_are_present():
     assert document["source_hash"] == "abc123"
     assert document["inputs"] == {"k": "v"}
     assert "repo_baseline" in document
-    assert document["plan_id"].startswith("plan-v1:")
+    assert document["plan_id"].startswith("plan-v2:")
 
 
 def test_the_memory_record_is_empty_at_freeze_time():
@@ -237,6 +238,13 @@ def test_an_available_baseline_is_part_of_the_identity_and_unavailable_baselines
 
 
 def test_non_git_plan_ids_bind_root_and_git_golden_is_unchanged(tmp_path, monkeypatch):
+    """The golden value is pinned under an empty profile store (see ``_store`` below).
+
+    Without pinning ``usable_agent_dirs``/extra/disabled dirs and the local store, this golden hash
+    would also depend on whatever agent profiles happen to be installed on the machine running the
+    test — the same leakage ``_store`` exists to prevent for the profile-set-digest tests below.
+    """
+    _store(tmp_path, monkeypatch)
     a, b = tmp_path / "a", tmp_path / "b"
     a.mkdir()
     b.mkdir()
@@ -256,5 +264,106 @@ def test_non_git_plan_ids_bind_root_and_git_golden_is_unchanged(tmp_path, monkey
     )
     assert (
         _frozen()["plan_id"]
-        == "plan-v1:a78d41d795d8f42cd5bf9d280e295a4b95dde82bb7dd87c6c977649f900b57c9"
+        == "plan-v2:PLACEHOLDER_RECOMPUTE_AFTER_REBASE"
     )
+
+
+# ---------------------------------------------------------------------------
+# The agent profile set is part of plan identity (issue #827)
+# ---------------------------------------------------------------------------
+
+
+def _store(tmp_path, monkeypatch, **profiles) -> None:
+    """Point the local agent store at ``tmp_path`` and write ``name -> source text`` into it.
+
+    Patches the module-global the real scan and the real read both consult, so these tests exercise
+    ``_list_installed_profiles`` and ``_read_agent_profile_source`` rather than a stub of them. The
+    built-in packaged store is still scanned and is identical across the cases, so it cancels out.
+    """
+    store = tmp_path / "agent-store"
+    store.mkdir(exist_ok=True)
+    for stale in store.glob("*.md"):
+        stale.unlink()
+    for name, text in profiles.items():
+        (store / f"{name}.md").write_text(text, encoding="utf-8")
+    monkeypatch.setattr(agent_profiles, "LOCAL_AGENT_STORE_DIR", store)
+
+
+def test_rewriting_an_agent_profile_changes_the_plan_id(tmp_path, monkeypatch):
+    """ISSUE #827's FIRST ACCEPTANCE CRITERION, and the reason this unit needed a scheme bump.
+
+    A script step's behaviour and tool policy come from whichever profile it names, resolved from a
+    file OUTSIDE the script at launch time. Under ``plan-v1`` that file was in no component of the
+    identifier, so rewriting a profile left the ``plan_id`` byte-identical and a brand-new run matched
+    the approval granted for the old profile. Nothing refused it.
+
+    If this test fails, an edited agent profile is again executing under a stale approval.
+    """
+    _store(tmp_path, monkeypatch, reviewer="---\nname: reviewer\n---\nBe careful.")
+    before = _frozen()["plan_id"]
+
+    _store(tmp_path, monkeypatch, reviewer="---\nname: reviewer\n---\nrm -rf everything.")
+    after = _frozen()["plan_id"]
+
+    assert before != after
+
+
+def test_installing_or_removing_a_profile_changes_the_plan_id(tmp_path, monkeypatch):
+    """The FULL set, not just the profiles a plan happens to name.
+
+    Script-tier steps are discovered by executing the Python, so at approval time there is no
+    inventory of which profiles a run will launch. A digest scoped to "the profiles this plan uses"
+    would need a list that cannot be produced when it is needed, so adding or removing ANY profile
+    must move the identifier.
+    """
+    _store(tmp_path, monkeypatch, reviewer="---\nname: reviewer\n---\nOne.")
+    one = _frozen()["plan_id"]
+
+    _store(
+        tmp_path,
+        monkeypatch,
+        reviewer="---\nname: reviewer\n---\nOne.",
+        builder="---\nname: builder\n---\nTwo.",
+    )
+    two = _frozen()["plan_id"]
+
+    assert one != two
+
+
+def test_renaming_a_profile_without_changing_its_text_changes_the_plan_id(tmp_path, monkeypatch):
+    """The name is digested alongside the content, because a step resolves its profile BY NAME."""
+    body = "---\nname: whoever\n---\nSame words."
+    _store(tmp_path, monkeypatch, reviewer=body)
+    as_reviewer = _frozen()["plan_id"]
+    _store(tmp_path, monkeypatch, builder=body)
+    as_builder = _frozen()["plan_id"]
+    assert as_reviewer != as_builder
+
+
+def test_an_unchanged_profile_set_leaves_the_plan_id_stable(tmp_path, monkeypatch):
+    """The other half of the contract: no spurious re-approval.
+
+    A digest that moved on its own would demand re-approval on every run, which trains an operator to
+    approve without reading — the same false positive ``plan_identifier``'s key sorting exists to
+    prevent.
+    """
+    _store(tmp_path, monkeypatch, reviewer="---\nname: reviewer\n---\nStable.")
+    assert _frozen()["plan_id"] == _frozen()["plan_id"]
+
+
+def test_an_unreadable_profile_set_fails_the_freeze_closed(monkeypatch, caplog):
+    """An INDETERMINATE profile set must not be silently digested as a smaller one.
+
+    A profile that vanishes between the scan and the read is the realistic case. Omitting it would
+    produce an identifier describing a profile set that is not the one on disk — and if that identifier
+    happened to match an older approval, the run would proceed. Raising becomes a NULL manifest, which
+    the approval gate refuses.
+    """
+
+    def _vanished(_name):
+        raise FileNotFoundError("profile removed mid-scan")
+
+    monkeypatch.setattr(agent_profiles, "_read_agent_profile_source", _vanished)
+    with caplog.at_level("WARNING"):
+        assert manifest_freeze.build_manifest_json(source_hash="h", inputs={}) is None
+    assert any("manifest freeze failed" in r.message for r in caplog.records)

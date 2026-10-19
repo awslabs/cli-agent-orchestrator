@@ -1,5 +1,6 @@
 """Agent profile utilities."""
 
+import hashlib
 import logging
 import os
 import re
@@ -346,6 +347,48 @@ def _list_installed_profiles() -> List[Dict]:
 def list_agent_profiles() -> List[Dict]:
     """List installed profiles, excluding the reserved launch-only namespace."""
     return [p for p in _list_installed_profiles() if not routes_to_ephemeral_store(p["name"])]
+
+
+PROFILE_SET_DIGEST_PREFIX = "sha256:"
+
+# ``<byte-length>:<bytes>`` per component, mirroring ``plan_identifier._frame``. A profile name cannot
+# contain ``:`` (``_validate_agent_name``) but the SOURCE TEXT can contain anything, so a plain
+# separator would not be injective and two different profile sets could digest identically — which, for
+# the caller that folds this into ``plan_id``, means one profile set executing under another's approval.
+_PROFILE_FRAME_SEP = ":"
+
+
+def profile_set_digest() -> str:
+    """Digest the FULL installed agent profile set — every name and its raw source text (issue #827).
+
+    Why the full set rather than the profiles a plan happens to name: script-tier steps are DISCOVERED
+    BY EXECUTING THE PYTHON, so at the point an approval is checked there is no inventory of which
+    profiles the run will launch. That is the same property that made ``plan_id`` run-level in the first
+    place (see ``plan_identifier``'s module docstring). A digest scoped to "the profiles this plan uses"
+    would need a list that cannot be produced when it is needed.
+
+    THE NAME IS DIGESTED ALONGSIDE THE CONTENT. Content alone would make "profile ``reviewer`` deleted
+    and profile ``writer`` added with its text" indistinguishable from a rename, and the profile a step
+    names is resolved by name at launch.
+
+    RAW SOURCE, NOT THE PARSED ``AgentProfile``. Parsing normalises away fields a future version may
+    start honouring, and an unparseable profile still has to produce a stable identity rather than an
+    exception. ``resolve_env_vars`` is deliberately NOT applied: it would pull the launching process's
+    environment into the digest, so an unrelated variable change would invalidate every approval.
+
+    RAISES rather than skipping an unreadable profile, which is the fail-closed direction and the whole
+    point. A profile that vanishes between the scan and the read leaves the SET INDETERMINATE; silently
+    omitting it would let a digest describe a profile set that is not the one on disk, and the caller
+    (``manifest_freeze``) turns an exception here into a NULL manifest, which the approval gate refuses.
+    """
+    names = sorted({profile["name"] for profile in list_agent_profiles()})
+    digest = hashlib.sha256()
+    for name in names:
+        for component in (name, _read_agent_profile_source(name)):
+            encoded = component.encode("utf-8")
+            digest.update(f"{len(encoded)}{_PROFILE_FRAME_SEP}".encode("utf-8"))
+            digest.update(encoded)
+    return PROFILE_SET_DIGEST_PREFIX + digest.hexdigest()
 
 
 def parse_agent_profile_text(resolved_text: str, profile_name: str) -> AgentProfile:
