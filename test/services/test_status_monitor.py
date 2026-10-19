@@ -1819,6 +1819,36 @@ class TestMidBurstProcessingProbe:
         sm._schedule_screen_detection("t1", provider)
         assert provider.probe_processing_from_screen.call_count == 0
 
+    def test_in_flight_probe_does_not_credit_a_newer_dispatch(self):
+        """#814 follow-up: the probe snapshots a generation for the skip check
+        but applied its verdict without pinning it, so a dispatch that lands
+        while the provider call is in flight (outside the lock) could have
+        turn N's stale frame stamp turn N+1 as observed-working.
+        """
+        sm = self._bursting_monitor()
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm.notify_input_sent("t1", assume_processing=True)  # turn 1 dispatched
+        turn_1_generation = sm._capture_generation["t1"]
+        sm._bursting["t1"] = True
+
+        def answer_and_redispatch(_lines):
+            # Simulates a concurrent re-dispatch for turn 2 while turn 1's
+            # probe is in flight.
+            sm.notify_input_sent("t1", assume_processing=True)
+            return True
+
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.supports_midburst_processing_probe = True
+        provider.probe_processing_from_screen.side_effect = answer_and_redispatch
+
+        sm._schedule_screen_detection("t1", provider)
+
+        turn_2_generation = sm._capture_generation["t1"]
+        assert turn_2_generation != turn_1_generation
+        # Turn 1's stale verdict must not be credited to turn 2's generation.
+        assert sm._processing_generation.get("t1") != turn_2_generation
+
 
 class TestOutputGenerationIsOutputOnly:
     """PR #566: the delivery-confirmation gate needs a counter only OUTPUT can move.
