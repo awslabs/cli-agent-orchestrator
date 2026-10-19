@@ -421,7 +421,19 @@ testpaths = ["test"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
-addopts = "--cov=src --cov-report=term-missing -m 'not e2e and not integration'"
+# Aligned with the marker expression CI actually runs (`-m "not e2e"` in
+# ci.yml's unit-test step), NOT a stricter local default. Before #9003 this read
+# `-m 'not e2e and not integration'`; because a command-line `-m` overrides the
+# one in addopts, integration-marked tests ran ONLY in CI and were deselected
+# everywhere an author or a reviewer looks. Measured over `test/`: the old
+# expression collected 16724 of 16985 (261 deselected), the new one collects
+# 16821 (164 deselected) -- 97 tests that used to be CI-only.
+#
+# The integration tests that need a real external CLI carry their own
+# `pytest.mark.skipif` on an env gate as well as the marker (see
+# test/providers/test_kiro_cli_integration.py:41), so selecting them locally
+# collects-and-skips rather than trying to drive an unauthenticated binary.
+addopts = "--cov=src --cov-report=term-missing -m 'not e2e'"
 
 # NFR-3's 80% line floor is enforced in CI, NOT here (issue #583 Bolt 3, build-and-test).
 #
