@@ -101,11 +101,12 @@ def test_a_non_json_body_falls_back(reader_name):
 
 @pytest.mark.parametrize("shape_name", sorted(SHAPES))
 def test_run_step_error_reader_tolerates_every_json_shape(shape_name):
-    kind, message, terminal_id = _parse_run_step_error(_response(SHAPES[shape_name]))
+    kind, message, terminal_id, policy_rule = _parse_run_step_error(_response(SHAPES[shape_name]))
 
     assert isinstance(message, str) and message
     assert kind is None or isinstance(kind, str)
     assert terminal_id is None or isinstance(terminal_id, str)
+    assert policy_rule is None or isinstance(policy_rule, str)
 
 
 # ---------------------------------------------------------------------------
