@@ -45,7 +45,7 @@ def _validate_key_part(value: str, label: str) -> str:
     """
     if value in (".", ".."):
         raise ValueError(f"{label} '{value}' is not allowed (traversal token)")
-    if not _NAME_RE.match(value):
+    if not _NAME_RE.fullmatch(value):
         raise ValueError(f"{label} '{value}' is invalid (must match {WORKFLOW_NAME_RE})")
     return value
 

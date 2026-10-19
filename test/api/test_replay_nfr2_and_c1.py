@@ -45,6 +45,7 @@ the gate exists to HALT on, so the requirement is stricter here than anywhere el
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -66,7 +67,13 @@ from cli_agent_orchestrator.models.workflow import (
     WorkflowStep,
 )
 from cli_agent_orchestrator.models.workflow_runtime import RunState, StepState
-from cli_agent_orchestrator.services import step_replay, workflow_journal, workflow_service
+from cli_agent_orchestrator.services import (
+    launch_guard,
+    settings_service,
+    step_replay,
+    workflow_journal,
+    workflow_service,
+)
 from cli_agent_orchestrator.services.script_runner import ScriptRunRecord
 from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
 from cli_agent_orchestrator.services.step_result import serialise_envelope
@@ -170,10 +177,21 @@ def _register_script_run(run_id: str, *, generation: str = "1") -> ScriptRunReco
     Both are needed: the journal row is what the generation fence reads, and the live record
     is the run-step route's script-tier discriminator.
     """
+    spec_snapshot = json.dumps(
+        {
+            "source": "",
+            "launch_guard": {
+                "profiles": {
+                    "developer": launch_guard._profile_digest("developer"),
+                },
+                "memory_enabled": settings_service.is_memory_enabled(),
+            },
+        }
+    )
     workflow_journal.insert_run(
         run_id=run_id,
         workflow_name="wf",
-        spec_snapshot="steps: []",
+        spec_snapshot=spec_snapshot,
         inputs_json="{}",
         state="running",
         started_at=TS,

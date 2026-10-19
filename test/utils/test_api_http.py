@@ -70,7 +70,7 @@ class TestHeaders:
 
 
 class TestVerbs:
-    @pytest.mark.parametrize("verb", ["get", "post", "delete"])
+    @pytest.mark.parametrize("verb", ["get", "post", "put", "delete"])
     def test_verb_attaches_the_header_and_passes_kwargs_through(self, auth_on, verb):
         with patch.object(requests, verb) as real:
             real.return_value = MagicMock(status_code=200)
