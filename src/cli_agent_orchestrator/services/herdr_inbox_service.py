@@ -577,8 +577,13 @@ class HerdrInboxService:
                 # resets the connection on a second events.subscribe.
                 await self._subscribe_all_events()
 
-                # Reconcile map against live herdr state. Events emitted while
-                # this runs buffer on the socket and are read by _event_loop.
+                # Reconcile map against live herdr state. _subscribe_all_events
+                # only proves the request was written to the socket, not that
+                # herdr has activated it server-side — this is fire-and-forget,
+                # we never read its response. Any pane.updated that arrives
+                # before activation completes is lost; _deliver_settled_panes
+                # below is what actually closes that window, by re-reading
+                # live state rather than depending on the subscription.
                 await self._reconcile()
 
                 # A subscription only reports TRANSITIONS. A pane that settled
