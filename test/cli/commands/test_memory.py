@@ -761,6 +761,7 @@ class TestMemoryListExplain:
                 "schema": "cao.memory.explain/1",
                 "query": "kafka streams",
                 "pool_size": 2,
+                "lexical_degenerate": False,
                 "candidate_limit": 50,
                 "candidates": [
                     {
@@ -900,6 +901,14 @@ class TestMemoryListExplain:
         assert f"{flag} requires --explain" in result.output
         service.recall.assert_not_called()
         service.recall_explain.assert_not_called()
+
+    @pytest.mark.parametrize("degenerate", [False, True])
+    def test_table_reports_lexical_degenerate(self, monkeypatch, degenerate):
+        service = self._service(monkeypatch)
+        service.recall_explain.return_value["lexical_degenerate"] = degenerate
+        result = CliRunner().invoke(list_memories, ["--explain", "--query", "kafka"])
+        assert result.exit_code == 0
+        assert f"Lexical degenerate: {str(degenerate).lower()}" in result.output
 
 
 class TestNonAccessingInspection:

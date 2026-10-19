@@ -509,6 +509,9 @@ def _print_explain_table(diagnostic: dict) -> None:
             f"{row['lexical']:>6.4f} {row['recency_factor']:>6.4f} {row['relevance']:>6.4f} "
             f"{rel_rank!s:>5} {def_rank!s:>5} {str(row['recovered']):>5} {str(row['superseded']):>5} {row['injection']:>9}"
         )
+    click.echo(
+        f"Lexical degenerate: {str(bool(diagnostic.get('lexical_degenerate', False))).lower()}"
+    )
 
 
 @memory.command()

@@ -2787,6 +2787,8 @@ class MemoryService:
             "limit": limit,
             "candidate_limit": self._candidate_limit(limit),
             "pool_size": len(relevance_rows),
+            "lexical_degenerate": bool(scores)
+            and all(score.lexical == 0.0 for score in scores.values()),
             "all_term_count": all_term_count,
             "partial_fill_count": len(relevance_rows) - all_term_count,
             "recency_floor": RELEVANCE_RECENCY_FLOOR,

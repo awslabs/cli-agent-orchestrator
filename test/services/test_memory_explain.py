@@ -94,6 +94,7 @@ def test_candidate_keys_are_exactly_the_schema(explained):
         "limit",
         "candidate_limit",
         "pool_size",
+        "lexical_degenerate",
         "all_term_count",
         "partial_fill_count",
         "recency_floor",
@@ -361,3 +362,66 @@ def test_builtin_store_failure_is_visible_once(
             next(row for row in result["candidates"] if row["key"] == "strong-old")["superseded"]
             is True
         )
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ({"strong-old": 1.0, "weak-new": 0.0}, False),
+        ({"strong-old": 0.0, "weak-new": 0.0}, True),
+        ({"strong-old": -2.0, "weak-new": -1.0}, True),
+    ],
+)
+def test_lexical_degenerate_uses_full_pool(explained, monkeypatch, raw, expected):
+    from cli_agent_orchestrator.services.memory_relationship_service import (
+        MemoryRelationshipService,
+    )
+
+    service, args = explained
+    monkeypatch.setenv("CAO_MEMORY_LIFECYCLE_ENABLED", "false")
+    monkeypatch.setattr(
+        service,
+        "_bm25_relevance",
+        lambda *a, **kw: {(key, "global", None, "native"): value for key, value in raw.items()},
+    )
+    monkeypatch.setattr(
+        MemoryRelationshipService, "superseded_targets", lambda *a, **kw: {"strong-old"}
+    )
+    result = _run(service.recall_explain(**args))
+    assert result["lexical_degenerate"] is expected
+    # A positive row demoted below the reported top set still makes the batch nondegenerate.
+    assert [row["key"] for row in result["candidates"]] == ["weak-new"]
+    assert result["candidates"][0]["lexical"] == 0.0
+
+
+def test_real_degenerate_batch_keeps_identity_order(svc, db_engine, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from test.services.test_scoring import _ctx, _stamp_updated_at
+
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.services import memory_relationship_service
+
+    factory = sessionmaker(bind=db_engine)
+    monkeypatch.setattr(database, "SessionLocal", factory)
+    monkeypatch.setattr(memory_relationship_service, "SessionLocal", factory)
+    monkeypatch.setenv("CAO_MEMORY_LIFECYCLE_ENABLED", "false")
+    ctx = _ctx(caller_scope="global")
+    stamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    for key, days in [("a-old", 30), ("z-new", 0)]:
+        _run(svc.store(key=key, content="kafka", scope="global", terminal_context=ctx))
+        _stamp_updated_at(db_engine, key, "global", stamp - timedelta(days=days))
+    args = dict(query="kafka", scope="global", limit=2, terminal_context=ctx)
+    recency = _run(svc.recall(**args))
+    assert [m.key for m in recency] == ["z-new", "a-old"]
+    raw = svc._bm25_relevance("kafka", recency, ctx, "global", False)
+    assert raw and max(raw.values()) <= 0.0
+    result = _run(svc.recall_explain(**args))
+    assert result["lexical_degenerate"] is True
+    assert [row["key"] for row in result["candidates"]] == ["a-old", "z-new"]
+    assert [m.key for m in _run(svc.recall(**args, sort_by="relevance"))] == ["a-old", "z-new"]
+
+
+def test_empty_pool_is_not_lexically_degenerate(svc):
+    result = _run(svc.recall_explain(query="missing", scope="global"))
+    assert result["pool_size"] == 0
+    assert result["lexical_degenerate"] is False

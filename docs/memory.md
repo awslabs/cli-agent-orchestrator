@@ -243,12 +243,17 @@ all other scopes are time-neutral. Future dates clamp to age zero; naive dates
 mean UTC. An exact match aged 365 days has factor about 0.861, so a fresh match
 with lexical strength 0.862 can beat it. These constants need rollout validation.
 Ties use lexical strength and full identity, with no timestamp tie-break.
+When a nonempty batch normalizes to all zeros (including batches with only
+nonpositive raw BM25 scores), relevance falls back to full identity order
+within each tier. Scope precedence and supersedes demotion still apply; an
+age factor multiplied by zero has no effect. Explain reports this condition
+as `lexical_degenerate`; ranking is unchanged.
 Scope precedence still dominates when no scope is specified. Only returned
 primary rows increment access; related expansion remains unchanged.
 
 Active supersedes targets are always demoted in `score` and `relevance`, using
-the existing same-scope relationship predicate. The lifecycle flag planned for
-later work does not undo this lexical-mode demotion. Explicit recall does not
+the existing same-scope relationship predicate. `memory.lifecycle.enabled`
+does not undo this lexical-mode demotion. Explicit recall does not
 exclude superseded memories. Default recall and injection are unchanged.
 An older remote memory owner may reject the new sort value; upgrade both nodes.
 
@@ -307,6 +312,23 @@ paths. Proposals, rejected and deleted edges do not exclude. Store failures
 fail open and appear in the source warnings and explain diagnostics. There is
 no cross-call cache: edge changes apply on the next call.
 
+Once lifecycle is enabled, any active `supersedes` edge removes its same-scope
+target from every agent's injection, including curator recall. Such an edge
+can be created through write/admin-scoped `POST /memory/relationships`, by
+`cao memory relationships promote`, or in a vault note's `cao.links` (reconcile
+marks links active by default when status is omitted). API authentication is
+off by default. These writers therefore also control injection suppression;
+the lifecycle flag adds no new authorization boundary.
+
+Lifecycle changes do not retract provider memory blocks already persisted
+in `<cwd>/.claude/CLAUDE.md` or `<cwd>/AGENTS.md`. Claude Code and Codex memory
+handlers refresh those blocks at the next terminal creation in that cwd,
+when retrieval returns a nonempty block and the write succeeds. Empty
+retrieval, fetch failures or write failures leave the previous block in place.
+Frozen workflow replays continue using the recorded memory block without
+rechecking lifecycle; another terminal creation does not invalidate that
+snapshot. A fresh workflow run resolves current memory.
+
 Explicit recall retains superseded memories. With lifecycle enabled, recency
 moves them last without changing membership; usage demotes them before the
 stable scope pass and slice. Score/relevance keep their existing always-on
@@ -345,7 +367,10 @@ increments access counts or expands related memories. Nothing is scored
 passively on ordinary recall calls. `--scope`, `--type` and `--all` retain their
 usual scope meaning. Explain's `--limit` defaults to 10 and accepts 1–100;
 `--format` is `table` (default) or `json`. Ordinary list output is unchanged.
-A bare `--query` or bare `--explain` is a usage error (exit 2).
+A bare `--query` or bare `--explain` is a usage error (exit 2). Explicit
+`--limit` or `--format` without `--explain` is also a usage error, including
+values equal to their defaults. Service errors report only the exception
+type and a prompt to inspect logs; details are available in debug logs.
 
 JSON schema `cao.memory.explain/1` reports pool and all-term/partial counts,
 the fixed recency constants, overlap at the limit, and at most twice the limit
@@ -354,14 +379,22 @@ fields are `key`, `scope`, `scope_id`, `source_kind`, `tier`, `lexical`,
 `recency_factor`, `relevance`, `relevance_rank`, `recency_rank`, `recovered`,
 and `superseded`, plus `injection` (`eligible`/`excluded`) and
 `exclusion_reasons` (ordered reason tokens). Top-level `eligibility_errors`
-lists sources that failed open. Injection verdicts describe this lifecycle
-seam only; confidentiality and budget gates still apply. Ranks are 1-based; relevance rank covers the entire pool,
-default rank covers only the default top set. A missing rank is JSON null.
+lists sources that failed open. Top-level `lexical_degenerate` is true when
+a nonempty relevance pool has only zero normalized lexical values; an empty
+pool reports false. The table includes the same boolean in its footer.
+Injection verdicts describe this lifecycle seam only; confidentiality and
+budget gates still apply. Ranks are 1-based; relevance rank covers the entire
+pool, default rank covers only the default top set. A missing rank is JSON null.
 `recovered` means relevance selected a row the default top set omitted.
 Scores use the exact ordering values, rounded to four decimal places.
 Explain resolves supersedes state once over both pools and uses that same
-snapshot for ordering, labels and the built-in injection verdict. Lifecycle
-recall similarly shares one ordering/label snapshot, including potential
+snapshot for ordering, labels and the built-in injection verdict. A failed
+group read adds `lifecycle.supersedes` to the errors and emits the same
+content-free failed-open warning as injection; that source is disabled for
+the check, and a failed snapshot is not installed or retried. Healthy parts
+of a partial snapshot still keep ordering and labels consistent. A late
+curator ordering-snapshot failure also reaches its check errors and warning.
+Lifecycle recall similarly shares one ordering/label snapshot, including potential
 related targets discovered before ordering; their bodies still load only
 after the primary slice. These snapshots never survive the call.
 Relevance clamps negative normalized BM25 values to zero; the existing

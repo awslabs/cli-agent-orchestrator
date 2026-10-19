@@ -346,6 +346,9 @@ def test_default_serialized_dict_and_json(extended, monkeypatch, surface):
     normalized = json.loads(json.dumps(actual).replace(str(service.base_dir), "<ROOT>"))
     assert normalized == expected
     assert json.loads(serialized) == expected
+    assert json.dumps(json.loads(serialized), sort_keys=True) == json.dumps(
+        expected, sort_keys=True
+    )
     assert _row(engine, "global-new").access_count == 8
     assert _row(engine, "global-old").access_count == 3
 

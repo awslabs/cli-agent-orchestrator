@@ -43,21 +43,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Opt-in `memory.lifecycle.enabled` excludes active supersedes targets from
   injection and adds transient recall labels/demotion. Defaults and canonical
-  Markdown remain unchanged; score/relevance demotion is always on. Part of #861.
+  Markdown remain unchanged; score/relevance demotion is always on. Ordering
+  and labels share one supersedes snapshot, including related targets. Part of #861.
 
 - Batch lifecycle eligibility seam for native, vault, related and curator
   injection paths, with lazy checks before caps and per-source fail-open
-  diagnostics. The registry starts empty; explicit recall remains unfiltered.
+  diagnostics. The registry contains only the built-in supersedes source,
+  disabled by default; ordinary explicit recall remains unfiltered.
   Part of #861. Refs #867.
 
 - On-demand `cao memory list --query Q --explain` compares default/relevance
   ranks without recording access or exposing memory content, tags or paths.
+  Both pools share one supersedes snapshot for consistent ranks and labels;
+  source failures are visible and errors omit paths and keys. `lexical_degenerate`
+  reports all-zero lexical batches without changing ranking.
   Table/JSON output is bounded; `memory.explain_enabled` defaults to true and
   supports `CAO_MEMORY_EXPLAIN_ENABLED`. Part of #861.
 
 - Opt-in memory recall `sort_by="relevance"` over the widened candidate pool,
   with all-term tiers and bounded age influence for native project rows.
-  Query-free calls retain recency behavior; defaults are unchanged. Part of #861.
+  Missing, empty and whitespace-only queries follow the exact recency path,
+  including source selection and access effects; defaults are unchanged. Part of #861.
 
 - `assign` and `handoff` now launch ephemeral agents (#801) from their creator terminal: Claude Code by default, Codex when an operator allows it.
 - Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `ephemeral.enabled` stays off by default.
@@ -173,14 +179,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surfacing bounded findings and the truncation-marker contract (#510)
 
 ### Fixed
-
-- Whitespace-only relevance queries follow the exact recency path, including
-  source selection and access deltas; legacy sort modes are unchanged. Part of #861.
-
-- Memory explain and lifecycle recall use one supersedes snapshot for
-  ordering and status labels, including related targets and default-only
-  diagnostic rows, so concurrent graph changes cannot contradict ranks.
-  Part of #861.
 
 - Corrective workflow re-prompts now reuse the attempt's rendered prompt, so
   workflow inputs and earlier step outputs stay filled in when structured output

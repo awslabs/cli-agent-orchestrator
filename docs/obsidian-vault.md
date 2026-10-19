@@ -347,3 +347,19 @@ matters.
 existing unmanaged note into a managed note in this release.
 
 With `memory.lifecycle.enabled=true`, active same-scope supersedes targets are excluded from injection. Relationship rows have no `source_kind`, so native-origin edges created before a scope became vault-mapped apply to vault notes with the same scope, scope ID and key. Canonical note fields are unchanged.
+
+
+Active vault `cao.links` of type `supersedes` suppress same-scope targets from
+every agent's injection when `memory.lifecycle.enabled=true`, including
+curator recall. Reconcile marks a link active by default when status is
+omitted. Write/admin `POST /memory/relationships` and
+`cao memory relationships promote` can create the same suppression effect;
+API authentication is off by default.
+
+Lifecycle changes do not retract memory blocks already written into
+`<cwd>/.claude/CLAUDE.md` or `<cwd>/AGENTS.md`. They refresh on the next terminal
+creation in that cwd only when a nonempty memory block is retrieved and
+successfully written. Empty retrieval and failed refreshes leave old blocks
+in place. Frozen workflow replays keep their recorded block without a
+lifecycle recheck, even after another terminal creation; fresh runs resolve
+current memory.
