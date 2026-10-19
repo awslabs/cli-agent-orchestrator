@@ -418,3 +418,37 @@ def test_transient_kinds_are_constructed_by_runtime_step_emitters():
     assert ProviderErrorMatch._field_defaults["kind"] == KIND_PROVIDER_ERROR
     emitted_kinds.add(KIND_PROVIDER_ERROR)
     assert api.main._TRANSIENT_ERROR_KINDS <= emitted_kinds
+
+
+@pytest.mark.parametrize("failure", ["lock", "path"])
+def test_delete_refusals_match_authoring_shape_and_hide_paths(spec_dir, monkeypatch, failure):
+    from cli_agent_orchestrator.utils.atomic_file import LockTimeoutError
+
+    submitted = "/workflows/opaque"
+    server_path = str(spec_dir / "opaque.py")
+    error = (
+        LockTimeoutError(Path(f"{server_path}; {submitted}"), 0.1)
+        if failure == "lock"
+        else svc.SpecPathRefusedError(f"refused {server_path}; {submitted}")
+    )
+
+    def refuse(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(svc, "create_workflow", refuse)
+    monkeypatch.setattr(svc, "update_workflow", refuse)
+    monkeypatch.setattr(svc, "delete_workflow", refuse)
+    client = TestClient(app, base_url="http://localhost", raise_server_exceptions=False)
+    created = client.post("/workflows", json={"name": "opaque", "source": GOOD})
+    updated = client.put(submitted, json={"source": GOOD, "expected_hash": "expected"})
+    deleted = client.delete(submitted)
+    assert (
+        deleted.status_code
+        == created.status_code
+        == updated.status_code
+        == (500 if failure == "lock" else 400)
+    )
+    assert deleted.json()["detail"] == created.json()["detail"] == updated.json()["detail"]
+    assert submitted not in deleted.text
+    assert server_path not in deleted.text
+    assert str(spec_dir) not in deleted.text

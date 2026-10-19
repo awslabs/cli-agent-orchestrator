@@ -5316,8 +5316,20 @@ async def delete_workflow_endpoint(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown workflow '{name}'"
         )
+    except workflow_spec_service.SpecPathRefusedError:
+        logger.error("workflow delete refused unsafe spec path", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_WORKFLOW_AUTHORING_PATH_REFUSED_DETAIL,
+        )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except OSError:
+        logger.error("workflow delete storage failed", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=_WORKFLOW_AUTHORING_STORAGE_DETAIL,
+        )
     return {"success": True, "name": name}
 
 
