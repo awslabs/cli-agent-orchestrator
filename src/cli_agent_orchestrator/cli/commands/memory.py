@@ -3,6 +3,7 @@
 import asyncio
 import dataclasses
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -13,6 +14,8 @@ from cli_agent_orchestrator.constants import MEMORY_ARCHIVE_DEFAULT_FORMAT
 from cli_agent_orchestrator.models.memory import MemoryScope, MemoryType
 from cli_agent_orchestrator.services.memory_service import MemoryDisabledError, MemoryService
 from cli_agent_orchestrator.services.settings_service import is_non_accessing_inspection_enabled
+
+logger = logging.getLogger(__name__)
 
 
 def _get_memory_service() -> MemoryService:
@@ -423,6 +426,11 @@ def list_memories(scope, memory_type, scan_all, query, explain, limit, output_fo
         raise click.UsageError("--explain requires --query.")
     if query is not None and not explain:
         raise click.UsageError("--query requires --explain.")
+    if not explain:
+        context = click.get_current_context()
+        for parameter, flag in (("limit", "--limit"), ("output_format", "--format")):
+            if context.get_parameter_source(parameter) is click.core.ParameterSource.COMMANDLINE:
+                raise click.UsageError(f"{flag} requires --explain.")
     if explain:
         from cli_agent_orchestrator.services.settings_service import is_memory_enabled
 
@@ -440,7 +448,8 @@ def list_memories(scope, memory_type, scan_all, query, explain, limit, output_fo
                 )
             )
         except Exception as e:
-            raise click.ClickException(str(e))
+            logger.debug("Memory explain failed: %s", e, exc_info=True)
+            raise click.ClickException(f"Explain failed ({type(e).__name__}); see logs") from e
         if diagnostic is None:
             raise click.ClickException("Explain is disabled (memory.explain_enabled=false).")
         if output_format == "json":

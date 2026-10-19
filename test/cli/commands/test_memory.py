@@ -9,6 +9,7 @@ from pathlib import Path
 from test.fixtures.vault_factory import build_vault_fixture
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from click.testing import CliRunner
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -867,6 +868,37 @@ class TestMemoryListExplain:
                 list_memories, ["--explain", "--query", "kafka", "--limit", limit]
             )
             assert result.exit_code == 2
+        service.recall_explain.assert_not_called()
+
+    @pytest.mark.parametrize("output_format", ["table", "json"])
+    @pytest.mark.parametrize("exception", [OSError, ValueError])
+    def test_explain_service_failure_is_content_free(self, monkeypatch, output_format, exception):
+        service = self._service(monkeypatch)
+        service.recall_explain.side_effect = exception("/PATH_SENTINEL/KEY_SENTINEL.md")
+        result = CliRunner().invoke(
+            list_memories, ["--explain", "--query", "kafka", "--format", output_format]
+        )
+        assert result.exit_code == 1
+        assert "PATH_SENTINEL" not in result.output
+        assert "KEY_SENTINEL" not in result.output
+        assert f"Explain failed ({exception.__name__}); see logs" in result.output
+
+    @pytest.mark.parametrize(
+        "args,flag",
+        [
+            (["--limit", "10"], "--limit"),
+            (["--limit", "2"], "--limit"),
+            (["--format", "table"], "--format"),
+            (["--format", "json"], "--format"),
+        ],
+    )
+    def test_explain_only_options_are_usage_errors(self, monkeypatch, args, flag):
+        service = self._service(monkeypatch)
+        service.recall = AsyncMock(return_value=[])
+        result = CliRunner().invoke(list_memories, args)
+        assert result.exit_code == 2
+        assert f"{flag} requires --explain" in result.output
+        service.recall.assert_not_called()
         service.recall_explain.assert_not_called()
 
 
