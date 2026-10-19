@@ -245,6 +245,7 @@ def poll_until_done(
     polling_interval: float = 1.0,
     idle_stable_polls: int = 3,
     read_status: Optional[Callable[[str], Optional[str]]] = None,
+    min_generation: Optional[int] = None,
 ) -> None:
     """Poll terminal status until the agent is done, errored, or timeout.
 
@@ -263,8 +264,24 @@ def poll_until_done(
       after a send before it has begun processing. Gating the IDLE path on
       "has started" prevents returning early with empty/partial output when the
       agent simply hasn't picked up the task yet; the stable-window then guards
-      against a momentary idle flap mid-turn. The COMPLETED path is byte-for-byte
-      unchanged.
+      against a momentary idle flap mid-turn.
+
+    ``min_generation`` is the dispatch boundary ``POST /terminals/{id}/input``
+    returned for the send this call is waiting on. Supplied, NO reading is treated
+    as evidence — not COMPLETED, not IDLE, not "started working" — unless the
+    ``status_generation`` reported alongside it is strictly greater, i.e. the
+    status was earned from output that landed after the send. This is what makes
+    "done" mean the turn that was sent rather than the frame on screen: for the
+    whole window between a dispatch and the new turn's first applied PROCESSING,
+    the server correctly reports the PREVIOUS turn's COMPLETED (``notify_input_sent``
+    deliberately leaves ``_last_status`` alone), and a bare COMPLETED returned
+    immediately with the previous turn's answer (#735, #407).
+
+    Omitted — or when the server reports no ``status_generation``, which is the
+    case for an older cao-server and for event-inbox backends (herdr) whose status
+    is derived on demand — the wait degrades to the frame-based behaviour above
+    rather than hanging. ERROR is honoured regardless of generation: a dead
+    provider is not a stale frame.
 
     ``read_status`` overrides only WHERE the status is read from, returning the
     same string ``GET /terminals/{id}`` puts in its ``status`` field. It exists so
@@ -290,14 +307,33 @@ def poll_until_done(
                 f"Timed out after {int(elapsed)}s waiting for terminal {terminal_id}"
             )
         try:
+            generation: Optional[int] = None
             if read_status is not None:
+                # A transport override reports a status only; it cannot carry the
+                # generation, so such a caller degrades to the frame-based wait.
                 status = read_status(terminal_id)
             else:
                 # Per-request timeout so a stalled server/network can't block past
                 # the outer timeout budget (matches wait_until_terminal_status).
                 resp = api_http.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
                 resp.raise_for_status()
-                status = resp.json().get("status")
+                payload = resp.json()
+                payload = payload if isinstance(payload, dict) else {}
+                status = payload.get("status")
+                raw_generation = payload.get("status_generation")
+                generation = raw_generation if isinstance(raw_generation, int) else None
+            if (
+                min_generation is not None
+                and generation is not None
+                and generation <= min_generation
+                and status != TerminalStatus.ERROR.value
+            ):
+                # Earned at or before the send's dispatch boundary: this describes
+                # the frame the previous turn left, not the turn being waited on.
+                # Not "done", and not evidence that this turn started either.
+                consecutive_idle = 0
+                time.sleep(polling_interval)
+                continue
             if status == TerminalStatus.COMPLETED.value:
                 return
             if status == TerminalStatus.ERROR.value:

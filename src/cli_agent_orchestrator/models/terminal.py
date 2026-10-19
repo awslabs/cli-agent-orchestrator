@@ -148,6 +148,19 @@ class Terminal(BaseModel):
     status: Optional[TerminalStatus] = Field(
         None, description="Current terminal status (live only)"
     )
+    status_generation: Optional[int] = Field(
+        None,
+        description=(
+            "Output generation that ``status`` was EARNED at, from "
+            "StatusMonitor.status_observation(). A status counts as evidence for a "
+            "particular send only when this is strictly greater than the dispatch "
+            "boundary that POST /terminals/{id}/input returned for that send: a status "
+            "VALUE alone cannot carry recency, so a ready status cached before a send is "
+            "otherwise indistinguishable from one earned after it (#735, #407). None for "
+            "event-inbox backends (herdr), which derive status on demand and never advance "
+            "the generation, and None on a server that does not report it."
+        ),
+    )
     last_active: Optional[datetime] = Field(None, description="Last active timestamp (UTC)")
 
     @field_validator("last_active")

@@ -933,6 +933,27 @@ class StatusMonitor:
             applied = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
             return StatusObservation(applied, self._status_generation.get(terminal_id, 0))
 
+    def status_generation(self, terminal_id: str) -> Optional[int]:
+        """Return the output generation ``_last_status`` was last EARNED at.
+
+        The read-only half of :meth:`status_observation`, for a caller that has
+        already obtained the status itself and only needs its recency —
+        ``get_terminal``, which publishes the pair over
+        ``GET /terminals/{id}`` so an HTTP client can tell a status earned for the
+        send it made from one that was already on screen (#735). Kept separate so
+        that endpoint does not run ``get_status`` twice: call ``get_status`` first,
+        then this, so any fresh verdict it applied is already stamped.
+
+        Returns None for event-inbox backends (herdr), which derive status on demand
+        and never advance the generation, matching ``status_observation``.
+        """
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        if get_backend().supports_event_inbox():
+            return None
+        with self._lock:
+            return self._status_generation.get(terminal_id, 0)
+
     def notify_input_sent(self, terminal_id: str, *, assume_processing: bool = False) -> None:
         """Arm the next PROCESSING transition.
 

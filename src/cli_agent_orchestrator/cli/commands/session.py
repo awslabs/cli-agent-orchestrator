@@ -280,18 +280,26 @@ def send(session_name, message, terminal_id, is_async, timeout):
             params={"message": message},
         )
         response.raise_for_status()
-    except api_http.exceptions.RequestException as e:
+        # The dispatch boundary names the turn we just started, so the wait below
+        # can refuse a status earned before it — otherwise the previous turn's
+        # COMPLETED, still on screen, ends the wait at once and we print its
+        # answer or a half-drawn frame (#735). An older cao-server omits it; then
+        # we fall back to the flat sleep and the frame-based wait.
+        boundary = response.json().get("dispatch_boundary")
+        boundary = boundary if isinstance(boundary, int) else None
+    except (api_http.exceptions.RequestException, ValueError) as e:
         raise click.ClickException(f"Failed to connect to cao-server: {e}")
 
     if is_async:
         click.echo(f"Message sent to terminal {target_id}")
         return
 
-    time.sleep(3)
+    if boundary is None:
+        time.sleep(3)
     effective_timeout = timeout if timeout is not None else _DEFAULT_SEND_TIMEOUT
     interrupted = False
     try:
-        poll_until_done(target_id, effective_timeout)
+        poll_until_done(target_id, effective_timeout, min_generation=boundary)
     except KeyboardInterrupt:
         interrupted = True
 

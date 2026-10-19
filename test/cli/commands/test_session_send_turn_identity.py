@@ -10,7 +10,8 @@ Nothing in that exchange names the turn that was sent:
 - ``GET /terminals/{id}`` reports ``status`` with no indication of which output it
   was earned from, even though ``StatusMonitor.status_observation`` can supply
   exactly that pair (status_monitor.py:903).
-- ``poll_until_done`` returns on the first COMPLETED it sees (utils/terminal.py:301).
+- ``poll_until_done`` returned on the first COMPLETED it saw, whatever turn it
+  belonged to.
 
 ``notify_input_sent`` deliberately leaves ``_last_status`` alone (status_monitor.py:936,
 and see the ``output_generation`` docstring at :858), so for the whole window between a
@@ -92,33 +93,53 @@ def test_status_after_dispatch_is_the_previous_turns_completed(get_backend, moni
     assert observation.output_generation <= boundary
 
 
-@patch("cli_agent_orchestrator.backends.registry.get_backend")
-def test_poll_until_done_returns_on_the_previous_turns_completion(get_backend, monitor):
-    """#735: the CLI's wait returns immediately on a pre-dispatch COMPLETED.
+def _http_reader(monitor, boundary, script):
+    """A fake ``GET /terminals/{id}`` sourced from a real StatusMonitor.
 
-    ``read_status`` is the real read path's shape -- it returns exactly the string
-    ``GET /terminals/{id}`` puts in ``status``, sourced here from a real
-    StatusMonitor in the post-dispatch window. Fails before the fix (returns with
-    the turn unstarted); after the fix it must keep waiting.
+    ``script`` is called with the 1-based read number and may advance the monitor
+    before the reading is taken, so a test describes a turn's timeline rather
+    than hand-rolling status payloads.
     """
-    get_backend.return_value = _tmux_backend()
-    monitor.notify_input_sent(TERMINAL_ID)
-
     reads = []
 
-    def read_status(terminal_id):
-        reads.append(terminal_id)
-        if len(reads) <= 3:
-            # The window: previous turn's COMPLETED is still latched.
-            return monitor.get_status(terminal_id).value
-        # The turn finally starts, then genuinely finishes.
-        if len(reads) == 4:
+    def get(url, timeout=None):
+        reads.append(url)
+        script(len(reads))
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "status": monitor.get_status(TERMINAL_ID).value,
+            "status_generation": monitor.status_generation(TERMINAL_ID),
+        }
+        return response
+
+    return reads, get
+
+
+@patch("cli_agent_orchestrator.backends.registry.get_backend")
+def test_poll_until_done_refuses_the_previous_turns_completion(get_backend, monitor):
+    """#735: the wait must not end on a COMPLETED earned before the dispatch.
+
+    Before the fix ``poll_until_done`` returned on the first read, with the turn
+    not yet started, and ``cao session send`` printed whatever the buffer held.
+    """
+    get_backend.return_value = _tmux_backend()
+    boundary = monitor.output_generation(TERMINAL_ID)
+    monitor.notify_input_sent(TERMINAL_ID)
+
+    def script(n):
+        # Reads 1-3 fall in the window where the previous turn's COMPLETED is
+        # still latched; the turn then starts and genuinely finishes.
+        if n == 4:
             _latch(monitor, TerminalStatus.PROCESSING, 9)
-        return monitor.get_status(terminal_id).value
+        elif n == 6:
+            _latch(monitor, TerminalStatus.COMPLETED, 10)
 
-    poll_until_done(TERMINAL_ID, timeout=30.0, polling_interval=0.01, read_status=read_status)
+    reads, get = _http_reader(monitor, boundary, script)
+    with patch("cli_agent_orchestrator.utils.terminal.api_http.get", side_effect=get):
+        poll_until_done(TERMINAL_ID, timeout=30.0, polling_interval=0.01, min_generation=boundary)
 
-    assert len(reads) > 3, (
+    assert len(reads) >= 6, (
         "poll_until_done accepted the previous turn's COMPLETED as this turn's "
         f"completion after {len(reads)} read(s); `cao session send` then prints "
         "whatever the buffer holds (#735)"
@@ -130,26 +151,57 @@ def test_poll_until_done_still_returns_on_a_genuine_completion(get_backend, moni
     """Guard against over-correcting: a COMPLETED earned after the dispatch
     boundary must still end the wait promptly."""
     get_backend.return_value = _tmux_backend()
+    boundary = monitor.output_generation(TERMINAL_ID)
     monitor.notify_input_sent(TERMINAL_ID)
 
-    reads = []
-
-    def read_status(terminal_id):
-        reads.append(terminal_id)
-        if len(reads) == 1:
+    def script(n):
+        if n == 1:
             _latch(monitor, TerminalStatus.PROCESSING, 9)
-        elif len(reads) == 2:
+        elif n == 2:
             _latch(monitor, TerminalStatus.COMPLETED, 10)
-        return monitor.get_status(terminal_id).value
 
-    poll_until_done(TERMINAL_ID, timeout=30.0, polling_interval=0.01, read_status=read_status)
+    reads, get = _http_reader(monitor, boundary, script)
+    with patch("cli_agent_orchestrator.utils.terminal.api_http.get", side_effect=get):
+        poll_until_done(TERMINAL_ID, timeout=30.0, polling_interval=0.01, min_generation=boundary)
 
-    assert len(reads) <= 4
+    assert len(reads) <= 3
 
 
-def test_input_endpoint_contract_hides_the_dispatch_boundary():
-    """``send_input`` collapses ``dispatch_input``'s boundary to ``True``, so the
-    HTTP caller cannot name the turn it just started (terminal_service.py:3853)."""
+@patch("cli_agent_orchestrator.backends.registry.get_backend")
+def test_poll_until_done_degrades_when_the_server_names_no_generation(get_backend, monitor):
+    """An older cao-server (or herdr) reports no ``status_generation``; the wait
+    must fall back to today's frame-based behaviour, never hang."""
+    get_backend.return_value = _tmux_backend()
+    monitor.notify_input_sent(TERMINAL_ID)
+
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"status": TerminalStatus.COMPLETED.value}
+
+    with patch("cli_agent_orchestrator.utils.terminal.api_http.get", return_value=response):
+        poll_until_done(TERMINAL_ID, timeout=5.0, polling_interval=0.01, min_generation=8)
+
+
+@patch("cli_agent_orchestrator.backends.registry.get_backend")
+def test_an_error_is_honoured_regardless_of_generation(get_backend, monitor):
+    """A dead provider is not a stale frame: ERROR must still raise even when it
+    carries a pre-dispatch generation."""
+    get_backend.return_value = _tmux_backend()
+    monitor.notify_input_sent(TERMINAL_ID)
+
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"status": TerminalStatus.ERROR.value, "status_generation": 1}
+
+    with patch("cli_agent_orchestrator.utils.terminal.api_http.get", return_value=response):
+        with pytest.raises(click.ClickException, match="ERROR"):
+            poll_until_done(TERMINAL_ID, timeout=5.0, polling_interval=0.01, min_generation=8)
+
+
+def test_send_input_wrapper_still_keeps_its_bool_contract():
+    """``send_input`` collapses the boundary to ``True`` by design; the HTTP
+    endpoint calls ``dispatch_input`` directly instead so the boundary reaches the
+    wire (api/main.py send_terminal_input)."""
     import cli_agent_orchestrator.services.terminal_service as ts
 
     with patch.object(ts, "dispatch_input", return_value=42) as dispatch:

@@ -4133,20 +4133,37 @@ async def send_terminal_input(
     orchestration_type: Optional[OrchestrationType] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
+    """Paste a message into a terminal and name the turn it starts.
+
+    ``dispatch_boundary`` is ``status_monitor.output_generation()`` sampled inside
+    the dispatch, after the monitor is armed and the rolling buffer cleared but
+    before any key reaches the pane. A client that must know whether a later
+    reading describes THIS send compares it against the ``status_generation`` on
+    ``GET /terminals/{id}``: only a status earned at a strictly greater generation
+    is evidence for this turn. Without it a caller cannot distinguish the previous
+    turn's COMPLETED, still latched because ``notify_input_sent`` deliberately
+    leaves ``_last_status`` alone, from this turn finishing — the #735/#407 defect.
+
+    ``success`` is unchanged and still first in the body, so existing clients that
+    read only that key are unaffected.
+    """
     try:
-        # send_input is blocking tmux I/O (bracketed paste + key sends). Run it
+        # dispatch_input is blocking tmux I/O (bracketed paste + key sends). Run it
         # off the event loop so a slow tmux call can't freeze every other
         # request — including /health and concurrent assign/handoff. Same
         # hazard class as issue #382 (only fixed for DELETE /sessions there).
-        success = await asyncio.to_thread(
-            terminal_service.send_input,
+        #
+        # Called instead of the ``send_input`` bool wrapper purely to keep the
+        # boundary it computes; the behaviour is identical.
+        boundary = await asyncio.to_thread(
+            terminal_service.dispatch_input,
             terminal_id,
             message,
             registry=get_plugin_registry(request),
             sender_id=sender_id,
             orchestration_type=orchestration_type,
         )
-        return {"success": success}
+        return {"success": True, "dispatch_boundary": boundary}
     except TerminalInputBlockedError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:

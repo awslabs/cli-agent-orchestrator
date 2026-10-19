@@ -3694,6 +3694,10 @@ def get_terminal(terminal_id: str) -> Dict:
         # unlike StatusMonitor's in-memory latch.
         if deferred_failure is not None:
             status = TerminalStatus.ERROR.value
+            # A durable failure marker is not earned from terminal output, so it
+            # carries no generation; a client must not be able to read it as
+            # evidence for the send it just made.
+            status_generation: Optional[int] = None
         else:
             observed_status = status_monitor.get_status(terminal_id)
             # External deferred initialization has a short two-phase window:
@@ -3715,6 +3719,11 @@ def get_terminal(terminal_id: str) -> Dict:
                 status = TerminalStatus.UNKNOWN.value
             else:
                 status = reported_status(terminal_id, observed_status).value
+            # Read AFTER get_status so any verdict it freshly applied is stamped.
+            try:
+                status_generation = status_monitor.status_generation(terminal_id)
+            except Exception:  # pragma: no cover - defensive; status stays usable
+                status_generation = None
 
         return {
             "id": metadata["id"],
@@ -3736,6 +3745,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "initial_delivery": metadata.get("initial_delivery"),
             "session_incarnation_id": metadata.get("session_incarnation_id"),
             "status": status,
+            "status_generation": status_generation,
             "last_active": metadata["last_active"],
         }
 
