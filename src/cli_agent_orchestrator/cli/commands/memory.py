@@ -475,7 +475,10 @@ def list_memories(scope, memory_type, scan_all, query, explain, limit, output_fo
     for mem in memories:
         updated = mem.updated_at.strftime("%Y-%m-%d %H:%M")
         tags = mem.tags if mem.tags else ""
-        click.echo(f"{mem.key:<30} {mem.scope:<10} {mem.memory_type:<12} {tags:<20} {updated}")
+        marker = f"  [{mem.lifecycle_status}]" if mem.lifecycle_status is not None else ""
+        click.echo(
+            f"{mem.key:<30} {mem.scope:<10} {mem.memory_type:<12} {tags:<20} {updated}{marker}"
+        )
 
 
 def _print_explain_table(diagnostic: dict) -> None:
@@ -534,6 +537,8 @@ def show(key, scope):
     click.echo(f"Tags:    {match.tags or '(none)'}")
     click.echo(f"Created: {match.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
     click.echo(f"Updated: {match.updated_at.strftime('%Y-%m-%d %H:%M:%S')}")
+    if match.lifecycle_status is not None:
+        click.echo(f"Status:  {match.lifecycle_status}")
     click.echo(f"File:    {match.file_path}")
     click.echo()
     click.echo(match.content)

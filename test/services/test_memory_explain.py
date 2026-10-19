@@ -101,6 +101,7 @@ def test_candidate_keys_are_exactly_the_schema(explained):
         "overlap_at_limit",
         "candidates",
         "eligibility_errors",
+        "lifecycle_enabled",
     }
     expected = {
         "key",

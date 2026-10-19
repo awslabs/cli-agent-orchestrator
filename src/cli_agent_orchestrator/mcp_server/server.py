@@ -1992,6 +1992,11 @@ async def memory_recall(
             "success": True,
             "memories": [
                 {
+                    **(
+                        {"lifecycle_status": m.lifecycle_status}
+                        if m.lifecycle_status is not None
+                        else {}
+                    ),
                     "key": m.key,
                     "content": m.content,
                     "memory_type": m.memory_type,

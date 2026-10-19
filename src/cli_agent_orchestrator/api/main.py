@@ -8637,7 +8637,19 @@ async def internal_memory_recall(
         sort_by=body.sort_by,
         include_related=body.include_related,
     )
-    return {"memories": [memory.model_dump(mode="json") for memory in memories]}
+    return {
+        "memories": [
+            {
+                **memory.model_dump(mode="json"),
+                **(
+                    {"lifecycle_status": memory.lifecycle_status}
+                    if memory.lifecycle_status is not None
+                    else {}
+                ),
+            }
+            for memory in memories
+        ]
+    }
 
 
 @app.post("/internal/memory/forget")

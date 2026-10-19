@@ -138,6 +138,11 @@ class Memory(BaseModel):
             "Comma-separated cross-reference keys. " "None=never computed; ''=computed empty."
         ),
     )
+    lifecycle_status: Optional[str] = Field(
+        default=None,
+        exclude=True,
+        description="Transient lifecycle label (e.g. superseded); never persisted or serialized by model_dump.",
+    )
     is_related: bool = Field(
         default=False,
         exclude=True,

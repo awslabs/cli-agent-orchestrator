@@ -180,3 +180,38 @@ def begin_check(request: EligibilityRequest) -> Optional[EligibilityCheck]:
         except Exception:
             _failed_open(source.name, request, 0, errors)
     return EligibilityCheck(request, enabled, errors) if enabled else None
+
+
+class SupersedesSource:
+    """Same-scope active supersedes targets; failures propagate to the check."""
+
+    name = "lifecycle.supersedes"
+
+    def is_enabled(self) -> bool:
+        from cli_agent_orchestrator.services.settings_service import is_memory_lifecycle_enabled
+
+        return is_memory_lifecycle_enabled()
+
+    def excluded(
+        self, request: EligibilityRequest, candidates: Sequence[MemoryIdentity]
+    ) -> Mapping[MemoryIdentity, str]:
+        from cli_agent_orchestrator.services.memory_relationship_service import (
+            MemoryRelationshipService,
+        )
+
+        groups: dict[tuple[str, Optional[str]], list[MemoryIdentity]] = {}
+        for identity in candidates:
+            groups.setdefault((identity.scope, identity.scope_id), []).append(identity)
+        result: dict[MemoryIdentity, str] = {}
+        service = MemoryRelationshipService()
+        for (scope, scope_id), members in groups.items():
+            targets = service.superseded_targets(
+                scope, scope_id, [identity.key for identity in members]
+            )
+            result.update(
+                {identity: "superseded" for identity in members if identity.key in targets}
+            )
+        return result
+
+
+register_source(SupersedesSource())

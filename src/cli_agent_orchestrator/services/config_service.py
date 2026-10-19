@@ -62,9 +62,14 @@ class ServerConfig(BaseModel):
     startup_prompt_handler_timeout: int = 20
 
 
+class LifecycleConfig(BaseModel):
+    enabled: bool = False
+
+
 class MemoryConfig(BaseModel):
     enabled: bool = True
     explain_enabled: bool = True
+    lifecycle: LifecycleConfig = Field(default_factory=LifecycleConfig)
     compile_mode: str = "llm"
     flush_threshold: float = 0.85
     compile_timeout_s: float = 120.0
@@ -196,6 +201,7 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_WS_ALLOWED_ORIGINS": ("network.ws_allowed_origins", "list", []),
     "CAO_MEMORY_ENABLED": ("memory.enabled", "bool", True),
     "CAO_MEMORY_EXPLAIN_ENABLED": ("memory.explain_enabled", "bool", True),
+    "CAO_MEMORY_LIFECYCLE_ENABLED": ("memory.lifecycle.enabled", "bool", False),
     "CAO_MEMORY_LINT_ENABLED": ("memory.lint_enabled", "bool", True),
     "CAO_MEMORY_COMPILE_MODE": ("memory.compile_mode", "str", "llm"),
     "CAO_MEMORY_FLUSH_THRESHOLD": ("memory.flush_threshold", "float", 0.85),
@@ -356,6 +362,8 @@ def _get_owned_section(path: str, default: Any) -> Any:
     if section == "server":
         return settings_service.get_server_settings().get(key, default)
     if section == "memory":
+        if key == "lifecycle.enabled":
+            return settings_service.is_memory_lifecycle_enabled()
         if key == "enabled":
             return settings_service.is_memory_enabled()
         if key == "lint_enabled":

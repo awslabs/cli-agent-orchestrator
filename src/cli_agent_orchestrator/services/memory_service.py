@@ -2483,6 +2483,9 @@ class MemoryService:
             terminal_id=terminal_id,
         )
 
+        from cli_agent_orchestrator.services.settings_service import is_memory_lifecycle_enabled
+
+        lifecycle_on = is_memory_lifecycle_enabled()
         check = None
         if (
             recall_policy.is_curator
@@ -2510,7 +2513,7 @@ class MemoryService:
             recall_policy,
             **eligibility_kwargs,
         )
-        if pool.effective_sort == "relevance" or check is not None:
+        if pool.effective_sort == "relevance" or check is not None or lifecycle_on:
             ordered = self._order_candidates(
                 pool.rows,
                 scope,
@@ -2521,6 +2524,7 @@ class MemoryService:
                 policy=recall_policy,
                 all_term_identities=pool.all_term_identities,
                 now=datetime.now(timezone.utc),
+                lifecycle_on=lifecycle_on,
             )
             return self._finish_recall(
                 ordered,
@@ -2530,6 +2534,7 @@ class MemoryService:
                 terminal_context=terminal_context,
                 policy=recall_policy,
                 **eligibility_kwargs,
+                lifecycle_on=lifecycle_on,
             )
         return self._apply_sort_and_increment(
             pool.rows,
@@ -2575,6 +2580,9 @@ class MemoryService:
             consumer="explicit_recall",
             terminal_id=(terminal_context or {}).get("terminal_id"),
         )
+        from cli_agent_orchestrator.services.settings_service import is_memory_lifecycle_enabled
+
+        lifecycle_on = is_memory_lifecycle_enabled()
         now = datetime.now(timezone.utc)
         default_pool = await self._recall_pool(
             query,
@@ -2596,6 +2604,7 @@ class MemoryService:
             scan_all=scan_all,
             policy=policy,
             now=now,
+            lifecycle_on=lifecycle_on,
         )[:limit]
         relevance_pool = await self._recall_pool(
             query,
@@ -2618,6 +2627,7 @@ class MemoryService:
             scan_all=scan_all,
             policy=policy,
             now=now,
+            lifecycle_on=lifecycle_on,
             all_term_identities=relevance_pool.all_term_identities,
             relevance_scores=scores,
         )
@@ -2698,6 +2708,7 @@ class MemoryService:
                 len(top_relevance & set(default_ranks)) / denominator if denominator else None
             ),
             "candidates": candidates,
+            "lifecycle_enabled": lifecycle_on,
             "eligibility_errors": list(check.errors) if check is not None else [],
         }
 
@@ -2914,6 +2925,7 @@ class MemoryService:
         all_term_identities: Optional[set[tuple]] = None,
         now: Optional[datetime] = None,
         relevance_scores: Optional[dict[tuple, RelevanceScore]] = None,
+        lifecycle_on: bool = False,
     ) -> list:
         """Order candidates only; never increment access or expand related rows."""
         from cli_agent_orchestrator.services.memory_scoring import (
@@ -2922,6 +2934,7 @@ class MemoryService:
             score_memory,
         )
 
+        superseded: set = set()
         if sort_by != "recency":
             if sort_by != "relevance":
                 self._enrich_access_counts(results)
@@ -2984,7 +2997,7 @@ class MemoryService:
                         m.key,
                     )
                 )
-            if sort_by in {"score", "relevance"}:
+            if sort_by in {"score", "relevance"} or lifecycle_on:
                 # FR-4.6: a memory that is the TARGET of an active supersedes edge
                 # must not outrank active guidance merely by textual similarity.
                 # Apply a stable demotion — superseded memories sink below
@@ -3006,6 +3019,14 @@ class MemoryService:
                 # within-scope ordering while enforcing scope dominance.
                 results.sort(key=lambda m: SCOPE_PRECEDENCE.get(m.scope, 99))
 
+        if lifecycle_on:
+            if sort_by == "recency":
+                superseded = self._superseded_keys(results)
+                results.sort(key=lambda m: 1 if self._is_superseded(m, superseded) else 0)
+            for memory in results:
+                memory.lifecycle_status = (
+                    "superseded" if self._is_superseded(memory, superseded) else None
+                )
         return results
 
     def _rank_relevance(
@@ -3077,6 +3098,7 @@ class MemoryService:
         *,
         policy: Optional[VaultInjectionPolicy] = None,
         eligibility: Optional[memory_eligibility.EligibilityCheck] = None,
+        lifecycle_on: bool = False,
     ) -> list:
         """Slice, bump only returned primaries, and optionally append related rows."""
         eligibility_kwargs: dict[str, Any] = (
@@ -3108,6 +3130,14 @@ class MemoryService:
             except Exception as e:  # noqa: BLE001 — non-blocking promise
                 logger.warning(f"related expansion failed, returning primaries: {e}")
 
+        if lifecycle_on:
+            extras = [memory for memory in sliced if memory.is_related]
+            if extras:
+                superseded = self._superseded_keys(extras)
+                for memory in extras:
+                    memory.lifecycle_status = (
+                        "superseded" if self._is_superseded(memory, superseded) else None
+                    )
         if eligibility is not None:
             for scope_value in MemoryScope:
                 excluded_count, source_names = eligibility.exclusion_summary_for_scope(

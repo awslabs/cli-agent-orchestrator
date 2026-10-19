@@ -273,7 +273,7 @@ The in-tree `services.memory_eligibility` registry provides batch lifecycle
 verdicts keyed by `(key, scope, scope_id, source_kind)`. Each enabled source is
 queried once per new candidate batch; identities are memoized only within the
 current injection build or curator recall. There is no cross-call cache or
-automatic discovery of external sources. C5 ships an empty registry.
+automatic discovery of external sources. The built-in `lifecycle.supersedes` source is disabled by default.
 
 Native entries, vault candidates and related targets are checked before their
 caps; vault exclusions happen before body loading. The same check also covers
@@ -294,6 +294,31 @@ batch. Other sources still apply. Warnings report source, purpose and count;
 injection exclusion summaries report scope, count and source names, without
 keys or content. **Eligibility is lifecycle, not confidentiality:** vault
 binding policy and provider redaction retain their separate fail-closed gates.
+
+### Supersedes lifecycle (opt-in)
+
+Enable with `cao config set memory.lifecycle.enabled true` or
+`CAO_MEMORY_LIFECYCLE_ENABLED=true` (environment > nested file value > default
+false). Invalid nested lifecycle objects or non-boolean file values warn and
+leave it disabled; read errors also leave it disabled. The built-in source
+excludes targets of active same-scope `supersedes` edges from all four injection
+paths. Proposals, rejected and deleted edges do not exclude. Store failures
+fail open and appear in the source warnings and explain diagnostics. There is
+no cross-call cache: edge changes apply on the next call.
+
+Explicit recall retains superseded memories. With lifecycle enabled, recency
+moves them last without changing membership; usage demotes them before the
+stable scope pass and slice. Score/relevance keep their existing always-on
+demotion; the flag adds annotation only in those modes. A transient
+`lifecycle_status="superseded"` is excluded from `model_dump` and every canonical
+writer. MCP and the internal recall route include it only when set, preserving
+gateway round trips. CLI show displays a status line and list appends a marker
+only when labelled. Related extras are annotated but remain in expansion order.
+
+Disabling this flag restores default injection and recency/usage behavior;
+it does **not** undo score/relevance demotion. Supersedes cycles exclude both
+ends, and a persistent curator can still restate guidance recalled earlier.
+The diagnostic includes `lifecycle_enabled` to identify the active flag state.
 
 ### On-demand relevance explain
 

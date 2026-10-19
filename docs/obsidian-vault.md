@@ -345,3 +345,5 @@ matters.
 
 `cao memory vault adopt` is deferred to release two. CAO does not turn an
 existing unmanaged note into a managed note in this release.
+
+With `memory.lifecycle.enabled=true`, active same-scope supersedes targets are excluded from injection. Relationship rows have no `source_kind`, so native-origin edges created before a scope became vault-mapped apply to vault notes with the same scope, scope ID and key. Canonical note fields are unchanged.
