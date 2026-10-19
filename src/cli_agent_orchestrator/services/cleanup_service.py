@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     IdempotencyKeyModel,
@@ -41,38 +42,44 @@ def stale_terminal_runtime_is_live(terminal: TerminalModel) -> bool:
     message already PENDING for that receiver silently leaves the
     reconciliation sweep forever while still reporting PENDING.
 
-    Fails CLOSED. When liveness cannot be established the row is reported live
-    and retained, because a wrong "gone" is irreversible and silent whereas a
-    wrong "live" only defers the row's deletion to the next sweep.
+    Fails CLOSED. ``cleanup_terminal_exact(..., close=False)`` proves identity
+    from the terminal's own ``@cao_terminal_id`` option rather than its
+    (reusable) session/window name, and only ``ABSENT`` -- positive proof no
+    live object carries this id -- is read as "gone". Both ``STILL_PRESENT``
+    and ``UNKNOWN`` (an unreadable listing, an ambiguous identity, or any
+    other unanswerable lookup) are treated as live and retained, because a
+    wrong "gone" is irreversible and silent whereas a wrong "live" only
+    defers the row's deletion to the next sweep.
     """
     backend = get_backend()
+    terminal_id = str(terminal.id)
     session_name = str(terminal.tmux_session)
     window_name = str(terminal.tmux_window)
     try:
-        if not backend.session_exists_strict(session_name):
-            return False
-    except Exception as exc:  # noqa: BLE001 — unanswerable liveness fails closed
-        logger.warning(
-            "Could not establish liveness for stale terminal %s (session %s); retaining it: %s",
-            terminal.id,
-            session_name,
-            exc,
+        result = backend.cleanup_terminal_exact(
+            terminal_id, session_name, window_name, close=False
         )
-        return True
-
-    # The session is alive; this terminal's window may still have been killed
-    # individually. A resolvable pane is the window-level liveness signal.
-    try:
-        return backend.get_pane_current_command(session_name, window_name) is not None
     except Exception as exc:  # noqa: BLE001 — unanswerable liveness fails closed
         logger.warning(
-            "Could not establish pane liveness for stale terminal %s (%s:%s); retaining it: %s",
-            terminal.id,
+            "Could not establish liveness for stale terminal %s (%s:%s); retaining it: %s",
+            terminal_id,
             session_name,
             window_name,
             exc,
         )
         return True
+
+    if result.outcome == TerminalCleanupOutcome.ABSENT:
+        return False
+    if result.outcome == TerminalCleanupOutcome.UNKNOWN:
+        logger.warning(
+            "Could not establish liveness for stale terminal %s (%s:%s); retaining it: %s",
+            terminal_id,
+            session_name,
+            window_name,
+            result.detail,
+        )
+    return True
 
 
 def cleanup_old_data():
