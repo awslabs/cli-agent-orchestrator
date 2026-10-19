@@ -2112,10 +2112,17 @@ class MemoryService:
                 out.add((g_scope, g_scope_id, k))
         return out
 
-    def _superseded_keys_with_status(self, memories: list[Memory]) -> tuple[set, bool]:
-        """Diagnostic snapshot with a failure bit; the frozen score reader stays unchanged."""
-        if not memories:
-            return set(), False
+    def _superseded_keys_with_status(
+        self, memories: list[Memory]
+    ) -> tuple[set, set[tuple[str, Optional[str]]]]:
+        """Return the healthy snapshot and failed groups; the frozen reader is unchanged."""
+        groups: dict[tuple[str, Optional[str]], list[str]] = {}
+        for memory in memories:
+            groups.setdefault((memory.scope, self._effective_scope_id(memory)), []).append(
+                memory.key
+            )
+        if not groups:
+            return set(), set()
         try:
             from cli_agent_orchestrator.services.memory_relationship_service import (
                 MemoryRelationshipService,
@@ -2123,19 +2130,14 @@ class MemoryService:
 
             service = MemoryRelationshipService()
         except Exception:
-            return set(), True
-        groups: dict[tuple[str, Optional[str]], list[str]] = {}
-        for memory in memories:
-            groups.setdefault((memory.scope, self._effective_scope_id(memory)), []).append(
-                memory.key
-            )
+            return set(), set(groups)
         snapshot: set = set()
-        failed = False
+        failed: set[tuple[str, Optional[str]]] = set()
         for (scope, scope_id), keys in groups.items():
             try:
                 targets = service.superseded_targets(scope, scope_id, keys)
             except Exception:
-                failed = True
+                failed.add((scope, scope_id))
                 continue
             snapshot.update((scope, scope_id, key) for key in targets)
         return snapshot, failed
@@ -2577,7 +2579,7 @@ class MemoryService:
             if check is not None:
                 superseded_snapshot, failed = self._superseded_keys_with_status(snapshot_rows)
                 if failed:
-                    check.fail_open_source("lifecycle.supersedes", len(snapshot_rows))
+                    check.report_source_failure("lifecycle.supersedes", len(snapshot_rows))
             else:
                 superseded_snapshot = self._superseded_keys(snapshot_rows)
         if (
@@ -2728,11 +2730,14 @@ class MemoryService:
         if superseded_failed:
             if check is None:
                 check = memory_eligibility.EligibilityCheck(request, [])
-            check.fail_open_source("lifecycle.supersedes", len(snapshot_rows))
+            check.report_source_failure(
+                "lifecycle.supersedes",
+                len(snapshot_rows),
+                purpose=None if lifecycle_on else "relevance_demotion",
+            )
         verdicts: dict[tuple, tuple[str, ...]] = {}
         if check is not None:
-            if not superseded_failed:
-                check.use_superseded_snapshot(superseded)
+            check.use_superseded_snapshot(superseded, failed_groups=superseded_failed)
             verdicts = {
                 tuple(identity): reasons
                 for identity, reasons in check.reasons(
@@ -2766,7 +2771,11 @@ class MemoryService:
                     "recency_rank": default_rank,
                     "recovered": rank is not None and rank <= limit and default_rank is None,
                     "superseded": self._is_superseded(memory, superseded),
-                    "injection": "excluded" if identity in verdicts else "eligible",
+                    "injection": (
+                        "unknown"
+                        if lifecycle_on and (identity[1], identity[2]) in superseded_failed
+                        else "excluded" if identity in verdicts else "eligible"
+                    ),
                     "exclusion_reasons": list(verdicts.get(identity, ())),
                 }
             )

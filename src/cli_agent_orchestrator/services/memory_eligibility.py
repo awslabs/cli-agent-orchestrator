@@ -72,13 +72,20 @@ class EligibilitySource(Protocol):
 _SOURCES: dict[str, EligibilitySource] = {}
 
 
-def _failed_open(name: str, request: EligibilityRequest, count: int, errors: list[str]) -> None:
+def _failed_open(
+    name: str,
+    request: EligibilityRequest,
+    count: int,
+    errors: list[str],
+    *,
+    purpose: Optional[str] = None,
+) -> None:
     if name not in errors:
         errors.append(name)
     logger.warning(
         "memory_eligibility_failed_open source=%s purpose=%s candidates=%d",
         name,
-        request.purpose,
+        purpose or request.purpose,
         count,
     )
 
@@ -99,15 +106,27 @@ class EligibilityCheck:
         self._memo: dict[MemoryIdentity, tuple[str, ...]] = {}
         self._origins: dict[MemoryIdentity, set[str]] = {}
 
+    def report_source_failure(
+        self, name: str, count: int, *, purpose: Optional[str] = None
+    ) -> None:
+        """Observe one failed read without disabling independent later candidate batches."""
+        _failed_open(name, self.request, count, self.errors, purpose=purpose)
+
     def fail_open_source(self, name: str, count: int) -> None:
         """Report an already failed source read and avoid retrying it in this check."""
-        _failed_open(name, self.request, count, self.errors)
+        self.report_source_failure(name, count)
         self._failed_sources.add(name)
 
-    def use_superseded_snapshot(self, snapshot: set) -> None:
+    def use_superseded_snapshot(
+        self, snapshot: set, *, failed_groups: Optional[set] = None
+    ) -> None:
         """Use a call-local supersedes snapshot for diagnostic verdicts, not a fresh read."""
         self._sources = tuple(
-            _SnapshotSupersedesSource(snapshot) if type(source) is SupersedesSource else source
+            (
+                _SnapshotSupersedesSource(snapshot, failed_groups)
+                if type(source) is SupersedesSource
+                else source
+            )
             for source in self._sources
         )
 
@@ -232,8 +251,9 @@ class SupersedesSource:
 class _SnapshotSupersedesSource(SupersedesSource):
     """A per-check immutable view of an already resolved graph snapshot."""
 
-    def __init__(self, snapshot: set):
+    def __init__(self, snapshot: set, failed_groups: Optional[set] = None):
         self._snapshot = frozenset(snapshot)
+        self._failed_groups = frozenset(failed_groups or ())
 
     def excluded(
         self, request: EligibilityRequest, candidates: Sequence[MemoryIdentity]
@@ -241,7 +261,8 @@ class _SnapshotSupersedesSource(SupersedesSource):
         return {
             identity: "superseded"
             for identity in candidates
-            if (identity.scope, identity.scope_id, identity.key) in self._snapshot
+            if (identity.scope, identity.scope_id) not in self._failed_groups
+            and (identity.scope, identity.scope_id, identity.key) in self._snapshot
         }
 
 

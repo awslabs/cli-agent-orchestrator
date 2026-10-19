@@ -353,10 +353,21 @@ def test_builtin_store_failure_is_visible_once(
         if "memory_eligibility_failed_open" in record.getMessage()
     ]
     assert len(warnings) == 1
-    assert "source=lifecycle.supersedes purpose=injected_context" in warnings[0]
+    purpose = "injected_context" if lifecycle_enabled else "relevance_demotion"
+    assert f"source=lifecycle.supersedes purpose={purpose}" in warnings[0]
     assert "PATH_SENTINEL" not in warnings[0]
     assert "KEY_SENTINEL" not in warnings[0]
-    assert all(row["injection"] == "eligible" for row in result["candidates"])
+    for row in result["candidates"]:
+        expected = (
+            "eligible"
+            if not lifecycle_enabled
+            else (
+                "unknown"
+                if not partial_failure or row["scope"] == "project"
+                else "excluded" if row["key"] == "strong-old" else "eligible"
+            )
+        )
+        assert row["injection"] == expected
     if partial_failure:
         assert (
             next(row for row in result["candidates"] if row["key"] == "strong-old")["superseded"]

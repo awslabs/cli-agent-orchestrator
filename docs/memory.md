@@ -377,7 +377,7 @@ the fixed recency constants, overlap at the limit, and at most twice the limit
 in candidates: the union of the relevance and default top sets. Candidate
 fields are `key`, `scope`, `scope_id`, `source_kind`, `tier`, `lexical`,
 `recency_factor`, `relevance`, `relevance_rank`, `recency_rank`, `recovered`,
-and `superseded`, plus `injection` (`eligible`/`excluded`) and
+and `superseded`, plus `injection` (`eligible`/`excluded`/`unknown`) and
 `exclusion_reasons` (ordered reason tokens). Top-level `eligibility_errors`
 lists sources that failed open. Top-level `lexical_degenerate` is true when
 a nonempty relevance pool has only zero normalized lexical values; an empty
@@ -390,10 +390,14 @@ Scores use the exact ordering values, rounded to four decimal places.
 Explain resolves supersedes state once over both pools and uses that same
 snapshot for ordering, labels and the built-in injection verdict. A failed
 group read adds `lifecycle.supersedes` to the errors and emits the same
-content-free failed-open warning as injection; that source is disabled for
-the check, and a failed snapshot is not installed or retried. Healthy parts
-of a partial snapshot still keep ordering and labels consistent. A late
-curator ordering-snapshot failure also reaches its check errors and warning.
+content-free failed-open warning as injection. The healthy partial snapshot
+is used for ordering, labels and injection verdicts without another read.
+With lifecycle enabled, only rows in failed scope groups report injection
+`unknown`; healthy groups keep their actual eligible/excluded verdicts.
+With lifecycle off, the failure warning uses purpose `relevance_demotion`;
+injection does not consult the disabled built-in source.
+A late curator ordering-snapshot failure reaches its check errors and warning
+without disabling the independent related-target batch, which can read again.
 Lifecycle recall similarly shares one ordering/label snapshot, including potential
 related targets discovered before ordering; their bodies still load only
 after the primary slice. These snapshots never survive the call.

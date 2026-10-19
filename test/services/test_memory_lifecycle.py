@@ -469,3 +469,111 @@ def test_curated_store_failure_is_observed(lifecycle, monkeypatch, caplog, late_
     assert checks[0].exclusion_summary("global", None) == (
         (1, ["lifecycle.supersedes"]) if late_failure else (0, [])
     )
+
+
+@pytest.fixture
+def partial_graph(svc, db_engine, monkeypatch):
+    factory = sessionmaker(bind=db_engine)
+    monkeypatch.setattr(database, "SessionLocal", factory)
+    monkeypatch.setattr(memory_relationship_service, "SessionLocal", factory)
+    ctx = _ctx(caller_scope="global")
+    now = datetime.now(timezone.utc)
+    for i, (key, scope) in enumerate(
+        [
+            ("g-new", "global"),
+            ("g-old", "global"),
+            ("p-new", "project"),
+            ("p-old", "project"),
+            ("g-rel", "global"),
+        ]
+    ):
+        _run(svc.store(key=key, content="kafka streams " + key, scope=scope, terminal_context=ctx))
+        _stamp_updated_at(db_engine, key, scope, now - timedelta(days=i))
+    project_id = svc.resolve_scope_id("project", ctx)
+    with factory() as db:
+        for scope, sid, source, target in [
+            ("global", "", "g-new", "g-old"),
+            ("global", "", "g-new", "g-rel"),
+            ("project", project_id, "p-new", "p-old"),
+        ]:
+            db.add(
+                MemoryRelationshipModel(
+                    scope=scope,
+                    scope_id=sid,
+                    source_key=source,
+                    target_key=target,
+                    type="supersedes",
+                    status="active",
+                    origin="human",
+                )
+            )
+        db.query(MemoryMetadataModel).filter_by(key="g-new").update({"related_keys": "g-rel"})
+        db.commit()
+    monkeypatch.setenv("CAO_MEMORY_LIFECYCLE_ENABLED", "true")
+    return svc, ctx
+
+
+def test_partial_explain_matches_real_injection(partial_graph, monkeypatch, caplog):
+    service, ctx = partial_graph
+    original = memory_relationship_service.MemoryRelationshipService.superseded_targets
+    calls = []
+
+    def fail_project(self, scope, scope_id, keys):
+        calls.append((scope, scope_id))
+        if scope == "project":
+            raise OSError("/PATH_SENTINEL/KEY_SENTINEL.md")
+        return original(self, scope, scope_id, keys)
+
+    monkeypatch.setattr(
+        memory_relationship_service.MemoryRelationshipService, "superseded_targets", fail_project
+    )
+    result = _run(service.recall_explain(query="kafka streams", limit=5, terminal_context=ctx))
+    assert len(calls) == 2 and len(set(calls)) == 2
+    assert result["eligibility_errors"] == ["lifecycle.supersedes"]
+    block = service.get_memory_context(ctx)
+    for row in result["candidates"]:
+        if row["scope"] == "global":
+            expected = "eligible" if f"] {row['key']}:" in block else "excluded"
+            assert row["injection"] == expected
+        else:
+            assert row["injection"] == "unknown"
+    assert "] g-old:" not in block
+    assert "] p-old:" in block
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "memory_eligibility_failed_open" in record.getMessage()
+    ]
+    assert warnings
+    assert all(
+        "PATH_SENTINEL" not in warning and "KEY_SENTINEL" not in warning for warning in warnings
+    )
+
+
+def test_curator_snapshot_failure_still_checks_related(partial_graph, monkeypatch, caplog):
+    service, ctx = partial_graph
+    original = memory_relationship_service.MemoryRelationshipService.superseded_targets
+    calls = []
+
+    def fail_second(self, scope, scope_id, keys):
+        calls.append(set(keys))
+        if len(calls) == 2:
+            raise OSError("/PATH_SENTINEL/KEY_SENTINEL.md")
+        return original(self, scope, scope_id, keys)
+
+    monkeypatch.setattr(
+        memory_relationship_service.MemoryRelationshipService, "superseded_targets", fail_second
+    )
+    rows = _run(
+        service.recall(
+            query="kafka streams",
+            scope="global",
+            limit=1,
+            include_related=True,
+            terminal_context=dict(ctx, agent_profile="memory_manager"),
+        )
+    )
+    assert "g-rel" not in [row.key for row in rows]
+    assert [row.key for row in rows] == ["g-new"]
+    assert len(calls) == 3 and calls[-1] == {"g-rel"}
+    assert "memory_eligibility_failed_open" in caplog.text
