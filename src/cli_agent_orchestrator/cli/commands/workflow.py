@@ -310,7 +310,7 @@ def workflow():
     """Author and inspect CAO workflow specs."""
 
 
-@workflow.command(name="create")
+@workflow.command(name="create", short_help="Create a Python workflow spec.")
 @click.argument("name")
 @click.option(
     "--from-file",
@@ -323,18 +323,18 @@ def workflow():
 def create_cmd(name, from_file, as_json):
     """Create a NEW workflow spec named NAME from a Python source file.
 
-    Refuses to overwrite an existing spec — use ``cao workflow update`` for that. Python only; a
+    Refuses to overwrite an existing spec — use `cao workflow update` for that. Python only; a
     YAML-tier name is refused with a message naming the restriction.
 
     The source is sent as TEXT and the SERVER decides where it lands: validation, the lint gate, path
     containment, the atomic write and the index update all happen there. This command opens exactly one
     file — the one you named — and never touches the spec directory itself.
 
-    Prints the new spec's ``content_hash``, which is what ``cao workflow update`` will want next.
+    Prints the new spec's `content_hash`, which is what `cao workflow update` will want next.
 
     Exit codes:
       0  created
-      1  refused, or the request errored (``--json`` carries a machine-readable class)
+      1  refused, or the request errored (`--json` carries a machine-readable class)
     """
     try:
         source = pathlib.Path(from_file).read_text()
@@ -362,7 +362,7 @@ def create_cmd(name, from_file, as_json):
     _echo_spec_result(response.json(), as_json, "created")
 
 
-@workflow.command(name="update")
+@workflow.command(name="update", short_help="Update a Python workflow spec.")
 @click.argument("name")
 @click.option(
     "--from-file",
@@ -381,20 +381,20 @@ def create_cmd(name, from_file, as_json):
 def update_cmd(name, from_file, expected_hash, as_json):
     """Replace an EXISTING workflow spec's source, refusing a stale update.
 
-    Refuses to create — use ``cao workflow create`` for that.
+    Refuses to create — use `cao workflow create` for that.
 
-    ``--expected-hash`` IS REQUIRED AND IS NEVER COMPUTED FOR YOU, deliberately. It is your assertion
+    `--expected-hash` IS REQUIRED AND IS NEVER COMPUTED FOR YOU, deliberately. It is your assertion
     about what you believe you are replacing, and that assertion is the whole mechanism: a hash derived
     from the file about to be overwritten would always match, so the check would pass unconditionally
     and a concurrent edit between read and write is exactly what would slip through. There is no
-    ``--force`` for the same reason — an unguarded path that exists is a path that gets used.
+    `--force` for the same reason — an unguarded path that exists is a path that gets used.
 
-    Get the current hash from ``cao workflow get NAME`` (it is on the ``Hash:`` line), or from the
-    ``hash`` field this command and ``create`` print on success.
+    Get the current hash from `cao workflow get NAME` (it is on the `Hash:` line), or from the
+    `hash` field this command and `create` print on success.
 
     Exit codes:
       0  updated
-      1  refused, or the request errored (``--json`` carries a machine-readable class)
+      1  refused, or the request errored (`--json` carries a machine-readable class)
     """
     quoted_name = _quoted_workflow_name(name, as_json)
     try:
@@ -579,9 +579,8 @@ def approve_cmd(plan_id, as_json):
 
     A plan identifier is computed at RUN START from the workflow's execution-affecting fields, so a
     NEW OR CHANGED PLAN IS REFUSED ONCE before it can be approved: run it, copy the plan_id from the
-    refusal, approve it here, run again. Approval enforcement is ON BY DEFAULT since issue #583
-    Bolt 3, so this command is consequential in a default installation; only setting
-    ``workflow.require_approval`` to false in ``settings.json`` turns the gate off.
+    refusal, approve it here, run again. Approval enforcement is on by default for script workflows, so this command is consequential in a default installation; only setting
+    `workflow.require_approval` to false in `settings.json` turns the gate off.
 
     Approving twice is harmless and changes nothing: the original approver and timestamp are kept and
     reported back, so "already approved" is distinguishable from "just approved by me".
