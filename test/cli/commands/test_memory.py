@@ -750,3 +750,119 @@ class TestMemoryHeal:
 
         assert result.exit_code != 0
         assert "another heal is running" in result.output
+
+
+class TestMemoryListExplain:
+    def _service(self, monkeypatch):
+        service = MagicMock()
+        service.recall_explain = AsyncMock(
+            return_value={
+                "schema": "cao.memory.explain/1",
+                "query": "kafka streams",
+                "pool_size": 2,
+                "candidate_limit": 50,
+                "candidates": [
+                    {
+                        "key": "strong-old",
+                        "scope": "global",
+                        "scope_id": None,
+                        "source_kind": "native",
+                        "tier": "all_terms",
+                        "lexical": 1.0,
+                        "recency_factor": 1.0,
+                        "relevance": 1.0,
+                        "relevance_rank": 1,
+                        "recency_rank": None,
+                        "recovered": True,
+                        "superseded": False,
+                    }
+                ],
+            }
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.memory._get_memory_service", lambda: service
+        )
+        return service
+
+    def test_requires_query(self, monkeypatch):
+        service = self._service(monkeypatch)
+        result = CliRunner().invoke(list_memories, ["--explain"])
+        assert result.exit_code == 2
+        assert "--explain requires --query" in result.output
+        service.recall_explain.assert_not_called()
+
+    def test_query_without_explain_is_usage_error(self, monkeypatch):
+        service = self._service(monkeypatch)
+        result = CliRunner().invoke(list_memories, ["--query", "kafka"])
+        assert result.exit_code == 2
+        assert "--query requires --explain" in result.output
+        service.recall.assert_not_called()
+
+    def test_disabled_exits_nonzero_with_named_switch(self, monkeypatch):
+        service = self._service(monkeypatch)
+        service.recall_explain.return_value = None
+        result = CliRunner().invoke(list_memories, ["--explain", "--query", "kafka"])
+        assert result.exit_code == 1
+        assert "memory.explain_enabled=false" in result.output
+
+    def test_memory_disabled_exits_with_named_switch(self, monkeypatch):
+        service = self._service(monkeypatch)
+        monkeypatch.setenv("CAO_MEMORY_ENABLED", "false")
+        result = CliRunner().invoke(list_memories, ["--explain", "--query", "kafka"])
+        assert result.exit_code == 1
+        assert "memory.enabled=false" in result.output
+        service.recall_explain.assert_not_called()
+
+    def test_json_round_trips(self, monkeypatch):
+        import json
+
+        service = self._service(monkeypatch)
+        result = CliRunner().invoke(
+            list_memories,
+            [
+                "--explain",
+                "--query",
+                "kafka streams",
+                "--format",
+                "json",
+                "--limit",
+                "2",
+                "--all",
+                "--scope",
+                "global",
+                "--type",
+                "reference",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == service.recall_explain.return_value
+        kwargs = service.recall_explain.await_args.kwargs
+        assert kwargs["limit"] == 2
+        assert kwargs["scan_all"] is True
+        assert kwargs["scope"] == "global"
+        assert kwargs["memory_type"] == "reference"
+        assert kwargs["terminal_context"] == {"cwd": str(Path.cwd().resolve())}
+
+    def test_table_lists_ranks(self, monkeypatch):
+        self._service(monkeypatch)
+        result = CliRunner().invoke(list_memories, ["--explain", "--query", "kafka"])
+        assert result.exit_code == 0, result.output
+        assert all(
+            label in result.output for label in ("REL#", "DEF#", "strong-old", "all_terms", "SUP")
+        )
+
+    def test_never_calls_recall(self, monkeypatch):
+        service = self._service(monkeypatch)
+        result = CliRunner().invoke(list_memories, ["--explain", "--query", "kafka"])
+        assert result.exit_code == 0, result.output
+        service.recall.assert_not_called()
+        assert service.recall_explain.await_args.kwargs["limit"] == 10
+
+    def test_limit_is_bounded(self, monkeypatch):
+        service = self._service(monkeypatch)
+        for limit in ("0", "101"):
+            result = CliRunner().invoke(
+                list_memories, ["--explain", "--query", "kafka", "--limit", limit]
+            )
+            assert result.exit_code == 2
+        service.recall_explain.assert_not_called()

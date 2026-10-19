@@ -2491,6 +2491,150 @@ class MemoryService:
             policy=recall_policy,
         )
 
+    async def recall_explain(
+        self,
+        query: str,
+        scope: Optional[str] = None,
+        memory_type: Optional[str] = None,
+        limit: int = 10,
+        terminal_context: Optional[dict] = None,
+        scan_all: bool = False,
+    ) -> Optional[dict]:
+        """Compare default/relevance recall on demand, without access or expansion.
+
+        Vault loading can still emit resolution warnings and truncation counters.
+        Only the union of the two top-limit sets is reported, without memory text.
+        """
+        from cli_agent_orchestrator.services.memory_scoring import (
+            RELEVANCE_RECENCY_FLOOR,
+            RELEVANCE_RECENCY_SCALE_DAYS,
+            relevance_recency_factor,
+        )
+        from cli_agent_orchestrator.services.settings_service import is_memory_explain_enabled
+
+        if not _is_memory_enabled() or not is_memory_explain_enabled():
+            return None
+        if not query or not query.strip():
+            raise ValueError("recall_explain requires a nonempty query")
+        if not 1 <= limit <= 100:
+            raise ValueError("recall_explain limit must be between 1 and 100")
+        policy = _resolve_injection_policy(
+            False,
+            consumer="explicit_recall",
+            terminal_id=(terminal_context or {}).get("terminal_id"),
+        )
+        now = datetime.now(timezone.utc)
+        default_pool = await self._recall_pool(
+            query,
+            scope,
+            memory_type,
+            limit,
+            terminal_context,
+            scan_all,
+            "hybrid",
+            "recency",
+            policy,
+        )
+        default_rows = self._order_candidates(
+            default_pool.rows,
+            scope,
+            "recency",
+            query=query,
+            terminal_context=terminal_context,
+            scan_all=scan_all,
+            policy=policy,
+            now=now,
+        )[:limit]
+        relevance_pool = await self._recall_pool(
+            query,
+            scope,
+            memory_type,
+            limit,
+            terminal_context,
+            scan_all,
+            "hybrid",
+            "relevance",
+            policy,
+        )
+        scores: dict[tuple, RelevanceScore] = {}
+        relevance_rows = self._order_candidates(
+            relevance_pool.rows,
+            scope,
+            "relevance",
+            query=query,
+            terminal_context=terminal_context,
+            scan_all=scan_all,
+            policy=policy,
+            now=now,
+            all_term_identities=relevance_pool.all_term_identities,
+            relevance_scores=scores,
+        )
+        relevance_ranks = {self._identity(m): i for i, m in enumerate(relevance_rows, 1)}
+        default_ranks = {self._identity(m): i for i, m in enumerate(default_rows, 1)}
+        top_relevance = {self._identity(m) for m in relevance_rows[:limit]}
+        union = {self._identity(m): m for m in relevance_rows[:limit]}
+        for memory in default_rows:
+            union.setdefault(self._identity(memory), memory)
+        try:
+            superseded = self._superseded_keys(list(union.values()))
+        except Exception:
+            superseded = set()
+        candidates = []
+        for identity, memory in union.items():
+            score = scores.get(identity)
+            if score is None:
+                # A default-only row has no lexical value in the relevance pool.
+                factor = (
+                    relevance_recency_factor(memory.updated_at, now=now)
+                    if memory.scope == "project" and memory.source_kind == "native"
+                    else 1.0
+                )
+                score = RelevanceScore(1, 0.0, factor, 0.0)
+            rank = relevance_ranks.get(identity)
+            default_rank = default_ranks.get(identity)
+            candidates.append(
+                {
+                    "key": memory.key,
+                    "scope": memory.scope,
+                    "scope_id": identity[2],
+                    "source_kind": memory.source_kind,
+                    "tier": "all_terms" if score.tier == 0 else "partial",
+                    "lexical": round(score.lexical, 4),
+                    "recency_factor": round(score.recency_factor, 4),
+                    "relevance": round(score.relevance, 4),
+                    "relevance_rank": rank,
+                    "recency_rank": default_rank,
+                    "recovered": rank is not None and rank <= limit and default_rank is None,
+                    "superseded": self._is_superseded(memory, superseded),
+                }
+            )
+        candidates.sort(
+            key=lambda c: (
+                c["relevance_rank"] if c["relevance_rank"] is not None else float("inf"),
+                c["recency_rank"] if c["recency_rank"] is not None else float("inf"),
+            )
+        )
+        denominator = max(len(top_relevance), len(default_ranks))
+        all_term_count = sum(
+            self._identity(m) in relevance_pool.all_term_identities for m in relevance_rows
+        )
+        return {
+            "schema": "cao.memory.explain/1",
+            "query": query,
+            "search_mode": "hybrid",
+            "limit": limit,
+            "candidate_limit": self._candidate_limit(limit),
+            "pool_size": len(relevance_rows),
+            "all_term_count": all_term_count,
+            "partial_fill_count": len(relevance_rows) - all_term_count,
+            "recency_floor": RELEVANCE_RECENCY_FLOOR,
+            "recency_scale_days": RELEVANCE_RECENCY_SCALE_DAYS,
+            "overlap_at_limit": (
+                len(top_relevance & set(default_ranks)) / denominator if denominator else None
+            ),
+            "candidates": candidates,
+        }
+
     async def _recall_pool(
         self,
         query: Optional[str],
@@ -2688,6 +2832,7 @@ class MemoryService:
         policy: Optional[VaultInjectionPolicy] = None,
         all_term_identities: Optional[set[tuple]] = None,
         now: Optional[datetime] = None,
+        relevance_scores: Optional[dict[tuple, RelevanceScore]] = None,
     ) -> list:
         """Order candidates only; never increment access or expand related rows."""
         from cli_agent_orchestrator.services.memory_scoring import (
@@ -2709,7 +2854,7 @@ class MemoryService:
                     )
                 )
             elif sort_by == "relevance":
-                self._rank_relevance(
+                scores = self._rank_relevance(
                     results,
                     query,
                     terminal_context,
@@ -2721,6 +2866,8 @@ class MemoryService:
                     max_body_chars=max_body_chars,
                     policy=policy,
                 )
+                if relevance_scores is not None:
+                    relevance_scores.update(scores)
             else:  # "score"
                 # Genuine 3-factor: score the WHOLE candidate set against the
                 # query in one corpus, normalise per-batch, and feed that into
@@ -2820,7 +2967,9 @@ class MemoryService:
                 if memory.scope == "project" and memory.source_kind == "native"
                 else 1.0
             )
-            lex = lexical.get(identity, 0.0)
+            # The shared normalizer can retain negative scores in mixed-sign corpora.
+            # Keep relevance bounded without changing the frozen score path.
+            lex = max(0.0, min(1.0, lexical.get(identity, 0.0)))
             values[identity] = RelevanceScore(
                 0 if identity in all_term_identities else 1, lex, factor, lex * factor
             )

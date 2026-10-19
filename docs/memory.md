@@ -267,6 +267,43 @@ memory_forget(
 )
 ```
 
+### On-demand relevance explain
+
+`cao memory list --query Q --explain` compares default recency recall with
+relevance recall through their shared pool and ordering functions. It never
+increments access counts or expands related memories. Nothing is scored
+passively on ordinary recall calls. `--scope`, `--type` and `--all` retain their
+usual scope meaning. Explain's `--limit` defaults to 10 and accepts 1–100;
+`--format` is `table` (default) or `json`. Ordinary list output is unchanged.
+A bare `--query` or bare `--explain` is a usage error (exit 2).
+
+JSON schema `cao.memory.explain/1` reports pool and all-term/partial counts,
+the fixed recency constants, overlap at the limit, and at most twice the limit
+in candidates: the union of the relevance and default top sets. Candidate
+fields are `key`, `scope`, `scope_id`, `source_kind`, `tier`, `lexical`,
+`recency_factor`, `relevance`, `relevance_rank`, `recency_rank`, `recovered`,
+and `superseded`. Ranks are 1-based; relevance rank covers the entire pool,
+default rank covers only the default top set. A missing rank is JSON null.
+`recovered` means relevance selected a row the default top set omitted.
+Scores use the exact ordering values, rounded to four decimal places.
+Relevance clamps negative normalized BM25 values to zero; the existing
+normalizer and frozen `score` behavior remain unchanged.
+A default-only row outside the relevance pool has no relevance rank and has
+zero lexical/relevance values. Overlap is intersection size divided by the
+larger top-set size; it is null when both sets are empty.
+
+Content, tags, paths, absolute timestamps, access counts and raw BM25 scores
+are omitted. The operator's query is echoed. Vault reads can still produce
+resolution warnings and increment the operational `recall_body_truncated`
+counter. This diagnostic leaves stored access state unchanged but does not
+promise zero vault observability effects.
+
+Disable it with `cao config set memory.explain_enabled false` or
+`CAO_MEMORY_EXPLAIN_ENABLED=false` (environment > file > default true).
+Disabled explain exits 1 and names `memory.explain_enabled`; a disabled memory
+subsystem exits 1 and names `memory.enabled`. An empty pool remains a successful
+diagnostic. This switch does not gate opt-in `sort_by="relevance"`.
+
 ## CLI Commands
 
 ```bash
@@ -275,6 +312,10 @@ cao memory list
 cao memory list --all              # all projects
 cao memory list --scope global
 cao memory list --type feedback
+
+# Compare default/relevance top results without recording access
+cao memory list --query "kafka streams" --explain
+cao memory list --query "kafka streams" --explain --limit 10 --format json
 
 # Show full content of a memory
 cao memory show <key>

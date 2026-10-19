@@ -378,3 +378,23 @@ class TestSavePrivateAndSymlinkSafe:
         assert not settings.is_symlink()
         assert oct(settings.stat().st_mode & 0o777) == oct(0o600)
         assert json.loads(settings.read_text())["terminal"]["backend"] == "tmux"
+
+
+def test_config_set_get_explain_enabled(_isolated_settings, monkeypatch):
+    from click.testing import CliRunner
+
+    from cli_agent_orchestrator.cli.commands.config import config
+    from cli_agent_orchestrator.services.config_service import MemoryConfig
+
+    runner = CliRunner()
+    assert MemoryConfig().explain_enabled is True
+    assert ConfigService.get("memory.explain_enabled") is True
+    result = runner.invoke(config, ["set", "memory.explain_enabled", "false"])
+    assert result.exit_code == 0, result.output
+    assert runner.invoke(config, ["get", "memory.explain_enabled"]).output.strip() == "false"
+    assert (
+        json.loads(_isolated_settings["settings"].read_text())["memory"]["explain_enabled"] is False
+    )
+    assert ConfigService.list_all()["memory.explain_enabled"] is False
+    monkeypatch.setenv("CAO_MEMORY_EXPLAIN_ENABLED", "true")
+    assert ConfigService.get("memory.explain_enabled") is True

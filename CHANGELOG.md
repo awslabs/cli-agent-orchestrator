@@ -36,6 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CAO_AUTH_LOCAL_TOKEN` when API authentication is enabled. The Python workflow SDK's
   run-step transport does not yet receive that credential; subprocess credential delivery
   remains a separate security-boundary decision.
+
+- On-demand `cao memory list --query Q --explain` compares default/relevance
+  ranks without recording access or exposing memory content, tags or paths.
+  Table/JSON output is bounded; `memory.explain_enabled` defaults to true and
+  supports `CAO_MEMORY_EXPLAIN_ENABLED`. Part of #861.
+
 - Opt-in memory recall `sort_by="relevance"` over the widened candidate pool,
   with all-term tiers and bounded age influence for native project rows.
   Query-free calls retain recency behavior; defaults are unchanged. Part of #861.
