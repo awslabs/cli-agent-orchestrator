@@ -773,9 +773,16 @@ class TestMessagePluginEvents:
         # Status is sourced from the event-driven StatusMonitor, not the provider.
         mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
 
-        inbox_service.deliver_pending("abcd1234", registry=registry)
+        # status_monitor is mocked bare here with no status_observation()
+        # configured, so the default-on submit confirmation (#78) would poll
+        # it forever and burn the real 8s timeout; this test is about event
+        # attribution, not that confirmation path.
+        with patch(
+            "cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", False
+        ):
+            inbox_service.deliver_pending("abcd1234", registry=registry)
 
-        mock_terminal_service.send_input.assert_called_once_with(
+        mock_terminal_service.dispatch_input.assert_called_once_with(
             "abcd1234",
             "Please review this",
             registry=registry,

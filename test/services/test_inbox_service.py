@@ -74,8 +74,13 @@ class TestCopilotQuietInboxRecovery:
             ),
             patch("cli_agent_orchestrator.services.inbox_service.update_message_status") as update,
             patch(
-                "cli_agent_orchestrator.services.inbox_service.terminal_service.send_input"
+                "cli_agent_orchestrator.services.inbox_service.terminal_service.dispatch_input"
             ) as send,
+            # This test is about the quiet-ready scheduling mechanism in
+            # StatusMonitor, not inbox submit confirmation (#78): the mocked
+            # StatusMonitor here never earns a real post-dispatch output
+            # generation, so confirmation would always burn the full timeout.
+            patch("cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", False),
         ):
             send.side_effect = lambda *args: loop.call_soon_threadsafe(delivered.set)
             svc = InboxService()
@@ -160,9 +165,14 @@ class TestCopilotQuietInboxRecovery:
             ),
             patch("cli_agent_orchestrator.services.inbox_service.update_message_status") as update,
             patch(
-                "cli_agent_orchestrator.services.inbox_service.terminal_service.send_input"
+                "cli_agent_orchestrator.services.inbox_service.terminal_service.dispatch_input"
             ) as send,
             patch("cli_agent_orchestrator.services.status_monitor.bus.publish") as publish,
+            # This test is about the quiet-ready scheduling mechanism in
+            # StatusMonitor, not inbox submit confirmation (#78): the mocked
+            # StatusMonitor here never earns a real post-dispatch output
+            # generation, so confirmation would always burn the full timeout.
+            patch("cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", False),
         ):
             svc = InboxService()
             # Reconciliation polls arrive after the confirmation TTL expires.
@@ -277,7 +287,10 @@ class TestInboxSubmitConfirmation:
                 return_value=[_make_message()],
             ),
             patch("cli_agent_orchestrator.services.inbox_service.update_message_status"),
-            patch("cli_agent_orchestrator.services.inbox_service.terminal_service.send_input"),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.terminal_service.dispatch_input",
+                return_value=7,
+            ),
             # Exercise the real decision helper, stubbing only its two sinks: the
             # pane render it reads and the key it sends.
             patch.object(terminal_service, "_message_visible_in_box", return_value=True),
@@ -318,7 +331,10 @@ class TestInboxSubmitConfirmation:
                 return_value=[_make_message()],
             ),
             patch("cli_agent_orchestrator.services.inbox_service.update_message_status"),
-            patch("cli_agent_orchestrator.services.inbox_service.terminal_service.send_input"),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.terminal_service.dispatch_input",
+                return_value=7,
+            ),
             patch(
                 "cli_agent_orchestrator.services.inbox_service.terminal_service"
                 ".redeliver_dropped_message_with_boundary"
@@ -348,7 +364,10 @@ class TestInboxSubmitConfirmation:
                 return_value=[_make_message()],
             ),
             patch("cli_agent_orchestrator.services.inbox_service.update_message_status"),
-            patch("cli_agent_orchestrator.services.inbox_service.terminal_service.send_input"),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.terminal_service.dispatch_input",
+                return_value=7,
+            ),
             patch(
                 "cli_agent_orchestrator.services.inbox_service.terminal_service"
                 ".redeliver_dropped_message_with_boundary",
@@ -382,7 +401,99 @@ class TestInboxSubmitConfirmation:
                 return_value=[_make_message()],
             ),
             patch("cli_agent_orchestrator.services.inbox_service.update_message_status"),
-            patch("cli_agent_orchestrator.services.inbox_service.terminal_service.send_input"),
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service.dispatch_input"),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.terminal_service"
+                ".redeliver_dropped_message_with_boundary"
+            ) as redeliver,
+        ):
+            InboxService().deliver_pending("term-1")
+
+        sm.status_observation.assert_not_called()
+        redeliver.assert_not_called()
+
+    def test_boundary_comes_from_dispatch_not_a_pre_send_sample(self):
+        """Codex review regression (#78): a boundary sampled via a bare
+        output_generation() call BEFORE send_input can be exceeded by output
+        that landed in the window before send_input's provider work, arm, and
+        buffer clear -- output that has nothing to do with this delivery --
+        falsely confirming a swallowed Enter. The boundary must instead come
+        from dispatch_input's return value, sampled after the arm and clear.
+        """
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+        sm = MagicMock()
+        sm.get_status.return_value = TerminalStatus.IDLE
+        # If the boundary were (wrongly) taken from a bare pre-send
+        # output_generation() call, it would see this stale, lower value.
+        sm.output_generation.return_value = 5
+        # The real dispatch boundary (dispatch_input's return, sampled after
+        # arm + clear) already absorbed this generation -- it is pre-dispatch
+        # output, not progress from THIS delivery's Enter.
+        sm.status_observation.return_value = StatusObservation(TerminalStatus.PROCESSING, 8)
+
+        timeout_patch, resubmit_patch = self._fast_confirm()
+        with (
+            timeout_patch,
+            resubmit_patch,
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", sm),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+                return_value=[_make_message()],
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.update_message_status"),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.terminal_service.dispatch_input",
+                return_value=8,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.terminal_service"
+                ".redeliver_dropped_message_with_boundary",
+                return_value=(False, None),
+            ) as redeliver,
+        ):
+            InboxService().deliver_pending("term-1")
+
+        # Confirmed only if the boundary were (wrongly) 5: 8 > 5. The fix uses
+        # dispatch_input's returned boundary of 8, so 8 > 8 is False and
+        # recovery must run.
+        redeliver.assert_called_once()
+        sm.output_generation.assert_not_called()
+
+    def test_event_inbox_backend_skips_confirmation(self):
+        """Event-inbox backends (herdr) push delivery synchronously inline on
+        their own asyncio event loop thread (herdr_inbox_service.py's
+        _event_loop -> _deliver, with no asyncio.to_thread offload -- see the
+        TODO at herdr_inbox_service.py:1276-1277). Running the blocking
+        confirmation wait there would stall that session's whole event loop
+        for up to the confirm timeout on every delivery. Confirmation must be
+        skipped entirely for these backends until that offload exists.
+        """
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+        sm = MagicMock()
+        sm.get_status.return_value = TerminalStatus.IDLE
+        # No pickup evidence at all -- a tmux backend would read this as a
+        # dropped Enter and run recovery.
+        sm.status_observation.return_value = StatusObservation(TerminalStatus.IDLE, 0)
+
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = True
+
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", sm),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_backend", return_value=backend
+            ),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+                return_value=[_make_message()],
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.update_message_status"),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.terminal_service.dispatch_input",
+                return_value=0,
+            ),
             patch(
                 "cli_agent_orchestrator.services.inbox_service.terminal_service"
                 ".redeliver_dropped_message_with_boundary"
@@ -447,7 +558,7 @@ class TestCodexEmptyTurnInboxIntegration:
         backend = MagicMock()
         backend.get_history.side_effect = lambda *args, **kwargs: current_capture["text"]
 
-        def send_input(_terminal_id, message):
+        def dispatch_input(_terminal_id, message):
             delivered_texts.append(message)
             status_monitor.notify_input_sent("term-1")
             provider.notify_status_buffer_reset(len(delivered_texts))
@@ -455,6 +566,7 @@ class TestCodexEmptyTurnInboxIntegration:
             provider.record_dispatched_message(message)
             status_monitor._apply_detection("term-1", TerminalStatus.PROCESSING)
             loop.call_soon_threadsafe(sends.put_nowait, message)
+            return len(delivered_texts)
 
         service = InboxService()
         with (
@@ -474,8 +586,8 @@ class TestCodexEmptyTurnInboxIntegration:
                 side_effect=update,
             ),
             patch(
-                "cli_agent_orchestrator.services.inbox_service.terminal_service.send_input",
-                side_effect=send_input,
+                "cli_agent_orchestrator.services.inbox_service.terminal_service.dispatch_input",
+                side_effect=dispatch_input,
             ),
             patch("cli_agent_orchestrator.services.status_monitor.bus", event_bus),
             patch(
@@ -525,6 +637,18 @@ class TestCodexEmptyTurnInboxIntegration:
 class TestDeliverPending:
     """Tests for InboxService.deliver_pending()."""
 
+    @pytest.fixture(autouse=True)
+    def _no_submit_confirmation(self):
+        """These tests mock status_monitor bare, with no status_observation()
+        configured, so the default-on submit confirmation (#78) would poll a
+        mock that never satisfies pickup and burn the real 8s timeout on every
+        test here. None of these tests are about that confirmation path.
+        """
+        with patch(
+            "cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", False
+        ):
+            yield
+
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
@@ -536,7 +660,7 @@ class TestDeliverPending:
         svc = InboxService()
         svc.deliver_pending("term-1")
 
-        mock_term_svc.send_input.assert_called_once_with("term-1", "hello")
+        mock_term_svc.dispatch_input.assert_called_once_with("term-1", "hello")
         mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
@@ -552,7 +676,7 @@ class TestDeliverPending:
         svc = InboxService()
         svc.deliver_pending("term-1")
 
-        mock_term_svc.send_input.assert_called_once_with("term-1", "hello")
+        mock_term_svc.dispatch_input.assert_called_once_with("term-1", "hello")
         mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
@@ -567,7 +691,7 @@ class TestDeliverPending:
         svc = InboxService()
         svc.deliver_pending("term-1")
 
-        mock_term_svc.send_input.assert_not_called()
+        mock_term_svc.dispatch_input.assert_not_called()
         mock_update.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
@@ -581,7 +705,7 @@ class TestDeliverPending:
         svc = InboxService()
         svc.deliver_pending("term-1")
 
-        mock_term_svc.send_input.assert_not_called()
+        mock_term_svc.dispatch_input.assert_not_called()
         mock_update.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
@@ -595,7 +719,7 @@ class TestDeliverPending:
         svc = InboxService()
         svc.deliver_pending("term-1")
 
-        mock_term_svc.send_input.assert_not_called()
+        mock_term_svc.dispatch_input.assert_not_called()
         mock_update.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
@@ -613,7 +737,7 @@ class TestDeliverPending:
         svc.deliver_pending("term-1", num_messages=2)
 
         mock_get.assert_called_once_with("term-1", limit=2)
-        mock_term_svc.send_input.assert_called_once_with("term-1", "hello\nworld")
+        mock_term_svc.dispatch_input.assert_called_once_with("term-1", "hello\nworld")
         assert mock_update.call_count == 2
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
@@ -631,7 +755,7 @@ class TestDeliverPending:
         svc.deliver_pending("term-1", num_messages=0)
 
         mock_get.assert_called_once_with("term-1", limit=100)
-        mock_term_svc.send_input.assert_called_once_with("term-1", "msg0\nmsg1\nmsg2")
+        mock_term_svc.dispatch_input.assert_called_once_with("term-1", "msg0\nmsg1\nmsg2")
         assert mock_update.call_count == 3
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
@@ -641,7 +765,7 @@ class TestDeliverPending:
     def test_marks_failed_on_send_error(self, mock_get, mock_monitor, mock_term_svc, mock_update):
         mock_get.return_value = [_make_message()]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
-        mock_term_svc.send_input.side_effect = RuntimeError("tmux error")
+        mock_term_svc.dispatch_input.side_effect = RuntimeError("tmux error")
 
         svc = InboxService()
         svc.deliver_pending("term-1")
@@ -675,7 +799,9 @@ class TestDeliverPending:
 
         order = []
         mock_update.side_effect = lambda *args, **kwargs: order.append(("update", args))
-        mock_term_svc.send_input.side_effect = lambda *args, **kwargs: order.append(("send", args))
+        mock_term_svc.dispatch_input.side_effect = lambda *args, **kwargs: order.append(
+            ("send", args)
+        )
 
         svc = InboxService()
         svc.deliver_pending("term-1")
@@ -699,7 +825,7 @@ class TestDeliverPending:
         """
         mock_get.return_value = [_make_message()]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
-        mock_term_svc.send_input.side_effect = TerminalNotFoundError("s:w")
+        mock_term_svc.dispatch_input.side_effect = TerminalNotFoundError("s:w")
 
         svc = InboxService()
         svc.deliver_pending("term-1")
@@ -757,7 +883,7 @@ class TestDeliverPending:
         for t in threads:
             t.join(timeout=10)
 
-        assert mock_term_svc.send_input.call_count == 1
+        assert mock_term_svc.dispatch_input.call_count == 1
         assert store["status"] == MessageStatus.DELIVERED
 
 
@@ -768,6 +894,17 @@ class TestEagerInboxDelivery:
     and WAITING_USER_ANSWER delivery when the env var is enabled and the
     provider declares accepts_input_while_processing=True.
     """
+
+    @pytest.fixture(autouse=True)
+    def _no_submit_confirmation(self):
+        """The IDLE/COMPLETED cases here go through the non-eager confirmation
+        path with status_monitor mocked bare, so without this they would burn
+        the real 8s timeout. See TestDeliverPending's fixture of the same name.
+        """
+        with patch(
+            "cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", False
+        ):
+            yield
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
@@ -788,7 +925,7 @@ class TestEagerInboxDelivery:
             svc = InboxService()
             svc.deliver_pending("t1")
 
-        mock_term_svc.send_input.assert_called_once()
+        mock_term_svc.dispatch_input.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
@@ -809,7 +946,7 @@ class TestEagerInboxDelivery:
             svc = InboxService()
             svc.deliver_pending("t1")
 
-        mock_term_svc.send_input.assert_called_once()
+        mock_term_svc.dispatch_input.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
@@ -830,7 +967,7 @@ class TestEagerInboxDelivery:
             svc = InboxService()
             svc.deliver_pending("t1")
 
-        mock_term_svc.send_input.assert_called_once()
+        mock_term_svc.dispatch_input.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
@@ -851,7 +988,7 @@ class TestEagerInboxDelivery:
             svc = InboxService()
             svc.deliver_pending("t1")
 
-        mock_term_svc.send_input.assert_not_called()
+        mock_term_svc.dispatch_input.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
@@ -872,7 +1009,7 @@ class TestEagerInboxDelivery:
             svc = InboxService()
             svc.deliver_pending("t1")
 
-        mock_term_svc.send_input.assert_not_called()
+        mock_term_svc.dispatch_input.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
@@ -893,7 +1030,7 @@ class TestEagerInboxDelivery:
             svc = InboxService()
             svc.deliver_pending("t1")
 
-        mock_term_svc.send_input.assert_called_once()
+        mock_term_svc.dispatch_input.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
@@ -914,7 +1051,7 @@ class TestEagerInboxDelivery:
             svc = InboxService()
             svc.deliver_pending("t1")
 
-        mock_term_svc.send_input.assert_not_called()
+        mock_term_svc.dispatch_input.assert_not_called()
 
 
 class TestPollOpenCodePendingMessages:
