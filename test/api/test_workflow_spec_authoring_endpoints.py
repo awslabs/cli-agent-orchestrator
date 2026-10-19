@@ -372,7 +372,7 @@ def test_both_endpoints_declare_a_write_scope():
                 deps = repr(getattr(route, "dependant", None)) + repr(
                     getattr(route, "dependencies", None)
                 )
-                assert "require_any_scope" in deps or getattr(route, "dependant", None) is not None
+                assert "require_any_scope" in deps
                 if method == "PUT":
                     doc = getattr(getattr(route, "endpoint", None), "__doc__", "") or ""
                     assert "optimistic concurrency control" in doc
