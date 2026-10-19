@@ -37,6 +37,9 @@ from pydantic import ValidationError
 
 from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.clients.database import (  # noqa: F401  Compatibility/test seam: creation no longer bulk-deletes with this helper, but older integrations/tests patch the imported symbol while exercising create_terminal. Keep the name exported from this module until that seam can be retired separately.
+    delete_terminals_by_session,
+)
 from cli_agent_orchestrator.clients.database import (
     count_runtime_allocated_terminals,
     create_inbox_message,
