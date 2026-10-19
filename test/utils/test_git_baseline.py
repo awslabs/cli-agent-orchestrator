@@ -256,6 +256,7 @@ def test_records_absence_outside_a_repository(tmp_path):
     assert git_baseline.derive_baseline(str(tmp_path)) == {
         "available": True,
         "repository": False,
+        "root": os.path.realpath(tmp_path),
     }
 
 
@@ -271,6 +272,7 @@ def test_plain_directory_proof_does_not_depend_on_git_stderr(monkeypatch, tmp_pa
     assert git_baseline.derive_baseline(str(tmp_path)) == {
         "available": True,
         "repository": False,
+        "root": os.path.realpath(tmp_path),
     }
 
 
@@ -398,3 +400,17 @@ def test_captures_no_branch_and_no_path(tmp_path):
 
     assert set(baseline) == {"available", "commit", "worktree_state"}
     assert str(tmp_path) not in str(baseline)
+
+
+def test_non_git_roots_and_aliases_have_directory_identity(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    sub = a / "sub"
+    sub.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(a, target_is_directory=True)
+    results = [git_baseline.derive_baseline(str(path)) for path in [a, b, sub]]
+    assert [value["root"] for value in results] == [os.path.realpath(path) for path in [a, b, sub]]
+    assert len({value["root"] for value in results}) == 3
+    assert git_baseline.derive_baseline(str(alias)) == results[0]

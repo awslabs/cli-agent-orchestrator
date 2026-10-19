@@ -450,6 +450,8 @@ there is no agent-side tool that grants approval.
 **Nothing in this section applies to YAML workflows.** Script-tier approval enforcement is active by
 default.
 
+For a working directory outside any Git repository, the plan identifier records the directory's canonical path and nothing about its contents.
+
 A script-tier run freezes an **execution manifest** at run start — the workflow's source hash, its
 resolved inputs, and the repository/worktree baseline — and derives a **plan identifier** (`plan_id`,
 of the form `plan-v1:<digest>`) from the execution-affecting fields. Change any of them and the

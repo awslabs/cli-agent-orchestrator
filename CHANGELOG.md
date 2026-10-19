@@ -650,6 +650,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A plain (non-Git) directory is now an approvable plan, keyed by its canonical path.
+
 - Script runs execute in, and fingerprint, one project root (#699): the run request's optional
   `working_directory`, defaulting to cao-server's working directory. The CLI sends its current
   directory (or `--working-directory`) and the MCP tools send the calling terminal's directory, so

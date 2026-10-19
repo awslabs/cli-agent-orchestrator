@@ -10,11 +10,9 @@ determinately not in a repository is a representable, approvable state. Failures
 identity indeterminate — ``git`` missing, an unreadable directory, or a hung process — remain unavailable
 so the approval path fails closed.
 
-COMMIT AND WORKTREE STATE ONLY, AND THE OMISSIONS ARE DELIBERATE. No branch name, and above all NO PATH: a path
-is environment-specific, so including it would make the ``plan_id`` derived from this baseline differ between
-two machines running an identical plan — a spurious re-approval on every machine change, which is the same
-false positive that sorting dict keys in ``plan_identifier`` exists to prevent. Normalise away what does not
-affect execution.
+COMMIT AND WORKTREE STATE IDENTIFY REPOSITORIES, WITH NO PATH. Identical repository state on two
+machines remains the same plan. For a directory outside Git, its canonical path is the only identity
+available; record that root, without claiming to fingerprint the directory's contents.
 
 ON THE DUPLICATION WITH ``worktree_service._run_git``. That function already has this module's exact
 never-raises contract, and it is private to a service whose purpose (worktree management) is unrelated to
@@ -288,7 +286,7 @@ def derive_baseline(cwd: str) -> Dict[str, Any]:
     """The repository baseline for a run starting in ``cwd``. Never raises.
 
     Returns ``{"available": False}`` when no verifiable baseline could be read,
-    ``{"available": True, "repository": False}`` for determinate non-repositories,
+    ``{"available": True, "repository": False, "root": <realpath>}`` for non-repositories,
     and ``{"available": True, "commit": <sha>, "worktree_state": <state>}`` for repositories.
 
     A successfully read commit may accompany ``available: False`` when the worktree snapshot itself
@@ -324,7 +322,7 @@ def derive_baseline(cwd: str) -> Dict[str, Any]:
     if probe.returncode != 0:
         marker_after = _git_marker_state(cwd)
         if marker_before is False and marker_after is False:
-            return {"available": True, "repository": False}
+            return {"available": True, "repository": False, "root": os.path.realpath(cwd)}
         return {"available": False}
     if probe.stdout.strip() != "true":
         return {"available": False}

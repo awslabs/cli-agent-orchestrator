@@ -2586,3 +2586,58 @@ async def test_submit_queued_run_executes_admitted_bytes(monkeypatch, tmp_path):
         await asyncio.gather(*tasks, return_exceptions=True)
         workflow_service.run_registry.clear()
         workflow_service._active_drives.clear()
+
+
+@pytest.mark.parametrize("endpoint", ["/workflows/runs", "/workflows/runs:submit"])
+def test_non_git_approval_cannot_transfer_to_another_root(
+    client, async_script_env, tmp_path, monkeypatch, endpoint
+):
+    from cli_agent_orchestrator.services import (
+        approval_gate,
+        approval_store,
+        launch_guard,
+        manifest_freeze,
+        script_runner,
+    )
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    spec = async_script_env["spec"]
+    manifest = manifest_freeze.build_manifest_json(
+        source_hash=spec.content_hash, inputs={}, cwd=str(a)
+    )
+    approved = json.loads(manifest)["plan_id"]
+    monkeypatch.setattr(approval_gate, "is_workflow_approval_required", lambda: True)
+    monkeypatch.setattr(
+        approval_store,
+        "approval_state",
+        lambda plan: approval_store.APPROVED if plan == approved else approval_store.ABSENT,
+    )
+    monkeypatch.setattr(launch_guard, "capture", lambda: {"profiles": {}, "memory_enabled": False})
+
+    async def drive(record, source, env, *, working_directory=None):
+        return _result(state=RunState.COMPLETED)
+
+    monkeypatch.setattr(script_runner, "_drive_frozen", drive)
+    ok = client.post(
+        endpoint,
+        json={"name_or_path": "scr", "inputs": {}, "run_id": "root-a", "working_directory": str(a)},
+    )
+    assert ok.status_code == (202 if endpoint.endswith(":submit") else 200), ok.text
+    row = workflow_journal.get_run("root-a")
+    frozen = json.loads(row.manifest_json)
+    snapshot = json.loads(row.spec_snapshot)
+    refused = client.post(
+        endpoint,
+        json={"name_or_path": "scr", "inputs": {}, "run_id": "root-b", "working_directory": str(b)},
+    )
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["detail"]["plan_id"] != approved
+    assert workflow_journal.get_run("root-b") is None
+    assert (
+        frozen["repo_baseline"]["root"]
+        == snapshot["working_directory"]
+        == workflow_service.run_registry["root-a"].working_directory
+        == os.path.realpath(a)
+    )
