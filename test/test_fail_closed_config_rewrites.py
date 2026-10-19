@@ -11,10 +11,15 @@ is a ``logger.warning`` nobody sees at the default level.
 That shape is invisible in review (the load and the save are usually different
 functions, often different commits) and invisible to tests that assert a write
 through its own read path. So it is enumerated here instead: this module walks
-the package's AST, finds every function that persists JSON to a path whose
-pre-image came from a lenient load, and pins the set. Adding one -- including
-re-adding a ``_load()`` / edit / ``_save()`` settings writer -- fails this test
-until it is either made fail-closed or allowlisted with a reason.
+the package's AST and, among functions that persist JSON through a recognized
+sink API (``_PERSIST_ATTRS``, or a write-mode ``open``/``Path.open``) in a
+bounded call shape (two hops of resolvable callers/callees), flags every one
+whose pre-image came from a lenient load, and pins the set. It is a structural
+heuristic over known shapes, not a proof of the property: a sink outside that
+vocabulary, or an unresolvable call, is invisible to it. Adding a recognized
+sink -- including re-adding a ``_load()`` / edit / ``_save()`` settings writer
+-- fails this test until it is either made fail-closed or allowlisted with a
+reason.
 
 A handler that catches ONLY absence (``FileNotFoundError``) is not lenient:
 absent-means-defaults is exactly the distinction the fix is built on.
@@ -81,6 +86,7 @@ _PERSIST_ATTRS = {
     "locked_atomic_rewrite",
     "replace",
 }
+_WRITE_MODE_CHARS = {"w", "a", "x"}
 _PARSE = {"json.load", "json.loads"}
 _RENDER = {"json.dump", "json.dumps"}
 _Key = Tuple[str, str]
@@ -113,6 +119,33 @@ def _is_read(name: str) -> bool:
 
 def _is_persist(name: str) -> bool:
     return name.rsplit(".", 1)[-1] in _PERSIST_ATTRS
+
+
+def _open_mode(name: str, call: ast.Call) -> Optional[str]:
+    # Builtin `open(file, mode, ...)`: mode is the 2nd positional. Method call
+    # `path.open(mode, ...)`: the implicit `self` isn't in `call.args`, so mode
+    # is the 1st positional.
+    mode_index = 1 if "." not in name else 0
+    if len(call.args) > mode_index:
+        arg = call.args[mode_index]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return arg.value
+    for kw in call.keywords:
+        if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
+            return kw.value.value if isinstance(kw.value.value, str) else None
+    return None
+
+
+def _is_write_mode_open(name: str, call: ast.Call) -> bool:
+    """``open(path, "w")`` / ``path.open("w")`` -- a sink the named helpers miss."""
+    if name.rsplit(".", 1)[-1] != "open":
+        return False
+    mode = _open_mode(name, call)
+    return mode is not None and any(c in _WRITE_MODE_CHARS for c in mode)
+
+
+def _is_persist_call(name: str, call: ast.Call) -> bool:
+    return _is_persist(name) or _is_write_mode_open(name, call)
 
 
 def _caught(handler: ast.ExceptHandler) -> Set[str]:
@@ -225,8 +258,9 @@ def find_lenient_rewrites() -> Dict[str, str]:
         resolve,
         {
             k
-            for k, names in call_index.items()
-            if any(_is_persist(n) for n in names) and any(n in _RENDER for n in names)
+            for k, calls in calls_with_nodes.items()
+            if any(_is_persist_call(n, c) for n, c in calls)
+            and any(n in _RENDER for n, _c in calls)
         },
         call_index,
         hops=2,
@@ -243,7 +277,7 @@ def find_lenient_rewrites() -> Dict[str, str]:
         if key not in persisters:
             continue
         module = key[0]
-        persist_calls = [c for n, c in calls_with_nodes[key] if _is_persist(n)] or [
+        persist_calls = [c for n, c in calls_with_nodes[key] if _is_persist_call(n, c)] or [
             c for n, c in calls_with_nodes[key] if any(r in persisters for r in resolve(module, n))
         ]
         reasons = []
@@ -251,7 +285,14 @@ def find_lenient_rewrites() -> Dict[str, str]:
         for name, call in calls_with_nodes[key]:
             if not any(r in lenient for r in resolve(module, name)):
                 continue
-            # `strict=True` opts out of the lenient contract.
+            # `strict=True` opts out of the lenient contract -- trusted syntactically,
+            # not by checking the callee honours it. That is a known limitation of
+            # this *structural* guard (it would miss a regression where the callee
+            # stops respecting `strict`), but it is not a coverage hole on this
+            # branch: `_load_raw`'s own behavior under `strict=True` is pinned by
+            # the executing tests in test_config_service.py (e.g.
+            # test_unparseable_file_is_refused_and_preserved and the migration
+            # tests), which go red if `strict` stops being honoured.
             if any(
                 kw.arg == "strict" and isinstance(kw.value, ast.Constant) and kw.value.value
                 for kw in call.keywords
