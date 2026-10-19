@@ -90,8 +90,9 @@ class TestSyntaxRule:
         # The depth here MUST stay under SCRIPT_LINT_MAX_SOURCE_CHARS, or the
         # oversize guard answers instead and this stops testing the parse path.
         # It used to be 200_000, which is past the guard AND past the point
-        # where ast.parse segfaults on 3.10 — see
-        # test_pathological_nesting_does_not_crash_the_interpreter below.
+        # where ast.parse segfaults on 3.10 — that exact input is now exercised
+        # safely in a child interpreter by
+        # test/services/test_ast_parse_depth_guard.py's crash probe.
         source = "a" + ".b" * 20_000 + "\n"
         assert len(source) <= SCRIPT_LINT_MAX_SOURCE_CHARS  # still the parse path
         result = lint_script(source, "deep.py")
@@ -129,20 +130,15 @@ class TestOversizeSourceGuard:
     whole test process dies mid-run. These tests are the regression guard for
     that crash class; the first one took the interpreter down before the cap
     existed.
-    """
 
-    def test_pathological_nesting_does_not_crash_the_interpreter(self):
-        # The exact input that used to segfault pytest: ~400 KB of attribute
-        # chain, 200_000 levels deep. The ONLY thing asserted is that control
-        # returns at all with a fail-closed verdict — that is the whole point.
-        source = "a" + ".b" * 200_000 + "\n"
-        result = lint_script(source, "pathological.py")
-        assert isinstance(result, ScriptValidationResult)
-        assert result.status == "fail"
-        f = result.findings[0]
-        assert f.rule_id == "syntax"
-        assert f.severity == "error"
-        assert f.line == 1
+    The actual 200_000-level input that used to segfault pytest is NOT replayed
+    here in-process — that is the exact anti-pattern this class guards against,
+    since a cap regression would take this test process down with no test
+    identity reported. It runs instead in a child interpreter, in
+    ``test/services/test_ast_parse_depth_guard.py``'s crash probe. Here, only
+    the length branch (shared by the deep case, since depth is irrelevant once
+    the length cap rejects first) is asserted in-process.
+    """
 
     def test_oversize_source_is_rejected_before_ast_parse(self, monkeypatch):
         # Ordering is the invariant: the cap is worthless if the parse has
