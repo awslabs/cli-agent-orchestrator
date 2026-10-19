@@ -2892,12 +2892,12 @@ def fail_orphaned_pending_messages(min_age_seconds: int) -> List[str]:
     is about to be delivered. They are not pending -- they are undeliverable,
     and this says so.
 
-    ``create_inbox_message`` rejects an unknown receiver and there is no path
-    that transiently removes a live terminal's row (session teardown deletes
-    rows only after the kill is CONFIRMED, and retention now retains live rows
-    -- see ``cleanup_service.stale_terminal_runtime_is_live``), so a missing
-    receiver row is a settled fact rather than a race. The same
-    ``min_age_seconds`` grace window as the sweep still applies.
+    ``create_inbox_message`` rejects an unknown receiver, and delivery requires
+    a row that ``list_pending_receiver_ids_older_than`` can join to, so a
+    missing receiver row makes the message undeliverable by every path
+    regardless of why the row is gone -- this does not depend on row deletion
+    being race-free. The same ``min_age_seconds`` grace window as the sweep
+    still applies.
 
     Returns the ids of the messages that were failed, for logging.
     """
