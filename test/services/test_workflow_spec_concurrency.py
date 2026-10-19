@@ -450,3 +450,107 @@ def test_service_refuses_unsupported_lock_without_touching_target(
 
     assert target.read_text(encoding="utf-8") == BASE
     assert sorted(path.name for path in tmp_path.iterdir()) == ["contended.py"]
+
+
+def _paused_writer(
+    scan_dir: str,
+    db_path: str,
+    operation: str,
+    expected_hash: str,
+    locked: Any,
+    release: Any,
+    results: Any,
+) -> None:
+    from cli_agent_orchestrator import constants
+    from cli_agent_orchestrator.services import workflow_spec_service
+
+    constants.DATABASE_FILE = Path(db_path)
+    persist = workflow_spec_service._persist_spec
+
+    def paused_persist(*args: Any, **kwargs: Any):
+        locked.set()
+        if not release.wait(timeout=15):
+            raise RuntimeError("writer was not released")
+        return persist(*args, **kwargs)
+
+    workflow_spec_service._persist_spec = paused_persist
+    try:
+        if operation == "create":
+            workflow_spec_service.create_workflow("contended", BASE, scan_dir=scan_dir)
+        else:
+            workflow_spec_service.update_workflow(
+                "contended", _large_source("updated"), expected_hash, scan_dir=scan_dir
+            )
+        results.put(("writer", "ok"))
+    except BaseException as exc:  # noqa: BLE001 - return child failures to parent
+        results.put(("writer", type(exc).__name__))
+
+
+def _delete_worker(
+    scan_dir: str,
+    db_path: str,
+    started: Any,
+    done: Any,
+    results: Any,
+) -> None:
+    from cli_agent_orchestrator import constants
+    from cli_agent_orchestrator.services import workflow_spec_service
+
+    constants.DATABASE_FILE = Path(db_path)
+    started.set()
+    try:
+        workflow_spec_service.delete_workflow("contended", scan_dir=scan_dir)
+        results.put(("delete", "ok"))
+    except BaseException as exc:  # noqa: BLE001 - return child failures to parent
+        results.put(("delete", type(exc).__name__))
+    finally:
+        done.set()
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+def test_delete_waits_for_same_name_writer_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    from cli_agent_orchestrator.clients.database import _migrate_workflow_index
+
+    db_path = tmp_path / "index.db"
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path)
+    _migrate_workflow_index()
+    expected_hash = ""
+    if operation == "update":
+        expected_hash = svc.create_workflow("contended", BASE, scan_dir=str(tmp_path)).content_hash
+
+    ctx = multiprocessing.get_context("spawn")
+    locked, release, started, done = (ctx.Event() for _ in range(4))
+    results = ctx.Queue()
+    writer = ctx.Process(
+        target=_paused_writer,
+        args=(str(tmp_path), str(db_path), operation, expected_hash, locked, release, results),
+    )
+    deleter = ctx.Process(
+        target=_delete_worker,
+        args=(str(tmp_path), str(db_path), started, done, results),
+    )
+    writer.start()
+    try:
+        assert locked.wait(timeout=10), "writer never reached publication under its lock"
+        deleter.start()
+        assert started.wait(timeout=10), "delete process never started"
+        assert not done.wait(timeout=0.5), "delete ran while the writer still held its lock"
+        assert (tmp_path / "contended.py").exists() == (operation == "update")
+    finally:
+        release.set()
+        for process in (writer, deleter):
+            if process.pid is not None:
+                process.join(timeout=20)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+
+    assert writer.exitcode == deleter.exitcode == 0
+    assert sorted(results.get(timeout=5) for _ in range(2)) == [("delete", "ok"), ("writer", "ok")]
+    assert not (tmp_path / "contended.py").exists()
+    with svc._connect() as conn:
+        assert conn.execute("SELECT name FROM workflow_index").fetchall() == []
+    with pytest.raises(KeyError):
+        svc.delete_workflow("contended", scan_dir=str(tmp_path))

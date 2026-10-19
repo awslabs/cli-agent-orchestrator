@@ -1320,7 +1320,9 @@ def delete_workflow(name: str, scan_dir: Optional[str] = None) -> None:
     ``_resolve_source_path``, the helper this calls, and both were corrected together.
 
     Files are canonical, so removing the source file is the authoritative act; the index
-    row removal is bookkeeping (rebuild would also drop it). An unknown name
+    row removal is bookkeeping (rebuild would also drop it). The writer's identity
+    lock covers lookup, removal and index cleanup so a same-name create/update
+    cannot interleave. An unknown name
     raises ``KeyError`` -> 404; a repeat delete of an already-removed name is a
     404, not a silent success (the unknown name is surfaced, not masked).
     ``_resolve_source_path`` returns a raw string pulled out of SQLite — the
@@ -1330,18 +1332,24 @@ def delete_workflow(name: str, scan_dir: Optional[str] = None) -> None:
     in-policy (a reconfigured ``scan_dir`` or direct DB write could otherwise
     let ``os.remove`` follow an unchecked path).
     """
-    source_path = _safe_spec_path(_resolve_source_path(name, scan_dir), scan_dir)
-    try:
-        os.remove(source_path)
-    except FileNotFoundError:
-        # The index row pointed at a now-missing file. Drop the stale row and
-        # surface the unknown name rather than masking it as success.
+    _validate_name(name)
+    safe_base = _safe_dir(scan_dir)
+    # Use the Python writer's target identity even for a YAML delete: a create
+    # of this name must wait until the old tier and its index row are removed.
+    lock_target = _safe_spec_path(os.path.join(safe_base, f"{name}.py"), safe_base)
+    with strict_identity_lock(_workflow_lock_identity(lock_target, safe_base), Path(lock_target)):
+        source_path = _safe_spec_path(_resolve_source_path(name, scan_dir), scan_dir)
+        try:
+            os.remove(source_path)
+        except FileNotFoundError:
+            # The index row pointed at a now-missing file. Drop the stale row and
+            # surface the unknown name rather than masking it as success.
+            with _connect() as conn:
+                conn.execute("DELETE FROM workflow_index WHERE name = ?", (name,))
+                conn.commit()
+            raise KeyError(name)
+        except OSError as e:
+            raise ValueError(f"could not delete workflow '{name}': {e}") from e
         with _connect() as conn:
             conn.execute("DELETE FROM workflow_index WHERE name = ?", (name,))
             conn.commit()
-        raise KeyError(name)
-    except OSError as e:
-        raise ValueError(f"could not delete workflow '{name}': {e}") from e
-    with _connect() as conn:
-        conn.execute("DELETE FROM workflow_index WHERE name = ?", (name,))
-        conn.commit()
