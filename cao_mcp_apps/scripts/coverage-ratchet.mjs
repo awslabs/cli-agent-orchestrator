@@ -27,9 +27,28 @@ function readJson(path) {
 }
 
 function pythonLinePct(report) {
-  // coverage.py json schema: { "totals": { "percent_covered": <float> } }
-  const pct = report?.totals?.percent_covered;
-  return typeof pct === "number" ? pct : null;
+  // coverage.py json schema: { "totals": { "covered_lines", "num_statements" } }.
+  //
+  // Computed, NOT read from `totals.percent_covered` (#9009): with `--cov-branch`
+  // on, coverage.py redefines that field as the blended
+  // (covered_lines + covered_branches) / (num_statements + num_branches). On a
+  // measured subset it moved 20.19% -> 16.52% purely from the flag. Reading it
+  // would silently re-point the 87.0 line floor at a different metric.
+  const totals = report?.totals;
+  const covered = totals?.covered_lines;
+  const total = totals?.num_statements;
+  if (typeof covered !== "number" || typeof total !== "number") return null;
+  return total === 0 ? 100 : (covered / total) * 100;
+}
+
+function pythonBranchPct(report) {
+  // Present only when pytest ran with `--cov-branch`; null means "not measured",
+  // which `evaluate` reports and skips rather than failing on.
+  const totals = report?.totals;
+  const covered = totals?.covered_branches;
+  const total = totals?.num_branches;
+  if (typeof covered !== "number" || typeof total !== "number") return null;
+  return total === 0 ? 100 : (covered / total) * 100;
 }
 
 function frontendLinePct(summary) {
@@ -67,11 +86,21 @@ function evaluate(label, floor, measured) {
 }
 
 const py = baseline.python ?? {};
+const pyReport = readJson(resolve(REPO_ROOT, py.coverage_json ?? "coverage.json"));
+evaluate("python", py.floor_pct ?? null, pythonLinePct(pyReport));
+
+// Branch coverage is a SECOND, separately-floored metric (#9009): a line floor
+// cannot see a condition only ever taken one way, which is how a declared
+// capability's other branch stays unreachable. Seeded with a null floor
+// (record-only) because the full-suite figure is unknown until CI measures it.
+const pyBranch = baseline.python_branch ?? {};
 evaluate(
-  "python",
-  py.floor_pct ?? null,
-  pythonLinePct(
-    readJson(resolve(REPO_ROOT, py.coverage_json ?? "coverage.json")),
+  "python-branch",
+  pyBranch.floor_pct ?? null,
+  pythonBranchPct(
+    pyBranch.coverage_json
+      ? readJson(resolve(REPO_ROOT, pyBranch.coverage_json))
+      : pyReport,
   ),
 );
 

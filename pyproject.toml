@@ -421,8 +421,14 @@ testpaths = ["test"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
-addopts = "--cov=src --cov-report=term-missing -m 'not e2e and not integration'"
+addopts = "--cov=src --cov-branch --cov-report=term-missing -m 'not e2e and not integration'"
 
+# `--cov-branch` is COLLECTION ONLY, never a gate here (issue #9009). It makes
+# partially-taken branches visible in `term-missing` as `123->exit` / `123->130`,
+# which is what a reachability bug looks like locally: the line runs, one side of
+# the condition never does. Measured cost on a 369-test subset: 49-57s without,
+# 54-57s with -- inside run-to-run noise, so no local-loop tax.
+#
 # NFR-3's 80% line floor is enforced in CI, NOT here (issue #583 Bolt 3, build-and-test).
 #
 # `fail_under` deliberately does NOT live in this file. `--cov` is in `addopts`
@@ -441,3 +447,9 @@ addopts = "--cov=src --cov-report=term-missing -m 'not e2e and not integration'"
 #
 # NOTE for anyone reading ci.yml: the separate "Coverage ratchet" step there
 # belongs to cao_mcp_apps (the TypeScript subproject), not to this suite.
+#
+# CAUTION (#9009): with `--cov-branch` on, coverage.py's `totals.percent_covered`
+# becomes a BLENDED line+branch figure -- (covered_lines + covered_branches) /
+# (num_statements + num_branches) -- not line coverage. Anything reading that
+# field as "line coverage" must compute `covered_lines / num_statements` itself;
+# `.coverage-baseline.json`'s floors are enforced by a ratchet that now does.
