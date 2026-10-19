@@ -392,6 +392,20 @@ def _get_value(path: str, default: Any = None, override: Optional[Any] = None) -
     if override is not None:
         return override
 
+    if path in {
+        "memory.explain_enabled",
+        "memory.non_accessing_inspection",
+        "memory.lifecycle.enabled",
+    }:
+        from cli_agent_orchestrator.services import settings_service
+
+        helpers = {
+            "memory.explain_enabled": settings_service.is_memory_explain_enabled,
+            "memory.non_accessing_inspection": settings_service.is_non_accessing_inspection_enabled,
+            "memory.lifecycle.enabled": settings_service.is_memory_lifecycle_enabled,
+        }
+        return helpers[path]()
+
     if path == "memory.lint_enabled":
         from cli_agent_orchestrator.services import settings_service
 
@@ -549,6 +563,8 @@ class ConfigService:
     @staticmethod
     def get_config() -> CAOConfig:
         """Assemble and validate the full typed config from resolved values."""
+        from cli_agent_orchestrator.services import settings_service
+
         return CAOConfig(
             agents=AgentsConfig(
                 dirs=_get_value("agents.dirs", default={}),
@@ -569,13 +585,9 @@ class ConfigService:
             ),
             memory=MemoryConfig(
                 enabled=_get_value("memory.enabled", default=True),
-                explain_enabled=_get_value("memory.explain_enabled", default=True),
-                non_accessing_inspection=_get_value(
-                    "memory.non_accessing_inspection", default=False
-                ),
-                lifecycle=LifecycleConfig(
-                    enabled=_get_value("memory.lifecycle.enabled", default=False)
-                ),
+                explain_enabled=settings_service.is_memory_explain_enabled(),
+                non_accessing_inspection=settings_service.is_non_accessing_inspection_enabled(),
+                lifecycle=LifecycleConfig(enabled=settings_service.is_memory_lifecycle_enabled()),
                 lint_enabled=_get_value("memory.lint_enabled", default=True),
                 compile_mode=_get_value("memory.compile_mode", default="llm"),
                 flush_threshold=_get_value("memory.flush_threshold", default=0.85),

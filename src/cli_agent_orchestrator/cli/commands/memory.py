@@ -449,7 +449,11 @@ def list_memories(scope, memory_type, scan_all, query, explain, limit, output_fo
             )
         except Exception as e:
             logger.debug("Memory explain failed: %s", e, exc_info=True)
-            raise click.ClickException(f"Explain failed ({type(e).__name__}); see logs") from e
+            if os.environ.get("CAO_LOG_LEVEL", "").strip().upper() == "DEBUG":
+                click.echo(f"Explain detail ({type(e).__name__}): {e}", err=True)
+            raise click.ClickException(
+                f"Explain failed ({type(e).__name__}); re-run with CAO_LOG_LEVEL=DEBUG for details"
+            ) from e
         if diagnostic is None:
             raise click.ClickException("Explain is disabled (memory.explain_enabled=false).")
         if output_format == "json":

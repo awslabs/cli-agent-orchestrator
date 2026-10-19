@@ -321,10 +321,14 @@ off by default. These writers therefore also control injection suppression;
 the lifecycle flag adds no new authorization boundary.
 
 Lifecycle changes do not retract provider memory blocks already persisted
-in `<cwd>/.claude/CLAUDE.md` or `<cwd>/AGENTS.md`. Claude Code and Codex memory
-handlers refresh those blocks at the next terminal creation in that cwd,
+in `<cwd>/.claude/CLAUDE.md`, `<cwd>/AGENTS.md` or Kiro's
+`<cwd>/.kiro/steering/cao-memory.md`. Claude Code, Codex and Kiro memory
+handlers refresh those files at the next terminal creation in that cwd,
 when retrieval returns a nonempty block and the write succeeds. Empty
 retrieval, fetch failures or write failures leave the previous block in place.
+Kiro owns its steering file and replaces the whole file; Claude Code and Codex
+replace only their delimited blocks. Kiro also validates the cwd and target
+before writing; missing cwd or failed validation leaves its old file intact.
 Frozen workflow replays continue using the recorded memory block without
 rechecking lifecycle; another terminal creation does not invalidate that
 snapshot. A fresh workflow run resolves current memory.
@@ -370,7 +374,9 @@ usual scope meaning. Explain's `--limit` defaults to 10 and accepts 1–100;
 A bare `--query` or bare `--explain` is a usage error (exit 2). Explicit
 `--limit` or `--format` without `--explain` is also a usage error, including
 values equal to their defaults. Service errors report only the exception
-type and a prompt to inspect logs; details are available in debug logs.
+type and an actionable hint. Set `CAO_LOG_LEVEL=DEBUG` and re-run explain to
+print the exception detail on stderr; normal stdout/stderr omit that detail.
+This opt-in diagnostic does not install a global CLI logging handler.
 
 JSON schema `cao.memory.explain/1` reports pool and all-term/partial counts,
 the fixed recency constants, overlap at the limit, and at most twice the limit

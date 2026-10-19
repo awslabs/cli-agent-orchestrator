@@ -882,7 +882,10 @@ class TestMemoryListExplain:
         assert result.exit_code == 1
         assert "PATH_SENTINEL" not in result.output
         assert "KEY_SENTINEL" not in result.output
-        assert f"Explain failed ({exception.__name__}); see logs" in result.output
+        assert (
+            f"Explain failed ({exception.__name__}); re-run with CAO_LOG_LEVEL=DEBUG for details"
+            in result.output
+        )
 
     @pytest.mark.parametrize(
         "args,flag",
@@ -909,6 +912,25 @@ class TestMemoryListExplain:
         result = CliRunner().invoke(list_memories, ["--explain", "--query", "kafka"])
         assert result.exit_code == 0
         assert f"Lexical degenerate: {str(degenerate).lower()}" in result.output
+
+    @pytest.mark.parametrize("fmt", ["table", "json"])
+    @pytest.mark.parametrize("debug", [False, True])
+    def test_explain_debug_detail_is_opt_in_stderr(self, monkeypatch, fmt, debug):
+        service = self._service(monkeypatch)
+        service.recall_explain.side_effect = PermissionError("/PATH_SENTINEL/KEY_SENTINEL.md")
+        if debug:
+            monkeypatch.setenv("CAO_LOG_LEVEL", "DEBUG")
+        else:
+            monkeypatch.delenv("CAO_LOG_LEVEL", raising=False)
+        result = CliRunner().invoke(
+            list_memories, ["--query", "kafka", "--explain", "--format", fmt]
+        )
+        assert result.exit_code == 1
+        assert "PATH_SENTINEL" not in result.stdout
+        assert "KEY_SENTINEL" not in result.stdout
+        assert ("PATH_SENTINEL" in result.stderr) is debug
+        assert ("KEY_SENTINEL" in result.stderr) is debug
+        assert "re-run with CAO_LOG_LEVEL=DEBUG for details" in result.stderr
 
 
 class TestNonAccessingInspection:

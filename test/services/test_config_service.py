@@ -463,6 +463,25 @@ def test_config_set_get_explain_enabled(_isolated_settings, monkeypatch):
             (False, True, True),
         ),
         ({"lifecycle": {"enabled": "yes"}}, {}, (True, False, False)),
+        (
+            {
+                "lifecycle": {"enabled": True},
+                "explain_enabled": False,
+                "non_accessing_inspection": True,
+            },
+            {
+                "CAO_MEMORY_LIFECYCLE_ENABLED": "  ",
+                "CAO_MEMORY_EXPLAIN_ENABLED": "  ",
+                "CAO_MEMORY_NON_ACCESSING_INSPECTION": "  ",
+            },
+            (False, True, True),
+        ),
+        (
+            {"explain_enabled": "false", "non_accessing_inspection": "false"},
+            {},
+            (True, True, False),
+        ),
+        ({"explain_enabled": "maybe"}, {}, (True, False, False)),
     ],
 )
 def test_typed_memory_config_matches_resolved_flags(
