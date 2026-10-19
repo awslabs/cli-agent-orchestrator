@@ -1541,11 +1541,26 @@ class TestRealTmuxHistoryLimit:
 
         try:
             client.create_session("depth-probe", "win1", "term-hist-3", str(tmp_path))
-            client.send_keys(
-                "depth-probe",
-                "win1",
-                'for i in $(seq 1 3000); do echo "cao-line-$i"; done',
+            # Drive the pane through a bare ``tmux send-keys``, not through
+            # TmuxClient's paste-buffer path: this test is about capture depth,
+            # and the send path has its own version-dependent behaviour (3.2a
+            # rejects ``paste-buffer -p``) that would turn an unrelated
+            # incompatibility into a failure of this assertion.
+            fill = subprocess.run(
+                [
+                    "tmux",
+                    "-L",
+                    socket_name,
+                    "send-keys",
+                    "-t",
+                    "depth-probe:win1",
+                    'for i in $(seq 1 3000); do echo "cao-line-$i"; done',
+                    "Enter",
+                ],
+                capture_output=True,
+                text=True,
             )
+            assert fill.returncode == 0, f"could not drive the probe pane: {fill.stderr}"
 
             deadline = time.time() + 30
             while time.time() < deadline:
@@ -1565,10 +1580,15 @@ class TestRealTmuxHistoryLimit:
                 "the full_history rung must read deeper than a 1000-line tail, "
                 "not get clamped to the same scrollback cap (#728)"
             )
-            assert "cao-line-1" in deep, (
+            # Exact line, not a substring: "cao-line-1" also matches
+            # "cao-line-1000" and would pass against a 2000-line buffer.
+            printed = deep.splitlines()
+            assert "cao-line-1" in printed, (
                 "the earliest line must still be in scrollback: with tmux's "
-                "2000-line default it has already been discarded (#728)"
+                "2000-line default the first ~1000 lines have already been "
+                "discarded, which is how a long worker reply is lost (#728)"
             )
+            assert "cao-line-3000" in printed
         finally:
             subprocess.run(["tmux", "-L", socket_name, "kill-server"], capture_output=True)
 
