@@ -6,13 +6,27 @@ process-local read-only services). It must never import the state clients
 ``clients.tmux`` or ``clients.database`` directly. This test AST-scans every
 ``mcp_server`` module and fails if any forbidden import is present, locking the
 invariant the codebase already satisfies (Requirement 7; Correctness Property 9).
+
+Scanning only for the state *clients* is not enough. A tool that instantiates a
+state *service* -- which opens those clients on its behalf -- passes a
+clients-only check while reaching the database anyway (issue #744:
+``MemoryService()`` inside ``store_lesson``). So the scan also rejects the
+service modules that open a state client themselves; see
+``FORBIDDEN_STATE_SERVICES`` and the two pinned allowlists below.
+
+Depth is deliberately ONE hop. ``services.settings_service`` imports
+``services.vault.config``, which imports ``clients.database``, so a transitive
+rule would flag nearly every ``mcp_server`` import -- including
+``mcp_server.utils`` itself -- and would contradict the "process-local
+read-only services" carve-out above. The rule is therefore: an ``mcp_server``
+module may not import a module that *itself* names a state client.
 """
 
 from __future__ import annotations
 
 import ast
 from pathlib import Path
-from typing import List
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import cli_agent_orchestrator
 
@@ -23,12 +37,137 @@ FORBIDDEN_MODULES = (
     "cli_agent_orchestrator.clients.database",
 )
 
+# Service modules that import a state client directly (module scope or inside a
+# function body), and so give an ``mcp_server`` caller a non-HTTP path to the
+# database. Every entry below was confirmed by grepping the service for
+# ``clients.tmux`` / ``clients.database``; the reason records what it opens.
+#
+# This list is scoped to the services ``mcp_server/`` imports today plus the
+# ones it is most likely to reach for next. 25 modules under ``services/``
+# touch a state client; listing all 25 would pin modules the boundary has no
+# relationship with and would churn on every unrelated rename. Add an entry
+# here when an ``mcp_server`` module starts importing another state service.
+FORBIDDEN_STATE_SERVICES: Dict[str, str] = {
+    # Writes memory metadata rows and wiki files: SessionLocal,
+    # MemoryMetadataModel, record_project_alias (memory_service.py:299, :391,
+    # :433, :493, :1150).
+    "cli_agent_orchestrator.services.memory_service": (
+        "opens clients.database (SessionLocal, MemoryMetadataModel) to read and "
+        "write memory rows"
+    ),
+    # Reads/writes WorkflowOutcomeModel rows (outcome_service.py:89, :131, :175).
+    "cli_agent_orchestrator.services.outcome_service": (
+        "opens clients.database (SessionLocal, WorkflowOutcomeModel) for workflow " "outcome rows"
+    ),
+    # Module-scope ``from cli_agent_orchestrator.clients import database``
+    # (ephemeral_service.py:22), so merely importing it binds the state client
+    # into the MCP process.
+    "cli_agent_orchestrator.services.ephemeral_service": (
+        "imports clients.database at module scope (ephemeral_service.py:22)"
+    ),
+    # Module-scope import of MemoryMetadataModel, SessionLocal, TerminalModel,
+    # VaultNoteModel, VaultRecallCounterModel (vault/reader.py:15-21).
+    "cli_agent_orchestrator.services.vault.reader": (
+        "imports clients.database models at module scope (vault/reader.py:15-21)"
+    ),
+}
+
 # Bare suffixes used to also catch relative or partially-qualified imports such
 # as ``from ..clients import tmux`` or ``import clients.database``.
 FORBIDDEN_SUFFIXES = ("clients.tmux", "clients.database")
 
+# Name used for imports that sit at module scope rather than inside a function.
+MODULE_SCOPE = "<module>"
+
+# --------------------------------------------------------------------------
+# Pinned exceptions.
+#
+# Both maps are keyed by ``(module relative to the package root, enclosing
+# function or <module>, forbidden module)``. Keying on the enclosing function
+# rather than a line number means the pin survives edits above it but still
+# expires if the import moves to a different tool.
+#
+# Keep these EXACT: `test_pinned_allowlists_are_exact` fails if an entry stops
+# matching a real import, so a fixed tool must be removed from the map in the
+# same change.
+# --------------------------------------------------------------------------
+
+# Legitimate: the tool picks the HTTP path when a remote Backplane is
+# configured and only falls back to the in-process service for a local,
+# single-host install. The remote fallback is
+# ``services.memory_gateway`` (``remote_memory_url()`` gate + ``store_memory`` /
+# ``recall_memory`` / ``forget_memory``, which POST to the ``/memory`` routes).
+DUAL_MODE_ALLOWLIST: Dict[Tuple[str, str, str], str] = {
+    (
+        "mcp_server/server.py",
+        MODULE_SCOPE,
+        "cli_agent_orchestrator.services.memory_service",
+    ): (
+        "constants and exception types only (MEMORY_DISABLED_MESSAGE, "
+        "MemoryDisabledError, MemoryPartialWriteError) -- no client is opened"
+    ),
+    (
+        "mcp_server/server.py",
+        MODULE_SCOPE,
+        "cli_agent_orchestrator.services.outcome_service",
+    ): (
+        "constants only (LEARNING_DISABLED_CODE, LEARNING_DISABLED_MESSAGE); the "
+        "report_outcome write path is HTTP (POST /outcomes)"
+    ),
+    (
+        "mcp_server/server.py",
+        "memory_store",
+        "cli_agent_orchestrator.services.memory_service",
+    ): "dual-mode: remote fallback is memory_gateway.store_memory (POST /memory)",
+    (
+        "mcp_server/server.py",
+        "memory_recall",
+        "cli_agent_orchestrator.services.memory_service",
+    ): "dual-mode: remote fallback is memory_gateway.recall_memory (POST /memory/recall)",
+    (
+        "mcp_server/server.py",
+        "memory_forget",
+        "cli_agent_orchestrator.services.memory_service",
+    ): "dual-mode: remote fallback is memory_gateway.forget_memory (POST /memory/forget)",
+    (
+        "mcp_server/server.py",
+        "memory_recall",
+        "cli_agent_orchestrator.services.vault.reader",
+    ): "MEMORY_MANAGER_PROFILE, a str constant (vault/reader.py:37) -- no client is opened",
+    (
+        "mcp_server/server.py",
+        "assign_elastic",
+        "cli_agent_orchestrator.services.ephemeral_service",
+    ): "log_refusal only: a logger.warning with no state access (ephemeral_service.py:152)",
+    (
+        "mcp_server/server.py",
+        "_create_ephemeral_from_arguments",
+        "cli_agent_orchestrator.services.ephemeral_service",
+    ): "log_refusal only: a logger.warning with no state access (ephemeral_service.py:152)",
+}
+
+# NOT legitimate: these reach the in-process service with no HTTP path at all,
+# so against a remote Backplane they write to the wrong database. Pinned here
+# only so the gate can ship green while the product fix lands separately.
+# Removing an entry is the definition of done for its tracking issue.
+KNOWN_GAP_ALLOWLIST: Dict[Tuple[str, str, str], str] = {
+    (
+        "mcp_server/server.py",
+        "store_lesson",
+        "cli_agent_orchestrator.services.memory_service",
+    ): (
+        "issue #744: store_lesson calls MemoryService() unconditionally with no "
+        "memory_gateway / remote_memory_url() branch, unlike memory_store. Needs a "
+        "route (or the gateway) before this entry can be deleted."
+    ),
+}
+
+ALLOWLIST: Dict[Tuple[str, str, str], str] = {**DUAL_MODE_ALLOWLIST, **KNOWN_GAP_ALLOWLIST}
+
 _PACKAGE_ROOT = Path(cli_agent_orchestrator.__file__).parent
 _MCP_SERVER_DIR = _PACKAGE_ROOT / "mcp_server"
+
+_FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
 
 
 def _mcp_server_modules() -> List[Path]:
@@ -37,32 +176,82 @@ def _mcp_server_modules() -> List[Path]:
     return sorted(_MCP_SERVER_DIR.rglob("*.py"))
 
 
-def _imported_targets(tree: ast.AST) -> List[str]:
-    """Collect the dotted module targets of every import in an AST."""
+def _scoped_imports(tree: ast.AST, scope: str = MODULE_SCOPE) -> Iterator[Tuple[str, int, str]]:
+    """Yield ``(enclosing function, line, dotted target)`` for every import.
 
-    targets: List[str] = []
-    for node in ast.walk(tree):
+    One walker, not two: this recurses the tree itself (rather than
+    ``ast.walk``) purely so each import carries the name of the function it sits
+    in -- ``ast.walk`` flattens the tree and loses that. Function *bodies* are
+    still visited, exactly as ``ast.walk`` visited them before, which is what
+    catches the deferred ``from ... import MemoryService`` inside a tool.
+    """
+
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, _FUNCTION_NODES):
+            # Nested defs keep the outermost tool name: that is the unit an
+            # allowlist entry is about.
+            inner_scope = node.name if scope == MODULE_SCOPE else scope
+            yield from _scoped_imports(node, inner_scope)
+            continue
+        if isinstance(node, ast.ClassDef):
+            yield from _scoped_imports(node, node.name if scope == MODULE_SCOPE else scope)
+            continue
         if isinstance(node, ast.Import):
             for alias in node.names:
-                targets.append(alias.name)
-        elif isinstance(node, ast.ImportFrom):
+                yield scope, node.lineno, alias.name
+            continue
+        if isinstance(node, ast.ImportFrom):
             # ``module`` may be None for ``from . import x``; fold the imported
             # names in so ``from ..clients import tmux`` is still caught.
             base = node.module or ""
-            targets.append(base)
+            yield scope, node.lineno, base
             for alias in node.names:
-                targets.append(f"{base}.{alias.name}" if base else alias.name)
-    return targets
+                yield scope, node.lineno, (f"{base}.{alias.name}" if base else alias.name)
+            continue
+        yield from _scoped_imports(node, scope)
+
+
+def _all_forbidden() -> Tuple[str, ...]:
+    return tuple(FORBIDDEN_MODULES) + tuple(FORBIDDEN_STATE_SERVICES)
+
+
+def _forbidden_root(target: str) -> Optional[str]:
+    """Return the forbidden module an import target names, else None."""
+
+    for module in _all_forbidden():
+        if target == module or target.startswith(f"{module}."):
+            return module
+    for suffix in FORBIDDEN_SUFFIXES:
+        if target == suffix or target.endswith(f".{suffix}"):
+            return suffix
+    return None
 
 
 def _is_forbidden(target: str) -> bool:
-    """True if an import target names a forbidden state client."""
+    """True if an import target names a forbidden state client or state service."""
 
-    if target in FORBIDDEN_MODULES:
-        return True
-    if any(target.startswith(f"{m}.") for m in FORBIDDEN_MODULES):
-        return True
-    return any(target == s or target.endswith(f".{s}") for s in FORBIDDEN_SUFFIXES)
+    return _forbidden_root(target) is not None
+
+
+def _findings() -> Dict[Tuple[str, str, str], int]:
+    """Every forbidden import in mcp_server/, keyed by (module, scope, root).
+
+    The value is the first line the import was seen on, for the failure
+    message. One ``from X import A, B`` yields a single finding: the key is the
+    forbidden module, not the raw target.
+    """
+
+    found: Dict[Tuple[str, str, str], int] = {}
+    for module_path in _mcp_server_modules():
+        rel = module_path.relative_to(_PACKAGE_ROOT).as_posix()
+        source = module_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(module_path))
+        for scope, lineno, target in _scoped_imports(tree):
+            root = _forbidden_root(target)
+            if root is None:
+                continue
+            found.setdefault((rel, scope, root), lineno)
+    return found
 
 
 def test_mcp_server_package_exists() -> None:
@@ -76,12 +265,87 @@ def test_mcp_server_modules_do_not_import_state_clients() -> None:
     """No module under mcp_server/ may import clients.tmux or clients.database."""
 
     violations: List[str] = []
-    for module_path in _mcp_server_modules():
-        source = module_path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(module_path))
-        for target in _imported_targets(tree):
-            if _is_forbidden(target):
-                rel = module_path.relative_to(_PACKAGE_ROOT)
-                violations.append(f"{rel} imports forbidden module '{target}'")
+    for (rel, scope, root), lineno in sorted(_findings().items()):
+        if root not in FORBIDDEN_MODULES and root not in FORBIDDEN_SUFFIXES:
+            continue
+        violations.append(f"{rel}:{lineno} ({scope}) imports forbidden module '{root}'")
 
     assert not violations, "HTTP-only boundary violated:\n" + "\n".join(violations)
+
+
+def test_mcp_server_modules_do_not_open_state_services() -> None:
+    """No module under mcp_server/ may import a state service unless pinned.
+
+    A state service opens ``clients.database`` on the caller's behalf, so
+    importing one is the same boundary break as importing the client -- the
+    gap #744 found in ``store_lesson``. Pinned exceptions live in
+    ``DUAL_MODE_ALLOWLIST`` (HTTP-first, local fallback) and
+    ``KNOWN_GAP_ALLOWLIST`` (tracked, not yet fixed).
+    """
+
+    violations: List[str] = []
+    for (rel, scope, root), lineno in sorted(_findings().items()):
+        if root not in FORBIDDEN_STATE_SERVICES:
+            continue
+        if (rel, scope, root) in ALLOWLIST:
+            continue
+        violations.append(
+            f"{rel}:{lineno} ({scope}) imports state service '{root}' "
+            f"-- {FORBIDDEN_STATE_SERVICES[root]}. "
+            "Route it through the FastAPI surface, or pin it in "
+            "DUAL_MODE_ALLOWLIST / KNOWN_GAP_ALLOWLIST with a reason."
+        )
+
+    assert not violations, "HTTP-only boundary violated (state service):\n" + "\n".join(violations)
+
+
+def test_pinned_allowlists_are_exact() -> None:
+    """Every pinned exception must still match a real import.
+
+    Without this, a fixed tool leaves a stale pin behind that silently
+    re-permits the next regression in the same function.
+    """
+
+    found = set(_findings())
+    stale = sorted(key for key in ALLOWLIST if key not in found)
+    assert not stale, (
+        "stale allowlist entries in test_http_only_boundary.py -- these imports no "
+        "longer exist, delete the pins:\n" + "\n".join(f"  {k}" for k in stale)
+    )
+
+
+def test_walker_sees_function_scoped_imports() -> None:
+    """The walker must reach imports deferred inside a function body.
+
+    This is the shape #744 hid behind: the state service is imported at the top
+    of the tool, not the top of the module. Pinned so a future refactor of the
+    walker cannot quietly stop looking inside functions.
+    """
+
+    tree = ast.parse(
+        "import os\n"
+        "\n"
+        "async def store_lesson():\n"
+        "    from cli_agent_orchestrator.services.memory_service import MemoryService\n"
+        "    if True:\n"
+        "        from cli_agent_orchestrator.clients import database\n"
+        "    return MemoryService(), database\n"
+    )
+    seen = {(scope, target) for scope, _, target in _scoped_imports(tree)}
+
+    assert (MODULE_SCOPE, "os") in seen
+    assert ("store_lesson", "cli_agent_orchestrator.services.memory_service") in seen
+    # Nested inside an `if` inside the function: still attributed to the tool.
+    assert ("store_lesson", "cli_agent_orchestrator.clients.database") in seen
+    assert _forbidden_root("cli_agent_orchestrator.services.memory_service.MemoryService") == (
+        "cli_agent_orchestrator.services.memory_service"
+    )
+
+
+def test_every_forbidden_state_service_has_a_reason() -> None:
+    """Documentation gate: each forbidden service records what it opens."""
+
+    missing = sorted(
+        name for name, reason in FORBIDDEN_STATE_SERVICES.items() if not reason.strip()
+    )
+    assert not missing, f"FORBIDDEN_STATE_SERVICES entries without a reason: {missing}"
