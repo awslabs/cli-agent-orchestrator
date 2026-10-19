@@ -71,7 +71,7 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 |-----|------|-----------|
 | **Unit Tests** (3.10 / 3.11 / 3.12) | `uv run pytest test/ examples/workflow/tests/ --ignore=test/providers/test_kiro_cli_integration.py --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator --cov-report=term-missing` | **Yes** |
 | ↳ step: **Validate Markdown links** | `uv run python scripts/validate_markdown_links.py` — every relative link in every tracked `.md`, including `skills/` | **Yes** |
-| **Code Quality** | black `--check`, isort `--check-only`, `uv run ruff check src/ test/ examples/`, then `uv run mypy src/` | black/isort/**ruff yes**; **mypy is non-blocking** (`continue-on-error: true`) |
+| **Code Quality** | black `--check`, isort `--check-only`, `uv run ruff check src/ test/ examples/`, then `uv run mypy src/` | **Yes** — black/isort/ruff fail the job; only the mypy step is non-blocking (`continue-on-error: true`) |
 | **AG-UI demo (shift-left recording)** | boots a `CAO_AGUI_ENABLED` server, drives the viewer, records a GIF artifact | **Yes** |
 | **AG-UI construct demos (shift-left recordings)** | same pattern for the L2 construct library | **Yes** |
 | **AG-UI stock-client live (AC3)** | drives a real third-party AG-UI client against the surface | **Yes** |
@@ -217,7 +217,7 @@ pins this table to the workflow files.
    stays in lockstep (`test/test_skill_packaging_parity.py` enforces it).
 7. **Commits:** only when asked; sign if the repo expects it; keep the subject concise and
    Conventional-Commits style; never force-push to `main`.
-7. **Open the PR, then watch its CI run to completion** and fix any red gate before calling
+8. **Open the PR, then watch its CI run to completion** and fix any red gate before calling
    it done (rule #2 and #4). Use `gh pr create` / `gh pr checks`.
 
 ## Not what you want?
