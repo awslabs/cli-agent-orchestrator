@@ -667,12 +667,11 @@ class StatusMonitor:
 
         now = time.monotonic()
         with self._lock:
-            if self._last_status.get(
-                terminal_id
-            ) == TerminalStatus.PROCESSING and self._processing_generation.get(
-                terminal_id
-            ) == self._capture_generation.get(
-                terminal_id, 0
+            generation = self._capture_generation.get(terminal_id, 0)
+            processing_observed = self._processing_generation.get(terminal_id) == generation
+            if (
+                self._last_status.get(terminal_id) == TerminalStatus.PROCESSING
+                and processing_observed
             ):
                 return
             last_probe = self._midburst_probe_at.get(terminal_id)
