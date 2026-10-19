@@ -1849,6 +1849,22 @@ class TestMidBurstProcessingProbe:
         # Turn 1's stale verdict must not be credited to turn 2's generation.
         assert sm._processing_generation.get("t1") != turn_2_generation
 
+    def test_dispatch_clears_the_previous_turns_probe_throttle(self):
+        """#814 follow-up: ``notify_input_sent`` bumped the capture generation
+        but left ``_midburst_probe_at`` in place, so the previous turn's
+        throttle could swallow the new turn's first probe opportunity.
+        """
+        sm = self._bursting_monitor()
+        sm._midburst_probe_at["t1"] = time.monotonic()  # previous turn just probed
+
+        sm.notify_input_sent("t1", assume_processing=True)
+        assert "t1" not in sm._midburst_probe_at
+
+        provider = self._probing_provider([True])
+        sm._bursting["t1"] = True
+        sm._schedule_screen_detection("t1", provider)
+        assert provider.probe_processing_from_screen.call_count == 1
+
 
 class TestOutputGenerationIsOutputOnly:
     """PR #566: the delivery-confirmation gate needs a counter only OUTPUT can move.

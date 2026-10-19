@@ -970,6 +970,9 @@ class StatusMonitor:
             self._confirmed_stale_capture_commit.pop(terminal_id, None)
             self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
             capture_handle = self._stale_capture_handle.pop(terminal_id, None)
+            # The previous turn's mid-burst probe throttle must not carry over: it
+            # would otherwise swallow the new turn's first probe opportunity (#814).
+            self._midburst_probe_at.pop(terminal_id, None)
             # ``_idle_from_completed`` is deliberately NOT cleared here. The marker
             # says the current IDLE is a previous COMPLETED with its box scrolled
             # off, and arming does not change what is on screen. Clearing it on
