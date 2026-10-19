@@ -24,6 +24,7 @@ from cli_agent_orchestrator.providers.cursor_cli import (
     CursorCliProvider,
     ProviderError,
 )
+from cli_agent_orchestrator.services.status_monitor import StatusMonitor
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -624,6 +625,58 @@ class TestGetStatusV2026Issue752:
         provider = make_provider()
         provider.mark_input_received()
         assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    # --- Hardening: structural anchor, not phrase-anywhere ----------------
+
+    def test_wrapped_indicator_on_line_after_placeholder_still_returns_processing(self):
+        # In a narrow pane the "ctrl+c to stop" hint can wrap onto the
+        # line immediately after the placeholder instead of sharing its
+        # line. Anchoring to a single input-box line (rather than from
+        # that line to the end of the tail) would miss it and report a
+        # working agent as COMPLETED.
+        output = (
+            "   → Add a follow-up\n" "ctrl+c to stop\n" "  Composer 2.5 Fast   Run Everything\n"
+        )
+        provider = make_provider()
+        provider.mark_input_received()
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_response_prose_with_placeholder_phrase_does_not_impersonate_input_box(self):
+        # The placeholder phrase can appear in ordinary response text,
+        # with no "→" arrow prefix. Matching the phrase anywhere in a
+        # line (instead of requiring the structural arrow) would treat
+        # that prose as the "last input-box line", find no indicator on
+        # it, and report a still-working agent as COMPLETED.
+        output = (
+            "   → Add a follow-up          ctrl+c to stop \n"
+            "  Composer 2.5 Fast   Run Everything\n"
+            "\n"
+            "The user can Add a follow-up after this step.\n"
+        )
+        provider = make_provider()
+        provider.mark_input_received()
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_status_monitor_never_latches_ready_on_prose_collision_buffer(self):
+        # End-to-end guard: even routed through StatusMonitor's sticky
+        # ready latch, the prose-collision buffer must never flip the
+        # terminal to a ready status while the agent is still working —
+        # a false COMPLETED there is permanent for the rest of the
+        # session (status_monitor.py's _apply_detection_locked refuses a
+        # later PROCESSING downgrade from a sticky ready status).
+        provider = make_provider()
+        provider.mark_input_received()
+        monitor = StatusMonitor()
+        terminal_id = "test-tid"
+
+        working = "   → Add a follow-up          ctrl+c to stop \n"
+        collision = working + "The user can Add a follow-up after this step.\n"
+
+        with monitor._lock:
+            monitor._apply_detection_locked(terminal_id, provider.get_status(working))
+            monitor._apply_detection_locked(terminal_id, provider.get_status(collision))
+
+        assert monitor._last_status[terminal_id] == TerminalStatus.PROCESSING
 
 
 # ---------------------------------------------------------------------------
