@@ -31,10 +31,12 @@ def test_resolve_init_timeout_prefers_the_profile_override():
     the issue called out as "strictly worse for the slower providers" -- the
     client budget has to follow the profile, not the server default.
     """
+    from cli_agent_orchestrator.utils.agent_profiles import ProfileSource
+
     profile = SimpleNamespace(provider_init_timeout=300)
     with patch(
-        "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile",
-        return_value=profile,
+        "cli_agent_orchestrator.utils.agent_profiles.load_launch_profile",
+        return_value=(profile, ProfileSource.INSTALLED),
     ):
         assert resolve_init_timeout("slow-agent", _SETTINGS) == 300
 
@@ -46,24 +48,78 @@ def test_resolve_init_timeout_falls_back_when_the_profile_cannot_be_loaded():
     this process cannot see it.
     """
     with patch(
-        "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile",
+        "cli_agent_orchestrator.utils.agent_profiles.load_launch_profile",
         side_effect=FileNotFoundError("no such profile"),
     ):
         assert resolve_init_timeout("missing", _SETTINGS) == 60
 
 
+def test_resolve_init_timeout_sees_a_reserved_ephemeral_profile_override():
+    """A reserved ephemeral name is served exclusively from the server-owned
+    live store by ``load_launch_profile`` (``agent_profiles.py``), never by
+    ``load_agent_profile`` alone. The client must resolve through the same
+    loader the server uses (``terminal_service.py:1497``), or it silently
+    falls back to the server default while the server applies the ephemeral
+    override."""
+    from cli_agent_orchestrator.utils.agent_profiles import ProfileSource
+
+    profile = SimpleNamespace(provider_init_timeout=300)
+    with patch(
+        "cli_agent_orchestrator.utils.agent_profiles.load_launch_profile",
+        return_value=(profile, ProfileSource.EPHEMERAL),
+    ):
+        assert resolve_init_timeout("Agent-fixup-1a2b", _SETTINGS) == 300
+
+
+def test_resolve_init_timeout_falls_back_when_ephemeral_profile_unavailable():
+    from cli_agent_orchestrator.utils.agent_profiles import EphemeralProfileUnavailable
+
+    with patch(
+        "cli_agent_orchestrator.utils.agent_profiles.load_launch_profile",
+        side_effect=EphemeralProfileUnavailable("gone"),
+    ):
+        assert resolve_init_timeout("Agent-fixup-1a2b", _SETTINGS) == 60
+
+
 def test_init_allowance_covers_more_than_one_init_phase():
     """A successful init legitimately spans several ``provider_init_timeout``
     waits (Claude 3T + settle, Kiro's legacy fallback 4T), so an allowance of
-    exactly T is short for a path that still succeeds."""
+    exactly T is short for a path that still succeeds. At the stock T=60, the
+    Antigravity-shaped fixed floor (10 + 2*180 = 370) exceeds the linear 4T
+    (240), so it is the one that sets the budget."""
     assert init_allowance(None, _SETTINGS) > 60
-    assert init_allowance(None, _SETTINGS) == 4 * 60 + 60
+    assert init_allowance(None, _SETTINGS) == 10 + 2 * 180 + 60
 
 
 def test_init_allowance_scales_with_provider_init_timeout():
-    """The property that makes this a derivation and not a literal."""
-    doubled = dict(_SETTINGS, provider_init_timeout=120)
-    assert init_allowance(None, doubled) == 2 * init_allowance(None, _SETTINGS) - 60
+    """The property that makes this a derivation and not a literal.
+
+    Once T is large enough that the linear ``_INIT_PHASES * T`` bound exceeds
+    Antigravity's fixed-floor shape, the allowance scales linearly with T."""
+    settings_300 = dict(_SETTINGS, provider_init_timeout=300)
+    settings_600 = dict(_SETTINGS, provider_init_timeout=600)
+    assert init_allowance(None, settings_600) == 2 * init_allowance(None, settings_300) - 60
+
+
+def test_init_allowance_covers_antigravity_cli_successful_init():
+    """``antigravity_cli.initialize`` is a 10s shell wait, then a startup-dialog
+    phase capped at ``max(180, T)``, then a readiness phase capped at
+    ``max(180, T)`` -- and the handler returns rather than raising at its outer
+    cap, so hitting all three caps is still a SUCCESSFUL init
+    (``antigravity_cli.py``). The allowance must cover that path or a
+    successful init is reported as a client-side failure."""
+    t = _SETTINGS["provider_init_timeout"]
+    antigravity_init_cost = 10.0 + 2 * max(180.0, t)
+    assert init_allowance(None, _SETTINGS) >= antigravity_init_cost
+
+
+def test_init_allowance_covers_kimi_cli_successful_init():
+    """``kimi_cli.initialize`` is a shell wait up to T, then a startup-dialog
+    phase and a readiness phase each capped at ``max(120, T)``
+    (``kimi_cli.py``). The allowance must cover that path too."""
+    t = _SETTINGS["provider_init_timeout"]
+    kimi_init_cost = t + 2 * max(120.0, t)
+    assert init_allowance(None, _SETTINGS) >= kimi_init_cost
 
 
 def test_synchronous_create_timeout_widens_only_the_read_half():
@@ -81,4 +137,4 @@ def test_synchronous_create_timeout_reads_settings_when_none_passed():
         "cli_agent_orchestrator.services.settings_service.get_server_settings",
         return_value=_SETTINGS,
     ):
-        assert synchronous_create_timeout() == (_CONNECT_TIMEOUT_S, 300.0)
+        assert synchronous_create_timeout() == (_CONNECT_TIMEOUT_S, 430.0)

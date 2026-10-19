@@ -27,6 +27,18 @@ from typing import Any, Dict, Optional, Tuple
 # goes on to finish the work.
 _INIT_PHASES = 4
 
+# Antigravity's successful path (``antigravity_cli.initialize``) does not scale
+# with T at the stock T=60: a 10s shell wait, then a startup-dialog phase
+# capped at ``max(180, T)``, then a separate readiness phase capped at
+# ``max(180, T)``. At defaults that is 10 + 2*180 = 370s, which is LONGER than
+# ``_INIT_PHASES * T`` (240s) -- a plain ``_INIT_PHASES * T`` allowance would
+# make a successful init look like a failure at the exact 300s a prior version
+# of this budget granted. ``init_allowance`` takes the max of the two shapes so
+# neither a large-T provider's linear cost nor Antigravity's fixed floor is
+# ever underpriced.
+_ANTIGRAVITY_SHELL_WAIT_S = 10.0
+_ANTIGRAVITY_PHASE_FLOOR_S = 180.0
+
 # Worst case of the server's confirm-and-resubmit loop after a send
 # (``_DEFERRED_SUBMIT_CONFIRM_TIMEOUT`` x (1 + ``_DEFERRED_SUBMIT_MAX_RESUBMITS``)
 # = 32s) with headroom for the pre-dispatch work (memory injection) and polling.
@@ -48,10 +60,13 @@ def resolve_init_timeout(
     """Return the ``provider_init_timeout`` (seconds) the SERVER will apply.
 
     Mirrors ``BaseProvider.get_init_timeout``: the profile's own
-    ``provider_init_timeout`` override wins over the server setting. A profile
-    that cannot be loaded here falls back to the server default rather than
-    failing the caller -- the server resolves the real profile itself; this only
-    sizes a wait.
+    ``provider_init_timeout`` override wins over the server setting. Resolved
+    through ``load_launch_profile``, the same loader the server uses
+    (``terminal_service.py``, ``claude_code.py``, ``codex.py``) -- a reserved
+    ephemeral name is served exclusively from the server-owned live store, and
+    ``load_agent_profile`` alone cannot see it. A profile that cannot be loaded
+    here falls back to the server default rather than failing the caller -- the
+    server resolves the real profile itself; this only sizes a wait.
     """
 
     from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -63,10 +78,10 @@ def resolve_init_timeout(
     if not agent_profile:
         return base
 
-    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+    from cli_agent_orchestrator.utils.agent_profiles import load_launch_profile
 
     try:
-        profile = load_agent_profile(agent_profile)
+        profile, _source = load_launch_profile(agent_profile)
     except Exception:  # noqa: BLE001 -- sizing a wait must never fail the call
         return base
     override = getattr(profile, "provider_init_timeout", None)
@@ -77,11 +92,17 @@ def init_allowance(
     agent_profile: Optional[str] = None,
     settings: Optional[Dict[str, Any]] = None,
 ) -> int:
-    """Seconds a client should allow for server-side init plus delivery confirmation."""
+    """Seconds a client should allow for server-side init plus delivery confirmation.
 
-    return _INIT_PHASES * resolve_init_timeout(agent_profile, settings) + (
-        _DELIVERY_CONFIRM_ALLOWANCE
-    )
+    Takes the larger of the linear ``_INIT_PHASES * T`` bound and Antigravity's
+    fixed-floor shape (``_ANTIGRAVITY_SHELL_WAIT_S + 2 * max(_ANTIGRAVITY_PHASE_FLOOR_S, T)``)
+    so a successful init on either shape of provider stays inside the budget.
+    """
+
+    timeout = resolve_init_timeout(agent_profile, settings)
+    linear_bound = _INIT_PHASES * timeout
+    fixed_floor_bound = _ANTIGRAVITY_SHELL_WAIT_S + 2 * max(_ANTIGRAVITY_PHASE_FLOOR_S, timeout)
+    return int(max(linear_bound, fixed_floor_bound)) + _DELIVERY_CONFIRM_ALLOWANCE
 
 
 def synchronous_create_timeout(

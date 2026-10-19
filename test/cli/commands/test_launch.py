@@ -14,6 +14,7 @@ from cli_agent_orchestrator.cli.commands.launch import (
     launch,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.utils.agent_profiles import ProfileSource
 
 # ── Backend auto-detection (issue #308) ──────────────────────────────
 
@@ -1641,8 +1642,9 @@ def test_launch_headless_task_budget_starts_at_confirmed_delivery():
 
         assert result.exit_code == 0, result.output
         assert order == ["delivery", "task"], "task budget started before delivery was confirmed"
-        # Init allowance: 4 init phases x the server default, plus the confirm loop.
-        mock_wait.assert_called_once_with("test-terminal-id", timeout=4 * 60 + 60)
+        # Init allowance at the stock T=60: the Antigravity-shaped fixed floor
+        # (10 + 2*180) exceeds the linear 4*T, plus the confirm loop.
+        mock_wait.assert_called_once_with("test-terminal-id", timeout=10 + 2 * 180 + 60)
         # Task budget is the task's alone -- no init allowance folded in.
         mock_poll.assert_called_once_with("test-terminal-id", timeout=_HEADLESS_TASK_TIMEOUT)
 
@@ -1826,20 +1828,24 @@ def test_launch_init_allowance_follows_the_profile_init_timeout():
     profile = MagicMock()
     profile.provider_init_timeout = 180
     with patch(
-        "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile", return_value=profile
+        "cli_agent_orchestrator.utils.agent_profiles.load_launch_profile",
+        return_value=(profile, ProfileSource.INSTALLED),
     ):
         assert _init_allowance("slow-agent", {"provider_init_timeout": 60}) == 4 * 180 + 60
 
     profile.provider_init_timeout = None
     with patch(
-        "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile", return_value=profile
+        "cli_agent_orchestrator.utils.agent_profiles.load_launch_profile",
+        return_value=(profile, ProfileSource.INSTALLED),
     ):
-        assert _init_allowance("plain-agent", {"provider_init_timeout": 90}) == 4 * 90 + 60
+        # 90 < 180, so the Antigravity-shaped floor (10 + 2*max(180, T)) wins
+        # over 4*T; see ``init_allowance.init_allowance``.
+        assert _init_allowance("plain-agent", {"provider_init_timeout": 90}) == 10 + 2 * 180 + 60
 
     with patch(
-        "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile",
+        "cli_agent_orchestrator.utils.agent_profiles.load_launch_profile",
         side_effect=FileNotFoundError("no such profile"),
     ):
         # An unloadable profile sizes the wait from the server default rather
         # than failing the launch; the server resolves the real profile itself.
-        assert _init_allowance("missing", {"provider_init_timeout": 60}) == 4 * 60 + 60
+        assert _init_allowance("missing", {"provider_init_timeout": 60}) == 10 + 2 * 180 + 60
