@@ -1,4 +1,4 @@
-"""Every first-party client of CAO's own scope-gated API attaches a bearer (#9007).
+"""Every first-party client of CAO's own scope-gated API attaches a bearer (#1005).
 
 The ROUTE side of the scope gate is centrally tested — ``test/security/test_authz_matrix.py``
 and ``test/api/test_auth_read_gating.py`` walk the route table, so adding a gated route is
