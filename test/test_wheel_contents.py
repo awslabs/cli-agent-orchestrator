@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import zipfile
 from pathlib import Path
@@ -87,13 +88,30 @@ def _built_web_ui_files() -> set[str]:
     }
 
 
-def _assets_referenced_by_index() -> set[str]:
+def _assets_referenced_by_index(index_path: Path = WEB_UI_INDEX) -> set[str]:
     """Wheel member names for every root-relative local URL ``index.html`` loads."""
-    html = WEB_UI_INDEX.read_text(encoding="utf-8")
+    html = index_path.read_text(encoding="utf-8")
     return {WHEEL_WEB_UI_PREFIX + url.lstrip("/") for url in _ASSET_URL_RE.findall(html)}
 
 
-def _build_wheel_members(tmp_path: Path) -> set[str]:
+def _copy_project_tree(dest: Path) -> Path:
+    """Copy the files ``uv build`` needs for a wheel into ``dest`` and return the copy's root.
+
+    Lets a test mutate the tree it builds from (e.g. deleting a file to simulate a broken
+    build) without touching ``REPO_ROOT`` itself. This suite runs under `pytest -n auto`
+    (DEVELOPMENT.md:142), so sibling tests build wheels from the real checkout concurrently;
+    writing into it here would race them.
+    """
+    project_root = dest / "project"
+    project_root.mkdir(parents=True)
+    for name in ("pyproject.toml", "README.md"):
+        shutil.copy2(REPO_ROOT / name, project_root / name)
+    shutil.copytree(REPO_ROOT / "scripts", project_root / "scripts")
+    shutil.copytree(REPO_ROOT / "src", project_root / "src")
+    return project_root
+
+
+def _build_wheel_members(tmp_path: Path, project_root: Path = REPO_ROOT) -> set[str]:
     """Run the real ``uv build`` -> hatchling pipeline and return the wheel's member names."""
     env = dict(os.environ)
     # This test only cares about web_ui/; disable the TUI's own build-time autobuild so
@@ -104,7 +122,7 @@ def _build_wheel_members(tmp_path: Path) -> set[str]:
 
     result = subprocess.run(
         ["uv", "build", "--wheel", "--out-dir", str(tmp_path)],
-        cwd=REPO_ROOT,
+        cwd=project_root,
         env=env,
         capture_output=True,
         text=True,
@@ -122,7 +140,7 @@ def _build_wheel_members(tmp_path: Path) -> set[str]:
         return set(zf.namelist())
 
 
-def web_ui_build_is_complete() -> bool:
+def web_ui_build_is_complete(web_ui_dir: Path = WEB_UI_DIR) -> bool:
     """Is a USABLE Vite build present in the tree — index.html plus every asset it loads?
 
     PUBLIC because ci.yml's `Web UI Build` job calls it as the skip-guard for this file:
@@ -136,12 +154,13 @@ def web_ui_build_is_complete() -> bool:
     test, not skip it (issue #705). This function is the CI precondition, where "npm run
     build exited 0 but wrote an incomplete tree" must fail the job before pytest runs.
     """
-    if not WEB_UI_INDEX.is_file():
+    index_path = web_ui_dir / "index.html"
+    if not index_path.is_file():
         return False
-    referenced = _assets_referenced_by_index()
+    referenced = _assets_referenced_by_index(index_path)
     if not referenced:
         return False
-    return all((WEB_UI_DIR / name[len(WHEEL_WEB_UI_PREFIX) :]).is_file() for name in referenced)
+    return all((web_ui_dir / name[len(WHEEL_WEB_UI_PREFIX) :]).is_file() for name in referenced)
 
 
 @pytest.mark.skipif(
@@ -222,33 +241,36 @@ def test_wheel_omitting_a_referenced_favicon_is_caught(tmp_path):
     fail assertion (2), not pass with ``favicon.svg`` silently absent from the wheel.
     Before ``_ASSET_URL_RE`` covered non-``/assets/*`` references, this case produced a
     false green.
-    """
-    favicon = WEB_UI_DIR / "favicon.svg"
-    moved_aside = Path(str(favicon) + ".movedforissue705test")
-    favicon.rename(moved_aside)
-    try:
-        assert not web_ui_build_is_complete(), (
-            "web_ui_build_is_complete() returned True with favicon.svg missing from the "
-            "source tree; it must fail closed on every local URL index.html references, "
-            "not just /assets/* bundles (issue #705 follow-up)."
-        )
 
-        names = _build_wheel_members(tmp_path)
-        referenced = _assets_referenced_by_index()
-        favicon_member = WHEEL_WEB_UI_PREFIX + "favicon.svg"
-        assert favicon_member in referenced, (
-            "index.html no longer references favicon.svg — fixture assumption broken, "
-            "update this test to match web/index.html."
-        )
-        assert favicon_member not in names, (
-            "favicon.svg was moved out of the source tree before packaging, so the "
-            "built wheel should not contain it; found it anyway."
-        )
-        unresolved = sorted(referenced - names)
-        assert favicon_member in unresolved, (
-            "index.html references favicon.svg, which is absent from both the source "
-            "tree and the wheel, but assertion (2)'s unresolved-reference check did not "
-            "flag it — this is exactly the false green issue #705 reports."
-        )
-    finally:
-        moved_aside.rename(favicon)
+    Builds from a COPY of the project tree (``_copy_project_tree``), not ``REPO_ROOT``
+    itself: deleting the copy's favicon leaves the real checkout untouched, so this test
+    cannot race sibling tests that build wheels from ``REPO_ROOT`` concurrently under
+    `pytest -n auto`.
+    """
+    project_root = _copy_project_tree(tmp_path / "src-copy")
+    web_ui_copy = project_root / "src" / "cli_agent_orchestrator" / "web_ui"
+    (web_ui_copy / "favicon.svg").unlink()
+
+    assert not web_ui_build_is_complete(web_ui_dir=web_ui_copy), (
+        "web_ui_build_is_complete() returned True with favicon.svg missing from the "
+        "source tree; it must fail closed on every local URL index.html references, "
+        "not just /assets/* bundles (issue #705 follow-up)."
+    )
+
+    names = _build_wheel_members(tmp_path / "wheel-out", project_root=project_root)
+    referenced = _assets_referenced_by_index(web_ui_copy / "index.html")
+    favicon_member = WHEEL_WEB_UI_PREFIX + "favicon.svg"
+    assert favicon_member in referenced, (
+        "index.html no longer references favicon.svg — fixture assumption broken, "
+        "update this test to match web/index.html."
+    )
+    assert favicon_member not in names, (
+        "favicon.svg was removed from the copied source tree before packaging, so the "
+        "built wheel should not contain it; found it anyway."
+    )
+    unresolved = sorted(referenced - names)
+    assert favicon_member in unresolved, (
+        "index.html references favicon.svg, which is absent from both the source "
+        "tree and the wheel, but assertion (2)'s unresolved-reference check did not "
+        "flag it — this is exactly the false green issue #705 reports."
+    )
