@@ -187,6 +187,8 @@ def policy_bounds(settings: dict[str, Any]) -> PolicyBounds:
     return PolicyBounds(
         default_tier=settings.get("default_tier"),
         max_tier=settings.get("max_tier"),
+        default_effort=settings.get("default_effort"),
+        max_effort=settings.get("max_effort"),
         allowed_providers=frozenset(settings["allowed_providers"]),
     )
 
@@ -227,6 +229,23 @@ def validate_block(settings: dict[str, Any]) -> None:
         raise EphemeralPolicyError(
             "policy_config_error:default_tier",
             "ephemeral.default_tier must be set when ephemeral.max_tier is set, and must not exceed it",
+        ) from None
+    for key in ("max_effort", "default_effort"):
+        value = settings.get(key)
+        options = POINTS["effort.route"].options
+        if value is not None and (not isinstance(value, str) or value not in options):
+            raise EphemeralPolicyError(
+                "policy_config_error:" + key,
+                "ephemeral." + key + " must be one of " + ", ".join(options),
+            )
+    try:
+        PolicyBounds(
+            default_effort=settings.get("default_effort"), max_effort=settings.get("max_effort")
+        ).validate({})
+    except PolicyConfigError:
+        raise EphemeralPolicyError(
+            "policy_config_error:default_effort",
+            "ephemeral.default_effort must be set when ephemeral.max_effort is set, and must not exceed it",
         ) from None
     try:
         policy_bounds(settings).validate(settings.get("_model_tiers", {}))

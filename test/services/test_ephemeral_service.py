@@ -222,6 +222,8 @@ def test_tiers_and_effort_not_yet_supported(create_store, key, values):
 def test_ignored_policy_keys_warn_and_do_not_apply(create_store, key, value, caplog):
     config = create_store[4]
     config["model_tiers"] = {"claude_code": {"small": "mapped-model"}}
+    if key == "max_effort":
+        config["ephemeral"]["default_effort"] = "low"
     if key == "max_tier":
         config["ephemeral"]["default_tier"] = "small"
     if key == "model_tiers":
@@ -785,7 +787,7 @@ def test_note_build_failure_precedes_all_writes(create_store, monkeypatch):
 
 def test_success_warning_failure_cannot_fail_committed_create(create_store, monkeypatch):
     service = create_store[0]
-    create_store[4]["ephemeral"]["max_effort"] = "low"
+    create_store[4]["ephemeral"].update(max_effort="low", default_effort="low")
     monkeypatch.setattr(service.logger, "warning", Mock(side_effect=RuntimeError("warning failed")))
     result = create(create_store)
     assert database.get_ephemeral_agent(result["name"])["state"] == "pending"
@@ -795,16 +797,16 @@ def test_success_warning_failure_cannot_fail_committed_create(create_store, monk
     "block,top,model_note,effort_note,notice",
     [
         (
-            {"max_effort": "private-effort"},
+            {"max_effort": "low", "default_effort": "low"},
             {},
             "model: provider default (tier omitted, no default_tier)",
-            "effort: provider default (effort omitted; ephemeral.max_effort is not applied yet)",
-            "ephemeral.max_effort is not applied yet; the provider default is used",
+            "effort: provider default (effort omitted; ephemeral.max_effort, ephemeral.default_effort are not applied yet)",
+            "ephemeral.max_effort, ephemeral.default_effort are not applied yet; the provider default is used",
         ),
         (
             {
-                "max_effort": "private-effort",
-                "default_effort": "private-effort",
+                "max_effort": "low",
+                "default_effort": "low",
             },
             {"model_tiers": {"claude_code": {"small": "private-model-id"}}},
             "model: provider default (tier omitted, no default_tier)",

@@ -343,3 +343,49 @@ def test_unknown_S1_reason_fails_closed(create_store, monkeypatch, reason):
     assert err.value.rule == "unexpected_failure" and err.value.status_code == 500
     assert "private-detail" not in err.value.message
     assert not (create_store[2] / "ephemeral").exists()
+
+
+@pytest.mark.parametrize("key", ["max_effort", "default_effort"])
+@pytest.mark.parametrize("value", ["extreme", 2, True, ["low"]])
+def test_B_V1_effort_closed_sets(create_store, key, value):
+    create_store[4]["ephemeral"][key] = value
+    err = assert_no_create(create_store, SPEC, "policy_config_error:" + key)
+    assert err.detail == "ephemeral." + key + " must be one of low, medium, high"
+
+
+@pytest.mark.parametrize("default", [None, "high"])
+def test_B_V2_effort_relation(create_store, default):
+    create_store[4]["ephemeral"].update(max_effort="medium", default_effort=default)
+    err = assert_no_create(create_store, SPEC, "policy_config_error:default_effort")
+    assert "ephemeral.default_effort" in err.detail and "ephemeral.max_effort" in err.detail
+
+
+@pytest.mark.parametrize(
+    "default,ceiling", itertools.product([None, "low", "medium", "high"], repeat=2)
+)
+@pytest.mark.parametrize("tier_default", [None, "small"])
+def test_B_V3_effort_policy_parity(create_store, default, ceiling, tier_default):
+    raw = create_store[4]
+    mapped(raw)
+    raw["ephemeral"].update(default_effort=default, max_effort=ceiling, default_tier=tier_default)
+    settings = create_store[0].read_settings()
+    try:
+        create_store[0].policy_bounds(settings).validate(settings["_model_tiers"])
+    except PolicyConfigError:
+        with pytest.raises(create_store[0].EphemeralPolicyError):
+            create_store[0].validate_block(settings)
+    else:
+        create_store[0].validate_block(settings)
+
+
+def test_B_R2_broken_effort_reverts(create_store):
+    service = create_store[0]
+    name = create(create_store)["name"]
+    create_store[4]["ephemeral"]["max_effort"] = "medium"
+    with pytest.raises(service.EphemeralPolicyError) as err:
+        service.claim_ephemeral_agent(name, {}, CALLER)
+    assert err.value.rule == "policy_config_error:default_effort"
+    row = database.get_ephemeral_agent(name)
+    assert row["state"] == "pending"
+    assert all(row[k] is None for k in ("claim_id", "claim_expires_at", "idempotency_key"))
+    assert "operator must fix ephemeral.default_effort" in err.value.detail

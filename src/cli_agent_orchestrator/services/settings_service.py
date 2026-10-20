@@ -113,6 +113,8 @@ EPHEMERAL_DEFAULTS = {
     "max_depth": 1,
     "max_tier": None,
     "default_tier": None,
+    "max_effort": None,
+    "default_effort": None,
 }
 
 
