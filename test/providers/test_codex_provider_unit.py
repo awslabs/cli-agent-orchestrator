@@ -1007,6 +1007,21 @@ class TestCodexConfigRejectionDiagnostic:
         assert "cao_reviewer.config.toml" in message
         assert "stale_profile" not in message
 
+    def test_stale_rejection_does_not_shadow_a_later_unrelated_failure(self):
+        """A fixed config rejected in the past must not be blamed for a later,
+        unrelated startup failure (e.g. a network error) on the next launch."""
+        pane = (
+            CONFIG_REJECTION_PANE
+            + "\n"
+            + "$ codex --profile cao_reviewer --no-alt-screen --disable shell_snapshot\n"
+            "Error: could not connect to model provider\n"
+            "$ "
+        )
+
+        message = _find_config_rejection(pane)
+
+        assert message is None, "the stale config rejection must not be reported here"
+
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")

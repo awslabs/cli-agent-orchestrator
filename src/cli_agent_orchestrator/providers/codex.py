@@ -170,6 +170,12 @@ CONFIG_ERROR_MESSAGE_ROWS = 8
 # A row that is nothing but the shell prompt codex exits back to. Marks the end
 # of the wrapped rejection message.
 SHELL_PROMPT_ONLY_PATTERN = r"^[$%#>❯›»]\s*$"
+# The shell prompt plus the `codex` invocation CAO itself typed to start this
+# terminal. Anchors _find_config_rejection() on the most recent launch attempt:
+# tmux scrollback can still hold an old rejection from an earlier, already-fixed
+# config above a *later* launch that failed for an unrelated reason, and that
+# stale message must not be reported as explaining the current failure.
+LAUNCH_COMMAND_PATTERN = r"^[$%#>❯›»]\s*codex\b"
 
 # Workspace trust/approval prompt shown when Codex opens a new directory.
 # Two known variants:
@@ -451,12 +457,20 @@ def _find_config_rejection(clean_output: str) -> Optional[str]:
     needs (the ``<name>.config.toml`` path to move settings into) is at the far
     end of it.
 
-    Scans the whole scrollback and keeps the LAST match, not the first: tmux
+    Scans only the most recent launch attempt, not the whole scrollback: tmux
     retains history across restarts, so an old rejection from a previous
-    launch can sit above a current, unrelated failure. The most recent launch
-    is what the caller is being asked to explain.
+    launch can sit above a current, unrelated failure, and that stale
+    rejection must not be reported as explaining a failure it did not cause.
+    The scan is bounded to the rows at or after the last line matching
+    LAUNCH_COMMAND_PATTERN (the `$ codex ...` CAO itself typed); a pane
+    fragment with no visible launch line (e.g. captured mid-attempt) falls
+    back to scanning everything, keeping the LAST match as before.
     """
     rows = [line.strip() for line in clean_output.splitlines() if line.strip()]
+    for index in range(len(rows) - 1, -1, -1):
+        if re.match(LAUNCH_COMMAND_PATTERN, rows[index]):
+            rows = rows[index:]
+            break
     rejection = None
     for index, row in enumerate(rows):
         # Anchor on the row that OPENS the message, not on the row carrying the
