@@ -1074,10 +1074,21 @@ def _validated_script_spec(name: str, source: str, target_path: str) -> ScriptSp
     its finding intact, and it is unreachable here because a syntax error is an ERROR
     finding that the gate refuses first (TS-3A3-5).
 
+    The ``WORKFLOW_MAX_SPEC_BYTES`` check runs BEFORE ``lint_script``, not after: both
+    caps reject oversize input, but they are different budgets with different public
+    messages (#969/#970), and ``SCRIPT_LINT_MAX_SOURCE_CHARS`` (128 KiB) is smaller than
+    ``WORKFLOW_MAX_SPEC_BYTES`` (256 KiB). Linting first would mean every spec over 128
+    KiB — including ones between 128 and 256 KiB that the byte budget alone would still
+    reject — surfaces the lint cap's generic "syntax" finding instead of the stable,
+    actionable "spec exceeds N bytes" error callers already depend on.
+
     Raises:
-        ValueError: a lint ERROR, or a malformed ``INPUTS`` literal. Lint findings
-            travel on the message rather than in a new exception type (TS-3A3-6).
+        ValueError: over the byte cap, a lint ERROR, or a malformed ``INPUTS`` literal.
+            Lint findings travel on the message rather than in a new exception type
+            (TS-3A3-6).
     """
+    if len(source.encode("utf-8")) > WORKFLOW_MAX_SPEC_BYTES:
+        raise ValueError(f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)")
     result = lint_script(source, target_path)
     if result.status == "fail":
         errors = "; ".join(
