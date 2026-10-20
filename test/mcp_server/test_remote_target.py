@@ -76,6 +76,7 @@ class TestResolveRemoteProvider:
         assert provider == "mock_cli"
         mock_requests.get.assert_called_once_with(
             "http://cao-worker-0:9889/agents/profiles/developer",
+            headers=None,
             timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
         )
 

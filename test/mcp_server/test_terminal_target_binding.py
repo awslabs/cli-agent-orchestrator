@@ -494,6 +494,7 @@ class TestAnswerUserPromptBinding:
         mock_requests.post.assert_called_once_with(
             f"{API_BASE_URL}/terminals/{CHILD}/input",
             params={"message": "1", "sender_id": OWN},
+            headers=None,
             timeout=_mcp_timeout(),
         )
 
