@@ -1343,13 +1343,21 @@ async def run_script_workflow(
     #     be logged and the run would continue — the gate would appear to work and would authorise
     #     nothing.
     # No-ops entirely when enforcement is disabled, which is the default.
+    # Bind the launch state at admission, before the gate can yield to an edit.
+    # Defer a capture refusal until after the gate to preserve its 403/503 precedence.
+    capture_error = None
+    try:
+        guard = await asyncio.to_thread(launch_guard.capture)
+    except approval_gate.PlanIdentityUnavailableError as exc:
+        capture_error = exc
     manifest_json = frozen.manifest_json
     approval_gate.ensure_plan_approved(
         tier="script",
         manifest_json=manifest_json,
         unavailable_reason=frozen.unavailable_reason or "internal",
     )
-    guard = await asyncio.to_thread(launch_guard.capture)
+    if capture_error is not None:
+        raise capture_error
 
     # --- Step 1: register the live record + journal the durable run row ---
     record = ScriptRunRecord(

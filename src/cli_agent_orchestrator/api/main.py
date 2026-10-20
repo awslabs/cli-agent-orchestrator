@@ -6079,12 +6079,20 @@ async def submit_workflow_run_endpoint(
         )
         manifest_json = frozen.manifest_json
         try:
+            # Keep the admission snapshot even if the profile set changes during
+            # the gate. Preserve the gate's refusal precedence on capture failure.
+            capture_error = None
+            try:
+                guard = await asyncio.to_thread(launch_guard.capture)
+            except approval_gate.PlanIdentityUnavailableError as exc:
+                capture_error = exc
             approval_gate.ensure_plan_approved(
                 tier="script",
                 manifest_json=manifest_json,
                 unavailable_reason=frozen.unavailable_reason or "internal",
             )
-            guard = await asyncio.to_thread(launch_guard.capture)
+            if capture_error is not None:
+                raise capture_error
         except approval_gate.PlanIdentityUnavailableError as e:
             # 503, not 403: the freeze above returned None, so CAO could not complete its own work and
             # nothing about the caller was wrong. MUST precede the arm below, which is its base class
