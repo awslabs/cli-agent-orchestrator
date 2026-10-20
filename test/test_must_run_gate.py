@@ -236,6 +236,19 @@ def test_marker_without_a_gate_name_is_reported_as_misuse(tmp_path):
     assert "with no gate name" in result.stdout
 
 
+def test_gate_fails_closed_under_pytest_xdist(tmp_path):
+    """Under -n, collection runs on the xdist workers, not this controller plugin
+    instance -- it must fail closed rather than report "0 test(s) ... ran as
+    required" and exit 0 for a gate it never actually checked."""
+    _scratch_session(tmp_path, SKIPPING_TEST)
+    result = _run(tmp_path, "-p", "xdist", "-n", "2", gates="unit")
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "must_run: VIOLATION" in result.stdout
+    assert "pytest-xdist" in result.stdout
+    assert "ran as required" not in result.stdout
+
+
 # ---------------------------------------------------------------------------
 # Wiring guard: every gate must have an owner
 # ---------------------------------------------------------------------------

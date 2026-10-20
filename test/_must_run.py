@@ -72,6 +72,25 @@ class MustRunGate:
         self.owned: List[str] = []
         self._gates_by_nodeid: Dict[str, Tuple[str, ...]] = {}
 
+    # -- session lifecycle --------------------------------------------------
+    def pytest_sessionstart(self, session: pytest.Session) -> None:
+        """Fail closed when this process cannot see collection at all.
+
+        Under pytest-xdist (``-n``), collection and ``pytest_itemcollected`` /
+        ``pytest_collection_modifyitems`` run on the workers, not on this
+        (controller) plugin instance, so ``self._gates_by_nodeid`` and
+        ``self.owned`` never get populated here and every enforcement check
+        below silently never fires. Left unchecked, the controller would print
+        "0 test(s) ... ran as required" and exit 0 -- the exact silent pass
+        this module exists to prevent. Catch it upfront instead.
+        """
+        if self.gates and session.config.pluginmanager.hasplugin("dsession"):
+            self.violations.append(
+                f"{ENV_VAR} cannot be enforced under pytest-xdist ('-n'); this process "
+                "never sees collection, so the gate would otherwise report success "
+                "without checking anything. Rerun the gated job without '-n'."
+            )
+
     # -- collection -------------------------------------------------------
     def pytest_itemcollected(self, item: pytest.Item) -> None:
         """Record every ``must_run`` item as it is collected.
