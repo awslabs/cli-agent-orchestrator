@@ -36,7 +36,8 @@ import pytest
 MARKER = "must_run"
 ENV_VAR = "CAO_MUST_RUN"
 
-#: Registered in ``pyproject.toml`` under ``[tool.pytest.ini_options] markers``.
+#: Registered via ``pytest_configure`` below -- the single source of truth for
+#: the marker's help text (``pytest --markers``).
 MARKER_DESCRIPTION = (
     "must_run(gate): assurance test that must actually execute in the CI job "
     "owning <gate>; a skip or deselection fails the session (see test/_must_run.py)"
@@ -192,4 +193,5 @@ def pytest_configure(config: pytest.Config) -> None:
     marker with no gate name) is still reported locally; only *enforcement* is
     scoped to ``CAO_MUST_RUN``.
     """
+    config.addinivalue_line("markers", MARKER_DESCRIPTION)
     config.pluginmanager.register(MustRunGate(active_gates()), "cao-must-run")

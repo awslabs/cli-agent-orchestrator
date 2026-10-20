@@ -414,8 +414,7 @@ markers = [
     "integration: marks integration tests",
     "e2e: marks end-to-end tests",
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
-    "live_provider: marks tests that need a real cao-server + authenticated provider CLI (gated behind CAO_RUN_LIVE_PROVIDER_TESTS=1, skipped by default)",
-    "must_run(gate): assurance test that must actually execute in the CI job owning <gate>; a skip or deselection fails the session (enforced when CAO_MUST_RUN lists the gate -- see test/_must_run.py)"
+    "live_provider: marks tests that need a real cao-server + authenticated provider CLI (gated behind CAO_RUN_LIVE_PROVIDER_TESTS=1, skipped by default)"
 ]
 asyncio_mode = "strict"
 testpaths = ["test"]
