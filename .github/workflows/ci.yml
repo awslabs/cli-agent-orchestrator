@@ -59,7 +59,7 @@ jobs:
           fi
           # CI intentionally includes integration-marked tests except for the Kiro
           # provider test, which requires an authenticated external CLI.
-          uv run pytest test/ examples/workflow/tests/ \
+          uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ \
             --ignore=test/providers/test_kiro_cli_integration.py \
             --ignore=test/e2e \
             -m "not e2e" \
@@ -211,7 +211,7 @@ jobs:
       - name: Backend coverage (for the ratchet floor)
         # Produces coverage.json (python floor) consumed by coverage:ratchet.
         run: |
-          uv run pytest test/ examples/workflow/tests/ \
+          uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ \
             --ignore=test/providers/test_kiro_cli_integration.py \
             --ignore=test/e2e \
             -m "not e2e" \
@@ -277,10 +277,10 @@ jobs:
         run: uv sync --locked --all-extras --dev
 
       - name: Check code formatting with black
-        run: uv run black --check src/ test/ examples/robotics/cross-zone-transport/
+        run: uv run black --check src/ test/ examples/robotics/cross-zone-transport/ examples/skills/
 
       - name: Check import sorting with isort
-        run: uv run isort --check-only src/ test/ examples/robotics/cross-zone-transport/
+        run: uv run isort --check-only src/ test/ examples/robotics/cross-zone-transport/ examples/skills/
 
       - name: Run type checker with mypy
         run: uv run mypy src/
