@@ -1913,3 +1913,43 @@ async def test_partial_start_snapshot_deleted_on_materialize_error(monkeypatch, 
     assert result.state == RunState.FAILED
     assert not (scratch / "start-partial-stage-failure.py").exists()
     assert "partial-stage-failure" not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforced", [True, False], ids=["enforced", "opt-out"])
+async def test_insert_failure_stops_enforced_script_before_spawn(monkeypatch, tmp_path, enforced):
+    from cli_agent_orchestrator.services import approval_store, settings_service
+
+    settings_service.SETTINGS_FILE.write_text(
+        json.dumps({"workflow": {"require_approval": enforced}})
+    )
+    monkeypatch.setattr(approval_store, "approval_state", lambda plan: approval_store.APPROVED)
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles, "list_agent_profiles", lambda: []
+    )
+    monkeypatch.setattr(settings_service, "is_memory_enabled", lambda: False)
+    private_path = str(tmp_path / "private-journal-location")
+
+    def insert_failure(*args, **kwargs):
+        raise RuntimeError(private_path)
+
+    monkeypatch.setattr(workflow_journal, "insert_run", insert_failure)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    result = await run_script_workflow(
+        _FakeScriptSpec(), {}, "insert-failed", working_directory=str(tmp_path)
+    )
+    if enforced:
+        assert spawned == {}, "an approved run without its journal row must never spawn"
+        assert result.state == RunState.FAILED
+        assert result.kind == "error"
+        assert result.warnings == [
+            "Could not durably record this script run; no script was started. "
+            "Repair the run journal and start a new run."
+        ]
+        assert private_path not in result.model_dump_json()
+        record = script_runner.run_registry["insert-failed"]
+        assert record.state == RunState.FAILED and record.finished_at is not None
+        assert "insert-failed" not in script_runner._active_drives
+    else:
+        assert spawned
+        assert result.state == RunState.COMPLETED

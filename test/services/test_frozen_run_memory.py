@@ -351,3 +351,27 @@ def test_the_block_content_is_never_logged(journalled_run, resolves, caplog):
         frozen_run_memory.frozen_memory_for(journalled_run, "term-1", "task")
 
     assert "LIVE BLOCK" not in caplog.text, "memory text must not reach a second sink"
+
+
+@pytest.mark.parametrize(
+    "run_id, expected",
+    [("missing-script", ""), ("missing-yaml", None), ("unknown", None), (None, None)],
+)
+def test_missing_row_never_selects_live_memory_for_known_script(
+    monkeypatch, resolves, run_id, expected
+):
+    from types import SimpleNamespace
+
+    from cli_agent_orchestrator.services import workflow_service
+
+    monkeypatch.setattr(workflow_journal, "get_run", lambda key: None)
+    monkeypatch.setattr(
+        workflow_service,
+        "run_registry",
+        {
+            "missing-script": SimpleNamespace(tier="script"),
+            "missing-yaml": SimpleNamespace(tier="yaml"),
+        },
+    )
+    assert frozen_run_memory.frozen_memory_for(run_id, "term", "work") == expected
+    assert resolves == []

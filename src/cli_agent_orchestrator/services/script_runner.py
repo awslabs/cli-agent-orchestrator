@@ -1338,11 +1338,9 @@ async def run_script_workflow(
     #   * BEFORE the registry write and the journal INSERT, so a refused start leaves no live record
     #     and no ``workflow_run`` row. Every first run of a new plan is refused by design, so
     #     recording them would durably record runs that never happened.
-    #   * OUTSIDE the ``try`` around ``insert_run`` below, which swallows EVERY exception by design
-    #     ("journal insert is best-effort; live floor still serves"). A refusal raised inside it would
-    #     be logged and the run would continue — the gate would appear to work and would authorise
-    #     nothing.
-    # No-ops entirely when enforcement is disabled, which is the default.
+    #   * OUTSIDE the ``try`` around ``insert_run`` below, so an approval refusal
+    #     cannot be handled as a journal fault (best-effort when enforcement is off).
+    # No-ops entirely when enforcement is disabled through the explicit opt-out.
     # Bind the launch state at admission, before the gate can yield to an edit.
     # Defer a capture refusal until after the gate to preserve its 403/503 precedence.
     capture_error = None
@@ -1407,9 +1405,18 @@ async def run_script_workflow(
             # it; reusing it rather than rebuilding is what makes checked-equals-stored true.
             manifest_json,
         )
-    except (
-        Exception
-    ) as e:  # noqa: BLE001 — journal insert is best-effort; live floor still serves (INV-4)
+    except Exception as e:  # noqa: BLE001 — a failed admission must settle before spawn
+        if guard.get("approval_required", True) or approval_gate.is_workflow_approval_required():
+            # An enforced run needs the durable guard and frozen-memory state.
+            # Never expose the journal exception (which can include local paths).
+            logger.warning("journal: script insert_run failed; refusing script spawn")
+            return await _finalize(
+                record,
+                state=RunState.FAILED,
+                kind="error",
+                error="Could not durably record this script run; no script was started. "
+                "Repair the run journal and start a new run.",
+            )
         logger.warning("journal: script insert_run for '%s' failed (run continues): %s", run_id, e)
 
     # --- Step 2: spawn (constructed env) + Step 3/4: drive, reap, interpret ---
