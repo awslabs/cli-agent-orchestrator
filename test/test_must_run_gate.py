@@ -218,7 +218,9 @@ def test_xfail_is_not_reported_as_a_must_run_violation(tmp_path):
     assert "VIOLATION" not in result.stdout
 
 
-def test_marker_without_a_gate_name_is_reported_as_misuse(tmp_path):
+@pytest.mark.parametrize("gates", [None, "unit"], ids=["unset", "unit-enforced"])
+def test_marker_without_a_gate_name_is_reported_as_misuse(tmp_path, gates):
+    """A bare marker fails the session regardless of CAO_MUST_RUN, including unset."""
     _scratch_session(
         tmp_path,
         """
@@ -229,7 +231,7 @@ def test_marker_without_a_gate_name_is_reported_as_misuse(tmp_path):
             assert True
         """,
     )
-    result = _run(tmp_path, gates="unit")
+    result = _run(tmp_path, gates=gates)
 
     assert result.returncode != 0, result.stdout + result.stderr
     assert "must_run: MISUSE" in result.stdout
