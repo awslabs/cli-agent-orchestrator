@@ -31,12 +31,13 @@ TOKEN = "local-machine-token"
 def auth_enabled():
     """Enable the auth layer with a provisioned local token.
 
-    ``get_local_bearer`` is default-off and reads both of these, so this is the
-    whole switch -- no server needs to be running for a header assertion.
+    ``get_local_bearer`` is default-off and reads ``CAO_AUTH_LOCAL_TOKEN``, so
+    that is the whole switch -- no server needs to be running for a header
+    assertion.
     """
     with patch.dict(
         os.environ,
-        {"CAO_AUTH_ENABLED": "true", "CAO_AUTH_LOCAL_TOKEN": TOKEN},
+        {"CAO_AUTH_LOCAL_TOKEN": TOKEN},
     ):
         from cli_agent_orchestrator.security.auth import get_local_bearer
 
