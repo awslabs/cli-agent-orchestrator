@@ -434,7 +434,7 @@ line_length = 100
 # But six are real, and each one is a test that silently never runs, because Python keeps
 # only the second definition and pytest collects only what Python kept:
 #
-#   test/utils/test_opencode_config.py:28 vs :57   class TestToOpencodeAgentId
+#   test/utils/test_opencode_config.py:27 vs :56   class TestToOpencodeAgentId
 #       -- the shadowed copy is the GHSA-6m35-gcf5-xm75 path-traversal regression
 #          (5 parametrized hostile names). VERIFIED not collected before #1005.
 #   test/providers/test_kiro_cli_unit.py:758/772/792/808 shadowed by :830/844/864/880
