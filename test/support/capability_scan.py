@@ -30,7 +30,16 @@ in:
   the name without reading it.
 
 Only a CONSUMER proves the capability reaches a decision. An OVERRIDE with no
-CONSUMER anywhere is precisely the #752/#814 shape.
+CONSUMER anywhere is precisely the #752/#814 shape. A CONSUMER in the same
+file as the only OVERRIDE does not count either: a self-call inside an
+overriding implementation proves that implementation uses its own method, not
+that anything outside it does.
+
+The ``event_type`` surface (plugin event names) is the one exception to the
+string-literal CONSUMER rule above: a ``@hook("post_x")`` subscriber or an
+event lookup table only proves the name is wired for receipt, not that
+anything ever dispatches it. For that kind, CONSUMER means instantiating the
+declaring event class outside its own module instead.
 """
 
 from __future__ import annotations
@@ -38,6 +47,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Sequence
 
@@ -61,6 +71,10 @@ class Capability:
     kind: str
     module: Path
     lineno: int
+    class_name: str = ""
+    """Declaring class name; only set for ``kind == "event_type"``, where the
+    capability's proof-of-reachability is instantiation of this class, not a
+    string-literal read of ``name`` (see :func:`_find_event_emissions`)."""
 
     @property
     def where(self) -> str:
@@ -90,8 +104,15 @@ class ScanResult:
 
     @property
     def reachable(self) -> bool:
-        """True when some decision path outside the declaring module reads it."""
-        return bool(self.consumers)
+        """True when some decision path outside the declaring module reads it.
+
+        A consumer in a file that itself overrides the name proves only that
+        this one implementation calls its own method or reads its own flag --
+        not that anything outside it does. Only a consumer in a file with no
+        override of the same name counts.
+        """
+        override_modules = {ov.module for ov in self.overrides}
+        return any(c.module not in override_modules for c in self.consumers)
 
 
 # --------------------------------------------------------------------------
@@ -135,6 +156,14 @@ def _is_docstring(st: ast.Expr) -> bool:
     return isinstance(st.value, ast.Constant) and isinstance(st.value.value, str)
 
 
+@lru_cache(maxsize=None)
+def parse_cached(path: Path) -> ast.Module:
+    """Parse ``path`` once. Every surface and test re-scans the same ``src/``
+    tree, so an uncached ``ast.parse`` per call multiplies real I/O + parse
+    cost by the number of surfaces and tests that run in one process."""
+    return ast.parse(path.read_text())
+
+
 def _class_def(tree: ast.AST, class_name: str) -> ast.ClassDef:
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef) and node.name == class_name:
@@ -166,7 +195,7 @@ def declared_capabilities(
         Capabilities in declaration order. Private names (leading ``_``) and
         dunders are never capabilities -- they are internal state.
     """
-    tree = ast.parse(module.read_text())
+    tree = parse_cached(module)
     cls = _class_def(tree, class_name)
     found: dict[str, Capability] = {}
 
@@ -206,7 +235,11 @@ def _declared_event_types(
 
     The capability here is the event NAME, because that string is the whole
     contract between an emitter and a ``@hook("...")`` subscriber: a vocabulary
-    entry nobody emits is a hook that can never fire.
+    entry nobody emits is a hook that can never fire. The declaring class's own
+    name is recorded as ``class_name`` -- for this kind, reachability is proven
+    by instantiating that class (see :func:`_find_event_emissions`), not by any
+    string-literal read of the event name: a subscriber or a lookup table names
+    the event without proving anything ever emits it (#1005 P2-1).
     """
     out: dict[str, Capability] = {}
     for node in ast.walk(tree):
@@ -226,7 +259,11 @@ def _declared_event_types(
                 name = st.value.value
                 if name_filter is None or name_filter(name):
                     out[name] = Capability(
-                        name=name, kind="event_type", module=module, lineno=st.lineno
+                        name=name,
+                        kind="event_type",
+                        module=module,
+                        lineno=st.lineno,
+                        class_name=node.name,
                     )
     return out
 
@@ -307,16 +344,25 @@ def _is_proving_literal_position(node: ast.Constant, parent: ast.AST | None) -> 
 
 
 def _used_names(tree: ast.AST, *, include_strings: bool) -> Iterator[tuple[str, int]]:
-    """Names this module READS: attribute access, bare identifiers, proving literals."""
+    """Names this module READS: attribute access, bare identifiers, proving literals.
+
+    Only ``ast.Load`` context counts. A Store-context ``Attribute``/``Name`` --
+    ``self.supports_probe: bool = True``, or the unpacked
+    ``self.supports_probe, self._x = True, 1`` -- is itself an assignment, not
+    a read, whatever shape the target takes (#1005 P2-2). Checking ``ctx``
+    instead of trying to enumerate every assignment-target shape in
+    ``_declared_names`` covers annotated and tuple-unpacked attribute targets
+    that function previously missed.
+    """
     declared = {(name, line) for name, line in _declared_names(tree)}
     docstrings = _docstring_nodes(tree) if include_strings else set()
     parents = _parent_map(tree) if include_strings else {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute):
-            if (node.attr, node.lineno) not in declared:
+            if isinstance(node.ctx, ast.Load) and (node.attr, node.lineno) not in declared:
                 yield node.attr, node.lineno
         elif isinstance(node, ast.Name):
-            if (node.id, node.lineno) not in declared:
+            if isinstance(node.ctx, ast.Load) and (node.id, node.lineno) not in declared:
                 yield node.id, node.lineno
         elif include_strings and isinstance(node, ast.Constant) and isinstance(node.value, str):
             if id(node) not in docstrings and _is_proving_literal_position(
@@ -349,7 +395,7 @@ def find_references(
     for path in search_files:
         if path.resolve() == declaring:
             continue
-        tree = ast.parse(path.read_text())
+        tree = parse_cached(path)
         is_impl = path.resolve() in impl
         if is_impl:
             for name, lineno in _declared_names(tree):
@@ -358,6 +404,43 @@ def find_references(
         for name, lineno in _used_names(tree, include_strings=include_strings):
             if name in wanted:
                 results[name].consumers.append(Reference(RefKind.CONSUMER, path, lineno))
+    return results
+
+
+def _find_event_emissions(
+    capabilities: Sequence[Capability],
+    *,
+    declaring_module: Path,
+    search_files: Sequence[Path],
+) -> dict[str, ScanResult]:
+    """Consumer = instantiation of the event's class outside the declaring module.
+
+    A ``@hook("post_x")`` subscriber or an event-name lookup table only proves
+    the event is wired for *receipt*; it vouches for every name on the surface
+    whether or not anything ever dispatches it. Only ``PostXEvent(...)``
+    proves some decision path actually emits the event (#1005 P2-1).
+    """
+    by_class: dict[str, list[Capability]] = {}
+    for cap in capabilities:
+        by_class.setdefault(cap.class_name, []).append(cap)
+    results = {cap.name: ScanResult(capability=cap) for cap in capabilities}
+    declaring = declaring_module.resolve()
+
+    for path in search_files:
+        if path.resolve() == declaring:
+            continue
+        tree = parse_cached(path)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name):
+                called = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                called = node.func.attr
+            else:
+                continue
+            for cap in by_class.get(called, []):
+                results[cap.name].consumers.append(Reference(RefKind.CONSUMER, path, node.lineno))
     return results
 
 
@@ -371,18 +454,38 @@ def scan_surface(
     include_strings: bool = False,
     search_root: Path = SRC_ROOT,
 ) -> list[ScanResult]:
-    """Run both helpers over one (base class, implementation glob) pair."""
+    """Run both helpers over one (base class, implementation glob) pair.
+
+    ``event_type`` capabilities are routed through :func:`_find_event_emissions`
+    instead of :func:`find_references`: a string-literal read proves an event
+    is named somewhere, not that anything emits it (#1005 P2-1).
+    """
     caps = declared_capabilities(declaring_module, class_name, kinds=kinds, name_filter=name_filter)
-    implementations = [
-        p for p in sorted(search_root.glob(implementation_glob)) if p != declaring_module
-    ]
-    refs = find_references(
-        [c.name for c in caps],
-        declaring_module=declaring_module,
-        implementation_files=implementations,
-        search_files=python_files(search_root),
-        include_strings=include_strings,
-    )
+    search_files = python_files(search_root)
+    event_caps = [c for c in caps if c.kind == "event_type"]
+    other_caps = [c for c in caps if c.kind != "event_type"]
+
+    refs: dict[str, ScanResult] = {}
+    if other_caps:
+        implementations = [
+            p for p in sorted(search_root.glob(implementation_glob)) if p != declaring_module
+        ]
+        refs.update(
+            find_references(
+                [c.name for c in other_caps],
+                declaring_module=declaring_module,
+                implementation_files=implementations,
+                search_files=search_files,
+                include_strings=include_strings,
+            )
+        )
+    if event_caps:
+        refs.update(
+            _find_event_emissions(
+                event_caps, declaring_module=declaring_module, search_files=search_files
+            )
+        )
+
     out = []
     for cap in caps:
         result = refs[cap.name]

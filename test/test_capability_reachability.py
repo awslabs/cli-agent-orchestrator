@@ -30,6 +30,7 @@ from test.support.capability_scan import (
     SRC_ROOT,
     declared_capabilities,
     find_references,
+    parse_cached,
     python_files,
     scan_surface,
 )
@@ -69,11 +70,19 @@ SURFACES = {
 }
 
 # Capability -> why it is allowed to have no consumer on a decision path.
-# Empty on purpose: as of this commit every declared capability on all four
-# surfaces is consumed somewhere in src/. An entry here is a documented debt,
-# not a way to silence the scan -- state what reads it instead, or when it will
-# be read.
-ALLOWLIST: dict[str, str] = {}
+# An entry here is a documented debt, not a way to silence the scan -- state
+# what reads it instead, or when it will be read. `test_allowlist_entries_are_
+# still_needed` expires an entry automatically once a real consumer lands.
+ALLOWLIST: dict[str, str] = {
+    "wait_until_input_ready": (
+        "BaseProvider.wait_until_input_ready (providers/base.py) is called only by "
+        "ClaudeCodeProvider.initialize, on its own override (providers/claude_code.py). "
+        "A consumer inside the only overriding file proves that implementation calls its "
+        "own method, not that any other provider's override ever runs (#1005 P2-2). Other "
+        "providers that override this hook must call it themselves until a generic caller "
+        "(e.g. in BaseProvider's lifecycle) reads it instead -- remove this entry then."
+    ),
+}
 
 # Capability name prefixes that mark a `getattr` literal as a capability read.
 CAPABILITY_PREFIXES = (
@@ -136,6 +145,9 @@ class TestCapabilitiesAreReachable:
         missing_reason = [name for name, reason in ALLOWLIST.items() if not reason.strip()]
         assert not missing_reason, f"allowlist entries need a reason: {missing_reason}"
 
+        if not ALLOWLIST:
+            return  # nothing to re-scan src/ for.
+
         reachable = {
             r.capability.name
             for surface in SURFACES
@@ -156,7 +168,7 @@ class TestNoStaleCapabilityReads:
     def _capability_getattr_literals():
         """Yield (name, file:line) for every ``getattr(x, "<capability>", ...)``."""
         for path in python_files(SRC_ROOT):
-            tree = ast.parse(path.read_text())
+            tree = parse_cached(path)
             for node in ast.walk(tree):
                 if not (
                     isinstance(node, ast.Call)
@@ -240,6 +252,122 @@ class TestConsumerLiteralPrecision:
             include_strings=True,
         )
         assert refs["supports_probe"].consumers, f"expected a consumer for: {source!r}"
+
+    @pytest.mark.parametrize(
+        "assignment",
+        [
+            "self.supports_probe: bool = True\n",
+            "self.supports_probe, self._x = True, 1\n",
+        ],
+    )
+    def test_store_context_attribute_assignment_is_not_a_consumer(self, tmp_path, assignment):
+        """Regression for P2-2 kind 2: an annotated or tuple-unpacked ``self.x =
+        ...`` is a Store-context assignment, not a read, whatever shape the
+        target takes."""
+        declaring = tmp_path / "base.py"
+        declaring.write_text("class Base:\n    supports_probe: bool = False\n")
+        impl = tmp_path / "impl.py"
+        impl.write_text(f"class Impl(Base):\n    def __init__(self):\n        {assignment}")
+
+        refs = find_references(
+            ["supports_probe"],
+            declaring_module=declaring,
+            implementation_files=[impl],
+            search_files=[declaring, impl],
+            include_strings=True,
+        )
+        assert not refs[
+            "supports_probe"
+        ].consumers, (
+            f"a Store-context attribute assignment must not count as a consumer: {assignment!r}"
+        )
+
+    def test_self_call_inside_the_only_override_is_not_reachable(self, tmp_path):
+        """Regression for P2-2 kind 1 (the live ``wait_until_input_ready`` shape):
+        a self-call inside the sole overriding implementation proves only that
+        implementation uses its own method, not that anything outside it does."""
+        declaring = tmp_path / "base.py"
+        declaring.write_text(
+            "class Base:\n    def wait_until_input_ready(self) -> None:\n        pass\n"
+        )
+        impl = tmp_path / "impl.py"
+        impl.write_text(
+            "class Impl(Base):\n"
+            "    def initialize(self):\n"
+            "        self.wait_until_input_ready()\n"
+            "    def wait_until_input_ready(self) -> None:\n"
+            "        ...\n"
+        )
+
+        refs = find_references(
+            ["wait_until_input_ready"],
+            declaring_module=declaring,
+            implementation_files=[impl],
+            search_files=[declaring, impl],
+            include_strings=True,
+        )
+        result = refs["wait_until_input_ready"]
+        assert result.overrides, "expected impl.py to register as an override"
+        assert not result.reachable, (
+            "a self-call inside the only overriding file must not make the capability "
+            "reachable -- it proves only that this implementation uses its own method"
+        )
+
+
+class TestEventEmissionRequiresInstantiation:
+    """Regression for P2-1: a subscriber or lookup table must not prove an event fires.
+
+    The only proof that a decision path ever dispatches a ``CaoEvent`` subclass
+    is instantiating it; a ``@hook("post_x")`` subscriber or an event-name
+    lookup table vouches for receipt, not dispatch.
+    """
+
+    def test_subscribed_but_never_instantiated_event_is_not_reachable(self, tmp_path):
+        declaring = tmp_path / "events.py"
+        declaring.write_text(
+            "class CaoEvent:\n    pass\n\n\n"
+            'class PostProbeEvent(CaoEvent):\n    event_type: str = "post_probe"\n'
+        )
+        subscriber = tmp_path / "subscriber.py"
+        subscriber.write_text('@hook("post_probe")\ndef on_probe():\n    pass\n')
+
+        results = {
+            r.capability.name: r
+            for r in scan_surface(
+                declaring_module=declaring,
+                class_name="CaoEvent",
+                kinds=("event_type",),
+                implementation_glob="*.py",
+                include_strings=True,
+                search_root=tmp_path,
+            )
+        }
+        assert not results["post_probe"].reachable, (
+            "a @hook subscriber alone must not prove the event is ever emitted -- "
+            "nothing in src/ instantiates PostProbeEvent"
+        )
+
+    def test_instantiated_event_is_reachable(self, tmp_path):
+        declaring = tmp_path / "events.py"
+        declaring.write_text(
+            "class CaoEvent:\n    pass\n\n\n"
+            'class PostProbeEvent(CaoEvent):\n    event_type: str = "post_probe"\n'
+        )
+        emitter = tmp_path / "emitter.py"
+        emitter.write_text("from events import PostProbeEvent\n\nPostProbeEvent()\n")
+
+        results = {
+            r.capability.name: r
+            for r in scan_surface(
+                declaring_module=declaring,
+                class_name="CaoEvent",
+                kinds=("event_type",),
+                implementation_glob="*.py",
+                include_strings=True,
+                search_root=tmp_path,
+            )
+        }
+        assert results["post_probe"].reachable, "instantiating the event class must count"
 
 
 class TestScanItselfIsWired:
