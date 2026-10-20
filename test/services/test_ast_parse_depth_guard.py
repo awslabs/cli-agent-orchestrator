@@ -1,5 +1,5 @@
 """Guard tests: every parser call on untrusted text, reachable by import-resolved dotted
-name, stays behind a length bound (#9001).
+name, stays behind a length bound (#969).
 
 The defect class, not the instance. A function contracted to be total ("never raises
 on input content") reaches an UNGATED NATIVE-RECURSION primitive -- CPython's C parser
@@ -66,7 +66,7 @@ _ALLOWED_PARSER_CALLS: Dict[Tuple[str, str, str], str] = {
         "and bail on its oversize finding: _read_script_spec (:1012) skips extraction when "
         "a rule_id == 'syntax' finding exists, _validated_script_spec (:1087) raises on "
         "status == 'fail'. test_oversize_rejection_keeps_the_rule_id_extract_inputs_skips_on "
-        "pins that coupling; giving the oversize rejection its own rule_id reopens #9001."
+        "pins that coupling; giving the oversize rejection its own rule_id reopens #969."
     ),
     (
         "cli_agent_orchestrator/services/workflow_spec_service.py",
@@ -149,7 +149,7 @@ def test_every_ast_parse_site_is_allowlisted_with_a_length_bound() -> None:
     assert not unbounded, (
         "new parser call on possibly-untrusted text with no recorded length bound: "
         f"{unbounded}. Bound the input BEFORE the parse (see SCRIPT_LINT_MAX_SOURCE_CHARS "
-        "and #9001), then add the site to _ALLOWED_PARSER_CALLS."
+        "and #969), then add the site to _ALLOWED_PARSER_CALLS."
     )
     stale = sorted(f"{p}::{q}::{t}" for p, q, t in expected - seen)
     assert not stale, f"_ALLOWED_PARSER_CALLS has rotted; these sites are gone: {stale}"
@@ -164,7 +164,7 @@ from cli_agent_orchestrator.constants import WORKFLOW_MAX_SPEC_BYTES
 from cli_agent_orchestrator.services.script_lint import lint_script
 from cli_agent_orchestrator.services import workflow_spec_service as wss
 
-# 1. The exact #9001 input, through the linter's own cap.
+# 1. The exact #969 input, through the linter's own cap.
 source = "a" + ".b" * 200_000 + "\\n"
 assert lint_script(source, "deep.py").status == "fail"
 
@@ -191,7 +191,7 @@ print("SURVIVED")
 
 
 def test_pathological_nesting_crashes_no_child_interpreter(tmp_path: Path) -> None:
-    """The exact #9001 input, through BOTH parser entry points, must return control."""
+    """The exact #969 input, through BOTH parser entry points, must return control."""
 
     env = {**os.environ, "CAO_HOME_DIR": str(tmp_path), "PYTHONFAULTHANDLER": "1"}
     proc = subprocess.run(
@@ -207,7 +207,7 @@ def test_pathological_nesting_crashes_no_child_interpreter(tmp_path: Path) -> No
         f"-11 is SIGSEGV). Either lint_script's cap regressed, or the worst-case source "
         f"WORKFLOW_MAX_SPEC_BYTES admits is past this machine's ast.parse C-stack cliff -- "
         f"in which case _extract_inputs needs a crash cap of its own, not a byte budget "
-        f"(#9001). stderr:\n{proc.stderr}"
+        f"(#969). stderr:\n{proc.stderr}"
     )
     assert "SURVIVED" in proc.stdout
 
@@ -236,7 +236,7 @@ def test_lint_cap_stays_below_the_measured_segfault_cliff() -> None:
     # ~2 chars per level, so 128 KiB admits 65_536 levels -- ~2.6x of margin.
     assert SCRIPT_LINT_MAX_SOURCE_CHARS <= 128 * 1024, (
         "raising this cap narrows the margin to the ast.parse segfault cliff; re-measure "
-        "the cliff on the target runner first (#9001)"
+        "the cliff on the target runner first (#969)"
     )
     largest = _REPO_ROOT / "examples" / "workflows" / "pr-health" / "pr_health.py"
     assert largest.is_file(), largest
