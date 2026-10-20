@@ -115,6 +115,7 @@ def test_create_files_hashes_and_response(create_store):
         assert path.stat().st_mode & 0o777 == 0o700
     audit = json.loads(archive.read_bytes())
     assert set(audit) == {
+        "launch_values",
         "audit_version",
         "name",
         "spec",
@@ -192,7 +193,7 @@ def test_policy_rejections_leave_nothing(create_store, patch, rule, caplog):
 @pytest.mark.parametrize(
     "key,values",
     [
-        ("model_tier", ["small", "medium", "large", "auto"]),
+        ("model_tier", ["auto"]),
         ("effort", ["low", "medium", "high", "auto"]),
     ],
 )
@@ -208,17 +209,14 @@ def test_tiers_and_effort_not_yet_supported(create_store, key, values):
         )
     with pytest.raises(service.EphemeralPolicyError) as err:
         create(create_store, {**SPEC, "model_tier": "small", "effort": "auto"})
-    assert err.value.rule == "tier_not_supported"
+    assert err.value.rule == "auto_requires_decision_platform"
 
 
 @pytest.mark.parametrize(
     "key,value",
     [
-        ("max_tier", "small"),
-        ("default_tier", "small"),
         ("max_effort", "low"),
         ("default_effort", "low"),
-        ("model_tiers", {"claude_code": {"small": "mapped-model"}}),
     ],
 )
 def test_ignored_policy_keys_warn_and_do_not_apply(create_store, key, value, caplog):
@@ -453,7 +451,7 @@ def test_invalid_config_precedes_creator(create_store, key, value):
             {},
             "kiro_cli",
             False,
-            "tier_not_supported",
+            "auto_requires_decision_platform",
         ),
         (["*"], {"effort": "low"}, {}, "kiro_cli", False, "effort_not_supported"),
         (["*"], {}, {"allowed_providers": ["codex"]}, "kiro_cli", False, "provider_unsupported"),
@@ -797,13 +795,6 @@ def test_success_warning_failure_cannot_fail_committed_create(create_store, monk
     "block,top,model_note,effort_note,notice",
     [
         (
-            {"max_tier": "small", "default_tier": "small"},
-            {"model_tiers": {"claude_code": {"small": "private-model-id"}}},
-            "model: provider default (tier omitted; ephemeral.max_tier, ephemeral.default_tier, model_tiers are not applied yet)",
-            "effort: provider default (effort omitted, no default_effort)",
-            "ephemeral.max_tier, ephemeral.default_tier, model_tiers are not applied yet; the provider default is used",
-        ),
-        (
             {"max_effort": "private-effort"},
             {},
             "model: provider default (tier omitted, no default_tier)",
@@ -812,15 +803,13 @@ def test_success_warning_failure_cannot_fail_committed_create(create_store, monk
         ),
         (
             {
-                "max_tier": "small",
-                "default_tier": "small",
                 "max_effort": "private-effort",
                 "default_effort": "private-effort",
             },
             {"model_tiers": {"claude_code": {"small": "private-model-id"}}},
-            "model: provider default (tier omitted; ephemeral.max_tier, ephemeral.default_tier, model_tiers are not applied yet)",
+            "model: provider default (tier omitted, no default_tier)",
             "effort: provider default (effort omitted; ephemeral.max_effort, ephemeral.default_effort are not applied yet)",
-            "ephemeral.max_tier, ephemeral.default_tier, ephemeral.max_effort, ephemeral.default_effort, model_tiers are not applied yet; the provider default is used",
+            "ephemeral.max_effort, ephemeral.default_effort are not applied yet; the provider default is used",
         ),
     ],
 )
@@ -868,7 +857,7 @@ def test_declared_non_v1_provider_obeys_fixed_check_order(create_store):
     spec = {**SPEC, "provider": "kiro_cli", "model_tier": "small"}
     with pytest.raises(service.EphemeralPolicyError) as err:
         create(create_store, spec)
-    assert err.value.rule == "tier_not_supported"
+    assert err.value.rule == "provider_unsupported"
     config["ephemeral"]["max_depth"] = 2
     with pytest.raises(service.EphemeralPolicyError) as err:
         create(create_store, spec)
