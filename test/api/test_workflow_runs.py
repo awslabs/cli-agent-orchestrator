@@ -2919,7 +2919,9 @@ def test_admission_guard_refuses_profile_edited_during_gate(
     )
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["kind"] == "plan_inputs_changed"
-    assert "changed after" in response.json()["detail"]["message"]
+    assert response.json()["detail"]["message"].startswith(
+        "Agent profile 'developer' changed after"
+    )
     create.assert_not_called()
 
 
