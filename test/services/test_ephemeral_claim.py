@@ -85,7 +85,10 @@ def test_early_refusal_order_and_unchanged_row(claimed_store, caller, body, rule
 
 
 @pytest.mark.parametrize("field", ["idempotency_key", "claim_id"])
-def test_launched_retry_precedes_model_and_tightened_policy(claimed_store, monkeypatch, field):
+@pytest.mark.parametrize("policy", ["tightened", "broken"])
+def test_launched_retry_precedes_model_and_tightened_policy(
+    claimed_store, monkeypatch, field, policy
+):
     env, name = claimed_store
     row_update(
         env,
@@ -103,6 +106,8 @@ def test_launched_retry_precedes_model_and_tightened_policy(claimed_store, monke
     env[4]["model_tiers"] = {
         "claude_code": {tier: "model-" + tier for tier in ("small", "medium", "large")}
     }
+    if policy == "broken":
+        env[4]["ephemeral"]["allowed_providers"] = []
     result = claim(
         env, name, model="ignored", **{field: "a" * 32 if field == "claim_id" else "retry"}
     )

@@ -197,16 +197,12 @@ def test_policy_rejections_leave_nothing(create_store, patch, rule, caplog):
         ("effort", ["auto"]),
     ],
 )
-def test_tiers_and_effort_not_yet_supported(create_store, key, values):
+def test_auto_refuses_in_either_field(create_store, key, values):
     service = create_store[0]
     for value in values:
         with pytest.raises(service.EphemeralPolicyError) as err:
             create(create_store, {**SPEC, key: value})
-        assert err.value.rule == (
-            "auto_requires_decision_platform"
-            if value == "auto"
-            else "tier_not_supported" if key == "model_tier" else "effort_not_supported"
-        )
+        assert err.value.rule == "auto_requires_decision_platform"
     with pytest.raises(service.EphemeralPolicyError) as err:
         create(create_store, {**SPEC, "model_tier": "small", "effort": "auto"})
     assert err.value.rule == "auto_requires_decision_platform"
