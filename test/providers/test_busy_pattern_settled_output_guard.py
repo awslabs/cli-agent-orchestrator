@@ -1,4 +1,4 @@
-"""Structural guard (GH #9011): no live-status pattern may match settled output.
+"""Structural guard (GH #974): no live-status pattern may match settled output.
 
 Every provider decides PROCESSING by matching a "the agent is working" pattern
 against pane text. Those patterns are each spelled out independently, and the
@@ -9,7 +9,7 @@ ordinary settled line reads PROCESSING. On ``get_status_from_screen`` that scan
 is an unscoped ``any()`` over the bottom rows, so the settled line pins
 PROCESSING until it scrolls off: ``_wait_for_completion`` sees neither COMPLETED
 nor IDLE and burns its whole budget as a timeout, and InboxService (IDLE or
-COMPLETED only) starves. That is #908 -> #956 -> #9011.
+COMPLETED only) starves. That is #908 -> #956 -> #974.
 
 This file enumerates the busy patterns instead of the lines: every module-level
 live-status pattern in every provider module is discovered by name and must
@@ -38,7 +38,7 @@ _IS_PATTERN_NAME = re.compile(r"(?:PATTERN|_RE)$")
 # Settled output: finished responses, tool-call lines and static chrome. None of
 # these is a live spinner, in any provider's TUI.
 SETTLED_LINES = [
-    # GH #9011: a finished response that reports its own timing. "●" is also
+    # GH #974: a finished response that reports its own timing. "●" is also
     # Claude Code's response marker and its reduced-motion spinner glyph.
     "● Done. The fix is in place… (3m 12s)",
     "● Approved the plan… (↓ 1.2k tokens)",
@@ -77,7 +77,7 @@ KNOWN_LOOSE = {
         "line-level form used next to the input box."
     ),
     "cursor_cli.PROCESSING_PATTERN": (
-        "KNOWN LIVE GAP, sibling of GH #9011: the glyph class includes '·' with "
+        "KNOWN LIVE GAP, sibling of GH #974: the glyph class includes '·' with "
         "no first-word gerund anchor, so a settled '·' bullet or the version "
         "footer directly above the last separator reads PROCESSING on "
         "cursor_cli's backwards walk (cursor_cli.py:728). Tracked for its own "
@@ -133,7 +133,7 @@ def test_busy_pattern_rejects_settled_output(qualname, pattern):
     assert not hits, (
         f"{qualname} reads settled output as a live spinner: {hits}. A busy "
         f"pattern that matches finished output pins PROCESSING on the unscoped "
-        f"screen scan (GH #9011). Anchor the match -- e.g. require the first "
+        f"screen scan (GH #974). Anchor the match -- e.g. require the first "
         f"word after the glyph to be a gerund, as claude_code._SPINNER_VERB "
         f"does -- or add {qualname} to KNOWN_LOOSE with the scoping that makes "
         f"it safe."

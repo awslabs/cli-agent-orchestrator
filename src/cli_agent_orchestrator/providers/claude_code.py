@@ -284,7 +284,7 @@ NEW_TUI_SPINNER_PATTERN = r"[✶✢✽✻✳·*][^\n]*ing…"
 # contraction ("Beboppin'", with either ASCII ' or the typographic ’). A plain
 # "\w*ing\b" rejects both — \w spans no "-" and no "'" — which is why #956
 # dropped the first-word anchor entirely rather than widening it, and that is
-# what left the reduced-motion pattern matching finished responses (GH #9011).
+# what left the reduced-motion pattern matching finished responses (GH #974).
 # No "\b" after the contraction: the next character is the "…", so there is no
 # word boundary to assert there.
 _SPINNER_VERB = r"[\w'’-]*(?:ing\b|in['’])"
@@ -302,7 +302,7 @@ NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+" + 
 # "● Analyzing… the diff is fine" and the tool-call line
 # "● Calling cao-mcp-server… (ctrl+o to expand)" do not match.
 #
-# GH #9011: the status anchor alone is NOT enough, because a finished response
+# GH #974: the status anchor alone is NOT enough, because a finished response
 # can carry a duration or token parenthetical of its own — "● Done. The fix is
 # in place… (3m 12s)", "● Approved the plan… (↓ 1.2k tokens)" — and "●" is the
 # response marker. That read PROCESSING on both status paths, and on the

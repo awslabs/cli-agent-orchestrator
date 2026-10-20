@@ -3192,7 +3192,7 @@ class TestClaudeCodeReducedMotionSpinner:
 
 
 class TestClaudeCodeReducedMotionFinishedResponse:
-    """GH #9011 (follow-up to #908 / #956): the reduced-motion pattern anchored
+    """GH #974 (follow-up to #908 / #956): the reduced-motion pattern anchored
     only on the parenthesised status, so a FINISHED response whose first line
     ends in a duration or token parenthetical read PROCESSING on both status
     paths. ``get_status_from_screen`` scans the bottom 25 rows for any match with
@@ -3286,7 +3286,7 @@ class TestClaudeCodeReducedMotionFinishedResponse:
         assert self._p().get_status("\n".join(screen)) == TerminalStatus.PROCESSING
 
     @pytest.mark.xfail(
-        reason="Known limitation (GH #9011 follow-up): the gerund anchor narrows "
+        reason="Known limitation (GH #974 follow-up): the gerund anchor narrows "
         "the match surface but cannot distinguish spinner prose from response "
         "prose on a single line. A finished response that happens to open with "
         "a gerund still reads PROCESSING. Needs a 'newer output below this line' "
@@ -3299,7 +3299,7 @@ class TestClaudeCodeReducedMotionFinishedResponse:
         assert self._p().get_status("\n".join(screen)) == TerminalStatus.COMPLETED
 
     @pytest.mark.xfail(
-        reason="Known limitation (GH #9011 follow-up): the gerund anchor requires "
+        reason="Known limitation (GH #974 follow-up): the gerund anchor requires "
         "a present-participle first word, so a custom non-gerund spinnerVerbs "
         "entry (e.g. 'Work in progress') falls through and misreads as COMPLETED "
         "instead of PROCESSING -- the same shape this fix was meant to close. "
