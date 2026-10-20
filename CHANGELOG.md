@@ -675,7 +675,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Ephemeral settings (#801): `ephemeral.max_tier`, `default_tier`, `max_effort`, `default_effort` and the `model_tiers` table are now validated, not ignored with a warning. A ceiling without a default, an invalid value, or a table missing a required mapping refuses every ephemeral create and claim with `policy_config_error:<key>`.
+- Ephemeral settings (#801): `ephemeral.max_tier`, `default_tier`, `max_effort`, `default_effort` and the `model_tiers` table are now validated, not ignored with a warning. A ceiling without a default, an invalid value, or a table missing a required mapping refuses every ephemeral create and claim with `policy_config_error:<key>`. Explicit `model_tier` and `effort` no longer refuse with `tier_not_supported`/`effort_not_supported`, and the 'not applied yet' notes and create warning are removed.
 
 - A plain (non-Git) directory is now an approvable plan, keyed by its canonical path.
 
