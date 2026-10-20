@@ -168,9 +168,9 @@ def _job_is_blocking(job: dict) -> bool:
     pins it directly instead of trusting that it works.
 
     STEP-level ``continue-on-error`` is deliberately not consulted. It tolerates
-    one step, not the job, and ``ci.yml`` carries three of them -- artifact
-    uploads -- while that job remains a hard gate. Folding steps in here would
-    mis-report a blocking job as tolerated.
+    one step, not the job, and ``ci.yml`` carries three of them -- artifact uploads
+    in three jobs -- while all three of those jobs remain hard gates. Folding steps
+    in here would mis-report three blocking jobs as tolerated.
     """
     return not _truthy_continue_on_error(job.get("continue-on-error"))
 
