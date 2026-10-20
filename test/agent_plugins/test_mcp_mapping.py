@@ -578,7 +578,7 @@ class TestPreExpansionMarker:
         ``install_service`` -- and they were stale re-import aliases there,
         unreferenced by any code in that module since the pass moved to
         ``agent_plugins/mcp_delivery.py`` (``_deliverable``, line ~494). Removing
-        those dead imports is what exposed this (#9003).
+        those dead imports is what exposed this (#1005).
 
         The end-to-end assertions live in ``test_mcp_delivery.py``, which
         installs a plugin, runs ``install_agent``, and reads the provider config.

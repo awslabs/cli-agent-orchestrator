@@ -282,7 +282,7 @@ jobs:
       - name: Check import sorting with isort
         run: uv run isort --check-only src/ test/ examples/robotics/cross-zone-transport/
 
-      # The dead-code gate (#9003). BLOCKING, unlike the mypy step below: the
+      # The dead-code gate (#1005). BLOCKING, unlike the mypy step below: the
       # selected rules (F401 unused import, F841 unused local) are green on main
       # as of this change, so any new finding is introduced by the PR under test.
       #

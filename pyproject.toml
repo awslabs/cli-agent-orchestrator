@@ -404,7 +404,7 @@ profile = "black"
 line_length = 100
 
 # ---------------------------------------------------------------------------------------
-# ruff — the dead-code gate black, isort and mypy all miss (#9003).
+# ruff — the dead-code gate black, isort and mypy all miss (#1005).
 #
 # WHY: issue #752's root cause was a computed status value that nothing ever read. black
 # and isort only reformat; mypy is `continue-on-error: true` in the Code Quality job and
@@ -416,7 +416,7 @@ line_length = 100
 #
 #     F401 unused import        165      selected  (165 of them autofixable)
 #     F841 unused local          27      selected  (the #752 class exactly)
-#     F811 redefinition         104      NOT selected -- see below, and see #9003
+#     F811 redefinition         104      NOT selected -- see below, and see #1005
 #     ARG  unused argument     3718      NOT selected
 #     B    flake8-bugbear        609      NOT selected (B904 346, B008 204, B905 23 ...)
 #
@@ -436,14 +436,14 @@ line_length = 100
 #
 #   test/utils/test_opencode_config.py:28 vs :57   class TestToOpencodeAgentId
 #       -- the shadowed copy is the GHSA-6m35-gcf5-xm75 path-traversal regression
-#          (5 parametrized hostile names). VERIFIED not collected before #9003.
+#          (5 parametrized hostile names). VERIFIED not collected before #1005.
 #   test/providers/test_kiro_cli_unit.py:758/772/792/808 shadowed by :830/844/864/880
 #   test/services/agui/test_edit_sanitization.py:47 shadowed by :67
 #
 # Turning F811 on means (a) suppressing the fixture-parameter pattern in those 15 files
 # via per-file-ignores and (b) un-shadowing six tests that have never executed and may
 # well fail. Both belong in a change that can take the failures seriously rather than
-# riding along with a tooling PR. Tracked on #9003.
+# riding along with a tooling PR. Tracked on #1005.
 # ---------------------------------------------------------------------------------------
 [tool.ruff]
 line-length = 100
@@ -472,7 +472,7 @@ python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
 # Aligned with the marker expression CI actually runs (`-m "not e2e"` in
-# ci.yml's unit-test step), NOT a stricter local default. Before #9003 this read
+# ci.yml's unit-test step), NOT a stricter local default. Before #1005 this read
 # `-m 'not e2e and not integration'`; because a command-line `-m` overrides the
 # one in addopts, integration-marked tests ran ONLY in CI and were deselected
 # everywhere an author or a reviewer looks. Measured over `test/`: the old
