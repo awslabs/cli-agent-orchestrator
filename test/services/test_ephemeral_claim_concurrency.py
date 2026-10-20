@@ -53,10 +53,16 @@ def test_double_claim_has_one_winner(file_store):
     assert database.get_ephemeral_agent(name)["state"] == "claimed"
 
 
-@pytest.mark.parametrize("bad_lease", [False, True])
+@pytest.mark.parametrize(
+    "bad_lease", [False, True, "default_tier_unmapped", "max_tier_without_default"]
+)
 def test_winner_recheck_reverts_without_admitting_competitor(file_store, monkeypatch, bad_lease):
     env, name = file_store
-    if bad_lease:
+    if bad_lease == "default_tier_unmapped":
+        env[4]["ephemeral"]["default_tier"] = "small"
+    elif bad_lease == "max_tier_without_default":
+        env[4]["ephemeral"]["max_tier"] = "medium"
+    elif bad_lease:
         env[4]["ephemeral"]["claim_lease_seconds"] = None
     else:
         env[4]["ephemeral"]["max_depth"] = 2
@@ -80,9 +86,17 @@ def test_winner_recheck_reverts_without_admitting_competitor(file_store, monkeyp
         finally:
             release.set()
         assert winner.result(timeout=10) == (
-            "policy_config_error:claim_lease_seconds"
-            if bad_lease
-            else "policy_config_error:max_depth"
+            "policy_config_error:model_tiers"
+            if bad_lease == "default_tier_unmapped"
+            else (
+                "policy_config_error:default_tier"
+                if bad_lease == "max_tier_without_default"
+                else (
+                    "policy_config_error:claim_lease_seconds"
+                    if bad_lease
+                    else "policy_config_error:max_depth"
+                )
+            )
         )
     row = database.get_ephemeral_agent(name)
     assert row["state"] == "pending" and row["claim_id"] is None

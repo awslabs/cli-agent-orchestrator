@@ -223,6 +223,9 @@ def test_tiers_and_effort_not_yet_supported(create_store, key, values):
 )
 def test_ignored_policy_keys_warn_and_do_not_apply(create_store, key, value, caplog):
     config = create_store[4]
+    config["model_tiers"] = {"claude_code": {"small": "mapped-model"}}
+    if key == "max_tier":
+        config["ephemeral"]["default_tier"] = "small"
     if key == "model_tiers":
         config[key] = value
     else:
@@ -784,7 +787,7 @@ def test_note_build_failure_precedes_all_writes(create_store, monkeypatch):
 
 def test_success_warning_failure_cannot_fail_committed_create(create_store, monkeypatch):
     service = create_store[0]
-    create_store[4]["ephemeral"]["max_tier"] = "small"
+    create_store[4]["ephemeral"]["max_effort"] = "low"
     monkeypatch.setattr(service.logger, "warning", Mock(side_effect=RuntimeError("warning failed")))
     result = create(create_store)
     assert database.get_ephemeral_agent(result["name"])["state"] == "pending"
@@ -794,11 +797,11 @@ def test_success_warning_failure_cannot_fail_committed_create(create_store, monk
     "block,top,model_note,effort_note,notice",
     [
         (
-            {"max_tier": "private-tier"},
-            {},
-            "model: provider default (tier omitted; ephemeral.max_tier is not applied yet)",
+            {"max_tier": "small", "default_tier": "small"},
+            {"model_tiers": {"claude_code": {"small": "private-model-id"}}},
+            "model: provider default (tier omitted; ephemeral.max_tier, ephemeral.default_tier, model_tiers are not applied yet)",
             "effort: provider default (effort omitted, no default_effort)",
-            "ephemeral.max_tier is not applied yet; the provider default is used",
+            "ephemeral.max_tier, ephemeral.default_tier, model_tiers are not applied yet; the provider default is used",
         ),
         (
             {"max_effort": "private-effort"},
@@ -809,8 +812,8 @@ def test_success_warning_failure_cannot_fail_committed_create(create_store, monk
         ),
         (
             {
-                "max_tier": "private-tier",
-                "default_tier": "private-tier",
+                "max_tier": "small",
+                "default_tier": "small",
                 "max_effort": "private-effort",
                 "default_effort": "private-effort",
             },

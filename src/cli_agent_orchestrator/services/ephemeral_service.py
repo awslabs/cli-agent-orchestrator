@@ -21,7 +21,8 @@ from sqlalchemy.exc import IntegrityError
 
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
-from cli_agent_orchestrator.decisions.policy import PolicyBounds
+from cli_agent_orchestrator.decisions.policy import PolicyBounds, PolicyConfigError
+from cli_agent_orchestrator.decisions.types import POINTS
 from cli_agent_orchestrator.models.ephemeral import TOOL_ATOMS, EphemeralSpec
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.services.secret_gate import scan_for_secrets
@@ -205,6 +206,28 @@ def validate_block(settings: dict[str, Any]) -> None:
             )
     if type(settings["max_depth"]) is not int or settings["max_depth"] != 1:
         raise EphemeralPolicyError("policy_config_error:max_depth", "ephemeral.max_depth must be 1")
+
+    for key in ("max_tier", "default_tier"):
+        value = settings.get(key)
+        options = POINTS["model.route"].options
+        if value is not None and (not isinstance(value, str) or value not in options):
+            raise EphemeralPolicyError(
+                "policy_config_error:" + key,
+                "ephemeral." + key + " must be one of " + ", ".join(options),
+            )
+    try:
+        PolicyBounds(
+            default_tier=settings.get("default_tier"), max_tier=settings.get("max_tier")
+        ).validate({})
+    except PolicyConfigError:
+        raise EphemeralPolicyError(
+            "policy_config_error:default_tier",
+            "ephemeral.default_tier must be set when ephemeral.max_tier is set, and must not exceed it",
+        ) from None
+    try:
+        policy_bounds(settings).validate(settings.get("_model_tiers", {}))
+    except PolicyConfigError as exc:
+        raise EphemeralPolicyError("policy_config_error:model_tiers", str(exc)) from None
 
 
 def normalize_brief(brief: str) -> str:
@@ -729,12 +752,13 @@ def _recheck_policy(row: dict[str, Any], settings: dict[str, Any], claim_id: Opt
                     claim_id,
                 )
         key = exc.rule.partition(":")[2]
+        keypath = key if key == "model_tiers" else "ephemeral." + key
         raise EphemeralPolicyError(
             exc.rule,
             "("
             + exc.detail
-            + "); the operator must fix ephemeral."
-            + key
+            + "); the operator must fix "
+            + keypath
             + " in settings before any launch can succeed",
         ) from None
     if row["provider"] not in settings["allowed_providers"]:

@@ -111,6 +111,8 @@ EPHEMERAL_DEFAULTS = {
     "pending_ttl_seconds": 900,
     "claim_lease_seconds": 60,
     "max_depth": 1,
+    "max_tier": None,
+    "default_tier": None,
 }
 
 
