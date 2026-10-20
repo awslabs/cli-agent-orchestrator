@@ -19,6 +19,8 @@ The operator-only `ephemeral` block in `settings.json` has these defaults:
     "max_brief_bytes": 8192,
     "pending_ttl_seconds": 900,
     "claim_lease_seconds": 60,
+    "max_tier": null,
+    "default_tier": null,
     "max_depth": 1
   }
 }
@@ -31,12 +33,40 @@ recheck whether the feature is enabled before touching a name. Unreadable
 settings fail closed. `max_depth` accepts only integer 1. Ephemeral callers cannot create
 other ephemerals, even when `child_may_delegate` allows the existing delegation tools.
 
-`ephemeral.max_tier`, `default_tier`, `max_effort`, `default_effort`, and top-level
-`model_tiers` are **not applied yet**. In particular, `max_tier` sets no ceiling. Each
-successful create with any such key set warns and names the ignored keys in its notes.
-Explicit `model_tier` and `effort` requests temporarily refuse with `tier_not_supported`
-and `effort_not_supported`; `auto` refuses with `auto_requires_decision_platform`.
-Omit both fields to use the provider default.
+## Model tier and effort
+
+`model_tier` accepts `small`, `medium`, or `large`, or can be omitted. `auto` in
+model tier or effort still refuses with `auto_requires_decision_platform`. Explicit
+effort still refuses with `effort_not_supported`; effort defaults and ceilings are
+not applied yet and are named in create notes and warnings.
+
+The model tier resolves once at create: the explicit value, else
+`ephemeral.default_tier`, else none. The registry row and response hold that resolved
+value; the stored spec keeps what was requested. Changing a default later never
+changes a pending name. No decider is asked for an ephemeral agent in any field state.
+
+Configure the top-level tier table with model ids for each allowed provider:
+
+```json
+{"model_tiers": {"claude_code": {"small": "<small model id>", "medium": "<medium model id>", "large": "<large model id>"}}}
+```
+
+See [Launch decisions](decisions.md) and `cao decisions tier` to manage mappings.
+A ceiling needs a default at or below it. Every tier at or below `ephemeral.max_tier`,
+and the default tier, must be mapped for every allowed provider. An invalid model id
+counts as unmapped. A broken block refuses every create and claim with
+`policy_config_error:<key>` until the operator fixes it. Unknown ephemeral keys, such
+as `min_tier`, remain silently ignored.
+
+An explicit tier above the ceiling gives `tier_exceeds_policy`; an unmapped explicit
+tier with no ceiling gives `tier_unmapped`. A resolved tier becomes `model:` in the
+live profile. At claim the id is looked up again in the current table, so a remap
+reaches pending names. A launch without a claim identifier runs the live file as it
+stands: normally the create-time id, or the id from an earlier finalized claim that lapsed.
+
+**Upgrade note:** earlier releases ignored the tier keys and table with a warning,
+whatever their values. They are now validated. A previously accepted block, such as a
+ceiling without a default, can therefore refuse every ephemeral create and claim.
 
 ## Create surface and stored files
 
@@ -111,7 +141,7 @@ The HTTP contract remains available for clients implementing their own launch pa
 
 Claim with `POST /ephemeral-agents/{name}/claim?caller_id=<creator-terminal-id>` and a JSON
 body containing optional `idempotency_key`, `claim_id`, and `model`. A per-call model is
-refused; omit it to use the provider default. The server checks creator identity and
+refused; set model tier in the spec instead. The server checks creator identity and
 ownership, answers a matching launched retry, then atomically claims a pending name.
 A successful response contains `claim_id`, `provider`, `effective_tools`, and `replayed: false`.
 A matching launched retry returns `terminal_id` and `replayed: true`, without rechecking policy.
@@ -126,12 +156,16 @@ get structured `ephemeral_expired` (409); never-created names get structured `un
 (404), including on `POST /sessions`.
 
 The claim lease covers claim to terminal creation. At claim, the server rechecks the operator
-block before the stored provider. A broken block returns `policy_config_error:<key>` and
+block before the stored provider and tier. A broken block returns `policy_config_error:<key>` and
 reverts that claim to pending; fix the named setting and retry. A removed provider returns
 `policy_changed_since_create:provider_not_allowed` and collects the name; create a new one.
+A stored tier above a tightened ceiling, an unmapped stored tier, or a stored provider
+default under a newly added ceiling returns `policy_changed_since_create:tier_exceeds_policy`
+or `policy_changed_since_create:tier_unmapped` and collects the name; re-create it.
+A broken table names `model_tiers`, never `ephemeral.model_tiers`.
 The stored spec is verified and the profile is finalized before the claim response.
 An owner may also launch a pending name without a claim identifier; that bind applies the
-same enabled and policy checks and loads the create-time profile. Posted tools must be a
+same enabled and policy checks and loads the live file as it stands. Posted tools must be a
 literal subset of the stored list; omitting tools uses the stored list.
 
 The lifecycle is `pending -> claimed -> launched -> gc`. The bind precedes backend
@@ -147,9 +181,12 @@ extraction failure tear down terminals owned by that call.
 | --- | --- |
 | 404 | `ephemeral_disabled`, `unknown_ephemeral` |
 | 409 | `already_claimed`, `claim_expired`, `ephemeral_expired`, `spec_unavailable` |
-| 400 | `creator_unresolved`, `not_owner`, `model_override_not_allowed`, `provider_mismatch`, `tool_exceeds_stored`, `policy_config_error:<key>`, `policy_changed_since_create:provider_not_allowed` |
+| 400 | `creator_unresolved`, `not_owner`, `model_override_not_allowed`, `provider_mismatch`, `tool_exceeds_stored`, `policy_config_error:<key>`, `policy_changed_since_create:provider_not_allowed`, `policy_changed_since_create:tier_exceeds_policy`, `policy_changed_since_create:tier_unmapped` |
 | 422 | `invalid_request` for the claim body; invalid launch claim identifiers or claim-plus-reuse requests |
 | 500 | `unexpected_failure` |
+
+Create also refuses with `tier_unmapped`, `tier_exceeds_policy` and
+`policy_config_error:<key>`, all HTTP 400.
 
 Policy errors carry `{kind: "ephemeral_policy", rule, message}` and never echo creator text.
 Archives record claimed, finalized, bound and released events, plus refusal counts. Archive updates

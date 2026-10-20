@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Ephemeral agents (#801) accept an explicit `model_tier` and apply `ephemeral.default_tier`, `ephemeral.max_tier` and the top-level `model_tiers` table at create, and again at claim. `auto` still refuses.
+
 - Conversational workflow authoring: `cao workflow create` / `update` and the `workflow_create`,
   `workflow_update`, `workflow_get` and `workflow_validate` MCP tools (#583 Bolt 3) (#699). Spec writes
   are atomic and serialized per workflow, so two concurrent creates cannot both succeed and an update
@@ -673,6 +675,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of spinning on a cancelled task and never exiting (#823)
 
 ### Changed
+
+- Ephemeral settings (#801): `ephemeral.max_tier`, `default_tier` and the `model_tiers` table are now validated, not ignored with a warning. A ceiling without a default, an invalid value, or a table missing a required mapping refuses every ephemeral create and claim with `policy_config_error:<key>`.
 
 - A plain (non-Git) directory is now an approvable plan, keyed by its canonical path.
 
