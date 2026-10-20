@@ -423,7 +423,7 @@ python_classes = "Test*"
 python_functions = "test_*"
 addopts = "--cov=src --cov-branch --cov-report=term-missing -m 'not e2e and not integration'"
 
-# `--cov-branch` is COLLECTION ONLY, never a gate here (issue #9009). It makes
+# `--cov-branch` is COLLECTION ONLY, never a gate here (issue #1005). It makes
 # partially-taken branches visible in `term-missing` as `123->exit` / `123->130`,
 # which is what a reachability bug looks like locally: the line runs, one side of
 # the condition never does. Measured cost on a 369-test subset: 49-57s without,
@@ -448,7 +448,7 @@ addopts = "--cov=src --cov-branch --cov-report=term-missing -m 'not e2e and not 
 # NOTE for anyone reading ci.yml: the separate "Coverage ratchet" step there
 # belongs to cao_mcp_apps (the TypeScript subproject), not to this suite.
 #
-# CAUTION (#9009): with `--cov-branch` on, coverage.py's `totals.percent_covered`
+# CAUTION (#1005): with `--cov-branch` on, coverage.py's `totals.percent_covered`
 # becomes a BLENDED line+branch figure -- (covered_lines + covered_branches) /
 # (num_statements + num_branches) -- not line coverage. Anything reading that
 # field as "line coverage" must compute `covered_lines / num_statements` itself;

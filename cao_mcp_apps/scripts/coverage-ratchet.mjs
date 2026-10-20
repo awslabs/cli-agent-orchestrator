@@ -29,7 +29,7 @@ function readJson(path) {
 function pythonLinePct(report) {
   // coverage.py json schema: { "totals": { "covered_lines", "num_statements" } }.
   //
-  // Computed, NOT read from `totals.percent_covered` (#9009): with `--cov-branch`
+  // Computed, NOT read from `totals.percent_covered` (#1005): with `--cov-branch`
   // on, coverage.py redefines that field as the blended
   // (covered_lines + covered_branches) / (num_statements + num_branches). On a
   // measured subset it moved 20.19% -> 16.52% purely from the flag. Reading it
@@ -89,7 +89,7 @@ const py = baseline.python ?? {};
 const pyReport = readJson(resolve(REPO_ROOT, py.coverage_json ?? "coverage.json"));
 evaluate("python", py.floor_pct ?? null, pythonLinePct(pyReport));
 
-// Branch coverage is a SECOND, separately-floored metric (#9009): a line floor
+// Branch coverage is a SECOND, separately-floored metric (#1005): a line floor
 // cannot see a condition only ever taken one way, which is how a declared
 // capability's other branch stays unreachable. Seeded with a null floor
 // (record-only) because the full-suite figure is unknown until CI measures it.

@@ -1,4 +1,4 @@
-"""Capability-reachability guards (issue #9009, generalising #814 and #752).
+"""Capability-reachability guards (issue #1005, generalising #814 and #752).
 
 The defect class: a capability is DECLARED on a base class and never CONSULTED
 on a decision path. Behaviour then falls back to a weaker signal with no error

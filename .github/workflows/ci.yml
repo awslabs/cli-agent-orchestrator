@@ -69,7 +69,7 @@ jobs:
             --cov-fail-under=80 \
             --cov-report=term-missing \
             -v
-        # --cov-branch (#9009) also makes --cov-fail-under read the BLENDED
+        # --cov-branch (#1005) also makes --cov-fail-under read the BLENDED
         # line+branch figure rather than line coverage. That is a strictly harder
         # bar at the same number, not a weaker one, and the authoritative
         # separately-floored line metric is the ratchet's (.coverage-baseline.json,
@@ -219,7 +219,7 @@ jobs:
       - name: Backend coverage (for the ratchet floor)
         # Produces coverage.json (python line + branch floors) consumed by
         # coverage:ratchet. --cov-branch adds num_branches/covered_branches to
-        # totals; the ratchet floors line and branch SEPARATELY (#9009).
+        # totals; the ratchet floors line and branch SEPARATELY (#1005).
         run: |
           uv run pytest test/ examples/workflow/tests/ \
             --ignore=test/providers/test_kiro_cli_integration.py \

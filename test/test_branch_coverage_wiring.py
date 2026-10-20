@@ -1,4 +1,4 @@
-"""Guards for branch-coverage collection and its separate floor (issue #9009).
+"""Guards for branch-coverage collection and its separate floor (issue #1005).
 
 A line floor cannot see a condition that is only ever taken one way -- which is
 how an unreachable capability branch stays invisible (#814). Branch data is

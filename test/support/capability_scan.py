@@ -1,4 +1,4 @@
-"""Capability-reachability scanning over the source tree (issue #9009).
+"""Capability-reachability scanning over the source tree (issue #1005).
 
 The defect class, from #814 and #752: a capability flag or detection signal is
 DECLARED on a base class and never CONSULTED on the decision path. Nothing
