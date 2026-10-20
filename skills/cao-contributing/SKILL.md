@@ -71,7 +71,7 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 |-----|------|-----------|
 | **Unit Tests** (3.10 / 3.11 / 3.12) | `uv run pytest test/ examples/workflow/tests/ --ignore=test/providers/test_kiro_cli_integration.py --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator --cov-report=term-missing` | **Yes** |
 | ↳ step: **Validate Markdown links** | `uv run python scripts/validate_markdown_links.py` — every relative link in every tracked `.md`, including `skills/` | **Yes** |
-| **Code Quality** | black `--check`, isort `--check-only`, then `uv run python scripts/mypy_ratchet.py` | **Yes** (all three; the mypy step's `continue-on-error` was removed in issue #9005) |
+| **Code Quality** | black `--check`, isort `--check-only`, then `uv run python scripts/mypy_ratchet.py` | **Yes** (all three; the mypy step's `continue-on-error` was removed in issue #1005) |
 | **AG-UI demo (shift-left recording)** | boots a `CAO_AGUI_ENABLED` server, drives the viewer, records a GIF artifact | **Yes** |
 | **AG-UI construct demos (shift-left recordings)** | same pattern for the L2 construct library | **Yes** |
 | **AG-UI stock-client live (AC3)** | drives a real third-party AG-UI client against the surface | **Yes** |
@@ -111,7 +111,7 @@ failure states, and the required-status rollout after the workflow lands.
 > and **never runs in CI**. So *most* `integration`-marked tests do run in CI — but not
 > that one, and nothing in CI covers it. If you change it, you have to run it yourself.
 
-> **mypy is blocking, via a ratchet** (issue #9005). The repo has **known, pre-existing,
+> **mypy is blocking, via a ratchet** (issue #1005). The repo has **known, pre-existing,
 > repo-wide mypy errors** — 177 of them in 22 files when the ratchet landed, concentrated in
 > `services/agui/run_plane.py`, `utils/agent_profiles.py`, `utils/orchestration.py`,
 > `mcp_server/server.py`, and `services/vault/reader.py`.

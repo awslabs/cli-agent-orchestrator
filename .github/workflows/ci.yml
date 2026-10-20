@@ -283,7 +283,7 @@ jobs:
         run: uv run isort --check-only src/ test/ examples/robotics/cross-zone-transport/
 
       - name: Run type checker with mypy (ratchet)
-        # Issue #9005. This step used to be `uv run mypy src/` with
+        # Issue #1005. This step used to be `uv run mypy src/` with
         # `continue-on-error: true`, so a red type check blocked nothing and the
         # repo's 177 pre-existing errors were indistinguishable from 178.
         #

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Ratchet ``mypy src/`` against a committed baseline so the type gate can block.
 
-Issue #9005 (TOOLING T1). Runs in ``ci.yml``'s ``Code Quality`` job, replacing the
+issue #1005. Runs in ``ci.yml``'s ``Code Quality`` job, replacing the
 ``continue-on-error: true`` mypy step that made a red type check cost nothing.
 
 WHY A RATCHET AND NOT A CLEANUP SPRINT
@@ -231,7 +231,7 @@ def baseline_metadata(path: Path) -> Dict[str, object]:
 def write_baseline(path: Path, counts: ErrorCounts, targets: Sequence[str]) -> None:
     payload = {
         "_comment": (
-            "Per-file, per-error-code mypy baseline for scripts/mypy_ratchet.py (issue #9005). "
+            "Per-file, per-error-code mypy baseline for scripts/mypy_ratchet.py (issue #1005). "
             "This number may only go DOWN. Regenerate with "
             "`python scripts/mypy_ratchet.py --update`; raising any count needs a reviewer's "
             "explicit sign-off in the PR."

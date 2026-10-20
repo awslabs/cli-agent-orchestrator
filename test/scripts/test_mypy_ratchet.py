@@ -1,6 +1,6 @@
 """Tests for ``scripts/mypy_ratchet.py`` and the Code Quality job that runs it.
 
-Issue #9005. The defect these pin is a gate that reports success no matter what: before this
+Issue #1005. The defect these pin is a gate that reports success no matter what: before this
 script, ``ci.yml``'s mypy step carried ``continue-on-error: true``, so 177 pre-existing type
 errors and any number of newly introduced ones produced the same green check.
 
@@ -391,7 +391,7 @@ def test_ci_code_quality_runs_the_ratchet() -> None:
 
 
 def test_ci_mypy_step_is_blocking() -> None:
-    """The one key that separates a gate from a decoration (issue #9005).
+    """The one key that separates a gate from a decoration (issue #1005).
 
     Comment lines are excluded deliberately: the step carries a comment *naming*
     ``continue-on-error`` to explain why it is absent, and that prose must not be mistaken

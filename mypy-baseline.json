@@ -1,5 +1,5 @@
 {
-  "_comment": "Per-file, per-error-code mypy baseline for scripts/mypy_ratchet.py (issue #9005). This number may only go DOWN. Regenerate with `python scripts/mypy_ratchet.py --update`; raising any count needs a reviewer's explicit sign-off in the PR.",
+  "_comment": "Per-file, per-error-code mypy baseline for scripts/mypy_ratchet.py (issue #1005). This number may only go DOWN. Regenerate with `python scripts/mypy_ratchet.py --update`; raising any count needs a reviewer's explicit sign-off in the PR.",
   "mypy_version": "mypy 2.4.0 (compiled: yes)",
   "targets": [
     "src/"
