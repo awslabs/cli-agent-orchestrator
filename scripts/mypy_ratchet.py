@@ -45,8 +45,10 @@ properties keep this one honest:
 1. **mypy crashing is a FAILED check, not a passed one.** mypy exits 0 with no errors, 1 with
    errors, and 2 on an internal error or bad config. Exit 2, or a non-zero exit with zero
    parsed error lines, is treated as a hard failure rather than "no errors found".
-2. **A missing or unparseable baseline fails.** It is not silently treated as empty (which
-   would pass trivially) nor as "everything is new" (which would fail confusingly).
+2. **A missing or unparseable baseline fails with a clear error.** Silently treating it as
+   empty would still fail -- every current error would compare as a regression against
+   nothing -- but as a confusing wall of per-file regressions instead of a clear
+   "baseline not found / malformed" diagnostic.
 3. **The raw mypy output is always echoed** to the job log before any verdict, so the gate
    never hides the diagnostics it is gating on.
 
@@ -190,8 +192,10 @@ def compare(baseline: ErrorCounts, current: ErrorCounts) -> Tuple[List[str], Lis
 def load_baseline(path: Path) -> ErrorCounts:
     """Read and validate the committed baseline.
 
-    Raises :class:`RatchetError` rather than returning an empty baseline when the file is
-    missing or malformed — an empty baseline would make every check pass.
+    Raises :class:`RatchetError` rather than silently treating a missing or malformed
+    baseline as empty. That would still fail every check -- every current error would
+    compare as a regression against nothing -- but as a confusing wall of per-file
+    regressions instead of a clear "baseline not found / malformed" diagnostic.
     """
     if not path.exists():
         raise RatchetError(

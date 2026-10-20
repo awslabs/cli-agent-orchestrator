@@ -173,7 +173,9 @@ def test_net_zero_swap_of_codes_within_one_file_is_still_a_regression() -> None:
 
 
 def test_missing_baseline_raises_rather_than_reading_as_empty(tmp_path: Path) -> None:
-    """An empty baseline would pass every check. Absence must be an error."""
+    """Reading a missing baseline as empty would still fail -- every current error compares
+    as a regression against nothing -- but as a confusing wall of per-file regressions
+    instead of a clear "baseline not found" error."""
     with pytest.raises(ratchet.RatchetError, match="not found"):
         ratchet.load_baseline(tmp_path / "absent.json")
 
@@ -363,7 +365,6 @@ def test_committed_baseline_is_loadable_and_self_consistent() -> None:
     counts = ratchet.load_baseline(BASELINE)
     payload = json.loads(BASELINE.read_text(encoding="utf-8"))
     assert payload["total_errors"] == ratchet.total_errors(counts)
-    assert counts, "a baseline with no entries would make the ratchet vacuous"
 
 
 def _code_quality_steps() -> List[Tuple[int, str]]:
