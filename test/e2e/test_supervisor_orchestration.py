@@ -515,17 +515,14 @@ def _run_supervisor_assign_test(provider: str):
         # processing again (showing "Working...").  We must wait for the
         # supervisor to finish processing the inbox message before extracting
         # output, otherwise we get the spinner text instead of the report.
-        _inbox_verified = False
         for _ in range(12):  # up to 60s
             delivered = _get_inbox_messages(supervisor_id, status_filter="delivered")
             if delivered:
-                _inbox_verified = True
                 break
             pending = _get_inbox_messages(supervisor_id, status_filter="pending")
             if not pending:
                 # No pending and no delivered — workers may have used handoff
                 # instead of assign+send_message, which is acceptable
-                _inbox_verified = True
                 break
             time.sleep(5)
 
