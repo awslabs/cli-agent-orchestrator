@@ -1356,7 +1356,7 @@ async def run_script_workflow(
     if capture_error is not None:
         raise capture_error
 
-    # --- Step 1: journal the run before publishing its live record ---
+    # --- Step 1: publish the live record + journal the durable run row ---
     record = ScriptRunRecord(
         run_id=run_id,
         workflow_name=spec.name,
@@ -1375,8 +1375,11 @@ async def run_script_workflow(
     # NOT evicted on finalize, mirroring the base YAML registry, so a bounded
     # post-run status window keeps serving. Registry eviction/TTL is deferred to
     # U5/base scope (no per-tier eviction here).
-    # Publish only after the INSERT, so a duplicate loser cannot replace the
-    # winning live record while the journal rejects its admission.
+    # Check and publish without yielding: cancellation must find this record
+    # even while the durable INSERT is pending, and a live winner must survive.
+    if run_id in run_registry or run_id in _active_drives:
+        raise KeyError(f"run_id '{run_id}' already exists")
+    run_registry[run_id] = record
 
     # The durable spec_snapshot carries the frozen source (resume reads it back).
     spec_snapshot = build_script_snapshot(
@@ -1406,8 +1409,10 @@ async def run_script_workflow(
             manifest_json,
         )
     except sqlite3.IntegrityError:
-        # Another admission can win after the route's availability check. Its
-        # row and live record belong to that run; never finalize or replace them.
+        # Remove only our publication; a replacement belongs to the winner.
+        # Never finalize or write through the winning run's journal row.
+        if run_registry.get(run_id) is record:
+            del run_registry[run_id]
         raise KeyError(f"run_id '{run_id}' already exists") from None
     except Exception as e:  # noqa: BLE001 — a failed admission must settle before spawn
         if guard.get("approval_required", True) or approval_gate.is_workflow_approval_required():
@@ -1416,7 +1421,6 @@ async def run_script_workflow(
             logger.warning(
                 "journal: script insert_run failed; refusing script spawn (%s)", type(e).__name__
             )
-            run_registry[run_id] = record
             return await _finalize(
                 record,
                 state=RunState.FAILED,
@@ -1430,7 +1434,11 @@ async def run_script_workflow(
             type(e).__name__,
         )
 
-    run_registry[run_id] = record
+    if record.cancelled:
+        # A cancel before the INSERT could not persist its generation yet. Honour
+        # it before spawning and fence callers against the now-durable row.
+        await _persist_generation_best_effort(record)
+        return await _finalize(record, state=RunState.CANCELLED, kind="cancelled")
 
     # --- Step 2: spawn (constructed env) + Step 3/4: drive, reap, interpret ---
     # Mark the drive live for the whole spawn->reap window so Gate-2 of a
