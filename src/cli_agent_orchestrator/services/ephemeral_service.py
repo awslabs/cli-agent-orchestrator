@@ -924,6 +924,7 @@ def finalize(name: str, claim_id: str, values: dict[str, Any]) -> None:
             changed = _change(db, name, "claimed", dict(profile_sha256=digest), claim_id)
             if changed:
                 os.replace(temp, EPHEMERAL_DIR / "live" / (name + ".md"))
+                # Failed commit: next finalize repairs both; launch never reads profile_sha256.
         if not changed:
             raise EphemeralPolicyError("claim_expired", status_code=409)
         _audit_update(row, "finalized", profile_sha256=digest, **values)
