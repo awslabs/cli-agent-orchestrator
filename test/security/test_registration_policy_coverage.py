@@ -1,6 +1,6 @@
 """One registration-policy coverage table across every surface CAO registers on.
 
-Why this module exists (#9006, from the sweep findings on #671, #829, #744):
+Why this module exists (#1005, from the sweep findings on #671, #829, #744):
 CAO enforces authorization **per registration**, not at a chokepoint. A FastAPI
 route carries its own ``require_any_scope`` dependency; a CAO MCP tool calls
 ``_tool_denied_reason`` in its own body; an MCP Apps tool declares its own
@@ -295,13 +295,13 @@ def _cao_mcp_registrations() -> Dict[str, bool]:
 # written to stop on the CAO server. ``install_profile``, ``send_session_message``
 # and ``shutdown_session`` are the same shape.
 #
-# The row is ``xfail(strict=True)`` and NOT exempted away: #9006 says to report
+# The row is ``xfail(strict=True)`` and NOT exempted away: #1005 says to report
 # the defect, not to fix the product code here. Strict means that once the ops
 # tools are gated, this row fails as XPASS and whoever fixes it has to delete the
 # xfail — the table cannot quietly keep claiming a hole that is closed.
 # --------------------------------------------------------------------------- #
 _OPS_XFAIL = (
-    "LIVE DEFECT (#9006, from the #671 guard analysis): cao-ops-mcp-server tools run no "
+    "LIVE DEFECT (#1005, from the #671 guard analysis): cao-ops-mcp-server tools run no "
     "caller-policy check at all. launch_session() forwards caller-supplied allowed_tools "
     "to POST /sessions, so a bound terminal with a narrow allowlist can mint a session "
     "with allowed_tools=['*']. Remove this xfail when the ops tools are gated."
@@ -372,7 +372,7 @@ def _plugin_mcp_registrations() -> Dict[str, bool]:
 #
 # This is the one row that is not about authorization. It is in the same table on
 # purpose: it is the same failure mode (a registration nothing cross-checks), and
-# the whole reason #9006 exists is that per-surface knowledge living in per-
+# the whole reason #1005 exists is that per-surface knowledge living in per-
 # surface files is how a surface gets missed.
 # --------------------------------------------------------------------------- #
 def _known_event_types() -> Set[str]:
