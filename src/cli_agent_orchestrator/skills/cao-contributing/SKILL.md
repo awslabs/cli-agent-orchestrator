@@ -102,10 +102,11 @@ failure states, and the required-status rollout after the workflow lands.
 
 > **The `-m "not e2e"` on the CI command replaces your local `addopts` — it does not
 > compose with it.** Since #1005 the two agree: `addopts` is `-m 'not e2e'`, so a default
-> local run selects the same test population CI does (16821 of 16985 over `test/`, vs
-> 16724 under the old `-m 'not e2e and not integration'`). Before that change a local run
-> was a strict **subset** of CI's selection and could be green while CI was red. If you
-> override `-m` yourself, compare deselected counts, not just pass counts.
+> local run uses the same marker expression CI does — the path differences below are what
+> still separates the two populations. Before that change, `addopts` read
+> `-m 'not e2e and not integration'`, a strictly narrower marker than CI's, and a local
+> run could be green while CI was red. If you override `-m` yourself, compare deselected
+> counts, not just pass counts.
 >
 > **CI's selection is narrower than the marker alone implies.** The same command passes
 > `--ignore=test/providers/test_kiro_cli_integration.py` and `--ignore=test/e2e`, and

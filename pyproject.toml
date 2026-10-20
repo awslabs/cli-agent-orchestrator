@@ -475,9 +475,10 @@ python_functions = "test_*"
 # ci.yml's unit-test step), NOT a stricter local default. Before #1005 this read
 # `-m 'not e2e and not integration'`; because a command-line `-m` overrides the
 # one in addopts, integration-marked tests ran ONLY in CI and were deselected
-# everywhere an author or a reviewer looks. Measured over `test/`: the old
-# expression collected 16724 of 16985 (261 deselected), the new one collects
-# 16821 (164 deselected) -- 97 tests that used to be CI-only.
+# everywhere an author or a reviewer looks. The new expression's marker matches
+# CI's; the old one additionally deselected every integration-marked test, all
+# of which used to run only in CI. (Collection counts aren't pinned here --
+# they drift with every test added.)
 #
 # The integration tests that need a real external CLI carry their own
 # `pytest.mark.skipif` on an env gate as well as the marker (see
