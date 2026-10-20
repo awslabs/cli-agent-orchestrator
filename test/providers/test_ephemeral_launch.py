@@ -241,7 +241,10 @@ def test_recorded_profile_prompt_tools_and_cleanup(create_store, monkeypatch, pr
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider_name", ["claude_code", "codex"])
 @pytest.mark.parametrize("tier", [None, "small"])
-async def test_A_L1_A_L2_mapped_model_launch(create_store, monkeypatch, provider_name, tier):
+@pytest.mark.parametrize("effort", [None, "high"])
+async def test_A_L1_A_L2_mapped_model_launch(
+    create_store, monkeypatch, provider_name, tier, effort
+):
     import shlex
     from test.services.test_ephemeral_service import CALLER, SPEC, create
     from test.services.test_ephemeral_tier_policy import mapped
@@ -253,6 +256,8 @@ async def test_A_L1_A_L2_mapped_model_launch(create_store, monkeypatch, provider
     mapped(env[4])
     env[4]["ephemeral"]["allowed_providers"] = ["claude_code", "codex"]
     spec = {**SPEC, "provider": provider_name, **({"model_tier": tier} if tier else {})}
+    if effort is not None:
+        spec["effort"] = effort
     result = create(env, spec)
     name = result["name"]
     token = env[0].claim_ephemeral_agent(name, {}, CALLER)["claim_id"]
@@ -298,5 +303,21 @@ async def test_A_L1_A_L2_mapped_model_launch(create_store, monkeypatch, provider
     assert args.count("--model") == (1 if tier else 0)
     if tier:
         assert args[args.index("--model") + 1] == model
+    if provider_name == "claude_code":
+        assert args.count("--effort") == (1 if effort else 0)
+        if effort:
+            assert args[args.index("--effort") + 1] == effort
+    else:
+        item = f'model_reasoning_effort="{effort}"'
+        assert args.count(item) == (1 if effort else 0)
+        if effort:
+            pos = args.index(item)
+            assert args[pos - 1] == "-c"
+            assert pos < args.index("check_for_update_on_startup=false")
+            assert pos > next(
+                i
+                for i, arg in enumerate(args)
+                if arg.startswith("mcp_servers.cao-mcp-server.command=")
+            )
     row = database.get_terminal_metadata(terminal.id)
     assert row["model"] == model and row["model_honored"] is True

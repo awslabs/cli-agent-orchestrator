@@ -91,11 +91,18 @@ def test_launched_retry_precedes_model_and_tightened_policy(claimed_store, monke
         env,
         name,
         state="launched",
+        model_tier="large",
+        effort="high",
         launched_terminal_id="eeeeeeee",
         claim_id="a" * 32,
         idempotency_key="retry",
     )
-    env[4]["ephemeral"]["allowed_providers"] = []
+    env[4]["ephemeral"].update(
+        default_tier="small", max_tier="medium", default_effort="low", max_effort="medium"
+    )
+    env[4]["model_tiers"] = {
+        "claude_code": {tier: "model-" + tier for tier in ("small", "medium", "large")}
+    }
     result = claim(
         env, name, model="ignored", **{field: "a" * 32 if field == "claim_id" else "retry"}
     )

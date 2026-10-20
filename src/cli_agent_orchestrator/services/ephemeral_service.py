@@ -319,6 +319,11 @@ def render_profile(
             "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
         },
     }
+    if effort is not None:
+        if provider == "claude_code":
+            metadata["claudeConfig"] = {"effort": effort}
+        elif provider == "codex":
+            metadata["codexConfig"] = {"model_reasoning_effort": effort}
     prefix, suffix = render_prompt_parts(name, caller_id, spec.purpose, tools)
     return cast(
         str,
@@ -370,26 +375,20 @@ def _cleanup(owned: list[tuple[Path, int, int]]) -> None:
             pass
 
 
-def _ignored_policy_notice(keys: list[str]) -> Optional[str]:
-    if not keys:
-        return None
-    verb = "is" if len(keys) == 1 else "are"
-    return ", ".join(keys) + " " + verb + " not applied yet"
-
-
-def _policy_notes(settings: dict[str, Any], spec: EphemeralSpec, tier: Optional[str]) -> list[str]:
+def _policy_notes(
+    settings: dict[str, Any], spec: EphemeralSpec, tier: Optional[str], effort: Optional[str]
+) -> list[str]:
     model = (
         f"model: tier {tier} ({'model_tier' if spec.model_tier is not None else 'ephemeral.default_tier'})"
         if tier is not None
         else "model: provider default (tier omitted, no default_tier)"
     )
-    effort_notice = _ignored_policy_notice(settings["_ignored_policy"])
-    effort = (
-        "effort: provider default (effort omitted; " + effort_notice + ")"
-        if effort_notice
+    effort_note = (
+        f"effort: {effort} ({'effort' if spec.effort is not None else 'ephemeral.default_effort'})"
+        if effort is not None
         else "effort: provider default (effort omitted, no default_effort)"
     )
-    return [model, effort]
+    return [model, effort_note]
 
 
 def _launch_value(requested: Optional[str], resolved: Optional[str]) -> dict[str, Any]:
@@ -443,15 +442,6 @@ def _stored_default_refusal(point: str, bounds: PolicyBounds) -> Optional[Epheme
     )
 
 
-def _warn_ignored_policy(name: str, notice: Optional[str]) -> None:
-    # A diagnostic failure cannot turn a committed create into a 500 refusal.
-    if notice:
-        try:
-            logger.warning("ephemeral create %s: %s; the provider default is used", name, notice)
-        except Exception:
-            pass
-
-
 def create_ephemeral_agent(
     raw: Any, caller_id: Optional[str], settings: Optional[dict[str, Any]] = None
 ) -> dict[str, Any]:
@@ -493,11 +483,6 @@ def create_ephemeral_agent(
         for field, value in (("model_tier", spec.model_tier), ("effort", spec.effort)):
             if value == "auto":
                 raise EphemeralPolicyError("auto_requires_decision_platform", field)
-        if spec.effort is not None:
-            raise EphemeralPolicyError(
-                "effort_not_supported",
-                f"effort={spec.effort} is not supported yet; omit effort to use the provider default",
-            )
         provider = spec.provider.value if spec.provider is not None else creator["provider"]
         if provider not in {item.value for item in ProviderType}:
             raise EphemeralPolicyError("creator_unresolved")
@@ -514,6 +499,10 @@ def create_ephemeral_agent(
         tiers = config["_model_tiers"]
         if spec.model_tier is not None:
             refusal = _value_refusal("model.route", spec.model_tier, provider, bounds, tiers)
+            if refusal is not None:
+                raise refusal
+        if spec.effort is not None:
+            refusal = _value_refusal("effort.route", spec.effort, provider, bounds, tiers)
             if refusal is not None:
                 raise refusal
         grants = set(atom for atom in TOOL_ATOMS if atom in creator_tools)
@@ -547,8 +536,8 @@ def create_ephemeral_agent(
         expires_at = expires.isoformat()
         tier = spec.model_tier or config["default_tier"]
         model = tiers[provider][tier] if tier is not None else None
-        notes = _policy_notes(config, spec, tier)
-        notice = _ignored_policy_notice(config["_ignored_policy"])
+        effort = spec.effort or config["default_effort"]
+        notes = _policy_notes(config, spec, tier, effort)
         for _ in range(5):
             name = f"{secrets.choice(BAND_NAMES)}-{spec.purpose}-{secrets.token_hex(2)}"
             if database.get_ephemeral_agent(
@@ -560,7 +549,7 @@ def create_ephemeral_agent(
                 "provider": provider,
                 "effective_tools": tools,
                 "model_tier": tier,
-                "effort": None,
+                "effort": effort,
                 "expires_at": expires_at,
                 "spec_sha256": digest,
                 "notes": notes,
@@ -574,10 +563,15 @@ def create_ephemeral_agent(
                     EPHEMERAL_DIR / "audit" / session,
                 ):
                     _directory(directory)
-                profile = render_profile(name, spec, provider, tools, caller_id, model=model)
+                profile = render_profile(
+                    name, spec, provider, tools, caller_id, model=model, effort=effort
+                )
                 profile_digest = hashlib.sha256(profile).hexdigest()
                 archive = {
-                    "launch_values": {"model_tier": _launch_value(spec.model_tier, tier)},
+                    "launch_values": {
+                        "model_tier": _launch_value(spec.model_tier, tier),
+                        "effort": _launch_value(spec.effort, effort),
+                    },
                     "audit_version": 1,
                     "name": name,
                     "spec": json.loads(canonical),
@@ -616,6 +610,7 @@ def create_ephemeral_agent(
                             provider=provider,
                             effective_tools=json.dumps(tools),
                             model_tier=tier,
+                            effort=effort,
                             created_at=created,
                             expires_at=expires,
                             spec_sha256=digest,
@@ -636,7 +631,6 @@ def create_ephemeral_agent(
             except BaseException:
                 _cleanup(owned)
                 raise
-            _warn_ignored_policy(name, notice)
             return result
         raise EphemeralPolicyError("name_space_exhausted", status_code=409)
     except EphemeralPolicyError as exc:
@@ -860,6 +854,17 @@ def _recheck_policy(
         else:
             # A5-3: keep this stored-NULL check separable pending M2.
             refusal = _stored_default_refusal("model.route", bounds)
+    if refusal is None:
+        effort = row["effort"]
+        if effort is not None:
+            refusal = _value_refusal("effort.route", effort, row["provider"], bounds, tiers)
+            if refusal is not None:
+                refusal = EphemeralPolicyError(
+                    refusal.rule, "stored " + refusal.detail.partition(";")[0]
+                )
+        else:
+            # A5-3: keep this stored-NULL check separable pending M2.
+            refusal = _stored_default_refusal("effort.route", bounds)
     if refusal is not None:
         with _transaction() as db:
             changed = _change(
@@ -876,7 +881,7 @@ def _recheck_policy(
     return dict(
         model_tier=tier,
         model=tiers[row["provider"]][tier] if tier is not None else None,
-        effort=None,
+        effort=row["effort"],
     )
 
 

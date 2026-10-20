@@ -555,6 +555,7 @@ async def test_unregistered_raw_tool_is_inert(create_store, enabled, monkeypatch
         ("unmapped", "tier_unmapped"),
         ("above", "tier_exceeds_policy"),
         ("block", "policy_config_error:model_tiers"),
+        ("effort", "effort_exceeds_policy"),
     ],
 )
 async def test_A_M1_real_create_rule_relay(create_store, monkeypatch, fault, rule):
@@ -569,6 +570,9 @@ async def test_A_M1_real_create_rule_relay(create_store, monkeypatch, fault, rul
         raw["ephemeral"].update(max_tier="medium", default_tier="small")
     if fault == "block":
         del raw["model_tiers"]["claude_code"]["small"]
+    if fault == "effort":
+        spec_tier = "small"
+        raw["ephemeral"].update(default_effort="low", max_effort="medium")
     monkeypatch.setattr(
         server.mcp_utils,
         "get_json",
@@ -584,7 +588,10 @@ async def test_A_M1_real_create_rule_relay(create_store, monkeypatch, fault, rul
         server.requests, "post", lambda url, **kwargs: client().post("/ephemeral-agents", **kwargs)
     )
     result = await server.create_ephemeral_agent(
-        "log_triage", "Inspect logs.", model_tier=spec_tier
+        "log_triage",
+        "Inspect logs.",
+        model_tier=spec_tier,
+        effort="high" if fault == "effort" else None,
     )
     assert set(result) == {"success", "rule", "message"}
     assert result["success"] is False and result["rule"] == rule

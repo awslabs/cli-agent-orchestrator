@@ -1,9 +1,19 @@
 """E2 policy contracts use the same snapshot as ephemeral creation and claims."""
 
+import hashlib
+import itertools
+import json
+import subprocess
+import sys
+from pathlib import Path
 from test.services.test_ephemeral_service import CALLER, SPEC, create, create_store  # noqa: F401
 from unittest.mock import Mock
 
+import frontmatter
+import pytest
+
 from cli_agent_orchestrator.clients import database
+from cli_agent_orchestrator.decisions.policy import DecisionInputError, PolicyConfigError
 from cli_agent_orchestrator.services import settings_service
 from cli_agent_orchestrator.services.model_tiers import load_model_tiers
 
@@ -27,17 +37,6 @@ def test_A_S1_one_snapshot(create_store, monkeypatch):
     service.bind_ephemeral_agent(name, "eeeeeeee", CALLER, "claude_code", None, None)
     reader.assert_called_once()
     assert database.get_ephemeral_agent(name)["state"] == "launched"
-
-
-import itertools
-import json
-import subprocess
-import sys
-from pathlib import Path
-
-import pytest
-
-from cli_agent_orchestrator.decisions.policy import PolicyConfigError
 
 
 def mapped(raw):
@@ -128,14 +127,6 @@ def test_A_R5_A_R6_block_error_reverts_claim(create_store):
     archive = json.loads(Path(row["audit_path"]).read_text())
     assert archive["refusals"][err.value.rule]["count"] == 1
     assert (home / "ephemeral/live" / (name + ".md")).exists()
-
-
-import hashlib
-from unittest.mock import patch
-
-import frontmatter
-
-from cli_agent_orchestrator.decisions.policy import DecisionInputError
 
 
 @pytest.mark.parametrize(
@@ -389,3 +380,94 @@ def test_B_R2_broken_effort_reverts(create_store):
     assert row["state"] == "pending"
     assert all(row[k] is None for k in ("claim_id", "claim_expires_at", "idempotency_key"))
     assert "operator must fix ephemeral.default_effort" in err.value.detail
+
+
+@pytest.mark.parametrize("provider", ["claude_code", "codex"])
+@pytest.mark.parametrize(
+    "asked,default,source",
+    [
+        ("high", None, "spec"),
+        (None, "medium", "default"),
+        ("low", "medium", "spec"),
+        (None, None, "none"),
+    ],
+)
+def test_B_C1_B_C3_B_N1_effort_resolution(create_store, provider, asked, default, source, caplog):
+    service, _, home, _, raw = create_store
+    raw["ephemeral"].update(allowed_providers=["claude_code", "codex"], default_effort=default)
+    spec = {**SPEC, "provider": provider, **({"effort": asked} if asked else {})}
+    result = create(create_store, spec)
+    row = database.get_ephemeral_agent(result["name"])
+    effort = asked or default
+    profile = frontmatter.loads((home / "ephemeral/live" / (result["name"] + ".md")).read_text())
+    assert row["effort"] == result["effort"] == effort
+    key = "claudeConfig" if provider == "claude_code" else "codexConfig"
+    config_key = "effort" if provider == "claude_code" else "model_reasoning_effort"
+    if effort:
+        assert profile[key] == {config_key: effort}
+        assert list(profile.metadata).index(key) == list(profile.metadata).index("mcpServers") + 1
+        assert (
+            result["notes"][1]
+            == f"effort: {effort} ({'effort' if asked else 'ephemeral.default_effort'})"
+        )
+    else:
+        assert "claudeConfig" not in profile and "codexConfig" not in profile
+    archive = json.loads(Path(row["audit_path"]).read_text())
+    assert archive["launch_values"]["effort"] == dict(
+        requested=asked, resolved=effort, source=source
+    )
+    before = (home / "ephemeral/live" / (result["name"] + ".md")).read_bytes()
+    service.claim_ephemeral_agent(result["name"], {}, CALLER)
+    assert (home / "ephemeral/live" / (result["name"] + ".md")).read_bytes() == before
+    assert "not applied yet" not in str(result) + caplog.text
+    assert not hasattr(service, "_ignored_policy_notice") and not hasattr(
+        service, "_warn_ignored_policy"
+    )
+    assert "_ignored_policy" not in service.read_settings()
+
+
+def test_B_C2_effort_order_and_ceiling(create_store):
+    raw = create_store[4]
+    mapped(raw)
+    raw["ephemeral"].update(
+        default_tier="small", max_tier="medium", default_effort="low", max_effort="medium"
+    )
+    err = assert_no_create(
+        create_store, {**SPEC, "model_tier": "large", "effort": "high"}, "tier_exceeds_policy"
+    )
+    err = assert_no_create(
+        create_store, {**SPEC, "model_tier": "small", "effort": "high"}, "effort_exceeds_policy"
+    )
+    assert "effort=high" in err.detail and "ephemeral.max_effort=medium" in err.detail
+    assert_no_create(
+        create_store, {**SPEC, "provider": "kiro_cli", "effort": "low"}, "provider_unsupported"
+    )
+
+
+@pytest.mark.parametrize("claimless", [False, True])
+@pytest.mark.parametrize("null", [False, True])
+def test_B_R1_stored_effort_and_A5_3(create_store, claimless, null):
+    service, _, home, _, raw = create_store
+    name = create(create_store, SPEC if null else {**SPEC, "effort": "high"})["name"]
+    raw["ephemeral"].update(max_effort="medium", default_effort="low")
+    with pytest.raises(service.EphemeralPolicyError) as err:
+        if claimless:
+            service.bind_ephemeral_agent(name, "eeeeeeee", CALLER, "claude_code", None, None)
+        else:
+            service.claim_ephemeral_agent(name, {}, CALLER)
+    assert err.value.rule == "policy_changed_since_create:effort_exceeds_policy"
+    assert "re-create" in err.value.detail
+    if null:
+        assert "provider default" in err.value.detail
+    row = database.get_ephemeral_agent(name)
+    assert row["state"] == "gc" and row["gc_reason"] == "policy_changed"
+    assert not (home / "ephemeral/live" / (name + ".md")).exists()
+    assert not (home / "ephemeral/live" / (name + ".spec.json")).exists()
+    assert json.loads(Path(row["audit_path"]).read_text())["events"][-1]["event"] == "released"
+
+
+def test_unknown_keys_ignored(create_store, caplog):
+    create_store[4]["ephemeral"]["min_tier"] = "private-setting"
+    result = create(create_store)
+    assert "private-setting" not in str(result) + caplog.text
+    assert not caplog.records

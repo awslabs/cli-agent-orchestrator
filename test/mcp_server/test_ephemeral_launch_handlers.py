@@ -61,6 +61,15 @@ def create_store(_create_store, request, monkeypatch):
                 return original({**raw, "model_tier": "small"}, *args, **kwargs)
 
             monkeypatch.setattr(_create_store[0], "create_ephemeral_agent", explicit)
+        elif variant == "effort_default":
+            _create_store[4]["ephemeral"]["default_effort"] = "low"
+        elif variant == "effort_explicit":
+            original = _create_store[0].create_ephemeral_agent
+
+            def explicit_effort(raw, *args, **kwargs):
+                return original({**raw, "effort": "low"}, *args, **kwargs)
+
+            monkeypatch.setattr(_create_store[0], "create_ephemeral_agent", explicit_effort)
     return _create_store
 
 
@@ -956,7 +965,9 @@ async def test_claimed_provider_error_preserves_handoff_and_releases(launch_http
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("e2_variant", ["omitted", "explicit", "default"])
+@pytest.mark.parametrize(
+    "e2_variant", ["omitted", "explicit", "default", "effort_explicit", "effort_default"]
+)
 @pytest.mark.parametrize("path", ["assign", "default", "nowait", "early"])
 async def test_A_D1_tier_launch_asks_no_decider(launch_http, askable_decisions, path, e2_variant):
     with record_decision_calls() as calls:
@@ -972,6 +983,7 @@ async def test_A_D1_tier_launch_asks_no_decider(launch_http, askable_decisions, 
     [
         ("tightened", "policy_changed_since_create:tier_exceeds_policy"),
         ("broken", "policy_config_error:model_tiers"),
+        ("effort", "policy_changed_since_create:effort_exceeds_policy"),
     ],
 )
 async def test_A_M1_claim_rule_relay(launch_http, path, fault, rule):
@@ -983,6 +995,9 @@ async def test_A_M1_claim_rule_relay(launch_http, path, fault, rule):
     env[4]["ephemeral"].update(default_tier="small", max_tier="medium")
     if fault == "broken":
         del env[4]["model_tiers"]["claude_code"]["small"]
+    elif fault == "effort":
+        row_update(env, name, model_tier="small", effort="high")
+        env[4]["ephemeral"].update(default_effort="low", max_effort="medium")
     result = await invoke(path, name)
     assert result["success"] is False and result["rule"] == rule
     assert result["terminal_id"] is None

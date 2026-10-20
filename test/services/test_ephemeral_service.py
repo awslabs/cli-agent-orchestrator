@@ -194,7 +194,7 @@ def test_policy_rejections_leave_nothing(create_store, patch, rule, caplog):
     "key,values",
     [
         ("model_tier", ["auto"]),
-        ("effort", ["low", "medium", "high", "auto"]),
+        ("effort", ["auto"]),
     ],
 )
 def test_tiers_and_effort_not_yet_supported(create_store, key, values):
@@ -210,31 +210,6 @@ def test_tiers_and_effort_not_yet_supported(create_store, key, values):
     with pytest.raises(service.EphemeralPolicyError) as err:
         create(create_store, {**SPEC, "model_tier": "small", "effort": "auto"})
     assert err.value.rule == "auto_requires_decision_platform"
-
-
-@pytest.mark.parametrize(
-    "key,value",
-    [
-        ("max_effort", "low"),
-        ("default_effort", "low"),
-    ],
-)
-def test_ignored_policy_keys_warn_and_do_not_apply(create_store, key, value, caplog):
-    config = create_store[4]
-    config["model_tiers"] = {"claude_code": {"small": "mapped-model"}}
-    if key == "max_effort":
-        config["ephemeral"]["default_effort"] = "low"
-    if key == "max_tier":
-        config["ephemeral"]["default_tier"] = "small"
-    if key == "model_tiers":
-        config[key] = value
-    else:
-        config["ephemeral"][key] = value
-    result = create(create_store)
-    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-    assert len(warnings) == 1 and key in warnings[0].message
-    assert any(key in note for note in result["notes"])
-    assert result["model_tier"] is None and result["effort"] is None
 
 
 @pytest.mark.parametrize("value", [None, 0, 2, "1", True])
@@ -455,7 +430,7 @@ def test_invalid_config_precedes_creator(create_store, key, value):
             False,
             "auto_requires_decision_platform",
         ),
-        (["*"], {"effort": "low"}, {}, "kiro_cli", False, "effort_not_supported"),
+        (["*"], {"effort": "low"}, {}, "kiro_cli", False, "provider_unsupported"),
         (["*"], {}, {"allowed_providers": ["codex"]}, "kiro_cli", False, "provider_unsupported"),
         (
             ["@cao-mcp-server"],
@@ -783,54 +758,6 @@ def test_note_build_failure_precedes_all_writes(create_store, monkeypatch):
     with factory() as db:
         assert db.query(database.EphemeralAgentModel).count() == 0
     assert not (home / "ephemeral").exists()
-
-
-def test_success_warning_failure_cannot_fail_committed_create(create_store, monkeypatch):
-    service = create_store[0]
-    create_store[4]["ephemeral"].update(max_effort="low", default_effort="low")
-    monkeypatch.setattr(service.logger, "warning", Mock(side_effect=RuntimeError("warning failed")))
-    result = create(create_store)
-    assert database.get_ephemeral_agent(result["name"])["state"] == "pending"
-
-
-@pytest.mark.parametrize(
-    "block,top,model_note,effort_note,notice",
-    [
-        (
-            {"max_effort": "low", "default_effort": "low"},
-            {},
-            "model: provider default (tier omitted, no default_tier)",
-            "effort: provider default (effort omitted; ephemeral.max_effort, ephemeral.default_effort are not applied yet)",
-            "ephemeral.max_effort, ephemeral.default_effort are not applied yet; the provider default is used",
-        ),
-        (
-            {
-                "max_effort": "low",
-                "default_effort": "low",
-            },
-            {"model_tiers": {"claude_code": {"small": "private-model-id"}}},
-            "model: provider default (tier omitted, no default_tier)",
-            "effort: provider default (effort omitted; ephemeral.max_effort, ephemeral.default_effort are not applied yet)",
-            "ephemeral.max_effort, ephemeral.default_effort are not applied yet; the provider default is used",
-        ),
-    ],
-)
-def test_ignored_notes_split_keys_without_values(
-    create_store, caplog, block, top, model_note, effort_note, notice
-):
-    config = create_store[4]
-    config["ephemeral"].update(block)
-    config.update(top)
-    result = create(create_store)
-    assert result["notes"] == [
-        model_note,
-        effort_note,
-    ]
-    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-    assert warnings == ["ephemeral create " + result["name"] + ": " + notice]
-    assert "private-tier" not in str(result) + caplog.text
-    assert "private-effort" not in str(result) + caplog.text
-    assert "private-model-id" not in str(result) + caplog.text
 
 
 @pytest.mark.parametrize("declared", [True, False])
