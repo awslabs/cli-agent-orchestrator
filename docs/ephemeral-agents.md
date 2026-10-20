@@ -21,6 +21,8 @@ The operator-only `ephemeral` block in `settings.json` has these defaults:
     "claim_lease_seconds": 60,
     "max_tier": null,
     "default_tier": null,
+    "max_effort": null,
+    "default_effort": null,
     "max_depth": 1
   }
 }
@@ -35,13 +37,12 @@ other ephemerals, even when `child_may_delegate` allows the existing delegation 
 
 ## Model tier and effort
 
-`model_tier` accepts `small`, `medium`, or `large`, or can be omitted. `auto` in
-model tier or effort still refuses with `auto_requires_decision_platform`. Explicit
-effort still refuses with `effort_not_supported`; effort defaults and ceilings are
-not applied yet and are named in create notes and warnings.
+`model_tier` accepts `small`, `medium`, or `large`; `effort` accepts `low`, `medium`,
+or `high`. Either can be omitted. `auto` in either field still refuses with
+`auto_requires_decision_platform`.
 
-The model tier resolves once at create: the explicit value, else
-`ephemeral.default_tier`, else none. The registry row and response hold that resolved
+Tier and effort resolve once at create: the explicit value, else
+`ephemeral.default_tier` or `ephemeral.default_effort`, else none. The registry row and response hold that resolved
 value; the stored spec keeps what was requested. Changing a default later never
 changes a pending name. No decider is asked for an ephemeral agent in any field state.
 
@@ -58,14 +59,20 @@ counts as unmapped. A broken block refuses every create and claim with
 `policy_config_error:<key>` until the operator fixes it. Unknown ephemeral keys, such
 as `min_tier`, remain silently ignored.
 
-An explicit tier above the ceiling gives `tier_exceeds_policy`; an unmapped explicit
-tier with no ceiling gives `tier_unmapped`. A resolved tier becomes `model:` in the
+An explicit tier or effort above its ceiling gives `tier_exceeds_policy` or
+`effort_exceeds_policy`; an unmapped explicit tier with no ceiling gives `tier_unmapped`.
+A resolved tier becomes `model:` in the
 live profile. At claim the id is looked up again in the current table, so a remap
 reaches pending names. A launch without a claim identifier runs the live file as it
 stands: normally the create-time id, or the id from an earlier finalized claim that lapsed.
 
-**Upgrade note:** earlier releases ignored the tier keys and table with a warning,
-whatever their values. They are now validated. A previously accepted block, such as a
+Effort becomes Claude Code's `claudeConfig.effort` (`--effort`) or Codex's
+`codexConfig.model_reasoning_effort`. Values pass through verbatim. A CLI rejection
+for a particular model is a launch failure, not a policy refusal. With effort omitted
+and no default, no provider config or effort flag is emitted.
+
+**Upgrade note:** earlier releases ignored the tier and effort keys and table with a warning,
+whatever their values. All four tier and effort keys are now validated. A previously accepted block, such as a
 ceiling without a default, can therefore refuse every ephemeral create and claim.
 
 ## Create surface and stored files
@@ -156,12 +163,13 @@ get structured `ephemeral_expired` (409); never-created names get structured `un
 (404), including on `POST /sessions`.
 
 The claim lease covers claim to terminal creation. At claim, the server rechecks the operator
-block before the stored provider and tier. A broken block returns `policy_config_error:<key>` and
+block before the stored provider, tier and effort. A broken block returns `policy_config_error:<key>` and
 reverts that claim to pending; fix the named setting and retry. A removed provider returns
 `policy_changed_since_create:provider_not_allowed` and collects the name; create a new one.
-A stored tier above a tightened ceiling, an unmapped stored tier, or a stored provider
+A stored tier or effort above a tightened ceiling, an unmapped stored tier, or a stored provider
 default under a newly added ceiling returns `policy_changed_since_create:tier_exceeds_policy`
-or `policy_changed_since_create:tier_unmapped` and collects the name; re-create it.
+or `policy_changed_since_create:effort_exceeds_policy`, or
+`policy_changed_since_create:tier_unmapped`, and collects the name; re-create it.
 A broken table names `model_tiers`, never `ephemeral.model_tiers`.
 The stored spec is verified and the profile is finalized before the claim response.
 An owner may also launch a pending name without a claim identifier; that bind applies the
@@ -181,11 +189,11 @@ extraction failure tear down terminals owned by that call.
 | --- | --- |
 | 404 | `ephemeral_disabled`, `unknown_ephemeral` |
 | 409 | `already_claimed`, `claim_expired`, `ephemeral_expired`, `spec_unavailable` |
-| 400 | `creator_unresolved`, `not_owner`, `model_override_not_allowed`, `provider_mismatch`, `tool_exceeds_stored`, `policy_config_error:<key>`, `policy_changed_since_create:provider_not_allowed`, `policy_changed_since_create:tier_exceeds_policy`, `policy_changed_since_create:tier_unmapped` |
+| 400 | `creator_unresolved`, `not_owner`, `model_override_not_allowed`, `provider_mismatch`, `tool_exceeds_stored`, `policy_config_error:<key>`, `policy_changed_since_create:provider_not_allowed`, `policy_changed_since_create:tier_exceeds_policy`, `policy_changed_since_create:tier_unmapped`, `policy_changed_since_create:effort_exceeds_policy` |
 | 422 | `invalid_request` for the claim body; invalid launch claim identifiers or claim-plus-reuse requests |
 | 500 | `unexpected_failure` |
 
-Create also refuses with `tier_unmapped`, `tier_exceeds_policy` and
+Create also refuses with `tier_unmapped`, `tier_exceeds_policy`, `effort_exceeds_policy` and
 `policy_config_error:<key>`, all HTTP 400.
 
 Policy errors carry `{kind: "ephemeral_policy", rule, message}` and never echo creator text.
