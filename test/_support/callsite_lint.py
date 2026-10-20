@@ -1,4 +1,4 @@
-"""Shared call-site lint helper for structural guard tests (#9008).
+"""Shared call-site lint helper for structural guard tests (#1005).
 
 Several defect classes in this repo share one shape: a *call site* carries a
 hand-written literal that was correct when it was typed and silently stopped

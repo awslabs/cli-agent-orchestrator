@@ -1,4 +1,4 @@
-"""Three call-site lint rules built on ``test/_support/callsite_lint.py`` (#9008).
+"""Three call-site lint rules built on ``test/_support/callsite_lint.py`` (#1005).
 
 Each rule closes one half of a defect class the repo has already paid for:
 
@@ -44,7 +44,7 @@ import pytest
 # an inline ``# subset-ok: <reason>`` comment, which is the better choice for a
 # one-off; the table is for idioms that repeat.
 #
-# The two sites #9008 named as seeds (``services/agui_stream.py`` ~161 and
+# The two sites #1005 named as seeds (``services/agui_stream.py`` ~161 and
 # ``services/event_primitives.py`` ~69-70) are deliberately absent: neither is
 # an Enum subset. Both compare *strings* read out of an untyped event detail
 # dict, so no Enum-keyed rule can see them. That stringly-typed sibling class

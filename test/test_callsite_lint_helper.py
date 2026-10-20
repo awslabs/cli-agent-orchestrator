@@ -1,4 +1,4 @@
-"""Unit tests for the shared call-site lint helper (#9008).
+"""Unit tests for the shared call-site lint helper (#1005).
 
 The three rules in ``test_callsite_lint_rules.py`` are only as trustworthy as
 this helper. Each test below feeds it synthetic source text so the rule
@@ -155,7 +155,7 @@ def test_enum_subset_sites_flag_every_literal_container_shape(body: str) -> None
 def test_enum_subset_sites_do_not_flag_the_shapes_that_are_fine(body: str) -> None:
     """A complete literal, a derived name, or a non-Enum set is not a finding.
 
-    ``string-literals`` is the honest limitation: the two sites #9008 named as
+    ``string-literals`` is the honest limitation: the two sites #1005 named as
     seeds compare strings, and this rule cannot see them.
     """
     assert _subset_details(body) == []
@@ -439,7 +439,7 @@ def test_a_bare_reason_row_implies_a_reviewed_count_of_one() -> None:
 
 
 def test_a_second_unreviewed_site_under_an_existing_key_is_not_silent() -> None:
-    """The gap #9008's reviewers found: a key collision must not hide growth.
+    """The gap #1005's reviewers found: a key collision must not hide growth.
 
     ``worker.py`` holding two ``poll_until_done`` calls behind one row is the
     live example this guards against -- a third call there must fail until the
