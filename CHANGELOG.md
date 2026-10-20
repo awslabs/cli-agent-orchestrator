@@ -16,8 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Breaking / migration:** a fresh script run now executes a private copy of the approved source.
   Modules beside the spec are not importable and `__file__` names the copy; this matches resume.
-- **Breaking / migration:** while approval is enabled, fresh agent steps in script runs refuse reserved
-  ephemeral profile names until #827 binds their definitions.
+- **Breaking / migration:** reserved ephemeral profiles are refused as script-run agent steps
+  while approval is enforced, because their definitions are generated at runtime and cannot be
+  approved in advance.
 - **Breaking / migration:** non-Git roots now bind the directory's canonical path into `plan_id`.
   Moving or renaming such a directory requires a new approval; Git-repository plan identifiers are
   unchanged.
@@ -152,6 +153,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Script runs now capture their agent-profile and memory-setting guard at admission,
+  before the approval gate, so edits during the gate refuse later agent launches.
+- Script runs under approval enforcement now stop before spawning if their run row
+  cannot be recorded. A missing row for a known script run also refuses agent
+  launches and supplies no memory instead of falling back to live memory.
 - Corrective workflow re-prompts now reuse the attempt's rendered prompt, so
   workflow inputs and earlier step outputs stay filled in when structured output
   is missing or invalid (#966).
