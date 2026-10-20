@@ -101,7 +101,7 @@ _KNOWN_STATE_SERVICE_REASONS: Dict[str, str] = {
 # Caveat worth knowing: ``memory_gateway`` itself imports ``MemoryService`` at
 # module scope (memory_gateway.py:15-19), so even the remote path still binds
 # ``clients.database`` into the MCP process. The gate proves intent, not
-# physical isolation; see the note in the PR for #9010.
+# physical isolation; see the note in the PR for #1005.
 DUAL_MODE_ALLOWLIST: Dict[Tuple[str, str, str], str] = {
     (
         "mcp_server/server.py",
