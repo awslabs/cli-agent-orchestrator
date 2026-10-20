@@ -3,10 +3,15 @@ name, stays behind a length bound (#969).
 
 The defect class, not the instance. A function contracted to be total ("never raises
 on input content") reaches an UNGATED NATIVE-RECURSION primitive -- CPython's C parser
-via ``ast.parse`` -- on unbounded caller-supplied text. On CPython <=3.11 the AST build
-recurses in C with no ``_Py_EnterRecursiveCall`` gate, so deep nesting exhausts the C
-stack and SEGFAULTS: no exception exists, so the ``except`` arms that are supposed to
-enforce totality never run. ``sys.setrecursionlimit`` does not reach that code.
+via ``ast.parse`` -- on unbounded caller-supplied text. Pre-3.12 CPython's AST build
+recurses in C with no ``_Py_EnterRecursiveCall`` gate, so deep nesting CAN exhaust the C
+stack and segfault with no exception to catch -- but where that cliff sits is host- and
+version-dependent, not a fixed line: this repo's DevSpace (CPython 3.10) segfaults around
+150,000-200,000 nesting levels, while the GitHub Actions runner (CPython 3.11) instead
+raises a clean ``RecursionError`` well before reaching a segfault on the same input.
+Neither direction is universal, so a fix must handle both outcomes: an exception to
+convert, and -- on a host whose cliff sits closer in -- no exception to see at all.
+``sys.setrecursionlimit`` does not reach that native-recursion code either way.
 
 The tooling half of the class is why a reader found this and a test did not. The original
 ``test_deeply_nested_expression_is_total`` asserted the right property in the wrong
@@ -35,8 +40,11 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
+import pytest
+
 import cli_agent_orchestrator
 from cli_agent_orchestrator.constants import SCRIPT_LINT_MAX_SOURCE_CHARS
+from cli_agent_orchestrator.services import workflow_spec_service as wss
 from cli_agent_orchestrator.services.script_lint import lint_script
 
 _SRC_ROOT = Path(cli_agent_orchestrator.__file__).parent.parent
@@ -218,6 +226,40 @@ def test_pathological_nesting_crashes_no_child_interpreter(tmp_path: Path) -> No
         f"(#969). stderr:\n{proc.stderr}"
     )
     assert "SURVIVED" in proc.stdout
+
+
+def test_extract_inputs_converts_recursion_error_to_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The backstop arm in ``_extract_inputs`` must fire, not just be unreachable.
+
+    The child-process probe above measures a REAL interpreter cliff, which is host- and
+    version-dependent (see the module docstring) -- on a host whose cliff sits further out,
+    that probe passes via a successful parse and never exercises these ``except`` arms at
+    all. Monkeypatching ``ast.parse`` forces the arm deterministically, on every host.
+    """
+
+    def _raise(*_args: object, **_kwargs: object) -> ast.Module:
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(wss.ast, "parse", _raise)
+    with pytest.raises(ValueError, match="too deeply nested"):
+        wss._extract_inputs("INPUTS = {}\n")
+
+
+def test_extract_inputs_converts_memory_error_to_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same backstop, the other arm: see
+    ``test_extract_inputs_converts_recursion_error_to_value_error`` for why this must be
+    forced rather than relied on to fire naturally."""
+
+    def _raise(*_args: object, **_kwargs: object) -> ast.Module:
+        raise MemoryError("out of memory")
+
+    monkeypatch.setattr(wss.ast, "parse", _raise)
+    with pytest.raises(ValueError, match="too complex"):
+        wss._extract_inputs("INPUTS = {}\n")
 
 
 def test_oversize_rejection_keeps_the_rule_id_extract_inputs_skips_on() -> None:
