@@ -1750,9 +1750,9 @@ async def _create_terminal_unguarded(
                 raise InstalledPolicyExceedsAllowlistError(
                     f"Delegation refused: no installed Kiro agent file with a `tools` list "
                     f"was found for '{agent_profile}', so the policy this bounded launch "
-                    f"would run cannot be compared with the creator's delegation ceiling "
-                    f"[{', '.join(allowed_tools)}]. Remedy: `cao install {agent_profile} "
-                    f"--provider kiro_cli`, then retry.",
+                    f"would run cannot be compared with the bounded allowlist "
+                    f"[{', '.join(allowed_tools)}] this terminal is allowed to run with. "
+                    f"Remedy: `cao install {agent_profile} --provider kiro_cli`, then retry.",
                     parent_id=bounding_id,
                     child_profile=agent_profile,
                 )
@@ -1792,7 +1792,23 @@ async def _create_terminal_unguarded(
             installed_permission = installed_opencode_permission(
                 agent_profile, opencode_cli.OPENCODE_CONFIG_DIR / "agents"
             )
-            if installed_permission is not None:
+            if installed_permission is None:
+                # No readable agent file with a dict `permission:` block: on
+                # OpenCode the installed file IS the policy, so the server
+                # cannot say what this launch would run. A bounded create
+                # fails closed here rather than skipping the check, mirroring
+                # the Kiro branch above.
+                raise InstalledPolicyExceedsAllowlistError(
+                    f"Delegation refused: no installed OpenCode agent file with a "
+                    f"`permission:` block was found for '{agent_profile}', so the policy "
+                    f"this bounded launch would run cannot be compared with the bounded "
+                    f"allowlist [{', '.join(allowed_tools)}] this terminal is allowed to "
+                    f"run with. Remedy: `cao install {agent_profile} --provider "
+                    f"opencode_cli`, then retry.",
+                    parent_id=bounding_id,
+                    child_profile=agent_profile,
+                )
+            else:
                 bounded = cao_tools_to_opencode_permission(allowed_tools)
                 wider = sorted(
                     tool

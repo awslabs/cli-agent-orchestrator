@@ -462,6 +462,100 @@ def test_installed_opencode_permission_reader(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Round 5: OpenCode Step 0d fails closed when CAO cannot read the installed
+# policy, mirroring the Kiro fail-closed tests below. @haofeif re-review at
+# fc4af221, P2.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_opencode_bounded_launch_without_an_installed_agent_file_is_refused(
+    launch, opencode_install
+):
+    """``installed_opencode_permission`` answers None for a missing agent file. On
+    OpenCode the installed file IS the policy, so a bounded create that cannot read
+    it is refused with the install remedy rather than skipping the comparison."""
+    from cli_agent_orchestrator.utils.delegation import InstalledPolicyExceedsAllowlistError
+
+    _seed("0000beef", "reviewer", REVIEWER, REVIEWER)
+    # No opencode_install(...): the agents directory holds no developer.md.
+    with pytest.raises(InstalledPolicyExceedsAllowlistError) as excinfo:
+        await create_terminal(
+            "opencode_cli",
+            "developer",
+            session_name="cao-sess",
+            new_session=False,
+            caller_id="0000beef",
+            allowed_tools=["fs_read"],
+        )
+    message = str(excinfo.value)
+    assert "no installed OpenCode agent file" in message
+    assert "cao install developer --provider opencode_cli" in message
+    assert excinfo.value.status_code == 403
+    assert excinfo.value.parent_id == "0000beef"
+
+
+@pytest.mark.asyncio
+async def test_opencode_bounded_launch_without_a_permission_block_is_refused(
+    launch, opencode_install
+):
+    """An agent file that exists but carries no dict ``permission:`` block is the
+    same fail-open gap as a missing file: the installed policy still cannot be
+    read, so the create must refuse rather than skip Step 0d."""
+    import frontmatter
+
+    from cli_agent_orchestrator.providers import opencode_cli
+    from cli_agent_orchestrator.utils.delegation import InstalledPolicyExceedsAllowlistError
+
+    _seed("0000beef", "reviewer", REVIEWER, REVIEWER)
+    (opencode_cli.OPENCODE_CONFIG_DIR / "agents" / "developer.md").write_text(
+        frontmatter.dumps(frontmatter.Post("x", description="d", mode="all"))
+    )
+    with pytest.raises(InstalledPolicyExceedsAllowlistError) as excinfo:
+        await create_terminal(
+            "opencode_cli",
+            "developer",
+            session_name="cao-sess",
+            new_session=False,
+            caller_id="0000beef",
+            allowed_tools=["fs_read"],
+        )
+    assert "no installed OpenCode agent file" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_opencode_operator_launch_without_an_installed_file_is_not_refused(
+    launch, opencode_install
+):
+    """The operator path is untouched: no caller, no ceiling comparison to fail closed on."""
+    child = await create_terminal(
+        "opencode_cli",
+        "developer",
+        session_name="cao-sess",
+        new_session=False,
+        allowed_tools=["fs_read"],
+    )
+    assert child.allowed_tools == ["fs_read"]
+
+
+@pytest.mark.asyncio
+async def test_opencode_unrestricted_delegator_without_an_installed_file_is_not_refused(
+    launch, opencode_install
+):
+    """A ``*`` ceiling has nothing the installed file could exceed; the warning path stays."""
+    _seed("0000beef", "sup", SUPERVISOR, ["*"])
+    child = await create_terminal(
+        "opencode_cli",
+        "developer",
+        session_name="cao-sess",
+        new_session=False,
+        caller_id="0000beef",
+        allowed_tools=["fs_read"],
+    )
+    assert child.allowed_tools == ["fs_read"]
+
+
+# ---------------------------------------------------------------------------
 # Round 4: Kiro Step 0d fails closed on a missing agent file; the idempotency
 # fingerprint hashes the delegating terminal.
 # ---------------------------------------------------------------------------
