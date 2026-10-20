@@ -37,8 +37,12 @@ Vocabulary handled here (see docs/tool-restrictions.md "Tool Vocabulary"):
 - ``@builtin`` grants nothing on any provider and is ignored on the child
   side, otherwise ``supervisor`` (no ``@builtin``) could never launch
   ``reviewer`` (which lists it).
-- Every other entry (``execute_bash``, ``web_fetch``, ``discovery``,
-  ``@cao-mcp-server``, ``@<server>``) matches by exact name.
+- ``@cao-mcp-server``, ``@<server>`` and other MCP references use the selector
+  rule of :func:`cli_agent_orchestrator.utils.tool_mapping.mcp_reference_covers`:
+  a whole-server grant covers a per-tool reference on that server (``@server``
+  covers ``@server/tool``), not exact-name matching.
+- Every other entry (``execute_bash``, ``web_fetch``, ``discovery``) matches by
+  exact name.
 """
 
 from __future__ import annotations
