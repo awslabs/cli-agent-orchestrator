@@ -215,3 +215,63 @@ class TestBuiltinProfileRefusal:
             )
         assert result.exit_code == 0
         mock_svc.plan.assert_called_once()
+
+
+@pytest.mark.parametrize("route", ["reserved-name", "normal-name", "explicit-path"])
+def test_promotion_namespace_refusal_preserves_legacy_copy(tmp_path, monkeypatch, route):
+    from unittest.mock import Mock
+
+    from cli_agent_orchestrator.cli.commands.memory import memory
+    from cli_agent_orchestrator.services import promotion_service, settings_service
+
+    reserved = "ACDC-log_triage-3f9a"
+    name = "ordinary" if route == "normal-name" else reserved
+    store = tmp_path / "store"
+    store.mkdir()
+    target = store / f"{name}.md"
+    target.write_text(f"---\nname: {name}\ndescription: Test\n---\nOriginal prompt\n")
+    before = target.read_bytes()
+    lookup = Mock(return_value={"cao_installed": str(store)})
+    monkeypatch.setattr(settings_service, "usable_agent_dirs", lookup)
+    monkeypatch.setattr(settings_service, "get_extra_agent_dirs", lambda: [])
+    # Only lesson discovery is stubbed: apply uses the real atomic profile writer.
+    service = object.__new__(promotion_service.PromotionService)
+    service.plan = Mock(
+        side_effect=lambda **kw: PromotionPlan(
+            agent_profile=kw["agent_profile"],
+            profile_path=kw["profile_path"],
+            candidates=[_candidate()],
+        )
+    )
+    monkeypatch.setattr(promotion_service, "PromotionService", lambda: service)
+    monkeypatch.setattr(promotion_service, "_is_promotion_enabled", lambda: True)
+    args = ["promote", name, "--apply"]
+    if route == "explicit-path":
+        args += ["--profile-path", str(target)]
+    result = CliRunner().invoke(memory, args)
+    if route == "reserved-name":
+        assert result.exit_code != 0, result.output
+        assert f"Reserved ephemeral profile name: {reserved}" in result.output
+        assert target.read_bytes() == before
+        lookup.assert_not_called()
+        service.plan.assert_not_called()
+    else:
+        assert result.exit_code == 0, result.output
+        assert "Lesson text." in target.read_text()
+        assert target.read_bytes() != before
+        service.plan.assert_called_once()
+        if route == "explicit-path":
+            lookup.assert_not_called()
+        else:
+            lookup.assert_called_once()
+
+
+def test_promotion_lookup_uses_shared_reservation_predicate(monkeypatch):
+    import click
+
+    from cli_agent_orchestrator.cli.commands.memory import _resolve_profile_path
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    monkeypatch.setattr(agent_profiles, "routes_to_ephemeral_store", lambda name: True)
+    with pytest.raises(click.ClickException, match="Reserved ephemeral profile name: ordinary"):
+        _resolve_profile_path("ordinary")

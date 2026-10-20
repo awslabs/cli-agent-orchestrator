@@ -42,7 +42,11 @@ cao --version           # Show version
 | `cao terminal` | Terminal management |
 | `cao workflow` | Workflow management |
 | `cao update` | Update CAO to the latest version |
+| `cao fleet` | Inspect and tear down a *remote* fleet's workers (status, shutdown) |
+| `cao worker` | Talk to one worker in a remote fleet (list, status, send, sessions, attach, logs, release) |
 | `cao flow` | **[Deprecated]** Alias for `schedule` |
+
+Every command in this table acts on this machine — its `cao-server`, its config, or its sessions — except `cao fleet` and `cao worker`, which address a remote cluster through that cluster's worker broker. Those two are configured entirely by environment and never fall back to the local server.
 
 ---
 
@@ -529,6 +533,208 @@ Workflow management for complex multi-step operations.
 
 ```bash
 cao workflow
+```
+
+---
+
+## cao fleet
+
+Inspect and tear down a CAO fleet's workers. A *fleet* is a cluster that runs one
+agent per worker, each with its own `cao-server`; these commands reach it through
+the fleet's worker broker over HTTP and know nothing about Kubernetes.
+
+Both `cao fleet` and `cao worker` read the same two variables and take no other
+configuration:
+
+```bash
+export CAO_ELASTIC_BROKER_URL=http://127.0.0.1:9890   # a port-forward is enough
+export CAO_ELASTIC_BROKER_TOKEN=...
+```
+
+Without both, every subcommand exits with `No fleet configured.` — neither group
+ever falls back to the `cao-server` on this machine. See
+[Environment Variables](environment-variables.md#remote-fleets-env-var-only).
+
+:::warning `cao shutdown` and `cao fleet shutdown` are different commands
+`cao shutdown` stops tmux sessions on **this machine**. `cao fleet shutdown`
+releases workers in a **remote cluster**, and the agent sessions inside them go
+with the workers.
+:::
+
+### cao fleet status
+
+Summarise the fleet: whether the broker is reachable, and what it is holding.
+
+```bash
+cao fleet status [--json]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--json` | Output in JSON format |
+
+A settled count is not an error count. `completed` and `released` are the normal
+end of a task; `terminated`, `failed` and `expired` are the three the broker
+records a reason for, and `cao worker list --all` prints those reasons.
+
+### cao fleet shutdown
+
+Release every live worker in the fleet.
+
+```bash
+cao fleet shutdown [--yes] [--json]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--yes`, `-y` | Skip the confirmation prompt |
+| `--json` | Output in JSON format (requires `--yes`) |
+
+This deletes the workers and their sessions; nothing is resumable afterwards. It
+does **not** touch the supervisor, the panel, or the cluster itself — those are
+deployed and removed by the cluster's own manifests, so this command cannot leave
+you without the fleet you would use to make new workers.
+
+`--json` cannot ask for confirmation without corrupting its own output, so it
+requires `--yes`; the two together are the only unattended form. The exit code is
+non-zero if any worker could not be released, in both modes.
+
+### Examples
+
+```bash
+# Is the broker there, and what is it holding?
+cao fleet status
+
+# Release everything, interactively
+cao fleet shutdown
+
+# Release everything from a script, and fail the step if any worker survived
+cao fleet shutdown --yes --json
+```
+
+---
+
+## cao worker
+
+Inspect and talk to one worker in a remote fleet. These are `cao session`'s verbs
+pointed at a single worker, and they name no scheduler: a worker is addressed the
+same way whatever the fleet runs it as. Configuration is the two variables under
+[`cao fleet`](#cao-fleet).
+
+### cao worker list
+
+List the workers the broker knows about.
+
+```bash
+cao worker list [--all] [--json]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--all` | Include settled leases and the reason each settled |
+| `--json` | Output in JSON format |
+
+Settled leases are hidden by default and are the interesting rows when a
+delegation claimed success and produced nothing: the broker's ledger records why
+a worker is gone, which a deleted pod cannot answer and the supervisor's own
+transcript does not contain.
+
+### cao worker status
+
+Show a worker's lease and what its agent is doing.
+
+```bash
+cao worker status WORKER_ID [--json]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--json` | Output in JSON format |
+
+Two sources, and both are needed: the lease says whether the cluster still
+considers the worker alive, the terminal says whether the agent inside it is
+working. They disagree in exactly the case worth catching — a Ready pod whose
+agent finished minutes ago without saying so.
+
+### cao worker send
+
+Send a message to a worker's agent and print its reply.
+
+```bash
+cao worker send WORKER_ID MESSAGE [--async] [--timeout N]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--async` | Send and return immediately, without waiting for the reply |
+| `--timeout N` | Seconds to wait for the agent to finish (default 300; ignored with `--async`) |
+
+Done-detection is the same logic a local `cao session send` uses, with the status
+read through the broker rather than re-implemented, so a worker running a provider
+that idles mid-turn is not reported as hung.
+
+### cao worker sessions
+
+List the sessions and terminals inside a worker.
+
+```bash
+cao worker sessions WORKER_ID [--json]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--json` | Output in JSON format |
+
+### cao worker attach
+
+Talk to a worker's agent turn by turn until you exit.
+
+```bash
+cao worker attach WORKER_ID
+```
+
+### cao worker logs
+
+Print a worker's container log — the smallest thing that makes a worker which
+failed to boot diagnosable without handing the caller `kubectl`.
+
+```bash
+cao worker logs WORKER_ID [-n LINES] [-f]
+```
+
+| Option | Description |
+|--------|-------------|
+| `-n`, `--tail LINES` | Lines to show (default 200) |
+| `-f`, `--follow` | Stream new lines as they arrive |
+
+### cao worker release
+
+Release one worker, deleting it and the session it was running.
+
+```bash
+cao worker release WORKER_ID
+```
+
+### Examples
+
+```bash
+# What is live right now?
+cao worker list
+
+# Why did that worker disappear?
+cao worker list --all
+
+# Ask one worker a question and wait for its answer
+cao worker send a1b2c3d4 "summarise what you changed"
+
+# Fire and forget
+cao worker send a1b2c3d4 "keep going" --async
+
+# Follow a worker that never became ready
+cao worker logs a1b2c3d4 -f
+
+# Hand one worker back without touching the rest of the fleet
+cao worker release a1b2c3d4
 ```
 
 ---

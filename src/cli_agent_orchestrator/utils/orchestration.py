@@ -26,6 +26,8 @@ import logging
 import os
 import re
 import time
+import uuid
+from collections.abc import Mapping
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 
 import requests
@@ -36,6 +38,7 @@ from cli_agent_orchestrator.constants import (
     CALLBACK_TERMINAL_ID_ENV,
     CALLBACK_URL_ENV,
     DEFAULT_PROVIDER,
+    DISCOVERY_TOOL_MARKER,
 )
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.inbox import OrchestrationType
@@ -46,6 +49,7 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
 )
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
+from cli_agent_orchestrator.utils.description import normalize_description
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_session_name_for_key,
@@ -62,17 +66,52 @@ def _mcp_timeout() -> float:
 def _auth_headers() -> Dict[str, str]:
     """Return the ``Authorization`` header for the internal client->API hop, if any.
 
-    Mirrors ``mcp_server.utils._auth_headers`` / ``mcp_server.app_tools._auth_headers``:
+    Same behaviour as ``mcp_server.utils._auth_headers`` / ``mcp_server.app_tools._auth_headers``;
+    the copies are per module, and what they share is the decision that matters,
+    ``_is_local_api`` (see ``_auth_headers_for``). ``test/test_bearer_scope_boundary.py``
+    holds every ``requests`` call in ``src/`` to the rule that an unscoped helper may
+    only be paired with a URL built on ``API_BASE_URL``. This helper
     attaches the operator-provisioned ``CAO_AUTH_LOCAL_TOKEN`` when the auth layer is
     enabled, and returns an empty mapping default-off so the no-auth posture stays
     byte-for-byte unchanged. Every ``requests`` call in this module passes
     ``headers=_auth_headers() or None`` -- without this, an auth-enabled deployment's
     cao-server rejects every one of these calls with a 401 and the CLI/MCP orchestration
     surface (assign, handoff, send_message, status, result, cancel, delete_terminal)
-    cannot be used at all.
+    cannot be used at all. Calls whose base URL may be another node go through
+    ``_auth_headers_for(base_url)`` so the token never leaves this node.
     """
     token = get_local_bearer()
     return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def _is_local_api(base_url: str) -> bool:
+    """True when ``base_url`` is this node's own cao-server (``API_BASE_URL``).
+
+    An exact string compare after trailing-slash normalisation, deliberately: it
+    is not this module's job to decide that ``localhost`` or ``::1`` names the
+    same listener as ``CAO_API_HOST``. The normal local path passes the
+    ``API_BASE_URL`` constant itself, and a differently spelled self-reference
+    fails closed (no bearer, 401) rather than leaking the token on a guess.
+    ``mcp_server.utils._auth_headers_for`` shares this predicate.
+    """
+    return base_url.rstrip("/") == API_BASE_URL.rstrip("/")
+
+
+def _auth_headers_for(base_url: str) -> Dict[str, str]:
+    """``_auth_headers()`` for the local API only; empty for any other host.
+
+    ``CAO_AUTH_LOCAL_TOKEN`` authenticates the client->API hop on THIS node.
+    Requests whose base URL came from a ``target_host`` argument or a
+    ``CAO_CALLBACK_URL`` env var go to some other host, and sending the token
+    there is a disclosure: whoever answers at that URL receives the operator's
+    bearer. Every caller here that may address another node uses this instead
+    of ``_auth_headers()``; ``get_handoff_result`` in ``mcp_server.server`` uses
+    the ``mcp_server.utils`` twin. These hops carry no credential for a remote node's own
+    auth layer; a deployment that provisioned the same token to every node was
+    authenticating cross-node calls by accident, and those calls now arrive
+    without a bearer.
+    """
+    return _auth_headers() if _is_local_api(base_url) else {}
 
 
 # Environment variable to enable/disable automatic sender terminal ID injection.
@@ -199,6 +238,155 @@ def _callback_route() -> Tuple[Optional[str], Optional[str]]:
     return (url.rstrip("/") if url else None, terminal_id or None)
 
 
+def has_discovery_grant(allowed_tools: Optional[Any]) -> bool:
+    """Whether a terminal's resolved ``allowed_tools`` carries the ``discovery`` grant.
+
+    One definition shared by ``_require_discovery_marker`` (the gate on
+    ``list_siblings`` / ``update_metadata``) and the ``send_message`` sibling
+    allowance below, so the two can never disagree about who holds the grant.
+    ``None`` (no role/allowedTools resolved at all) and ``"*"`` both mean
+    unrestricted, matching ``resolve_allowed_tools``' own semantics.
+    """
+    if allowed_tools is None:
+        return True
+    return "*" in allowed_tools or DISCOVERY_TOOL_MARKER in allowed_tools
+
+
+def _target_binding_denial(
+    target_id: str,
+    *,
+    base_url: Optional[str] = None,
+    target_meta: Optional[Dict[str, Any]] = None,
+    allow_parent: bool = False,
+    allow_discovered_sibling: bool = False,
+) -> Optional[str]:
+    """Return a refusal message if the calling terminal may not act on ``target_id``.
+
+    Binds the terminal-targeting MCP tools (``delete_terminal``,
+    ``answer_user_prompt``, ``send_message`` with an explicit receiver) to the
+    caller's own place in the assign/handoff tree. ``None`` means allowed.
+
+    * No ``CAO_TERMINAL_ID`` (operator shell, external MCP client, ``cao`` CLI
+      outside a CAO pane): unchanged, there is no caller to bind to.
+    * The caller's own terminal: allowed.
+    * A terminal the caller created via assign/handoff (the target's recorded
+      ``caller_id`` is the caller): allowed. This is what lets an in-terminal
+      supervisor answer or delete its own workers, including a remote worker
+      addressed by ``target_host``, whose row on that node records the
+      supervisor as ``caller_id``.
+    * A target on a REMOTE node (``base_url`` differs from the local server)
+      whose row reports this caller as ``callback_terminal_id``: allowed. A
+      remote node never records the supervisor as ``caller_id`` (it has no row
+      for the supervisor); it does keep the ``CAO_CALLBACK_TERMINAL_ID`` the
+      supervisor injected, and ``GET /terminals/{id}`` publishes it in that
+      field. A remote node too old to return the field refuses, fail closed.
+    * With ``allow_parent``: the caller's own creator, found through the
+      caller's ``caller_id`` row or ``CAO_CALLBACK_TERMINAL_ID`` for a remote
+      worker: allowed. Only ``send_message`` wants this (a worker replying up).
+    * With ``allow_discovered_sibling``: when the caller holds the
+      ``discovery`` grant (same test as ``_require_discovery_marker``), a
+      target that ``GET /terminals/{own}/siblings`` returns (widest scope the
+      caller may see: full own group, ``cross_session=true``): allowed. This
+      keeps the documented peer flow of issue #432, "find siblings with
+      list_siblings, then message them with send_message", with exact
+      membership. Only ``send_message`` wants this.
+    * Anything else (a sibling without the grant, another supervisor's worker,
+      an unrelated session): refused before any state-changing HTTP call is
+      made.
+
+    A target the server does not know (404) is NOT refused here, so the tool's
+    own request still produces its usual not-found result. Any other lookup
+    failure refuses, fail closed, with the detail attached.
+
+    This runs in the MCP server process next to the agent. It stops a confused
+    or prompt-injected agent from steering a tool at another terminal through
+    the tool interface. It is not server-side identity: the HTTP API still
+    authorises by scope only.
+    """
+    own_id = _current_terminal_id()
+    if not own_id or target_id == own_id:
+        return None
+
+    base = (base_url or API_BASE_URL).rstrip("/")
+    is_remote = base != API_BASE_URL.rstrip("/")
+    timeout = (REMOTE_CONNECT_TIMEOUT, _mcp_timeout()) if is_remote else _mcp_timeout()
+
+    if allow_parent:
+        _, callback_terminal_id = _callback_route()
+        if callback_terminal_id and target_id == callback_terminal_id:
+            return None
+
+    if target_meta is None:
+        try:
+            response = requests.get(
+                f"{base}/terminals/{target_id}",
+                headers=_auth_headers_for(base) or None,
+                timeout=timeout,
+            )
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            target_meta = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            # ValueError covers a 200 with a non-JSON body: fail closed, not loud.
+            return (
+                f"Could not verify that terminal {own_id} may act on terminal "
+                f"{target_id} ({exc}); refusing."
+            )
+
+    if target_meta.get("caller_id") == own_id:
+        return None
+
+    # Only a REMOTE row is read this way: a local row's callback_terminal_id
+    # names a supervisor on some other node, which this caller cannot be.
+    if is_remote and target_meta.get("callback_terminal_id") == own_id:
+        return None
+
+    if (allow_parent or allow_discovered_sibling) and not is_remote:
+        try:
+            own_response = requests.get(
+                f"{API_BASE_URL}/terminals/{own_id}",
+                headers=_auth_headers() or None,
+                timeout=_mcp_timeout(),
+            )
+            own_response.raise_for_status()
+            own_meta = own_response.json()
+            if allow_parent and own_meta.get("caller_id") == target_id:
+                return None
+            if allow_discovered_sibling and has_discovery_grant(own_meta.get("allowed_tools")):
+                # The server compares against the caller's OWN persisted group
+                # and clamps depth to it, so this is exactly what list_siblings
+                # could ever return; cross_session=true is that tool's widest
+                # explicit opt-in. A group-less caller gets [] and is refused.
+                siblings_response = requests.get(
+                    f"{API_BASE_URL}/terminals/{own_id}/siblings",
+                    params={"cross_session": "true"},
+                    headers=_auth_headers() or None,
+                    timeout=_mcp_timeout(),
+                )
+                siblings_response.raise_for_status()
+                siblings = siblings_response.json()
+                if not isinstance(siblings, list):
+                    raise ValueError("siblings response is not a list")
+                if any(isinstance(s, dict) and s.get("id") == target_id for s in siblings):
+                    return None
+        except (requests.RequestException, ValueError) as exc:
+            # ValueError covers a 200 with a non-JSON body: fail closed, not loud.
+            return (
+                f"Could not verify that terminal {own_id} may act on terminal "
+                f"{target_id} ({exc}); refusing."
+            )
+
+    relation = "itself or terminals it created via assign or handoff"
+    if allow_parent:
+        relation += ", or the terminal that created it"
+    if allow_discovered_sibling:
+        relation += ", or a sibling it can discover with list_siblings"
+    return (
+        f"Terminal {own_id} may only act on {relation}. " f"Terminal {target_id} is none of those."
+    )
+
+
 def _resolve_target_base_url(target_host: str) -> str:
     """Normalize a ``target_host`` value into a cao-server base URL.
 
@@ -226,7 +414,7 @@ def _wait_remote_ready(base_url: str, timeout: float) -> None:
 
     Exists because "the pod is Ready" and "the Service in front of the pod is
     routable" are different claims, and only the second one is what a caller
-    needs. A broker that leases a worker the moment its Job and Service objects
+    needs. A broker that leases a worker the moment its workload and Service objects
     exist is handing back an address that becomes usable shortly afterwards -
     endpoint published, kube-proxy rules programmed on this node - and the
     difference is a second or two that no readiness probe on the pod can observe.
@@ -352,14 +540,13 @@ def _resolve_child_allowed_tools(
     Returns:
         Comma-separated string of allowed tools, or None for unrestricted.
     """
+    from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
     from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
     from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
     try:
         child_profile = load_agent_profile(child_profile_name)
-        mcp_server_names = (
-            list(child_profile.mcpServers.keys()) if child_profile.mcpServers else None
-        )
+        mcp_server_names = grantable_server_names(child_profile)
         child_allowed = resolve_allowed_tools(
             child_profile.allowedTools, child_profile.role, mcp_server_names
         )
@@ -386,6 +573,114 @@ def _resolve_child_allowed_tools(
     return ",".join(child_allowed)
 
 
+def _remote_ephemeral_refusal(name: str, target_host: Optional[str]) -> Optional[str]:
+    """Refuse before contacting another node; the name belongs to its creator node."""
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    if target_host and agent_profiles.routes_to_ephemeral_store(name):
+        from cli_agent_orchestrator.services.ephemeral_service import log_refusal
+
+        log_refusal(
+            "remote_placement_not_allowed",
+            os.environ.get("CAO_TERMINAL_ID"),
+            name,
+            "omit target_host",
+        )
+        return f"remote_placement_not_allowed: ephemeral agent '{name}' can only launch on the node that created it; omit target_host"
+    return None
+
+
+class EphemeralClaim(NamedTuple):
+    """Recorded launch authority, or an existing terminal returned by a keyed retry."""
+
+    provider: str
+    effective_tools: list[str]
+    claim_id: Optional[str] = None
+    terminal_id: Optional[str] = None
+
+
+class _ClaimRefused(ValueError):
+    """Carry only the policy relay's public rule and message to the handler."""
+
+    def __init__(self, rule: str, message: str):
+        super().__init__(message)
+        self.rule = rule
+
+
+def _local_claim_refusal(rule: str, detail: str = "") -> _ClaimRefused:
+    from cli_agent_orchestrator.services.ephemeral_service import log_refusal
+
+    log_refusal(rule, os.environ.get("CAO_TERMINAL_ID"), None, detail)
+    return _ClaimRefused(rule, f"ephemeral policy: {rule}" + (f" {detail}" if detail else ""))
+
+
+def _claim_ephemeral(
+    name: str, model: Optional[str], idempotency_key: Optional[str] = None
+) -> Optional[EphemeralClaim]:
+    """Claim reserved names before resolution; installed targets keep their old path."""
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    if not agent_profiles.routes_to_ephemeral_store(name):
+        return None
+    if model is not None:
+        raise _local_claim_refusal("model_override_not_allowed", "set model_tier in the spec")
+    caller_id = _current_terminal_id()
+    if not caller_id:
+        raise _local_claim_refusal("not_owner")
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/ephemeral-agents/{name}/claim",
+            params={"caller_id": caller_id},
+            json={"idempotency_key": idempotency_key} if idempotency_key is not None else {},
+            headers=_auth_headers() or None,
+            timeout=_mcp_timeout(),
+        )
+        data = response.json()
+        if response.status_code != 200:
+            error = data.get("detail") if isinstance(data, dict) else None
+            if isinstance(error, dict):
+                raise _ClaimRefused(
+                    error.get("rule", "unexpected_failure"),
+                    error.get("message", "ephemeral policy: unexpected_failure"),
+                )
+            raise ValueError()
+        if data.get("replayed") is True:
+            terminal_id = data["terminal_id"]
+            # The replay response deliberately contains only the terminal id.
+            # Recover its recorded launch settings, never resolve the profile again.
+            response = requests.get(
+                f"{API_BASE_URL}/terminals/{terminal_id}",
+                headers=_auth_headers() or None,
+                timeout=_mcp_timeout(),
+            )
+            response.raise_for_status()
+            metadata = response.json()
+            return EphemeralClaim(
+                metadata["provider"], metadata["allowed_tools"], terminal_id=terminal_id
+            )
+        return EphemeralClaim(data["provider"], data["effective_tools"], data["claim_id"])
+    except _ClaimRefused:
+        raise
+    except requests.exceptions.JSONDecodeError:
+        raise _local_claim_refusal("unexpected_failure") from None
+    except requests.HTTPError:
+        raise _local_claim_refusal("unexpected_failure") from None
+    except requests.RequestException:
+        raise _local_claim_refusal(
+            "creator_unresolved", "cao-server could not be reached"
+        ) from None
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise _local_claim_refusal("unexpected_failure") from None
+
+
+def _require_claim(name: str, claim: Optional[EphemeralClaim]) -> None:
+    """Low-level helpers never launch a reserved target without a claim."""
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    if claim is None and agent_profiles.routes_to_ephemeral_store(name):
+        raise ValueError("Ephemeral targets cannot be launched without a claim.")
+
+
 def _create_terminal(
     agent_profile: str,
     working_directory: Optional[str] = None,
@@ -397,12 +692,16 @@ def _create_terminal(
     use_worktree: bool = False,
     create_timeout: Optional[float] = None,
     idempotency_key: Optional[str] = None,
+    claim: Optional[EphemeralClaim] = None,
+    description: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
     Args:
         agent_profile: Agent profile for the terminal
         working_directory: Optional working directory for the terminal
+        claim: Optional ephemeral launch claim for binding the child terminal
+        description: Optional description persisted on the child terminal
         idempotency_key: Review on PR #634, issue #616. Forwarded as a query
             param to whichever endpoint this call hits (existing-session or
             new-session); the server returns the terminal a PRIOR call with
@@ -453,6 +752,11 @@ def _create_terminal(
     Raises:
         Exception: If terminal creation fails
     """
+    _require_claim(agent_profile, claim)
+
+    if claim is not None and claim.terminal_id is not None:
+        return claim.terminal_id, claim.provider
+
     provider = DEFAULT_PROVIDER
     parent_allowed_tools = None
 
@@ -469,7 +773,11 @@ def _create_terminal(
         terminal_metadata = response.json()
 
         # Treat the supervisor provider as a fallback, not an explicit override.
-        provider = resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
+        provider = (
+            claim.provider
+            if claim is not None
+            else resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
+        )
         session_name = terminal_metadata["session_name"]
         parent_allowed_tools = terminal_metadata.get("allowed_tools")
 
@@ -495,13 +803,19 @@ def _create_terminal(
                 )
 
         # Resolve child's allowed_tools via inheritance
-        child_allowed_tools = _resolve_child_allowed_tools(parent_allowed_tools, agent_profile)
+        child_allowed_tools = (
+            ",".join(claim.effective_tools)
+            if claim is not None
+            else _resolve_child_allowed_tools(parent_allowed_tools, agent_profile)
+        )
 
         # Create new terminal in existing session - always pass working_directory
         params = {"provider": provider, "agent_profile": agent_profile}
         # Record the creating terminal so send_message can route callbacks
         # structurally instead of parsing IDs out of message text (issue #284).
         params["caller_id"] = current_terminal_id
+        if claim is not None and claim.claim_id is not None:
+            params["claim_id"] = claim.claim_id
         if working_directory:
             params["working_directory"] = working_directory
         if child_allowed_tools:
@@ -517,10 +831,9 @@ def _create_terminal(
         # The message payload goes in the JSON body, not the query string, so
         # prompt content isn't exposed in HTTP access logs and isn't subject to
         # URL-length limits. Only routing flags stay in params.
-        json_body = None
+        json_body = {"description": normalize_description(description, truncate=True)}
         if defer_init:
             params["defer_init"] = "true"
-            json_body = {}
             if initial_message is not None:
                 json_body["initial_message"] = initial_message
             if initial_message_orchestration_type is not None:
@@ -537,6 +850,13 @@ def _create_terminal(
             headers=_auth_headers() or None,
             timeout=create_timeout if create_timeout is not None else _mcp_timeout(),
         )
+        if claim is not None and response.status_code >= 400:
+            kind, message, _, rule = _parse_run_step_error(response)
+            if kind == "ephemeral_policy":
+                raise _ClaimRefused(rule or "unexpected_failure", message)
+            raise _ClaimRefused(
+                "unexpected_failure", f"ephemeral launch failed ({response.status_code})"
+            )
         response.raise_for_status()
         terminal = response.json()
     else:
@@ -588,9 +908,9 @@ def _create_terminal(
         if idempotency_key:
             params["idempotency_key"] = idempotency_key
 
-        json_body = None
+        json_body = {"description": normalize_description(description, truncate=True)}
         if initial_message is not None:
-            json_body = {"initial_message": initial_message}
+            json_body["initial_message"] = initial_message
             if initial_message_orchestration_type is not None:
                 json_body["initial_message_orchestration_type"] = (
                     initial_message_orchestration_type.value
@@ -696,9 +1016,12 @@ class HandoffContext(NamedTuple):
     session_name: Optional[str]
     caller_id: Optional[str]
     allowed_tools: Optional[list]
+    claim_id: Optional[str] = None
 
 
-def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
+def _resolve_handoff_provider(
+    agent_profile: str, claim: Optional[EphemeralClaim] = None
+) -> HandoffContext:
     """Resolve the handoff context for a worker WITHOUT creating a terminal.
 
     Mirrors the resolution branch of the former ``_create_terminal``: a worker
@@ -712,6 +1035,8 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
     the single combined run-step call, while preserving the same-session /
     caller_id / allowed_tools behavior the old six-call path had.
     """
+    _require_claim(agent_profile, claim)
+
     current_terminal_id = _current_terminal_id()
     if not current_terminal_id:
         return HandoffContext(
@@ -729,6 +1054,14 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
     response.raise_for_status()
     terminal_metadata = response.json()
 
+    if claim is not None:
+        return HandoffContext(
+            claim.provider,
+            terminal_metadata["session_name"],
+            current_terminal_id,
+            claim.effective_tools,
+            claim.claim_id,
+        )
     provider = resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
     # Resolve the child's allowed-tools via the same inheritance the old path
     # used; _resolve_child_allowed_tools returns a comma-separated string (or
@@ -758,8 +1091,8 @@ def _terminal_id_from_detail(detail: str) -> Optional[str]:
 
 def _parse_run_step_error(
     response: requests.Response,
-) -> tuple[Optional[str], str, Optional[str]]:
-    """Parse a run-step error response into ``(kind, message, terminal_id)``.
+) -> tuple[Optional[str], str, Optional[str], Optional[str]]:
+    """Parse a run-step error into ``(kind, message, terminal_id, policy_rule)``.
 
     The run-step endpoint returns a STRUCTURED detail object
     ``{"message", "kind", "terminal_id"}`` so callers read the failure kind and
@@ -771,16 +1104,18 @@ def _parse_run_step_error(
         payload = response.json()
     except ValueError:
         fallback = f"status {response.status_code}"
-        return None, fallback, None
+        return None, fallback, None, None
 
-    detail = payload.get("detail")
+    detail = payload.get("detail") if isinstance(payload, dict) else None
     if isinstance(detail, dict):
         message = detail.get("message") or f"status {response.status_code}"
-        return detail.get("kind"), message, detail.get("terminal_id")
+        kind = detail.get("kind")
+        rule = detail.get("rule", "unexpected_failure") if kind == "ephemeral_policy" else None
+        return kind, message, detail.get("terminal_id"), rule
     if isinstance(detail, str) and detail:
-        return None, detail, _terminal_id_from_detail(detail)
+        return None, detail, _terminal_id_from_detail(detail), None
     fallback = f"status {response.status_code}"
-    return None, fallback, None
+    return None, fallback, None, None
 
 
 def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
@@ -817,21 +1152,25 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
         base_url = callback_url
 
     params = {"sender_id": sender_id, "message": message}
-    # BOTH header sets, and the union is not a compromise between two merge
-    # sides -- they are disjoint and independently load-bearing.
-    # `_auth_headers()` carries the local `Authorization: Bearer` an
-    # auth-enabled cao-server rejects every call without (haofeif's P2 on PR
-    # #634); `elastic_worker_gateway_headers()` carries the broker's
-    # worker-id/release-token pair an elastic worker's callback hop needs. They
-    # share no key, so neither can shadow the other, and an auth-enabled
-    # elastic deployment genuinely needs both on the same request. Each is
-    # empty when its own feature is off, so the default-off posture is still
-    # byte-for-byte `None`.
-    request_headers = {**_auth_headers(), **elastic_worker_gateway_headers()} or None
+
+    def _inbox_headers(target_base_url: str) -> Optional[Dict[str, str]]:
+        # BOTH header sets, and the union is not a compromise between two merge
+        # sides -- they are disjoint and independently load-bearing.
+        # `_auth_headers_for()` carries the local `Authorization: Bearer` an
+        # auth-enabled cao-server rejects every call without (haofeif's P2 on
+        # PR #634) -- for the LOCAL node only, since the token is this node's
+        # and must not be sent to a callback host; `elastic_worker_gateway_headers()`
+        # carries the broker's worker-id/release-token pair an elastic worker's
+        # callback hop needs. They share no key, so neither can shadow the
+        # other, and an auth-enabled elastic deployment genuinely needs both on
+        # the same request. Each is empty when its own feature is off, so the
+        # default-off posture is still byte-for-byte `None`.
+        return {**_auth_headers_for(target_base_url), **elastic_worker_gateway_headers()} or None
+
     response = requests.post(
         f"{base_url}/terminals/{receiver_id}/inbox/messages",
         params=params,
-        headers=request_headers,
+        headers=_inbox_headers(base_url),
         timeout=_mcp_timeout(),
     )
     if response.status_code == 404 and callback_url and base_url != callback_url:
@@ -841,7 +1180,7 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
         response = requests.post(
             f"{callback_url}/terminals/{receiver_id}/inbox/messages",
             params=params,
-            headers=request_headers,
+            headers=_inbox_headers(callback_url),
             timeout=_mcp_timeout(),
         )
     response.raise_for_status()
@@ -849,17 +1188,60 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
     return data
 
 
+def _render_lint_findings(findings: Any) -> str:
+    """Render lint findings with severity, rule, source line, and message."""
+    if not isinstance(findings, list):
+        return ""
+    lines = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        lines.append(
+            f"{finding.get('severity', '?')} {finding.get('rule_id', '?')} "
+            f"at line {finding.get('line', '?')}: {finding.get('message', '')}"
+        )
+    return "; ".join(lines)
+
+
 def _extract_error_detail(response: requests.Response, fallback: str) -> str:
-    """Extract a human-readable error detail from an API response."""
+    """Extract a human-readable error detail from an API response.
+
+    Valid JSON is not necessarily a JSON *object*: a gateway or proxy between the
+    agent and cao-server can answer a 502 with ``[]`` or a bare string, both of
+    which parse fine and have no ``.get``. Assuming a mapping here turned that
+    into an ``AttributeError`` raised out of the error path — so a transport
+    fault surfaced as a crash instead of the typed ``success: False`` envelope
+    every caller is written against. Check the type before subscripting.
+
+    Structured details carry an approval-refusal message or lint findings.
+    Keep accepting string details for callers talking to older servers.
+    """
     try:
         payload = response.json()
     except ValueError:
         return fallback
 
+    if not isinstance(payload, dict):
+        return fallback
+
     detail = payload.get("detail")
+    if isinstance(detail, dict):
+        message = detail.get("message")
+        if isinstance(message, str) and message:
+            return message
+        rendered = _render_lint_findings(detail.get("findings"))
+        return rendered or fallback
     if isinstance(detail, str) and detail:
         return detail
     return fallback
+
+
+# Server-side ready-wait (up to 120s) plus slack, added to the caller's step
+# timeout to get the HTTP read budget. Named rather than inlined because the
+# resulting budget (timeout + this) is what decides whether the pending/job_id
+# branch is reachable at all under a given provider's tools/call deadline -- see
+# the Timeout branch in _run_step_and_build_result. No message quotes 180.
+_CLIENT_TIMEOUT_HEADROOM = 180
 
 
 async def _run_step_and_build_result(
@@ -896,6 +1278,12 @@ async def _run_step_and_build_result(
     is the name quoted back to the operator in the remote-cleanup hints below.
     """
     known_terminal_id: Optional[str] = payload.get("reuse_terminal_id")
+    # Read off the payload for the same reason ``reuse_terminal_id`` is: the
+    # caller owns it, and this helper only needs it to describe what it just
+    # POSTed. Present only on the default single-call path (issue #447) --
+    # absent on the early-terminal-id path, which already reported a real
+    # terminal_id to the caller and so needs no separate discovery key.
+    job_id: Optional[str] = payload.get("job_id")
     # Allow the full step time plus the server-side ready-wait (up to 120s)
     # plus headroom; the server enforces the per-step timeout internally.
     #
@@ -903,7 +1291,7 @@ async def _run_step_and_build_result(
     # node would consume the FULL read budget (~timeout+180s) just failing
     # to connect. Local calls keep the plain timeout (localhost connect
     # cannot black-hole meaningfully) so their behavior is unchanged.
-    client_timeout = float(timeout) + 180.0
+    client_timeout = float(timeout) + _CLIENT_TIMEOUT_HEADROOM
     request_timeout: Any = (
         (REMOTE_CONNECT_TIMEOUT, client_timeout) if target_host else client_timeout
     )
@@ -911,11 +1299,42 @@ async def _run_step_and_build_result(
         response = requests.post(
             f"{base_url}/terminals/run-step",
             json=payload,
-            headers=_auth_headers() or None,
+            headers=_auth_headers_for(base_url) or None,
             timeout=request_timeout,
         )
     except requests.Timeout:
         timeout_msg = f"Handoff timed out after {timeout} seconds"
+        if job_id:
+            # The transport died, but the step may still be running (or have
+            # already finished) server-side. The server persists the result in
+            # handoff_results under this job_id BEFORE the terminal is torn
+            # down, so it is retrievable (issue #447 / PR #453 review finding 3 --
+            # naming the tool, not a bare "GET /handoff-results/{job_id}",
+            # because the supervisor LLM has no base URL and no token to build
+            # that request itself).
+            #
+            # THIS BRANCH IS NOT FULL COVERAGE, and the row outliving the
+            # transport is not the same as this message reaching anyone. The HTTP
+            # read budget set above is timeout + _CLIENT_TIMEOUT_HEADROOM (default
+            # 600 + 180 = 780s), while several providers cap a single
+            # tools/call at ~600s (Codex, Kimi, MiniMax). For an MCP-supervisor
+            # caller on those providers the PROVIDER deadline usually fires
+            # first, so ``requests.Timeout`` is never raised here and this
+            # pending/job_id result is never returned -- the supervisor sees its
+            # own tool-call timeout with no job_id in hand. Closing that gap
+            # (surfacing the job_id before the call can be pre-empted) is
+            # tracked separately in #715; it is NOT fixed here.
+            # ``target_host`` is quoted here when set because the row lives in
+            # THAT node's database (PR #453 review, haofeif): the retrieval tool
+            # defaults to the supervisor's own node, so a remote job retrieved
+            # without it answers a false not-found.
+            retrieval_args = f"job_id={job_id}"
+            if target_host:
+                retrieval_args += f", target_host='{target_host}'"
+            timeout_msg += (
+                f". The job may still be running server-side; retrieve the "
+                f"result with the get_handoff_result tool, {retrieval_args}"
+            )
         if target_host and not known_terminal_id:
             # Client-side timeout on a fresh remote create: the step may still
             # be running and its terminal id is unknown here, so it cannot be
@@ -928,6 +1347,8 @@ async def _run_step_and_build_result(
             )
         return HandoffResult(
             success=False,
+            pending=True if job_id else None,
+            job_id=job_id,
             message=timeout_msg,
             output=None,
             terminal_id=known_terminal_id,
@@ -938,13 +1359,25 @@ async def _run_step_and_build_result(
         # run-step endpoint returns a STRUCTURED detail object
         # ({message, kind, terminal_id}) so we read terminal_id and the
         # failure kind as fields rather than scraping the message.
-        kind, structured_detail, tid = _parse_run_step_error(response)
+        kind, structured_detail, tid, rule = _parse_run_step_error(response)
         # worker RAN LONG (timeout) vs CRASHED (terminal reached ERROR) must
         # be reported distinctly so a 5s crash is not mislabeled as an
         # N-second timeout. The structured `kind` is authoritative; the
         # status code is only the fallback when an older server omits it
         # (504 -> timeout, 502 -> error).
-        if kind == "error" or (kind is None and response.status_code == 502):
+        if kind == "ephemeral_policy":
+            msg = structured_detail
+        # Generic text is only for failures before any worker is known; a launched
+        # worker's timeout, error or extraction failure keeps its handoff result.
+        elif (
+            payload.get("claim_id") is not None
+            and kind not in ("error", "timeout")
+            and response.status_code not in (502, 504)
+            and tid is None
+        ):
+            msg = f"ephemeral launch failed ({response.status_code})"
+            rule = "unexpected_failure"
+        elif kind == "error" or (kind is None and response.status_code == 502):
             msg = f"Handoff failed: worker errored ({structured_detail})"
         elif kind == "timeout" or (kind is None and response.status_code == 504):
             msg = f"Handoff timed out after {timeout} seconds"
@@ -966,7 +1399,9 @@ async def _run_step_and_build_result(
                     f"on {target_host}; DELETE {base_url}/terminals/{resolved_tid} "
                     f"(or delete_terminal('{resolved_tid}', target_host='{target_host}'))."
                 )
-        return HandoffResult(success=False, message=msg, output=None, terminal_id=resolved_tid)
+        return HandoffResult(
+            success=False, message=msg, rule=rule, output=None, terminal_id=resolved_tid
+        )
 
     data = response.json()
     terminal_id = data.get("terminal_id", known_terminal_id)
@@ -1005,6 +1440,7 @@ async def _handoff_impl(
     wait: bool = True,
     idempotency_key: Optional[str] = None,
     target_host: Optional[str] = None,
+    description: Optional[str] = None,
 ) -> HandoffResult:
     """Implementation of handoff logic.
 
@@ -1089,6 +1525,17 @@ async def _handoff_impl(
     table), so a keyed retry that lands on a different ``target_host`` could
     not dedupe even if the plumbing were threaded.
     """
+    refusal = _remote_ephemeral_refusal(agent_profile, target_host)
+    if refusal:
+        return HandoffResult(
+            success=False,
+            message=refusal,
+            output=None,
+            terminal_id=None,
+            job_id=None,
+            pending=False,
+        )
+
     start_time = time.time()
     terminal_id: Optional[str] = None
 
@@ -1130,7 +1577,13 @@ async def _handoff_impl(
             terminal_id=None,
         )
 
+    claim: Optional[EphemeralClaim] = None
     try:
+        claim = _claim_ephemeral(
+            agent_profile,
+            model,
+            idempotency_key if on_terminal_id is not None or not wait else None,
+        )
         if target_host:
             # Remote placement: the worker runs on target_host's node in a
             # fresh session there. The supervisor's session/caller_id/allowed
@@ -1149,7 +1602,11 @@ async def _handoff_impl(
             # codex fast-fail (which needs CAO_TERMINAL_ID) can run before any
             # terminal exists, on every path below.
             base_url = API_BASE_URL
-            ctx = _resolve_handoff_provider(agent_profile)
+            ctx = (
+                _resolve_handoff_provider(agent_profile, claim=claim)
+                if claim is not None
+                else _resolve_handoff_provider(agent_profile)
+            )
         provider = ctx.provider
 
         # Fail fast for codex: its handoff banner requires CAO_TERMINAL_ID. We
@@ -1174,6 +1631,15 @@ async def _handoff_impl(
             # and tool inheritance. Byte-for-byte the original single-seam
             # behavior (BR-8) -- this is what the MCP tool always takes.
             shaped_message = _shape_handoff_message(provider, message)
+            # Minted HERE, before the POST, so the key exists on the client even
+            # if the response never arrives (issue #447). The server records the
+            # result under it; client-side generation is what makes it available
+            # to the Timeout branch in ``_run_step_and_build_result``. This does
+            # NOT deduplicate execution -- a retry with the same job_id would
+            # still run a second step. Only the default single-call path needs
+            # it: the early-terminal-id path already hands back a real
+            # terminal_id, which is its own discovery handle.
+            job_id = uuid.uuid4().hex
             payload: Dict[str, Any] = {
                 "provider": provider,
                 "agent": agent_profile,
@@ -1181,12 +1647,16 @@ async def _handoff_impl(
                 "teardown": True,
                 "timeout": float(timeout),
                 "use_worktree": use_worktree,
+                "job_id": job_id,
+                "description": normalize_description(description, truncate=True),
             }
             if ctx.session_name:
                 payload["session_name"] = ctx.session_name
             if ctx.caller_id:
                 payload["caller_id"] = ctx.caller_id
-            if ctx.allowed_tools:
+            if ctx.claim_id is not None:
+                payload["claim_id"] = ctx.claim_id
+            if ctx.allowed_tools or ctx.claim_id is not None:
                 payload["allowed_tools"] = ctx.allowed_tools
             if working_directory:
                 payload["working_directory"] = working_directory
@@ -1216,6 +1686,7 @@ async def _handoff_impl(
         # GET); reassigning ``provider`` to its return value uses whatever it
         # actually persisted on the terminal as the source of truth for the
         # reuse call below, rather than assuming the two resolutions agree.
+        claim_kwargs: Dict[str, Any] = {"claim": claim} if claim is not None else {}
         terminal_id, provider = _create_terminal(
             agent_profile,
             working_directory,
@@ -1224,6 +1695,8 @@ async def _handoff_impl(
             use_worktree=use_worktree,
             create_timeout=_HANDOFF_CREATE_TIMEOUT_S,
             idempotency_key=idempotency_key,
+            description=description,
+            **claim_kwargs,
         )
         if on_terminal_id is not None:
             try:
@@ -1292,7 +1765,7 @@ async def _handoff_impl(
             # errored, or timed-out wait leaves the terminal alive on purpose,
             # so the operator can inspect/recover it via status/result/cancel,
             # which is the entire point of surfacing terminal_id early.
-            cleanup = _delete_terminal_impl(terminal_id)
+            cleanup = _delete_terminal_impl(terminal_id, check_binding=False)
             if not cleanup.get("success"):
                 logger.warning(
                     "handoff: post-success teardown of terminal %s failed: %s",
@@ -1301,7 +1774,29 @@ async def _handoff_impl(
                 )
         return result
 
+    except _ClaimRefused as exc:
+        return HandoffResult(
+            success=False,
+            rule=exc.rule,
+            message=str(exc),
+            terminal_id=terminal_id,
+            output=None,
+            job_id=None,
+            pending=None,
+        )
+
     except Exception as e:
+        if claim is not None and terminal_id is None:
+            logger.warning("ephemeral launch failed after claim: %s", type(e).__name__)
+            return HandoffResult(
+                success=False,
+                rule="unexpected_failure",
+                message="ephemeral launch failed",
+                output=None,
+                terminal_id=None,
+                job_id=None,
+                pending=None,
+            )
         # Surface terminal_id when known. With the single-call design the server
         # owns the terminal lifecycle, so on a client-side failure (e.g. the
         # provider resolution) there is usually no terminal to surface.
@@ -1323,6 +1818,7 @@ def _assign_remote(
     ready_wait_seconds: float = 0.0,
     callback_url: Optional[str] = None,
     remote_session_name: Optional[str] = None,
+    description: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create an assign worker on a REMOTE CAO node (one-agent-per-pod topology).
 
@@ -1395,6 +1891,7 @@ def _assign_remote(
         f"{base_url}/sessions",
         params=params,
         json={
+            "description": normalize_description(description, truncate=True),
             "initial_message": worker_message,
             "initial_message_orchestration_type": OrchestrationType.ASSIGN.value,
             "env_vars": {
@@ -1472,6 +1969,7 @@ def _assign_impl(
     ready_wait_seconds: float = 0.0,
     callback_url: Optional[str] = None,
     remote_session_name: Optional[str] = None,
+    description: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1493,7 +1991,12 @@ def _assign_impl(
     worker-side ``send_message`` uses to deliver replies to this node.
     Omitting ``target_host`` preserves local behavior byte-for-byte.
     """
+    refusal = _remote_ephemeral_refusal(agent_profile, target_host)
+    if refusal:
+        return {"success": False, "terminal_id": None, "message": refusal}
+
     terminal_id: Optional[str] = None
+    claim: Optional[EphemeralClaim] = None
     try:
         # Fail fast before creating the worker terminal when CAO_TERMINAL_ID is
         # unset — REGARDLESS of the sender-ID-injection flag. The deferred-init
@@ -1503,6 +2006,7 @@ def _assign_impl(
         # which cannot honor defer_init/initial_message — assign would create a
         # worker, never deliver the task, and still return success. Guarding
         # here also avoids leaving an orphan window behind (issue #284).
+        claim = _claim_ephemeral(agent_profile, model)
         current_terminal_id = _current_terminal_id()
         if not current_terminal_id:
             return {
@@ -1542,6 +2046,7 @@ def _assign_impl(
                 ready_wait_seconds=ready_wait_seconds,
                 callback_url=callback_url,
                 remote_session_name=remote_session_name,
+                description=description,
             )
 
         # Create terminal in DEFERRED-INIT mode: cao-server returns as soon
@@ -1549,15 +2054,18 @@ def _assign_impl(
         # provider.initialize() and initial-message delivery run as a
         # background task on the server. The call typically returns
         # in under 2 seconds regardless of how long init takes.
+        claim_kwargs: Dict[str, Any] = {"claim": claim} if claim is not None else {}
         terminal_id, _ = _create_terminal(
             agent_profile,
             working_directory,
             engine=engine,
             defer_init=True,
+            description=description,
             initial_message=worker_message,
             initial_message_orchestration_type=OrchestrationType.ASSIGN,
             model=model,
             use_worktree=use_worktree,
+            **claim_kwargs,
         )
 
         return {
@@ -1572,7 +2080,18 @@ def _assign_impl(
             ),
         }
 
+    except _ClaimRefused as exc:
+        return {"success": False, "terminal_id": terminal_id, "rule": exc.rule, "message": str(exc)}
+
     except Exception as e:
+        if claim is not None and terminal_id is None:
+            logger.warning("ephemeral launch failed after claim: %s", type(e).__name__)
+            return {
+                "success": False,
+                "terminal_id": None,
+                "rule": "unexpected_failure",
+                "message": "ephemeral launch failed",
+            }
         # Surface the terminal_id when creation succeeded before the failure
         # (e.g. the send POST failed) so the orphaned terminal can be
         # inspected or deleted — matching the ready-timeout path above.
@@ -1588,6 +2107,7 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
     """Implementation of send_message logic."""
     try:
         own_terminal_id = _current_terminal_id()
+        explicit_receiver = bool(receiver_id)
 
         # A REMOTE worker has no local caller row; its cross-node supervisor is
         # recorded in CAO_CALLBACK_TERMINAL_ID instead (injected at creation) —
@@ -1655,6 +2175,17 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
                 ),
             }
 
+        # An explicitly named receiver must be in the caller's assign/handoff
+        # tree: the recorded caller and the cross-node callback supervisor were
+        # resolved above from trusted DB/env fields, so only an ID the agent
+        # typed needs checking (self was already refused).
+        if own_terminal_id and explicit_receiver:
+            denial = _target_binding_denial(
+                receiver_id, allow_parent=True, allow_discovered_sibling=True
+            )
+            if denial:
+                return {"success": False, "error": denial}
+
         # Auto-inject sender terminal ID suffix when enabled. Skipped when
         # CAO_TERMINAL_ID is unset — never inject 'unknown' as a routable
         # address (issue #284); _send_to_inbox raises a clear error for that
@@ -1681,7 +2212,9 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
         return {"success": False, "error": str(e)}
 
 
-def _delete_terminal_impl(terminal_id: str, target_host: Optional[str] = None) -> Dict[str, Any]:
+def _delete_terminal_impl(
+    terminal_id: str, target_host: Optional[str] = None, *, check_binding: bool = True
+) -> Dict[str, Any]:
     """Implementation of delete_terminal logic.
 
     Kills the tmux window and removes the terminal record. Used both by the
@@ -1692,6 +2225,11 @@ def _delete_terminal_impl(terminal_id: str, target_host: Optional[str] = None) -
     the local cao-server exactly as before. The MCP tool wrapper launders
     pydantic's ``FieldInfo`` default into ``None`` before calling; the CLI
     passes a real ``Optional[str]``, so no laundering happens here.
+
+    ``check_binding``: refuse a target outside the caller's assign/handoff tree
+    (see ``_target_binding_denial``). Internal callers that are tearing down a
+    terminal they created in the same call pass ``False``; the tool and CLI
+    paths keep the default.
     """
     # Hoisted above the try because the HTTPError arm below interpolates it: if
     # it were assigned inside, a raise before that line would turn a reportable
@@ -1699,9 +2237,13 @@ def _delete_terminal_impl(terminal_id: str, target_host: Optional[str] = None) -
     location = f" on node {target_host}" if target_host else ""
     try:
         base_url = _resolve_target_base_url(target_host) if target_host else API_BASE_URL
+        if check_binding:
+            denial = _target_binding_denial(terminal_id, base_url=base_url)
+            if denial:
+                return {"success": False, "message": denial}
         response = requests.delete(
             f"{base_url}/terminals/{terminal_id}",
-            headers=_auth_headers() or None,
+            headers=_auth_headers_for(base_url) or None,
             # A remote node that is unreachable must fail on CONNECT rather than
             # hang for the full read timeout; a local delete keeps its single
             # scalar timeout so default-path behavior is unchanged.
@@ -1849,6 +2391,12 @@ def _cancel_impl(terminal_id: str, delete: bool = False) -> Dict[str, Any]:
         return _delete_terminal_impl(terminal_id)
 
     try:
+        # Same binding as --delete: a caller with CAO_TERMINAL_ID (a shell
+        # inside a CAO pane) may interrupt itself or its own workers only. An
+        # operator shell with no identity is unchanged.
+        denial = _target_binding_denial(terminal_id)
+        if denial:
+            return {"success": False, "terminal_id": terminal_id, "error": denial}
         response = requests.post(
             f"{API_BASE_URL}/terminals/{terminal_id}/key",
             params={"key": "C-c"},

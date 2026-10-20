@@ -23,6 +23,8 @@ from cli_agent_orchestrator.security.auth import (
     get_jwks_uri,
     get_scopes_for_local_token,
     is_auth_enabled,
+    is_idp_configured,
+    is_local_token_mode,
 )
 
 __all__ = [
@@ -39,4 +41,6 @@ __all__ = [
     "get_jwks_uri",
     "get_scopes_for_local_token",
     "is_auth_enabled",
+    "is_idp_configured",
+    "is_local_token_mode",
 ]

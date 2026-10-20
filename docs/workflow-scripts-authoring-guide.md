@@ -7,6 +7,11 @@ live in `~/.aws/cli-agent-orchestrator/workflows/` and are run **by their
 stem**: `<name>.py` there runs as `cao workflow run <name>`. There is no
 `--script` flag, and a path outside that directory is rejected.
 
+Script runs execute in one project root: the run request's `working_directory`, defaulting
+to the calling terminal's directory (MCP), the current directory (CLI), or cao-server's
+directory (direct REST). The same directory is fingerprinted for approval and used for agent
+steps that name no directory. Resume reuses the recorded root.
+
 It covers the `cao_workflow` shim's contract, when to reach for a script
 instead of YAML, the determinism obligation resume relies on, how to declare
 a recovery policy, and the resume boundary itself.
@@ -56,8 +61,12 @@ emit_output({"reviewed": True})
 - **Errors are typed and never retried:** `ShimIdentityError` (identity env
   missing — nothing was attempted), `ShimTransportError` (network failure,
   wraps the underlying `urllib` error), `ShimHTTPError` (non-2xx response,
-  carries `.status`/`.body`). All four (`ShimError` plus these three
-  subclasses) are importable from `cao_workflow` directly:
+  carries `.status`/`.body`). When the response has a non-empty string
+  `detail.kind`, `str(ShimHTTPError)` prints
+  `run-step returned HTTP <status> (<kind>): <message>` (omitting the message
+  suffix when absent); unstructured responses keep the original
+  `run-step returned HTTP <status>` text. All four (`ShimError` plus these
+  three subclasses) are importable from `cao_workflow` directly:
   `from cao_workflow import run_step, ShimHTTPError`.
 - **`step_id` is required for concurrent fan-out.** If you call `step` or
   `run_step` from more than one thread (e.g. via `concurrent.futures`), pass an
@@ -129,7 +138,17 @@ an explicit, stable `step_id` per call:
 
 ```python
 def _run_shard(shard):
-    return run_step("kiro_cli", "reviewer", f"review {shard}", step_id=f"shard-{shard}")
+    return step(
+        "claude_code",                    # headless: kiro_cli currently hangs a step (SKILL.md R5)
+        "reviewer",
+        f"review {shard}",
+        step_id=f"shard-{shard}",         # explicit and stable — the rule above
+        # A reviewer READS the shard and returns findings inline, so re-running it has the same
+        # effect as running it once. That is what makes "idempotent" an honest claim HERE — it is
+        # a statement about this step, not a default. A step that filed a ticket or sent mail
+        # would need "manual", and CAO would halt and ask rather than repeat it.
+        recovery="idempotent",
+    )
 
 with ThreadPoolExecutor(max_workers=3) as pool:
     futures = [pool.submit(_run_shard, s) for s in ("alpha", "beta", "gamma")]
@@ -243,8 +262,8 @@ it.
 
 Inside your script a halt arrives as a `ShimHTTPError` with `.status == 409`,
 whose `.body` names `kind: "decision_required"`, the `step_id`, and which
-condition fired. Resolve it by naming a decision per halted step and resuming
-again:
+condition fired; `str(exc)` now shows `(decision_required)` and the message too.
+Resolve it by naming a decision per halted step and resuming again:
 
 ```bash
 cao workflow resume <run-id> --decide <step_id>=rerun   # re-execute that step
@@ -260,9 +279,10 @@ consent. **Consent does not persist across resumes** — one `rerun` is never
 standing authorisation for a later one, and must never be presented to a user
 as though it were.
 
-A divergence arrives the same way, as a `409` with `kind: "diverged"`, but it
-has a different remedy: there is no decision to make, because the fix is to
-look at what changed in the script at that step key.
+A divergence arrives the same way, as a `409` with `kind: "diverged"`, and
+`str(exc)` shows `(diverged)` too, but it has a different remedy: there is no
+decision to make, because the fix is to look at what changed in the script at
+that step key.
 
 **Do not let a blanket `except ShimError` swallow either one.**
 `ShimHTTPError` is a `ShimError`, so a catch-all written for per-unit timeout

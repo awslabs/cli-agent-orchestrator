@@ -2,8 +2,11 @@
 
 The subprocess is MOCKED throughout (fast, hermetic, default matrix) — the
 OS-touching proofs live under the ``e2e`` marker in
-``test/e2e/test_script_runner_e2e.py``. Coverage maps to the code-generation
-test plan:
+``test/e2e/script_runner/test_script_runner_e2e.py``. The one exception is
+``test_close_pipes_closes_a_real_process_transport``, which spawns a short-lived
+real child because ``_close_pipes`` depends on a private attribute of
+``asyncio.subprocess.Process`` that the fakes cannot vouch for. Coverage maps
+to the code-generation test plan:
 
 - M1 result-shape contract: a script COMPLETED result has the same base fields
   as a YAML run + ``kind=None``/``output``/``warnings=[]`` (INV-5).
@@ -29,6 +32,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
+import signal
+import sys
 from pathlib import Path
 from typing import List, Optional
 
@@ -73,6 +80,21 @@ def _patched_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_SCRATCH_DIR", tmp_path / "scratch")
+    # issue #583 Bolt 3 (``approval-enforcement-default``): the approval gate now defaults ON, and
+    # every test in this module drives a script run whose plan is not approved. These are tests of the
+    # RUNNER -- spawn, reap, sentinel scanning, resume admission, TOCTOU -- not of approval, so the
+    # gate is turned off here through the real setting. Doing it in the fixture rather than per test
+    # keeps the runner's own behaviour the only variable, and using the setting rather than patching
+    # ``ensure_plan_approved`` out means the gate's disabled path stays genuinely exercised.
+    import json as _json
+
+    from cli_agent_orchestrator.services import settings_service as _settings
+
+    _gate_off = tmp_path / "settings.json"
+    _gate_off.write_text(_json.dumps({"workflow": {"require_approval": False}}))
+    monkeypatch.setattr(_settings, "SETTINGS_FILE", _gate_off)
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
     # Isolate the process-local registry between tests.
     from cli_agent_orchestrator.services import workflow_service
 
@@ -161,13 +183,91 @@ class _FakeStream:
         return chunk
 
 
-def _install_fake_spawn(monkeypatch: pytest.MonkeyPatch, process: _FakeProcess) -> dict:
+class _HeldOpenStream(_FakeStream):
+    """A stream that yields its payload and then never reaches EOF.
+
+    This is what the script's pipes look like when a background process it
+    started inherited them and is still running.
+    """
+
+    async def read(self, n: int = -1) -> bytes:
+        chunk = await super().read(n)
+        if chunk:
+            return chunk
+        await asyncio.Event().wait()
+
+
+class _FakeTransport:
+    """Records whether the drive closed the subprocess pipes."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _HeldPipesProcess:
+    """A script that exits while its stdout/stderr stay open.
+
+    ``returncode`` flips from None to ``exit_rc`` after ``exit_after`` seconds,
+    as asyncio sets it when the process exits, whether or not anything is in
+    ``wait()``. ``wait_holds_for_pipes`` picks the ``wait()`` behaviour: on
+    Python 3.10 it returns at the exit, and from 3.11 a ``wait()`` started
+    before the exit does not return until the pipes reach EOF, which here is
+    never. With ``exit_after=None`` the script runs until it is signalled:
+    SIGKILL ends it at once, SIGTERM 0.02s later and only when ``honours_sigterm``.
+    """
+
+    def __init__(
+        self,
+        *,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+        wait_holds_for_pipes: bool,
+        exit_rc: int = 0,
+        exit_after: Optional[float] = 0.05,
+        honours_sigterm: bool = True,
+    ):
+        self.returncode: Optional[int] = None
+        self.stdout = _HeldOpenStream(stdout)
+        self.stderr = _HeldOpenStream(stderr)
+        self._wait_holds_for_pipes = wait_holds_for_pipes
+        self._honours_sigterm = honours_sigterm
+        self._exited = asyncio.Event()
+        self._transport = _FakeTransport()
+        self.signals: List[str] = []
+        if exit_after is not None:
+            asyncio.get_running_loop().call_later(exit_after, self._exit, exit_rc)
+
+    def _exit(self, rc: int) -> None:
+        self.returncode = rc
+        self._exited.set()
+
+    async def wait(self) -> int:
+        if self._wait_holds_for_pipes:
+            await asyncio.Event().wait()
+        await self._exited.wait()
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.signals.append("SIGTERM")
+        if self._honours_sigterm:
+            asyncio.get_running_loop().call_later(0.02, self._exit, -15)
+
+    def kill(self) -> None:
+        self.signals.append("SIGKILL")
+        self._exit(-9)
+
+
+def _install_fake_spawn(monkeypatch: pytest.MonkeyPatch, process: object) -> dict:
     """Patch ``asyncio.create_subprocess_exec`` to return ``process``; capture args."""
     captured: dict = {}
 
     async def _fake_exec(*args, **kwargs):
         captured["args"] = args
         captured["env"] = kwargs.get("env")
+        captured["cwd"] = kwargs.get("cwd")
         return process
 
     monkeypatch.setattr(
@@ -278,11 +378,26 @@ async def test_lint_fail_raises_before_any_spawn(monkeypatch: pytest.MonkeyPatch
 
 
 @pytest.mark.asyncio
-async def test_happy_completed_result_shape_and_sentinel(monkeypatch: pytest.MonkeyPatch):
+async def test_happy_completed_result_shape_and_sentinel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
     """M1 + A6: exit 0 -> COMPLETED, tier-neutral shape, sentinel output parsed."""
     proc = _FakeProcess(exit_rc=0, stdout=b'log line\nCAO_WORKFLOW_OUTPUT:{"answer": 42}\n')
     captured = _install_fake_spawn(monkeypatch, proc)
-    result = await run_script_workflow(_FakeScriptSpec(), {}, "run-ok")
+    manifest_cwds = []
+    monkeypatch.setattr(
+        script_runner.manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: script_runner.manifest_freeze.FrozenManifest(
+            (lambda **kwargs: manifest_cwds.append(kwargs["cwd"]) or None)(**kwargs)
+        ),
+    )
+    result = await run_script_workflow(
+        _FakeScriptSpec(),
+        {},
+        "run-ok",
+        working_directory=str(tmp_path),
+    )
 
     assert isinstance(result, WorkflowRunResult)
     assert result.state == RunState.COMPLETED
@@ -298,6 +413,10 @@ async def test_happy_completed_result_shape_and_sentinel(monkeypatch: pytest.Mon
     # F3: the journaled started_at is the SAME timestamp as the record's, not a
     # second independent _now() call.
     assert row.started_at == result.started_at
+    assert script_runner.run_registry["run-ok"].working_directory == os.path.realpath(tmp_path)
+    assert captured["cwd"] == os.path.realpath(tmp_path)
+    assert manifest_cwds == [os.path.realpath(tmp_path)]
+    assert json.loads(row.spec_snapshot)["working_directory"] == os.path.realpath(tmp_path)
     # Constructed env is the exact 6-key allowlist (INV-2 + BR-A5), no resume flag.
     env = captured["env"]
     assert set(env) == {
@@ -313,22 +432,64 @@ async def test_happy_completed_result_shape_and_sentinel(monkeypatch: pytest.Mon
 
 
 @pytest.mark.asyncio
+async def test_blocking_run_persists_launch_guard(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        script_runner.launch_guard.settings_service,
+        "is_workflow_approval_required",
+        lambda: True,
+    )
+    monkeypatch.setattr(script_runner.approval_gate, "ensure_plan_approved", lambda **kwargs: None)
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles,
+        "list_agent_profiles",
+        lambda: [{"name": "developer"}],
+    )
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles,
+        "_read_agent_profile_source",
+        lambda name: "profile source",
+    )
+    monkeypatch.setattr(
+        script_runner.launch_guard.settings_service,
+        "is_memory_enabled",
+        lambda: True,
+    )
+    _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+
+    await run_script_workflow(
+        _FakeScriptSpec(),
+        {},
+        "run-guard-persisted",
+        working_directory=str(tmp_path),
+    )
+
+    snapshot = json.loads(workflow_journal.get_run("run-guard-persisted").spec_snapshot)
+    assert snapshot["launch_guard"]["memory_enabled"] is True
+    assert set(snapshot["launch_guard"]["profiles"]) == {"developer"}
+
+
+@pytest.mark.asyncio
 async def test_crash_nonzero_exit_failed_kind_error(monkeypatch: pytest.MonkeyPatch):
-    """Nonzero exit -> FAILED, kind=error, stderr tail surfaced, sweep fired."""
+    """Nonzero exit -> FAILED with a redacted durable diagnostic and a swept worker."""
     swept = {"run": None}
+    aws_key = "AKIAIOSFODNN7EXAMPLE"
 
     async def _fake_sweep(run_id):
         swept["run"] = run_id
 
     monkeypatch.setattr(script_runner, "_reconcile_orphans", _fake_sweep)
-    proc = _FakeProcess(exit_rc=1, stderr=b"Traceback: boom\n")
-    _install_fake_spawn(monkeypatch, proc)
+    proc = _FakeProcess(exit_rc=1, stderr=f"Traceback: boom with {aws_key}\n".encode())
+    captured = _install_fake_spawn(monkeypatch, proc)
 
     result = await run_script_workflow(_FakeScriptSpec(), {}, "run-crash")
     assert result.state == RunState.FAILED
     assert result.kind == "error"
     assert any("boom" in w for w in result.warnings)  # stderr tail surfaced
     assert swept["run"] == "run-crash"
+    row = workflow_journal.get_run("run-crash")
+    assert row is not None
+    assert getattr(row, "error", None) == "Traceback: boom with [REDACTED:aws_access_key]"
+    assert aws_key not in getattr(row, "error", "")
 
 
 @pytest.mark.asyncio
@@ -366,6 +527,30 @@ async def test_hang_timeout_reap_bumps_generation(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.asyncio
+async def test_timeout_with_pipes_held_open_settles_and_closes_them(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A timed-out script whose pipes a process it started still holds settles as a timeout.
+
+    The timeout arm cancels the readers, so it has to close the pipes as well,
+    or that process blocks on its next write once the buffer fills.
+    """
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 0.1)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.05)
+    proc = _HeldPipesProcess(wait_holds_for_pipes=True, exit_after=None)
+    _install_fake_spawn(monkeypatch, proc)
+
+    result = await asyncio.wait_for(
+        run_script_workflow(_FakeScriptSpec(), {}, "run-timeout-held-pipes"), timeout=5.0
+    )
+    assert result.state == RunState.FAILED
+    assert result.kind == "timeout"
+    assert proc.signals == ["SIGTERM"]
+    assert proc._transport.closed
+
+
+@pytest.mark.asyncio
 async def test_timeout_bound_helper_raises():
     """_await_exit_within_bound converts the elapsed bound into TimeoutBound."""
     proc = _FakeProcess(exit_rc=0, hang=True)
@@ -392,6 +577,40 @@ async def test_terminate_cooperative_never_escalates():
     await script_runner._terminate(proc, grace=0.05)
     assert proc.signals == ["SIGTERM"]
     assert proc.returncode == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("honours_sigterm", "signals", "rc"),
+    [(True, ["SIGTERM"], -15), (False, ["SIGTERM", "SIGKILL"], -9)],
+    ids=["honours-sigterm", "ignores-sigterm"],
+)
+async def test_terminate_settles_on_exit_while_pipes_are_held(
+    monkeypatch: pytest.MonkeyPatch, honours_sigterm: bool, signals: List[str], rc: int
+):
+    """_terminate returns once the script exits, even if a process it started holds the pipes.
+
+    From 3.11 ``wait()`` waits for pipe EOF too, so a ``wait()`` after SIGKILL
+    could block for as long as that process lived, and so could cancel. The
+    poll interval is stretched past the grace so a SIGTERM exit is only seen
+    after the grace elapses, and must still not be followed by SIGKILL.
+    """
+    monkeypatch.setattr(script_runner, "_EXIT_POLL_INTERVAL", 10.0)
+    proc = _HeldPipesProcess(
+        wait_holds_for_pipes=True, exit_after=None, honours_sigterm=honours_sigterm
+    )
+    await asyncio.wait_for(script_runner._terminate(proc, grace=0.05), timeout=2.0)
+    assert proc.signals == signals
+    assert proc.returncode == rc
+
+
+@pytest.mark.asyncio
+async def test_terminate_does_not_spend_the_grace_after_a_sigterm_exit():
+    """A script that exits on SIGTERM is reaped then, not when the grace runs out."""
+    proc = _HeldPipesProcess(wait_holds_for_pipes=True, exit_after=None)
+    await asyncio.wait_for(script_runner._terminate(proc, grace=5.0), timeout=1.0)
+    assert proc.signals == ["SIGTERM"]
+    assert proc.returncode == -15
 
 
 @pytest.mark.asyncio
@@ -429,6 +648,140 @@ async def test_chatty_child_no_deadlock(monkeypatch: pytest.MonkeyPatch):
     assert result.state == RunState.COMPLETED
     # The sentinel is in the tail, so it survives the ring-buffer cap.
     assert result.output == {"done": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wait_holds_for_pipes", [False, True], ids=["wait-returns-at-exit", "wait-holds-for-pipes"]
+)
+async def test_exit_with_pipes_held_open_completes(
+    monkeypatch: pytest.MonkeyPatch, wait_holds_for_pipes: bool
+):
+    """A script that exits 0 while a process it started keeps stdout open completes.
+
+    Before the fix, the 3.11+ ``wait()`` shape ran out the wall-clock bound and
+    settled FAILED,kind=timeout with the output dropped, and the 3.10 shape
+    blocked in the unbounded drain for as long as the pipes stayed open.
+    """
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 1.0)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.05)
+    proc = _HeldPipesProcess(
+        stdout=b'CAO_WORKFLOW_OUTPUT:{"ok": true}\n', wait_holds_for_pipes=wait_holds_for_pipes
+    )
+    _install_fake_spawn(monkeypatch, proc)
+
+    result = await asyncio.wait_for(
+        run_script_workflow(_FakeScriptSpec(), {}, "run-held-pipes"), timeout=5.0
+    )
+    assert result.state == RunState.COMPLETED
+    assert result.kind is None
+    assert result.output == {"ok": True}
+    assert any("still open" in w for w in result.warnings)
+    assert proc.signals == []  # an exited script is never signalled
+    assert proc._transport.closed  # the held pipes are not left open in the server
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wait_holds_for_pipes", [False, True], ids=["wait-returns-at-exit", "wait-holds-for-pipes"]
+)
+async def test_nonzero_exit_with_pipes_held_open_fails_with_warning(
+    monkeypatch: pytest.MonkeyPatch, wait_holds_for_pipes: bool
+):
+    """A nonzero exit with the pipes held open settles FAILED,kind=error, not timeout."""
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 1.0)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.05)
+    proc = _HeldPipesProcess(stderr=b"boom\n", wait_holds_for_pipes=wait_holds_for_pipes, exit_rc=3)
+    _install_fake_spawn(monkeypatch, proc)
+
+    result = await asyncio.wait_for(
+        run_script_workflow(_FakeScriptSpec(), {}, "run-held-pipes-rc3"), timeout=5.0
+    )
+    assert result.state == RunState.FAILED
+    assert result.kind == "error"
+    assert any("boom" in w for w in result.warnings)  # stderr tail surfaced
+    assert any("still open" in w for w in result.warnings)
+    assert proc.signals == []
+    assert proc._transport.closed
+
+
+@pytest.mark.asyncio
+async def test_missing_transport_is_logged_and_not_reported_as_closed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """Without ``_transport`` the run still settles, and nothing claims the pipes were closed."""
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 1.0)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.05)
+    proc = _HeldPipesProcess(
+        stdout=b'CAO_WORKFLOW_OUTPUT:{"ok": true}\n', wait_holds_for_pipes=True
+    )
+    del proc._transport
+    _install_fake_spawn(monkeypatch, proc)
+
+    with caplog.at_level(logging.WARNING, logger=script_runner.__name__):
+        result = await asyncio.wait_for(
+            run_script_workflow(_FakeScriptSpec(), {}, "run-held-pipes-no-transport"), timeout=5.0
+        )
+    assert result.state == RunState.COMPLETED
+    assert result.output == {"ok": True}
+    assert any("could not be closed" in w for w in result.warnings)
+    assert not any("were closed" in w for w in result.warnings)
+    assert any("has no _transport" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_close_pipes_closes_a_real_process_transport():
+    """``_close_pipes`` reaches the transport of a real ``asyncio.subprocess.Process``.
+
+    Every other test here hands the drive a fake with a ``_FakeTransport``, so
+    they would keep passing if a Python release renamed the private attribute.
+    asyncio closes the transport on its own once the child has exited and both
+    pipes reach EOF, so the child starts a process that holds them, as a script
+    that backgrounds something does.
+    """
+    holder_code = "import time; time.sleep(30)"
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import subprocess, sys; "
+        f"p = subprocess.Popen([sys.executable, '-c', {holder_code!r}]); "
+        "print(p.pid, flush=True)",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    holder_pid = int(await asyncio.wait_for(proc.stdout.readline(), timeout=10.0))
+    try:
+        for _ in range(500):
+            if proc.returncode is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert proc.returncode == 0
+        assert not proc._transport.is_closing()  # the holder keeps both pipes open
+
+        assert script_runner._close_pipes(proc) is True
+        assert proc._transport.is_closing()
+    finally:
+        try:
+            os.kill(holder_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_exit_just_before_the_bound_is_not_a_timeout(monkeypatch: pytest.MonkeyPatch):
+    """An exit asyncio recorded before the bound elapsed is not reported as a timeout.
+
+    The poll interval is stretched past the bound so the exit lands while
+    ``_wait_for_exit`` is between two ``returncode`` checks.
+    """
+    monkeypatch.setattr(script_runner, "_EXIT_POLL_INTERVAL", 10.0)
+    proc = _HeldPipesProcess(wait_holds_for_pipes=True, exit_after=0.05)
+
+    await script_runner._await_exit_within_bound(proc, timeout=0.3)
+    assert proc.returncode == 0
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +927,15 @@ async def test_resume_live_run_raises_not_allowed(monkeypatch: pytest.MonkeyPatc
     from cli_agent_orchestrator.services import workflow_service
 
     monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    # Admission freezing is covered separately; avoid timing this liveness proof
+    # against filesystem/profile discovery before the drive starts.
+    monkeypatch.setattr(
+        script_runner.manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: script_runner.manifest_freeze.FrozenManifest(
+            (lambda **kw: None)(**kwargs)
+        ),
+    )
     proc = _FakeProcess(exit_rc=0, hang=True)
     _install_fake_spawn(monkeypatch, proc)
 
@@ -716,7 +1078,9 @@ async def test_resume_happy_materializes_and_deletes_temp(monkeypatch: pytest.Mo
     workflow_journal.insert_run(
         run_id="run-resume",
         workflow_name="wf",
-        spec_snapshot=json.dumps({"source": source, "path": "/tmp/wf.py"}),
+        spec_snapshot=json.dumps(
+            {"source": source, "path": "/tmp/wf.py", "working_directory": "/recorded/root"}
+        ),
         inputs_json="{}",
         state="failed",
         started_at="2026-07-08T00:00:00Z",
@@ -735,6 +1099,8 @@ async def test_resume_happy_materializes_and_deletes_temp(monkeypatch: pytest.Mo
     env = captured["env"]
     assert env["CAO_WORKFLOW_RESUME"] == "1"
     assert env["CAO_WORKFLOW_GENERATION"] == "4"
+    assert captured["cwd"] == "/recorded/root"
+    assert script_runner.run_registry["run-resume"].working_directory == "/recorded/root"
     # The exec'd path is the engine-owned materialized temp file, NOT the on-disk
     # author file — and it is deleted in the finally after reap (BR-30).
     exec_path = captured["args"][1]
@@ -1084,6 +1450,92 @@ def test_completion_creates_step_state_when_missing(_patched_journal):
     assert record.step_states["s1"].attempts == 1
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caught_kind", "caught_error"),
+    (
+        ("provider_error", "provider error (api_error)"),
+        ("timeout", "readiness timeout while waiting for terminal"),
+    ),
+)
+async def test_caught_step_kind_does_not_override_unrelated_run_failure(
+    _patched_journal, caught_kind, caught_error
+):
+    """A script may catch a typed step failure and later exit for another reason.
+
+    The live terminal kind is ``error`` because the subprocess failed; the cold
+    result must retain that run-level verdict even though the durable step still
+    carries the kind it caught as diagnostic data.
+    """
+    from cli_agent_orchestrator.api.main import _resolve_error_kind
+    from cli_agent_orchestrator.services import workflow_service
+
+    run_id = f"run-caught-{caught_kind}"
+    workflow_journal.insert_run(
+        run_id=run_id,
+        workflow_name="wf",
+        spec_snapshot="{}",
+        inputs_json="{}",
+        state=RunState.RUNNING.value,
+        started_at="2026-07-08T00:00:00Z",
+        tier="script",
+    )
+    record = _make_record(run_id, process=None, generation="1")
+    record.step_states["s1"] = StepRunState(step_id="s1", state=StepState.RUNNING)
+    workflow_service.run_registry[run_id] = record
+
+    settle = record_step_completion(_kw(run_id, "s1"))
+    assert settle is not None
+    settle("term-caught", caught_error, None, None, caught_kind)
+
+    result = await script_runner._finalize(
+        record,
+        state=RunState.FAILED,
+        kind="error",
+        error="unrelated author-side failure",
+    )
+
+    assert result.kind == "error"
+    row = workflow_journal.get_run(run_id)
+    assert row is not None and row.kind == "error"
+    steps = workflow_journal.get_steps(run_id)
+    assert steps[0].error_kind == caught_kind
+    assert _resolve_error_kind(row, steps) == "error"
+
+
+@pytest.mark.asyncio
+async def test_script_result_preserves_provider_error_kind(_patched_journal):
+    """The final script ``WorkflowRunResult`` carries the settled structured kind."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    run_id = "run-provider-result"
+    workflow_journal.insert_run(
+        run_id=run_id,
+        workflow_name="wf",
+        spec_snapshot="{}",
+        inputs_json="{}",
+        state=RunState.RUNNING.value,
+        started_at="2026-07-08T00:00:00Z",
+        tier="script",
+    )
+    record = _make_record(run_id, process=None, generation="1")
+    record.step_states["s1"] = StepRunState(step_id="s1", state=StepState.RUNNING)
+    workflow_service.run_registry[run_id] = record
+
+    settle = record_step_completion(_kw(run_id, "s1"))
+    assert settle is not None
+    settle("term-provider", "provider error (api_error)", None, None, "provider_error")
+
+    result = await script_runner._finalize(
+        record, state=RunState.FAILED, kind="provider_error", error="provider error"
+    )
+
+    assert len(result.steps) == 1
+    assert result.steps[0].state == StepState.FAILED
+    assert result.steps[0].error_kind == "provider_error"
+    assert record.step_states["s1"].attempts == 1
+
+
 def test_completion_journal_failure_never_raises(monkeypatch, _patched_journal):
     """INV-4: a journal write failure during settle is swallowed — the in-memory
     transition still lands, the call never raises."""
@@ -1213,16 +1665,19 @@ async def test_run_script_workflow_prepared_drives_without_reinsert(
     monkeypatch.setattr(workflow_journal, "insert_run", _fail_insert)
 
     proc = _FakeProcess(exit_rc=0, stdout=b'CAO_WORKFLOW_OUTPUT:{"ok": true}\n')
-    _install_fake_spawn(monkeypatch, proc)
+    captured = _install_fake_spawn(monkeypatch, proc)
 
     record = _make_record("run-prep-script", process=None, generation="1")
     workflow_service.run_registry["run-prep-script"] = record
 
     env = build_env("run-prep-script", "1", {})
-    result = await run_script_workflow_prepared(record, "/tmp/wf.py", env)
+    result = await run_script_workflow_prepared(
+        record, source="print('x')\n", env=env, working_directory="/prepared/root"
+    )
 
     assert result.state == RunState.COMPLETED
     assert result.output == {"ok": True}
+    assert captured["cwd"] == "/prepared/root"
     # DR-2: liveness mark cleared on exit.
     assert "run-prep-script" not in workflow_service._active_drives
 
@@ -1237,7 +1692,7 @@ async def test_run_script_workflow_prepared_marks_then_clears_active_drive(
 
     observed = {"live": None}
 
-    async def _fake_drive(record, script_path, env):
+    async def _fake_drive(record, script_path, env, *, working_directory=None):
         observed["live"] = record.run_id in workflow_service._active_drives
         return WorkflowRunResult(
             run_id=record.run_id,
@@ -1248,6 +1703,213 @@ async def test_run_script_workflow_prepared_marks_then_clears_active_drive(
 
     monkeypatch.setattr(script_runner, "_drive_process", _fake_drive)
     record = _make_record("run-prep-live", process=None, generation="1")
-    await run_script_workflow_prepared(record, "/tmp/wf.py", build_env("run-prep-live", "1", {}))
+    await run_script_workflow_prepared(
+        record, source="print('x')\n", env=build_env("run-prep-live", "1", {})
+    )
     assert observed["live"] is True
     assert "run-prep-live" not in workflow_service._active_drives
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_fresh_run_executes_approved_bytes_after_mid_start_update(monkeypatch, tmp_path):
+    """Admission, the journal and the interpreter must all use the approved source."""
+    import hashlib
+
+    from cli_agent_orchestrator.clients.database import _migrate_workflow_index
+    from cli_agent_orchestrator.services import (
+        approval_gate,
+        approval_store,
+        launch_guard,
+        settings_service,
+        workflow_spec_service,
+    )
+
+    _migrate_workflow_index()
+    settings_service.SETTINGS_FILE.write_text('{"workflow": {"require_approval": true}}')
+    monkeypatch.setattr(approval_store, "DATABASE_FILE", tmp_path / "wf.db")
+    monkeypatch.setattr(launch_guard.agent_profiles, "list_agent_profiles", lambda: [])
+    monkeypatch.setattr(launch_guard.settings_service, "is_memory_enabled", lambda: False)
+    spec_dir = tmp_path / "specs"
+    spec_dir.mkdir()
+    source_a = 'print(\'CAO_WORKFLOW_OUTPUT:{"ran": "A-approved-é"}\')\r\n'
+    source_b = 'print(\'CAO_WORKFLOW_OUTPUT:{"ran": "B-never-approved"}\')\n'
+    spec = workflow_spec_service.create_workflow("fresh", source_a, scan_dir=str(spec_dir))
+    with pytest.raises(approval_gate.PlanApprovalRequiredError) as refusal:
+        await run_script_workflow(spec, {}, "fresh-refused", working_directory=str(tmp_path))
+    approval_store.grant(refusal.value.plan_id, "test-operator")
+
+    capture = launch_guard.capture
+
+    def update_in_window():
+        workflow_spec_service.update_workflow(
+            spec.name, source_b, spec.content_hash, scan_dir=str(spec_dir)
+        )
+        return capture()
+
+    monkeypatch.setattr(launch_guard, "capture", update_in_window)
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_SCRATCH_DIR", scratch)
+    materialize = script_runner._materialize_snapshot
+    staged = {}
+
+    def observe_snapshot(*args, **kwargs):
+        path = materialize(*args, **kwargs)
+        staged["path"] = path
+        staged["hash"] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        return path
+
+    monkeypatch.setattr(script_runner, "_materialize_snapshot", observe_snapshot)
+    result = await run_script_workflow(spec, {}, "fresh-approved", working_directory=str(tmp_path))
+    assert result.state == RunState.COMPLETED
+    assert result.output == {"ran": "A-approved-é"}
+    row = workflow_journal.get_run("fresh-approved")
+    snapshot = json.loads(row.spec_snapshot)
+    manifest = json.loads(row.manifest_json)
+    assert (
+        staged["hash"] == manifest["source_hash"] == snapshot["content_hash"] == spec.content_hash
+    )
+    assert manifest["plan_id"] == refusal.value.plan_id
+    assert Path(spec.path).read_text() == source_b
+    assert not Path(staged["path"]).exists()
+
+
+def test_prepared_source_is_keyword_only():
+    import inspect
+
+    signature = inspect.signature(run_script_workflow_prepared)
+    assert "spec_path" not in signature.parameters
+    assert signature.parameters["source"].kind == inspect.Parameter.KEYWORD_ONLY
+    with pytest.raises(TypeError):
+        run_script_workflow_prepared(
+            _make_record("old-caller", process=None, generation="1"), "/tmp/wf.py", {}
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prepared", [False, True], ids=["blocking", "prepared"])
+@pytest.mark.parametrize(
+    "outcome", ["success", "failure", "timeout", "cancel", "spawn-failure", "exception"]
+)
+async def test_fresh_snapshot_lifecycle(monkeypatch, tmp_path, outcome, prepared):
+    """Private source exists during the drive and is removed on every exit path."""
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_SCRATCH_DIR", scratch)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 0.01)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.01)
+    spec = _FakeScriptSpec(source="print('approved')\n", path=str(tmp_path / "author.py"))
+    Path(spec.path).write_text(spec.source)
+    run_id = "snapshot-lifecycle"
+    seen = []
+
+    def observe(path):
+        staged = Path(path)
+        assert staged != Path(spec.path)
+        assert staged.read_text() == spec.source
+        assert staged.stat().st_mode & 0o777 == 0o600
+        assert scratch.stat().st_mode & 0o777 == 0o700
+        assert not staged.stem.isidentifier()
+        assert staged.name == f"start-{run_id}.py"
+        seen.append(staged)
+
+    proc = _FakeProcess(exit_rc=1 if outcome == "failure" else 0, hang=outcome == "timeout")
+
+    async def spawn(*args, **kwargs):
+        observe(args[1])
+        if outcome == "spawn-failure":
+            raise OSError("spawn refused")
+        if outcome == "cancel":
+            script_runner.run_registry[run_id].cancelled = True
+        return proc
+
+    async def raising_drive(record, path, env, *, working_directory=None):
+        observe(path)
+        raise RuntimeError("drive exception")
+
+    monkeypatch.setattr(script_runner.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    if outcome == "exception":
+        monkeypatch.setattr(script_runner, "_drive_process", raising_drive)
+
+    async def start():
+        if not prepared:
+            return await run_script_workflow(spec, {}, run_id)
+        _seed_script_run(run_id)
+        record = _make_record(run_id, process=None, generation="1")
+        script_runner.run_registry[run_id] = record
+        return await run_script_workflow_prepared(record, source=spec.source, env={})
+
+    if outcome == "exception":
+        with pytest.raises(RuntimeError, match="drive exception"):
+            await start()
+    else:
+        result = await start()
+        state = {"success": RunState.COMPLETED, "cancel": RunState.CANCELLED}.get(
+            outcome, RunState.FAILED
+        )
+        kind = {"success": None, "cancel": "cancelled", "timeout": "timeout"}.get(outcome, "error")
+        assert result.state == state
+        assert result.kind == kind
+        assert workflow_journal.get_run(run_id).state == state.value
+    assert seen and not seen[0].exists()
+    assert run_id not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prepared", [False, True], ids=["blocking", "prepared"])
+async def test_fresh_materialize_oserror_settles_failed(monkeypatch, tmp_path, prepared):
+    def cannot_stage(*args, **kwargs):
+        raise OSError(28, "No space left on device", "/private/engine/source.py")
+
+    async def must_not_drive(*args, **kwargs):
+        pytest.fail("materialization failure must not spawn")
+
+    monkeypatch.setattr(script_runner, "_materialize_snapshot", cannot_stage)
+    monkeypatch.setattr(script_runner, "_drive_process", must_not_drive)
+    run_id = "stage-failure"
+    if prepared:
+        _seed_script_run(run_id)
+        record = _make_record(run_id, process=None, generation="1")
+        result = await run_script_workflow_prepared(record, source="print('approved')", env={})
+    else:
+        result = await run_script_workflow(_FakeScriptSpec(), {}, run_id)
+    assert result.state == RunState.FAILED
+    assert result.kind == "error"
+    assert result.warnings == [
+        "could not stage the approved script source: No space left on device"
+    ]
+    assert workflow_journal.get_run(run_id).state == "failed"
+    assert run_id not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["fdopen", "write"])
+async def test_partial_start_snapshot_deleted_on_materialize_error(monkeypatch, tmp_path, failure):
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_SCRATCH_DIR", scratch)
+    fdopen = script_runner.os.fdopen
+
+    class FailingWriter:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.stream.close()
+
+        def write(self, source):
+            self.stream.write(source[:5])
+            raise OSError(28, "No space left on device")
+
+    def fail_materialize(fd, *args, **kwargs):
+        if failure == "fdopen":
+            raise OSError(24, "Too many open files")
+        return FailingWriter(fdopen(fd, *args, **kwargs))
+
+    monkeypatch.setattr(script_runner.os, "fdopen", fail_materialize)
+    result = await run_script_workflow(_FakeScriptSpec(), {}, "partial-stage-failure")
+    assert result.state == RunState.FAILED
+    assert not (scratch / "start-partial-stage-failure.py").exists()
+    assert "partial-stage-failure" not in script_runner._active_drives

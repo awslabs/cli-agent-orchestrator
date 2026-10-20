@@ -4,8 +4,8 @@
 #
 #   * This file supplies the entries that are always there -- the supervisor.
 #   * The broker adds and removes the `role: worker` entries at runtime, because
-#     elastic workers are Jobs with generated names that nothing can enumerate
-#     ahead of time. See `_update_fleet_config` in broker.py.
+#     elastic workers are created on demand with generated ids that nothing can
+#     enumerate ahead of time. See `_update_fleet_config` in broker.py.
 #
 # So the live object normally differs from this file, and that is expected rather
 # than drift. Re-running `kubectl apply -k k8s` resets it to just the supervisor;

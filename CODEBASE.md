@@ -31,6 +31,7 @@ to use.
 | `src/cli_agent_orchestrator/mcp_server/` | In-session orchestration MCP tools |
 | `src/cli_agent_orchestrator/ops_mcp_server/` | External operations MCP tools |
 | `src/cli_agent_orchestrator/services/` | Session, terminal, inbox, workflow, memory, event, configuration, and plugin services |
+| `src/cli_agent_orchestrator/decisions/` | Launch-decision platform: points, policy, settings, deciders, records, shadow runner, telemetry, and operator access ([docs](docs/decisions.md)) |
 | `src/cli_agent_orchestrator/backends/` | Terminal-backend abstraction and tmux/herdr implementations |
 | `src/cli_agent_orchestrator/clients/` | SQLite and tmux clients used by services and backends |
 | `src/cli_agent_orchestrator/providers/` | Provider adapters for interactive agent CLIs |
@@ -39,7 +40,8 @@ to use.
 | `src/cli_agent_orchestrator/utils/` | Profile, skill, path, tool, and terminal helpers |
 | `src/cli_agent_orchestrator/agent_store/` | Packaged agent profiles |
 | `src/cli_agent_orchestrator/skills/` | Skills packaged with the Python distribution |
-| `src/cli_agent_orchestrator/plugins/` | Plugin API, event definitions, discovery, and built-ins |
+| `src/cli_agent_orchestrator/plugins/` | Event-plugin API, event definitions, discovery, and built-ins |
+| `src/cli_agent_orchestrator/agent_plugins/` | Agent Plugins 1.0.0 support: manifest validation, containment, source resolution, install store, skill projection, and MCP mapping/delivery |
 | `src/cli_agent_orchestrator/security/` | Authentication and authorization helpers |
 | `src/cli_agent_orchestrator/telemetry/` | OpenTelemetry spans, metrics, context, and semantic conventions |
 | `src/cli_agent_orchestrator/graph/` | Graph providers, cache, models, and export sinks |
@@ -48,6 +50,7 @@ to use.
 | `src/cao_workflow/` | Standalone workflow authoring/runtime package shipped by the project |
 | `web/` | React browser UI source and build configuration |
 | `cao_mcp_apps/` | MCP App React views and build tooling |
+| `agent-plugin/` | CAO's own Agent Plugins 1.0.0 packages (`cao`, `cao-contributor`), generated and checked by `make check-agent-plugin` |
 | `test/` | Unit, API, CLI, documentation, and integration tests |
 
 ## Request and service flow
@@ -110,7 +113,7 @@ respective persistence and projection behavior.
 `plugins/base.py` and `plugins/events.py` define the extension contract;
 `plugins/registry.py` discovers entry points from the `cao.plugins` group.
 Built-in integrations live under `plugins/builtin/`. See
-[Plugins](docs/plugins.md) before changing hook behavior.
+[Event Plugins](docs/plugins.md) before changing hook behavior.
 
 Authentication and authorization helpers live under `security/`, while
 network allowlists and server defaults are defined through configuration and

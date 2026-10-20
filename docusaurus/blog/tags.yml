@@ -39,3 +39,8 @@ community:
   label: Community
   permalink: /community
   description: Project news, contributor spotlights, and events.
+
+physical-ai:
+  label: Physical AI
+  permalink: /physical-ai
+  description: Agents that plan, move, or check machines, in a simulator or in the physical world.

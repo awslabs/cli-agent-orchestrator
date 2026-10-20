@@ -1,10 +1,26 @@
 """Default-off OAuth 2.1 / RFC 9728 auth core for the CAO MCP App.
 
 This module provides scope extraction, JWKS caching, and the FastAPI
-``get_current_scopes`` dependency. It is **default-off**: with ``AUTH0_DOMAIN``
-unset *and* ``CAO_AUTH_JWKS_URI`` unset, every authorization path returns the
-full scope taxonomy and no enforcement happens — behavior is byte-for-byte
-identical to a build with no auth layer.
+``get_current_scopes`` dependency. It is **default-off**: with ``AUTH0_DOMAIN``,
+``CAO_AUTH_JWKS_URI`` *and* ``CAO_AUTH_LOCAL_TOKEN`` all unset, every
+authorization path returns the full scope taxonomy and no enforcement happens —
+behavior is byte-for-byte identical to a build with no auth layer. In that
+posture any caller that can reach the port (loopback by default, so any process
+or user on the same host) is trusted.
+
+Two opt-in modes turn enforcement on:
+
+* **IdP mode** — ``AUTH0_DOMAIN`` or ``CAO_AUTH_JWKS_URI`` is set. Bearer tokens
+  are RS256 JWTs verified against the IdP's JWKS (signature, issuer, audience,
+  expiry) and scopes come from the token's claims. ``CAO_AUTH_LOCAL_TOKEN`` is
+  then the machine token CAO's own clients forward on their internal hops (see
+  :func:`get_local_bearer`).
+* **Local-token mode** (issue #706) — no IdP, but ``CAO_AUTH_LOCAL_TOKEN`` is
+  set. Every bearer presented to the API must equal that value (constant-time
+  compare); a match grants the full scope set, anything else fails closed with
+  401. This is the single-operator control for a workstation shared with other
+  local users or agents: one exported variable both enables enforcement and is
+  the credential CAO's clients forward, so nothing else needs configuring.
 
 The implementation is a **generic OAuth 2.1** one:
 all load-bearing standards (RFC 9728 Protected Resource Metadata, RFC 8693 Token
@@ -26,6 +42,7 @@ avoid changing security-critical resolution behavior in this PR. See
 docs/configuration.md for the full rationale.
 """
 
+import hmac
 import logging
 import os
 import threading
@@ -73,16 +90,45 @@ def _generic_jwks_uri() -> str:
     return os.getenv("CAO_AUTH_JWKS_URI", "").strip()
 
 
-def is_auth_enabled() -> bool:
-    """Return whether the auth layer is active.
+def _local_token() -> str:
+    return os.getenv("CAO_AUTH_LOCAL_TOKEN", "").strip()
 
-    Default-off: auth is enabled only when an IdP is configured — either
-    ``AUTH0_DOMAIN`` (Auth0 convenience) or ``CAO_AUTH_JWKS_URI`` (generic IdP).
-    With neither set, the layer is off and every path returns
-    the full scope set.
+
+def is_idp_configured() -> bool:
+    """Return whether an OAuth IdP is configured (JWT verification via JWKS).
+
+    True when ``AUTH0_DOMAIN`` (Auth0 convenience) or ``CAO_AUTH_JWKS_URI``
+    (generic IdP) is set. This is the predicate for everything that only makes
+    sense with a JWT issuer behind it: JWKS resolution, audience/issuer pinning
+    and the RFC 9728 protected-resource metadata endpoint.
     """
 
     return bool(_auth0_domain()) or bool(_generic_jwks_uri())
+
+
+def is_local_token_mode() -> bool:
+    """Return whether ``CAO_AUTH_LOCAL_TOKEN`` is the sole credential (no IdP).
+
+    In this mode the API requires every bearer to equal the configured local
+    token and grants the full scope set on a match (issue #706). When an IdP is
+    *also* configured the IdP wins: the local token is then a JWT that CAO's own
+    clients forward, verified like any other token, and this returns False.
+    """
+
+    return not is_idp_configured() and bool(_local_token())
+
+
+def is_auth_enabled() -> bool:
+    """Return whether the auth layer is active.
+
+    Default-off: auth is enabled when an IdP is configured — ``AUTH0_DOMAIN``
+    (Auth0 convenience) or ``CAO_AUTH_JWKS_URI`` (generic IdP) — **or** when a
+    standalone ``CAO_AUTH_LOCAL_TOKEN`` is set (see :func:`is_local_token_mode`).
+    With none of the three set, the layer is off and every path returns the
+    full scope set.
+    """
+
+    return is_idp_configured() or bool(_local_token())
 
 
 def get_jwks_uri() -> Optional[str]:
@@ -108,11 +154,12 @@ def get_expected_audience() -> Optional[str]:
     ``API_BASE_URL`` — the resource identifier advertised by the RFC 9728 PRM
     endpoint (``/.well-known/oauth-protected-resource``) — so audience
     verification is never silently disabled. An explicit ``CAO_AUTH_AUDIENCE`` /
-    ``AUTH0_AUDIENCE`` takes precedence. Returns ``None`` only when auth is
-    disabled (default-off), so nothing changes in the no-auth posture.
+    ``AUTH0_AUDIENCE`` takes precedence. Returns ``None`` when no IdP is
+    configured — default-off, and local-token mode, where there is no JWT to
+    carry an audience — so nothing changes in the no-auth posture.
     """
 
-    if not is_auth_enabled():
+    if not is_idp_configured():
         return None
     return (
         os.getenv("CAO_AUTH_AUDIENCE", "").strip()
@@ -253,14 +300,21 @@ def extract_scopes_from_token(token: str) -> List[str]:
     a generic ``Exception`` from the JWKS fetch) on any validation failure so the
     caller can map it to HTTP 401.
 
-    Validation pins the token to the configured authorization server (``iss``)
-    and audience (``aud``) in addition to the RS256 signature and ``exp`` so a
-    token minted by a different IdP — or for a different resource on the same
-    IdP — is rejected rather than accepted on signature alone.
+    Local-token mode (:func:`is_local_token_mode`): the token is compared to
+    ``CAO_AUTH_LOCAL_TOKEN`` in constant time; a match grants the full scope
+    set, a mismatch raises ``jwt.InvalidTokenError``. No JWKS is consulted.
+
+    IdP mode: validation pins the token to the configured authorization server
+    (``iss``) and audience (``aud``) in addition to the RS256 signature and
+    ``exp`` so a token minted by a different IdP — or for a different resource
+    on the same IdP — is rejected rather than accepted on signature alone.
     """
 
     if not is_auth_enabled():
         return list(FULL_SCOPE_SET)
+
+    if is_local_token_mode():
+        return _scopes_for_local_token(token)
 
     uri = get_jwks_uri()
     if not uri:  # pragma: no cover - guarded by is_auth_enabled
@@ -299,6 +353,25 @@ def extract_scopes_from_token(token: str) -> List[str]:
     return _scopes_from_claims(claims)
 
 
+def _scopes_for_local_token(token: str) -> List[str]:
+    """Local-token mode: fail closed unless ``token`` equals the configured value.
+
+    The comparison is constant-time so a caller cannot recover the token byte by
+    byte from response timing. A shared secret carries no claims, so a match
+    grants the full taxonomy: whoever holds the operator's token *is* the
+    operator. Raises ``jwt.InvalidTokenError`` (a ``PyJWTError``) on mismatch so
+    the existing 401 mapping in :func:`get_current_scopes` and the WebSocket /
+    SSE handshakes applies unchanged.
+    """
+
+    expected = _local_token()
+    if not expected:  # pragma: no cover - guarded by is_local_token_mode
+        raise jwt.InvalidTokenError("CAO_AUTH_LOCAL_TOKEN is not configured")
+    if not token or not hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
+        raise jwt.InvalidTokenError("bearer token does not match CAO_AUTH_LOCAL_TOKEN")
+    return list(FULL_SCOPE_SET)
+
+
 def get_scopes_for_local_token() -> List[str]:
     """Return the granted scope set for the local (loopback) caller.
 
@@ -306,7 +379,9 @@ def get_scopes_for_local_token() -> List[str]:
     layer is the real security boundary). Default-off returns the full taxonomy.
     When auth is enabled, an optional ``CAO_AUTH_LOCAL_TOKEN`` is validated if
     present; otherwise the full set is returned and enforcement defers to the
-    FastAPI ``Depends(get_current_scopes)`` boundary.
+    FastAPI ``Depends(get_current_scopes)`` boundary. In local-token mode the
+    configured token trivially matches itself, so this is the full set and the
+    FastAPI boundary does the real work.
     """
 
     if not is_auth_enabled():
@@ -343,7 +418,8 @@ def get_local_bearer() -> Optional[str]:
     no local token is configured it also returns ``None`` — the caller is
     responsible for surfacing the actionable misconfiguration
     (:func:`local_auth_misconfig_error`) rather than letting the bare ``401``
-    leak out.
+    leak out. In local-token mode the token *is* the credential the API
+    expects, so forwarding it is exactly what makes the internal hop succeed.
     """
 
     if not is_auth_enabled():

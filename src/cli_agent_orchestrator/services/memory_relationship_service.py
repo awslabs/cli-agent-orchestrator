@@ -26,9 +26,12 @@ Fail-closed: every validation raises ``ValueError`` BEFORE any DB write.
 import json
 import logging
 import uuid
+from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from functools import partial
+from typing import Any, Callable, Dict, List, Optional, cast
 
 from sqlalchemy.exc import IntegrityError
 
@@ -39,22 +42,23 @@ from cli_agent_orchestrator.clients.database import (
     SessionLocal,
     _utcnow,
 )
+from cli_agent_orchestrator.models.relationship import (
+    VALID_ORIGINS,
+    VALID_STATUSES,
+    VALID_TYPES,
+)
 from cli_agent_orchestrator.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
 
-# Closed taxonomies (reuse the graph EdgeType string values, ADR-5).
-VALID_TYPES = frozenset({"relates_to", "contradiction", "supersedes"})
-VALID_STATUSES = frozenset({"active", "proposal", "rejected", "superseded", "deleted"})
+# Closed taxonomies are imported and re-exported from the side-effect-free leaf
+# module so existing callers retain this public import path.
 # Statuses an OPERATOR reached through an explicit command (`relationships
 # reject` / `relationships delete`). A producer recompute must never overwrite
 # one: re-creation is the documented way back, exactly as ``promote()`` refuses
 # these two. ``superseded`` is excluded on purpose — it is lifecycle-derived, not
 # operator-authored.
 CURATION_TERMINAL_STATUSES = frozenset({"rejected", "deleted"})
-VALID_ORIGINS = frozenset(
-    {"compiler", "wiki_lint", "human", "legacy_related_keys", "external_import"}
-)
 
 # Bounds (NFR-1.6). Final numeric values.
 MAX_EDGES_PER_MUTATION = 64
@@ -63,6 +67,15 @@ MAX_ATTRIBUTES_BYTES = 2048
 # The content-free audit event for relationship mutations (NFR-1.7). MUST be
 # registered in NOWAIT_AUDIT_EVENTS or audit_log drops it silently.
 AUDIT_EVENT = "relationship_mutation"
+EdgeIdentity = tuple[str, str, str, str, str, str]
+
+
+class EdgeSnapshotDriftError(ValueError):
+    """Content-free failure for an immutable edge snapshot mismatch."""
+
+    def __init__(self, reasons: dict[str, str]):
+        self.reasons = dict(reasons)
+        super().__init__(f"relationship edge snapshot drift: {self.reasons}")
 
 
 @dataclass
@@ -131,6 +144,7 @@ class EdgeInput:
     """One edge in a ``replace_set`` batch."""
 
     target_key: str
+    status: str = "active"
     confidence: Optional[float] = None
     rank: Optional[int] = None
     attributes: Optional[Dict[str, Any]] = None
@@ -274,7 +288,13 @@ class MemoryRelationshipService:
         return src, tgt
 
     def _assert_endpoint_exists(
-        self, db: Any, scope: str, scope_id: Optional[str], key: str
+        self,
+        db: Any,
+        scope: str,
+        scope_id: Optional[str],
+        key: str,
+        *,
+        source_kind: str = "native",
     ) -> None:
         """Assert a memory with ``key`` exists in the SAME (scope, scope_id).
 
@@ -285,6 +305,7 @@ class MemoryRelationshipService:
         q = db.query(MemoryMetadataModel).filter(
             MemoryMetadataModel.key == key,
             MemoryMetadataModel.scope == scope,
+            MemoryMetadataModel.source_kind == source_kind,
         )
         if scope_id is not None:
             q = q.filter(MemoryMetadataModel.scope_id == scope_id)
@@ -476,6 +497,10 @@ class MemoryRelationshipService:
         origin: str,
         type: str,
         edges: List[EdgeInput],
+        *,
+        source_kind: str = "native",
+        db: Any = None,
+        audit_sink: Optional[List[Callable[[], None]]] = None,
     ) -> ReplaceReport:
         """Producer-scoped replacement (principle 6, FR-2.5).
 
@@ -500,11 +525,12 @@ class MemoryRelationshipService:
         src = self._sanitize_key(source_key)
         sentinel = self._to_sentinel(scope_id)
         report = ReplaceReport()
+        owns_session = db is None
 
         # Validate + resolve the incoming set first (fail-closed); collect valid
         # targets, report the rest (FR-1.5-style) without aborting the whole op.
         valid: Dict[str, EdgeInput] = {}
-        with SessionLocal() as db:
+        with SessionLocal() if owns_session else nullcontext(db) as db:
             for edge in edges:
                 try:
                     tgt = self._sanitize_key(edge.target_key)
@@ -518,19 +544,20 @@ class MemoryRelationshipService:
                 # with self/dangling above (reviewer F3): one bad edge in a batch
                 # is reported, not a hard abort of the whole replace_set.
                 try:
+                    self._validate_status(edge.status)
                     self._validate_confidence(edge.confidence)
                     self._validate_attributes(edge.attributes)
                 except ValueError:
                     report.rejected.append({"target": tgt, "reason": "invalid_attrs_or_confidence"})
                     continue
                 try:
-                    self._assert_endpoint_exists(db, scope, scope_id, tgt)
+                    self._assert_endpoint_exists(db, scope, scope_id, tgt, source_kind=source_kind)
                 except ValueError:
                     report.rejected.append({"target": tgt, "reason": "dangling"})
                     continue
                 valid[tgt] = edge
             # Source must exist too.
-            self._assert_endpoint_exists(db, scope, scope_id, src)
+            self._assert_endpoint_exists(db, scope, scope_id, src, source_kind=source_kind)
 
             existing_rows = (
                 db.query(MemoryRelationshipModel)
@@ -567,7 +594,9 @@ class MemoryRelationshipService:
             # could only ever report False (human review, PR #524). One batched
             # lookup for the whole set; None when the source has no updated_at,
             # which simply leaves staleness unknown as before.
-            src_updated = self._source_updated_map(db, scope, scope_id, {src}).get(src)
+            src_updated = self._source_updated_map(
+                db, scope, scope_id, {src}, source_kind=source_kind
+            ).get(src)
             for tgt, edge in valid.items():
                 r = existing_by_target.get(tgt)
                 attrs_json = self._validate_attributes(edge.attributes)
@@ -592,7 +621,7 @@ class MemoryRelationshipService:
                     r.confidence = self._validate_confidence(edge.confidence)
                     r.rank = edge.rank
                     r.attributes_json = attrs_json
-                    r.status = "active"
+                    r.status = edge.status
                     r.source_updated_at = src_updated
                     r.updated_at = now
                     report.kept += 1
@@ -606,7 +635,7 @@ class MemoryRelationshipService:
                             target_key=tgt,
                             type=type,
                             origin=origin,
-                            status="active",
+                            status=edge.status,
                             confidence=self._validate_confidence(edge.confidence),
                             rank=edge.rank,
                             attributes_json=attrs_json,
@@ -614,12 +643,70 @@ class MemoryRelationshipService:
                         )
                     )
                     report.added += 1
-            db.commit()
+            if owns_session:
+                db.commit()
         # Content-free summary audit for the bulk producer write (reviewer F2):
         # replace_set is the highest-volume path (compiler/lint every compile),
         # so it must leave a forensic trail. Counts + endpoints/origin/type only,
         # never a memory body/prompt (NFR-1.7).
-        self._audit_replace_set(scope, sentinel, src, origin, type, report)
+        emit_audit = partial(
+            self._audit_replace_set,
+            scope,
+            sentinel,
+            src,
+            origin,
+            type,
+            report,
+        )
+        if owns_session:
+            emit_audit()
+        elif audit_sink is not None:
+            audit_sink.append(emit_audit)
+        return report
+
+    def clear_source(
+        self,
+        scope: str,
+        scope_id: Optional[str],
+        source_key: str,
+        origin: str,
+        *,
+        preserve_terminal: bool = True,
+        db: Any = None,
+    ) -> ReplaceReport:
+        """Clear one producer's rows for a source across every relationship type."""
+        self._validate_origin(origin)
+        src = self._sanitize_key(source_key)
+        sentinel = self._to_sentinel(scope_id)
+        report = ReplaceReport()
+        owns_session = db is None
+        session = SessionLocal() if owns_session else db
+        try:
+            rows = (
+                session.query(MemoryRelationshipModel)
+                .filter(
+                    MemoryRelationshipModel.scope == scope,
+                    MemoryRelationshipModel.scope_id == sentinel,
+                    MemoryRelationshipModel.source_key == src,
+                    MemoryRelationshipModel.origin == origin,
+                )
+                .all()
+            )
+            for row in rows:
+                row_status = cast(str, row.status)
+                row_target = cast(str, row.target_key)
+                if preserve_terminal and row_status in CURATION_TERMINAL_STATUSES:
+                    report.preserved.append({"target": row_target, "status": row_status})
+                    continue
+                session.delete(row)
+                report.removed += 1
+            if owns_session:
+                session.commit()
+        finally:
+            if owns_session:
+                session.close()
+        if owns_session:
+            self._audit_replace_set(scope, sentinel, src, origin, "all", report)
         return report
 
     def _audit_replace_set(
@@ -710,6 +797,155 @@ class MemoryRelationshipService:
             self._audit("patch", row)
             return self._to_dto(row)
 
+    def preflight_edge_identities(
+        self,
+        expect: Mapping[str, EdgeIdentity],
+        *,
+        require_status: Optional[str] = None,
+        db: Any = None,
+    ) -> dict[str, str]:
+        """Return content-free drift reasons for an exact immutable edge set."""
+        if require_status is not None:
+            self._validate_status(require_status)
+        owns_session = db is None
+        session = SessionLocal() if owns_session else db
+        try:
+            rows = (
+                session.query(MemoryRelationshipModel)
+                .filter(MemoryRelationshipModel.id.in_(tuple(expect)))
+                .all()
+                if expect
+                else []
+            )
+            by_id = {cast(str, row.id): row for row in rows}
+            reasons: dict[str, str] = {}
+            for edge_id, identity in expect.items():
+                row = by_id.get(edge_id)
+                if row is None:
+                    reasons[edge_id] = "edge_missing"
+                    continue
+                actual: EdgeIdentity = (
+                    cast(str, row.scope),
+                    cast(str, row.scope_id),
+                    cast(str, row.source_key),
+                    cast(str, row.target_key),
+                    cast(str, row.type),
+                    cast(str, row.origin),
+                )
+                if actual != identity:
+                    reasons[edge_id] = "edge_identity_drift"
+                elif require_status is not None and row.status != require_status:
+                    reasons[edge_id] = "edge_status_drift"
+            return reasons
+        finally:
+            if owns_session:
+                session.close()
+
+    def restore_statuses(
+        self,
+        restore: Mapping[str, str],
+        *,
+        expect: Mapping[str, EdgeIdentity],
+        require_status: str = "superseded",
+        db: Any = None,
+        audit_sink: Optional[List[Callable[[], None]]] = None,
+    ) -> int:
+        """Restore an exact receipt-owned edge set, atomically or not at all."""
+        if set(restore) != set(expect):
+            raise ValueError("restore and edge snapshot ids must match")
+        for status in restore.values():
+            self._validate_status(status)
+        self._validate_status(require_status)
+        owns_session = db is None
+        session = SessionLocal() if owns_session else db
+        deferred: List[Callable[[], None]] = []
+        try:
+            reasons = self.preflight_edge_identities(
+                expect,
+                require_status=require_status,
+                db=session,
+            )
+            if reasons:
+                raise EdgeSnapshotDriftError(reasons)
+            rows = (
+                session.query(MemoryRelationshipModel)
+                .filter(MemoryRelationshipModel.id.in_(tuple(restore)))
+                .all()
+                if restore
+                else []
+            )
+            for row in rows:
+                edge_id = cast(str, row.id)
+                row.status = restore[edge_id]
+                row.updated_at = _utcnow()
+                deferred.append(partial(self._audit, "migration_restore", row))
+            if owns_session:
+                session.commit()
+                for emit in deferred:
+                    emit()
+            elif audit_sink is not None:
+                audit_sink.extend(deferred)
+            return len(rows)
+        except Exception:
+            if owns_session:
+                session.rollback()
+            raise
+        finally:
+            if owns_session:
+                session.close()
+
+    def supersede_ids(
+        self,
+        ids: Sequence[str],
+        *,
+        expect: Mapping[str, EdgeIdentity],
+        db: Any = None,
+        audit_sink: Optional[List[Callable[[], None]]] = None,
+    ) -> dict[str, str]:
+        """Supersede exactly one captured migration prefix and return prior statuses."""
+        edge_ids = tuple(ids)
+        if len(edge_ids) > MAX_EDGES_PER_MUTATION:
+            raise ValueError(f"supersede_ids exceeds {MAX_EDGES_PER_MUTATION} edges")
+        if len(set(edge_ids)) != len(edge_ids):
+            raise ValueError("supersede_ids contains a duplicate edge id")
+        if set(edge_ids) != set(expect):
+            raise ValueError("supersede ids and edge snapshot ids must match")
+        owns_session = db is None
+        session = SessionLocal() if owns_session else db
+        deferred: List[Callable[[], None]] = []
+        try:
+            reasons = self.preflight_edge_identities(expect, db=session)
+            if reasons:
+                raise EdgeSnapshotDriftError(reasons)
+            rows = (
+                session.query(MemoryRelationshipModel)
+                .filter(MemoryRelationshipModel.id.in_(edge_ids))
+                .all()
+                if edge_ids
+                else []
+            )
+            prior_statuses = {cast(str, row.id): cast(str, row.status) for row in rows}
+            for status in prior_statuses.values():
+                self._validate_status(status)
+            for row in rows:
+                row.status = "superseded"
+                row.updated_at = _utcnow()
+                deferred.append(partial(self._audit, "migration_supersede", row))
+            if owns_session:
+                session.commit()
+                for emit in deferred:
+                    emit()
+            elif audit_sink is not None:
+                audit_sink.extend(deferred)
+            return prior_statuses
+        except Exception:
+            if owns_session:
+                session.rollback()
+            raise
+        finally:
+            if owns_session:
+                session.close()
+
     def promote(self, id: str) -> RelationshipDTO:
         """proposal -> active (FR-2.2)."""
         with SessionLocal() as db:
@@ -745,15 +981,34 @@ class MemoryRelationshipService:
             self._audit("soft_delete", row)
             return self._to_dto(row)
 
-    def purge_for_key(self, scope: str, scope_id: Optional[str], key: str) -> int:
-        """HARD-delete every row touching ``key`` in either direction.
+    def purge_for_key(
+        self,
+        scope: str,
+        scope_id: Optional[str],
+        key: str,
+        *,
+        spare_origins: tuple[str, ...] = ("vault",),
+        origins: tuple[str, ...] | None = None,
+        db: Any = None,
+        audit_sink: Optional[List[Callable[[], None]]] = None,
+    ) -> int:
+        """HARD-delete selected rows touching ``key`` in either direction.
 
         Called when the underlying memory is FORGOTTEN (human review, PR #524).
-        ``forget()`` removes the wiki file, the index entry and the
-        memory_metadata row, but used to leave these rows behind still ``active``
+        Native ``forget()`` removes the wiki file, the index entry and its
+        native memory_metadata row, but used to leave these rows behind still ``active``
         — so a later memory created with the SAME slug silently inherited the
         dead memory's edges, and every read path had to tolerate endpoints that
         no longer resolve.
+
+        ``spare_origins`` defaults to ``("vault",)`` to match
+        ``MemoryService._delete_metadata``'s source-kind predicate: native
+        forget must not half-delete a vault-backed memory by removing its
+        relationship projection while preserving its metadata.
+
+        ``origins`` selects only those origins for a derived-state removal.
+        It lets vault forget deindex vault edges without touching a native
+        memory that shares the same key and scope.
 
         This is a HARD delete, not the ``soft_delete`` status transition: a
         soft-deleted row is a curation record ABOUT a live memory, whereas here
@@ -770,32 +1025,49 @@ class MemoryRelationshipService:
 
         k = self._sanitize_key(key)
         sentinel = self._to_sentinel(scope_id)
-        with SessionLocal() as db:
-            rows = (
-                db.query(MemoryRelationshipModel)
-                .filter(
-                    MemoryRelationshipModel.scope == scope,
-                    MemoryRelationshipModel.scope_id == sentinel,
-                    or_(
-                        MemoryRelationshipModel.source_key == k,
-                        MemoryRelationshipModel.target_key == k,
-                    ),
-                )
-                .all()
-            )
+        owns_session = db is None
+        session = SessionLocal() if owns_session else db
+        try:
+            filters = [
+                MemoryRelationshipModel.scope == scope,
+                MemoryRelationshipModel.scope_id == sentinel,
+                or_(
+                    MemoryRelationshipModel.source_key == k,
+                    MemoryRelationshipModel.target_key == k,
+                ),
+            ]
+            if origins is None:
+                filters.append(MemoryRelationshipModel.origin.notin_(spare_origins))
+            else:
+                filters.append(MemoryRelationshipModel.origin.in_(origins))
+            rows = session.query(MemoryRelationshipModel).filter(*filters).all()
             if not rows:
                 return 0
             for r in rows:
-                db.delete(r)
-            db.commit()
-        self._audit_purge(scope, sentinel, k, len(rows))
+                session.delete(r)
+            if owns_session:
+                session.commit()
+        finally:
+            if owns_session:
+                session.close()
+        emit_audit = partial(self._audit_purge, scope, sentinel, k, len(rows))
+        if owns_session:
+            emit_audit()
+        elif audit_sink is not None:
+            audit_sink.append(emit_audit)
         return len(rows)
 
     # ------------------------------------------------------------------ #
     # read operations
     # ------------------------------------------------------------------ #
     def _source_updated_map(
-        self, db: Any, scope: str, scope_id: Optional[str], source_keys: set
+        self,
+        db: Any,
+        scope: str,
+        scope_id: Optional[str],
+        source_keys: set,
+        *,
+        source_kind: str = "native",
     ) -> Dict[str, datetime]:
         """Batch-load source memories' updated_at for staleness (avoid N+1)."""
         if not source_keys:
@@ -803,6 +1075,7 @@ class MemoryRelationshipService:
         q = db.query(MemoryMetadataModel).filter(
             MemoryMetadataModel.scope == scope,
             MemoryMetadataModel.key.in_(list(source_keys)),
+            MemoryMetadataModel.source_kind == source_kind,
         )
         if scope_id is not None:
             q = q.filter(MemoryMetadataModel.scope_id == scope_id)

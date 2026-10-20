@@ -106,3 +106,22 @@ def mock_db():
         ),
     ):
         yield terminals
+
+
+@pytest.fixture(autouse=True)
+def managed_kimi_code_home(tmp_path, monkeypatch):
+    """Keep Kimi Code's managed runtime home inside the test's own tmp tree.
+
+    The Kimi Code launch path writes the worker's ``KIMI_CODE_HOME`` to
+    ``CAO_HOME_DIR/providers/kimi_code/<terminal digest>/kimi-home``, which in a
+    test session is the operator's real CAO home. That directory holds a copy of
+    the source home's credentials, so a test must never create it there.
+    ``KimiCliProvider`` reads the module global on every call, so patching it
+    here relocates every build/cleanup pair for the test without changing what
+    production resolves. A test that needs a different location can still
+    override it — a ``monkeypatch.setattr`` in the test body runs later and wins.
+    """
+
+    from cli_agent_orchestrator.providers import kimi_cli
+
+    monkeypatch.setattr(kimi_cli, "CAO_HOME_DIR", tmp_path / "cao-home", raising=False)

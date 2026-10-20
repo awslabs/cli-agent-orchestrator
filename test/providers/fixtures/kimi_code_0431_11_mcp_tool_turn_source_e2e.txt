@@ -1,0 +1,44 @@
+
+[<USER>@<HOST> project-d6]$
+[<USER>@<HOST> project-d6]$ { printf 'CAO_KIMI_BIN=%s\n' "$(command -v kimi 2>/dev/null)"; printf 'CAO_KIMI_HOME=%s\n' "${KIMI_CODE_HOME:-$HOME/.kimi-code}"; kimi --help 2>&1; printf '\n%s\n' 'CAO-KIMI-PROBE-END'; } > /tmp
+/<CAOTMP>/kimi-probe.txt 2>&1
+[<USER>@<HOST> project-d6]$ env KIMI_CODE_HOME=<CAOTMP>/kimi-home CAO_TERMINAL_ID=<TID> TERM=xterm-256color KIMI_MCP_TOOL_TIMEOUT_MS=600000 KIMI_MCP_STARTUP_TIMEOUT_MS=60000 KIMI_CODE_NO_AUTO_UPDATE=1 KIMI
+_CLI_NO_AUTO_UPDATE=1 <HOME>/.kimi-code/bin/kimi --auto --agent-file <CAOTMP>/kimi-code-agent.md
+
+ [38;5;111m╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮[39m
+ [38;5;111m│[39m                                                                                                                                                                                                                        [38;5;111m│[39m
+ [38;5;111m│[39m  [38;5;111m▐█▛█▛█▌[39m  [1m[38;5;111mWelcome to Kimi Code![0m                                                                                                                                                                                        [38;5;111m│[39m
+ [38;5;111m│[39m  [38;5;111m▐█████▌[39m  [38;5;244mSend /help for help information.[39m                                                                                                                                                                             [38;5;111m│[39m
+ [38;5;111m│[39m                                                                                                                                                                                                                        [38;5;111m│[39m
+ [38;5;111m│[39m  [1m[38;5;244mDirectory: [0m<E2EDIR>/project-d6                                                                                                                                                                        [38;5;111m│[39m
+ [38;5;111m│[39m  [1m[38;5;244mSession:   [0msession_<UUID>                                                                                                                                                               [38;5;111m│[39m
+ [38;5;111m│[39m  [1m[38;5;244mModel:     [0m<MODEL>                                                                                                                                                                                        [38;5;111m│[39m
+ [38;5;111m│[39m  [1m[38;5;244mVersion:   [0m0.43.1                                                                                                                                                                                                     [38;5;111m│[39m
+ [38;5;111m│[39m  [1m[38;5;244mMCP:       [0m1 connected                                                                                                                                                                                                [38;5;111m│[39m
+ [38;5;111m│[39m                                                                                                                                                                                                                        [38;5;111m│[39m
+ [38;5;111m╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯[39m
+
+ [1m[38;5;111m✦ Kimi Code Desktop is here[0m [1m[38;5;255m— Everything you love about Kimi Code, now on desktop[0m
+   [38;5;244minstall from https://www.kimi.com/code[39m
+
+   [38;5;244mNo session yet — one will be created on your first message.[39m
+   [38;5;215mtmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to ~/.tmux.conf and restart tmux.[39m
+   [38;5;114mMCP server "cao-mcp-server" connected · 29 tools (stdio)[39m
+
+ [1m[38;5;222m✨ Use the CAO MCP tool `find_profiles` exactly once with query "kimi" and limit 3. Then reply with exactly one line of the form MCP-OK=<number of profiles returned>. Do not call any other tool. Do not create, assign, [0m
+    [1m[38;5;222mhand off, message, or delete anything.[0m
+
+ [38;5;114m● [39mUsed [1m[38;5;111mfind_profiles[0;2m · MCP/cao-mcp-server (kimi)[0m
+   [2m<mcp-result-extras>[0m
+   [2m{"structuredContent":{"result":[]},"_meta":{"fastmcp":{"wrap_result":true}}}[0m
+   [2m</mcp-result-extras>[0m
+
+ [38;5;244m● [3mZero profiles returned. Reply one line.[0m
+
+ [38;5;253m● [39mMCP-OK=<N>
+
+ [38;5;240m╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮[39m
+ [38;5;240m│[39m > [7m [0m                                                                                                                                                                                                                    [38;5;240m│[39m
+ [38;5;240m╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯[39m
+ [1m[38;5;215mNever Ask[0m  [38;5;253m<MODEL> thinking: high[39m  [38;5;244m<E2EDIR>/project-d6[39m  [38;5;244mmaster[39m                                                                                   [38;5;242m/compact compresses context when it gets long[39m
+                                                                                                                                                                                                   [38;5;253mcontext: 4% (32.1k/977k)[39m

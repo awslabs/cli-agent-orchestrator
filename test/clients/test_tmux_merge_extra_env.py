@@ -65,3 +65,41 @@ def test_is_blocked_env_key_classification():
     # Unrelated keys aren't blocked.
     assert TmuxClient._is_blocked_env_key("AWS_REGION") is False
     assert TmuxClient._is_blocked_env_key("MNEMOSYNE_DIR") is False
+
+
+def test_merge_drops_loader_shell_interpreter_startup_keys(caplog):
+    """The server-side net catches a caller that bypassed the CLI/API validators."""
+    env: dict[str, str] = {}
+    TmuxClient._merge_extra_env(
+        env,
+        {
+            "LD_PRELOAD": "/tmp/x.so",
+            "DYLD_INSERT_LIBRARIES": "/tmp/x.dylib",
+            "BASH_ENV": "/tmp/rc",
+            "NODE_OPTIONS": "--require /tmp/x.js",
+            "PYTHONPATH": "/tmp/pp",
+            "HOME": "/tmp/evil",
+            "PATH": "/tmp/evil/bin",
+            "PS1": "$(/tmp/evil/run)",
+            "OK": "y",
+        },
+    )
+    assert env == {"OK": "y"}
+
+
+def test_is_blocked_env_key_refuses_hijack_keys_without_allowlist():
+    for key in (
+        "LD_PRELOAD",
+        "LD_AUDIT",
+        "DYLD_FRAMEWORK_PATH",
+        "BASH_ENV",
+        "ENV",
+        "ZDOTDIR",
+        "PATH",
+        "HOME",
+        "PROMPT_COMMAND",
+    ):
+        assert TmuxClient._is_blocked_env_key(key) is True, key
+    # ordinary vars and the existing auth allowlist are untouched
+    assert TmuxClient._is_blocked_env_key("AWS_REGION") is False
+    assert TmuxClient._is_blocked_env_key("CLAUDE_CODE_USE_BEDROCK") is False

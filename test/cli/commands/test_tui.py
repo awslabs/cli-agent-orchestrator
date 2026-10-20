@@ -21,7 +21,6 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from cli_agent_orchestrator.cli import main as cli_main
 from cli_agent_orchestrator.cli.commands import tui as tui_module
 from cli_agent_orchestrator.cli.commands.tui import tui
 from cli_agent_orchestrator.cli.main import cli
@@ -32,8 +31,8 @@ class TestTuiCommandRegistered:
 
     def test_tui_is_registered_on_the_cli_group(self):
         """`cao tui` must be reachable from the top-level group, not just importable."""
-        assert "tui" in cli.commands
-        assert cli.commands["tui"] is cli_main.tui
+        assert "tui" in cli.list_commands(None)
+        assert cli.get_command(None, "tui") is tui
 
     def test_tui_help_exits_zero(self):
         """`cao tui --help` works. This command did not exist before issue #321."""

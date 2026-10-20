@@ -288,6 +288,34 @@ def test_register_app_tools_enabled_sets_visibility(monkeypatch: pytest.MonkeyPa
     ]
 
 
+@pytest.mark.asyncio
+async def test_real_server_hides_app_only_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A real FastMCP server does not list or run app-only tools, as on FastMCP 3."""
+
+    from fastmcp import Client, FastMCP
+    from fastmcp.exceptions import ToolError
+
+    monkeypatch.setenv("CAO_MCP_APPS_ENABLED", "true")
+    fake = _FakeMCP()
+    assert app_tools.register_app_tools(fake) is True
+    app_only = {
+        name
+        for name, entry in fake.registered.items()
+        if "model" not in entry["meta"]["ui"]["visibility"]
+    }
+    assert app_only
+
+    server = FastMCP("app-only-check")
+    assert app_tools.register_app_tools(server) is True
+    async with Client(server) as client:
+        listed = {tool.name for tool in await client.list_tools()}
+        assert set(fake.registered) - app_only <= listed
+        assert listed.isdisjoint(app_only)
+        for name in sorted(app_only):
+            with pytest.raises(ToolError, match="Unknown tool"):
+                await client.call_tool(name, {})
+
+
 # ---------------------------------------------------------------------------
 # Task 12.1 (Unit tier) — remaining choke-point matrix cells.
 #

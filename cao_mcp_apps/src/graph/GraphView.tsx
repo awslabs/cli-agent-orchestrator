@@ -67,7 +67,7 @@ export function GraphView({
   scope,
   scopeId,
   onOpenTopic,
-}: GraphViewProps): JSX.Element {
+}: GraphViewProps): React.JSX.Element {
   const [snapshot, setSnapshot] = useState<GraphViewData | null>(
     initialSnapshot ?? null,
   );

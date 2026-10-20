@@ -32,7 +32,16 @@ _CSI_PATTERN = re.compile(r"(\x9B|\x1B\[)[0-?]*[ -/]*[@-~]")
 
 # OSC (Operating System Command) — terminal title, hyperlinks, etc.
 # ESC ] ... (BEL | ST)
-_OSC_PATTERN = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+#
+# Deliberately NOT a raw string: the negated class must exclude the real ESC/BEL
+# bytes, and static analysers that read the pattern out of an r"..." literal see
+# `\x1b` as the four characters `\`,`x`,`1`,`b` rather than one control byte. A
+# class that only excludes those four characters looks unbounded to them, so
+# `\x1b]\x1b]\x1b]…` reads as a quadratic-backtracking input (CWE-1333) that
+# CPython never actually walks. Letting Python resolve the escapes here keeps
+# the compiled pattern identical and the class unambiguous. `\\]` / `\\\\` are
+# the regex escapes for a literal `]` and the `ESC \` (ST) terminator.
+_OSC_PATTERN = re.compile("\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)")
 
 # Non-printable control characters (except \t and \n which are meaningful)
 # Includes C1 control range (\x80-\x9f) minus \x9B which is handled as CSI above

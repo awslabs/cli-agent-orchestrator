@@ -104,7 +104,10 @@ def test_fleet_snapshot_isolates_terminal_listing_failure(monkeypatch):
     def _boom(_session_id):
         raise RuntimeError("backend down")
 
-    monkeypatch.setattr("cli_agent_orchestrator.clients.database.list_terminals_by_session", _boom)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.session_service.list_current_session_terminals",
+        _boom,
+    )
     _install_bus(monkeypatch, [])
 
     with client.stream("GET", "/agui/v1/stream") as resp:

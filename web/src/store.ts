@@ -1,6 +1,9 @@
 import { create } from 'zustand'
 import {
   api,
+  sessionDescriptionRevision,
+  SESSION_DESCRIPTION_READ_ATTEMPTS,
+  ApiError,
   Session,
   SessionDetail,
   TerminalMeta,
@@ -34,6 +37,15 @@ interface Store {
   deleteSession: (name: string) => Promise<void>
   showSnackbar: (snackbar: Snackbar) => void
   hideSnackbar: () => void
+  /** Positive while some in-flight interaction (an authoring modal's save)
+      owns navigation: App-level tab changes must be refused, because a tab
+      switch unmounts the panel and its modal, discarding the draft and
+      landing any rejection on an unmounted component (#692 review). A
+      counter, not a boolean, so overlapping holders cannot release each
+      other's lock. */
+  navLockCount: number
+  acquireNavLock: () => void
+  releaseNavLock: () => void
   setConnected: (connected: boolean) => void
   setTerminalStatus: (id: string, status: string) => void
   clearTerminalStatuses: (ids: string[]) => void
@@ -76,6 +88,7 @@ export const useStore = create<Store>((set, get) => ({
   activeSessionDetail: null,
   connected: false,
   snackbar: null,
+  navLockCount: 0,
   terminalStatuses: {},
 
   workflowRuns: [],
@@ -111,12 +124,27 @@ export const useStore = create<Store>((set, get) => ({
     }
     set({ activeSession: name })
     try {
-      const detail = await api.getSession(name)
-      if (!jsonEqual(get().activeSessionDetail, detail)) {
-        set({ activeSessionDetail: detail })
+      // A PATCH can complete between the API promise resolving and this
+      // continuation. Bound this second revision check as well as the API's.
+      for (let attempt = 0; attempt < SESSION_DESCRIPTION_READ_ATTEMPTS; attempt++) {
+        const revision = sessionDescriptionRevision
+        const detail = await api.getSession(name)
+        if (get().activeSession !== name) return
+        if (revision !== sessionDescriptionRevision) continue
+        if (!jsonEqual(get().activeSessionDetail, detail)) {
+          set({ activeSessionDetail: detail })
+        }
+        return
       }
-    } catch {
-      set({ activeSessionDetail: null })
+      throw new Error('Session descriptions kept changing; retry on the next poll')
+    } catch (error) {
+      // Preserve the mounted editor on transient failures, but remove deleted
+      // sessions. A late failure must never clear a different selection.
+      if (get().activeSession === name && (
+        (error as ApiError | null)?.status === 404 || get().activeSessionDetail?.session.id !== name
+      )) {
+        set({ activeSessionDetail: null })
+      }
     }
   },
 
@@ -148,6 +176,8 @@ export const useStore = create<Store>((set, get) => ({
 
   showSnackbar: (snackbar) => set({ snackbar }),
   hideSnackbar: () => set({ snackbar: null }),
+  acquireNavLock: () => set(state => ({ navLockCount: state.navLockCount + 1 })),
+  releaseNavLock: () => set(state => ({ navLockCount: Math.max(0, state.navLockCount - 1) })),
   setConnected: (connected) => set({ connected }),
   setTerminalStatus: (id, status) =>
     set(state => {

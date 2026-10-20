@@ -64,6 +64,17 @@ For stdio MCP servers, CAO resolves the runtime command and adds
 are preserved. Every generated directory is mode `0700`, generated files are
 mode `0600`, and terminal cleanup removes only its own directory.
 
+MCP servers declared by installed [agent plugins](agent-plugins.md) are merged
+into this `.mcp.json` at launch time, alongside the profile's own — recomputed on
+every terminal creation rather than persisted, so the paths never go stale. A
+server the profile already declares wins; all three transports are carried.
+
+
+### Agent-plugin MCP working directory
+
+Its MCP config format has no working-directory key (checked against the vendor's own MCP documentation, 2026-09-16), so CAO carries an agent plugin's declared `cwd` by launching the server through `/bin/sh -c 'cd -- "$1" && shift && exec "$@"'`. `exec` replaces the shell, the environment passes through, and argument boundaries survive because each argument stays a separate argv element. On a host with no `/bin/sh` such a server is skipped with `mcp.cwd_unsupported` rather than started in the wrong directory.
+See [Agent Plugins](agent-plugins.md) for the full per-provider table.
+
 ## Tool restrictions and approvals
 
 OMP's `--tools` only filters built-ins; it cannot fully restrict discovered

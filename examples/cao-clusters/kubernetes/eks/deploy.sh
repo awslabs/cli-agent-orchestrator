@@ -219,8 +219,8 @@ echo "applying"
 kubectl apply -k "$RENDER"
 
 # The supervisor is a StatefulSet here, not a Deployment, and there is no worker
-# workload to wait for: workers are Jobs the broker mints per task and are not
-# created by this apply at all.
+# workload to wait for: a worker is a Deployment the broker mints per task, and
+# none is created by this apply at all.
 kubectl -n cao-cluster rollout status statefulset/cao-supervisor --timeout=900s
 kubectl -n cao-cluster rollout status deployment/cao-worker-broker --timeout=300s
 kubectl -n cao-cluster rollout status deployment/cao-fleet-panel --timeout=300s

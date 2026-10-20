@@ -11,14 +11,13 @@ from cli_agent_orchestrator.services import flow_service
 @click.group()
 def schedule():
     """Manage scheduled agent flows."""
-    # Ensure database is initialized
-    init_db()
 
 
 @schedule.command()
 @click.argument("file_path", type=click.Path(exists=True))
 def add(file_path):
     """Add a flow from file."""
+    init_db()
     try:
         added = flow_service.add_flow(file_path)
         click.echo(f"Flow '{added.name}' added successfully")
@@ -32,6 +31,7 @@ def add(file_path):
 @schedule.command()
 def list():
     """List all flows."""
+    init_db()
     try:
         flows = flow_service.list_flows()
         if not flows:
@@ -58,7 +58,11 @@ def list():
 @schedule.command()
 @click.argument("name")
 def remove(name):
-    """Remove a flow."""
+    """Remove a flow.
+
+    Acts immediately; there is no confirmation prompt.
+    """
+    init_db()
     try:
         flow_service.remove_flow(name)
         click.echo(f"Flow '{name}' removed successfully")
@@ -70,6 +74,7 @@ def remove(name):
 @click.argument("name")
 def disable(name):
     """Disable a flow."""
+    init_db()
     try:
         flow_service.disable_flow(name)
         click.echo(f"Flow '{name}' disabled")
@@ -81,6 +86,7 @@ def disable(name):
 @click.argument("name")
 def enable(name):
     """Enable a flow."""
+    init_db()
     try:
         flow_service.enable_flow(name)
         click.echo(f"Flow '{name}' enabled")
@@ -117,6 +123,7 @@ async def _run_flow_with_pipeline(name):
 @click.argument("name")
 def run(name):
     """Manually run a flow."""
+    init_db()
     try:
         # execute_flow is async in the event-driven architecture (it awaits the
         # async create_terminal); drive it to completion from this sync command
@@ -138,7 +145,6 @@ def flow():
         fg="yellow",
         err=True,
     )
-    init_db()
 
 
 # Share the same subcommand objects so alias behavior is identical (issue #378).

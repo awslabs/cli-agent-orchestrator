@@ -3,9 +3,12 @@
 Publisher: terminal.{id}.output
 """
 
+import codecs
+import errno
 import logging
 import os
 import select
+import stat
 import threading
 import time
 from typing import Callable, Dict, Optional, Tuple
@@ -52,6 +55,44 @@ _COALESCE_MAX_BYTES = 64 * 1024
 # fakes. terminal_service wires the real backend calls at create_reader time.
 PaneProbe = Callable[[], str]  # returns the live pane content (tmux capture-pane tail)
 RearmPipe = Callable[[], None]  # re-attaches pipe-pane (stop then start, NOT a bare toggle)
+
+
+def _ensure_fifo(fifo_path) -> None:
+    """Create ``fifo_path`` as an owner-only FIFO, or accept an existing FIFO.
+
+    ``os.mkfifo`` is exclusive by nature (it fails with EEXIST rather than
+    replacing anything), so a leftover FIFO from an earlier run is kept while a
+    regular file or a symlink planted at the predictable path is refused.
+    ``lstat`` rather than ``stat``: a symlink AT the path is the thing to
+    refuse, whatever it points to. The mode is 0600 on top of the 0700
+    ``FIFO_DIR``; the tmux pipe-pane writer runs as the same user.
+    """
+    try:
+        os.mkfifo(fifo_path, 0o600)
+    except FileExistsError:
+        pass
+    if not stat.S_ISFIFO(os.lstat(fifo_path).st_mode):
+        raise OSError(errno.EEXIST, f"{fifo_path} exists and is not a FIFO; refusing to use it")
+
+
+def _open_fifo(fifo_path, flags: int) -> int:
+    """``os.open`` the FIFO with ``O_NOFOLLOW`` and confirm the descriptor is a FIFO.
+
+    Closes the window between :func:`_ensure_fifo` and the open: a symlink
+    swapped in meanwhile fails the open (ELOOP), and anything that is not a
+    FIFO once opened is closed and refused instead of being read from or
+    written to.
+    """
+    # O_NOFOLLOW is POSIX.1-2008; every platform with os.mkfifo that CAO runs
+    # on (Linux, macOS, the BSDs) has it.
+    fd = os.open(str(fifo_path), flags | os.O_NOFOLLOW)
+    try:
+        if not stat.S_ISFIFO(os.fstat(fd).st_mode):
+            raise OSError(errno.EEXIST, f"{fifo_path} is not a FIFO; refusing to use it")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 class FifoManager:
@@ -169,8 +210,7 @@ class FifoManager:
             if terminal_id in self._readers:
                 return
 
-            if not fifo_path.exists():
-                os.mkfifo(fifo_path)
+            _ensure_fifo(fifo_path)
 
             stop_flag = threading.Event()
             thread = threading.Thread(
@@ -187,7 +227,7 @@ class FifoManager:
             self._last_data_at[terminal_id] = now
             self._registered_at[terminal_id] = now
             self._ever_delivered[terminal_id] = False
-            if enroll:
+            if pane_probe is not None and rearm is not None:
                 self._pane_probe[terminal_id] = pane_probe
                 self._rearm[terminal_id] = rearm
             thread.start()
@@ -197,18 +237,28 @@ class FifoManager:
 
         logger.info("Started FIFO reader for terminal %s", terminal_id)
 
-    def stop_reader(self, terminal_id: str) -> None:
+    def stop_reader(self, terminal_id: str) -> bool:
         """Stop the reader thread (if running) and delete the FIFO file.
 
-        The unlink is best-effort and runs even when no in-memory reader is
-        tracked for ``terminal_id`` — e.g. retention cleanup iterating DB
-        terminals after a server restart, where ``_readers`` is empty but stale
-        ``*.fifo`` files may still be on disk. Without it those files would
-        accumulate unbounded.
+        Returns True only when the tracked reader has actually exited and the
+        FIFO path is gone. Most callers ignore this — they tear down for side
+        effects — but the deferred-init tombstone reclaimer uses it as a hard
+        completeness signal, so a leaked reader thread or an unremovable file
+        keeps the runtime cleanup retryable instead of being recorded as done.
+        Timed-out readers remain tracked, with their stop flags set, until a
+        later call observes their exit. They cannot be replaced in the meantime.
+
+        The unlink is best-effort about the ABSENT case and runs even when no
+        in-memory reader is tracked for ``terminal_id`` — e.g. retention cleanup
+        iterating DB terminals after a server restart, where ``_readers`` is
+        empty but stale ``*.fifo`` files may still be on disk. Without it those
+        files would accumulate unbounded.
         """
         with self._lock:
-            stop_flag = self._readers.pop(terminal_id, None)
-            thread = self._threads.pop(terminal_id, None)
+            stop_flag = self._readers.get(terminal_id)
+            thread = self._threads.get(terminal_id)
+            if stop_flag is not None:
+                stop_flag.set()
             # Drop watchdog bookkeeping so a re-created terminal starts clean and
             # the watchdog stops probing a gone pane.
             self._pane_probe.pop(terminal_id, None)
@@ -233,33 +283,52 @@ class FifoManager:
         # actually torn down at process shutdown (api/main.py's lifespan).
         fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
 
-        if stop_flag and thread:
+        complete = True
+        if thread is not None:
             # The reader never blocks in open()/read() (non-blocking fd +
-            # select with a timeout), so setting the flag is sufficient — it is
-            # observed within one poll interval. No write-side "wakeup" open is
+            # select with a timeout), so setting the flag is sufficient once
+            # any in-flight publish finishes. No write-side "wakeup" open is
             # needed; the old wakeup raced with the reader's reopen cycle and
             # could strand the thread forever in a blocking FIFO open on an
             # unlinked inode (issue #382).
-            stop_flag.set()
             thread.join(timeout=2.0)
             if thread.is_alive():
-                # Never silent: a leaked reader thread was how #382's wedge
-                # built up. With the non-blocking loop this should not happen.
+                # A slow in-flight publish can outlast the join even though
+                # FIFO I/O is non-blocking. Keep it tracked for the next stop.
                 logger.warning(
                     "FIFO reader thread for terminal %s did not exit "
-                    "within 2s; leaking a daemon thread",
+                    "within 2s; retaining it for cleanup retry",
                     terminal_id,
                 )
+                complete = False
             else:
                 logger.info("Stopped FIFO reader for terminal %s", terminal_id)
 
-        # Best-effort unlink regardless of whether a reader was tracked — when
-        # none is tracked there is no active reader holding the FIFO, so removing
-        # a stale file on disk is safe.
-        try:
-            fifo_path.unlink()
-        except OSError:
-            pass
+        with self._lock:
+            # Another stop may have finished this generation and a subsequent
+            # create may have replaced it while we joined. Never remove that
+            # replacement's references or FIFO, or report it as reclaimed.
+            if (
+                self._readers.get(terminal_id) is not stop_flag
+                or self._threads.get(terminal_id) is not thread
+            ):
+                return False
+            if complete:
+                self._readers.pop(terminal_id, None)
+                self._threads.pop(terminal_id, None)
+
+            # Unlink even for an untracked stale FIFO or a pending stop. Keep
+            # this under the creation lock so a new reader cannot claim the
+            # path between dropping the exited reader and removing its FIFO.
+            try:
+                fifo_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                complete = False
+                logger.warning("Failed to remove FIFO for terminal %s: %s", terminal_id, exc)
+
+        return complete
 
     def _reader_loop(self, terminal_id: str, fifo_path, stop_flag: threading.Event) -> None:
         """Read chunks from FIFO and publish to the event bus.
@@ -303,14 +372,15 @@ class FifoManager:
         read_fd = -1
         keepalive_fd = -1
         pending = bytearray()
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         # Time at which the currently-accumulating batch started.
         batch_start = 0.0
         try:
             # Non-blocking read open of a FIFO succeeds immediately (POSIX),
             # writer attached or not.
-            read_fd = os.open(str(fifo_path), os.O_RDONLY | os.O_NONBLOCK)
+            read_fd = _open_fifo(fifo_path, os.O_RDONLY | os.O_NONBLOCK)
             # With our read end open, a non-blocking write open cannot ENXIO.
-            keepalive_fd = os.open(str(fifo_path), os.O_WRONLY | os.O_NONBLOCK)
+            keepalive_fd = _open_fifo(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
 
             while not stop_flag.is_set():
                 # Wait at most _COALESCE_WINDOW so we always flush pending data
@@ -334,19 +404,16 @@ class FifoManager:
                         # schedule below — the watchdog cares whether the FIFO
                         # delivered data, not whether/when a batch flushed.
                         #
-                        # Guarded by membership rather than unconditional: if
-                        # stop_reader already popped this terminal (torn down
-                        # while this thread was mid-read, before it noticed
-                        # stop_flag), writing here would resurrect a dict entry
-                        # nothing will ever clean up again — a slow leak across
-                        # create/stop churn. The check-then-write must happen
-                        # under _lock as one critical section: a stop_reader()
-                        # pop between an unlocked check and the assignment
-                        # could still resurrect the entry (round-3 Copilot
-                        # review on #397). Cheap and non-blocking either way —
-                        # this is a plain dict write, not the slow tmux probe.
+                        # Only the current, active reader may update watchdog
+                        # state. stop_reader keeps timed-out readers tracked
+                        # but drops their liveness state immediately; a late
+                        # read must not resurrect it. Check the generation and
+                        # stop flag under the same lock as teardown and writes.
                         with self._lock:
-                            if terminal_id in self._readers:
+                            if (
+                                self._readers.get(terminal_id) is stop_flag
+                                and not stop_flag.is_set()
+                            ):
                                 self._last_data_at[terminal_id] = time.monotonic()
                                 self._ever_delivered[terminal_id] = True
                         if not pending:
@@ -363,7 +430,9 @@ class FifoManager:
                     or len(pending) >= _COALESCE_MAX_BYTES
                     or not readable
                 ):
-                    bus.publish(topic, {"data": pending.decode("utf-8", errors="replace")})
+                    text = decoder.decode(pending)
+                    if text:
+                        bus.publish(topic, {"data": text})
                     pending.clear()
         except Exception as e:
             if not stop_flag.is_set():
@@ -371,11 +440,12 @@ class FifoManager:
         finally:
             # Flush any unpublished bytes so the last frame of a torn-down
             # terminal isn't lost — status/log consumers may need it.
-            if pending:
-                try:
-                    bus.publish(topic, {"data": pending.decode("utf-8", errors="replace")})
-                except Exception:
-                    pass
+            try:
+                text = decoder.decode(pending, final=True)
+                if text:
+                    bus.publish(topic, {"data": text})
+            except Exception:
+                pass
             for fd in (read_fd, keepalive_fd):
                 if fd >= 0:
                     try:

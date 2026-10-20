@@ -1,9 +1,9 @@
 """Inbox message models."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class OrchestrationType(str, Enum):
@@ -30,4 +30,9 @@ class InboxMessage(BaseModel):
     receiver_id: str = Field(..., description="Receiver terminal ID")
     message: str = Field(..., description="Message content")
     status: MessageStatus = Field(..., description="Message status")
-    created_at: datetime = Field(..., description="Creation timestamp")
+    created_at: datetime = Field(..., description="Creation timestamp (UTC)")
+
+    @field_validator("created_at")
+    @classmethod
+    def _created_at_is_utc(cls, v: datetime) -> datetime:
+        return v.replace(tzinfo=timezone.utc) if v.tzinfo is None else v

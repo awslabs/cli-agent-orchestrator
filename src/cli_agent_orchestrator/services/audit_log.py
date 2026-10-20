@@ -96,6 +96,12 @@ NOWAIT_AUDIT_EVENTS: frozenset = frozenset(
         # memory body/prompt — NFR-1.7). MUST be whitelisted or the event is
         # silently dropped and the content-free-audit test passes vacuously.
         "relationship_mutation",
+        # U5-B emits these reconciliation outcomes. They carry only counts,
+        # codes, and relative paths; registration must land first because an
+        # unlisted event is silently dropped at the audit boundary.
+        "vault_reconcile_completed",
+        "vault_note_quarantined",
+        "vault_secret_quarantined",
     }
 )
 AUDIT_EVENT_WHITELIST: frozenset = SYNC_AUDIT_EVENTS | NOWAIT_AUDIT_EVENTS

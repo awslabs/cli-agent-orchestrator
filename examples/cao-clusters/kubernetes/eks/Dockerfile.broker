@@ -4,6 +4,9 @@ RUN pip install --no-cache-dir \
     "fastapi>=0.104.0" \
     "kubernetes>=30.0.0,<35.0.0" \
     "requests>=2.32.0" \
+    # HTTPResponse.shutdown() landed in 2.3.0; the broker's log-follow teardown
+    # depends on it to interrupt a blocked readline on client disconnect.
+    "urllib3>=2.3.0" \
     "uvicorn[standard]>=0.24.0"
 
 WORKDIR /app

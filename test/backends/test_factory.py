@@ -160,3 +160,75 @@ class TestBackendFactoryErrors:
         _isolated_settings.write_text("")
         backend = BackendFactory.create()
         assert isinstance(backend, TmuxBackend)
+
+
+class TestSpawnModeWiring:
+    """The seam where a typo silently turns pane mode off, with every other test green."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_spawn_env(self, monkeypatch):
+        monkeypatch.delenv("CAO_TERMINAL_SPAWN_MODE", raising=False)
+        monkeypatch.delenv("CAO_TERMINAL_PANE_WINDOW", raising=False)
+
+    def test_default_is_window_mode(self, _isolated_settings):
+        backend = BackendFactory.create()
+
+        assert isinstance(backend, TmuxBackend)
+        assert backend._spawn_mode == "window"
+        assert backend._client.pane_mode is False
+
+    def test_settings_file_selects_pane_mode(self, _isolated_settings):
+        _isolated_settings.write_text(
+            json.dumps({"terminal": {"spawn_mode": "pane", "pane_window": "fleet"}})
+        )
+
+        backend = BackendFactory.create()
+
+        assert backend._spawn_mode == "pane"
+        assert backend._pane_window == "fleet"
+        # Only a pane-mode client asks tmux where a terminal is.
+        assert backend._client.pane_mode is True
+
+    def test_env_var_selects_pane_mode(self, _isolated_settings, monkeypatch):
+        monkeypatch.setenv("CAO_TERMINAL_SPAWN_MODE", "pane")
+        monkeypatch.setenv("CAO_TERMINAL_PANE_WINDOW", "fleet")
+
+        backend = BackendFactory.create()
+
+        assert backend._spawn_mode == "pane"
+        assert backend._pane_window == "fleet"
+
+    def test_a_typo_falls_back_to_window_and_says_so(self, _isolated_settings, caplog):
+        """Silently behaving as window mode is how this feature would go missing."""
+        _isolated_settings.write_text(json.dumps({"terminal": {"spawn_mode": "panes"}}))
+
+        with caplog.at_level("WARNING"):
+            backend = BackendFactory.create()
+
+        assert backend._spawn_mode == "window"
+        assert "panes" in caplog.text
+
+    def test_default_layout_is_tiled(self, _isolated_settings):
+        assert BackendFactory.create()._pane_layout == "tiled"
+
+    def test_settings_file_selects_a_layout(self, _isolated_settings):
+        _isolated_settings.write_text(
+            json.dumps({"terminal": {"spawn_mode": "pane", "pane_layout": "even-vertical"}})
+        )
+
+        assert BackendFactory.create()._pane_layout == "even-vertical"
+
+    def test_env_var_selects_a_layout(self, _isolated_settings, monkeypatch):
+        monkeypatch.setenv("CAO_TERMINAL_PANE_LAYOUT", "even-horizontal")
+
+        assert BackendFactory.create()._pane_layout == "even-horizontal"
+
+    def test_an_unknown_layout_falls_back_to_tiled_and_says_so(self, _isolated_settings, caplog):
+        """An unchecked name reaches the client, which refuses the spawn outright."""
+        _isolated_settings.write_text(json.dumps({"terminal": {"pane_layout": "even-vertikal"}}))
+
+        with caplog.at_level("WARNING"):
+            backend = BackendFactory.create()
+
+        assert backend._pane_layout == "tiled"
+        assert "even-vertikal" in caplog.text

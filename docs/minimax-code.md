@@ -47,17 +47,34 @@ role: developer
 Implement the requested change and verify it.
 ```
 
-MiniMax Code's public interactive CLI does not expose a model flag. CAO applies
-`model:` in an `mcode` profile or `--model` at launch by setting `defaultModel`
-only in the terminal-local copy of `config.yaml`; the explicit launch override
-wins over the profile value. The user's normal MiniMax Code configuration is
-not modified.
+CAO sets `defaultModel` only in the terminal-local copy of `config.yaml`.
+Selection precedence is an explicit session/terminal API `model` parameter,
+then the profile's `model:`, then the user's saved `defaultModel`. If none is
+set, CAO uses `minimax/MiniMax-M3`. The user's normal configuration is not modified.
+Saved legacy and custom selections, already-qualified model keys, and provider
+settings are preserved. An explicit bare `MiniMax-M3` is normalized to
+`minimax/MiniMax-M3`; this key follows MiniMax Code's configured managed or
+API-key model source.
 
-The current MiniMax model IDs are `MiniMax-M3` and `MiniMax-M2.7`. For example:
+For example, add this frontmatter to an `mcode` agent profile and launch it with
+`cao launch --agents <profile-name> --provider mcode`:
 
-```bash
-cao launch --agents developer --provider mcode --model MiniMax-M3
+```yaml
+provider: mcode
+model: minimax/MiniMax-M3
 ```
+
+`cao launch` has no `--model` option. Model selection is configured through the
+profile or the session/terminal API instead.
+
+M3 is the verified default for this adapter. The public
+[`@minimax-ai/code@0.6.12` package](https://www.npmjs.com/package/@minimax-ai/code/v/0.6.12)
+requires qualified `provider/model` keys and includes M3 in its managed and
+API-key catalogs. Its Flash entry is `MiniMax-M3.1-Flash-Preview`, not the final
+`MiniMax-M3.1-Flash` key, so CAO does not advertise final Flash support or alias
+that key to Preview. The CLI owns model discovery and inference; the CAO
+`/agents/providers` response retains its common `name`, `binary`, `installed`
+shape.
 
 ## Runtime behavior
 
@@ -109,6 +126,17 @@ by the default MCP timeout. Absolute executable paths are converted to a bare
 command plus a terminal-local `PATH` prefix because the MiniMax Plugin schema
 requires PATH-resolved commands.
 
+MCP servers declared by installed [agent plugins](agent-plugins.md) are merged
+into that generated Plugin at launch time, alongside the profile's own —
+recomputed on every terminal creation rather than persisted, so the paths never
+go stale. One constraint is specific to this provider: the MiniMax Plugin schema
+accepts only server names matching
+`^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$`, so an agent-plugin server named e.g. `Acme` is
+skipped for `mcode` with a report and delivered normally to other providers. It is
+skipped rather than passed through because the serializer rejects such a name
+while the terminal is being created, which would cost you the agent rather than
+one tool.
+
 ## Tool restrictions
 
 MiniMax Code has no public native flag for CAO's `allowedTools` vocabulary.
@@ -154,3 +182,8 @@ PYTHONPATH=src .venv/bin/python -m pytest -m e2e \
   test/e2e/test_supervisor_orchestration.py \
   -k MiniMaxCode -v -o 'addopts='
 ```
+
+### Agent-plugin MCP working directory
+
+Its MCP config format has no working-directory key (checked against the vendor's own MCP documentation, 2026-09-16), so CAO carries an agent plugin's declared `cwd` by launching the server through `/bin/sh -c 'cd -- "$1" && shift && exec "$@"'`. `exec` replaces the shell, the environment passes through, and argument boundaries survive because each argument stays a separate argv element. On a host with no `/bin/sh` such a server is skipped with `mcp.cwd_unsupported` rather than started in the wrong directory.
+See [Agent Plugins](agent-plugins.md) for the full per-provider table.

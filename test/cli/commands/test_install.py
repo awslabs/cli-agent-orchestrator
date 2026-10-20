@@ -7,7 +7,7 @@ import pytest
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.install import (
-    _copy_local_profile_to_store,
+    _read_local_profile,
     install,
 )
 from cli_agent_orchestrator.services.install_service import InstallResult
@@ -130,11 +130,13 @@ class TestInstallCommand:
     def test_install_file_source_prints_copy_confirmation(
         self, runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """File path installs should copy to the store and print a copy confirmation.
+        """File path installs hand the file's text to the service and print a copy confirmation.
 
-        File-handling lives entirely in the CLI: the service layer only sees
-        the validated bare stem. We verify the copy happened and the service
-        was called with the stem, not the original path.
+        File-handling lives entirely in the CLI: the service layer sees the
+        validated bare stem plus the text, never the path. The CLI itself
+        writes nothing -- the service stores the text once the ownership guard
+        has accepted it (round-6 review of #493), so a refused import cannot
+        replace the previously stored profile.
         """
         local_store = tmp_path / "agent-store"
         local_store.mkdir()
@@ -164,9 +166,12 @@ class TestInstallCommand:
         assert result.exit_code == 0, result.output
         assert "Copied agent from file to local store" in result.output
         assert "Agent 'local' installed successfully" in result.output
-        # Service sees the validated stem, never the full user path.
-        mock_install.assert_called_once_with("local", "kiro_cli", None)
-        assert (local_store / "local.md").read_text() == source_profile.read_text()
+        # Service sees the validated stem and the text, never the full user path.
+        mock_install.assert_called_once_with(
+            "local", "kiro_cli", None, profile_content=source_profile.read_text()
+        )
+        # The CLI does not write the store; that is the service's job, after the guard.
+        assert not (local_store / "local.md").exists()
 
     def test_install_file_source_missing_file_fails_fast(
         self, runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -234,22 +239,22 @@ class TestInstallCommand:
         assert "Key must not be empty" in result.output
 
 
-class TestCopyLocalProfileToStore:
+class TestReadLocalProfile:
     """Tests for the file-handling helper that lives only in the CLI layer.
 
     This helper is the reason ``install_service.install_agent`` can keep a
-    narrow, bare-name-or-URL contract: the CLI copies user files into the
-    local store itself and then forwards just the validated stem.
+    narrow, bare-name-or-URL contract: the CLI reads user files itself and
+    forwards just the validated stem and the text.
     """
 
     def test_returns_none_for_url_source(self) -> None:
-        assert _copy_local_profile_to_store("https://example.com/a.md") is None
-        assert _copy_local_profile_to_store("http://example.com/a.md") is None
+        assert _read_local_profile("https://example.com/a.md") is None
+        assert _read_local_profile("http://example.com/a.md") is None
 
     def test_returns_none_for_bare_name(self) -> None:
-        assert _copy_local_profile_to_store("developer") is None
+        assert _read_local_profile("developer") is None
 
-    def test_copies_file_and_returns_stem(
+    def test_reads_file_and_returns_stem_and_text_without_writing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         store = tmp_path / "store"
@@ -259,10 +264,8 @@ class TestCopyLocalProfileToStore:
         src = tmp_path / "my-agent.md"
         src.write_text("body", encoding="utf-8")
 
-        stem = _copy_local_profile_to_store(str(src))
-
-        assert stem == "my-agent"
-        assert (store / "my-agent.md").read_text(encoding="utf-8") == "body"
+        assert _read_local_profile(str(src)) == ("my-agent", "body")
+        assert not store.exists()
 
 
 def test_install_omp_provider_is_accepted_by_cli():

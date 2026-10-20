@@ -163,7 +163,7 @@ class TestRestoreCommand:
 
         with patch("cli_agent_orchestrator.cli.commands.terminal.TERMINAL_LOG_DIR", tmp_path):
             with patch(
-                "cli_agent_orchestrator.cli.commands.terminal.requests.get", return_value=mock_resp
+                "cli_agent_orchestrator.cli.commands.terminal.api_http.get", return_value=mock_resp
             ):
                 result = runner.invoke(terminal, ["restore", "abc12345"])
 
@@ -185,7 +185,7 @@ class TestRestoreCommand:
 
         with patch("cli_agent_orchestrator.cli.commands.terminal.TERMINAL_LOG_DIR", tmp_path):
             with patch(
-                "cli_agent_orchestrator.cli.commands.terminal.requests.get",
+                "cli_agent_orchestrator.cli.commands.terminal.api_http.get",
                 side_effect=requests.exceptions.ConnectionError(),
             ):
                 result = runner.invoke(terminal, ["restore", "abc12345"])
@@ -224,7 +224,7 @@ class TestRestoreCommand:
 
         with patch("cli_agent_orchestrator.cli.commands.terminal.TERMINAL_LOG_DIR", tmp_path):
             with patch(
-                "cli_agent_orchestrator.cli.commands.terminal.requests.get", return_value=mock_resp
+                "cli_agent_orchestrator.cli.commands.terminal.api_http.get", return_value=mock_resp
             ):
                 with patch(
                     "cli_agent_orchestrator.cli.commands.terminal.get_backend",
@@ -255,7 +255,7 @@ class TestRestoreCommand:
 
         with patch("cli_agent_orchestrator.cli.commands.terminal.TERMINAL_LOG_DIR", tmp_path):
             with patch(
-                "cli_agent_orchestrator.cli.commands.terminal.requests.get", return_value=mock_resp
+                "cli_agent_orchestrator.cli.commands.terminal.api_http.get", return_value=mock_resp
             ):
                 with patch(
                     "cli_agent_orchestrator.cli.commands.terminal.get_backend",
@@ -289,7 +289,7 @@ class TestRestoreCommand:
 
         with patch("cli_agent_orchestrator.cli.commands.terminal.TERMINAL_LOG_DIR", tmp_path):
             with patch(
-                "cli_agent_orchestrator.cli.commands.terminal.requests.get", return_value=mock_resp
+                "cli_agent_orchestrator.cli.commands.terminal.api_http.get", return_value=mock_resp
             ):
                 with patch(
                     "cli_agent_orchestrator.cli.commands.terminal.get_backend",
@@ -330,7 +330,7 @@ class TestRestoreCommand:
 
         with patch("cli_agent_orchestrator.cli.commands.terminal.TERMINAL_LOG_DIR", tmp_path):
             with patch(
-                "cli_agent_orchestrator.cli.commands.terminal.requests.get", return_value=mock_resp
+                "cli_agent_orchestrator.cli.commands.terminal.api_http.get", return_value=mock_resp
             ):
                 with patch(
                     "cli_agent_orchestrator.cli.commands.terminal.get_backend",

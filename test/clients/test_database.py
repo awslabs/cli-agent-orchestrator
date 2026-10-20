@@ -1,21 +1,25 @@
 """Tests for the database client."""
 
+import sqlite3
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
+from cli_agent_orchestrator.clients import database as db_mod
 from cli_agent_orchestrator.clients.database import (
     Base,
     FlowModel,
     IdempotencyKeyModel,
     InboxModel,
+    MemoryMetadataModel,
     TerminalModel,
+    count_runtime_allocated_terminals,
     create_flow,
     create_inbox_message,
     create_terminal,
@@ -40,6 +44,8 @@ from cli_agent_orchestrator.clients.database import (
     update_flow_run_times,
     update_last_active,
     update_message_status,
+    update_terminal_deferred_init_failure,
+    update_terminal_deferred_init_runtime_reclaimed,
     update_terminal_group,
     update_terminal_metadata,
     update_terminal_shell_command,
@@ -72,6 +78,29 @@ class TestTerminalOperations:
         assert result["id"] == "test123"
         mock_session.add.assert_called_once()
         mock_session.commit.assert_called_once()
+
+    def test_runtime_capacity_excludes_reclaimed_deferred_tombstone(self, test_db):
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal("live0001", "cao-live", "w-live", "kimi_cli")
+            create_terminal("dead0001", "cao-dead", "w-dead", "kimi_cli")
+            assert count_runtime_allocated_terminals() == 2
+
+            assert update_terminal_deferred_init_runtime_reclaimed("dead0001", True)
+
+            assert count_runtime_allocated_terminals() == 1
+
+    def test_session_incarnation_backfill_is_atomic_when_any_row_is_missing(self, test_db):
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            create_terminal("live0001", "cao-live", "w-live", "kimi_cli")
+
+            assert (
+                db_mod.update_terminals_session_incarnation(["live0001", "missing1"], "inc-current")
+                is False
+            )
+            assert get_terminal_metadata("live0001")["session_incarnation_id"] is None
+
+            assert db_mod.update_terminals_session_incarnation(["live0001"], "inc-current") is True
+            assert get_terminal_metadata("live0001")["session_incarnation_id"] == "inc-current"
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_get_terminal_metadata_found(self, mock_session_class):
@@ -220,6 +249,7 @@ class TestTerminalOperations:
         mock_terminal.provider = "kiro_cli"
         mock_terminal.agent_profile = "developer"
         mock_terminal.working_directory = "/workspace/project"
+        mock_terminal.deferred_init_failure_json = None
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()
@@ -259,8 +289,9 @@ class TestTerminalOperations:
         Uses the real in-memory DB (not a mocked session) so the age cutoff,
         status filter, and terminal join are actually exercised.
         """
-        old = datetime.now() - timedelta(seconds=120)
-        fresh = datetime.now()
+        # Server timestamps are UTC.
+        old = datetime.now(timezone.utc) - timedelta(seconds=120)
+        fresh = datetime.now(timezone.utc)
 
         with test_db() as seed:
             seed.add_all(
@@ -644,6 +675,9 @@ class TestGroupAndMetadata:
         mock_terminal.allowed_tools = None
         mock_terminal.group = '["tenant_1", "project_5"]'
         mock_terminal.metadata_json = '{"task": "reviewing PR"}'
+        mock_terminal.deferred_init_failure_json = (
+            '{"phase": "deferred_init", "kind": "provider_init_error", "message": "failed"}'
+        )
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()
@@ -655,6 +689,11 @@ class TestGroupAndMetadata:
 
         assert result["group"] == ["tenant_1", "project_5"]
         assert result["metadata"] == {"task": "reviewing PR"}
+        assert result["deferred_init_failure"] == {
+            "phase": "deferred_init",
+            "kind": "provider_init_error",
+            "message": "failed",
+        }
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_update_terminal_group(self, mock_session_class):
@@ -742,6 +781,36 @@ class TestGroupAndMetadata:
         assert result is False
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_deferred_init_failure_is_separate_from_metadata(
+        self, mock_session_class
+    ):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_terminal.metadata_json = '{"origin":"bridge"}'
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        failure = {
+            "phase": "deferred_init",
+            "kind": "provider_init_error",
+            "message": "workspace trust required",
+        }
+        result = update_terminal_deferred_init_failure("test123", failure)
+
+        assert result is True
+        assert mock_terminal.deferred_init_failure_json == (
+            '{"phase": "deferred_init", "kind": "provider_init_error", '
+            '"message": "workspace trust required"}'
+        )
+        assert mock_terminal.metadata_json == '{"origin":"bridge"}'
+        mock_session.commit.assert_called_once()
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_get_terminal_group_returns_decoded_list(self, mock_session_class):
         mock_session = MagicMock()
         mock_session.__enter__ = MagicMock(return_value=mock_session)
@@ -807,6 +876,8 @@ class TestListSiblingsByGroupPrefix:
                     tmux_session="s",
                     tmux_window="w",
                     provider="kiro_cli",
+                    model="model-x",
+                    model_honored=True,
                     group='["tenant_1", "project_5", "folder_1"]',
                     metadata_json='{"task": "reviewing"}',
                 ),
@@ -815,6 +886,8 @@ class TestListSiblingsByGroupPrefix:
                     tmux_session="s",
                     tmux_window="w",
                     provider="kiro_cli",
+                    model="model-y",
+                    model_honored=False,
                     group='["tenant_1", "project_5", "folder_2"]',
                 ),
                 TerminalModel(
@@ -836,6 +909,7 @@ class TestListSiblingsByGroupPrefix:
         assert by_id["sib-1"]["group"] == ["tenant_1", "project_5", "folder_1"]
         assert by_id["sib-1"]["metadata"] == {"task": "reviewing"}
         assert by_id["sib-2"]["metadata"] is None
+        assert all(set(sibling) == {"id", "group", "metadata"} for sibling in result)
 
     def test_caller_excluded_from_its_own_results(self, test_db):
         self._seed(
@@ -1687,10 +1761,20 @@ class TestTerminalsSchemaMigration:
 
         with sqlite3.connect(str(db_file)) as conn:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(terminals)")}
-            rows = conn.execute("SELECT id, caller_id, working_directory FROM terminals").fetchall()
+            rows = conn.execute(
+                "SELECT id, caller_id, working_directory, model, model_honored FROM terminals"
+            ).fetchall()
         assert "caller_id" in columns
         assert "working_directory" in columns
-        assert rows == [("abc12345", None, None)], "existing rows must get NULL metadata values"
+        assert "provider_variant" in columns
+        assert "deferred_init_failure" in columns
+        assert "deferred_init_external_owner" in columns
+        assert "deferred_init_runtime_reclaimed" in columns
+        assert "session_incarnation_id" in columns
+        assert {"model", "model_honored"} <= columns
+        assert rows == [
+            ("abc12345", None, None, None, None)
+        ], "existing rows must get NULL launch-model values"
 
     def test_migration_is_idempotent(self, tmp_path, monkeypatch):
         """Running the migration twice must not fail or duplicate columns."""
@@ -1720,6 +1804,13 @@ class TestTerminalsSchemaMigration:
         assert columns.count("caller_id") == 1
         assert columns.count("working_directory") == 1
         assert columns.count("allowed_tools") == 1
+        assert columns.count("provider_variant") == 1
+        assert columns.count("deferred_init_failure") == 1
+        assert columns.count("deferred_init_external_owner") == 1
+        assert columns.count("deferred_init_runtime_reclaimed") == 1
+        assert columns.count("session_incarnation_id") == 1
+        assert columns.count("model") == 1
+        assert columns.count("model_honored") == 1
 
     def test_group_and_metadata_columns_added_to_legacy_table(self, tmp_path, monkeypatch):
         """#432: a pre-existing terminals table (predating group/metadata) gains both
@@ -1870,6 +1961,9 @@ class TestTerminalsSchemaMigration:
                 assert row is not None
                 assert row["group"] is None, "pre-migration rows must read group as NULL"
                 assert row["metadata"] is None, "pre-migration rows must read metadata as NULL"
+                assert row["provider_variant"] is None
+                assert row["model"] is None
+                assert row["model_honored"] is None
 
             # Original pre-migration data must survive untouched.
             assert aaaa["tmux_session"] == "cao-sess-1"
@@ -1890,6 +1984,18 @@ class TestTerminalsSchemaMigration:
             columns = [row[1] for row in conn.execute("PRAGMA table_info(terminals)")]
         assert columns.count("group") == 1
         assert columns.count("metadata") == 1
+        assert columns.count("provider_variant") == 1
+        assert columns.count("model") == 1
+        assert columns.count("model_honored") == 1
+        # create_all adds new tables to old databases, including decision records.
+        with sqlite3.connect(str(db_file)) as conn:
+            indexes = conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = ?"
+                " AND name NOT LIKE 'sqlite_autoindex%'",
+                ("decision_records",),
+            ).fetchone()[0]
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+        assert "decision_records" in tables and indexes == 3
 
 
 class TestTerminalMetadataRoundTrip:
@@ -1944,6 +2050,64 @@ class TestTerminalMetadataRoundTrip:
         assert fetched is not None
         assert fetched["caller_id"] is None
         assert fetched["working_directory"] is None
+
+    def test_session_incarnation_round_trips_through_all_session_reads(self, tmp_path, monkeypatch):
+        """Durable session incarnation identity is returned by every session read."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        engine = create_engine(f"sqlite:///{tmp_path / 'incarnation.db'}")
+        Base.metadata.create_all(bind=engine)
+        monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
+
+        created = create_terminal(
+            "abc12345",
+            "cao-s",
+            "w-0",
+            "kiro_cli",
+            session_incarnation_id="inc-123",
+        )
+        assert created["session_incarnation_id"] == "inc-123"
+
+        fetched = get_terminal_metadata("abc12345")
+        assert fetched is not None
+        assert fetched["session_incarnation_id"] == "inc-123"
+        assert list_terminals_by_session("cao-s")[0]["session_incarnation_id"] == "inc-123"
+        assert list_terminals_in_sessions(["cao-s"])[0]["session_incarnation_id"] == "inc-123"
+
+    @pytest.mark.parametrize("model_honored", [True, False])
+    def test_launch_model_round_trips_through_terminal_record(
+        self, tmp_path, monkeypatch, model_honored
+    ):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        engine = create_engine(f"sqlite:///{tmp_path / 'model.db'}")
+        Base.metadata.create_all(bind=engine)
+        monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
+
+        created = create_terminal(
+            "abc12345",
+            "cao-s",
+            "w-0",
+            "mock_cli" if not model_honored else "codex",
+            model="model-x",
+            model_honored=model_honored,
+        )
+        fetched = get_terminal_metadata("abc12345")
+        listed = list_terminals_by_session("cao-s")
+
+        assert created["model"] == "model-x"
+        assert created["model_honored"] is model_honored
+        assert fetched is not None
+        assert fetched["model"] == "model-x"
+        assert fetched["model_honored"] is model_honored
+        assert listed[0]["model"] == "model-x"
+        assert listed[0]["model_honored"] is model_honored
 
 
 class TestProjectAliasMigration:
@@ -2004,6 +2168,129 @@ class TestProjectAliasMigration:
         with sqlite3.connect(str(db_file)) as conn:
             rows = conn.execute("SELECT alias, project_id FROM project_aliases").fetchall()
         assert rows == [("a1", "p1")], "current-schema table must be left intact"
+
+
+class TestMemoryScopeNullUniquenessMigration:
+    """Partial unique index for NULL scope_id rows (issue #657).
+
+    SQLite treats NULL != NULL in a UNIQUE index, so the table-level
+    uq_memory_key_scope never fired for global/federated memories; the
+    partial index covers exactly those rows. Real SQLite throughout — the
+    NULL-distinctness being asserted is engine behavior no mock can exercise.
+    """
+
+    def _mem(self, key, file_path, scope="global", scope_id=None):
+        return MemoryMetadataModel(
+            key=key,
+            memory_type="project",
+            scope=scope,
+            scope_id=scope_id,
+            file_path=file_path,
+            tags="",
+        )
+
+    def _legacy_db(self, tmp_path, monkeypatch, dupe_paths=()):
+        """A legacy pre-#657 database: fresh schema, partial index dropped,
+        optionally seeded with duplicate global rows the old constraint let
+        in. DATABASE_FILE is pointed at it."""
+        db_file = tmp_path / "legacy.db"
+        engine = create_engine(f"sqlite:///{db_file}")
+        Base.metadata.create_all(bind=engine)
+        engine.dispose()
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute("DROP INDEX IF EXISTS uq_memory_key_scope_null")
+            for path in dupe_paths:
+                conn.execute(
+                    "INSERT INTO memory_metadata (id, key, memory_type, scope, scope_id, "
+                    "file_path, tags, access_count) "
+                    f"VALUES ('{path}', 'd', 'project', 'global', NULL, '{path}', '', 0)"
+                )
+            conn.commit()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+        return db_file
+
+    def test_fresh_database_rejects_duplicate_global_rows(self):
+        """Two (key, global, NULL) rows must collide — the reporter's case.
+        The scoped sibling of the same key stays distinct: that is what
+        keeping scope_id nullable (not the sentinel) buys."""
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(bind=engine)
+        with sessionmaker(bind=engine)() as s:
+            s.add(self._mem("shared", "/a.md"))
+            s.commit()
+            s.add(self._mem("shared", "/b.md"))
+            with pytest.raises(IntegrityError):
+                s.commit()
+            s.rollback()
+            s.add(self._mem("shared", "/c.md", scope="session", scope_id="t1"))
+            s.commit()  # distinct (key, scope, scope_id) — accepted
+            rows = s.query(MemoryMetadataModel).order_by(MemoryMetadataModel.scope).all()
+        assert [r.scope for r in rows] == ["global", "session"]
+
+    def test_existing_database_gains_the_index(self, tmp_path, monkeypatch):
+        """A pre-index database gets uq_memory_key_scope_null on init."""
+        db_file = self._legacy_db(tmp_path, monkeypatch)
+        db_mod._migrate_memory_scope_null_uniqueness()
+
+        with sqlite3.connect(str(db_file)) as conn:
+            names = {r[1] for r in conn.execute("PRAGMA index_list('memory_metadata')")}
+        assert "uq_memory_key_scope_null" in names
+
+    def test_duplicate_seed_skips_index_then_recovers_after_repair(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Fail-soft path (both seeded-duplicate cases from the issue): with
+        duplicates present the index is skipped with a warning naming them
+        and pointing at cao memory repair, and rows are kept; re-running
+        after the repair creates the index."""
+        db_file = self._legacy_db(tmp_path, monkeypatch, dupe_paths=("/1.md", "/2.md"))
+        with caplog.at_level("WARNING"):
+            db_mod._migrate_memory_scope_null_uniqueness()  # skips, warns
+
+        assert any("uq_memory_key_scope_null" in r.message for r in caplog.records)
+        assert any("cao memory repair" in r.message for r in caplog.records)
+        with sqlite3.connect(str(db_file)) as conn:
+            names = {r[1] for r in conn.execute("PRAGMA index_list('memory_metadata')")}
+            rows = conn.execute("SELECT COUNT(*) FROM memory_metadata").fetchone()[0]
+        assert "uq_memory_key_scope_null" not in names
+        assert rows == 2, "duplicates must be left for `cao memory repair`, never deleted here"
+
+        # The repair the warning advertises: the reconciliation service's
+        # dedupe path clears the stale sibling, then re-invokes the migrator.
+        # The seeded rows carry key='d', so the canonical topic is 'd.md'.
+        from cli_agent_orchestrator.services.memory_reconciliation import (
+            MemoryReconciliationService,
+        )
+
+        base_dir = tmp_path / "memory"
+        topic = base_dir / "global" / "wiki" / "global" / "d.md"
+        topic.parent.mkdir(parents=True, exist_ok=True)
+        topic.write_text(
+            "# d\n"
+            "<!-- id: 11111111-1111-1111-1111-111111111111 | scope: global | "
+            "type: reference | tags:  -->\n\n"
+            "## 2026-07-15T01:00:00Z\ndurable body\n",
+            encoding="utf-8",
+        )
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "UPDATE memory_metadata SET file_path = ? WHERE file_path = '/1.md'",
+                (str(topic),),
+            )
+            conn.commit()
+        engine = create_engine(f"sqlite:///{db_file}")
+        try:
+            report = MemoryReconciliationService(base_dir, engine).apply()
+            assert report.counts["dedupe_metadata"] == 1
+        finally:
+            engine.dispose()
+        with sqlite3.connect(str(db_file)) as conn:
+            names = {r[1] for r in conn.execute("PRAGMA index_list('memory_metadata')")}
+            rows = conn.execute("SELECT COUNT(*) FROM memory_metadata").fetchone()[0]
+        assert rows == 1, "the canonical row survives the advertised repair"
+        assert "uq_memory_key_scope_null" in names, "repair re-attempts the index in-run"
 
 
 class TestListTerminalsInSessions:
@@ -2209,13 +2496,21 @@ class TestListTerminalsInSessions:
         # Keys pinned absolutely, not just against each other — a key dropped
         # from BOTH projections would otherwise pass while breaking consumers.
         assert set(batched[0]) == {
+            "description",
             "id",
             "tmux_session",
             "tmux_window",
             "provider",
             "agent_profile",
+            "model",
+            "model_honored",
+            "ephemeral",
             "working_directory",
             "engine",
+            "deferred_init_failure",
+            "deferred_init_external_owner",
+            "deferred_init_runtime_reclaimed",
+            "session_incarnation_id",
             "last_active",
         }
 
@@ -2312,3 +2607,75 @@ def test_no_upsert_against_the_terminals_table():
         "upsert against terminals would break the ownership ordering contract "
         "(see TerminalModel); use UPDATE instead:\n  " + "\n  ".join(offenders)
     )
+
+
+class TestPendingInboxCounts:
+    def test_empty_receivers_do_not_open_database(self):
+        with patch.object(db_mod, "SessionLocal") as factory:
+            assert db_mod.get_pending_inbox_counts([]) == {}
+        factory.assert_not_called()
+
+    def test_receivers_without_pending_messages(self, test_db):
+        with test_db() as db:
+            db.add(
+                InboxModel(
+                    sender_id="sender",
+                    receiver_id="empty",
+                    message="done",
+                    status=MessageStatus.DELIVERED.value,
+                )
+            )
+            db.commit()
+        with patch.object(db_mod, "SessionLocal", test_db):
+            assert db_mod.get_pending_inbox_counts(["empty", "missing"]) == {}
+
+    def test_counts_are_exact_grouped_and_independent_of_sender(self, test_db):
+        # Inbox persistence has no orchestration-type column: all delivery modes
+        # share these rows and the counter must not inspect their payloads.
+        with test_db() as db:
+            for receiver, count in [("first", 123), ("second", 2), ("excluded", 5)]:
+                db.add(
+                    TerminalModel(
+                        id=receiver,
+                        tmux_session="synthetic-session",
+                        tmux_window=receiver,
+                        provider="codex",
+                    )
+                )
+                for index in range(count):
+                    db.add(
+                        InboxModel(
+                            sender_id=f"sender-{index % 3}",
+                            receiver_id=receiver,
+                            message=f"synthetic message {index}",
+                            status=MessageStatus.PENDING.value,
+                        )
+                    )
+                for status in (MessageStatus.DELIVERED, MessageStatus.FAILED):
+                    db.add(
+                        InboxModel(
+                            sender_id="sender",
+                            receiver_id=receiver,
+                            message="not pending",
+                            status=status.value,
+                        )
+                    )
+            db.commit()
+        statements = []
+        engine = test_db.kw["bind"]
+
+        def observe(conn, cursor, statement, parameters, context, executemany):
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", observe)
+        try:
+            with patch.object(db_mod, "SessionLocal", test_db):
+                assert db_mod.get_pending_inbox_counts(["first", "second", "missing"]) == {
+                    "first": 123,
+                    "second": 2,
+                }
+        finally:
+            event.remove(engine, "before_cursor_execute", observe)
+        assert len(statements) == 1
+        assert "GROUP BY" in statements[0].upper()

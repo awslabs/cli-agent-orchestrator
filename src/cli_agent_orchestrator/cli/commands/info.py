@@ -4,7 +4,6 @@ import os
 import subprocess
 
 import click
-import requests
 
 from cli_agent_orchestrator.constants import (
     DATABASE_FILE,
@@ -12,6 +11,7 @@ from cli_agent_orchestrator.constants import (
     SERVER_PORT,
     SESSION_PREFIX,
 )
+from cli_agent_orchestrator.utils import api_http
 
 
 @click.command()
@@ -42,7 +42,7 @@ def info():
             try:
                 # Call API to get session details
                 url = f"http://{SERVER_HOST}:{SERVER_PORT}/sessions/{session_name}"
-                response = requests.get(url)
+                response = api_http.get(url)
 
                 if response.status_code == 200:
                     data = response.json()
@@ -53,7 +53,7 @@ def info():
                     click.echo(
                         f"Session ID: {session_name} (Warning: Session not found in CAO server)"
                     )
-            except requests.exceptions.RequestException:
+            except api_http.exceptions.RequestException:
                 click.echo(f"Session ID: {session_name} (Warning: Could not connect to CAO server)")
         else:
             click.echo("Not currently in a CAO session.")

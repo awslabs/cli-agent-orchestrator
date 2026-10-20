@@ -1,12 +1,15 @@
 """Tests for the `cao config` CLI command group (issue #357)."""
 
 import json
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.config import _coerce, config
 from cli_agent_orchestrator.services import config_service as cs
+from cli_agent_orchestrator.services.config_service import ConfigService
+from cli_agent_orchestrator.utils.atomic_file import LockTimeoutError
 
 
 @pytest.fixture(autouse=True)
@@ -123,6 +126,25 @@ class TestConfigSet:
         # Clean ClickException, not a leaked ValueError traceback (issue #357).
         assert result.exception is None or isinstance(result.exception, SystemExit)
         assert "Unknown memory setting" in result.output
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            LockTimeoutError(Path("settings.lock"), 0.01),
+            OSError("settings.json is read-only"),
+        ],
+    )
+    def test_set_write_failure_is_a_clean_cli_error(
+        self, runner, _isolated_settings, monkeypatch, failure
+    ):
+        monkeypatch.setattr(ConfigService, "set", lambda key, value: (_ for _ in ()).throw(failure))
+
+        result = runner.invoke(config, ["set", "workflow.require_approval", "false"])
+
+        assert result.exit_code != 0
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "could not save configuration" in result.output
+        assert str(failure) in result.output
 
     def test_set_memory_lint_enabled_false_persists_locally(self, runner, _isolated_settings):
         result = runner.invoke(config, ["set", "memory.lint_enabled", "false"])

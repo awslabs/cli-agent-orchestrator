@@ -1,4 +1,4 @@
-"""Per-(provider, scope, scope_id, lint_enabled) GraphView cache.
+"""GraphView cache keyed by provider-defined immutable tuples.
 
 Issue #348, perf follow-up.
 
@@ -27,6 +27,11 @@ min): the graph can be up to TTL seconds stale after a memory edit, which for a
 human-viewed knowledge graph is an acceptable price for a self-contained,
 boundary-respecting cache. ``invalidate`` is still exposed so a future write-path
 hook can wire proactive invalidation without changing this module's shape.
+
+Fingerprint-bearing providers can produce a new key after each configuration
+change. Expired entries are therefore swept on every lookup, and per-key locks
+are reference-counted and reclaimed once no caller or live entry needs them.
+The retained key set is bounded by one TTL window plus in-flight builds.
 """
 
 import asyncio
@@ -43,11 +48,13 @@ from cli_agent_orchestrator.graph.models import GraphView
 # write-invalidation (see module docstring).
 DEFAULT_TTL_S = 300.0
 
-# Cache key: (provider name, scope, scope_id, lint_enabled). scope_id is
+# Base cache key: (provider name, scope, scope_id, lint_enabled). scope_id is
 # normalized to a string-or-None so ``("memory","global",None,True)`` and a
 # project projection never collide, a global request never serves a
 # project-scope entry, and lint-enabled/disabled graph projections stay isolated.
-CacheKey = tuple[str, str, Optional[str], bool]
+# The memory provider appends its current binding fingerprint. The four-element
+# form remains supported for every other existing consumer.
+CacheKey = tuple[str, str, Optional[str], bool] | tuple[str, str, Optional[str], bool, str]
 
 
 @dataclass
@@ -77,8 +84,9 @@ class GraphViewCache:
         self._clock = clock
         self._entries: dict[CacheKey, _Entry] = {}
         self._locks: dict[CacheKey, asyncio.Lock] = {}
+        self._lock_users: dict[CacheKey, int] = {}
         # Guards mutation of the ``_locks`` map itself so two coroutines racing
-        # to create the per-key lock can't each make a different one.
+        # to create/reference the per-key lock can't each use a different one.
         self._locks_guard = asyncio.Lock()
 
     async def _lock_for(self, key: CacheKey) -> asyncio.Lock:
@@ -87,20 +95,51 @@ class GraphViewCache:
             if lock is None:
                 lock = asyncio.Lock()
                 self._locks[key] = lock
+            self._lock_users[key] = self._lock_users.get(key, 0) + 1
             return lock
+
+    def _release_lock_user(self, key: CacheKey, lock: asyncio.Lock) -> None:
+        """Release one caller's lock reference without yielding the event loop."""
+        users = self._lock_users.get(key)
+        if users is None:
+            return
+        if users > 1:
+            self._lock_users[key] = users - 1
+            return
+        self._lock_users.pop(key, None)
+        if key not in self._entries and self._locks.get(key) is lock:
+            self._locks.pop(key, None)
+
+    def _prune_unused_lock(self, key: CacheKey) -> None:
+        if self._lock_users.get(key, 0) == 0 and key not in self._entries:
+            self._locks.pop(key, None)
+            self._lock_users.pop(key, None)
+
+    def _sweep(self) -> None:
+        """Reclaim expired entries and every unreferenced orphan lock."""
+        now = self._clock()
+        expired = [
+            key
+            for key, entry in self._entries.items()
+            if now - entry.created_monotonic >= self._ttl
+        ]
+        for key in expired:
+            self._entries.pop(key, None)
+        for key in tuple(self._locks):
+            self._prune_unused_lock(key)
+        for key, users in tuple(self._lock_users.items()):
+            if users == 0 and key not in self._locks:
+                self._lock_users.pop(key, None)
 
     def _fresh(self, key: CacheKey) -> Optional[_Entry]:
         entry = self._entries.get(key)
         if entry is None:
             return None
         if self._clock() - entry.created_monotonic >= self._ttl:
-            # Evict the expired entry so ``_entries`` doesn't retain a stale
-            # GraphView for every key ever queried. ``_locks`` is intentionally
-            # NOT pruned here: it holds one tiny ``asyncio.Lock`` per key
-            # (bounded by the number of distinct keys, a small finite set), and
-            # a concurrent coroutine may be awaiting that very lock — dropping
-            # it mid-flight would let a second builder run for the same key.
+            # Evict the expired entry and its lock only when no caller holds a
+            # reference. Referenced locks survive until the final caller exits.
             del self._entries[key]
+            self._prune_unused_lock(key)
             return None
         return entry
 
@@ -113,23 +152,33 @@ class GraphViewCache:
         ``builder``. ``builder`` is invoked at most once per (key, window) even
         under concurrent callers.
         """
+        self._sweep()
         entry = self._fresh(key)
         if entry is not None:
             return entry.view, True, entry.as_of
 
-        lock = await self._lock_for(key)
-        async with lock:
-            # Re-check under the lock: a concurrent caller may have built it
-            # while we waited (single-flight — this is where the herd collapses
-            # onto one build).
-            entry = self._fresh(key)
-            if entry is not None:
-                return entry.view, True, entry.as_of
+        lock: Optional[asyncio.Lock] = None
+        try:
+            lock = await self._lock_for(key)
+            async with lock:
+                # Re-check under the lock: a concurrent caller may have built it
+                # while we waited (single-flight — this is where the herd collapses
+                # onto one build).
+                entry = self._fresh(key)
+                if entry is not None:
+                    return entry.view, True, entry.as_of
 
-            view = await builder()
-            as_of = datetime.now(timezone.utc).isoformat()
-            self._entries[key] = _Entry(view=view, created_monotonic=self._clock(), as_of=as_of)
-            return view, False, as_of
+                view = await builder()
+                as_of = datetime.now(timezone.utc).isoformat()
+                self._entries[key] = _Entry(
+                    view=view,
+                    created_monotonic=self._clock(),
+                    as_of=as_of,
+                )
+                return view, False, as_of
+        finally:
+            if lock is not None:
+                self._release_lock_user(key, lock)
 
     def invalidate(self, key: CacheKey) -> None:
         """Drop a single key's entry (no-op if absent).
@@ -138,10 +187,20 @@ class GraphViewCache:
         over write-invalidation — see module docstring).
         """
         self._entries.pop(key, None)
+        self._prune_unused_lock(key)
 
     def clear(self) -> None:
-        """Drop all cached entries (used by tests and any global flush)."""
+        """Drop cached entries and unreferenced locks.
+
+        In-flight callers retain their shared lock and may repopulate the cache,
+        preserving the established clear-during-build serialization behavior.
+        """
         self._entries.clear()
+        for key in tuple(self._locks):
+            self._prune_unused_lock(key)
+        for key, users in tuple(self._lock_users.items()):
+            if users == 0:
+                self._lock_users.pop(key, None)
 
 
 def make_meta(base: dict[str, Any], *, cached: bool, as_of: str) -> dict[str, Any]:

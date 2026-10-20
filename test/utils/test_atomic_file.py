@@ -29,11 +29,14 @@ import pytest
 from cli_agent_orchestrator.constants import LOCK_DIR
 from cli_agent_orchestrator.utils.atomic_file import (
     LockTimeoutError,
+    LockUnavailableError,
     _file_lock,
     _lock_path_for,
     locked_atomic_delete,
     locked_atomic_rewrite,
     locked_atomic_write,
+    strict_target_lock,
+    unlocked_atomic_write,
 )
 
 
@@ -107,6 +110,56 @@ def test_lock_path_stable_and_distinct(tmp_path: Path) -> None:
     # A different target must not collide.
     other = tmp_path / "sub" / "CLAUDE.md"
     assert _lock_path_for(other) != first
+
+
+def test_strict_lock_refuses_to_run_without_fcntl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import cli_agent_orchestrator.utils.atomic_file as atomic_file_module
+
+    target = tmp_path / "workflow.py"
+    monkeypatch.setattr(atomic_file_module, "_FCNTL_AVAILABLE", False)
+
+    with pytest.raises(LockUnavailableError, match="unavailable"):
+        with strict_target_lock(target):
+            pytest.fail("strict lock must never yield without process locking")
+
+    assert not target.exists()
+
+
+def test_strict_lock_keeps_one_permanent_lock_inode(tmp_path: Path) -> None:
+    target = tmp_path / "workflow.py"
+    lock_path = _lock_path_for(target)
+
+    with strict_target_lock(target):
+        first_inode = lock_path.stat().st_ino
+    with strict_target_lock(target):
+        second_inode = lock_path.stat().st_ino
+
+    assert first_inode == second_inode
+    assert lock_path.exists()
+
+
+def test_strict_lock_open_failure_never_yields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import cli_agent_orchestrator.utils.atomic_file as atomic_file_module
+
+    target = tmp_path / "workflow.py"
+    real_open = atomic_file_module.os.open
+    lock_path = _lock_path_for(target)
+
+    def _failing_open(path: str, *args: object, **kwargs: object) -> int:
+        if path == str(lock_path):
+            raise OSError("lock storage unavailable")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(atomic_file_module.os, "open", _failing_open)
+    with pytest.raises(LockUnavailableError, match="cannot open workflow lock"):
+        with strict_target_lock(target):
+            pytest.fail("strict lock must not yield after lockfile open failure")
+
+    assert not target.exists()
 
 
 def test_creates_parent_directory(tmp_path: Path) -> None:
@@ -310,19 +363,22 @@ def test_temp_files_are_unique_per_call_not_fixed_name(tmp_path: Path) -> None:
 
     import cli_agent_orchestrator.utils.atomic_file as atomic_file_module
 
-    real_mkstemp = atomic_file_module.tempfile.mkstemp
+    # Spy on the helper that names the temp file: the first call creates a
+    # NEW target (O_EXCL create with the umask applied), the second rewrites
+    # an existing one (mkstemp), so spying on mkstemp alone would see one.
+    real_open_temp = atomic_file_module._open_unique_temp
 
-    def spying_mkstemp(*args, **kwargs):
-        fd, name = real_mkstemp(*args, **kwargs)
-        seen_names.append(name)
-        return fd, name
+    def spying_open_temp(*args, **kwargs):
+        fd, path = real_open_temp(*args, **kwargs)
+        seen_names.append(str(path))
+        return fd, path
 
-    atomic_file_module.tempfile.mkstemp = spying_mkstemp
+    atomic_file_module._open_unique_temp = spying_open_temp
     try:
         locked_atomic_rewrite(target, lambda existing: "one")
         locked_atomic_rewrite(target, lambda existing: "two")
     finally:
-        atomic_file_module.tempfile.mkstemp = real_mkstemp
+        atomic_file_module._open_unique_temp = real_open_temp
 
     assert len(seen_names) == 2
     assert seen_names[0] != seen_names[1], "temp file names must not collide across calls"
@@ -845,3 +901,92 @@ def test_delete_does_not_disturb_the_lock_file_itself(tmp_path: Path) -> None:
     assert not target.exists()
     assert lock_path.exists()
     assert LOCK_DIR in lock_path.parents
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
+def test_umask_is_never_touched(tmp_path: Path, monkeypatch) -> None:
+    """The umask is process-global and cao-server is threaded: reading it via
+    os.umask(0) + restore leaves a window in which another thread's new file is
+    born 0666. Neither the new-file nor the rewrite path may call os.umask."""
+    calls: list[int] = []
+    real_umask = os.umask
+
+    def recording_umask(mask: int) -> int:
+        calls.append(mask)
+        return real_umask(mask)
+
+    monkeypatch.setattr(os, "umask", recording_umask)
+    target = tmp_path / "AGENTS.md"
+    locked_atomic_rewrite(target, lambda existing: "first")  # new file
+    locked_atomic_rewrite(target, lambda existing: existing + " again")  # rewrite
+    assert calls == []
+    assert target.read_text(encoding="utf-8") == "first again"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
+def test_new_file_mode_follows_a_restrictive_umask_too(tmp_path: Path) -> None:
+    """The kernel, not CAO, applies the umask: a 0o077 umask yields 0600."""
+    target = tmp_path / "private.md"
+    old_umask = os.umask(0o077)
+    try:
+        locked_atomic_rewrite(target, lambda existing: "content")
+    finally:
+        os.umask(old_umask)
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
+
+
+def _lock_dir_entries() -> set:
+    return set(LOCK_DIR.iterdir()) if LOCK_DIR.exists() else set()
+
+
+class TestUnlockedAtomicWrite:
+    """The lock-free sibling for one-shot, uniquely named targets (terminal sidecars).
+
+    It must keep every publish property of the locked writer EXCEPT the lock,
+    and above all it must not leave a lock file behind: the locked writer keeps
+    one per target forever, which is exactly the growth these callers avoid.
+    """
+
+    def test_publishes_content_with_explicit_mode_and_no_lock_file(self, tmp_path: Path) -> None:
+        target = tmp_path / "abcd1234.scrollback"
+        before = _lock_dir_entries()
+
+        unlocked_atomic_write(target, "history", mode=0o600)
+
+        assert target.read_text(encoding="utf-8") == "history"
+        assert oct(target.stat().st_mode & 0o777) == oct(0o600)
+        assert _lock_dir_entries() == before, "unlocked writer must not add to LOCK_DIR"
+        assert not _lock_path_for(target).exists()
+        assert [p.name for p in tmp_path.iterdir()] == [target.name], "no temp file left"
+
+    def test_replaces_a_planted_symlink_instead_of_following_it(self, tmp_path: Path) -> None:
+        victim = tmp_path / "victim.txt"
+        victim.write_text("do not touch", encoding="utf-8")
+        target = tmp_path / "abcd1234.snapshot.json"
+        target.symlink_to(victim)
+
+        unlocked_atomic_write(target, "{}", mode=0o600)
+
+        assert victim.read_text(encoding="utf-8") == "do not touch"
+        assert not target.is_symlink()
+        assert target.read_text(encoding="utf-8") == "{}"
+        assert oct(target.stat().st_mode & 0o777) == oct(0o600)
+
+    def test_mode_none_preserves_an_existing_mode_like_the_locked_writer(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "notes.md"
+        target.write_text("v1", encoding="utf-8")
+        target.chmod(0o644)
+
+        unlocked_atomic_write(target, "v2")
+
+        assert target.read_text(encoding="utf-8") == "v2"
+        assert oct(target.stat().st_mode & 0o777) == oct(0o644)
+
+    def test_creates_missing_parent_directory(self, tmp_path: Path) -> None:
+        target = tmp_path / "deeper" / "still" / "abcd1234.scrollback"
+
+        unlocked_atomic_write(target, "x", mode=0o600)
+
+        assert target.read_text(encoding="utf-8") == "x"

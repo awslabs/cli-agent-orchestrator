@@ -1,0 +1,10 @@
+{
+  "name": "cao-braces-compat",
+  "version": "0.0.0",
+  "private": true,
+  "main": "index.cjs",
+  "license": "Apache-2.0",
+  "peerDependencies": {
+    "@dieub/braces-depth-guard": "3.0.3-pn.3"
+  }
+}

@@ -9,6 +9,7 @@ engine (no mocking of the memory internals); the lint LLM is stubbed.
 import asyncio
 import json
 import time
+from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -16,11 +17,19 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients.database import Base, MemoryMetadataModel
-from cli_agent_orchestrator.graph.models import EdgeType, GraphView
+from cli_agent_orchestrator.graph.cache import GraphViewCache
+from cli_agent_orchestrator.graph.models import EdgeType, GraphView, Node
 from cli_agent_orchestrator.graph.providers import get_provider
+from cli_agent_orchestrator.graph.providers import memory as memory_provider_module
 from cli_agent_orchestrator.graph.providers.memory import MemoryGraphProvider
 from cli_agent_orchestrator.services import settings_service, wiki_lint
 from cli_agent_orchestrator.services.memory_service import MemoryService
+from cli_agent_orchestrator.services.vault.binding import (
+    NativeBinding,
+    VaultBinding,
+    VaultConfigUnavailableError,
+)
+from cli_agent_orchestrator.services.vault.config import FolderMapping
 from cli_agent_orchestrator.services.wiki_lint import LintIssue
 
 BODY = "A reasonably long article body so contradiction pairing engages." + " filler" * 10
@@ -199,6 +208,31 @@ class TestMemoryProviderHappyPath:
     @pytest.mark.asyncio
     async def test_resolvable_from_registry(self):
         assert isinstance(get_provider("memory"), MemoryGraphProvider)
+
+    @pytest.mark.asyncio
+    async def test_graph_attributes_do_not_expose_paths(self, populated_scope, monkeypatch):
+        """Node and edge attrs are flags/provenance, never vault path data."""
+        _disable_llm(monkeypatch)
+        provider = MemoryGraphProvider(memory_service=populated_scope)
+
+        view = await provider.project(scope="global")
+
+        def values(value):
+            if isinstance(value, dict):
+                for child in value.values():
+                    yield from values(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    yield from values(child)
+            else:
+                yield value
+
+        for item in [*view.nodes, *view.edges]:
+            for value in values(item.attrs):
+                if isinstance(value, str):
+                    assert "/" not in value
+                    assert "\\" not in value
+                    assert not value.endswith(".md")
 
 
 class TestMemoryProviderEdgeCases:
@@ -488,7 +522,7 @@ class TestMemoryProviderEdgeCases:
             ("a", "b", EdgeType.RELATES_TO)
         ]
         assert view.meta["lint_enabled"] is False
-        assert view.meta["lint_enrichment"] == "disabled"
+        assert view.meta["lint_enrichment"] == "disabled_by_setting"
         assert set(view.meta["disabled_enrichments"]) == {
             "orphan_page",
             "contradiction",
@@ -499,3 +533,159 @@ class TestMemoryProviderEdgeCases:
         by_id = {n.id: n for n in view.nodes}
         assert "is_hub" not in by_id["a"].attrs
         assert all(e.type != EdgeType.CONTRADICTION for e in view.edges)
+
+    @pytest.mark.asyncio
+    async def test_unavailable_vault_binding_fails_closed(self, populated_scope, monkeypatch):
+        """Unknown vault ownership must not expose a retained native projection."""
+        run_lint = AsyncMock(return_value=[])
+        monkeypatch.setattr(wiki_lint, "run_lint", run_lint)
+
+        def unavailable_binding(*_args):
+            raise VaultConfigUnavailableError("invalid vault configuration")
+
+        provider = MemoryGraphProvider(
+            memory_service=populated_scope,
+            lint_enabled=lambda: True,
+            binding_resolver=unavailable_binding,
+        )
+
+        view = await provider.project(scope="global")
+
+        run_lint.assert_not_awaited()
+        assert view.nodes == []
+        assert view.edges == []
+        assert view.meta["boundary_cause"] == "vault_config_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_index_disabled_vault_binding_has_empty_graph_with_boundary_cause(
+        self, populated_scope, tmp_path
+    ):
+        mapping = FolderMapping(folder="Mapped", scope="global", index=False)
+        resolved = VaultBinding(
+            scope="global",
+            scope_id=None,
+            vault_id="vault",
+            root=str(tmp_path),
+            mapping=mapping,
+        )
+        provider = MemoryGraphProvider(
+            memory_service=populated_scope,
+            lint_enabled=lambda: True,
+            binding_resolver=lambda *_args: resolved,
+        )
+
+        view = await provider.project(scope="global")
+
+        assert view.nodes == []
+        assert view.edges == []
+        assert view.meta["boundary_cause"] == "not_indexable"
+
+    @pytest.mark.asyncio
+    async def test_graph_cache_key_changes_when_vault_binding_becomes_not_indexable(
+        self, populated_scope, tmp_path, monkeypatch
+    ):
+        """Current binding policy must not reuse an authorized warm graph."""
+        monkeypatch.setattr(memory_provider_module, "_CACHE", GraphViewCache())
+        mapping = FolderMapping(folder="Mapped", scope="global", index=True)
+        current = {
+            "binding": VaultBinding(
+                scope="global",
+                scope_id=None,
+                vault_id="vault",
+                root=str(tmp_path),
+                mapping=mapping,
+                managed_folder="CAO",
+                exclude=("Mapped/Private/**",),
+            )
+        }
+        provider = MemoryGraphProvider(
+            memory_service=populated_scope,
+            lint_enabled=lambda: True,
+            binding_resolver=lambda *_args: current["binding"],
+        )
+        fingerprints = [memory_provider_module.binding_fingerprint(current["binding"])]
+        assert fingerprints[0] == memory_provider_module.binding_fingerprint(
+            replace(current["binding"])
+        )
+
+        async def build(_scope, _scope_id, _lint_enabled, resolved_binding):
+            if (
+                isinstance(resolved_binding, VaultBinding)
+                and resolved_binding.index
+                and resolved_binding.mapping.folder == "Mapped"
+                and resolved_binding.exclude == ("Mapped/Private/**",)
+            ):
+                return GraphView(
+                    nodes=[Node(id="authorized", kind="topic", label="authorized")],
+                    edges=[],
+                    meta={"provider": "memory"},
+                )
+            boundary = (
+                {"boundary_cause": "not_indexable"}
+                if isinstance(resolved_binding, VaultBinding)
+                else {}
+            )
+            return GraphView(nodes=[], edges=[], meta={"provider": "memory", **boundary})
+
+        monkeypatch.setattr(provider, "_build", AsyncMock(side_effect=build))
+
+        first = await provider.project(scope="global")
+        warm = await provider.project(scope="global")
+        current["binding"] = VaultBinding(
+            scope="global",
+            scope_id=None,
+            vault_id="vault",
+            root=str(tmp_path),
+            mapping=mapping.model_copy(update={"folder": "Mapped/Public"}),
+            managed_folder="CAO",
+            exclude=("Mapped/Private/**",),
+        )
+        fingerprints.append(memory_provider_module.binding_fingerprint(current["binding"]))
+        narrowed = await provider.project(scope="global")
+        current["binding"] = VaultBinding(
+            scope="global",
+            scope_id=None,
+            vault_id="vault",
+            root=str(tmp_path),
+            mapping=mapping,
+            managed_folder="CAO",
+            exclude=("Mapped/**",),
+        )
+        fingerprints.append(memory_provider_module.binding_fingerprint(current["binding"]))
+        excluded = await provider.project(scope="global")
+        current["binding"] = VaultBinding(
+            scope="global",
+            scope_id=None,
+            vault_id="vault",
+            root=str(tmp_path),
+            mapping=mapping.model_copy(update={"index": False}),
+            managed_folder="CAO",
+            exclude=("Mapped/Private/**",),
+        )
+        fingerprints.append(memory_provider_module.binding_fingerprint(current["binding"]))
+        revoked = await provider.project(scope="global")
+        current["binding"] = NativeBinding(scope="global", scope_id=None)
+        fingerprints.append(memory_provider_module.binding_fingerprint(current["binding"]))
+        disabled = await provider.project(scope="global")
+
+        assert ([node.id for node in first.nodes], first.meta["cached"]) == (
+            ["authorized"],
+            False,
+        )
+        assert ([node.id for node in warm.nodes], warm.meta["cached"]) == (
+            ["authorized"],
+            True,
+        )
+        assert narrowed.nodes == []
+        assert narrowed.meta["cached"] is False
+        assert excluded.nodes == []
+        assert excluded.meta["cached"] is False
+        assert revoked.nodes == []
+        assert revoked.edges == []
+        assert revoked.meta["cached"] is False
+        assert revoked.meta["boundary_cause"] == "not_indexable"
+        assert disabled.nodes == []
+        assert disabled.edges == []
+        assert disabled.meta["cached"] is False
+        assert len(set(fingerprints)) == len(fingerprints)
+        assert provider._build.await_count == 5

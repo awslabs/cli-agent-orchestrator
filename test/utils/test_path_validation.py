@@ -281,3 +281,82 @@ class TestSafeJoinUnderBase:
         (base / "link").symlink_to(outside)
         with pytest.raises(ValueError, match="Path traversal detected"):
             safe_join_under_base(str(base), "link", "topic.md")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX system paths")
+class TestBlockedSubtrees:
+    """The blocklist is a set of subtrees for system locations, not only exact names."""
+
+    def test_library_roots_are_blocked_in_their_canonical_spelling(self):
+        """On usr-merged Linux ``/lib`` resolves to ``/usr/lib`` before the check runs,
+        so ``/lib`` on its own never fired; the canonical roots must be listed too."""
+        from cli_agent_orchestrator.utils.path_validation import _blocked_reason
+
+        assert _blocked_reason("/usr/lib/systemd/system/evil.service") != ""
+        assert _blocked_reason("/usr/lib64/cao-evil") != ""
+        assert _blocked_reason("/lib/cao-evil") != ""
+        assert _blocked_reason("/lib64/cao-evil") != ""
+        # And through the real validator, whatever /lib resolves to on this host.
+        if os.path.isdir("/lib"):
+            with pytest.raises(ValueError, match="blocked system"):
+                resolve_and_validate_path("/lib/cao-evil", allow_create=True)
+        # /usr/libexec and /usr/local/lib are not system library roots here.
+        assert _blocked_reason("/usr/local/lib/x") == ""
+        assert _blocked_reason("/usr/libexec/x") == ""
+
+    def test_crontab_spool_is_blocked(self):
+        from cli_agent_orchestrator.utils.path_validation import _blocked_reason
+
+        assert _blocked_reason("/var/spool/cron/crontabs/root") != ""
+        assert _blocked_reason("/var/spool/mail/x") == ""  # only the cron spool
+
+    def test_root_home_is_a_blocked_subtree(self):
+        """``/root/.ssh/authorized_keys`` and ``/root/.bashrc`` are persistence for
+        whoever reaches the API of a cao-server running as root."""
+        from cli_agent_orchestrator.utils.path_validation import _blocked_reason
+
+        assert _blocked_reason("/root") != ""
+        assert _blocked_reason("/root/.ssh/authorized_keys") != ""
+        assert _blocked_reason("/root/.bashrc") != ""
+        assert _blocked_reason("/root/projects/app") != ""
+        assert _blocked_reason("/rootfs/x") == ""  # lookalike prefix
+
+    @pytest.mark.parametrize("target", ["/etc/hosts", "/dev/null"])
+    def test_files_inside_blocked_subtrees_are_refused_even_with_allow_file(self, target):
+        assert os.path.exists(target)
+        with pytest.raises(ValueError, match="beneath blocked system path"):
+            resolve_and_validate_path(target, allow_file=True)
+
+    def test_existing_directory_inside_a_blocked_subtree_is_refused(self):
+        candidates = [
+            d for d in ("/etc/ssl", "/etc/ssh", "/dev/fd", "/usr/bin") if os.path.isdir(d)
+        ]
+        assert candidates, "no blocked-subtree child directory exists on this host"
+        with pytest.raises(ValueError, match="blocked system"):
+            resolve_and_validate_path(candidates[0])
+
+    def test_new_name_deep_inside_a_blocked_subtree_is_refused(self):
+        # Caught at the resolved-path step: the subtree rule is a string-prefix
+        # test, so it does not need the target to exist.
+        with pytest.raises(ValueError, match="beneath blocked system path"):
+            resolve_and_validate_path("/etc/ssl/new/deeper", allow_create=True)
+
+    def test_children_of_exact_only_roots_stay_allowed(self, tmp_path):
+        # tmp_path lives under /tmp (Linux) or /private/var/folders (macOS);
+        # both roots are exact-only, so projects there remain valid.
+        assert resolve_and_validate_path(str(tmp_path)) == os.path.realpath(str(tmp_path))
+
+    def test_dev_shm_is_carved_out_of_the_dev_subtree(self):
+        from cli_agent_orchestrator.utils.path_validation import _blocked_reason
+
+        assert _blocked_reason("/dev/shm") == ""
+        assert _blocked_reason("/dev/shm/cao-export") == ""
+        assert _blocked_reason("/dev/shmem") != ""  # lookalike is still under /dev
+        assert _blocked_reason("/dev/null") != ""
+
+    def test_lookalike_prefix_is_not_blocked(self, tmp_path):
+        # "/etcetera" shares a string prefix with "/etc" but is not inside it;
+        # emulate with a directory whose name starts like a blocked root.
+        look = tmp_path / "etc_like"
+        look.mkdir()
+        assert resolve_and_validate_path(str(look)) == os.path.realpath(str(look))

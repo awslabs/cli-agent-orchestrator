@@ -974,3 +974,76 @@ def test_cleanup_logs_unregister_exception(caplog):
     assert "disk full" in caplog.text
     assert "_unregister_mcp_servers" in caplog.text
     loop.close()
+
+
+def test_cwd_reaches_the_shared_mcp_config(tmp_path):
+    """Reported by review 5222539218 on #584 (item 4).
+
+    Antigravity documents ``cwd`` ("Working directory for `stdio` servers."), so an
+    agent plugin's declared directory is carried natively into mcp_config.json
+    rather than through the ``/bin/sh`` wrapper the formats without such a field
+    need.
+    """
+    import json
+
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    cfg = tmp_path / "mcp_config.json"
+    profile = AgentProfile(
+        name="worker",
+        description="Worker",
+        system_prompt="Work.",
+        mcpServers={"demo-tools": {"command": "demo-server", "args": [], "cwd": "/plugins/demo"}},
+    )
+    p = make_provider(agent_profile="worker")
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            return_value="/usr/local/bin/agy",
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+            return_value=profile,
+        ),
+        patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+    ):
+        p._build_agy_command()
+
+    entry = json.loads(cfg.read_text())["mcpServers"]["demo-tools-test-tid"]
+    assert entry["cwd"] == "/plugins/demo"
+    assert entry["command"] == "demo-server", "must NOT be shimmed: the format has a cwd field"
+
+
+# --------------------------------------------------------------------------- #
+# Mid-burst PROCESSING probe
+# --------------------------------------------------------------------------- #
+
+
+def test_provider_opts_into_midburst_probe():
+    """agy animates its spinner for the whole turn, so only the probe sees the
+    turn: without it the terminal read IDLE until the turn ended, and the
+    delivery check re-sent a task that the worker was already running (live,
+    agy 1.3.3, 2026-10-11)."""
+    assert make_provider().supports_midburst_processing_probe is True
+
+
+def test_probe_sees_the_processing_footer():
+    screen = ["> analyze this", "⣽  Working...", "─" * 80, "esc to cancel   Gemini 3.1 Pro"]
+    assert make_provider().probe_processing_from_screen(screen) is True
+
+
+def test_probe_needs_positive_evidence():
+    screen = ["> analyze this", "─" * 80, "? for shortcuts   Gemini 3.1 Pro"]
+    assert make_provider().probe_processing_from_screen(screen) is False
+
+
+def test_probe_leaves_an_approval_prompt_to_the_detector():
+    screen = ["Do you want to allow this action? [y/n]", "esc to cancel   Gemini 3.1 Pro"]
+    assert make_provider().probe_processing_from_screen(screen) is False
+
+
+def test_probe_changes_no_turn_state():
+    provider = make_provider()
+    turns = provider._turns
+    provider.probe_processing_from_screen(["esc to cancel   Gemini 3.1 Pro"])
+    assert provider._turns == turns

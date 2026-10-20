@@ -102,7 +102,7 @@ def _snap_resp(state, status_code=200):
 # ---------------------------------------------------------------------------
 # OR-1: renders normal frames in seq order and OR-2: closes on terminal.
 # ---------------------------------------------------------------------------
-def test_renders_normal_frames_in_seq_order(runner):
+def test_renders_normal_frames_in_seq_order(runner, monkeypatch):
     """OR-1/OR-2: normal frames render in ascending seq; a terminal run.* frame
     ends the follow and yields exit 0 for a completed run."""
     stream = _stream_resp(
@@ -110,9 +110,11 @@ def test_renders_normal_frames_in_seq_order(runner):
         _event_frame(2, "step.completed", "s2", "completed"),
         _event_frame(3, "run.completed", None, "completed"),
     )
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "events-follow-token")
     with (
         patch(
-            "cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.requests.get",
+            return_value=stream,
         ) as get,
         _HUMAN,
     ):
@@ -126,6 +128,7 @@ def test_renders_normal_frames_in_seq_order(runner):
     args, kwargs = get.call_args
     assert args[0].endswith("/workflows/runs/run1/events")
     assert kwargs["headers"]["Accept"] == "text/event-stream"
+    assert kwargs["headers"]["Authorization"] == "Bearer events-follow-token"
     assert kwargs["stream"] is True
 
 
@@ -135,7 +138,7 @@ def test_terminal_failed_frame_exits_1(runner):
         _event_frame(1, "step.attempt.failed", "s1", "failed"),
         _event_frame(2, "run.failed", None, "failed"),
     )
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream):
         result = runner.invoke(workflow, ["events", "run1"])
     assert result.exit_code == 1
 
@@ -148,7 +151,7 @@ def test_step_completed_state_does_not_close_follow_early(runner):
         _event_frame(2, "run.failed", None, "failed"),
     )
     with (
-        patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream),
+        patch("cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream),
         _HUMAN,
     ):
         result = runner.invoke(workflow, ["events", "run1"])
@@ -170,7 +173,7 @@ def test_gap_rendered_as_declared(runner):
         _event_frame(23, "run.completed", None, "completed"),
     )
     with (
-        patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream),
+        patch("cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream),
         _HUMAN,
     ):
         result = runner.invoke(workflow, ["events", "run1"])
@@ -192,7 +195,7 @@ def test_no_gap_frame_no_synthesized_gap(runner):
         # seq jumps to 23 with NO gap frame between them.
         _event_frame(23, "run.completed", None, "completed"),
     )
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream):
         result = runner.invoke(workflow, ["events", "run1"])
     assert result.exit_code == 0
     # The follower renders what the server DECLARES; a bare seq jump is not a gap.
@@ -208,7 +211,7 @@ def test_gap_frame_does_not_advance_cursor_or_close(runner):
         _gap_frame(after_seq=10, before_seq=12, missing_count=1),
         _event_frame(12, "run.cancelled", None, "cancelled"),
     )
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream):
         result = runner.invoke(workflow, ["events", "run1"])
     # Cancelled is terminal-non-completed -> exit 1; the gap did not end the follow.
     assert result.exit_code == 1
@@ -238,7 +241,7 @@ def test_reconnect_uses_last_id_as_after_seq(runner):
 
     with (
         patch(
-            "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
             side_effect=[first, second],
         ) as get,
         patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
@@ -256,7 +259,7 @@ def test_after_seq_flag_sets_initial_cursor(runner):
     """--after-seq seeds the initial resume cursor on the very first open."""
     stream = _stream_resp(_event_frame(6, "run.completed", None, "completed"))
     with patch(
-        "cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream
     ) as get:
         result = runner.invoke(workflow, ["events", "run1", "--after-seq", "5"])
     assert result.exit_code == 0
@@ -266,19 +269,21 @@ def test_after_seq_flag_sets_initial_cursor(runner):
 # ---------------------------------------------------------------------------
 # F-1 terminal guard: a stream that ends WITHOUT a terminal event must not hang.
 # ---------------------------------------------------------------------------
-def test_stream_ends_without_terminal_does_final_status_check(runner):
+def test_stream_ends_without_terminal_does_final_status_check(runner, monkeypatch):
     """F-1: the stream ends with NO terminal frame (a swallowed terminal event). The
     follower must NOT hang — it does a final GET status and closes on the terminal
     state read there (here: completed -> exit 0)."""
     stream = _stream_resp(_event_frame(1, "step.completed", "s1", "completed"))
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "events-final-token")
     with patch(
-        "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.requests.get",
         side_effect=[stream, _snap_resp("completed")],
     ) as get:
         result = runner.invoke(workflow, ["events", "run1"])
     assert result.exit_code == 0
     # The 2nd GET is the snapshot route (the terminal guard).
     assert get.call_args_list[1].args[0].endswith("/workflows/runs/run1")
+    assert get.call_args_list[1].kwargs["headers"] == {"Authorization": "Bearer events-final-token"}
     assert "completed" in result.output
 
 
@@ -288,7 +293,7 @@ def test_stream_ends_non_terminal_reports_stream_ended_exit_0(runner):
     stream = _stream_resp(_event_frame(1, "step.completed", "s1", "completed"))
     with (
         patch(
-            "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
             side_effect=[stream, _snap_resp("running")],
         ),
         _HUMAN,
@@ -307,7 +312,7 @@ def test_reconnect_budget_exhausted_falls_back_to_status(runner):
     drops = [dropping] * (WORKFLOW_EVENTS_MAX_RECONNECTS + 1)
     with (
         patch(
-            "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
             side_effect=drops + [_snap_resp("completed")],
         ),
         patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
@@ -325,10 +330,10 @@ def test_ctrl_c_detaches_without_cancel(runner):
     hint, and NO cancel POST is issued."""
     with (
         patch(
-            "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
             side_effect=KeyboardInterrupt,
         ),
-        patch("cli_agent_orchestrator.cli.commands.workflow.requests.post") as post,
+        patch("cli_agent_orchestrator.cli.commands.workflow.api_http.post") as post,
     ):
         result = runner.invoke(workflow, ["events", "run1"])
     assert result.exit_code == 0
@@ -349,7 +354,7 @@ def test_json_emits_stable_lines_including_gap(runner):
         _gap_frame(after_seq=19, before_seq=21, missing_count=1),
         _event_frame(21, "run.completed", None, "completed"),
     )
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream):
         result = runner.invoke(workflow, ["events", "run1", "--json"])
     assert result.exit_code == 0
     lines = [json.loads(ln) for ln in result.stdout.splitlines() if ln.strip()]
@@ -374,7 +379,7 @@ def test_non_tty_json_no_gap_frame_still_no_synthesized_gap(runner):
         _event_frame(19, "step.completed", "s1", "completed"),
         _event_frame(23, "run.completed", None, "completed"),
     )
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream):
         result = runner.invoke(workflow, ["events", "run1", "--json"])
     assert result.exit_code == 0
     lines = [json.loads(ln) for ln in result.stdout.splitlines() if ln.strip()]
@@ -389,13 +394,13 @@ def test_unknown_run_404(runner):
     genuinely unknown — the message must stay run-scoped."""
     stream = _stream_resp(status_code=404)
     stream.json.return_value = {"detail": "unknown run 'ghost'"}
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream):
         result = runner.invoke(workflow, ["events", "ghost"])
     assert result.exit_code != 0
     assert "unknown run" in result.output
 
 
-def test_absent_events_route_reported_as_capability_not_unknown_run(runner):
+def test_absent_events_route_reported_as_capability_not_unknown_run(runner, monkeypatch):
     """CD-1: a 404 from the events route on a run that IS readable means the ROUTE is
     missing (it ships with issue #504), not the run.
 
@@ -412,17 +417,22 @@ def test_absent_events_route_reported_as_capability_not_unknown_run(runner):
     snapshot_200 = MagicMock()
     snapshot_200.status_code = 200
     snapshot_200.json.return_value = {"run_id": "live-1", "state": "running", "steps": []}
+    monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "events-probe-token")
 
     with patch(
-        "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.requests.get",
         side_effect=[events_404, snapshot_200],
-    ):
+    ) as get:
         result = runner.invoke(workflow, ["events", "live-1"])
     assert result.exit_code != 0
     # Names the CAPABILITY, not the run, and points at something that works.
     assert "no live event stream" in result.output
     assert "unknown run" not in result.output
     assert "cao workflow wait live-1" in result.output
+    assert all(
+        call.kwargs["headers"]["Authorization"] == "Bearer events-probe-token"
+        for call in get.call_args_list
+    )
 
 
 def test_absent_events_route_on_batch_read_also_degrades(runner):
@@ -436,7 +446,7 @@ def test_absent_events_route_on_batch_read_also_degrades(runner):
     snapshot_200.json.return_value = {"run_id": "live-2", "state": "running", "steps": []}
 
     with patch(
-        "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
         side_effect=[batch_404, snapshot_200],
     ):
         result = runner.invoke(workflow, ["events", "live-2", "--no-follow"])
@@ -453,7 +463,7 @@ def test_probe_transport_failure_falls_back_to_run_scoped_message(runner):
     events_404.json.return_value = {"detail": "unknown run 'maybe'"}
 
     with patch(
-        "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
         side_effect=[events_404, requests.ConnectionError("probe down")],
     ):
         result = runner.invoke(workflow, ["events", "maybe"])
@@ -486,15 +496,14 @@ def test_no_follow_batch_read(runner):
     resp.status_code = 200
     resp.json.return_value = rows
     with patch(
-        "cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=resp
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=resp
     ) as get:
         result = runner.invoke(workflow, ["events", "run1", "--no-follow"])
     assert result.exit_code == 0
     assert "seq 1" in result.output and "seq 2" in result.output
     # Batch read does NOT request the SSE variant.
-    assert "headers" not in get.call_args.kwargs or "Accept" not in get.call_args.kwargs.get(
-        "headers", {}
-    )
+    headers = get.call_args.kwargs.get("headers") or {}
+    assert "Accept" not in headers
 
 
 def test_cli_module_is_thin_http_client_no_engine_import():
@@ -555,7 +564,7 @@ def test_stream_closed_after_terminal_frame_break(runner):
         _event_frame(3, "step.completed", "s3", "completed"),
         _event_frame(4, "step.completed", "s4", "completed"),
     )
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream):
         result = runner.invoke(workflow, ["events", "run1"])
     assert result.exit_code == 0
     stream.close.assert_called()
@@ -564,7 +573,7 @@ def test_stream_closed_after_terminal_frame_break(runner):
 def test_stream_closed_on_non_200_error_arm(runner):
     """The non-200 arm closes too — an early ``raise`` must not leak the socket."""
     stream = _stream_resp(status_code=500)
-    with patch("cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream):
+    with patch("cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream):
         result = runner.invoke(workflow, ["events", "run1"])
     assert result.exit_code != 0
     stream.close.assert_called()
@@ -586,7 +595,7 @@ def test_every_reconnect_closes_its_own_stream(runner):
 
     with (
         patch(
-            "cli_agent_orchestrator.cli.commands.workflow.requests.get",
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
             side_effect=[dropped, final],
         ),
         patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep", lambda *_: None),
@@ -596,3 +605,45 @@ def test_every_reconnect_closes_its_own_stream(runner):
     # BOTH the dropped stream and the reconnected one were closed.
     dropped.close.assert_called()
     final.close.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# A missing credential is fatal, not a reconnect (review of #838).
+# ---------------------------------------------------------------------------
+def test_missing_credential_during_follow_exits_1_with_the_message(runner):
+    """``api_http`` raises AuthNotConfiguredError for a local 401 with no bearer.
+    It is a RequestException, so the reconnect handler used to retry it and the
+    final status read then swallowed it into ``stream ended`` with exit 0. It
+    must fail loudly and once."""
+    from cli_agent_orchestrator.utils import api_http
+
+    with (
+        patch(
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
+            side_effect=api_http.AuthNotConfiguredError(api_http.NO_TOKEN_MESSAGE),
+        ) as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.workflow.time.sleep"),
+    ):
+        result = runner.invoke(workflow, ["events", "run1"])
+    assert result.exit_code == 1
+    assert "CAO_AUTH_LOCAL_TOKEN" in result.output
+    assert mock_get.call_count == 1, "the auth failure must not be retried"
+
+
+def test_missing_credential_on_the_final_status_read_exits_1(runner):
+    """The stream ends without a terminal frame and the final status read is the
+    call that meets the 401: still exit 1, not ``stream ended``."""
+    from cli_agent_orchestrator.utils import api_http
+
+    stream = _stream_resp(_event_frame(1, "step.completed", "s1", "completed"))
+    with (
+        patch(
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.get",
+            side_effect=[stream, api_http.AuthNotConfiguredError(api_http.NO_TOKEN_MESSAGE)],
+        ),
+        _HUMAN,
+    ):
+        result = runner.invoke(workflow, ["events", "run1"])
+    assert result.exit_code == 1
+    assert "CAO_AUTH_LOCAL_TOKEN" in result.output
+    assert "stream ended" not in result.output

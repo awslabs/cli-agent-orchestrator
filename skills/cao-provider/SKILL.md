@@ -101,13 +101,15 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
 
 ### Step 5: Tool restriction enforcement
 
-There are three approaches depending on the CLI's capabilities. Read `docs/tool-restrictions.md` for full context.
+Two separate questions, answered in two places. Read `docs/tool-restrictions.md` for full context.
 
-**Hard enforcement via CLI flags** (e.g., Claude Code, Copilot CLI): Add the provider to `TOOL_MAPPING` in `src/cli_agent_orchestrator/utils/tool_mapping.py` to translate CAO vocabulary to native tool names.
+**How CAO delivers the policy** (one of three mechanisms):
 
-**Hard enforcement via agent JSON** (e.g., Kiro CLI): The CLI reads `allowedTools` from the agent profile. No `TOOL_MAPPING` entry needed — CAO passes vocabulary directly.
+- **CLI flags** (e.g., Claude Code `--disallowedTools`, Copilot CLI `--deny-tool`, Grok `--allow`/`--deny`): add the provider to `TOOL_MAPPING` in `src/cli_agent_orchestrator/utils/tool_mapping.py` to translate CAO vocabulary to native tool names.
+- **Agent file** (e.g., Kiro CLI, OpenCode CLI): CAO writes `allowedTools` into the agent file at install time in its own vocabulary or the CLI's permission schema. No `TOOL_MAPPING` entry needed.
+- **System prompt** (e.g., Kimi CLI, Codex): CAO prepends restriction instructions to the system prompt. No `TOOL_MAPPING` entry needed.
 
-**Soft enforcement via system prompt** (e.g., Kimi CLI, Codex): No native restriction mechanism. CAO prepends restriction instructions to the system prompt. No `TOOL_MAPPING` entry needed.
+**Whether the CLI then enforces it** is a separate fact, recorded per provider in `src/cli_agent_orchestrator/utils/enforcement.py` (`native`, `prompt`, `none`) and shown to the operator on the launch gate. The mechanism does not decide it: OpenCode enforces its agent-file permission block (`native`, at install time), while Kiro is launched `--trust-all-tools` with `tools: ["*"]` and its `allowedTools` only suppresses approval prompts (`none`). Adding a provider means adding BOTH its delivery code and its `PROVIDER_ENFORCEMENT` row; `test/test_enforcement_tables.py` fails until the docs tables agree.
 
 Only add a `TOOL_MAPPING` entry if the CLI has its own native tool names that differ from CAO's vocabulary.
 

@@ -554,3 +554,35 @@ def test_extracts_unterminated_final_block_and_cleanup_tolerates_removal_errors(
         provider.cleanup()
 
     assert provider._artifact_dir is None
+
+
+def test_the_profile_load_is_wrapped_in_plugin_delivery(tmp_path, monkeypatch):
+    """Reproduced by review 3 on #584: OMP never saw installed plugins' MCP servers.
+
+    OMP has a native ``profile.mcpServers`` serializer (``_write_extension_root``)
+    and re-reads the profile at launch, exactly like the providers the previous
+    review wired — but its ``_load_profile`` was not wrapped, so plugin delivery
+    stopped at the install path and never reached the extension root.
+
+    The provider key is asserted too, not just the call: the key selects the
+    ``PROVIDER_TRANSPORTS`` row, so a wrong one silently falls through to the
+    stdio-only default.
+    """
+    from cli_agent_orchestrator.models.provider import ProviderType
+
+    calls = []
+
+    def spy(profile, provider=None):
+        calls.append((profile, provider))
+        return profile
+
+    monkeypatch.setattr("cli_agent_orchestrator.providers.omp.CAO_HOME_DIR", tmp_path)
+    monkeypatch.setattr("cli_agent_orchestrator.providers.omp._with_plugin_mcp", spy)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.omp.load_agent_profile", lambda _name: make_profile()
+    )
+
+    _command_parts(make_provider(agent_profile="analyst"))
+
+    assert calls, "omp built its command without passing the profile through plugin delivery"
+    assert all(provider_key == ProviderType.OMP.value for _, provider_key in calls), calls

@@ -1,0 +1,50 @@
+export KIMI_CODE_HOME=<A0DIR>/kimi-home-shared
+[<USER>@<HOST> project]$ export KIMI_CODE_HOME=<A0DIR>/kimi-home-shared
+[<USER>@<HOST> project]$ TERM=xterm-256color kimi
+ [38;5;111m──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+ [1m[38;5;111m Trust this folder?[0m
+ [38;5;242m ↑↓ navigate · Enter select · Esc exit[39m
+
+  [38;5;255m<A0DIR>/project[39m
+
+  [38;5;242mProject-level MCP servers are disabled until you explicitly choose Trust. Trust starts the listed project MCP targets and remembers this folder.[39m
+  [38;5;215mProject MCP targets:[39m
+    [38;5;215ma0probe (stdio): command=<PYTHON3> args=["<A0DIR>/mcp-probe/probe_server.py","PROJECT-CONTROL"][39m
+
+ [38;5;111m  ❯ [1mTrust this folder[0m
+     [38;5;242mEnable project MCP servers. Remembered for this folder.[39m
+
+ [38;5;244m    [38;5;253mDon't trust[39m
+     [38;5;242mExit Kimi Code. Asked again next launch.[39m
+
+ [38;5;111m──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

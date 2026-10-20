@@ -7,8 +7,10 @@ server-error envelope, and a transport-error envelope.
 """
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 import requests
 
 from cli_agent_orchestrator.constants import MCP_REQUEST_TIMEOUT, WORKFLOW_RUN_REQUEST_TIMEOUT
@@ -33,6 +35,70 @@ def _resp(status_code, json_body):
 
 
 class TestWorkflowRun:
+    def test_explicit_root_is_sent_on_first_request(self):
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server.requests.post",
+            return_value=_resp(200, {"run_id": "run1", "state": "completed", "steps": []}),
+        ) as post:
+            asyncio.run(workflow_run("wf", working_directory="/project"))
+
+        assert post.call_count == 1
+        assert post.call_args.kwargs["json"]["working_directory"] == "/project"
+
+    def test_terminal_root_is_resolved_before_first_request(self):
+        events = []
+
+        def _root(path):
+            events.append(("get", path))
+            return {"working_directory": "/terminal/project"}
+
+        def _post(*args, **kwargs):
+            events.append(("post", kwargs["json"]))
+            return _resp(200, {"run_id": "run1", "state": "completed", "steps": []})
+
+        with (
+            patch.dict("os.environ", {"CAO_TERMINAL_ID": "term/one"}),
+            # Root forwarding is tested after the independently covered caller gate.
+            patch(
+                "cli_agent_orchestrator.mcp_server.server._tool_denied_reason", return_value=None
+            ),
+            patch("cli_agent_orchestrator.mcp_server.server.mcp_utils.get_json", _root),
+            patch("cli_agent_orchestrator.mcp_server.server.requests.post", _post),
+        ):
+            asyncio.run(workflow_run("wf"))
+
+        assert events == [
+            ("get", "/terminals/term%2Fone/working-directory"),
+            (
+                "post",
+                {
+                    "name_or_path": "wf",
+                    "inputs": {},
+                    "working_directory": "/terminal/project",
+                },
+            ),
+        ]
+
+    def test_failed_terminal_root_lookup_omits_field_and_posts_once(self):
+        with (
+            patch.dict("os.environ", {"CAO_TERMINAL_ID": "term-one"}),
+            patch(
+                "cli_agent_orchestrator.mcp_server.server._tool_denied_reason", return_value=None
+            ),
+            patch(
+                "cli_agent_orchestrator.mcp_server.server.mcp_utils.get_json",
+                side_effect=requests.ConnectionError("down"),
+            ),
+            patch(
+                "cli_agent_orchestrator.mcp_server.server.requests.post",
+                return_value=_resp(200, {"run_id": "run1", "state": "completed", "steps": []}),
+            ) as post,
+        ):
+            asyncio.run(workflow_run("wf"))
+
+        assert post.call_count == 1
+        assert "working_directory" not in post.call_args.kwargs["json"]
+
     def test_success_envelope(self):
         body = {
             "run_id": "run1",
@@ -682,3 +748,41 @@ class TestTimeoutSplitGuardC6:
         ) as get:
             asyncio.run(workflow_wait("run1"))
         assert get.call_args_list[0].kwargs["timeout"] == _mcp_timeout()
+
+
+@pytest.mark.parametrize("tool", [workflow_run, workflow_resume])
+def test_approval_refusal_preserves_human_remedy_for_agents(monkeypatch, tool):
+    from cli_agent_orchestrator.services import approval_gate, approval_store
+
+    plan_id = "plan-v1:agent-boundary"
+    monkeypatch.setattr(approval_gate, "is_workflow_approval_required", lambda: True)
+    monkeypatch.setattr(approval_store, "approval_state", lambda plan: approval_store.ABSENT)
+    with pytest.raises(approval_gate.PlanApprovalRequiredError) as refused:
+        approval_gate.ensure_plan_approved(
+            tier="script", manifest_json=json.dumps({"plan_id": plan_id})
+        )
+    message = str(refused.value)
+    response = _resp(
+        403, {"detail": {"kind": "approval_required", "plan_id": plan_id, "message": message}}
+    )
+    with patch("cli_agent_orchestrator.mcp_server.server.requests.post", return_value=response):
+        out = asyncio.run(tool("wf"))
+
+    assert out == {
+        "ok": False,
+        "class": "approval_required",
+        "plan_id": plan_id,
+        "error": message,
+    }
+    assert "\n" not in out["error"]
+    assert "needs human approval" in out["error"]
+    assert f"an operator approves it with `cao workflow approve {plan_id}`" in out["error"]
+
+
+def test_plan_approval_description_does_not_offer_an_agent_off_switch():
+    from cli_agent_orchestrator.mcp_server.server import workflow_plan_approval
+
+    description = workflow_plan_approval.__doc__
+    assert "workflow.require_approval" not in description
+    assert "settings.json" not in description
+    assert "operator" in description and "disabled enforcement" in description

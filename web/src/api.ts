@@ -1,4 +1,48 @@
-const BASE = ''  // Vite proxy handles routing to backend
+/**
+ * Path prefix this bundle is served under, with no trailing slash.
+ *
+ * Vite fills `import.meta.env.BASE_URL` from the `base` config (or `--base` on
+ * the CLI) and always terminates it with a slash. A default build therefore
+ * gives `/`, so BASE is `''` and every URL built below is byte-identical to the
+ * root-absolute paths it replaced. Only a build that opts in with
+ * `--base=/some/prefix/` sees a different value.
+ *
+ * `--base` on its own is not enough to serve the app under a prefix: Vite
+ * rewrites the asset references baked into index.html and the bundle, but it
+ * cannot touch a URL the app assembles at runtime, because those are ordinary
+ * strings it never sees as URLs. The three helpers here are those runtime URLs
+ * — REST, the terminal WebSocket, the workflow event stream — and they are the
+ * whole set (`DashboardHome`'s `fetch` is a local that shadows the global and
+ * calls `api.getTerminalStatus`).
+ *
+ * A relative `--base` such as `./` cannot work for runtime calls and is not
+ * supported; use an absolute prefix.
+ */
+import { tokenQuery, withAuth } from './auth'
+
+const BASE = import.meta.env.BASE_URL.replace(/\/$/, '')
+
+/**
+ * URL for the terminal's xterm WebSocket, honouring BASE. Carries the stored
+ * bearer as `?token=` when one is set: a browser cannot put a header on a
+ * WebSocket handshake, and the server accepts the token from that query
+ * parameter (and redacts it from its access log).
+ */
+export function terminalSocketUrl(terminalId: string): string {
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${protocol}//${location.host}${BASE}/terminals/${terminalId}/ws${tokenQuery('token', false)}`
+}
+
+/**
+ * URL for a workflow run's SSE event stream, honouring BASE. Carries the stored
+ * bearer as `?access_token=` when one is set, which is what the route accepts
+ * for clients that cannot send headers; the `fetch`-based follower sends the
+ * header as well.
+ */
+export function eventStreamUrl(runId: string, afterSeq?: number): string {
+  const q = afterSeq != null ? `?after_seq=${afterSeq}` : ''
+  return `${BASE}/workflows/runs/${encodeURIComponent(runId)}/events${q}${tokenQuery('access_token', q !== '')}`
+}
 
 /**
  * Error thrown by fetchJSON on a non-OK response. Carries the HTTP status and
@@ -18,7 +62,7 @@ async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: numb
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), opts?.timeoutMs ?? 10000)
   try {
-    const res = await fetch(`${BASE}${url}`, { ...opts, signal: controller.signal })
+    const res = await fetch(`${BASE}${url}`, { ...opts, headers: withAuth(opts?.headers), signal: controller.signal })
     if (!res.ok) {
       // Best-effort read of the JSON error body to expose the server's
       // `detail` without leaking a full response. A non-JSON body is fine —
@@ -65,6 +109,7 @@ export interface Session {
 }
 
 export interface Terminal {
+  description: string | null
   id: string
   name: string
   provider: string
@@ -80,7 +125,9 @@ export interface SessionDetail {
 }
 
 export interface TerminalMeta {
+  description: string | null
   id: string
+  pending_inbox_count?: number
   tmux_session: string
   tmux_window: string
   provider: string
@@ -103,6 +150,77 @@ export interface AgentProfileInfo {
   // Other enabled directories that also define this profile name (the winner
   // above is what loads). Empty/absent when the name is unique. (GH #280)
   duplicated_in?: string[]
+}
+
+/**
+ * One row from `GET /agents/profiles/search`. The backend contract
+ * (services/profile_search.py RESULT_FIELDS) is metadata-only: the profile
+ * prompt body is never returned. `score` = `coverage` + a BM25 tie-break
+ * fraction below 1, so descending score always agrees with the server's
+ * result order — the client must preserve that order, never re-sort.
+ */
+export interface ProfileSearchResult {
+  name: string
+  description: string
+  capabilities: string[]
+  tags: string[]
+  role: string
+  source: AgentProfileSource
+  coverage: number
+  score: number
+}
+
+/**
+ * Parsed profile from `GET /agents/profiles/{name}`. This response is
+ * *resolved* (env-var placeholders substituted) — fine for display, but an
+ * editor must load `GET /agents/profiles/{name}/source` instead so a save
+ * never persists resolved secrets. Only the fields the detail pane renders
+ * are declared; the endpoint returns the full model with nulls excluded.
+ */
+export interface AgentProfileDetail {
+  name: string
+  description: string
+  provider?: string
+  model?: string
+  role?: string
+  tags?: string[]
+  capabilities?: string[]
+}
+
+/** One scaffold template from `GET /agents/profiles/templates`. `name` is `category/name`. */
+export interface TemplateSummary {
+  name: string
+  description: string
+}
+
+/**
+ * One finding from the profile validator, shared by
+ * `POST /agents/profiles/validate` and the write routes' `warnings`.
+ */
+export interface ProfileValidationMessage {
+  severity: 'error' | 'warning'
+  message: string
+  path?: string | null
+}
+
+export interface ProfileValidationResponse {
+  valid: boolean
+  messages: ProfileValidationMessage[]
+}
+
+/**
+ * Outcome of a profile create or replace. `warnings` carries advisory
+ * findings that did not block the write; error findings reject with 400
+ * (detail shape `{message, errors}`) and never reach here.
+ */
+export interface ProfileWriteResponse {
+  name: string
+  warnings: ProfileValidationMessage[]
+}
+
+export interface TemplatePreview {
+  template: string
+  content: string
 }
 
 export interface AgentDirsSettings {
@@ -391,9 +509,148 @@ export interface RunSummaryRow {
   current_step_id: string | null
 }
 
+// ── Agent Plugins (Agent Plugins 1.0.0) ──────────────────────────────────────
+// Distinct from CAO's event-plugin system, which has no web surface.
+
+export interface PluginFinding {
+  severity: 'fatal' | 'skipped' | 'warning' | 'info'
+  code: string
+  /** The specification clause this finding enforces, e.g. "§5.2". */
+  spec_ref: string
+  message: string
+  path: string | null
+}
+
+export interface PluginDiscoveredSkill {
+  name: string
+  directory: string
+  description: string
+}
+
+/** A live session whose profile references a skill a removal would withdraw. */
+export interface PluginAffectedSession {
+  terminal_id: string
+  session_name: string
+  profile_name: string
+  skill_names: string[]
+}
+
+export interface InstalledPlugin {
+  name: string
+  version: string | null
+  source: { kind: string; location: string; ref: string | null; subdir: string | null }
+  resolved_ref: string | null
+  installed_at: string
+  schema_id: string
+  skill_names: string[]
+  projected_skill_names: string[]
+  findings: PluginFinding[]
+  affected_sessions: PluginAffectedSession[]
+}
+
+export interface PluginListResponse {
+  plugins: InstalledPlugin[]
+  untrusted_content_warning: string
+}
+
+export interface PluginValidationReport {
+  root: string
+  loadable: boolean
+  name: string | null
+  version: string | null
+  description: string | null
+  schema_id: string | null
+  skills: PluginDiscoveredSkill[]
+  mcp_present: boolean
+  findings: PluginFinding[]
+}
+
+export interface PluginInstallOutcome {
+  installed: boolean
+  dry_run: boolean
+  report: PluginValidationReport
+  record: InstalledPlugin | null
+  projection_findings: PluginFinding[]
+}
+
+export interface PluginUninstallOutcome {
+  name: string
+  removed: boolean
+  purged_data: boolean
+  affected_sessions: PluginAffectedSession[]
+  projection_findings: PluginFinding[]
+}
+
+export interface PluginInstallBody {
+  source: string
+  kind?: 'path' | 'git'
+  ref?: string
+  subdir?: string
+  force?: boolean
+}
+
+export let sessionDescriptionRevision = 0
+export const SESSION_DESCRIPTION_READ_ATTEMPTS = 3
+
 export const api = {
   // Agent Profiles & Providers
   listProfiles: () => fetchJSON<AgentProfileInfo[]>('/agents/profiles'),
+  // Server-ranked search. Result order is the relevance ranking — render as-is.
+  searchProfiles: (q: string, limit?: number) =>
+    fetchJSON<ProfileSearchResult[]>(`/agents/profiles/search?q=${encodeURIComponent(q)}${limit ? `&limit=${limit}` : ''}`),
+  getProfile: (name: string) => fetchJSON<AgentProfileDetail>(`/agents/profiles/${encodeURIComponent(name)}`),
+  // Profile authoring (issue #510).
+  getProfileSchema: () => fetchJSON<Record<string, any>>('/agents/profiles/schema'),
+  listProfileTemplates: () => fetchJSON<TemplateSummary[]>('/agents/profiles/templates'),
+  // The template identifier is `category/name` and travels as two path
+  // segments — the backend route is declared as
+  // `/templates/{category}/{name}/schema` — so the slash must NOT be encoded.
+  getTemplateSchema: (template: string) =>
+    fetchJSON<Record<string, any>>(`/agents/profiles/templates/${template.split('/').map(encodeURIComponent).join('/')}/schema`),
+  previewTemplate: (template: string, config: Record<string, unknown>) =>
+    fetchJSON<TemplatePreview>('/agents/profiles/templates/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ template, config }),
+      // Authoring calls run the full validator server-side; the 10s
+      // default turns a slow round-trip into a phantom 'Validation failed'.
+      timeoutMs: 30000
+    }),
+  validateProfile: (content: string) =>
+    fetchJSON<ProfileValidationResponse>('/agents/profiles/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+      // Authoring calls run the full validator server-side; the 10s
+      // default turns a slow round-trip into a phantom 'Validation failed'.
+      timeoutMs: 30000
+    }),
+  createProfile: (name: string, content: string) =>
+    fetchJSON<ProfileWriteResponse>('/agents/profiles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, content }),
+      // Authoring calls run the full validator server-side; the 10s
+      // default turns a slow round-trip into a phantom 'Validation failed'.
+      timeoutMs: 30000
+    }),
+  // The authoring read: returns the document exactly as stored, with env-var
+  // placeholders intact. An editor MUST read from here — the parsed
+  // GET /agents/profiles/{name} is resolved, and round-tripping it through a
+  // write would persist resolved secrets into a plaintext profile.
+  getProfileSource: (name: string) =>
+    fetchJSON<{ name: string; content: string }>(`/agents/profiles/${encodeURIComponent(name)}/source`),
+  replaceProfile: (name: string, content: string) =>
+    fetchJSON<ProfileWriteResponse>(`/agents/profiles/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+      // Authoring calls run the full validator server-side; the 10s
+      // default turns a slow round-trip into a phantom 'Validation failed'.
+      timeoutMs: 30000
+    }),
+  deleteProfile: (name: string) =>
+    fetchJSON<void>(`/agents/profiles/${encodeURIComponent(name)}`, { method: 'DELETE' }),
   listProviders: () => fetchJSON<ProviderInfo[]>('/agents/providers'),
 
   // Settings
@@ -407,7 +664,16 @@ export const api = {
 
   // Sessions
   listSessions: () => fetchJSON<Session[]>('/sessions'),
-  getSession: (name: string) => fetchJSON<SessionDetail>(`/sessions/${name}`),
+  getSession: async (name: string): Promise<SessionDetail> => {
+    // Never return a pre-edit response, but let a future poll recover if edits
+    // keep invalidating every read instead of keeping this request alive forever.
+    for (let attempt = 0; attempt < SESSION_DESCRIPTION_READ_ATTEMPTS; attempt++) {
+      const revision = sessionDescriptionRevision
+      const detail = await fetchJSON<SessionDetail>(`/sessions/${name}`)
+      if (revision === sessionDescriptionRevision) return detail
+    }
+    throw new Error('Session descriptions kept changing; retry on the next poll')
+  },
   createSession: (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string) =>
     fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: 90000 }),
   deleteSession: async (name: string) => {
@@ -422,6 +688,15 @@ export const api = {
   },
 
   // Terminals
+  updateTerminalDescription: async (id: string, description: string | null) => {
+    const terminal = await fetchJSON<Terminal>(`/terminals/${encodeURIComponent(id)}/description`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ description }),
+    })
+    sessionDescriptionRevision++
+    return terminal
+  },
   getTerminalStatus: (id: string) =>
     fetchJSON<Terminal>(`/terminals/${id}`).then(t => t.status),
   getTerminalOutput: (id: string, mode: 'full' | 'last' = 'full') =>
@@ -560,5 +835,39 @@ export const api = {
   getTerminalOutputRange: (terminalId: string, offset: number, length: number) =>
     fetchJSON<TerminalOutputRange>(
       `/terminals/${encodeURIComponent(terminalId)}/output/range?offset=${offset}&length=${length}`,
+    ),
+  // Agent Plugins. Install clones or copies a whole package tree and rebuilds
+  // the skill projection, so it gets a wider timeout than the 10s default —
+  // a git source has a network fetch in the middle of it.
+  //
+  // 330_000 is derived, not chosen: the server's clone budget is
+  // `GIT_TIMEOUT_S = 300` in `agent_plugins/resolver.py`, plus 30s of margin for
+  // validation and the projection rebuild that follow the clone. The client MUST
+  // outlast the server, because the route awaits `asyncio.to_thread(...)`, which
+  // cannot be cancelled and sees no client disconnect: aborting first showed the
+  // operator a failure for an install the backend went on to commit. `validatePlugin`
+  // carries the same budget because validation resolves — and therefore clones — the
+  // source first. If `GIT_TIMEOUT_S` moves, these move with it;
+  // `test/agent_plugins/test_web_timeout_drift.py` fails if they ever cross.
+  listPlugins: () => fetchJSON<PluginListResponse>('/plugins'),
+  installPlugin: (body: PluginInstallBody) =>
+    fetchJSON<PluginInstallOutcome>('/plugins', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      timeoutMs: 330000,
+    }),
+  validatePlugin: (body: PluginInstallBody) =>
+    fetchJSON<PluginValidationReport>('/plugins/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      timeoutMs: 330000,
+    }),
+  // No git involved in a removal, so it keeps the narrower budget.
+  uninstallPlugin: (name: string, purgeData = false) =>
+    fetchJSON<PluginUninstallOutcome>(
+      `/plugins/${encodeURIComponent(name)}${purgeData ? '?purge_data=true' : ''}`,
+      { method: 'DELETE', timeoutMs: 60000 },
     ),
 }

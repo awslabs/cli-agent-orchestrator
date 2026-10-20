@@ -13,7 +13,11 @@ from cli_agent_orchestrator.security.auth import get_local_bearer
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
     elastic_worker_gateway_headers,
 )
-from cli_agent_orchestrator.services.memory_service import MemoryPartialWriteError, MemoryService
+from cli_agent_orchestrator.services.memory_service import (
+    ForgetResult,
+    MemoryPartialWriteError,
+    MemoryService,
+)
 
 
 def remote_memory_url() -> Optional[str]:
@@ -149,7 +153,7 @@ async def forget_memory(
     key: str,
     scope: str,
     terminal_context: Optional[dict[str, Any]],
-) -> bool:
+) -> ForgetResult:
     if not remote_memory_url():
         return await MemoryService().forget(
             key=key,
@@ -161,7 +165,7 @@ async def forget_memory(
         "/internal/memory/forget",
         {"key": key, "scope": scope, "terminal_context": terminal_context},
     )
-    return bool(payload["deleted"])
+    return ForgetResult(**payload["deleted"])
 
 
 def memory_context_for_terminal(terminal_id: str, task_description: str = "") -> str:

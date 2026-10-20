@@ -61,7 +61,13 @@ class TestAssign:
         assert result.exit_code == 0
         assert "a1b2c3d4" in result.output
         mock_impl.assert_called_once_with(
-            "developer", "do the thing", None, engine=None, model=None, use_worktree=False
+            "developer",
+            "do the thing",
+            None,
+            engine=None,
+            model=None,
+            use_worktree=False,
+            description=None,
         )
 
     @patch("cli_agent_orchestrator.cli.commands.agent._assign_impl")
@@ -99,7 +105,13 @@ class TestAssign:
 
         assert result.exit_code == 0
         mock_impl.assert_called_once_with(
-            "developer", "do it", "/repo", engine="v2", model="fable-5", use_worktree=True
+            "developer",
+            "do it",
+            "/repo",
+            engine="v2",
+            model="fable-5",
+            use_worktree=True,
+            description=None,
         )
 
     @patch("cli_agent_orchestrator.cli.commands.agent._assign_impl")
@@ -190,6 +202,7 @@ class TestHandoff:
             "engine": "kas",
             "model": "fable-5",
             "use_worktree": True,
+            "description": None,
             "wait": True,
         }
 
@@ -260,11 +273,18 @@ class TestHandoff:
         result = runner.invoke(agent, ["handoff", "developer", "do it", "--json"])
 
         assert result.exit_code == 0
+        # The full dump, which is the point of this test: every HandoffResult
+        # field appears, including the ones this success path leaves unset.
+        # ``pending``/``job_id`` (issue #447) are None here because they are
+        # only populated when a transport timeout leaves the step in flight.
         assert json.loads(result.output) == {
             "success": True,
             "message": "ok",
             "output": "done",
             "terminal_id": "w1",
+            "pending": None,
+            "job_id": None,
+            "rule": None,
         }
 
 
@@ -436,3 +456,26 @@ class TestHandoffMachineModeGating:
 
         assert result.exit_code == 0
         assert "Waiting for" not in result.output
+
+
+@pytest.mark.parametrize("command", ["assign", "handoff"])
+@pytest.mark.parametrize("description", [None, "Review code"])
+def test_description_flag(runner, command, description):
+    target = f"cli_agent_orchestrator.cli.commands.agent._{command}_impl"
+    captured = {}
+
+    def assign(*args, **kwargs):
+        captured.update(kwargs)
+        return {"success": True, "terminal_id": "feed1234", "message": "ok"}
+
+    async def handoff(*args, **kwargs):
+        captured.update(kwargs)
+        return HandoffResult(success=True, terminal_id="feed1234", message="ok", output="Done")
+
+    args = [command, "developer", "Task", "--json"]
+    if description is not None:
+        args.extend(["--description", description])
+    with patch(target, side_effect=assign if command == "assign" else handoff):
+        result = runner.invoke(agent, args)
+    assert result.exit_code == 0, result.output
+    assert captured["description"] == description

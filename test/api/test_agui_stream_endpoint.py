@@ -159,7 +159,7 @@ def test_stream_fleet_snapshot_with_terminals_emits_delta(monkeypatch):
 
     calls = {"n": 0}
 
-    def _terms(session_id):
+    def _terms(session_id, **_kwargs):
         # Return an extra terminal on the second snapshot so the fleet state
         # moves and a STATE_DELTA is emitted after the live event.
         calls["n"] += 1
@@ -184,7 +184,10 @@ def test_stream_fleet_snapshot_with_terminals_emits_delta(monkeypatch):
             )
         return terms
 
-    monkeypatch.setattr("cli_agent_orchestrator.clients.database.list_terminals_by_session", _terms)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.session_service.list_current_session_terminals",
+        _terms,
+    )
 
     live_event = {
         "id": "ev-1",

@@ -150,3 +150,43 @@ class TestLogWriterBatching:
         # No cross-contamination
         assert "D" not in c_content
         assert "C" not in d_content
+
+
+class TestLogWriterPrivateFiles:
+    """Terminal logs hold raw PTY bytes: created 0600, never appended through a symlink."""
+
+    def test_write_creates_log_private(self, tmp_path):
+        from cli_agent_orchestrator.services.log_writer import LogWriter
+
+        path = tmp_path / "abcd1234.log"
+        LogWriter._write(path, "hello\n")
+        LogWriter._write(path, "again\n")
+        assert path.read_text() == "hello\nagain\n"
+        assert oct(path.stat().st_mode & 0o777) == oct(0o600)
+
+    def test_write_tightens_an_existing_world_readable_log(self, tmp_path):
+        """O_CREAT's mode only applies on create: a 0644 log left by a terminal
+        that was running across the upgrade must be tightened by the next write,
+        and the write must still append rather than truncate."""
+        from cli_agent_orchestrator.services.log_writer import LogWriter
+
+        path = tmp_path / "abcd1234.log"
+        path.write_text("old\n")
+        path.chmod(0o644)
+        assert oct(path.stat().st_mode & 0o777) == oct(0o644)
+        LogWriter._write(path, "new\n")
+        assert oct(path.stat().st_mode & 0o777) == oct(0o600)
+        assert path.read_text() == "old\nnew\n"
+
+    def test_write_refuses_a_symlinked_log_path(self, tmp_path):
+        import pytest
+
+        from cli_agent_orchestrator.services.log_writer import LogWriter
+
+        victim = tmp_path / "victim.txt"
+        victim.write_text("do not touch")
+        link = tmp_path / "abcd1234.log"
+        link.symlink_to(victim)
+        with pytest.raises(OSError):
+            LogWriter._write(link, "leak\n")
+        assert victim.read_text() == "do not touch"

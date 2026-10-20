@@ -134,7 +134,7 @@ Then check the backend for:
 - the `cao.orchestration.dispatches` counter (tagged with
   `cao.orchestration.type`) incrementing per dispatch.
 
-The active trace context is also injected into the outgoing plugin event as a
+The active trace context is also injected into the event dispatched to event plugins as a
 W3C `traceparent`, so a downstream consumer can continue the same trace.
 
 The `invoke_agent` and `chat` span helpers (with `cao.tier` / `gen_ai.request.model`

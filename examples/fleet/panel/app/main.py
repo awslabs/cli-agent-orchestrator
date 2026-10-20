@@ -99,11 +99,16 @@ async def launch(name: str, body: dict = Body(default_factory=dict)):
     provider = body.get("provider") or "claude_code"
     wd = body.get("working_directory")
     task = body.get("task")
-    session_name = body.get("session_name") or ("fleet-panel-" + os.urandom(3).hex())
+    session_name = body.get("session_name")
+    generated_name = not session_name
+    if generated_name:
+        session_name = "fleet-panel-" + os.urandom(3).hex()
     _safe_segment(session_name, "session_name")
     async with httpx.AsyncClient(timeout=client.LAUNCH_TIMEOUT) as c:
         try:
-            term = await client.launch(c, base, agent, provider, session_name, wd)
+            term = await client.launch(
+                c, base, agent, provider, session_name, wd, generated_name=generated_name
+            )
         except httpx.HTTPStatusError as exc:
             detail = (exc.response.text or "").strip() or str(exc)
             raise HTTPException(status_code=502, detail=f"{name} launch failed: {detail}")

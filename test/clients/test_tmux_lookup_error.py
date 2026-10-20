@@ -321,19 +321,19 @@ class TestKillParseFailure:
     def test_kill_session_falls_back_to_the_cli(self, tmux):
         tmux.server.sessions.get.side_effect = parse_failure(times=2)
         # The CLI kill exiting 0 is not on its own a True: the verification poll
-        # still has to see the session gone. Exit 0 with "ses" absent from the
+        # still has to see the session gone. Exit 0 with "cao-ses" absent from the
         # name list is that authoritative "gone" (#498).
         tmux.server.cmd.return_value = list_sessions_result()
 
         with patch("cli_agent_orchestrator.clients.tmux.subprocess") as mock_subprocess:
             mock_subprocess.run.return_value = MagicMock(returncode=0, stderr="")
-            assert tmux.kill_session("ses") is True
+            assert tmux.kill_session("cao-ses") is True
 
         assert mock_subprocess.run.call_args[0][0] == [
             "tmux",
             "kill-session",
             "-t",
-            "=ses",
+            "=cao-ses",
         ]
 
     def test_cli_fallback_still_has_to_confirm_the_session_is_gone(self, tmux, monkeypatch):
@@ -345,12 +345,12 @@ class TestKillParseFailure:
         intact instead of dropping rows for a live session (#498).
         """
         tmux.server.sessions.get.side_effect = parse_failure(times=2)
-        tmux.server.cmd.return_value = list_sessions_result("ses")
+        tmux.server.cmd.return_value = list_sessions_result("cao-ses")
         monkeypatch.setattr(tmux, "_KILL_SESSION_VERIFY_TIMEOUT_SECONDS", 0)
 
         with patch("cli_agent_orchestrator.clients.tmux.subprocess") as mock_subprocess:
             mock_subprocess.run.return_value = MagicMock(returncode=0, stderr="")
-            assert tmux.kill_session("ses") is False
+            assert tmux.kill_session("cao-ses") is False
 
         mock_subprocess.run.assert_called_once()
 
@@ -358,7 +358,7 @@ class TestKillParseFailure:
         tmux.server.sessions.get.return_value = None
 
         with patch("cli_agent_orchestrator.clients.tmux.subprocess") as mock_subprocess:
-            assert tmux.kill_session("ses") is False
+            assert tmux.kill_session("cao-ses") is False
         mock_subprocess.run.assert_not_called()
 
     def test_kill_window_falls_back_to_the_cli(self, tmux):
@@ -368,13 +368,13 @@ class TestKillParseFailure:
 
         with patch("cli_agent_orchestrator.clients.tmux.subprocess") as mock_subprocess:
             mock_subprocess.run.return_value = MagicMock(returncode=0, stderr="")
-            assert tmux.kill_window("ses", "win") is True
+            assert tmux.kill_window("cao-ses", "win") is True
 
         assert mock_subprocess.run.call_args[0][0] == [
             "tmux",
             "kill-window",
             "-t",
-            "=ses:win",
+            "=cao-ses:win",
         ]
 
     def test_cli_fallback_reports_failure_rather_than_success(self, tmux):
@@ -382,13 +382,13 @@ class TestKillParseFailure:
 
         with patch("cli_agent_orchestrator.clients.tmux.subprocess") as mock_subprocess:
             mock_subprocess.run.return_value = MagicMock(returncode=1, stderr="server not found")
-            assert tmux.kill_session("ses") is False
+            assert tmux.kill_session("cao-ses") is False
 
     def test_cli_fallback_rejects_an_invalid_name(self, tmux):
         tmux.server.sessions.get.side_effect = parse_failure(times=2)
 
         with patch("cli_agent_orchestrator.clients.tmux.subprocess") as mock_subprocess:
-            assert tmux.kill_session("bad:name") is False
+            assert tmux.kill_session("cao-bad:name") is False
         mock_subprocess.run.assert_not_called()
 
 

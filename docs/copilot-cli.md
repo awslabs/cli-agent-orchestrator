@@ -59,6 +59,21 @@ The provider detects:
 
 Trust handling is done in `initialize()`. `get_status()` is read-only.
 
+After trust is dismissed, cursor-addressed FIFO redraws can leave the monitor's
+cached status at `WAITING_USER_ANSWER` even though the rendered pane is idle.
+Copilot opts into fresh-pane recovery for that stale waiting state. Recovery
+requires a quiet output buffer, two consecutive matching pane classifications,
+and current-generation evidence; a live approval dialog remains waiting.
+
+Copilot v1.0.95 has been observed with both a `❯` composer between separator
+rules and an empty heavy-box composer (`╻▄▄…`, `┃`, `╹▀▀…`). The detector accepts
+both captured layouts, independent of the mode displayed in the footer. For the
+heavy box, matching borders, an empty interior, and the following Copilot hint
+bar are required; active execution and trust/approval indicators still block
+readiness. A plain `capture-pane` snapshot preserves visible box characters but
+omits color and terminal negotiation sequences, so it does not establish why
+Copilot selected a particular layout.
+
 ### Message Extraction
 
 `GET /terminals/{terminal_id}/output?mode=last` extracts the final assistant message by:
@@ -87,6 +102,12 @@ Implementation:
 
 - Add `cao-mcp-server` with `CAO_TERMINAL_ID`
 - Pass the merged MCP payload inline as JSON
+
+
+### Agent-plugin MCP working directory
+
+Its MCP config format has no working-directory key (checked against the vendor's own MCP documentation, 2026-09-16), so CAO carries an agent plugin's declared `cwd` by launching the server through `/bin/sh -c 'cd -- "$1" && shift && exec "$@"'`. `exec` replaces the shell, the environment passes through, and argument boundaries survive because each argument stays a separate argv element. On a host with no `/bin/sh` such a server is skipped with `mcp.cwd_unsupported` rather than started in the wrong directory.
+See [Agent Plugins](agent-plugins.md) for the full per-provider table.
 
 ## Configuration
 

@@ -6,19 +6,19 @@ import logging
 import re
 import time
 import uuid
-from typing import Optional, Union
-
-import requests
+from typing import Callable, Optional, Union
 
 from cli_agent_orchestrator.constants import API_BASE_URL, SESSION_PREFIX
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.utils import api_http
 
 logger = logging.getLogger(__name__)
 
 # Allowlist for tmux session/window names. tmux uses ':' and '.' as target
 # delimiters and treats leading '-' as an option, so we constrain names to
-# safe characters only. The 64-char cap matches typical tmux name lengths.
-_VALID_TMUX_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_\-]{0,63}$")
+# safe characters only. The cap matches typical tmux name lengths.
+SESSION_NAME_MAX_LENGTH = 64
+_VALID_TMUX_NAME = re.compile(rf"^[A-Za-z0-9_][A-Za-z0-9_\-]{{0,{SESSION_NAME_MAX_LENGTH - 1}}}$")
 
 
 def validate_tmux_name(name: str, kind: str = "name") -> str:
@@ -229,7 +229,7 @@ def sync_backend_from_server() -> None:
     from cli_agent_orchestrator.backends.registry import set_backend
 
     try:
-        resp = requests.get(f"{API_BASE_URL}/health", timeout=2.0)
+        resp = api_http.get(f"{API_BASE_URL}/health", timeout=2.0)
         resp.raise_for_status()
         data = resp.json()
         backend_name = data.get("terminal_backend")
@@ -244,6 +244,7 @@ def poll_until_done(
     timeout: float,
     polling_interval: float = 1.0,
     idle_stable_polls: int = 3,
+    read_status: Optional[Callable[[str], Optional[str]]] = None,
 ) -> None:
     """Poll terminal status until the agent is done, errored, or timeout.
 
@@ -265,6 +266,13 @@ def poll_until_done(
       against a momentary idle flap mid-turn. The COMPLETED path is byte-for-byte
       unchanged.
 
+    ``read_status`` overrides only WHERE the status is read from, returning the
+    same string ``GET /terminals/{id}`` puts in its ``status`` field. It exists so
+    a terminal on a remote node - a `cao worker` reached through a cluster broker -
+    is judged done by exactly this logic rather than by a second copy of it. The
+    IDLE-versus-COMPLETED reasoning above is provider behaviour, not transport
+    behaviour, so it must not be duplicated per transport.
+
     Raises click.ClickException on error, timeout, or request failure.
     """
     import click
@@ -282,11 +290,14 @@ def poll_until_done(
                 f"Timed out after {int(elapsed)}s waiting for terminal {terminal_id}"
             )
         try:
-            # Per-request timeout so a stalled server/network can't block past
-            # the outer timeout budget (matches wait_until_terminal_status).
-            resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
-            resp.raise_for_status()
-            status = resp.json().get("status")
+            if read_status is not None:
+                status = read_status(terminal_id)
+            else:
+                # Per-request timeout so a stalled server/network can't block past
+                # the outer timeout budget (matches wait_until_terminal_status).
+                resp = api_http.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
+                resp.raise_for_status()
+                status = resp.json().get("status")
             if status == TerminalStatus.COMPLETED.value:
                 return
             if status == TerminalStatus.ERROR.value:
@@ -317,8 +328,94 @@ def poll_until_done(
                 # UNKNOWN or any other non-ready status: not evidence of work.
                 # Reset the idle streak but do not flip observed_working.
                 consecutive_idle = 0
-        except requests.exceptions.RequestException as e:
+        except api_http.exceptions.RequestException as e:
             raise click.ClickException(f"Failed to poll terminal status: {e}")
+        time.sleep(polling_interval)
+
+
+def wait_for_initial_delivery(
+    terminal_id: str,
+    timeout: float,
+    polling_interval: float = 1.0,
+) -> dict:
+    """Block until the server has settled the initial message this terminal was created with.
+
+    ``POST /sessions`` with ``initial_message`` returns as soon as the terminal
+    row exists; provider init, the send and its confirmation then run server-side
+    (``terminal_service._schedule_deferred_init``). The outcome is persisted on
+    the terminal row as ``initial_delivery`` -- ``pending`` until the worker has
+    been observed working on the message, then ``delivered``, or ``failed`` with
+    a ``kind`` and ``message`` -- so a client can wait for a durable verdict
+    rather than inferring one from status samples, and so a cao-server restart
+    (which sweeps a stranded ``pending`` to ``failed``/``interrupted``) cannot
+    leave it waiting on a task that no longer exists. ``cao launch`` uses this
+    for both ``--async`` (exit only once delivery is confirmed, or non-zero with
+    the reason) and the synchronous headless run (start the task budget here).
+
+    Returns the terminal payload once ``initial_delivery.state == "delivered"``.
+    Raises ``click.ClickException`` when the delivery failed, when the terminal
+    reached ERROR first (``deferred_init_failure`` carries the detail), on
+    timeout, or on a 4xx from the poll. Any other request error (a connection
+    error, a read timeout, a 5xx, or a reply that is not JSON) is retried until
+    ``timeout``: the server is busy initializing and delivering while this runs,
+    and giving up on one failed poll made ``cao launch --async`` exit non-zero
+    for a task that was still going to be delivered (#882).
+    """
+    import click
+
+    start = time.time()
+    last_error: Optional[str] = None
+    while True:
+        elapsed = time.time() - start
+        if elapsed > timeout:
+            message = (
+                f"Timed out after {int(elapsed)}s waiting for the initial message to be "
+                f"delivered to terminal {terminal_id}; the server may still be initializing "
+                "the provider. Inspect it with `cao terminal`."
+            )
+            if last_error is not None:
+                message += (
+                    f" The last poll failed ({last_error}), so the message may already "
+                    "have been delivered."
+                )
+            raise click.ClickException(message)
+        try:
+            resp = api_http.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
+            resp.raise_for_status()
+            payload = resp.json()
+        except api_http.exceptions.RequestException as e:
+            response = getattr(e, "response", None)
+            if response is not None and 400 <= response.status_code < 500:
+                raise click.ClickException(f"Failed to poll terminal delivery state: {e}")
+            last_error = str(e)
+            logger.debug(f"wait_for_initial_delivery [{terminal_id}]: poll failed, retrying: {e}")
+            time.sleep(polling_interval)
+            continue
+        last_error = None
+        if not isinstance(payload, dict):
+            payload = {}
+        delivery = payload.get("initial_delivery")
+        delivery = delivery if isinstance(delivery, dict) else {}
+        state = delivery.get("state")
+        if state == "delivered":
+            return payload
+        if state == "failed":
+            kind = delivery.get("kind") or "failed"
+            detail = delivery.get("message") or "no detail recorded"
+            raise click.ClickException(
+                f"Initial message was not delivered to terminal {terminal_id} ({kind}): {detail}"
+            )
+        if payload.get("status") == TerminalStatus.ERROR.value:
+            failure = payload.get("deferred_init_failure")
+            detail = (
+                failure.get("message")
+                if isinstance(failure, dict) and failure.get("message")
+                else None
+            )
+            raise click.ClickException(
+                f"Terminal {terminal_id} reached ERROR before the initial message was delivered"
+                + (f": {detail}" if detail else "")
+            )
         time.sleep(polling_interval)
 
 
@@ -354,7 +451,7 @@ def wait_until_terminal_status(
     while time.time() - start_time < timeout:
         poll_count += 1
         try:
-            response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
+            response = api_http.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
             if response.status_code == 200:
                 current_status = response.json().get("status")
                 last_seen = current_status

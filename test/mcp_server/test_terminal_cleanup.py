@@ -97,6 +97,52 @@ class TestMemoryTerminalContext:
                 assert _get_terminal_context_from_env() is None
         mock_get.assert_not_called()
 
+    def test_unknown_terminal_404_is_no_context(self):
+        """A 404 genuinely means "no such terminal" -> None, degrade to global."""
+        response = MagicMock()
+        response.status_code = 404
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "abc12345"}):
+            with patch(
+                "cli_agent_orchestrator.mcp_server.utils.get_json",
+                side_effect=requests.HTTPError("404", response=response),
+            ):
+                assert _get_terminal_context_from_env() is None
+
+    def test_auth_failure_propagates_instead_of_reading_as_no_context(self):
+        """A 401/500 must NOT degrade to None.
+
+        Returning None here is the original bug: with auth enabled the scope-gated
+        terminal lookup 401'd, the context resolved to None, and the memory scope
+        silently collapsed to global — a wrong-but-plausible scope rather than an
+        error. Only a 404 may mean "no context".
+        """
+        for code in (401, 403, 500, 503):
+            response = MagicMock()
+            response.status_code = code
+            with patch.dict(os.environ, {"CAO_TERMINAL_ID": "abc12345"}):
+                with patch(
+                    "cli_agent_orchestrator.mcp_server.utils.get_json",
+                    side_effect=requests.HTTPError(str(code), response=response),
+                ):
+                    try:
+                        _get_terminal_context_from_env()
+                    except requests.HTTPError:
+                        continue
+                    raise AssertionError(f"HTTP {code} silently degraded to no-context")
+
+    def test_transport_failure_propagates(self):
+        """An unreachable server is not "no terminal identity" either."""
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "abc12345"}):
+            with patch(
+                "cli_agent_orchestrator.mcp_server.utils.get_json",
+                side_effect=requests.ConnectionError("refused"),
+            ):
+                try:
+                    _get_terminal_context_from_env()
+                except requests.RequestException:
+                    return
+                raise AssertionError("a down server silently degraded to no-context")
+
 
 class TestDeleteTerminal:
     def test_success(self):
@@ -160,3 +206,61 @@ class TestDeleteTerminal:
 
         _, kwargs = mock_delete.call_args
         assert kwargs["headers"] == {"Authorization": "Bearer tok"}
+
+
+class TestMemoryToolsSurfaceContextFailures:
+    """The behaviour change the PR body advertises, pinned.
+
+    The memory tools previously fell back to a GLOBAL-scope write when the
+    terminal lookup failed — a silent scope downgrade. Now the failure propagates
+    out of ``_get_terminal_context_from_env`` and each tool reports it, so an
+    operator sees "cannot reach cao-server" instead of a memory quietly filed in
+    the wrong scope. Only the outcome tools had coverage for this shape.
+    """
+
+    @staticmethod
+    def _run(coro):
+        import asyncio
+
+        return asyncio.run(coro)
+
+    def test_memory_store_reports_a_transport_failure(self):
+        from cli_agent_orchestrator.mcp_server import server as srv
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "abc12345"}):
+            with patch.object(
+                srv,
+                "_get_terminal_context_from_env",
+                side_effect=requests.ConnectionError("refused"),
+            ):
+                result = self._run(
+                    srv.memory_store(
+                        content="c",
+                        memory_type="user",
+                        scope="session",
+                        key=None,
+                        tags=None,
+                    )
+                )
+
+        assert result["success"] is False
+        # Not a silent global-scope write, and not "disabled".
+        assert "disabled" not in result, result
+        assert result["error"]
+
+    def test_memory_recall_reports_a_transport_failure(self):
+        from cli_agent_orchestrator.mcp_server import server as srv
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "abc12345"}):
+            with patch.object(
+                srv,
+                "_get_terminal_context_from_env",
+                side_effect=requests.ConnectionError("refused"),
+            ):
+                result = self._run(
+                    srv.memory_recall(query=None, scope=None, memory_type=None, limit=10)
+                )
+
+        assert result["success"] is False
+        assert "disabled" not in result, result
+        assert result["error"]

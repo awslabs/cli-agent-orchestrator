@@ -55,6 +55,8 @@ def set_cmd(key, value):
         # or out-of-range values (e.g. memory.flush_threshold). Surface a clean
         # CLI error instead of an unhandled Python traceback.
         raise click.ClickException(str(exc))
+    except OSError as exc:
+        raise click.ClickException(f"could not save configuration: {exc}")
     click.echo(json.dumps(result))
     if key.startswith(_ENV_ONLY_SECTIONS):
         click.echo(

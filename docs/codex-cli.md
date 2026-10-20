@@ -22,6 +22,13 @@ export OPENAI_API_KEY=your-key-here
 codex login
 ```
 
+> **Security note.** If Codex is launched under CAO without credentials, the
+> startup handler leaves the first-run sign-in menu on screen for an operator to
+> complete (it cannot be answered automatically). That live sign-in pane — OAuth
+> device code or API-key paste — is attachable through the Web UI and the PTY
+> WebSocket like any other CAO terminal, so enable control-plane authentication
+> before launching Codex workers that will need to sign in interactively.
+
 ### Using Codex Provider with CAO
 
 Create a terminal using the Codex provider:
@@ -59,6 +66,16 @@ The provider supports two output formats for status detection:
 
 The `USER_PREFIX_PATTERN` uses `[^\S\n]` (horizontal whitespace only) to prevent matching across newline boundaries, correctly distinguishing `› ` (idle prompt) from `› text` (user input).
 
+**Completion footer (Codex 0.155 and later).** Codex streams the final answer with no spinner, so a frame of a streaming answer looks like a finished turn. From 0.155, Codex ends each successful turn with a dim footer under the final message: `Worked for 32s • 4:19 PM` (0.159 and later), `Worked for 1m 5s · done 4:19 PM` or `done 4:19 PM` (0.155), and a bare `4:19 PM` for short turns on 0.156 to 0.158. The footer always has the time. When `initialize()` reads such a release in the startup banner, and the status bar is one that `TUI_FOOTER_PATTERN` knows, the rendered screen follows these rules:
+
+- A turn is COMPLETED when the last row above the composer is the footer, under a reply or tool row. An empty turn is also COMPLETED when CAO recorded the exact dispatched message, its full rendered echo is visible after a pre-dispatch screen capture, and a valid footer follows it with no response rows in between. Without that attribution, an empty-looking frame remains UNKNOWN. An error cell (`■ ...`) also ends a turn.
+- A user message with rows under it and no footer is PROCESSING. A user message with nothing under it is UNKNOWN, which keeps the last status.
+- A frame without the status bar is a redraw in progress: UNKNOWN, unless a spinner or the footer decides.
+- A spinner above the footer of a finished turn is history (for example, a spinner line that a tool result quotes).
+- Extraction removes the footer row from the reply. For an attributed empty turn it returns `""`; manual input, incomplete echoes, stale screens, and ambiguous captures do not imply an empty answer.
+
+The raw stream (`CAO_PYTE_STATUS=false`) keeps the older rules, because it keeps every redraw. A provider rebuilt after a cao-server restart does not run `initialize()` and also keeps the older rules.
+
 ### Message Extraction
 
 The provider automatically extracts the last assistant response from terminal output using a two-phase approach:
@@ -92,11 +109,22 @@ If the agent profile includes `mcpServers`, CAO injects each MCP server into Cod
 
 For example, the `code_supervisor` profile includes the `cao-mcp-server` which provides `handoff` and `send_message` tools. This allows the supervisor agent to delegate work to Developer and Reviewer agents through CAO's multi-agent orchestration.
 
+CAO passes each server's environment as **one TOML inline table with quoted keys**
+(`-c mcp_servers.<name>.env={ "LOG.LEVEL" = "info" }`) rather than one override per key.
+Codex parses the value side of `-c key=value` as TOML, so any environment key an
+[agent plugin](agent-plugins.md) may legally declare is expressible there. The server
+*name* is different: it becomes a segment of the override's dotted **path**, so a name
+that is not a bare TOML key (`^[A-Za-z0-9_-]+$`) would nest the entry under the wrong
+table. An agent-plugin server with such a name is not delivered to Codex and is
+reported as `mcp.server_name_unsupported`; that agent plugin's other servers are unaffected.
+
+For the CAO server, CAO also sets `omit_tools_from=["deferred"]`. Codex defers MCP tools behind its `tool_search` tool, and a search for `assign handoff` can rank other CAO tools first; a supervisor then reports that `cao-mcp-server` failed to start. With the setting, the CAO tools are in the initial tool list. The key exists from Codex 0.150.
+
 CAO also sets `tool_timeout_sec=600.0` (10 minutes) for each MCP server to allow long-running operations like handoff. **Important**: The value must be a TOML float (`600.0`, not `600`) because Codex deserializes this field via `Option<f64>`. A TOML integer is silently rejected, falling back to the 60-second default.
 
 ### Memory Injection
 
-When CAO's memory system is enabled, the built-in `codex_memory` plugin auto-injects
+When CAO's memory system is enabled, the built-in `codex_memory` event plugin auto-injects
 relevant memories into the project on terminal creation. On `post_create_terminal` for a
 `codex` terminal, it writes a delimited block into `<cwd>/AGENTS.md` — the file Codex CLI
 reads from the working directory as project instructions:
@@ -111,10 +139,10 @@ reads from the working directory as project instructions:
 <!-- cao-memory:end -->
 ```
 
-Because `AGENTS.md` is a user-authored, repo-root file, the plugin owns **only** the
+Because `AGENTS.md` is a user-authored, repo-root file, the event plugin owns **only** the
 delimited block and replaces it in place on each run — any hand-written content around it
-is preserved (the same approach as the Claude Code `CLAUDE.md` plugin, not Kiro's
-whole-file ownership). The plugin is observer-only: it runs after the terminal is created,
+is preserved (the same approach as the Claude Code `CLAUDE.md` event plugin, not Kiro's
+whole-file ownership). The event plugin is observer-only: it runs after the terminal is created,
 logs-and-skips on any error, and never crashes `cao-server`. It writes nothing when memory
 is disabled or there are no relevant memories. See [memory.md](memory.md) for the full
 memory system.
@@ -127,6 +155,24 @@ The Codex provider automatically adds these flags for tmux compatibility:
 - `--disable shell_snapshot`: Prevents TTY input conflicts (SIGTTIN) caused by the shell_snapshot subprocess inheriting stdin in tmux
 
 By default, CAO also passes `--yolo` (alias for `--dangerously-bypass-approvals-and-sandbox`) because CAO agents run in non-interactive tmux sessions where approval prompts block handoff/assign flows. Profiles can opt out via `codexProfile`; see [Custom Codex Profile](#custom-codex-profile). Any unrestricted allowed-tools configuration (`allowedTools: ["*"]`, `--allowed-tools '*'`, or `cao launch --yolo`) forces `--yolo` regardless of the profile setting.
+
+> **`--yolo` makes your Codex sandbox settings inert — do not rely on them as containment.**
+> Because `--yolo` bypasses the sandbox entirely, nothing in your `~/.codex/config.toml`
+> `[sandbox_*]` tables applies to a default CAO worker. That includes
+> `[sandbox_workspace_write].network_access = false`: setting it does not stop a worker reaching
+> the network, and it does not restrict Codex's built-in backend web tool, which runs server-side
+> rather than as a sandboxed shell command (reported in
+> [#707](https://github.com/awslabs/cli-agent-orchestrator/issues/707)). A worker that reads
+> untrusted web content can carry prompt-injected instructions into the working tree with no
+> human in the loop.
+>
+> To actually contain a Codex worker:
+>
+> - **`codexProfile`** drops `--yolo`, so your named `[profiles.<name>]` block governs sandbox and
+>   approvals. Note that `allowedTools: ["*"]` overrides it and forces `--yolo`; CAO logs a
+>   warning when that happens, so the discard is not silent.
+> - **`use_worktree=true`** puts writes in a throwaway git worktree behind review instead of the
+>   live tree. That bounds the damage; it does not stop the network access.
 
 ### Custom Codex Profile
 
@@ -295,9 +341,10 @@ PY
 - `IDLE_PROMPT_STRICT_PATTERN` matches only empty prompt lines (`› ` or `❯ ` without trailing text) for extraction boundary detection.
 - Output mode `last` uses `CodexProvider.extract_last_message_from_script()`, which extracts text between the last user message and the next idle prompt.
 - Exiting a Codex terminal uses `/exit` (`POST /terminals/{terminal_id}/exit`).
+- **Exit check**: when the pane's command is again the shell that ran before Codex, the status is ERROR, so that the inbox does not type into the shell. The lookup costs about 0.1 s of tmux calls, so a ready verdict (IDLE or COMPLETED) reads it every time, and other verdicts read it at most every 2 s (`EXIT_CHECK_INTERVAL_S`).
 - **Handoff message context**: `_handoff_impl()` prepends a `[CAO Handoff]` prefix to the task message so the worker agent knows this is a blocking handoff. Without this, Codex agents proactively try to use `send_message` to notify the supervisor, which fails because the worker doesn't have the supervisor's terminal ID. The prefix tells the agent to simply output results and finish — the orchestrator captures the response automatically.
 - **TUI footer handling** (`--no-alt-screen` mode): Codex always renders a TUI footer at the bottom, even during processing. The footer format varies by version: v0.110 and earlier use `› [suggestion hint]` + `? for shortcuts` + `N% context left`; v0.111+ (PR #13202) use `› [suggestion hint]` + `model · N% left · path`. `TUI_FOOTER_PATTERN` detects both formats, and `_compute_tui_footer_cutoff()` finds the precise start of the footer area. Both `get_status()` and `extract_last_message_from_script()` use this cutoff to exclude footer lines from user-message matching — preventing false IDLE and extraction contamination.
-- **TUI progress spinner**: During processing, Codex shows `• [text] (Ns • esc to interrupt)` inline. The `•` would falsely match `ASSISTANT_PREFIX_PATTERN`, and the TUI `›` hint would match idle prompt — triggering false COMPLETED. `TUI_PROGRESS_PATTERN` detects the spinner and returns PROCESSING before the COMPLETED check.
+- **TUI progress spinner**: During processing, Codex shows `• [text] (Ns • esc to interrupt)` inline. The `•` would falsely match `ASSISTANT_PREFIX_PATTERN`, and the TUI `›` hint would match idle prompt — triggering false COMPLETED. `TUI_PROGRESS_PATTERN` detects the spinner and returns PROCESSING before the COMPLETED check. codex-cli 0.153.x alternates the leading glyph between `•` and `◦` as the spinner animates, so the pattern accepts either; a frame that lands on the hollow glyph used to read IDLE.
 
 ### Status Values
 

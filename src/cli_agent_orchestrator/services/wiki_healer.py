@@ -86,6 +86,10 @@ class HealConflictError(HealError):
     """Raised when the ``.heal.lock`` cannot be acquired (another heal runs)."""
 
 
+class VaultBoundScopeError(HealError):
+    """Raised when native maintenance is asked to mutate a vault-backed scope."""
+
+
 # -----------------------------------------------------------------------------
 # Frozen dataclasses
 # -----------------------------------------------------------------------------
@@ -269,6 +273,7 @@ def _row_exists(db: Any, key: str, scope: str, scope_id: Optional[str]) -> bool:
         .filter(
             MemoryMetadataModel.key == key,
             MemoryMetadataModel.scope == scope,
+            MemoryMetadataModel.source_kind == "native",
             (
                 MemoryMetadataModel.scope_id == scope_id
                 if scope_id is not None
@@ -316,6 +321,7 @@ def _delete_row(db: Any, key: str, scope: str, scope_id: Optional[str]) -> int:
         .filter(
             MemoryMetadataModel.key == key,
             MemoryMetadataModel.scope == scope,
+            MemoryMetadataModel.source_kind == "native",
             (
                 MemoryMetadataModel.scope_id == scope_id
                 if scope_id is not None
@@ -452,6 +458,7 @@ async def _heal_contradiction(
             .filter(
                 MemoryMetadataModel.key == k,
                 MemoryMetadataModel.scope == scope,
+                MemoryMetadataModel.source_kind == "native",
                 (
                     MemoryMetadataModel.scope_id == scope_id
                     if scope_id is not None
@@ -680,6 +687,7 @@ async def _heal_poison(
             .filter(
                 MemoryMetadataModel.key == key,
                 MemoryMetadataModel.scope == scope,
+                MemoryMetadataModel.source_kind == "native",
                 (
                     MemoryMetadataModel.scope_id == scope_id
                     if scope_id is not None
@@ -775,6 +783,13 @@ async def heal(
     if not _is_memory_enabled():
         raise MemoryDisabledError(
             "memory is disabled (memory.enabled=false); refusing to heal wiki"
+        )
+
+    from cli_agent_orchestrator.services.vault.binding import VaultBinding, resolve
+
+    if isinstance(resolve(scope, scope_id), VaultBinding):
+        raise VaultBoundScopeError(
+            "vault-bound scope cannot be healed; reconcile the vault instead"
         )
 
     if svc is None:

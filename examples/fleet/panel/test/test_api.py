@@ -1,6 +1,6 @@
 import httpx
-from fastapi.testclient import TestClient
 from app import client, config, main
+from fastapi.testclient import TestClient
 
 
 def _patch_fleet(monkeypatch, online_health, sessions_by_machine):
@@ -155,13 +155,25 @@ def _err(kind, status=None):
 
 def test_launch_autogenerates_session_name_and_delivers_task(monkeypatch):
     launched = {}
-    async def fake_launch(c, base, profile, provider, session_name, wd=None):
-        launched.update(profile=profile, provider=provider, session_name=session_name, wd=wd)
+
+    async def fake_launch(
+        c, base, profile, provider, session_name, wd=None, *, generated_name=False
+    ):
+        launched.update(
+            profile=profile,
+            provider=provider,
+            session_name=session_name,
+            wd=wd,
+            generated_name=generated_name,
+        )
         return {"id": "term-9"}
+
     sent = {}
+
     async def fake_send(c, base, tid, msg, sender_id="fleet-panel"):
         sent.update(tid=tid, msg=msg)
         return {}
+
     monkeypatch.setattr(client, "launch", fake_launch)
     monkeypatch.setattr(client, "send_message", fake_send)
     tc = TestClient(main.app)
@@ -175,14 +187,22 @@ def test_launch_autogenerates_session_name_and_delivers_task(monkeypatch):
     assert launched["session_name"] == data["session_name"]
     assert launched["profile"] == "developer" and launched["provider"] == "claude_code"
     assert launched["wd"] == "/w"
+    assert launched["generated_name"] is True
     assert sent["tid"] == "term-9" and sent["msg"] == "do X"
 
 
 def test_launch_uses_provided_session_name_and_skips_task(monkeypatch):
-    async def fake_launch(c, base, profile, provider, session_name, wd=None):
+    launched = {}
+
+    async def fake_launch(
+        c, base, profile, provider, session_name, wd=None, *, generated_name=False
+    ):
+        launched.update(session_name=session_name, generated_name=generated_name)
         return {"id": "term-1"}
+
     def _boom(*a, **k):
         raise AssertionError("send_message must not be called when no task is given")
+
     monkeypatch.setattr(client, "launch", fake_launch)
     monkeypatch.setattr(client, "send_message", _boom)
     tc = TestClient(main.app)
@@ -190,6 +210,7 @@ def test_launch_uses_provided_session_name_and_skips_task(monkeypatch):
     assert r.status_code == 200
     body = r.json()
     assert body["session_name"] == "my-sess"
+    assert launched == {"session_name": "my-sess", "generated_name": False}
     assert body["task_sent"] is False
 
 

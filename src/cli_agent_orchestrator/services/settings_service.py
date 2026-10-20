@@ -4,9 +4,10 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.utils.atomic_file import locked_atomic_write
 from cli_agent_orchestrator.utils.paths import normalized_path
 
 logger = logging.getLogger(__name__)
@@ -25,22 +26,150 @@ _BOOL_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _BOOL_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 
-def _load() -> Dict[str, Any]:
-    """Load settings from disk."""
-    if SETTINGS_FILE.exists():
-        try:
-            data = json.loads(SETTINGS_FILE.read_text())
-            if isinstance(data, dict):
-                return data
-        except Exception as e:
+class SettingsUnreadableError(RuntimeError):
+    """settings.json is PRESENT but could not be read or parsed.
+
+    Distinct from "absent", which legitimately means "use the built-in defaults".
+    Conflating the two is how a filesystem problem masquerades as a deliberate
+    opt-out: where reads under the CAO home directory are denied,
+    ``is_learning_enabled()`` answered False and agents reported "workflow
+    self-learning is disabled" — a configuration message for a permissions fault.
+
+    Callers that must fail closed still do; they just now know WHY.
+    """
+
+    def __init__(self, path: Path, cause: BaseException) -> None:
+        self.path = path
+        self.cause = cause
+        super().__init__(f"{path} could not be read: {type(cause).__name__}: {cause}")
+
+    def redacted_detail(self) -> str:
+        """Describe the failure WITHOUT the absolute path, for API responses.
+
+        Server filesystem paths are deliberately kept out of HTTP payloads (the
+        same reason ``MemorySummary`` excludes ``file_path``), so the path is
+        logged server-side and only the exception kind travels.
+        """
+        return (
+            f"CAO settings.json could not be read ({type(self.cause).__name__}); "
+            "configuration state is unknown — check permissions on the CAO home directory"
+        )
+
+
+def _load_or_raise() -> Dict[str, Any]:
+    """Load settings, distinguishing "absent" from "unreadable".
+
+    Deliberately calls ``read_text()`` rather than testing ``exists()`` first:
+    ``Path.exists()`` swallows ``PermissionError`` from the PARENT directory and
+    returns False, so an unreadable home directory would take the "no settings
+    file, use defaults" branch silently, without even a log line.
+    """
+    try:
+        raw = SETTINGS_FILE.read_text()
+    except FileNotFoundError:
+        return {}  # genuinely absent — defaults are the right answer
+    except (OSError, ValueError) as e:  # Includes UnicodeDecodeError from read_text().
+        raise SettingsUnreadableError(SETTINGS_FILE, e) from e
+
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise SettingsUnreadableError(SETTINGS_FILE, e) from e
+    if not isinstance(data, dict):
+        raise SettingsUnreadableError(
+            SETTINGS_FILE, TypeError(f"expected a JSON object, got {type(data).__name__}")
+        )
+    return data
+
+
+def _load_result_detail() -> Tuple[Dict[str, Any], bool, bool]:
+    """Read once, distinguishing absent, unreadable, and parsed-invalid settings.
+
+    Approval stays enabled on either failure, but its diagnostic source distinguishes
+    read/decode failures from a parsed value that is not a JSON object. Use the same
+    strict loader as learning_status so both controls observe the same file semantics.
+    """
+    try:
+        return _load_or_raise(), True, False
+    except SettingsUnreadableError as e:
+        read_or_decode_failed = not isinstance(e.cause, TypeError)
+        if read_or_decode_failed:
             logger.warning(f"Failed to read settings: {e}")
-    return {}
+        return {}, False, read_or_decode_failed
+
+
+def _load_result() -> Tuple[Dict[str, Any], bool]:
+    """Retain the two-item settings result for callers that only need readability."""
+    data, ok, _read_or_decode_failed = _load_result_detail()
+    return data, ok
+
+
+EPHEMERAL_DEFAULTS = {
+    "enabled": False,
+    "allowed_providers": ["claude_code"],
+    "max_brief_bytes": 8192,
+    "pending_ttl_seconds": 900,
+    "claim_lease_seconds": 60,
+    "max_depth": 1,
+}
+
+
+def get_ephemeral_settings() -> Dict[str, Any]:
+    """Read the operator-only block strictly, without environment overrides."""
+    settings = _load_or_raise()
+    block = settings.get("ephemeral", {})
+    if not isinstance(block, dict):
+        block = {}
+    result = {**EPHEMERAL_DEFAULTS, **block}
+    result["_ignored_policy"] = [
+        "ephemeral." + key
+        for key in ("max_tier", "default_tier", "max_effort", "default_effort")
+        if block.get(key) is not None
+    ]
+    if settings.get("model_tiers") is not None:
+        result["_ignored_policy"].append("model_tiers")
+    return result
+
+
+def child_may_delegate() -> bool:
+    """Operator-only ephemeral.child_may_delegate; no environment overrides."""
+    block = _load_or_raise().get("ephemeral", {})
+    return isinstance(block, dict) and block.get("child_may_delegate") is True
+
+
+def _load() -> Dict[str, Any]:
+    """Load settings from disk, tolerating an unreadable file.
+
+    Lenient wrapper over :func:`_load_or_raise` so every existing caller keeps
+    its "unreadable behaves like absent" contract. Callers that need to tell the
+    two apart use :func:`_load_or_raise` or :func:`learning_status`.
+    """
+    try:
+        return _load_or_raise()
+    except SettingsUnreadableError as e:
+        logger.warning(f"Failed to read settings: {e}")
+        return {}
+
+
+def settings_readable() -> bool:
+    """True when settings.json is absent or readable; False when it cannot be read."""
+    try:
+        _load_or_raise()
+    except SettingsUnreadableError:
+        return False
+    return True
 
 
 def _save(data: Dict[str, Any]) -> None:
-    """Save settings to disk."""
+    """Save settings to disk.
+
+    Published atomically at mode 0600 through the shared writer: the new file
+    replaces the ``settings.json`` directory entry, so a symlink planted at
+    that path is swapped out rather than followed, and the result is private
+    like ``.env`` and the database. ``write_text`` did neither.
+    """
     CAO_HOME_DIR.mkdir(parents=True, exist_ok=True)
-    SETTINGS_FILE.write_text(json.dumps(data, indent=2))
+    locked_atomic_write(SETTINGS_FILE, json.dumps(data, indent=2), mode=0o600)
 
 
 def get_agent_dirs() -> Dict[str, str]:
@@ -64,6 +193,85 @@ def get_agent_dirs() -> Dict[str, str]:
     result = dict(_DEFAULTS)
     result.update(saved)
     return result
+
+
+def installed_context_dir_override() -> Optional[Path]:
+    """Return ``agents.dirs.cao_installed`` when configured away from its default.
+
+    Returns None when the setting is absent or spells the default location.
+
+    The installed-profile context directory has two names for one default: the
+    ``AGENT_CONTEXT_DIR`` constant and this setting's default entry, both
+    ``CAO_HOME_DIR / "agent-context"``. Every consumer that has to find that
+    directory -- the install writer, the opencode collision guard, the Copilot
+    skill-injection probe -- calls this and falls back to its own imported
+    constant on None. So with an unconfigured setting the constant stays the
+    single source of truth (and a test that redirects the constant redirects
+    every consumer), while an operator who points the setting elsewhere moves
+    every consumer together instead of splitting them (PR #493).
+
+    Compared through ``normalized_path`` (realpath + expanduser), so a trailing
+    slash, a ``~`` or a symlinked spelling of the default is still the default
+    rather than an override to a directory nobody else looks in.
+    """
+    configured = usable_agent_dirs().get("cao_installed")
+    if configured is None:
+        return None
+    if normalized_path(configured) == normalized_path(_DEFAULTS["cao_installed"]):
+        return None
+    return Path(configured).expanduser()
+
+
+def usable_agent_dirs() -> Dict[str, str]:
+    """``get_agent_dirs()`` with every value that is not a directory replaced by its default.
+
+    ``get_agent_dirs`` returns what settings.json says, which is right for the
+    Settings UI. It is wrong for anything that walks the filesystem: a blank
+    value is ``Path("")``, i.e. ``Path(".")`` -- the server's working directory
+    -- and a relative one moves with whoever launched the process. Fed to
+    profile discovery, the lookup behind ``cao install <name>``, memory
+    promotion's profile lookup or the installed-context resolver, either would
+    turn the working directory into a
+    profile source and, for ``cao_installed``, the trusted write root, so a
+    profile named ``README`` or ``AGENTS`` lands on a repository file. Every
+    consumer that opens directories goes through this instead; each bad value is
+    logged once per call and falls back to the built-in default for its key, and
+    every surviving value is returned with ``~`` expanded.
+    """
+    result = dict(get_agent_dirs())
+    for key, value in list(result.items()):
+        if not isinstance(value, str) or not value.strip():
+            logger.warning(f"Ignoring blank agents.dirs.{key}; using its default directory")
+        elif not Path(value).expanduser().is_absolute():
+            logger.warning(
+                f"Ignoring relative agents.dirs.{key}={value!r}; using its default directory"
+            )
+        else:
+            # Returned expanded: a ``~`` spelling is a real directory to every
+            # consumer, not a literal path named "~" that discovery finds empty.
+            result[key] = str(Path(value).expanduser())
+            continue
+        if key in _DEFAULTS:
+            result[key] = _DEFAULTS[key]
+        else:
+            del result[key]
+    return result
+
+
+def installed_context_lookup_dirs(default: Path) -> List[Path]:
+    """Directories an existing installed context copy may live in, in probe order.
+
+    The configured override first, then ``default`` -- the constant the caller
+    imports -- when an override is active, because releases before the writer
+    honoured the setting deposited every copy at the default regardless. With no
+    override, just ``default``. Consumers that need to FIND a copy (the install
+    ownership guard, the Copilot skill-injection probe) iterate this; the writer
+    uses only the first entry.
+    """
+    override = installed_context_dir_override()
+    if override is None or normalized_path(override) == normalized_path(default):
+        return [default]
+    return [override, default]
 
 
 def set_agent_dirs(dirs: Dict[str, str]) -> Dict[str, str]:
@@ -298,8 +506,8 @@ def get_max_terminals() -> Optional[int]:
     Counts TRACKED terminals, meaning rows in the terminals table, not probed
     liveness: a terminal row is only removed by an explicit ``delete_terminal``,
     so a terminal whose process died without cleanup still occupies a slot. That
-    is harmless in the topology the cap exists for (a worker pod is a disposable
-    Job, so its rows die with it) but an operator who sets ``server.max_terminals``
+    is harmless in the topology the cap exists for (a worker pod is disposable and
+    its state is an emptyDir, so its rows die with it) but an operator who sets ``server.max_terminals``
     on a long-lived node may have to delete a stale row by hand. Deliberately not
     probed here: this check runs before anything is allocated precisely so it can
     stay cheap, and per-row liveness probing would put tmux calls in that path.
@@ -355,6 +563,9 @@ def get_memory_settings() -> Dict[str, Any]:
         saved = {}
     result = dict(defaults)
     result.update(saved)
+    # Vault config has cross-field safety invariants and is intentionally
+    # available only through get_vault_config().
+    result.pop("vault", None)
 
     # Env-var overlay: CAO_MEMORY_ENABLED beats settings.json
     env_enabled = os.environ.get("CAO_MEMORY_ENABLED")
@@ -395,6 +606,25 @@ def get_memory_settings() -> Dict[str, Any]:
 
     result["lint_enabled"] = is_memory_lint_enabled(settings=settings)
     return result
+
+
+def get_vault_config():
+    """Load the validated ``memory.vault`` object with a disable-only env gate."""
+    from cli_agent_orchestrator.services.vault.config import VaultConfig
+
+    settings = _load()
+    memory = settings.get("memory", {})
+    raw_vault = memory.get("vault", {}) if isinstance(memory, dict) else {}
+    if not isinstance(raw_vault, dict):
+        raise ValueError("memory.vault must be an object")
+    config = VaultConfig.model_validate(raw_vault)
+
+    # This operational override may only reduce exposure. In particular, an
+    # env value of true never enables a file-disabled or absent configuration.
+    raw_env = os.environ.get("CAO_MEMORY_VAULT_ENABLED")
+    if raw_env is not None and raw_env.strip().lower() in _BOOL_FALSE_VALUES:
+        config.enabled = False
+    return config
 
 
 def _coerce_optional_bool(value: Any, *, label: str) -> Optional[bool]:
@@ -468,21 +698,89 @@ def is_learning_enabled() -> bool:
     learning regardless of this flag. Read errors default to False (opt-in
     features fail closed, mirroring the default).
     """
+    return learning_status().enabled
+
+
+class LearningStatus(NamedTuple):
+    """Whether learning is on, AND whether that answer is trustworthy.
+
+    ``unreadable`` is the honesty bit. ``enabled`` alone cannot distinguish
+    "the operator opted out" from "the settings file could not be read", and
+    those need different messages: the first is a configuration fact, the
+    second is a filesystem fault the operator has to go fix.
+    """
+
+    enabled: bool
+    unreadable: bool
+    detail: str
+
+
+def learning_status() -> LearningStatus:
+    """Resolve learning state, reporting whether settings.json was readable.
+
+    ``unreadable`` is True only when settings.json could not be read AND no
+    decisive ``CAO_MEMORY_LEARNING_ENABLED`` override is present: an
+    env-var-driven install is unaffected by an unreadable file, so reporting it
+    as broken would be its own kind of lie.
+
+    Still fails closed — ``enabled`` is False whenever the answer is unknown.
+    """
+    env_learning = os.environ.get("CAO_MEMORY_LEARNING_ENABLED")
+    env_decisive = env_learning is not None and env_learning.strip() != ""
+
+    try:
+        _load_or_raise()
+    except SettingsUnreadableError as e:
+        if not env_decisive:
+            # error, not warning: this is an operator-actionable fault, and the
+            # symptom it produces ("learning is disabled") does not look like one.
+            logger.error(f"Cannot determine learning state: {e}")
+            return LearningStatus(False, True, e.redacted_detail())
+        logger.warning(f"settings.json unreadable; using CAO_MEMORY_LEARNING_ENABLED: {e}")
+
     try:
         settings = get_memory_settings()
-        return bool(settings.get("enabled", True)) and bool(settings.get("learning_enabled", False))
+        enabled = bool(settings.get("enabled", True)) and bool(
+            settings.get("learning_enabled", False)
+        )
     except Exception as e:
         logger.warning(f"Failed to read memory.learning_enabled, defaulting to False: {e}")
-        return False
+        return LearningStatus(False, False, f"Failed to read learning settings: {e}")
+    return LearningStatus(enabled, False, "")
 
 
-def is_workflow_approval_required() -> bool:
-    """Return True when an unapproved script-tier workflow run must be refused (issue #583 FR-8).
+#: Where a resolved approval posture came from. A CLOSED set: the startup line renders these
+#: verbatim, so adding a member means updating that call site too.
+GATE_SOURCE_ENV = "env"
+GATE_SOURCE_FILE = "settings.json"
+GATE_SOURCE_DEFAULT = "default"
+GATE_SOURCE_READ_FAILURE = "read-failure-fallback"
+GATE_SOURCE_INVALID_SETTINGS = "invalid-settings-fallback"
 
-    Default is **False**: enforcement is opt-in. A ``plan_id`` does not exist until run start, so a
-    plan that has never run cannot have been approved and its first run is refused by design. Making
-    that the default would break every existing script-tier caller one Bolt before the authoring
-    sequence that presents a plan and takes approval BEFORE running.
+
+class WorkflowApprovalPosture(NamedTuple):
+    """A resolved approval-gate posture and the mechanism that decided it.
+
+    ``source`` lets the startup line distinguish an explicit settings-file opt-out from a malformed
+    file that leaves enforcement enabled and needs repair.
+    """
+
+    required: bool
+    source: str
+
+
+def resolve_workflow_approval_posture() -> WorkflowApprovalPosture:
+    """Resolve whether the approval gate is required, and what decided it (issue #583 FR-8).
+
+    DEFAULT IS **TRUE** SINCE ISSUE #583 BOLT 3 (``approval-enforcement-default``). Bolt 2 shipped
+    this opt-in for a specific reason that no longer holds: an always-on gate turned a TRANSIENT
+    freeze failure into a refused HEALTHY run, because ``manifest_freeze.build_manifest_json`` is
+    total and writes NULL on failure, and NULL fails closed. Bolt 3 makes the two causes
+    distinguishable — a missing plan identifier now raises
+    :class:`~cli_agent_orchestrator.services.approval_gate.PlanIdentityUnavailableError` and
+    transports as 503, while a genuinely unapproved plan stays 403 — and ships the authoring
+    sequence that takes approval BEFORE running. With both in place, leaving FR-8's guarantee
+    opt-in would mean it never applies in a default installation.
 
     PRECEDENCE IS DELIBERATELY ASYMMETRIC, AND THIS IS NOT AN OVERSIGHT. Every sibling setting here
     resolves ``CAO_* env var > settings.json > default`` — see :func:`is_memory_enabled`. This one
@@ -496,30 +794,73 @@ def is_workflow_approval_required() -> bool:
     operator's settings file still read as configured on — which would make the weakest
     configuration mechanism in the system the one that decides whether runs are authorised. The
     asymmetry is monotonic in the safe direction: nothing that merely influences an environment can
-    weaken the gate, while enabling it for a single test or trial stays a one-liner.
+    weaken the gate. Flipping the default does NOT reopen this; it only changes what the variable is
+    useful for, from switching a control on to re-asserting one that is already on.
 
-    Read failure resolves to the default (disabled) with a warning, which is the ONE place this
-    mechanism is deliberately not fail-closed. Treating an unreadable settings file as "gate on"
-    would refuse every script run in the installation on the strength of a JSON typo. Resolving to
-    disabled makes the unreadable case behave like the unconfigured case, and the asymmetry above
-    bounds the residual: an operator who enabled the gate via the environment is unaffected by a
-    corrupt file.
+    Read/decode failures and malformed configuration FAIL CLOSED: both preserve required enforcement
+    and log an error naming the repair path. :data:`GATE_SOURCE_READ_FAILURE` is reserved for a file
+    that could not be read or decoded; :data:`GATE_SOURCE_INVALID_SETTINGS` names content that parsed
+    but cannot configure this setting. A valid explicit JSON boolean ``false`` is the only settings
+    file opt-out.
+
+    An ABSENT settings file is NOT a read failure. It is the unconfigured case and resolves to the
+    default, which is now enabled. :func:`_load_result` is what makes the two distinguishable.
     """
     env = os.environ.get("CAO_WORKFLOW_REQUIRE_APPROVAL")
     if env is not None and env.strip().lower() in ("1", "true", "yes"):
         # Enable-only: a falsy env value is NOT consulted, so it cannot override an enabling
         # settings.json below. Returning early on truthy is what makes the precedence asymmetric.
-        return True
-    try:
-        workflow_settings = _load().get("workflow", {})
-        if not isinstance(workflow_settings, dict):
-            return False
-        return bool(workflow_settings.get("require_approval", False))
-    except Exception as e:
-        logger.warning(
-            "Failed to read workflow.require_approval, defaulting to False (gate disabled): %s", e
+        return WorkflowApprovalPosture(True, GATE_SOURCE_ENV)
+
+    data, ok, read_or_decode_failed = _load_result_detail()
+    if not ok:
+        if read_or_decode_failed:
+            logger.error(
+                "Failed to read or decode workflow approval settings from %s; the approval gate "
+                "remains REQUIRED. Repair settings.json and restart or reload the server; "
+                "CAO_WORKFLOW_REQUIRE_APPROVAL=1 may explicitly affirm enabled enforcement.",
+                SETTINGS_FILE,
+            )
+            return WorkflowApprovalPosture(True, GATE_SOURCE_READ_FAILURE)
+        logger.error(
+            "Invalid settings.json content in %s; the approval gate remains REQUIRED. Repair "
+            "settings.json and restart or reload the server; only an explicit JSON boolean "
+            "workflow.require_approval=false disables enforcement.",
+            SETTINGS_FILE,
         )
-        return False
+        return WorkflowApprovalPosture(True, GATE_SOURCE_INVALID_SETTINGS)
+
+    workflow_settings = data.get("workflow", {})
+    if not isinstance(workflow_settings, dict):
+        logger.error(
+            "The 'workflow' key in %s is not an object; the approval gate remains REQUIRED. "
+            "Repair settings.json and restart or reload the server.",
+            SETTINGS_FILE,
+        )
+        return WorkflowApprovalPosture(True, GATE_SOURCE_INVALID_SETTINGS)
+
+    if "require_approval" in workflow_settings:
+        required = workflow_settings["require_approval"]
+        if isinstance(required, bool):
+            return WorkflowApprovalPosture(required, GATE_SOURCE_FILE)
+        logger.error(
+            "workflow.require_approval in %s must be a JSON boolean; the approval gate remains "
+            "REQUIRED. Repair settings.json and restart or reload the server.",
+            SETTINGS_FILE,
+        )
+        return WorkflowApprovalPosture(True, GATE_SOURCE_INVALID_SETTINGS)
+    return WorkflowApprovalPosture(True, GATE_SOURCE_DEFAULT)
+
+
+def is_workflow_approval_required() -> bool:
+    """Return True when an unapproved script-tier workflow run must be refused (issue #583 FR-8).
+
+    Thin delegation to :func:`resolve_workflow_approval_posture`, which carries the full reasoning.
+    The signature is unchanged from Bolt 2 so that every existing caller — and every test asserting
+    this exact shape — is untouched; callers that need to know WHY the gate is on or off ask the
+    resolver instead.
+    """
+    return resolve_workflow_approval_posture().required
 
 
 def is_instruction_promotion_enabled() -> bool:
@@ -748,6 +1089,43 @@ def get_extra_skill_dirs() -> List[str]:
     if not isinstance(dirs, list):
         return []
     return [d.strip() for d in dirs if isinstance(d, str) and d.strip()]
+
+
+def get_skill_projection_mode() -> str:
+    """How Agent-Plugin skills are materialized into the global skill store.
+
+    ``"symlink"`` (default) links each projected skill at
+    ``SKILLS_DIR/<name>``; ``"copy"`` copies the content instead, for
+    environments where symlink creation is unsupported (Windows without
+    Developer Mode or elevation). Copy mode re-copies on every projection
+    rebuild, so it is correct but not free.
+
+    Reads ``skills.projection_mode``, alongside the existing
+    ``skills.extra_dirs``. Any unrecognized value falls back to ``"symlink"``
+    rather than raising — a hand-edited ``settings.json`` must not be able to
+    break plugin installation.
+    """
+    settings = _load()
+    nested = settings.get("skills", {})
+    mode = nested.get("projection_mode") if isinstance(nested, dict) else None
+    if isinstance(mode, str) and mode.strip().lower() in ("symlink", "copy"):
+        return mode.strip().lower()
+    return "symlink"
+
+
+def set_skill_projection_mode(mode: str) -> str:
+    """Set the Agent-Plugin skill projection mode (``"symlink"`` or ``"copy"``)."""
+    normalized = (mode or "").strip().lower()
+    if normalized not in ("symlink", "copy"):
+        raise ValueError(f"projection_mode must be 'symlink' or 'copy', got {mode!r}")
+    settings = _load()
+    skills_section = settings.get("skills", {})
+    if not isinstance(skills_section, dict):
+        skills_section = {}
+    skills_section["projection_mode"] = normalized
+    settings["skills"] = skills_section
+    _save(settings)
+    return normalized
 
 
 def set_extra_skill_dirs(dirs: List[str]) -> List[str]:

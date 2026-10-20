@@ -3,26 +3,34 @@
 import asyncio
 import logging
 import os
+import re
 import time
+from collections.abc import Mapping
 from typing import Annotated, Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import quote
 
 import requests
 from fastmcp import FastMCP
-from pydantic import Field
+from fastmcp.tools import Tool, ToolResult
+from pydantic import Field, WithJsonSchema
 
 from cli_agent_orchestrator.constants import (
     ADVERTISED_URL_ENV,
     API_BASE_URL,
     DISCOVERY_TOOL_MARKER,
     ELASTIC_CALLBACK_URL_ENV,
+    HANDOFF_RESULTS_ROUTE,
     WORKFLOW_EVENTS_CONNECT_TIMEOUT,
     WORKFLOW_EVENTS_MCP_MAX_EVENTS,
     WORKFLOW_EVENTS_MCP_MAX_SECONDS,
     WORKFLOW_EVENTS_READ_TIMEOUT,
+    WORKFLOW_NAME_RE,
     WORKFLOW_POLL_INTERVAL_SECONDS,
     WORKFLOW_RUN_REQUEST_TIMEOUT,
 )
+from cli_agent_orchestrator.mcp_server import utils as mcp_utils
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
+from cli_agent_orchestrator.mcp_server.utils import _auth_headers, _auth_headers_for
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck, parse_decision
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
@@ -33,8 +41,14 @@ from cli_agent_orchestrator.services.memory_service import (
     MemoryDisabledError,
     MemoryPartialWriteError,
 )
-from cli_agent_orchestrator.services.outcome_service import LEARNING_DISABLED_MESSAGE
+from cli_agent_orchestrator.services.outcome_service import (
+    LEARNING_DISABLED_CODE,
+    LEARNING_DISABLED_MESSAGE,
+)
 from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT
+from cli_agent_orchestrator.utils.caller_tools import (
+    caller_effective_allowed_tools as _caller_effective_allowed_tools,
+)
 from cli_agent_orchestrator.utils.orchestration import (
     ENABLE_SENDER_ID_INJECTION,
     REMOTE_CONNECT_TIMEOUT,
@@ -44,7 +58,10 @@ from cli_agent_orchestrator.utils.orchestration import (
     _extract_error_detail,
     _handoff_impl,
     _mcp_timeout,
+    _resolve_target_base_url,
     _send_message_impl,
+    _target_binding_denial,
+    has_discovery_grant,
 )
 from cli_agent_orchestrator.utils.workflow_events import parse_sse_frames
 
@@ -106,6 +123,11 @@ def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
         )
         status_response.raise_for_status()
         terminal = status_response.json()
+        # The row we just fetched carries caller_id, so the binding check costs
+        # no extra request. Refuse before revealing the target's prompt state.
+        denial = _target_binding_denial(terminal_id, target_meta=terminal)
+        if denial:
+            return {"success": False, "terminal_id": terminal_id, "error": denial}
         current_status = terminal.get("status")
         if current_status != TerminalStatus.WAITING_USER_ANSWER.value:
             return {
@@ -219,6 +241,42 @@ def _send_terminal_input(terminal_id: str, message: str) -> None:
     response.raise_for_status()
 
 
+def _refusal_envelope_fields(response: requests.Response) -> Dict[str, Any]:
+    """Extra ``ok=False`` envelope fields for an approval refusal, or ``{}`` if this is not one.
+
+    Issue #583 Bolt 3 (``authoring-sequence``) -- the APPROVE step of FR-10's sequence, made
+    branchable. An agent must be able to tell these apart WITHOUT parsing prose:
+
+    * ``class: "approval_required"`` with a ``plan_id`` -> present that identifier to the human, tell
+      them to run ``cao workflow approve <plan_id>``, and STOP. Do not retry: a loop around a human
+      authorisation gate is a bypass by repetition. There is deliberately no tool that grants an
+      approval.
+    * ``class: "plan_identity_unavailable"`` with ``plan_id: None`` -> CAO could not complete its own
+      freeze. There is nothing to approve. Relay ``message`` to the user. Retry only if ``message``
+      says a retry can help. Never present an approval prompt.
+
+    Returns ``{}`` for every other body, INCLUDING a string ``detail`` from an older server -- so the
+    envelope simply keeps its previous shape rather than growing a null ``class``.
+
+    Follows the classed-refusal convention the four authoring tools established. The other eleven
+    workflow tools still return a bare ``error`` string; widening them is the retrofit named at
+    ``authoring-mcp-tools``' BR-9.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    detail = payload.get("detail")
+    if not isinstance(detail, dict):
+        return {}
+    kind = detail.get("kind")
+    if kind not in ("approval_required", "plan_identity_unavailable"):
+        return {}
+    return {"class": kind, "plan_id": detail.get("plan_id")}
+
+
 def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
     """Fetch a skill body from cao-server and return content or a structured error."""
     try:
@@ -299,8 +357,17 @@ if ENABLE_WORKING_DIRECTORY:
             ),
         ),
         target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
+        description: Annotated[
+            Optional[str],
+            Field(
+                description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
+            ),
+        ] = None,
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
+
+        Optionally supply description: a short phrase for the operator identifying
+        the child responsibility (64 Unicode code points, truncated on creation).
 
         This tool allows handing off tasks to other agents by creating a new terminal
         in the same session. It sends the message, waits for completion, and captures the output.
@@ -360,6 +427,9 @@ if ENABLE_WORKING_DIRECTORY:
         Returns:
             HandoffResult with success status, message, and agent output
         """
+        denied = _tool_denied_reason("handoff")
+        if denied:
+            return HandoffResult(success=False, message=denied, output=None, terminal_id=None)
         return await _handoff_impl(
             agent_profile,
             message,
@@ -369,6 +439,7 @@ if ENABLE_WORKING_DIRECTORY:
             model=model,
             use_worktree=use_worktree,
             target_host=target_host,
+            description=description,
         )
 
 else:
@@ -402,8 +473,17 @@ else:
             ),
         ),
         target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
+        description: Annotated[
+            Optional[str],
+            Field(
+                description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
+            ),
+        ] = None,
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
+
+        Optionally supply description: a short phrase for the operator identifying
+        the child responsibility (64 Unicode code points, truncated on creation).
 
         This tool allows handing off tasks to other agents by creating a new terminal
         in the same session. It sends the message, waits for completion, and captures the output.
@@ -451,6 +531,9 @@ else:
         Returns:
             HandoffResult with success status, message, and agent output
         """
+        denied = _tool_denied_reason("handoff")
+        if denied:
+            return HandoffResult(success=False, message=denied, output=None, terminal_id=None)
         return await _handoff_impl(
             agent_profile,
             message,
@@ -460,6 +543,7 @@ else:
             model=model,
             use_worktree=use_worktree,
             target_host=target_host,
+            description=description,
         )
 
 
@@ -517,6 +601,7 @@ call delete_terminal(terminal_id) to free system resources.
 
 Args:
     agent_profile: Agent profile for the worker terminal
+    description: Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)
     message: Task message (include callback instructions)"""
 
     if enable_workdir:
@@ -573,7 +658,16 @@ if ENABLE_WORKING_DIRECTORY:
             ),
         ),
         target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
+        description: Annotated[
+            Optional[str],
+            Field(
+                description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
+            ),
+        ] = None,
     ) -> Dict[str, Any]:
+        denied = _tool_denied_reason("assign")
+        if denied:
+            return {"success": False, "error": denied}
         return _assign_impl(
             agent_profile,
             message,
@@ -582,6 +676,7 @@ if ENABLE_WORKING_DIRECTORY:
             model=model,
             use_worktree=use_worktree,
             target_host=target_host,
+            description=description,
         )
 
 else:
@@ -608,7 +703,16 @@ else:
             ),
         ),
         target_host: Optional[str] = Field(default=None, description=_target_host_field_desc),
+        description: Annotated[
+            Optional[str],
+            Field(
+                description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
+            ),
+        ] = None,
     ) -> Dict[str, Any]:
+        denied = _tool_denied_reason("assign")
+        if denied:
+            return {"success": False, "error": denied}
         return _assign_impl(
             agent_profile,
             message,
@@ -617,6 +721,7 @@ else:
             model=model,
             use_worktree=use_worktree,
             target_host=target_host,
+            description=description,
         )
 
 
@@ -632,7 +737,7 @@ def _elastic_broker_config() -> Tuple[str, str]:
 
 
 # How long the elastic path waits for a freshly leased worker to answer through
-# its Service. The broker returns a lease as soon as the Job and Service objects
+# its Service. The broker returns a lease as soon as the workload and Service objects
 # exist, so this covers the worker's whole boot plus endpoint propagation - and it
 # is the ONE place that wait now happens, instead of once in the broker (on pod
 # readiness) and then implicitly again here (on a connect timeout, unretried).
@@ -678,12 +783,21 @@ async def assign_elastic(
     ),
     engine: Optional[str] = Field(default=None, description="Optional Kiro engine override"),
     model: Optional[str] = Field(default=None, description=_model_field_desc),
+    description: Annotated[
+        Optional[str],
+        Field(
+            description="Optional operator-facing description of the child responsibility (64 Unicode code points; truncated on creation)"
+        ),
+    ] = None,
 ) -> Dict[str, Any]:
-    """Provision one Kubernetes Job and assign one task to it.
+    """Provision one elastic worker and assign one task to it.
+
+    Optionally supply description: an operator-facing phrase identifying the
+    child responsibility (64 Unicode code points, truncated on creation).
 
     The worker must call ``complete_assignment`` exactly once after producing
     its final result. That tool durably delivers the callback before releasing
-    this worker's Job.
+    this worker.
 
     A successful return means the task was PLACED, not that it finished - the
     result arrives later through the supervisor's inbox. So a worker that dies
@@ -693,6 +807,26 @@ async def assign_elastic(
     arrived, and records which happened. Query ``GET /workers`` on the broker
     when a delegation reports success and produces no artifact.
     """
+    # Checked before the broker is asked for a lease, so a refused caller never
+    # gets a worker provisioned on its behalf. For a bound caller this resolves
+    # the terminal context over blocking HTTP, so it runs off the event loop for
+    # the same reason as the broker POST below.
+    denied = await asyncio.to_thread(_tool_denied_reason, "assign_elastic")
+    if denied:
+        return {"success": False, "terminal_id": None, "elastic": True, "message": denied}
+    from cli_agent_orchestrator.utils import agent_profiles
+
+    if agent_profiles.routes_to_ephemeral_store(agent_profile):
+        from cli_agent_orchestrator.services.ephemeral_service import log_refusal
+
+        text = f"remote_placement_not_allowed: ephemeral agent '{agent_profile}' can only launch on the node that created it; use assign or handoff"
+        log_refusal(
+            "remote_placement_not_allowed",
+            os.environ.get("CAO_TERMINAL_ID"),
+            agent_profile,
+            "use assign or handoff",
+        )
+        return {"success": False, "terminal_id": None, "elastic": True, "message": text}
     try:
         callback_terminal_id = _current_terminal_id()
         if not callback_terminal_id:
@@ -763,6 +897,7 @@ async def assign_elastic(
             ready_wait_seconds=_elastic_ready_wait(),
             callback_url=os.environ.get(ELASTIC_CALLBACK_URL_ENV) or None,
             remote_session_name=str(lease["session_name"]),
+            description=description,
         )
         result["worker_id"] = worker_id
         result["elastic"] = True
@@ -801,6 +936,11 @@ async def send_message(
     the terminal that created this one via handoff/assign. This is the
     reliable way to send results back to your supervisor.
 
+    An explicit receiver_id must be one of: a terminal you created via
+    assign/handoff, the terminal that created you, or (when your profile
+    grants the 'discovery' tool) a sibling that list_siblings returns for
+    you. Any other id is refused before anything is sent.
+
     Args:
         message: Message content to send
         receiver_id: Terminal ID of the receiver (optional, defaults to the recorded caller)
@@ -815,7 +955,7 @@ async def send_message(
 async def complete_assignment(
     message: str = Field(description="Final result to deliver to the assigning supervisor"),
 ) -> Dict[str, Any]:
-    """Deliver an elastic worker's final result, then release its Kubernetes Job."""
+    """Deliver an elastic worker's final result, then release the worker itself."""
     worker_id = os.environ.get("CAO_ELASTIC_WORKER_ID", "").strip()
     broker_url = os.environ.get("CAO_ELASTIC_BROKER_URL", "").strip().rstrip("/")
     release_token = os.environ.get("CAO_ELASTIC_RELEASE_TOKEN", "").strip()
@@ -953,6 +1093,12 @@ def delete_terminal(
     worker pods a leftover terminal — including one stuck in ERROR — occupies
     the pod's only slot until deleted).
 
+    You may delete your own terminal or one you created via assign/handoff,
+    locally or on a target_host node; any other id is refused. A remote node
+    recognises you through the callback id it recorded when you created the
+    worker, so the node must run a cao-server that reports it (this release
+    or later) and must not have restarted since the worker was created.
+
     Args:
         terminal_id: The terminal ID to delete
         target_host: Remote CAO node hosting the terminal; omit for local
@@ -973,6 +1119,100 @@ def delete_terminal(
     if not isinstance(target_host, str) or not target_host.strip():
         target_host = None
     return _delete_terminal_impl(terminal_id, target_host=target_host)
+
+
+@mcp.tool()
+def get_handoff_result(
+    job_id: str = Field(
+        description=(
+            "The job_id returned by handoff when pending=True (transport timed "
+            "out but the job may still be running or already finished server-side)."
+        )
+    ),
+    target_host: Optional[str] = Field(
+        default=None,
+        description=(
+            "Remote CAO node that ran the handoff (same format as "
+            "assign/handoff target_host: DNS name, host:port, or URL). Required "
+            "when the pending handoff was placed remotely -- the result row lives "
+            "in THAT node's database, not this one, so omitting it returns a "
+            "false not-found. Omit for local handoffs (behavior unchanged)."
+        ),
+    ),
+) -> Dict[str, Any]:
+    """Retrieve a durably persisted handoff result by job_id (issue #447).
+
+    Call this when a prior ``handoff`` call returned ``pending=True`` — the
+    transport timed out before the result arrived, but the work continues
+    server-side under ``job_id``. Poll this tool until ``state`` is no longer
+    ``"running"``.
+
+    Two things the request needs beyond the id, both mirroring
+    ``delete_terminal`` (PR #453 review, haofeif):
+
+    - The internal ``Authorization`` header, for a LOCAL retrieval. The
+      endpoint is scope-gated, so without it an auth-enabled deployment answers
+      401 to a caller legitimately holding the job_id. A retrieval aimed at a
+      ``target_host`` carries no bearer: ``CAO_AUTH_LOCAL_TOKEN`` is this node's
+      credential, and sending it to another host would disclose it there.
+    - ``target_host``. ``handoff(target_host=...)`` runs the step on that node
+      and persists the row in ITS database, so the supervisor's own base URL has
+      no such row.
+
+    Args:
+        job_id: The job_id from the pending handoff result.
+        target_host: Node that ran the handoff; omit for local.
+
+    Returns:
+        Dict with ``success``, ``state`` ("running"|"completed"|"error"),
+        ``terminal_id``, ``last_message`` (populated when completed), and
+        ``error_message`` (populated when errored). ``success=False`` with a
+        ``message`` when the job_id is unknown or the request failed.
+    """
+    # Direct (non-MCP) invocation gets pydantic's FieldInfo as the default rather
+    # than None. Normalized here in the tool wrapper for the same reason
+    # delete_terminal does it there: the leak is an artifact of FastMCP's Field
+    # default, so it belongs to server.py.
+    if not isinstance(target_host, str) or not target_host.strip():
+        target_host = None
+    location = f" on node {target_host}" if target_host else ""
+    try:
+        base_url = _resolve_target_base_url(target_host) if target_host else API_BASE_URL
+        path = HANDOFF_RESULTS_ROUTE.format(job_id=job_id)
+        response = requests.get(
+            f"{base_url}{path}",
+            headers=_auth_headers_for(base_url) or None,
+            # A black-holed remote node must fail on CONNECT rather than burn the
+            # full read budget; a local read keeps its single scalar timeout so
+            # default-path behavior is unchanged.
+            timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()) if target_host else _mcp_timeout(),
+        )
+        response.raise_for_status()
+        data = response.json()
+        return {
+            "success": True,
+            "state": data.get("state"),
+            "terminal_id": data.get("terminal_id"),
+            "last_message": data.get("last_message"),
+            "error_message": data.get("error_message"),
+        }
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            return {
+                "success": False,
+                "message": (
+                    f"No handoff result found for job_id {job_id}{location}"
+                    + (
+                        ""
+                        if target_host
+                        else ". If the handoff was placed on a remote node, retry "
+                        "with target_host set to that node."
+                    )
+                ),
+            }
+        return {"success": False, "message": f"Failed to retrieve handoff result: {str(e)}"}
+    except Exception as e:
+        return {"success": False, "message": f"Failed to retrieve handoff result: {str(e)}"}
 
 
 def _own_terminal_id_or_error(action: str) -> Union[str, Dict[str, Any]]:
@@ -1025,11 +1265,9 @@ def _require_discovery_marker(own_terminal_id: str, action: str) -> Optional[Dic
         }
     # None (no role/allowedTools resolved at all) and "*" both mean
     # unrestricted, matching resolve_allowed_tools' own semantics elsewhere.
-    if (
-        allowed_tools is not None
-        and "*" not in allowed_tools
-        and (DISCOVERY_TOOL_MARKER not in allowed_tools)
-    ):
+    # The test itself lives in orchestration.has_discovery_grant so the
+    # send_message sibling allowance uses the identical definition.
+    if not has_discovery_grant(allowed_tools):
         return {
             "success": False,
             "error": (
@@ -1147,7 +1385,10 @@ async def list_siblings(
     here.
 
     Use this to find other agents working in the same project/folder/tenant,
-    then message them with send_message using the returned id.
+    then message them with send_message using the returned id. send_message
+    accepts a sibling as receiver_id only while you hold the same 'discovery'
+    grant this tool needs; it checks the sibling list itself, so a terminal
+    that is not your sibling (or has since left the group) is refused.
     """
     return _list_siblings_impl(depth, cross_session)
 
@@ -1242,19 +1483,37 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout())
-        response.raise_for_status()
-        meta = response.json()
+        # Via mcp_utils, which attaches the internal Authorization header. The
+        # bare requests.get here did not, and GET /terminals/{id} IS scope-gated —
+        # so with auth enabled the call 401'd, this returned None, and every
+        # memory scope silently collapsed to global.
+        #
+        # A 404 (terminal genuinely not registered) is the only case that means
+        # "no context". Transport and auth failures PROPAGATE so the caller can
+        # say "cannot reach cao-server" rather than "could not resolve terminal
+        # context" — reporting a down server as a missing identity is the same
+        # class of misdirection as reporting an unreadable config as "disabled".
+        try:
+            meta = mcp_utils.get_json(f"/terminals/{terminal_id}", timeout=_mcp_timeout())
+        except requests.HTTPError as e:
+            if getattr(e.response, "status_code", None) == 404:
+                return None
+            raise
         ctx: Dict[str, Any] = {
             "terminal_id": meta["id"],
             "session_name": meta["session_name"],
             "provider": meta["provider"],
             "agent_profile": meta.get("agent_profile"),
+            "allowed_tools": meta.get("allowed_tools"),
+            "ephemeral": meta.get("ephemeral", False),
         }
-        # Try to get working directory for project scope resolution
+        # Try to get working directory for project scope resolution. Same header
+        # reasoning as above — best-effort, so a failure degrades project scope
+        # rather than failing the call.
         try:
             wd_resp = requests.get(
                 f"{API_BASE_URL}/terminals/{terminal_id}/working-directory",
+                headers=mcp_utils._auth_headers() or None,
                 timeout=_mcp_timeout(),
             )
             if wd_resp.status_code == 200:
@@ -1262,6 +1521,11 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
         except Exception:
             pass
         return ctx
+    except requests.RequestException:
+        # Let the caller distinguish "unreachable / unauthorized" from "no
+        # context"; the memory tools still degrade to None via their own
+        # handlers, while the outcome tools report the real cause.
+        raise
     except Exception as e:
         logger.warning(f"Failed to get terminal context for memory tools: {e}")
         return None
@@ -1286,6 +1550,274 @@ def _caller_has_store_lesson_capability(caller_profile: Optional[str]) -> bool:
     except Exception as e:  # noqa: BLE001 — authz check fails closed
         logger.warning(f"store_lesson capability lookup failed for {caller_profile!r}: {e}")
         return False
+
+
+CAO_MCP_SERVER_SELECTOR = "@cao-mcp-server"
+
+
+def _tool_denied_reason(tool_name: str) -> Optional[str]:
+    """Reason the calling terminal's allowlist bars ``tool_name``, or None to allow.
+
+    ``assign``, ``handoff`` and ``assign_elastic`` spawn a terminal under a
+    caller-chosen ``agent_profile``. ``workflow_run``, ``workflow_resume`` and
+    ``workflow_start`` can dispatch the same work through a workflow. An agent
+    reaching any of them can mint a new identity with its own memory scope
+    under another installed profile (#671). The
+    provider-native restrictions built by ``utils/tool_mapping`` cannot cover
+    that: ``get_disallowed_tools`` skips every ``@``-prefixed entry because MCP
+    server references have no native tool names, so CAO's own MCP surface is
+    unreachable from that mechanism by construction.
+
+    The authorization model here is the one CAO already has, not a second one.
+    The effective list is the terminal's recorded ``allowed_tools``, or the
+    profile resolution that ``None`` stands for, and these operations are
+    granted by the documented ``@cao-mcp-server`` server selector or by ``*``.
+    Bare tool names are provider-native vocabulary and never name an MCP tool.
+
+    Fails closed. An unset ``CAO_TERMINAL_ID`` is the supported operator
+    context (``cao assign`` and ``cao handoff`` run with no caller identity)
+    and allows. Once the caller claims an identity every failure to resolve it
+    denies: a malformed ID, an unreachable or unauthorized cao-server, a
+    terminal that is not registered, an unreadable profile.
+
+    ``None`` from ``_get_terminal_context_from_env`` is NOT proof of an
+    operator context. That helper also returns ``None`` for a malformed
+    ``CAO_TERMINAL_ID`` (which ``_current_terminal_id`` itself calls a hard
+    error) and from its trailing ``except Exception``. So boundness is
+    established here from the environment rather than inferred from the
+    absence of an exception.
+    """
+    if not os.environ.get("CAO_TERMINAL_ID"):
+        return None
+
+    try:
+        context = _get_terminal_context_from_env()
+    except Exception as e:  # noqa: BLE001  (an unknown result must not dispatch)
+        logger.warning(f"authorization lookup failed for '{tool_name}': {e}")
+        return f"cannot authorize '{tool_name}': the calling terminal could not be resolved ({e})"
+
+    if context is None:
+        return (
+            f"cannot authorize '{tool_name}': CAO_TERMINAL_ID is set but the calling "
+            "terminal could not be resolved"
+        )
+
+    if tool_name == "create_ephemeral_agent" and context.get("ephemeral"):
+        return "max_depth_exceeded: ephemeral agents cannot create ephemeral agents (ephemeral.max_depth=1)"
+
+    if tool_name in {
+        "assign",
+        "handoff",
+        "assign_elastic",
+        "workflow_run",
+        "workflow_resume",
+        "workflow_start",
+    }:
+        try:
+            from cli_agent_orchestrator.services.settings_service import child_may_delegate
+
+            if context.get("ephemeral") and not child_may_delegate():
+                return f"'{tool_name}' is not permitted: ephemeral child delegation requires ephemeral.child_may_delegate"
+        except Exception as exc:
+            return f"cannot authorize '{tool_name}': ephemeral delegation policy could not be resolved ({exc})"
+
+    try:
+        allowed = _caller_effective_allowed_tools(context)
+    except Exception as e:  # noqa: BLE001  (an unknown result must not dispatch)
+        logger.warning(f"allowlist resolution failed for '{tool_name}': {e}")
+        return (
+            f"cannot authorize '{tool_name}': the caller's allowed tools could not "
+            f"be resolved ({e})"
+        )
+
+    if allowed is None:
+        return f"cannot authorize '{tool_name}': the caller's allowed tools could not be resolved"
+
+    if "*" in allowed or CAO_MCP_SERVER_SELECTOR in allowed:
+        return None
+
+    return (
+        f"'{tool_name}' is not permitted: the calling terminal's allowed tools do not "
+        f"include '{CAO_MCP_SERVER_SELECTOR}'"
+    )
+
+
+async def create_ephemeral_agent(
+    purpose: Annotated[Any, WithJsonSchema({"type": "string"})],
+    brief: Annotated[Any, WithJsonSchema({"type": "string"})],
+    tools: Annotated[
+        Any,
+        WithJsonSchema(
+            {
+                "anyOf": [
+                    {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["fs_read", "fs_list", "fs_write", "execute_bash", "web_fetch"],
+                        },
+                    },
+                    {"type": "null"},
+                ]
+            }
+        ),
+    ] = None,
+    provider: Annotated[
+        Any,
+        WithJsonSchema(
+            {"anyOf": [{"type": "string", "enum": ["claude_code", "codex"]}, {"type": "null"}]}
+        ),
+    ] = None,
+    model_tier: Annotated[
+        Any,
+        WithJsonSchema(
+            {
+                "anyOf": [
+                    {"type": "string", "enum": ["small", "medium", "large", "auto"]},
+                    {"type": "null"},
+                ]
+            }
+        ),
+    ] = None,
+    effort: Annotated[
+        Any,
+        WithJsonSchema(
+            {
+                "anyOf": [
+                    {"type": "string", "enum": ["low", "medium", "high", "auto"]},
+                    {"type": "null"},
+                ]
+            }
+        ),
+    ] = None,
+    description: Annotated[
+        Any, WithJsonSchema({"anyOf": [{"type": "string"}, {"type": "null"}]})
+    ] = None,
+) -> Dict[str, Any]:
+    """Create and store a bounded agent profile for its creator to launch once.
+
+    The CAO-recorded tool list is bounded by the creator's effective list.
+    This is not an OS privilege boundary or a per-tool MCP restriction.
+    Codex tools are advisory when the operator enables Codex. The feature
+    defaults off; see docs/ephemeral-agents.md for the full honesty statement.
+    """
+    return await _create_ephemeral_from_arguments(
+        {
+            "purpose": purpose,
+            "brief": brief,
+            "description": description,
+            "provider": provider,
+            "tools": tools,
+            "model_tier": model_tier,
+            "effort": effort,
+        }
+    )
+
+
+async def _create_ephemeral_from_arguments(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Gate before forwarding raw arguments to the sole, server-side validator."""
+    from cli_agent_orchestrator.services.ephemeral_service import log_refusal
+
+    caller_id = os.environ.get("CAO_TERMINAL_ID")
+    if not caller_id:
+        rule, detail = "creator_unresolved", "a registered calling terminal is required"
+    else:
+        denied = await asyncio.to_thread(_tool_denied_reason, "create_ephemeral_agent")
+        if denied:
+            rule = (
+                "max_depth_exceeded"
+                if "max_depth_exceeded" in denied
+                else (
+                    "creator_unresolved" if "cannot authorize" in denied else "tool_exceeds_creator"
+                )
+            )
+            detail = (
+                "ephemeral agents cannot create ephemeral agents"
+                if rule == "max_depth_exceeded"
+                else (
+                    "@cao-mcp-server"
+                    if rule == "tool_exceeds_creator"
+                    else "calling terminal could not be resolved"
+                )
+            )
+        else:
+            payload = {"spec_version": 1, **arguments}
+            try:
+                response = await asyncio.to_thread(
+                    requests.post,
+                    f"{API_BASE_URL}/ephemeral-agents",
+                    params={"caller_id": caller_id},
+                    json=payload,
+                    headers=mcp_utils._auth_headers() or None,
+                    timeout=_mcp_timeout(),
+                )
+                data = response.json()
+                if response.status_code == 201:
+                    return data
+                error = data.get("detail", {}) if isinstance(data, dict) else None
+                if not isinstance(error, dict):
+                    # Auth refusals use string details, outside the policy error contract.
+                    log_refusal("unexpected_failure", caller_id, None, "")
+                    return {
+                        "success": False,
+                        "rule": "unexpected_failure",
+                        "message": "ephemeral policy: unexpected_failure",
+                    }
+                return {
+                    "success": False,
+                    "rule": error.get("rule", "unexpected_failure"),
+                    "message": error.get("message", "ephemeral policy: unexpected_failure"),
+                }
+            except requests.exceptions.JSONDecodeError:
+                # requests' JSON error is also a RequestException; it is not a network failure.
+                rule, detail = "unexpected_failure", ""
+            except requests.RequestException:
+                rule, detail = "creator_unresolved", "cao-server could not be reached"
+            except ValueError:
+                rule, detail = "unexpected_failure", ""
+    log_refusal(rule, caller_id, None, detail)
+    return {
+        "success": False,
+        "rule": rule,
+        "message": f"ephemeral policy: {rule}" + (f" {detail}" if detail else ""),
+    }
+
+
+class _EphemeralCreateTool(Tool):
+    """Use normal tool resolution, but never bind untrusted creation arguments."""
+
+    async def run(self, arguments: Dict[str, Any]) -> ToolResult:
+        return ToolResult(structured_content=await _create_ephemeral_from_arguments(arguments))
+
+
+def _register_ephemeral_tool(target: FastMCP, enabled: Any) -> None:
+    """Register only on literal operator opt-in; agent terminals must restart to see it."""
+    if enabled is True:
+        # The function supplies documentation/schema only, not the execution binder.
+        advertised = Tool.from_function(create_ephemeral_agent)
+        target.add_tool(
+            _EphemeralCreateTool(
+                name=advertised.name,
+                description=advertised.description,
+                parameters=advertised.parameters,
+                output_schema=advertised.output_schema,
+            )
+        )
+
+
+def _ephemeral_enabled_at_startup() -> bool:
+    from cli_agent_orchestrator.services.settings_service import (
+        SettingsUnreadableError,
+        get_ephemeral_settings,
+    )
+
+    try:
+        return get_ephemeral_settings()["enabled"] is True
+    except SettingsUnreadableError:
+        return False
+
+
+_register_ephemeral_tool(mcp, _ephemeral_enabled_at_startup())
 
 
 @mcp.tool()
@@ -1448,6 +1980,14 @@ async def memory_recall(
             if remote_memory_url()
             else await MemoryService().recall(**kwargs)
         )
+        # Curated recall is inserted verbatim into another terminal's context.
+        # Keep its vault/native scope set aligned with the deterministic builder:
+        # agent-scoped memories are explicit-recall-only in this release.
+        from cli_agent_orchestrator.services.vault.reader import MEMORY_MANAGER_PROFILE
+
+        if (terminal_context or {}).get("agent_profile") == MEMORY_MANAGER_PROFILE:
+            injectable_scopes = {"session", "project", "global"}
+            memories = [memory for memory in memories if memory.scope in injectable_scopes]
         return {
             "success": True,
             "memories": [
@@ -1457,7 +1997,20 @@ async def memory_recall(
                     "memory_type": m.memory_type,
                     "scope": m.scope,
                     "tags": m.tags,
-                    "file_path": m.file_path,
+                    "file_path": (
+                        getattr(m, "source_path", None)
+                        if getattr(m, "source_kind", "native") == "vault"
+                        else m.file_path
+                    ),
+                    "source_kind": getattr(m, "source_kind", "native"),
+                    "source_path": getattr(m, "source_path", None),
+                    "indexed_at": (
+                        m.indexed_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        if getattr(m, "indexed_at", None)
+                        else None
+                    ),
+                    "index_freshness": getattr(m, "index_freshness", None),
+                    "content_truncated": bool(getattr(m, "content_truncated", False)),
                     "updated_at": m.updated_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 }
                 for m in memories
@@ -1482,7 +2035,8 @@ async def memory_forget(
 ) -> Dict[str, Any]:
     """Remove a memory by key and scope.
 
-    Deletes the wiki topic file and removes the entry from index.md.
+    Deletes native memory files or deindexes vault-backed memory without
+    deleting the underlying vault note.
     """
     from cli_agent_orchestrator.services.memory_gateway import forget_memory, remote_memory_url
     from cli_agent_orchestrator.services.memory_service import MemoryService
@@ -1504,7 +2058,9 @@ async def memory_forget(
         )
         return {
             "success": True,
-            "deleted": deleted,
+            "deleted": bool(deleted),
+            "action": deleted.action,
+            "path": deleted.path,
             "key": key,
             "scope": scope,
         }
@@ -1512,6 +2068,42 @@ async def memory_forget(
         return {"success": False, "disabled": True, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def _outcome_tool_error(
+    exc: Exception, fallback: str, *, extra: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Translate a failed outcome-API call into the tool's error payload.
+
+    ``disabled: True`` requires a 404 **and** the gate's own
+    ``LEARNING_DISABLED_CODE`` discriminator in the body. Status alone is not
+    enough: a missing ``/outcomes`` route during a mixed-version rollout, or a
+    proxy that does not know the path, returns an ordinary
+    ``{"detail": "Not Found"}`` 404 — and ``skills/cao-learning`` instructs
+    agents to skip a ``disabled: true`` payload SILENTLY, so inferring the
+    feature state from a generic 404 drops outcomes without a trace. That is the
+    same class of misreporting this module exists to remove, so an unmarked 404
+    stays an explicit failure with no ``disabled`` key.
+
+    A 503 (settings unreadable) and a transport failure are likewise never
+    "disabled", for the same reason: an unreadable settings.json used to present
+    itself as a deliberate opt-out.
+    """
+    extra = dict(extra or {})
+    if isinstance(exc, requests.ConnectionError):
+        return {
+            "success": False,
+            "error": "Failed to connect to cao-server. The server may not be running.",
+            **extra,
+        }
+    response = getattr(exc, "response", None)
+    if response is None:
+        return {"success": False, "error": f"{fallback}: {exc}", **extra}
+
+    detail = _extract_error_detail(response, fallback)
+    if response.status_code == 404 and LEARNING_DISABLED_CODE in detail:
+        return {"success": False, "disabled": True, "error": detail, **extra}
+    return {"success": False, "error": detail, **extra}
 
 
 @mcp.tool()
@@ -1555,11 +2147,6 @@ async def report_outcome(
     Requires memory.learning_enabled=true (opt-in); otherwise returns a
     disabled payload without recording anything.
     """
-    from cli_agent_orchestrator.services.outcome_service import (
-        LearningDisabledError,
-        OutcomeService,
-    )
-
     try:
         terminal_context = _get_terminal_context_from_env()
         if not terminal_context:
@@ -1567,20 +2154,25 @@ async def report_outcome(
                 "success": False,
                 "error": "Could not resolve terminal context (CAO_TERMINAL_ID unset or unknown)",
             }
-        service = OutcomeService()
-        outcome = service.record_outcome(
-            session_name=terminal_context["session_name"],
-            task_label=task_label,
-            success=success,
-            workflow_name=workflow_name,
-            agent_profile=agent_profile or terminal_context.get("agent_profile"),
-            source_terminal_id=terminal_context["terminal_id"],
-            score=score,
-            friction_notes=friction_notes,
+        payload = mcp_utils.post_body_json(
+            "/outcomes",
+            {
+                "session_name": terminal_context["session_name"],
+                "task_label": task_label,
+                "success": success,
+                "workflow_name": workflow_name,
+                "agent_profile": agent_profile or terminal_context.get("agent_profile"),
+                "source_terminal_id": terminal_context["terminal_id"],
+                "score": score,
+                "friction_notes": friction_notes,
+            },
+            timeout=_mcp_timeout(),
         )
-        return {"success": True, "outcome_id": outcome["id"]}
-    except LearningDisabledError as e:
-        return {"success": False, "disabled": True, "error": str(e)}
+        # Only the id: the route returns the whole record, and echoing it would
+        # newly surface friction_notes back to the agent that wrote them.
+        return {"success": True, "outcome_id": payload["outcome"]["id"]}
+    except requests.RequestException as e:
+        return _outcome_tool_error(e, "Failed to record outcome")
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1607,17 +2199,7 @@ async def list_outcomes(
     Requires memory.learning_enabled=true; returns an empty list with a
     disabled marker otherwise.
     """
-    from cli_agent_orchestrator.services.outcome_service import OutcomeService
-    from cli_agent_orchestrator.services.settings_service import is_learning_enabled
-
     try:
-        if not is_learning_enabled():
-            return {
-                "success": False,
-                "disabled": True,
-                "error": LEARNING_DISABLED_MESSAGE,
-                "outcomes": [],
-            }
         if session_name is None:
             # Fail closed: without an explicit session filter the caller's
             # own session is REQUIRED. Proceeding with None would run an
@@ -1635,13 +2217,20 @@ async def list_outcomes(
                     ),
                     "outcomes": [],
                 }
-        outcomes = OutcomeService().list_outcomes(
+        payload = mcp_utils.get_json(
+            "/outcomes",
             session_name=session_name,
             agent_profile=agent_profile,
             workflow_name=workflow_name,
-            limit=limit,
+            # Clamped, not passed through: OutcomeService clamps silently, so
+            # limit=500 works today, while the route's Query(le=200) would 422 it.
+            limit=min(max(1, int(limit)), 200),
+            timeout=_mcp_timeout(),
         )
+        outcomes = payload["outcomes"]
         return {"success": True, "outcomes": outcomes, "count": len(outcomes)}
+    except requests.RequestException as e:
+        return _outcome_tool_error(e, "Failed to list outcomes", extra={"outcomes": []})
     except Exception as e:
         return {"success": False, "error": str(e), "outcomes": []}
 
@@ -1810,6 +2399,7 @@ async def workflow_return(
         response = requests.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/steps/{step_id}/output",
             json=payload,
+            headers=mcp_utils._auth_headers() or None,
             timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:
@@ -1829,6 +2419,21 @@ async def workflow_return(
     ).model_dump()
 
 
+def _workflow_default_root(explicit: object) -> Optional[str]:
+    """Resolve an explicit or caller-terminal project root before the run POST."""
+    if isinstance(explicit, str):
+        return explicit
+    terminal_id = os.getenv("CAO_TERMINAL_ID")
+    if not terminal_id:
+        return None
+    try:
+        data = mcp_utils.get_json(f"/terminals/{quote(terminal_id, safe='')}/working-directory")
+        value = data.get("working_directory")
+        return value if isinstance(value, str) else None
+    except (requests.RequestException, ValueError, TypeError, AttributeError):
+        return None
+
+
 @mcp.tool()
 async def workflow_run(
     name_or_path: Annotated[
@@ -1845,6 +2450,16 @@ async def workflow_run(
                 "Optional explicit run id (matches WORKFLOW_NAME_RE); the server mints "
                 "one if omitted. Validation and the uniqueness/admission gate are "
                 "server-side — a collision surfaces as the ok=False error envelope."
+            )
+        ),
+    ] = None,
+    working_directory: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Optional project root for a script run (its working directory, and the "
+                "directory fingerprinted for approval). Defaults to the calling terminal's "
+                "working directory, else cao-server's. Ignored for YAML workflows."
             )
         ),
     ] = None,
@@ -1872,6 +2487,10 @@ async def workflow_run(
     (``_check_run_id_available``, 409 on collision), surfaced through the envelope.
     The tool stays blocking (FR-5.2); the async ``:submit`` spine is a separate seam.
     """
+    denied = await asyncio.to_thread(_tool_denied_reason, "workflow_run")
+    if denied:
+        return {"ok": False, "error": denied}
+
     payload: Dict[str, Any] = {"name_or_path": name_or_path, "inputs": inputs or {}}
     # Forward the id ONLY when a real value was supplied. ``isinstance(..., str)``
     # (not ``is not None``) so the omitted case is byte-identical to today whether
@@ -1880,6 +2499,10 @@ async def workflow_run(
     # sentinel, which is not a str) — FR-1.2.
     if isinstance(run_id, str):
         payload["run_id"] = run_id
+    root = _workflow_default_root(working_directory)
+    if root is not None:
+        payload["working_directory"] = root
+    auth_headers = mcp_utils._auth_headers() or None
     try:
         # The server awaits the WHOLE run inline (Q1=A), so this blocks for the full
         # run duration — use the worst-case-covering run timeout, NOT the short
@@ -1887,6 +2510,7 @@ async def workflow_run(
         response = requests.post(
             f"{API_BASE_URL}/workflows/runs",
             json=payload,
+            headers=auth_headers,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
         )
     except requests.RequestException as e:
@@ -1894,7 +2518,9 @@ async def workflow_run(
 
     if response.status_code != 200:
         detail = _extract_error_detail(response, f"status {response.status_code}")
-        return {"ok": False, "error": detail}
+        # FR-10 APPROVE step: carry the refusal class and plan_id as FIELDS so an
+        # agent branches rather than scraping the message. {} for any other body.
+        return {"ok": False, "error": detail, **_refusal_envelope_fields(response)}
 
     data = response.json()
     return {
@@ -1952,6 +2578,10 @@ async def workflow_resume(
     values. The tool's contract is otherwise unchanged: a 400 from the route is still
     just another ``ok=False`` detail.
     """
+    denied = await asyncio.to_thread(_tool_denied_reason, "workflow_resume")
+    if denied:
+        return {"ok": False, "error": denied}
+
     # ``decisions`` arrives as a real dict from an MCP client (fastmcp resolves the
     # declared default through the generated model) and as the ``FieldInfo`` SENTINEL
     # when a Python caller omits the argument entirely — this module's tools are
@@ -1974,6 +2604,7 @@ async def workflow_resume(
         response = requests.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/resume",
             json={"decisions": dict(supplied)} if supplied else None,
+            headers=mcp_utils._auth_headers() or None,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
         )
     except requests.RequestException as e:
@@ -1981,7 +2612,9 @@ async def workflow_resume(
 
     if response.status_code != 200:
         detail = _extract_error_detail(response, f"status {response.status_code}")
-        return {"ok": False, "error": detail}
+        # FR-10 APPROVE step: carry the refusal class and plan_id as FIELDS so an
+        # agent branches rather than scraping the message. {} for any other body.
+        return {"ok": False, "error": detail, **_refusal_envelope_fields(response)}
 
     data = response.json()
     return {
@@ -2006,6 +2639,7 @@ async def workflow_cancel(
     try:
         response = requests.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/cancel",
+            headers=mcp_utils._auth_headers() or None,
             timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:
@@ -2045,6 +2679,16 @@ async def workflow_start(
             )
         ),
     ] = None,
+    working_directory: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Optional project root for a script run (its working directory, and the "
+                "directory fingerprinted for approval). Defaults to the calling terminal's "
+                "working directory, else cao-server's. Ignored for YAML workflows."
+            )
+        ),
+    ] = None,
 ) -> Dict[str, Any]:
     """Submit a workflow run ASYNCHRONOUSLY and return its handle immediately (issue #505, U6).
 
@@ -2060,17 +2704,26 @@ async def workflow_start(
     blocking tool); admission (uniqueness) is the server's and a collision surfaces
     as ``ok=False``.
     """
+    denied = await asyncio.to_thread(_tool_denied_reason, "workflow_start")
+    if denied:
+        return {"ok": False, "error": denied}
+
     payload: Dict[str, Any] = {"name_or_path": name_or_path, "inputs": inputs or {}}
     # Forward the id ONLY when a real value was supplied — ``isinstance(..., str)``
     # (not ``is not None``) so the omitted case is byte-identical whether invoked
     # through FastMCP (Field default -> None) or called directly (FieldInfo sentinel).
     if isinstance(run_id, str):
         payload["run_id"] = run_id
+    root = _workflow_default_root(working_directory)
+    if root is not None:
+        payload["working_directory"] = root
+    auth_headers = mcp_utils._auth_headers() or None
     try:
         # Async submit — the normal per-call timeout, NOT the long blocking one (TR-1).
         response = requests.post(
             f"{API_BASE_URL}/workflows/runs:submit",
             json=payload,
+            headers=auth_headers,
             timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:
@@ -2078,7 +2731,9 @@ async def workflow_start(
 
     if response.status_code != 202:
         detail = _extract_error_detail(response, f"status {response.status_code}")
-        return {"ok": False, "error": detail}
+        # FR-10 APPROVE step: carry the refusal class and plan_id as FIELDS so an
+        # agent branches rather than scraping the message. {} for any other body.
+        return {"ok": False, "error": detail, **_refusal_envelope_fields(response)}
 
     data = response.json()
     links = data.get("links") or {}
@@ -2104,16 +2759,23 @@ async def workflow_plan_approval(
     Approving is ``cao workflow approve <plan_id>`` at a human's terminal, behind the ``cao:admin``
     scope. Use this tool to tell the operator which ``plan_id`` to approve.
 
-    WHAT IS NOT IMPLEMENTED, stated because you may otherwise assume it: a plan identifier covers the
-    workflow's execution-affecting fields, so changing any of them yields a different ``plan_id`` that
-    needs its own approval. But **rejection of an update presenting a stale source hash is NOT yet
-    implemented** — do not rely on a stale-hash check having run. Six manifest fields (provider,
-    model, profile, permissions, limits, retry policy) are also **omitted rather than recorded**,
+    A plan identifier covers the workflow's execution-affecting fields, so changing any of them yields a
+    different ``plan_id`` that needs its own approval. **Rejection of an update presenting a stale source
+    hash IS implemented** (issue #583 Bolt 3): ``workflow_update`` requires an ``expected_hash`` and the
+    server refuses the write when the spec has moved on, so a caller that edits from a stale read is
+    stopped rather than silently overwriting. You therefore do NOT need to re-verify the hash yourself —
+    and you must not fetch it immediately before writing, because a hash read from the file you are about
+    to overwrite always matches, which removes the check rather than satisfying it.
+
+    WHAT IS STILL NOT RECORDED, stated because you may otherwise assume it: six manifest fields
+    (provider, model, profile, permissions, limits, retry policy) are **omitted rather than recorded**,
     because script-tier steps are discovered by executing the Python and so have no run-level value at
     freeze time; they are covered transitively by the source hash.
 
-    Approval enforcement is **off by default**. When it is off, an unapproved plan still runs, and
-    ``approved: false`` here is informational rather than a prediction that the run will be refused.
+    Approval enforcement is **on by default** since issue #583 Bolt 3, so ``approved: false`` here
+    normally DOES predict that a run of this plan will be refused. It is informational rather than
+    predictive only where an operator has disabled enforcement. An unreadable or invalid settings
+    file leaves enforcement ON.
 
     ``plan_id`` is ``null`` for a YAML run (which never freezes a manifest) and for a script run whose
     freeze failed. That is reported distinctly from "not approved", because the two call for entirely
@@ -2124,6 +2786,7 @@ async def workflow_plan_approval(
     try:
         response = requests.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}/plan",
+            headers=mcp_utils._auth_headers() or None,
             timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:
@@ -2160,6 +2823,7 @@ async def workflow_status(
     try:
         response = requests.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}",
+            headers=mcp_utils._auth_headers() or None,
             timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:
@@ -2193,6 +2857,17 @@ async def workflow_result(
     Returns a structured envelope on EVERY path — never raises into the agent loop
     (EV-1).
 
+    **TO DECIDE WHETHER TO RETRY OR TO FIX THE WORKFLOW, READ
+    ``failure_envelope.classification``** (issue #583 FR-10): ``transient`` means the
+    same run may succeed on retry; ``artifact_defect`` means a new run needs a changed
+    spec first; ``cancelled`` means a human stopped it and no action is implied. Branch
+    on that FIELD rather than on ``error_kind``, which records the cause rather than the
+    remedy, and never on the message text.
+
+    Two related conditions never appear here, because neither is a run outcome: a replay
+    divergence and a halt awaiting a recovery decision are both returned as a ``kind`` on
+    a 409 from the step-execution route, and neither is persisted.
+
     No run-level ``output`` (PR #525 review): the journal has no column for one, so
     the key this docstring used to advertise was always null. Per-step outputs are
     unaffected — read them from ``steps[].output``.
@@ -2200,6 +2875,7 @@ async def workflow_result(
     try:
         response = requests.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}/result",
+            headers=mcp_utils._auth_headers() or None,
             timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:
@@ -2233,6 +2909,7 @@ async def workflow_list(
         response = requests.get(
             f"{API_BASE_URL}/workflows/runs",
             params=params,
+            headers=mcp_utils._auth_headers() or None,
             timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:
@@ -2270,6 +2947,7 @@ async def workflow_wait(
         try:
             response = requests.get(
                 f"{API_BASE_URL}/workflows/runs/{run_id}",
+                headers=mcp_utils._auth_headers() or None,
                 timeout=_mcp_timeout(),
             )
         except requests.RequestException as e:
@@ -2296,6 +2974,7 @@ async def workflow_wait(
     try:
         result_response = requests.get(
             f"{API_BASE_URL}/workflows/runs/{run_id}/result",
+            headers=mcp_utils._auth_headers() or None,
             timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:
@@ -2335,7 +3014,11 @@ def _classify_events_404(run_id: str, detail: str) -> tuple:
     than asserting a server capability it could not verify.
     """
     try:
-        probe = requests.get(f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=_mcp_timeout())
+        probe = requests.get(
+            f"{API_BASE_URL}/workflows/runs/{run_id}",
+            headers=mcp_utils._auth_headers() or None,
+            timeout=_mcp_timeout(),
+        )
     except requests.RequestException:
         return detail, False
     if probe.status_code == 200:
@@ -2412,7 +3095,7 @@ async def workflow_events(
     params: Dict[str, Any] = {}
     if isinstance(after_seq, int):
         params["after_seq"] = after_seq
-    headers = {"Accept": "text/event-stream"}
+    headers = {**mcp_utils._auth_headers(), "Accept": "text/event-stream"}
 
     events: List[Dict[str, Any]] = []
     gaps: List[Dict[str, Any]] = []
@@ -2536,6 +3219,284 @@ async def workflow_events(
     }
 
 
+# ---------------------------------------------------------------------------
+# Conversational authoring (issue #583 Bolt 3, ``authoring-mcp-tools``).
+#
+# The four operations FR-10 asks for, and the surface its Pass criterion is actually about: "an agent can
+# carry a workflow from description to running without the user choosing a format". Python is the only
+# format written, so no format question is ever put to anyone.
+#
+# THERE IS NO GRANT TOOL HERE, AND THERE NEVER WILL BE. Approving a plan stays a human act performed
+# through ``cao workflow approve``. Bolt 2 made ``workflow_plan_approval`` read-only for this reason: an
+# MCP grant tool lets an agent approve the plan it just wrote, which collapses the human authorisation
+# FR-8 exists to preserve. Adding four authoring tools is precisely the moment someone would "complete
+# the set", so the absence is enforced by a test over the registered tool inventory rather than by this
+# comment alone — see ``test_no_mcp_tool_grants_an_approval``.
+#
+# EVERY PARAMETER BELOW IS REQUIRED, VIA ``Annotated[str, Field(...)]`` RATHER THAN A DEFAULT. That shape
+# is load-bearing, not stylistic. A ``Field(...)`` sitting in a parameter's DEFAULT arrives as a truthy
+# ``FieldInfo`` sentinel when a Python caller omits the argument — which is how this module's own tests
+# call these tools — so a guard written as ``if value:`` would treat "nothing supplied" as "something
+# supplied". That trap is live here and mitigated inline three times elsewhere in this file. With nothing
+# optional it cannot occur at all, and ``test_authoring_tools_declare_no_field_defaults`` keeps it that
+# way rather than trusting that no one adds a convenience argument later.
+#
+# Refusals carry a machine-readable ``class`` alongside the server's own message. This departs from the
+# 11 older workflow tools, which return a bare string: FR-10's criterion is about what an AGENT can do,
+# and ``services.md`` tells callers to branch on a field and never to scrape a message, so a surface
+# built for agents that forces prose-parsing satisfies the letter and misses the point. Retrofitting the
+# other 11 is the correct end state and is deliberately NOT done here (it would mean reaching into tools
+# this unit does not own); it needs ``_extract_error_detail`` widened to return the status alongside the
+# detail.
+# ---------------------------------------------------------------------------
+
+#: Status -> refusal class, per calling tool. Knowing the TOOL is what lets ``create``'s 409
+#: (already_exists) and ``update``'s 409 (stale_hash) carry different classes — a discrimination the CLI
+#: could not make, because it maps from the status alone.
+_AUTHORING_CLASS_BY_STATUS = {
+    "create": {409: "already_exists", 400: "invalid_request"},
+    "update": {404: "not_found", 409: "stale_hash", 400: "invalid_request"},
+    "get": {404: "not_found", 400: "invalid_request", 409: "conflict"},
+    "validate": {400: "invalid_request", 404: "not_found"},
+}
+
+
+def _authoring_refusal(
+    op: str,
+    response: requests.Response,
+    auth_headers: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
+    """Build the classed refusal envelope for an authoring tool.
+
+    Lint failures reach authoring callers as 400 invalid-request responses because the service flattens
+    them into ``ValueError``. The classifier deliberately does not sniff messages, so a hypothetical 422
+    falls through to the generic ``error`` class rather than advertising a dead branch.
+    """
+    if response.status_code == 401:
+        detail = (
+            "cao-server rejected the configured local authentication credential"
+            if auth_headers
+            else "cao-server requires authentication; configure CAO_AUTH_LOCAL_TOKEN"
+        )
+    else:
+        detail = _extract_error_detail(response, f"status {response.status_code}")
+    klass = _AUTHORING_CLASS_BY_STATUS.get(op, {}).get(response.status_code, "error")
+    return {"ok": False, "class": klass, "error": detail}
+
+
+def _unreachable_refusal(exc: Exception) -> Dict[str, Any]:
+    """A transport failure is not a content refusal, and must never read like one.
+
+    The agent's next action differs completely — start the server versus fix the spec — so this carries
+    its own class rather than being folded into ``invalid_request``.
+    """
+    return {"ok": False, "class": "unreachable", "error": f"could not reach cao-server: {exc}"}
+
+
+def _workflow_name_refusal(name: object) -> Optional[Dict[str, Any]]:
+    """Validate the documented bare workflow-name contract before making an HTTP request."""
+    if isinstance(name, str) and re.fullmatch(WORKFLOW_NAME_RE, name):
+        return None
+    return {
+        "ok": False,
+        "class": "invalid_request",
+        "error": "workflow name must be a bare name matching [A-Za-z0-9_-]{1,64}",
+    }
+
+
+def _authoring_success(response: requests.Response) -> Dict[str, Any]:
+    """Return a successful authoring envelope without letting malformed JSON escape the tool."""
+    try:
+        body = response.json()
+    except ValueError:
+        return {
+            "ok": False,
+            "class": "error",
+            "error": "cao-server returned an invalid success response",
+        }
+    if not isinstance(body, Mapping):
+        return {
+            "ok": False,
+            "class": "error",
+            "error": "cao-server returned an unexpected success response",
+        }
+    return {**body, "ok": True}
+
+
+@mcp.tool()
+async def workflow_create(
+    name: Annotated[str, Field(description="Bare workflow name (no path, no extension)")],
+    source: Annotated[str, Field(description="The Python spec's full source text")],
+) -> Dict[str, Any]:
+    """Create a NEW Python workflow spec (issue #583 FR-10).
+
+    A thin HTTP client over ``POST /workflows``. Refuses to overwrite an existing spec — use
+    ``workflow_update`` for that. Python only; a YAML-tier name is refused with a message naming the
+    restriction.
+
+    Send the SOURCE TEXT, never a path: the server decides where a spec lands, and validation, the lint
+    gate, path containment, the atomic write and the index update all happen there. This tool opens no
+    files — going through CAO rather than using your own file tools is the point of the design.
+
+    On success returns ``{ok: True, name, path, content_hash}``. **Keep ``content_hash``** — it is what
+    ``workflow_update`` requires next, so the authoring loop needs no ``workflow_get`` between edits.
+
+    On refusal returns ``{ok: False, class, error}`` where ``class`` is one of ``already_exists`` (that
+    name is taken), ``invalid_request`` (bad name, wrong tier, YAML refused, over the size cap, or lint
+    errors that would make the spec unrunnable), or ``unreachable``. Branch on ``class``, not on the
+    message. Never raises into the agent loop (EV-1).
+    """
+    refusal = _workflow_name_refusal(name)
+    if refusal:
+        return refusal
+    auth_headers = mcp_utils._auth_headers() or None
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/workflows",
+            json={"name": name, "source": source},
+            headers=auth_headers,
+            timeout=_mcp_timeout(),
+        )
+    except requests.RequestException as e:
+        return _unreachable_refusal(e)
+
+    if response.status_code not in (200, 201):
+        return _authoring_refusal("create", response, auth_headers)
+
+    return _authoring_success(response)
+
+
+@mcp.tool()
+async def workflow_update(
+    name: Annotated[str, Field(description="Bare workflow name of the EXISTING spec")],
+    source: Annotated[str, Field(description="The replacement Python source text")],
+    expected_hash: Annotated[
+        str,
+        Field(
+            description="The content_hash you believe the spec currently has (see the tool docs)"
+        ),
+    ],
+) -> Dict[str, Any]:
+    """Replace an EXISTING spec's source, refusing a stale update (issue #583 FR-10, FR-8).
+
+    A thin HTTP client over ``PUT /workflows/{name}``. Refuses to create — use ``workflow_create``.
+
+    **WHERE ``expected_hash`` COMES FROM.** Use the ``content_hash`` returned by your previous
+    ``workflow_create`` or ``workflow_update`` call. The happy path therefore needs no extra call at all:
+    both write tools hand back the new hash, so an agent iterating on a spec already holds what the next
+    edit requires. If you have lost it, ``workflow_get`` returns it.
+
+    **DO NOT FETCH IT IMMEDIATELY BEFORE WRITING.** Calling ``workflow_get`` and passing the hash you just
+    received straight into this tool DEFEATS the check entirely rather than satisfying it: a hash read
+    from the file you are about to overwrite always matches, so the comparison passes unconditionally and
+    a concurrent edit between your read and your write is exactly what slips through unnoticed. The hash
+    is meaningful only as an assertion about what you believe you are replacing — which is why there is no
+    force flag and no way to omit it.
+
+    On success returns ``{ok: True, name, path, content_hash}`` with the NEW hash for your next edit.
+
+    On refusal returns ``{ok: False, class, error}`` where ``class`` is ``not_found`` (no such spec —
+    create it), ``stale_hash`` (someone changed it since your hash; re-read and re-apply your change),
+    ``invalid_request``, or ``unreachable``. Never raises into the agent loop (EV-1).
+    """
+    refusal = _workflow_name_refusal(name)
+    if refusal:
+        return refusal
+    encoded_name = quote(name, safe="")
+    auth_headers = mcp_utils._auth_headers() or None
+    try:
+        response = requests.put(
+            f"{API_BASE_URL}/workflows/{encoded_name}",
+            json={"source": source, "expected_hash": expected_hash},
+            headers=auth_headers,
+            timeout=_mcp_timeout(),
+        )
+    except requests.RequestException as e:
+        return _unreachable_refusal(e)
+
+    if response.status_code != 200:
+        return _authoring_refusal("update", response, auth_headers)
+
+    return _authoring_success(response)
+
+
+@mcp.tool()
+async def workflow_get(
+    name: Annotated[str, Field(description="Bare workflow name (no path, no extension)")],
+) -> Dict[str, Any]:
+    """Read back a workflow spec, including its source and ``content_hash`` (issue #583 FR-10).
+
+    A thin HTTP client over ``GET /workflows/{name}``. This is FR-10's "inspect" operation: it returns the
+    parsed, validated spec, so it is how you see what a workflow currently is rather than what you last
+    sent.
+
+    Use it to recover a ``content_hash`` you no longer have — but note ``workflow_create`` and
+    ``workflow_update`` both return the hash, so the ordinary editing loop does not need this call. Note
+    also that this route rebuilds the spec index, so calling it in a loop is the expensive way to do
+    anything.
+
+    On refusal returns ``{ok: False, class, error}`` with ``class`` of ``not_found``, ``conflict``
+    (remove or rename the colliding spec file), ``invalid_request``, or ``unreachable``. Never raises
+    into the agent loop (EV-1).
+    """
+    refusal = _workflow_name_refusal(name)
+    if refusal:
+        return refusal
+    encoded_name = quote(name, safe="")
+    auth_headers = mcp_utils._auth_headers() or None
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/workflows/{encoded_name}",
+            headers=auth_headers,
+            timeout=_mcp_timeout(),
+        )
+    except requests.RequestException as e:
+        return _unreachable_refusal(e)
+
+    if response.status_code != 200:
+        return _authoring_refusal("get", response, auth_headers)
+
+    return _authoring_success(response)
+
+
+@mcp.tool()
+async def workflow_validate(
+    source: Annotated[str, Field(description="Python spec source text to lint, as a draft")],
+) -> Dict[str, Any]:
+    """Lint Python spec source WITHOUT creating anything (issue #583 FR-10).
+
+    A thin HTTP client over ``POST /workflows/validate``. Takes TEXT, not a name and not a path, so **a
+    draft can be checked before it exists anywhere** — which is the order to work in: validate, revise,
+    then ``workflow_create``. Creating first and learning about lint errors from a refused write is the
+    slower loop.
+
+    Nothing is written to disk to perform the check, and no file needs to exist.
+
+    To validate a spec that is already stored, call ``workflow_get`` and pass its ``source`` here.
+
+    On success returns ``{ok: True, **the ScriptValidationResult}`` — read its ``status`` (``pass`` or
+    ``fail``) and its ``findings``. **A lint ERROR means CAO would refuse to RUN the spec**, so treat a
+    failing verdict as work to do before creating, not as advice.
+
+    On refusal returns ``{ok: False, class, error}``. Never raises into the agent loop (EV-1).
+    """
+    auth_headers = mcp_utils._auth_headers() or None
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/workflows/validate",
+            json={"source": source},
+            headers=auth_headers,
+            timeout=_mcp_timeout(),
+        )
+    except requests.RequestException as e:
+        return _unreachable_refusal(e)
+
+    if response.status_code != 200:
+        return _authoring_refusal("validate", response, auth_headers)
+
+    return _authoring_success(response)
+
+
 # The MCP Apps surface — tools (render_dashboard / render_agent_view /
 # cao_fetch_history / subscribe_events / submit_command), the ui://cao/* resources,
 # the topology widget (cao://widget/topology + /widgets/topology/), and the SEP-2133
@@ -2550,7 +3511,9 @@ register_mcp_server_surfaces(mcp)
 
 def main():
     """Main entry point for the MCP server."""
-    mcp.run()
+    # Pinned: FASTMCP_TRANSPORT in the pane environment must not turn the
+    # per-terminal stdio server into a network listener.
+    mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

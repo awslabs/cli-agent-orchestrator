@@ -8,10 +8,17 @@ import asyncio
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from cli_agent_orchestrator.models.memory import Memory
 from cli_agent_orchestrator.services.memory_service import MemoryService
+from cli_agent_orchestrator.services.vault.config import (
+    FolderMapping,
+    VaultConfig,
+    VaultSpec,
+)
 
 pytestmark = pytest.mark.usefixtures("isolated_memory_db")
 
@@ -114,7 +121,7 @@ class TestStoreUpdatesIndexMd:
         svc = MemoryService(base_dir=tmp_path)
         ctx = _make_terminal_context()
 
-        mem = _run(
+        _run(
             svc.store(
                 content="Always use type hints",
                 scope="project",
@@ -322,7 +329,7 @@ class TestForgetRemovesFileAndIndex:
         assert file_path.exists()
 
         deleted = _run(svc.forget(key="temp-note", scope="global", terminal_context=ctx))
-        assert deleted is True
+        assert deleted.action == "deleted"
         assert not file_path.exists()
 
         # Check index
@@ -341,7 +348,7 @@ class TestForgetNonexistentKey:
         ctx = _make_terminal_context()
 
         result = _run(svc.forget(key="nonexistent", scope="global", terminal_context=ctx))
-        assert result is False
+        assert result.action == "absent"
 
 
 class TestGetContextRespectsBudget:
@@ -832,7 +839,7 @@ class TestForgetWithExplicitScopeId:
             )
         )
 
-        assert deleted is True
+        assert bool(deleted)
         assert not Path(mem.file_path).exists()
 
     def test_forget_global_with_explicit_scope_id_none(self, tmp_path: Path):
@@ -853,7 +860,7 @@ class TestForgetWithExplicitScopeId:
         assert Path(mem.file_path).exists()
 
         deleted = _run(svc.forget(key="global-ref", scope="global", scope_id=None))
-        assert deleted is True
+        assert deleted.action == "deleted"
         assert not Path(mem.file_path).exists()
 
 
@@ -1138,7 +1145,7 @@ class TestSessionScopeIdRoundTrip:
                 terminal_context=None,
                 scope_id=mem.scope_id,
             )
-            assert ok is True
+            assert ok.action == "deleted"
 
         # Both files gone.
         remaining = await svc.recall(scope="session", terminal_context=None)
@@ -1259,6 +1266,257 @@ class TestSessionScopeIdRoundTrip:
         assert results == []
 
 
+class TestVaultScopeAuthority:
+    """Configured vault mappings replace native visibility for their identity."""
+
+    @pytest.mark.asyncio
+    async def test_unscoped_recall_hides_native_replica_for_index_disabled_mapping(
+        self, tmp_path, monkeypatch
+    ):
+        from cli_agent_orchestrator.services import memory_service, settings_service
+
+        service = MemoryService(base_dir=tmp_path / "native")
+        monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+        monkeypatch.setattr(
+            settings_service, "get_vault_config", lambda: VaultConfig(enabled=False)
+        )
+        await service.store(
+            content="retained native global replica",
+            scope="global",
+            memory_type="reference",
+            key="native-replica",
+        )
+        assert {
+            memory.key for memory in await service.recall(search_mode="metadata", limit=10)
+        } == {"native-replica"}
+
+        vault_root = tmp_path / "vault"
+        vault_root.mkdir()
+        config = VaultConfig(
+            enabled=True,
+            vaults=[
+                VaultSpec(
+                    id="scope-test",
+                    root=str(vault_root),
+                    managed_folder="CAO",
+                    mappings=[
+                        FolderMapping(folder="Mapped", scope="global", index=False),
+                        FolderMapping(
+                            folder="CAO", scope="agent", scope_id="writer", writable=True
+                        ),
+                    ],
+                )
+            ],
+        )
+        monkeypatch.setattr(settings_service, "get_vault_config", lambda: config)
+
+        assert await service.recall(search_mode="metadata", limit=10) == []
+
+    @pytest.mark.asyncio
+    async def test_unscoped_recall_only_uses_callers_project_vault_mapping(
+        self, tmp_path, monkeypatch
+    ):
+        """A project-A caller cannot enumerate project-B's configured vault."""
+        from cli_agent_orchestrator.services import memory_service, settings_service
+
+        vault_root = tmp_path / "vault"
+        vault_root.mkdir()
+        config = VaultConfig(
+            enabled=True,
+            vaults=[
+                VaultSpec(
+                    id="scope-test",
+                    root=str(vault_root),
+                    managed_folder="CAO",
+                    mappings=[
+                        FolderMapping(folder="ProjectA", scope="project", scope_id="project-a"),
+                        FolderMapping(folder="ProjectB", scope="project", scope_id="project-b"),
+                        FolderMapping(folder="CAO", scope="global", writable=True),
+                    ],
+                )
+            ],
+        )
+        monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+        monkeypatch.setattr(settings_service, "get_vault_config", lambda: config)
+        service = MemoryService(base_dir=tmp_path / "native")
+        caller_context = _make_terminal_context(cwd=str(tmp_path / "project-a"))
+        service.resolve_scope_id = lambda scope, _context: (  # type: ignore[method-assign]
+            "project-a" if scope == "project" else None
+        )
+
+        def candidates_for(bindings, **_kwargs):
+            return [
+                SimpleNamespace(
+                    binding=binding,
+                    metadata=SimpleNamespace(memory_type="reference"),
+                    require_injectable=False,
+                )
+                for binding in bindings
+                if binding.scope == "project"
+            ]
+
+        def memory_for(candidate, **_kwargs):
+            key = f"{candidate.binding.scope_id}-key"
+            return Memory(
+                id=key,
+                key=key,
+                memory_type="reference",
+                scope="project",
+                scope_id=candidate.binding.scope_id,
+                file_path=key,
+                created_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+                updated_at=datetime(2025, 1, 1, tzinfo=timezone.utc),
+                content=key,
+                source_kind="vault",
+            )
+
+        monkeypatch.setattr(service, "_vault_candidates", candidates_for)
+        monkeypatch.setattr(memory_service, "load_candidate", memory_for)
+
+        results = await service.recall(
+            terminal_context=caller_context,
+            search_mode="metadata",
+            limit=10,
+        )
+
+        assert {memory.key for memory in results} == {"project-a-key"}
+
+    def test_context_does_not_fall_back_to_native_peer_when_vault_injection_is_disabled(
+        self, tmp_path, monkeypatch
+    ):
+        """A mapped `inject=False` project suppresses both vault and native context."""
+        from cli_agent_orchestrator.services import memory_service, settings_service
+
+        service = MemoryService(base_dir=tmp_path / "native")
+        terminal_context = _make_terminal_context(cwd=str(tmp_path / "project-a"))
+        service.resolve_scope_id = lambda scope, _context: (  # type: ignore[method-assign]
+            "project-a" if scope == "project" else None
+        )
+        monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+        monkeypatch.setattr(
+            settings_service, "get_vault_config", lambda: VaultConfig(enabled=False)
+        )
+        _run(
+            service.store(
+                content="native-peer",
+                scope="project",
+                memory_type="reference",
+                key="native-peer",
+                terminal_context=terminal_context,
+            )
+        )
+
+        vault_root = tmp_path / "vault"
+        vault_root.mkdir()
+        config = VaultConfig(
+            enabled=True,
+            vaults=[
+                VaultSpec(
+                    id="context-test",
+                    root=str(vault_root),
+                    managed_folder="CAO",
+                    mappings=[
+                        FolderMapping(
+                            folder="ProjectA",
+                            scope="project",
+                            scope_id="project-a",
+                            inject=False,
+                        ),
+                        FolderMapping(folder="CAO", scope="global", writable=True),
+                    ],
+                )
+            ],
+        )
+        monkeypatch.setattr(settings_service, "get_vault_config", lambda: config)
+        monkeypatch.setattr(service, "_vault_candidates", lambda *_args, **_kwargs: [])
+
+        context = service.get_memory_context(terminal_context)
+
+        assert "native-peer" not in context
+        assert "vault-peer" not in context
+
+    @pytest.mark.asyncio
+    async def test_malformed_vault_config_fails_closed_for_recall_and_injection(
+        self, tmp_path, monkeypatch
+    ):
+        from cli_agent_orchestrator.services import memory_service, settings_service
+
+        service = MemoryService(base_dir=tmp_path / "native")
+        terminal_context = _make_terminal_context(cwd=str(tmp_path / "project-a"))
+        service.resolve_scope_id = lambda scope, _context: (  # type: ignore[method-assign]
+            "project-a" if scope == "project" else None
+        )
+        monkeypatch.setattr(memory_service, "_is_memory_enabled", lambda: True)
+        monkeypatch.setattr(
+            settings_service, "get_vault_config", lambda: VaultConfig(enabled=False)
+        )
+        await service.store(
+            content="retained native replica",
+            scope="project",
+            memory_type="reference",
+            key="native-peer",
+            terminal_context=terminal_context,
+        )
+
+        def malformed_config():
+            raise ValueError("malformed vault config")
+
+        monkeypatch.setattr(settings_service, "get_vault_config", malformed_config)
+
+        assert (
+            await service.recall(
+                scope="project",
+                terminal_context=terminal_context,
+                search_mode="metadata",
+            )
+            == []
+        )
+        assert service.get_memory_context(terminal_context) == ""
+
+    def test_alias_lookup_failure_fails_closed_for_recall_sources(self, tmp_path, monkeypatch):
+        from cli_agent_orchestrator.clients import database
+        from cli_agent_orchestrator.services import settings_service
+
+        vault_root = tmp_path / "vault"
+        vault_root.mkdir()
+        config = VaultConfig(
+            enabled=True,
+            vaults=[
+                VaultSpec(
+                    id="scope-test",
+                    root=str(vault_root),
+                    managed_folder="CAO",
+                    mappings=[
+                        FolderMapping(
+                            folder="Project",
+                            scope="project",
+                            scope_id="project-a",
+                        ),
+                        FolderMapping(folder="CAO", scope="global", writable=True),
+                    ],
+                )
+            ],
+        )
+        service = MemoryService(base_dir=tmp_path / "native")
+        terminal_context = _make_terminal_context(cwd=str(tmp_path / "project-a"))
+        service.resolve_scope_id = lambda scope, _context: (  # type: ignore[method-assign]
+            "project-a" if scope == "project" else None
+        )
+        monkeypatch.setattr(settings_service, "get_vault_config", lambda: config)
+        monkeypatch.setattr(
+            database,
+            "SessionLocal",
+            lambda: (_ for _ in ()).throw(RuntimeError("project alias database unavailable")),
+        )
+
+        native_dirs, vault_bindings, _max_body_chars, _config = service._resolve_sources(
+            "project", terminal_context, scan_all=False
+        )
+
+        assert native_dirs == []
+        assert vault_bindings == []
+
+
 # ===========================================================================
 # FEDERATED scope (issue #313) — machine-wide shared tier
 # ===========================================================================
@@ -1375,7 +1633,7 @@ class TestFederatedScope:
         assert "[fed-forget]" in index_path.read_text(encoding="utf-8")
 
         ok = _run(svc.forget(key="fed-forget", scope="federated", terminal_context=ctx))
-        assert ok is True
+        assert ok.action == "deleted"
         assert not wiki.exists()
         assert _fed_row(engine, "fed-forget") is None
         assert "[fed-forget]" not in index_path.read_text(encoding="utf-8")

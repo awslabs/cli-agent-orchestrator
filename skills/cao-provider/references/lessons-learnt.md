@@ -30,7 +30,7 @@ def paste_enter_count(self) -> int:
 
 **Problem:** CLI tools frequently update their TUI. Kiro CLI changed from `[agent] >` to `agent · model · ◔ N%` with `ask a question, or describe a task` as the idle indicator. The old regex stopped matching.
 
-**Fix:** 
+**Fix:**
 - Build detection for multiple prompt formats (old and new)
 - Use fallback patterns: check the primary pattern first, then fall back to alternatives
 - Consider adding a `--legacy-ui` flag if the CLI supports it
@@ -114,11 +114,11 @@ unset_cmd = (
 **Problem:** New providers skip tool restriction wiring because the resolution path is non-obvious. The `role` field in agent profiles is not just a label — it drives the default `allowedTools` bundle, which in turn determines what native tools get blocked.
 
 **Resolution chain:**
-1. Explicit `allowedTools` in profile or `--allowed-tools` CLI flag (highest priority)
-2. Role-based defaults from `constants.py` (`supervisor` → `["@cao-mcp-server", "fs_read", "fs_list"]`, `developer` → `["@builtin", "fs_*", "execute_bash", "@cao-mcp-server"]`, `reviewer` → `["@builtin", "fs_read", "fs_list", "@cao-mcp-server"]`)
-3. Custom roles from `settings.json` (user-defined bundles)
-4. Fallback: unrestricted `["*"]` (backward compatible)
-5. MCP server names appended as `@server_name`
+1. Explicit `allowedTools` in profile or `--allowed-tools` CLI flag (highest priority). An explicit list is honored even when `role` names nothing.
+2. Custom roles from `settings.json` (user-defined bundles). A settings role with the same name as a built-in replaces it, and CAO logs a warning naming the role.
+3. Role-based defaults from `constants.py` (`supervisor` → `["@cao-mcp-server", "fs_read", "fs_list"]`, `developer` → `["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"]`, `reviewer` → `["@builtin", "fs_read", "fs_list", "@cao-mcp-server"]`, `workflow_scout` → `["@builtin", "fs_read", "execute_bash", "@cao-mcp-server"]`)
+4. Developer defaults when `role` and `allowedTools` are both omitted. An unrecognized `role` raises `ValueError` instead of falling open to unrestricted `["*"]`.
+5. MCP server names appended as `@server_name` when CAO chose the list. An explicit `allowedTools` list is left as written.
 
 **Fix:** When building your provider's `_build_command()`, always check `self._allowed_tools` and apply restrictions. The resolution is already done by the time your provider receives the list — you just need to enforce it via CLI flags, agent JSON, or system prompt.
 
@@ -138,10 +138,12 @@ When writing handoff/assign logic, never flatten `["*"]` to `None` before passin
 
 **Problem:** Implementing tool restrictions the wrong way for your provider type. A provider that accepts CAO vocabulary in agent JSON doesn't need TOOL_MAPPING, and a provider with no native restriction mechanism can only use soft enforcement (system prompt).
 
-**The three approaches:**
-- **Hard via CLI flags** (Claude Code `--disallowedTools`, Copilot CLI `--deny-tool`): Add provider to `TOOL_MAPPING` in `tool_mapping.py` to translate CAO vocabulary → native tool names. `get_disallowed_tools()` computes which native tools to block.
-- **Hard via agent JSON** (Kiro CLI): The CLI reads `allowedTools` from the agent profile at install time. No `TOOL_MAPPING` entry needed — pass CAO vocabulary directly.
-- **Soft via system prompt** (Kimi CLI, Codex): No native restriction mechanism. CAO prepends `SECURITY_PROMPT` from `constants.py` to the system prompt. This is advisory only — the CLI can still use any tool.
+**Delivery (three mechanisms) and enforcement (three levels) are separate questions:**
+- **CLI flags** (Claude Code `--disallowedTools`, Copilot CLI `--deny-tool`, Grok `--allow`/`--deny`): Add provider to `TOOL_MAPPING` in `tool_mapping.py` to translate CAO vocabulary → native tool names. `get_disallowed_tools()` computes which native tools to block. Enforcement: `native`.
+- **Agent file** (Kiro CLI, OpenCode CLI): CAO writes the policy into the agent file at install time; no `TOOL_MAPPING` entry is needed. Enforcement depends on the CLI: OpenCode applies its permission block (`native`, install time); Kiro is launched `--trust-all-tools` with `tools: ["*"]` and its `allowedTools` only suppresses approval prompts (`none`).
+- **System prompt** (Kimi CLI, Codex): No native restriction mechanism. CAO prepends `SECURITY_PROMPT` from `constants.py` to the system prompt. Enforcement: `prompt` (advisory only — the CLI can still use any tool).
+
+Record the level in `PROVIDER_ENFORCEMENT` (`utils/enforcement.py`) when adding a provider; the launch gate, the server warning and the docs tables all read it.
 
 **Limitation:** Soft enforcement is not a security boundary. If a provider doesn't support native tool blocking, document this in the provider's docs under "Known Limitations".
 

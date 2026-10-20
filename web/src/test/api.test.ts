@@ -30,11 +30,56 @@ describe('API wrapper', () => {
     expect(mockFetch).toHaveBeenCalledWith('/sessions', expect.objectContaining({ signal: expect.any(AbortSignal) }))
   })
 
+  it('updates and clears a terminal description with JSON', async () => {
+    for (const description of ['Review', null]) {
+      mockResponse({ id: 'abcd1234', description })
+      const terminal = await api.updateTerminalDescription('abcd1234', description)
+      expect(terminal.description).toBe(description)
+      expect(mockFetch).toHaveBeenLastCalledWith('/terminals/abcd1234/description', expect.objectContaining({
+        method: 'PATCH', body: JSON.stringify({ description }),
+      }))
+    }
+  })
+
+  it('reports description PATCH errors', async () => {
+    mockResponse({ detail: 'Description must be at most 64 characters' }, 422)
+    await expect(api.updateTerminalDescription('abcd1234', 'x'.repeat(65))).rejects.toMatchObject({ status: 422, detail: 'Description must be at most 64 characters' })
+  })
+
+  it('revalidates a session response that started before a successful description PATCH', async () => {
+    let finish!: (response: unknown) => void
+    mockFetch.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    const reading = api.getSession('cao-demo')
+    mockResponse({ id: 'abcd1234', description: 'New' })
+    await api.updateTerminalDescription('abcd1234', 'New')
+    const fresh = { session: { name: 'cao-demo' }, terminals: [{ id: 'abcd1234', description: 'New' }] }
+    mockResponse(fresh)
+    finish({ ok: true, text: async () => JSON.stringify({ terminals: [{ id: 'abcd1234', description: 'Old' }] }) })
+    expect(await reading).toEqual(fresh)
+  })
+
   it('listProfiles fetches /agents/profiles', async () => {
     const profiles = [{ name: 'dev', description: 'Developer', source: 'built-in' }]
     mockResponse(profiles)
     const result = await api.listProfiles()
     expect(result).toEqual(profiles)
+  })
+
+  it('stops revalidating when descriptions change throughout every read', async () => {
+    let reads = 0
+    mockFetch.mockImplementation(async (url: string) => ({
+      ok: true,
+      text: async () => {
+        if (url.startsWith('/sessions/')) {
+          if (++reads > 5) throw new Error('Too many reads')
+          await api.updateTerminalDescription('abcd1234', 'New')
+          return JSON.stringify({ terminals: [{ description: 'Old' }] })
+        }
+        return JSON.stringify({ id: 'abcd1234', description: 'New' })
+      },
+    }))
+    await expect(api.getSession('cao-demo')).rejects.toThrow('Session descriptions kept changing')
+    expect(mockFetch.mock.calls.filter(([url]) => url === '/sessions/cao-demo')).toHaveLength(3)
   })
 
   it('listProviders fetches /agents/providers', async () => {
@@ -387,5 +432,66 @@ describe('API wrapper', () => {
     await expect(
       api.exportGraph('memory', { sink: 'obsidian', dest: 'x' }, 'global')
     ).rejects.toMatchObject({ status: 422, detail: "export rejected: secret pattern 'aws-key' detected" })
+  })
+
+  // ── Agent Plugins ─────────────────────────────────────────────────────────
+
+  it('listPlugins fetches /plugins', async () => {
+    mockResponse({ plugins: [], untrusted_content_warning: 'w' })
+    const result = await api.listPlugins()
+    expect(result.plugins).toEqual([])
+    expect(mockFetch).toHaveBeenCalledWith('/plugins', expect.objectContaining({ signal: expect.any(AbortSignal) }))
+  })
+
+  it('installPlugin POSTs the source body to /plugins', async () => {
+    mockResponse({ installed: true })
+    await api.installPlugin({ source: 'https://github.com/o/r', ref: 'main' })
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/plugins',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ source: 'https://github.com/o/r', ref: 'main' }),
+      }),
+    )
+  })
+
+  it('validatePlugin POSTs to /plugins/validate', async () => {
+    mockResponse({ loadable: true })
+    await api.validatePlugin({ source: '/local/plugin' })
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/plugins/validate',
+      expect.objectContaining({ method: 'POST' }),
+    )
+  })
+
+  it('uninstallPlugin DELETEs the encoded name', async () => {
+    mockResponse({ removed: true })
+    await api.uninstallPlugin('my plugin')
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/plugins/my%20plugin',
+      expect.objectContaining({ method: 'DELETE' }),
+    )
+  })
+
+  it('uninstallPlugin forwards purge_data only when asked', async () => {
+    mockResponse({ removed: true })
+    await api.uninstallPlugin('demo', true)
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/plugins/demo?purge_data=true',
+      expect.objectContaining({ method: 'DELETE' }),
+    )
+  })
+
+  it('installPlugin surfaces the 422 validation detail', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 422,
+      statusText: 'Unprocessable Entity',
+      json: () => Promise.resolve({ detail: 'plugin is not loadable' }),
+    })
+    await expect(api.installPlugin({ source: '/bad' })).rejects.toMatchObject({
+      status: 422,
+      detail: 'plugin is not loadable',
+    })
   })
 })

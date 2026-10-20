@@ -1,6 +1,6 @@
 [project]
 name = "cli-agent-orchestrator"
-version = "2.5.0"
+version = "2.5.4"
 description = "CLI Agent Orchestrator"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,8 +37,8 @@ dependencies = [
     "fastapi>=0.104.0",
     # Upper bound: ext_apps/sep2133.advertise_capability monkey-patches a FastMCP
     # internal (create_initialization_options); cap the major to avoid silent
-    # breakage on a new major release. Tested against 3.x.
-    "fastmcp>=2.14.0,<4.0.0",
+    # breakage on a new major release. Tested against 3.x and 4.x.
+    "fastmcp>=3.2.0,<5.0.0",
     "mcp>=1.23.0",
     "pydantic>=2.10.6",
     "apscheduler>=3.10.4",
@@ -64,6 +64,7 @@ dependencies = [
     "requests>=2.32.0",
     "rank-bm25>=0.2.2",
     "pyte>=0.8.2",
+    "wcwidth>=0.2.13",
     # JWT/JWKS verification for the default-off OAuth 2.1 auth layer (RS256 via
     # JWKS). The [crypto] extra pulls in `cryptography` for RSA signature
     # verification and provides `jwt.PyJWKClient`. See spec task 9.1 research note.
@@ -81,6 +82,17 @@ dependencies = [
     # other way: `pyjwt[crypto]` itself only requires `cryptography>=3.4`, so a bare
     # `uv lock --upgrade-package` would drift back down on the next unrelated relock.
     "cryptography>=50.0.0",
+    # Floor on the TRANSITIVE `anyio` that `httpx`/`starlette` pull in, for exactly the
+    # reason recorded above `cryptography`. Two advisories affect the 4.11.0 the lockfile
+    # had resolved: CVE-2026-63374 (CRITICAL) and CVE-2026-64847 (MEDIUM), both fixed in
+    # 4.14.2. Trivy's gate is repo-wide and blocking, so an unpatched transitive dep fails
+    # CI on `main` and on every open PR rather than merely appearing in the Security tab.
+    #
+    # Declared as a DIRECT floor for the same reason `cryptography` is: no dependent
+    # expresses a floor this high (`httpx` requires `anyio>=3.0`), so a bare relock drifts
+    # back down. Note this is the ROOT lockfile — `examples/fleet/panel/uv.lock` was bumped
+    # separately in 9cecfc3b and does not constrain this one.
+    "anyio>=4.14.2",
     "jsonschema>=4.25",
     "jinja2>=3.1.0",
     # Obsidian graph sink (Issue #348) imports yaml at module top; declare it
@@ -94,6 +106,7 @@ dependencies = [
     # not just a dev dependency — or every `cao` command would fail to import.
     "tomli>=2.0.0; python_version < '3.11'",
     "psutil>=7.0.0",
+    "tomlkit>=0.13.3,<1.0.0",
 ]
 
 [project.optional-dependencies]
@@ -124,6 +137,9 @@ kiro_cli_memory = "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory:KiroCl
 codex_memory = "cli_agent_orchestrator.plugins.builtin.codex_memory:CodexMemoryPlugin"
 event_log_publisher = "cli_agent_orchestrator.plugins.builtin.event_log_publisher:EventLogPublisher"
 mcp_apps = "cli_agent_orchestrator.plugins.builtin.mcp_apps:McpAppsPlugin"
+
+[project.entry-points."cao.deciders"]
+fixed_table = "cli_agent_orchestrator.decisions.fixed_table:FixedTableDecider"
 
 [project.urls]
 Homepage = "https://github.com/awslabs/cli-agent-orchestrator"
@@ -373,6 +389,9 @@ dev = [
     # with authlib; runtime verification needs only pyjwt[crypto].
     "authlib>=1.7.1",
     "types-psutil>=7.0.0",
+    # Tests import httpx directly; fastmcp 4 / mcp 2 use httpx2 and no longer
+    # pull httpx in transitively.
+    "httpx>=0.28.1",
 ]
 
 [tool.black]
@@ -403,3 +422,22 @@ python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
 addopts = "--cov=src --cov-report=term-missing -m 'not e2e and not integration'"
+
+# NFR-3's 80% line floor is enforced in CI, NOT here (issue #583 Bolt 3, build-and-test).
+#
+# `fail_under` deliberately does NOT live in this file. `--cov` is in `addopts`
+# above, so it applies to EVERY pytest invocation -- and a single test file
+# reports roughly 24% coverage of the whole package. A `fail_under = 80` here
+# would therefore fail ordinary focused test runs.
+#
+# The default marker expression above also excludes integration tests, while
+# the coverage figure is measured over CI's explicitly selected `-m "not e2e"`
+# suite across `test/` and `examples/workflow/tests/`. The two invocations do
+# not measure the same test population, so a pyproject floor would enforce the
+# CI threshold against a different suite even on a full default local run.
+#
+# The floor is enforced instead by `--cov-fail-under=80` on that explicit CI
+# invocation in `.github/workflows/ci.yml`.
+#
+# NOTE for anyone reading ci.yml: the separate "Coverage ratchet" step there
+# belongs to cao_mcp_apps (the TypeScript subproject), not to this suite.

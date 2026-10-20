@@ -90,7 +90,7 @@ Controls where CAO discovers agent profiles.
 | `dirs` | object | Provider-keyed paths to agent profile directories |
 | `extra_dirs` | array | Additional directories to scan for profiles |
 | `disabled_dirs` | array | Configured directories toggled off (profiles hidden without deletion) |
-| `roles` | object | Custom role-to-allowedTools mappings for names other than the built-in `supervisor`/`reviewer`/`developer`, which cannot be overridden |
+| `roles` | object | Custom role-to-allowedTools mappings. A name that matches a built-in role (`supervisor`/`reviewer`/`developer`/`workflow_scout`) replaces that built-in, and CAO logs a warning naming the role |
 
 ### `skills`
 
@@ -145,13 +145,14 @@ These keys exist in the schema but only their `CAO_*` env-var counterparts have 
 
 ### `auth` (env-var only)
 
-Default-off OAuth 2.1 auth. Activates when an IdP is configured &mdash; either `AUTH0_DOMAIN` or `CAO_AUTH_JWKS_URI`.
+Default-off. Activates when an IdP is configured &mdash; either `AUTH0_DOMAIN` or `CAO_AUTH_JWKS_URI` (OAuth 2.1, RS256 JWTs verified against the IdP's JWKS) &mdash; **or** when `CAO_AUTH_LOCAL_TOKEN` is set on its own (a shared-secret bearer every caller must present). With none of the three set, the API trusts every caller that can reach its port; on a shared workstation that includes other local users and agents. See [Environment variables](environment-variables.md#network-and-auth-env-var-only).
 
 | Key | Env Var | Description |
 |-----|---------|-------------|
 | `jwks_uri` | `CAO_AUTH_JWKS_URI` | Generic IdP JWKS endpoint |
-| `audience` | `CAO_AUTH_AUDIENCE` | Expected token audience |
-| `issuer` | `CAO_AUTH_ISSUER` | Issuer for RFC 9728 PRM endpoint |
+| `audience` | `CAO_AUTH_AUDIENCE` | Expected token audience (IdP mode) |
+| `issuer` | `CAO_AUTH_ISSUER` | Issuer for RFC 9728 PRM endpoint (IdP mode) |
+| &mdash; | `CAO_AUTH_LOCAL_TOKEN` | Alone: the shared-secret bearer that activates auth. With an IdP: the machine JWT CAO's clients forward internally |
 
 ### `logging`
 

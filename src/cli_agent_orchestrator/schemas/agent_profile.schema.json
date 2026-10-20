@@ -29,7 +29,7 @@
     },
     "role": {
       "type": "string",
-      "description": "Agent role. Built-in values: supervisor, developer, reviewer. Custom roles are also supported via settings.json."
+      "description": "Agent role. Built-in values: supervisor, developer, reviewer, workflow_scout. Custom roles are also supported via settings.json."
     },
     "provider": {
       "type": "string",
@@ -100,6 +100,16 @@
       "type": "string",
       "minLength": 1
     },
+    "kimiSwarm": {
+      "type": ["boolean", "null"],
+      "description": "Kimi Code only. Override native Swarm startup activation; omission or null inherits the operator default. Requires a vetted executable when enabled and grants no additional tools."
+    },
+    "kimiSwarmMaxConcurrency": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "maximum": 10,
+      "description": "Kimi Code only. Concurrent native subagents per batch. Omission or null inherits the managed policy; an explicit limit requires executable verification."
+    },
     "grokNativeWorkflows": {
       "type": "boolean",
       "default": false,
@@ -144,6 +154,11 @@
     },
     "useLegacyMcpJson": {
       "type": "boolean"
+    },
+    "x-cao-source-stem": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,64}$",
+      "description": "CAO-generated context-copy provenance. Records the original profile source stem."
     }
   },
   "additionalProperties": false

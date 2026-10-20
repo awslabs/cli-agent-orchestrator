@@ -51,6 +51,8 @@ next input.
 2. Call handoff for report template:
    - agent_profile: "report_generator"
    - message: "Create report template with sections: [requirements]"
+   - Do not pass a timeout. The default (600 seconds) includes the time that
+     the worker needs to start.
 
 3. **Finish your turn** — state what you dispatched and that you're waiting for
    results. Do not run any commands. Worker results will be delivered to your

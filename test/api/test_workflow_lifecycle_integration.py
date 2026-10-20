@@ -120,6 +120,18 @@ def journal_db(monkeypatch, tmp_path):
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+    # issue #583 Bolt 3 (``approval-enforcement-default``): approval enforcement defaults ON, so an
+    # unapproved script-tier plan is refused with 403 before any lifecycle behaviour happens. These
+    # tests are about the LIFECYCLE -- compose, drive, cancel, detached observation -- so the gate is
+    # turned off through the real setting rather than by patching the gate out.
+    import json as _json
+
+    from cli_agent_orchestrator.services import settings_service as _settings
+
+    _gate_off = tmp_path / "settings.json"
+    _gate_off.write_text(_json.dumps({"workflow": {"require_approval": False}}))
+    monkeypatch.setattr(_settings, "SETTINGS_FILE", _gate_off)
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
     workflow_service.run_registry.clear()
     workflow_service._active_drives.clear()
     yield db_path
@@ -594,7 +606,7 @@ def test_u10_live_event_following_renders_ordered_progress_and_declared_gap():
     # to assert the interactive progress + gap lines.
     with (
         mock.patch(
-            "cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream
+            "cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream
         ),
         mock.patch(
             "cli_agent_orchestrator.cli.commands.workflow._machine_mode", return_value=False
@@ -626,7 +638,7 @@ def test_u10_follower_does_not_infer_gap_from_seq_numbering():
         _u10_event_frame(23, "run.completed", None, "completed"),
     )
     with mock.patch(
-        "cli_agent_orchestrator.cli.commands.workflow.requests.get", return_value=stream
+        "cli_agent_orchestrator.cli.commands.workflow.api_http.get", return_value=stream
     ):
         result = CliRunner().invoke(workflow, ["events", "run1"])
     assert result.exit_code == 0

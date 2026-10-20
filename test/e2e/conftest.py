@@ -14,8 +14,11 @@ module top.
 Run with: uv run pytest -m e2e test/e2e/ -v
 """
 
+import json
 import os
 import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 from test.fixtures.cao_server import CaoServer, _patch_api_base_url_for_e2e
@@ -67,11 +70,105 @@ def require_claude():
         pytest.skip("claude CLI not installed")
 
 
+_KIRO_LOGIN: dict[str, tuple[bool, str]] = {}
+
+
+def _kiro_logged_in() -> tuple[bool, str]:
+    """``kiro-cli whoami`` in the developer's real HOME, once per session.
+
+    The managed server seeds kiro's login into its redirected HOME by symlink
+    (``test.fixtures.cao_server._seed_kiro_e2e_state``), so a kiro that is
+    logged out here is logged out there too -- and there it would open the
+    SSO device-login flow and sit at "Opening browser..." until CAO's
+    agent-prompt timeout. Skipping is the honest outcome for that machine.
+    """
+    if "result" not in _KIRO_LOGIN:
+        # Two attempts a few seconds apart: ``whoami`` reads the token out of
+        # kiro's SQLite secret store, and a kiro that is still shutting down
+        # or mid-refresh (e.g. the agents a previous e2e class launched)
+        # briefly answers "Not logged in" on a machine that is logged in.
+        # One such answer must not skip the whole class.
+        verdict: tuple[bool, str] = (False, "no whoami output")
+        for attempt in range(2):
+            if attempt:
+                time.sleep(3)
+            try:
+                proc = subprocess.run(
+                    ["kiro-cli", "whoami"], capture_output=True, text=True, timeout=30
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                verdict = (False, f"kiro-cli whoami did not answer: {exc}")
+                continue
+            out = (proc.stdout + proc.stderr).strip()
+            first = out.splitlines()[0] if out else ""
+            logged_in = (
+                proc.returncode == 0
+                and "logged in" in out.lower()
+                and "not logged in" not in out.lower()
+            )
+            verdict = (logged_in, first)
+            if logged_in:
+                break
+        _KIRO_LOGIN["result"] = verdict
+    return _KIRO_LOGIN["result"]
+
+
 @pytest.fixture()
 def require_kiro():
-    """Skip test if kiro-cli is not available."""
+    """Skip test if kiro-cli is not installed, or is installed but not logged in."""
     if not _cli_available("kiro-cli"):
         pytest.skip("kiro-cli CLI not installed")
+    logged_in, detail = _kiro_logged_in()
+    if not logged_in:
+        pytest.skip(f"kiro-cli is installed but not logged in ({detail or 'no whoami output'})")
+
+
+@pytest.fixture()
+def kiro_profiles_in_server_home(
+    require_kiro, require_cao_server: CaoServer
+) -> dict[str, dict[str, object]]:
+    """Install the profiles the Kiro e2e cases launch INTO THE MANAGED SERVER'S HOME.
+
+    The server runs with ``$HOME`` redirected to a per-session tmp dir, and the
+    kiro-cli it spawns reads ``$HOME/.kiro/agents/<profile>.json`` from that
+    HOME. A profile a developer installs with ``cao install`` lands in the real
+    HOME and is never seen, so without this step ``--agent code_supervisor``
+    resolves to no installed agent and a "restricted supervisor" case exercises
+    Kiro's default agent instead: bash then runs because there was no
+    restriction to ignore, which is indistinguishable from the outcome the case
+    asserts. Runs the real installer with ``HOME`` pointed at the server's
+    directory (the same command the docs give, into the HOME that matters) and
+    returns the agent JSON each profile produced so the case can assert the
+    policy it claims to exercise before launching anything.
+    """
+    home = require_cao_server.home_dir
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    configs: dict[str, dict[str, object]] = {}
+    for name in ("developer", "code_supervisor"):
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "cli_agent_orchestrator.cli.main",
+                "install",
+                name,
+                "--provider",
+                "kiro_cli",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert proc.returncode == 0, (
+            f"cao install {name} --provider kiro_cli failed in HOME={home}:\n"
+            f"{proc.stdout}\n{proc.stderr}"
+        )
+        agent_file = home / ".kiro" / "agents" / f"{name}.json"
+        assert agent_file.is_file(), f"installer wrote no {agent_file}"
+        configs[name] = json.loads(agent_file.read_text(encoding="utf-8"))
+    return configs
 
 
 @pytest.fixture()

@@ -6,11 +6,15 @@ in the issue.
 """
 
 import json
+from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 
 from cli_agent_orchestrator.services import config_service as cs
+from cli_agent_orchestrator.services import settings_service
 from cli_agent_orchestrator.services.config_service import ConfigService
+from cli_agent_orchestrator.utils import atomic_file
 
 
 @pytest.fixture(autouse=True)
@@ -135,6 +139,79 @@ class TestGetConfig:
         assert cfg.apps.enabled is False
         assert cfg.logging.level == "INFO"
 
+    def test_terminal_pane_fields_are_resolved_not_defaulted(self, _isolated_settings, monkeypatch):
+        """A field the model carries but never populates reads as a default that is a lie."""
+        _isolated_settings["settings"].write_text(
+            json.dumps({"terminal": {"spawn_mode": "pane", "pane_window": "fleet"}})
+        )
+        monkeypatch.setenv("CAO_TERMINAL_PANE_LAYOUT", "even-vertical")
+
+        cfg = ConfigService.get_config()
+
+        assert cfg.terminal.spawn_mode == "pane"
+        assert cfg.terminal.pane_window == "fleet"
+        assert cfg.terminal.pane_layout == "even-vertical"
+
+    def test_vault_env_var_can_disable_but_not_enable(
+        self, _isolated_settings, monkeypatch, tmp_path
+    ):
+        vault = {
+            "enabled": False,
+            "vaults": [
+                {
+                    "id": "primary",
+                    "root": str(tmp_path),
+                    "managed_folder": "CAO",
+                    "mappings": [
+                        {
+                            "folder": "CAO",
+                            "scope": "agent",
+                            "scope_id": "writer",
+                            "writable": True,
+                        }
+                    ],
+                }
+            ],
+        }
+        _isolated_settings["settings"].write_text(json.dumps({"memory": {"vault": vault}}))
+
+        monkeypatch.setenv("CAO_MEMORY_VAULT_ENABLED", "true")
+        assert ConfigService.get("memory.vault.enabled") is False
+
+        vault["enabled"] = True
+        _isolated_settings["settings"].write_text(json.dumps({"memory": {"vault": vault}}))
+        monkeypatch.setenv("CAO_MEMORY_VAULT_ENABLED", "false")
+        assert ConfigService.get("memory.vault.enabled") is False
+        assert ConfigService.get("memory.vault")["enabled"] is False
+
+    def test_list_disables_invalid_vault_without_hiding_other_settings(
+        self, _isolated_settings, caplog
+    ):
+        _isolated_settings["settings"].write_text(
+            json.dumps(
+                {
+                    "memory": {
+                        "vault": {
+                            "enabled": True,
+                            "vaults": [{"id": "primary", "root": "/missing-vault"}],
+                        }
+                    },
+                    "terminal": {"backend": "herdr"},
+                }
+            )
+        )
+
+        values = ConfigService.list_all()
+
+        assert values["memory.vault"] == {
+            "enabled": False,
+            "max_recall_body_chars": 4096,
+            "vaults": [],
+        }
+        assert values["memory.vault.enabled"] is False
+        assert values["terminal.backend"] == "herdr"
+        assert caplog.text.count("Invalid vault configuration disabled") == 1
+
 
 class TestSetAndPath:
     def test_set_persists_and_get_reads_it_back(self, _isolated_settings):
@@ -142,6 +219,117 @@ class TestSetAndPath:
         assert ConfigService.get("terminal.backend") == "herdr"
         on_disk = json.loads(_isolated_settings["settings"].read_text())
         assert on_disk["terminal"]["backend"] == "herdr"
+
+    def test_set_atomically_replaces_settings_and_enforces_private_mode(
+        self, _isolated_settings, monkeypatch
+    ):
+        settings_file = _isolated_settings["settings"]
+        settings_file.write_text('{"workflow": {"require_approval": true}}')
+        settings_file.chmod(0o640)
+        monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
+        real_replace = atomic_file.os.replace
+        replacements = []
+
+        def _record_replace(source, target):
+            replacements.append((Path(source), Path(target)))
+            real_replace(source, target)
+
+        monkeypatch.setattr(atomic_file.os, "replace", _record_replace)
+
+        ConfigService.set("workflow.require_approval", False)
+
+        assert len(replacements) == 1
+        assert replacements[0][1] == settings_file
+        assert json.loads(settings_file.read_text())["workflow"]["require_approval"] is False
+        assert settings_file.stat().st_mode & 0o777 == 0o600
+
+    def test_set_replaces_settings_symlink_and_preserves_target(
+        self, _isolated_settings, monkeypatch
+    ):
+        settings_file = _isolated_settings["settings"]
+        target = settings_file.with_name("dotfiles-settings.json")
+        target.write_text('{"workflow": {"require_approval": true}}')
+        target.chmod(0o640)
+        settings_file.symlink_to(target)
+        monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
+
+        ConfigService.set("workflow.require_approval", False)
+
+        assert not settings_file.is_symlink()
+        assert json.loads(settings_file.read_text())["workflow"]["require_approval"] is False
+        assert json.loads(target.read_text()) == {"workflow": {"require_approval": True}}
+        assert target.stat().st_mode & 0o777 == 0o640
+
+    def test_set_replaces_dangling_settings_symlink(self, _isolated_settings, monkeypatch):
+        settings_file = _isolated_settings["settings"]
+        target = settings_file.with_name("dotfiles-settings.json")
+        settings_file.symlink_to(target)
+        monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
+
+        ConfigService.set("workflow.require_approval", False)
+
+        assert not settings_file.is_symlink()
+        assert json.loads(settings_file.read_text())["workflow"]["require_approval"] is False
+        assert not target.exists()
+
+    def test_config_and_settings_writers_share_lock_through_symlinked_home(
+        self, tmp_path, monkeypatch
+    ):
+        real_home = tmp_path / "real-home"
+        real_home.mkdir()
+        linked_home = tmp_path / "linked-home"
+        linked_home.symlink_to(real_home, target_is_directory=True)
+        settings_file = linked_home / "settings.json"
+        monkeypatch.setattr(settings_service, "CAO_HOME_DIR", linked_home)
+        monkeypatch.setattr(settings_service, "SETTINGS_FILE", settings_file)
+        monkeypatch.setattr(atomic_file, "LOCK_DIR", tmp_path / "locks")
+        lock_paths = []
+        real_file_lock = atomic_file._file_lock
+
+        @contextmanager
+        def _record_file_lock(lock_path, timeout):
+            lock_paths.append(lock_path)
+            with real_file_lock(lock_path, timeout):
+                yield
+
+        monkeypatch.setattr(atomic_file, "_file_lock", _record_file_lock)
+
+        cs._save_raw({"writer": "config"})
+        settings_service._save({"writer": "settings"})
+
+        assert lock_paths == [
+            atomic_file._lock_path_for(real_home / "settings.json"),
+            atomic_file._lock_path_for(real_home / "settings.json"),
+        ]
+
+    def test_delegation_and_migration_do_not_reenter_settings_lock(
+        self, _isolated_settings, monkeypatch
+    ):
+        monkeypatch.setattr(
+            atomic_file, "LOCK_DIR", _isolated_settings["settings"].parent / "locks"
+        )
+        real_file_lock = atomic_file._file_lock
+        lock_held = False
+
+        @contextmanager
+        def _reject_reentry(lock_path, timeout):
+            nonlocal lock_held
+            assert not lock_held, "settings lock was re-entered"
+            lock_held = True
+            try:
+                with real_file_lock(lock_path, timeout):
+                    yield
+            finally:
+                lock_held = False
+
+        monkeypatch.setattr(atomic_file, "_file_lock", _reject_reentry)
+
+        ConfigService.set("agents.dirs.kiro_cli", "/tmp/agents")
+        ConfigService.set("skills.extra_dirs", ["/tmp/skills"])
+        ConfigService.set("memory.enabled", False)
+        _isolated_settings["legacy"].write_text(json.dumps({"terminal_backend": "herdr"}))
+
+        assert ConfigService.get("terminal.backend") == "herdr"
 
     def test_set_agents_extra_dirs_routes_through_settings_service(self, _isolated_settings):
         ConfigService.set("agents.extra_dirs", ["/a", "/b"])
@@ -158,3 +346,35 @@ class TestListAll:
         assert "memory.compile_mode" in result
         assert "server.mcp_request_timeout" in result
         assert result["terminal.backend"] == "tmux"
+
+
+class TestSavePrivateAndSymlinkSafe:
+    """``cao config set`` is the second writer of settings.json and must match the
+    first: 0600, atomic, never through a symlink. ``ConfigService.set`` reaches
+    ``_save_raw`` for every key settings_service does not own (``terminal.backend``
+    here), so this pins that path rather than the settings_service one."""
+
+    def test_set_creates_file_private(self, _isolated_settings):
+        settings = _isolated_settings["settings"]
+        ConfigService.set("terminal.backend", "tmux")
+        assert oct(settings.stat().st_mode & 0o777) == oct(0o600)
+        assert json.loads(settings.read_text())["terminal"]["backend"] == "tmux"
+
+    def test_set_tightens_an_existing_world_readable_file(self, _isolated_settings):
+        settings = _isolated_settings["settings"]
+        settings.write_text(json.dumps({"terminal": {"backend": "herdr"}}))
+        settings.chmod(0o644)
+        ConfigService.set("terminal.backend", "tmux")
+        assert oct(settings.stat().st_mode & 0o777) == oct(0o600)
+        assert json.loads(settings.read_text())["terminal"]["backend"] == "tmux"
+
+    def test_set_does_not_follow_a_symlink(self, _isolated_settings, tmp_path):
+        settings = _isolated_settings["settings"]
+        victim = tmp_path / "victim.txt"
+        victim.write_text("do not touch")
+        settings.symlink_to(victim)
+        ConfigService.set("terminal.backend", "tmux")
+        assert victim.read_text() == "do not touch"
+        assert not settings.is_symlink()
+        assert oct(settings.stat().st_mode & 0o777) == oct(0o600)
+        assert json.loads(settings.read_text())["terminal"]["backend"] == "tmux"

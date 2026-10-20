@@ -83,11 +83,11 @@ def main() -> None:
     generate_changelog(new)
 
     print(f"Bumped {old} -> {new}")
-    print(f"\nNext steps:")
+    print("\nNext steps:")
     print(f"  1. git add pyproject.toml CHANGELOG.md {DEVCONTAINER_FEATURE.relative_to(ROOT)}")
     print(f"  2. git commit -m 'chore: release v{new}'")
     print(f"  3. git tag v{new}")
-    print(f"  4. git push && git push --tags")
+    print("  4. git push && git push --tags")
 
 
 if __name__ == "__main__":

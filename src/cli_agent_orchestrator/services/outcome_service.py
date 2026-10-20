@@ -27,9 +27,23 @@ MAX_TASK_LABEL_CHARS = 200
 MAX_NOTES_CHARS = 1000
 MAX_LIST_LIMIT = 200
 
+# Machine-readable marker for "the learning FEATURE GATE said no", as distinct
+# from "that route does not exist here". Both are HTTP 404, and status alone
+# cannot tell them apart: during a mixed-version rollout, or behind a proxy that
+# does not know ``/outcomes``, an ordinary ``{"detail": "Not Found"}`` would
+# otherwise be read as a deliberate opt-out. ``skills/cao-learning`` tells agents
+# to skip a ``disabled: true`` payload SILENTLY, so that misread drops outcomes
+# without a trace — the exact failure this change exists to remove.
+#
+# Emitted in the gate's 404 detail and matched by the MCP layer; keep the two in
+# step. Prefixed rather than a separate response field because FastAPI's
+# HTTPException carries only ``detail`` through to the client.
+LEARNING_DISABLED_CODE = "cao.learning_disabled"
+
 LEARNING_DISABLED_MESSAGE = (
-    "workflow self-learning is disabled. Set memory.learning_enabled=true in "
-    "settings.json (and keep memory.enabled=true) to enable outcome capture."
+    f"[{LEARNING_DISABLED_CODE}] workflow self-learning is disabled. Set "
+    "memory.learning_enabled=true in settings.json (and keep memory.enabled=true) "
+    "to enable outcome capture."
 )
 
 

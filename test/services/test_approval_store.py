@@ -42,6 +42,53 @@ def _columns(path):
 
 
 # ---------------------------------------------------------------------------
+# Lock tolerance (issue #583 Bolt 3, ``approval-enforcement-default``; NFR-4)
+# ---------------------------------------------------------------------------
+
+
+def test_the_connection_tolerates_a_busy_database(db_path):
+    """The gate now reads this store on EVERY default-install run start, so contention matters.
+
+    NFR-4 bounds lock contention at up to 12 concurrent background drives. This store adds no
+    ``busy_timeout`` pragma and does not need one: CPython's ``sqlite3.connect`` defaults to
+    ``timeout=5.0``, which IS ``PRAGMA busy_timeout = 5000``.
+
+    THE SECOND HALF OF THIS TEST IS WHAT GIVES IT TEETH. Asserting 5000 alone passes on stock CPython
+    whether or not the code does anything, which is a test that cannot fail — the exact shape the
+    construction guardrails forbid, and the trap that a sibling unit in this issue already fell into
+    once. Forcing the library default to 0 and re-asserting is what would catch a future refactor
+    passing ``timeout=0`` and silently dropping the guarantee.
+    """
+    with approval_store._connect() as conn:
+        effective = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    assert effective == 5000, (
+        "the effective busy_timeout is the guarantee, whether it comes from a pragma or from the "
+        "library default"
+    )
+
+    real_connect = sqlite3.connect
+    calls = {}
+
+    def _impatient(*args, **kwargs):
+        calls["timeout"] = kwargs.get("timeout")
+        kwargs["timeout"] = 0
+        return real_connect(*args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sqlite3, "connect", _impatient)
+        with approval_store._connect() as conn:
+            forced = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+
+    assert calls, "_connect must go through sqlite3.connect for this control to be meaningful"
+    assert forced == 0, (
+        "with the library default forced to 0 the effective timeout drops to 0, which proves the "
+        "5000 above comes from the default and NOT from a pragma this module sets. If this ever "
+        "reads 5000, the module has grown an explicit pragma and the assertion above is no longer "
+        "measuring what it claims to measure"
+    )
+
+
+# ---------------------------------------------------------------------------
 # The two load-bearing properties
 # ---------------------------------------------------------------------------
 
@@ -63,6 +110,37 @@ def test_a_repeated_grant_does_not_rewrite_the_original(db_path):
 def test_an_unknown_plan_is_not_approved(db_path):
     """Absence answers False and raises nothing — so every fault mode is fail-closed."""
     assert approval_store.is_approved("plan-v1:never-granted") is False
+
+
+# ---------------------------------------------------------------------------
+# The tri-state sibling (issue #696): a store FAULT is distinct from an ABSENCE
+# ---------------------------------------------------------------------------
+
+
+def test_approval_state_reports_absent_approved_and_is_consistent_with_is_approved(db_path):
+    assert approval_store.approval_state("plan-v1:missing") == approval_store.ABSENT
+    approval_store.grant("plan-v1:present", "stan")
+    assert approval_store.approval_state("plan-v1:present") == approval_store.APPROVED
+    # is_approved is the boolean view of the same fact.
+    assert approval_store.is_approved("plan-v1:present") is True
+    assert approval_store.is_approved("plan-v1:missing") is False
+
+
+def test_a_store_fault_is_unknown_not_absent(db_path, monkeypatch):
+    """A database error must answer UNKNOWN, not ABSENT — the whole point of #696.
+
+    ``is_approved`` still collapses the fault to False (fail-closed), but ``approval_state`` preserves
+    that CAO could not read the store, so the gate can refuse without calling it a missing approval.
+    """
+
+    def unreadable_store(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(approval_store, "_connect", unreadable_store)
+
+    assert approval_store.approval_state("plan-v1:anything") == approval_store.UNKNOWN
+    # The boolean view stays fail-closed: a fault is not permission.
+    assert approval_store.is_approved("plan-v1:anything") is False
 
 
 # ---------------------------------------------------------------------------

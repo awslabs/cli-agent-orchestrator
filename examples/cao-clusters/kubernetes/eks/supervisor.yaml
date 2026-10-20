@@ -1,6 +1,6 @@
 # The one long-lived pod in the fleet. It holds the conversation a participant
-# drives, and every unit of delegated work becomes a Job that the broker mints
-# and destroys - so this is the only place CAO state persists.
+# drives, and every unit of delegated work becomes a Deployment that the broker
+# mints and destroys - so this is the only place CAO state persists.
 #
 # A StatefulSet rather than a Deployment for a stable name: `cao-supervisor` is
 # what the broker points CAO_MEMORY_API_URL at, and what workers call back to.
@@ -97,7 +97,7 @@ spec:
                   key: token
             # How long assign_elastic polls a NEW worker's /health through its
             # Service before giving up on it. The broker hands the lease back as
-            # soon as the Job and Service exist, so this is where the worker's boot
+            # soon as the Deployment and Service exist, so this is where its boot
             # is waited out - on the address the task is about to be posted to,
             # which is the only check that covers both "the pod came up" and "the
             # Service in front of it routes". Generous on purpose: the failure it

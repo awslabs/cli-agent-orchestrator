@@ -6,13 +6,19 @@ backends (tmux) it returns the pushed pipeline status; for event-inbox backends
 provider's native status. These tests pin both paths.
 """
 
+import asyncio
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.status_monitor import (
     STALE_PROCESSING_BUFFER_QUIET_S,
+    STALE_PROCESSING_CAPTURE_INTERVAL_S,
     STALE_PROCESSING_CONFIRM_TTL_S,
     StatusMonitor,
 )
@@ -41,6 +47,241 @@ class TestGetStatusTmux:
         sm = StatusMonitor()
 
         assert sm.get_status("missing") == TerminalStatus.UNKNOWN
+
+
+class TestPollerRecheckInput:
+    """The cheap re-check that get_status() runs for a poller while a terminal
+    reads PROCESSING parses the raw buffer, unless the provider opts in to the
+    screen with ``status_recheck_uses_screen``. A Codex raw buffer of a working
+    turn parsed as IDLE; applied, it ended PROCESSING right after it began, and
+    the latch then refused the turn's real PROCESSING (live, 2026-10-11)."""
+
+    @staticmethod
+    def _provider(screen_recheck):
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.supports_direct_status_probe = False
+        provider.supports_stale_processing_capture = False
+        provider.status_recheck_uses_screen = screen_recheck
+        provider.get_status.return_value = TerminalStatus.IDLE  # the raw buffer
+        provider.get_status_from_screen.return_value = TerminalStatus.PROCESSING
+        return provider
+
+    @staticmethod
+    def _monitor():
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = "raw redraw fragments"
+        sm._buffer_changed_at["t1"] = time.monotonic()
+        with sm._lock:
+            sm._feed_screen_locked("t1", "• Working (3s • esc to interrupt)")
+        return sm
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_opted_in_provider_rechecks_the_screen(self, mock_pm, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = self._provider(screen_recheck=True)
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        provider.get_status.assert_not_called()
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_polls_on_unchanged_output_reuse_the_verdict(self, mock_pm, mock_get_backend):
+        """The render holds the lock that the output consumer needs."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = self._provider(screen_recheck=True)
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+
+        for _ in range(3):
+            assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert provider.get_status_from_screen.call_count == 1
+
+        sm._output_generation["t1"] = sm._output_generation.get("t1", 0) + 1
+        sm.get_status("t1")
+        assert provider.get_status_from_screen.call_count == 2
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_codex_recheck_reads_its_screen(self, mock_pm, mock_get_backend, mock_codex_backend):
+        """A real Codex provider: its raw buffer parses IDLE, its screen shows
+        a reply that is still streaming."""
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+
+        provider = CodexProvider("t1", "s", "w")
+        provider._codex_version = (0, 160, 0)
+        provider._ends_turns_with_footer = True
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        mock_get_backend.return_value = backend
+        mock_codex_backend.return_value = backend
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = "› Ask Codex to do anything\n  gpt-6 · /tmp/project\n"
+        sm._buffer_changed_at["t1"] = time.monotonic()
+        with sm._lock:
+            sm._feed_screen_locked(
+                "t1",
+                "\r\n".join(
+                    [
+                        "› Analyze Dataset A.",
+                        "• The mean is 3, because the values are",
+                        "› Ask Codex to do anything",
+                        "  gpt-6 · /tmp/project",
+                    ]
+                ),
+            )
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_codex_empty_dispatched_turn_transitions_processing_to_completed(
+        self, mock_codex_backend
+    ):
+        """A real Codex screen verdict is applied and published by the monitor."""
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+
+        fixture = (
+            Path(__file__).parents[1] / "providers/fixtures/codex_empty_turn_completed.txt"
+        ).read_text()
+        backend = MagicMock()
+        backend.get_history.return_value = "› Previous task\n› Ask Codex to do anything\n"
+        mock_codex_backend.return_value = backend
+        provider = CodexProvider("t1", "session", "window")
+        provider._codex_version = (0, 162, 1)
+        provider._ends_turns_with_footer = True
+        provider.notify_status_buffer_reset(3)
+        provider.mark_input_received()
+        provider.record_dispatched_message(
+            "ACK: agente disponible\n\n"
+            "[Message from terminal worker. Use send_message MCP tool for any follow-up work.]"
+        )
+        detected = provider.get_status_from_screen(fixture.splitlines())
+        assert detected == TerminalStatus.COMPLETED
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        with patch("cli_agent_orchestrator.services.status_monitor.bus") as bus:
+            assert sm._apply_detection("t1", detected)
+
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        bus.publish.assert_called_once_with(
+            "terminal.t1.status", {"status": TerminalStatus.COMPLETED.value}
+        )
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_codex_old_reply_and_footer_without_bar_do_not_complete_new_dispatch(
+        self, mock_codex_backend
+    ):
+        """A historical completion keeps PROCESSING latched until new output ends."""
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+
+        status_bar = "  gpt-6 max · /tmp/project                       ⚠ 1 warning · f2 to view"
+        composer = "› Ask Codex to do anything"
+        previous = [
+            "› Previous task",
+            "• Previous answer",
+            "  Worked for 2s • 4:19 PM",
+            composer,
+            status_bar,
+        ]
+        backend = MagicMock()
+        backend.get_history.return_value = "\n".join(previous)
+        mock_codex_backend.return_value = backend
+        provider = CodexProvider("t1", "session", "window")
+        provider._codex_version = (0, 162, 1)
+        provider._ends_turns_with_footer = True
+        provider.notify_status_buffer_reset(3)
+        provider.mark_input_received()
+        provider.record_dispatched_message("new task")
+
+        monitor = StatusMonitor()
+        monitor._last_status["t1"] = TerminalStatus.PROCESSING
+        old_frame = previous[:-1]
+        old_verdict = provider.get_status_from_screen(old_frame)
+        with patch("cli_agent_orchestrator.services.status_monitor.bus") as bus:
+            assert old_verdict == TerminalStatus.UNKNOWN
+            assert monitor._apply_detection("t1", old_verdict)
+            assert monitor._last_status["t1"] == TerminalStatus.PROCESSING
+            bus.publish.assert_not_called()
+
+            completed_frame = [
+                *previous[:-2],
+                "• New answer after the previous turn",
+                "  Worked for 5s • 4:20 PM",
+                composer,
+                status_bar,
+            ]
+            completed_verdict = provider.get_status_from_screen(completed_frame)
+            assert completed_verdict == TerminalStatus.COMPLETED
+            assert monitor._apply_detection("t1", completed_verdict)
+
+        assert monitor._last_status["t1"] == TerminalStatus.COMPLETED
+        bus.publish.assert_called_once_with(
+            "terminal.t1.status", {"status": TerminalStatus.COMPLETED.value}
+        )
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_ready_verdict_from_output_that_changed_during_the_read_is_not_applied(
+        self, mock_pm, mock_get_backend
+    ):
+        """The read releases the lock. A chunk that lands meanwhile can show a
+        new turn, and the old ready verdict would let the inbox type into it."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = self._provider(screen_recheck=True)
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+
+        def read_while_a_chunk_lands(_lines):
+            with sm._lock:
+                sm._output_generation["t1"] = sm._output_generation.get("t1", 0) + 1
+            return TerminalStatus.COMPLETED
+
+        provider.get_status_from_screen.side_effect = read_while_a_chunk_lands
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert "t1" not in sm._recheck_cache
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_ready_verdict_is_not_applied_after_newer_output(self, mock_pm, mock_get_backend):
+        """Output can also land between the read and the apply."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = self._provider(screen_recheck=True)
+        provider.get_status_from_screen.return_value = TerminalStatus.COMPLETED
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+        generation = sm._output_generation.get("t1", 0)
+
+        assert (
+            sm._apply_detection("t1", TerminalStatus.COMPLETED, output_generation=generation + 1)
+            is False
+        )
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert (
+            sm._apply_detection("t1", TerminalStatus.COMPLETED, output_generation=generation)
+            is True
+        )
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_other_providers_keep_the_raw_recheck(self, mock_pm, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = self._provider(screen_recheck=False)
+        mock_pm.get_provider.return_value = provider
+        sm = self._monitor()
+
+        assert sm.get_status("t1") == TerminalStatus.IDLE
+        provider.get_status.assert_called_once_with("raw redraw fragments")
 
 
 class TestGetStatusEventInbox:
@@ -819,6 +1060,77 @@ class TestStaleProcessingCapturePane:
 class TestScreenDetection:
     """Rendered-screen detection should fail soft and keep monitoring alive."""
 
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_kimi_private_dsr_invalid_model_frame_latches_error(self, mock_pm, mock_settings):
+        """Regression for the live Kimi Code 2.1.1 invalid-model incident.
+
+        The same output burst contains a DEC-private DSR query and an indented
+        ``Error: Failed to start a session`` row. Before this fix pyte raised on
+        the DSR before rendered-screen detection ran; even when replayed past
+        that crash, Kimi's top-anchored error regex missed the indented row and
+        the empty composer read as ready. Feed the whole shape through the real
+        StatusMonitor ingestion path and pin the required terminal verdict.
+        """
+
+        from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider, KimiDialect
+
+        provider = KimiCliProvider("t1", "s", "w")
+        provider._dialect = KimiDialect.CODE
+        mock_pm.get_provider.return_value = provider
+        mock_settings.return_value = {"state_buffer_max": 32768}
+
+        sm = StatusMonitor()
+        sm._process_chunk(
+            "t1",
+            "\x1b[?6n"
+            '   Error: Failed to start a session: Model "bad-model" is\r\n'
+            " not configured in config.toml.\r\n"
+            "╭────────────────────────────────────────────╮\r\n"
+            "│ >                                          │\r\n"
+            "╰────────────────────────────────────────────╯\r\n"
+            "Never Ask  bad-model thinking  /tmp/project\r\n"
+            "context: 0%\r\n",
+        )
+
+        assert sm._last_status["t1"] is TerminalStatus.ERROR
+
+    def test_private_device_status_query_does_not_break_pyte_feed(self):
+        """pyte 0.8.2 passes ``private=True`` to DSR handlers.
+
+        Kimi Code 2.1.x emits ``CSI ? 6 n`` during ordinary TUI redraws. The
+        stock ``pyte.Screen.report_device_status(mode)`` rejects that keyword,
+        which used to abort the output chunk before StatusMonitor could
+        schedule rendered-screen detection. CAO only needs a passive
+        compositor, so the private query is ignored and the rest of the frame
+        must still render.
+        """
+
+        sm = StatusMonitor()
+        with sm._lock:
+            sm._feed_screen_locked(
+                "t1",
+                '\x1b[?6nError: Failed to start a session: Model "bad" is not configured.\r\n',
+            )
+
+        rendered, _ = sm._screen_lines("t1")
+        assert rendered is not None
+        assert any("Failed to start a session" in line for line in rendered)
+
+    def test_multi_parameter_device_attributes_do_not_break_pyte_feed(self):
+        """Passive composition ignores DA frames pyte 0.8.2 cannot dispatch."""
+
+        sm = StatusMonitor()
+        with sm._lock:
+            sm._feed_screen_locked(
+                "t1",
+                "\x1b[?1;2c\x1b[1;2cKimi frame survived\r\n",
+            )
+
+        rendered, _ = sm._screen_lines("t1")
+        assert rendered is not None
+        assert any("Kimi frame survived" in line for line in rendered)
+
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     def test_render_error_falls_back_to_raw_buffer_detection(self, mock_pm):
         class BrokenScreen:
@@ -1139,6 +1451,48 @@ class TestRawDebounceArmedDetection:
         assert sm._last_status["t1"] == TerminalStatus.PROCESSING
 
 
+class TestRawDetectionGeneration:
+    @pytest.mark.parametrize(
+        "detected", [TerminalStatus.PROCESSING, TerminalStatus.WAITING_USER_ANSWER]
+    )
+    @pytest.mark.parametrize("has_loop", [False, True])
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_pre_input_verdict_does_not_stamp_new_generation(
+        self, mock_pm, mock_settings, has_loop, detected
+    ):
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        mock_pm.get_provider.return_value = provider
+        sm = StatusMonitor()
+        if has_loop:
+            sm._loop = MagicMock()
+        started = threading.Event()
+        resume = threading.Event()
+
+        def detect(_terminal_id, _buffer):
+            started.set()
+            assert resume.wait(timeout=5)
+            return detected
+
+        with patch.object(sm, "_detect_status", side_effect=detect):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(sm._process_chunk, "t1", "old pane")
+                try:
+                    assert started.wait(timeout=5)
+                    previous_generation = sm._capture_generation["t1"]
+                    sm.notify_input_sent("t1")
+                    assert sm._capture_generation["t1"] == previous_generation + 1
+                finally:
+                    resume.set()
+                future.result(timeout=5)
+
+        assert sm._last_status.get("t1", TerminalStatus.UNKNOWN) == TerminalStatus.UNKNOWN
+        assert "t1" not in sm._waiting_generation
+        assert "t1" not in sm._processing_generation
+
+
 class TestProcessChunkBufferTruncation:
     """_process_chunk truncates the rolling buffer to the live
     state_buffer_max server setting, not a fixed constant."""
@@ -1191,3 +1545,955 @@ class TestProcessChunkBufferTruncation:
         sm_large._detect_status = lambda tid, buf: TerminalStatus.UNKNOWN
         sm_large._process_chunk("t1", payload)
         assert "MARKER" in sm_large.get_buffer("t1")
+
+
+class TestMidBurstProcessingProbe:
+    """A TUI that redraws its spinner every second never goes quiescent, so the
+    edge-only screen path saw IDLE for a whole busy turn (codex 0.153, live
+    2026-09-08). While bursting, an opted-in provider's non-mutating
+    ``probe_processing_from_screen()`` is asked at most every
+    PYTE_MIDBURST_PROBE_S, and only a True answer is applied."""
+
+    def _bursting_monitor(self, screen_lines=("• Working (3s • esc to interrupt)",)):
+        sm = StatusMonitor()
+        sm._loop = MagicMock()  # a loop exists -> edge-debounced path, not inline
+        sm._arm_quiesce_timer = lambda *a, **k: None
+        sm._cancel_quiesce_handle = lambda *a, **k: None
+        # A real pyte screen holding the frame, so a probe reads it through the
+        # same render path production uses rather than a stubbed accessor.
+        with sm._lock:
+            sm._feed_screen_locked("t1", "\r\n".join(screen_lines))
+        sm._last_status["t1"] = TerminalStatus.IDLE
+        sm._allow_processing_revert["t1"] = True
+        return sm
+
+    def _probing_provider(self, answers):
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.supports_midburst_processing_probe = True
+        provider.probe_processing_from_screen.side_effect = list(answers)
+        return provider
+
+    def test_processing_seen_mid_burst_is_applied(self):
+        sm = self._bursting_monitor()
+        provider = self._probing_provider([True])
+        sm._detect_screen = lambda tid, prov: TerminalStatus.IDLE  # rising edge: old ready box
+
+        sm._schedule_screen_detection("t1", provider)
+        assert sm._last_status["t1"] == TerminalStatus.IDLE
+        sm._schedule_screen_detection("t1", provider)  # mid-burst probe: spinner visible
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+    def test_probe_is_rate_limited_and_never_applies_ready(self):
+        sm = self._bursting_monitor()
+        # False == "this half-drawn frame does not show work", e.g. a frame
+        # caught mid-repaint that still parses as the previous response box.
+        provider = self._probing_provider([False, False])
+        sm._detect_screen = lambda tid, prov: TerminalStatus.IDLE
+
+        sm._schedule_screen_detection("t1", provider)  # rising edge
+        sm._schedule_screen_detection("t1", provider)  # first mid-burst probe
+        sm._schedule_screen_detection("t1", provider)  # within the window: no probe
+        assert provider.probe_processing_from_screen.call_count == 1
+        assert sm._last_status["t1"] == TerminalStatus.IDLE
+
+    def test_no_probe_once_processing(self):
+        sm = self._bursting_monitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        provider = self._probing_provider([True])
+        sm._bursting["t1"] = True
+        sm._schedule_screen_detection("t1", provider)
+        assert provider.probe_processing_from_screen.call_count == 0
+
+    def test_provider_without_opt_in_is_never_probed(self):
+        """Fail closed, like supports_screen_detection and
+        supports_direct_status_probe: no flag, no mid-burst probe."""
+        sm = self._bursting_monitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.supports_midburst_processing_probe = False
+        detector_calls = []
+        sm._detect_screen = lambda tid, prov: detector_calls.append(tid) or TerminalStatus.IDLE
+
+        sm._bursting["t1"] = True
+        sm._schedule_screen_detection("t1", provider)
+        assert provider.probe_processing_from_screen.call_count == 0
+        assert detector_calls == []  # and the full detector is not run either
+        assert sm._last_status["t1"] == TerminalStatus.IDLE
+
+    def test_mid_burst_probe_leaves_a_stateful_provider_untouched(self):
+        """A discarded verdict does not undo what a detector did to reach it.
+
+        minimax_code opts into screen detection and commits turn bookkeeping
+        inside get_status (``_last_completion_identity`` /
+        ``_last_completion_buffer_epoch``, clearing ``_awaiting_turn``). Running
+        it against a mid-redraw frame — here turn A's retained response with its
+        user row momentarily erased, which changes the completion fingerprint —
+        makes that frame look like a NEW completion. Even with the COMPLETED
+        verdict thrown away, the bookkeeping would stick and the next settled
+        frame would report turn B complete on turn A's output. minimax does not
+        set supports_midburst_processing_probe, so the probe never asks it.
+        """
+        from pathlib import Path
+
+        from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider
+
+        fixture = (
+            Path(__file__).resolve().parents[1]
+            / "providers"
+            / "fixtures"
+            / "minimax_code_completed.txt"
+        ).read_text(encoding="utf-8")
+        provider = MiniMaxCodeProvider(
+            terminal_id="t1", session_name="s", window_name="w", agent_profile=None
+        )
+        assert provider.get_status(fixture) == TerminalStatus.IDLE  # turn A settles
+        provider.notify_status_buffer_reset(1)
+        provider.mark_input_received()  # turn B armed
+        provider._last_dispatch_time = 0
+        assert provider._awaiting_turn is True
+
+        mid_redraw = [line for line in fixture.splitlines() if not line.startswith("› Explain")]
+        sm = self._bursting_monitor(screen_lines=mid_redraw)
+        before = dict(vars(provider))
+
+        sm._bursting["t1"] = True
+        sm._schedule_screen_detection("t1", provider)
+
+        assert vars(provider) == before
+        assert provider._awaiting_turn is True
+        # The settled frame still reads IDLE: turn B is still pending, which is
+        # the base behavior. (Feeding the same mid-redraw frame to the detector
+        # would have returned COMPLETED and cleared _awaiting_turn.)
+        assert provider.get_status_from_screen(fixture.splitlines()) == TerminalStatus.IDLE
+        assert provider._awaiting_turn is True
+
+    def test_codex_spinner_frame_probes_processing_without_mutating(self):
+        """The regression this fix exists for, through the real provider."""
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+
+        provider = CodexProvider(
+            terminal_id="t1", session_name="s", window_name="w", agent_profile=None
+        )
+        assert provider.supports_midburst_processing_probe is True
+        working = [
+            "› Improve documentation in @filename",
+            "• Working (3s • esc to interrupt)",
+            "",
+            "  gpt-5.6-terra high · /tmp/project",
+        ]
+        before = dict(vars(provider))
+        assert provider.probe_processing_from_screen(working) is True
+        assert vars(provider) == before  # the predicate is an observation only
+
+        idle = [
+            "› Improve documentation in @filename",
+            "",
+            "  gpt-5.6-terra high · /tmp/project",
+        ]
+        assert provider.probe_processing_from_screen(idle) is False
+
+        sm = self._bursting_monitor(screen_lines=working)
+        sm._bursting["t1"] = True
+        sm._schedule_screen_detection("t1", provider)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+    def test_erased_composer_is_not_work_evidence_and_the_real_spinner_still_lands(self):
+        """A partial redraw must not spend the dispatch arm.
+
+        `CodexProvider.get_status` answers PROCESSING for two different reasons:
+        a detected spinner, and a catch-all for a frame with no idle composer at
+        the bottom. The second is right for settled detection and wrong for a
+        mid-burst probe: erasing the composer while the previous response is
+        still on screen carries no evidence of new work. Taken as busy it
+        consumes the arm `notify_input_sent` set, the restored old completion
+        then latches, and the genuine spinner that follows is refused by the
+        sticky-ready rule — the terminal reads COMPLETED for the whole new turn.
+        """
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+
+        provider = CodexProvider(
+            terminal_id="t1", session_name="s", window_name="w", agent_profile=None
+        )
+        old_response = [
+            "› Explain the result",
+            "• The integration is complete.",
+            "",
+            "  gpt-5.6-terra high · /tmp/project",
+        ]
+        erased_composer = ["• The integration is complete."]
+        real_spinner = [
+            "› Explain the result",
+            "• Working (3s • esc to interrupt)",
+            "",
+            "  gpt-5.6-terra high · /tmp/project",
+        ]
+
+        # The frame with no composer and no spinner is exactly the one the full
+        # detector calls PROCESSING through its fallback.
+        assert provider.get_status_from_screen(erased_composer) == TerminalStatus.PROCESSING
+        assert provider.probe_processing_from_screen(erased_composer) is False
+
+        sm = self._bursting_monitor(screen_lines=erased_composer)
+        sm._last_status["t1"] = TerminalStatus.COMPLETED  # previous turn
+        sm.notify_input_sent("t1")  # new turn dispatched: arm the transition
+        sm._bursting["t1"] = True
+
+        sm._schedule_screen_detection("t1", provider)  # probe the erased frame
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        assert sm._allow_processing_revert["t1"] is True  # the arm survives
+
+        # The old completion is redrawn and settles; still armed, still COMPLETED.
+        with sm._lock:
+            sm._screens.pop("t1", None)
+            sm._feed_screen_locked("t1", "\r\n".join(old_response))
+        # Quiescence with no event loop detects inline, the same call
+        # _on_screen_quiescent makes on its worker thread.
+        sm._loop = None
+        sm._on_screen_quiescent("t1", provider)
+        sm._loop = MagicMock()
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        assert sm._allow_processing_revert["t1"] is True
+
+        # The genuine spinner appears mid-burst and must be honoured.
+        with sm._lock:
+            sm._screens.pop("t1", None)
+            sm._feed_screen_locked("t1", "\r\n".join(real_spinner))
+            sm._midburst_probe_at.pop("t1", None)
+        sm._bursting["t1"] = True
+        sm._schedule_screen_detection("t1", provider)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+
+class TestOutputGenerationIsOutputOnly:
+    """PR #566: the delivery-confirmation gate needs a counter only OUTPUT can move.
+
+    ``_capture_generation`` must advance on ``notify_input_sent`` too (a new turn
+    invalidates in-flight capture verdicts), so it cannot serve: a redelivery's own
+    arm would satisfy "output arrived since dispatch" on a still-cached COMPLETED.
+    ``output_generation()`` therefore exposes a separate counter that only
+    ``_process_chunk`` bumps.
+    """
+
+    def test_unknown_terminal_reads_zero(self):
+        assert StatusMonitor().output_generation("never-seen") == 0
+
+    def test_arming_a_turn_does_not_advance_it(self):
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")
+        sm.notify_input_sent("t1", assume_processing=False)
+        assert sm.output_generation("t1") == 0, (
+            "notify_input_sent moved the output generation: a redelivery's own arm would "
+            "now pass for post-dispatch output and confirm a stale COMPLETED"
+        )
+        # The capture generation, by contrast, MUST have moved -- that is its job.
+        assert sm._capture_generation["t1"] == 2
+
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_each_real_chunk_advances_it_by_one(self, mock_pm, mock_settings):
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        sm.notify_input_sent("t1")  # dispatch: arms, does not count
+        boundary = sm.output_generation("t1")
+        for chunk in ("thinking ", "done.\n", "> "):
+            sm._process_chunk("t1", chunk)
+
+        assert sm.output_generation("t1") == boundary + 3
+        # Interleaving another arm (a redelivery) still adds nothing.
+        sm.notify_input_sent("t1")
+        assert sm.output_generation("t1") == boundary + 3
+
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_forgetting_a_terminal_resets_it(self, mock_pm, mock_settings):
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        sm._process_chunk("t1", "x")
+        assert sm.output_generation("t1") == 1
+        sm.reset_buffer("t1")
+        assert sm.output_generation("t1") == 0
+        sm._process_chunk("t1", "y")
+        sm.clear_terminal("t1")
+        assert sm.output_generation("t1") == 0
+
+
+class TestStatusObservationIsStampedWhenEarned:
+    """PR #566 round 9: a status VALUE cannot say when it was earned, so the monitor
+    stamps each applied status with the output generation it was computed from and
+    ``status_observation`` returns the pair. Delivery confirmation compares that
+    stamp (not the live counter) with the dispatch boundary.
+    """
+
+    @staticmethod
+    def _tmux_backend():
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        return backend
+
+    def test_unknown_terminal_observes_unknown_at_generation_zero(self):
+        with patch(
+            "cli_agent_orchestrator.backends.registry.get_backend",
+            return_value=self._tmux_backend(),
+        ):
+            observation = StatusMonitor().status_observation("never-seen")
+        assert observation.status == TerminalStatus.UNKNOWN
+        assert observation.output_generation == 0
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_a_changed_status_is_stamped_with_the_output_that_produced_it(
+        self, mock_pm, mock_settings, mock_backend
+    ):
+        mock_backend.return_value = self._tmux_backend()
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        mock_pm.get_provider.return_value = provider
+        sm = StatusMonitor()
+
+        provider.get_status.return_value = TerminalStatus.IDLE
+        sm._process_chunk("t1", "> ")  # generation 1
+        assert sm.status_observation("t1") == (TerminalStatus.IDLE, 1)
+
+        sm.notify_input_sent("t1")  # a dispatch arms the sticky latch; not output
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        sm._process_chunk("t1", "⠋")  # generation 2
+        sm._process_chunk("t1", "⠙")  # generation 3, still PROCESSING: re-earned
+        assert sm.status_observation("t1") == (TerminalStatus.PROCESSING, 3)
+
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        sm._process_chunk("t1", "✓ done\n> ")  # generation 4
+        assert sm.status_observation("t1") == (TerminalStatus.COMPLETED, 4)
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_an_unchanged_ready_status_keeps_its_old_stamp(
+        self, mock_pm, mock_settings, mock_backend
+    ):
+        """The round-9 defect in one assertion: unrelated output moves the counter,
+        a sticky COMPLETED re-detected from a repaint must NOT move with it."""
+        mock_backend.return_value = self._tmux_backend()
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        mock_pm.get_provider.return_value = provider
+        sm = StatusMonitor()
+
+        sm._process_chunk("t1", "startup ✓\n> ")  # earned at 1
+        sm.notify_input_sent("t1")  # a dispatch: arms, does not count
+        sm.clear_rolling_buffer("t1")
+        for frame in ("\x1b[2J", "(repaint) ✓\n> ", "\x1b[?25h"):
+            sm._process_chunk("t1", frame)  # 2, 3, 4 -- all re-parse as COMPLETED
+        assert sm.output_generation("t1") == 4
+        assert sm.status_observation("t1") == (TerminalStatus.COMPLETED, 1)
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_optimistic_processing_latch_is_stamped_at_the_pre_send_generation(self, mock_backend):
+        mock_backend.return_value = self._tmux_backend()
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.IDLE
+        sm._output_generation["t1"] = 6
+        sm.notify_input_sent("t1", assume_processing=True)
+        boundary = sm.output_generation("t1")
+        observation = sm.status_observation("t1")
+        assert observation.status == TerminalStatus.PROCESSING
+        assert (
+            observation.output_generation == 6 == boundary
+        ), "a guessed PROCESSING must never read as newer than the dispatch it was guessed at"
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_event_inbox_backends_report_no_generation(self, mock_backend):
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = True
+        mock_backend.return_value = backend
+        sm = StatusMonitor()
+        with patch.object(sm, "get_status", return_value=TerminalStatus.COMPLETED):
+            observation = sm.status_observation("herd1")
+        assert observation == (TerminalStatus.COMPLETED, None)
+
+    def test_forgetting_a_terminal_drops_the_stamp(self):
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm._status_generation["t1"] = 5
+        sm.clear_terminal("t1")
+        assert "t1" not in sm._status_generation
+        sm._status_generation["t1"] = 5
+        sm.reset_buffer("t1")
+        assert "t1" not in sm._status_generation
+
+
+class TestPollRederivesOnRegisteredDetector:
+    """GH #865: while the cached status is PROCESSING, ``get_status`` re-derives
+    on every poll. A provider that opts in with ``status_recheck_uses_screen``
+    (claude_code) must be re-read from its composited screen, not the raw rolling
+    window: Ink repaints only changed cells, so the window holds glyph fragments
+    and, once a long answer has pushed the input box past the size cap, no box at
+    all. Read from there, the raw detector called a streaming turn ready and
+    ``run_step`` tore the worker down mid-answer. A screen-path provider that has
+    not opted in (kimi_cli) keeps the raw re-check."""
+
+    class _Screen:
+        def __init__(self, rows):
+            self.display = rows
+
+    def _monitor(self, provider, rows):
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = "✢\n 3\n· thinking\n⏺\n❯\xa0\n"  # raw window: fragments, no box
+        sm._buffer_changed_at["t1"] = time.monotonic()  # still streaming: not quiet
+        sm._screens["t1"] = (self._Screen(rows), MagicMock())
+        return sm
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_screen_provider_ready_verdict_from_the_composite_is_applied(
+        self, mock_pm, mock_get_backend
+    ):
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.status_recheck_uses_screen = True
+        provider.get_status_from_screen.return_value = TerminalStatus.COMPLETED
+        mock_pm.get_provider.return_value = provider
+        mock_get_backend.return_value = _backend(event_inbox=False)
+
+        sm = self._monitor(provider, ["⏺ done", "✻ Worked for 4s", "────", "❯", "────"])
+
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        provider.get_status.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_raw_provider_keeps_the_raw_rederivation(self, mock_pm, mock_get_backend):
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        provider.status_recheck_uses_screen = False
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        mock_pm.get_provider.return_value = provider
+        mock_get_backend.return_value = _backend(event_inbox=False)
+
+        sm = self._monitor(provider, [])
+
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+        provider.get_status.assert_called_once_with(sm._buffers["t1"])
+        provider.get_status_from_screen.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", True)
+    @patch("cli_agent_orchestrator.providers.claude_code.get_backend")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_claude_valve_fires_through_the_stale_pane_recheck(
+        self, mock_pm, mock_get_backend, mock_claude_backend
+    ):
+        """A real ClaudeCodeProvider through ``get_status``, polled once a second
+        as a run-step waiter does, on an end state that paints no summary (the
+        reply to ``/compact``). The poll re-check reads the composite once and
+        reuses that verdict while the output stays the same (#907), so the grace
+        valve runs again only through the stale-pane re-check (#558), every 3 s
+        once the buffer is quiet. PROCESSING holds through the grace period; the
+        fallback lands at the first capture read after it and is applied on the
+        confirming read. The composite keeps a hint row the pane has cleared, so
+        the two views are different frames (the P2 of the review)."""
+        from cli_agent_orchestrator.providers.claude_code import (
+            TURN_END_GRACE_S,
+            ClaudeCodeProvider,
+        )
+
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        backend.get_history.return_value = ""  # the dispatch snapshot: nothing on screen yet
+        mock_get_backend.return_value = backend
+        mock_claude_backend.return_value = backend
+        provider = ClaudeCodeProvider("t1", "s", "w")
+        provider.mark_input_received()
+        clock = {"now": 1000.0}
+        provider._turn_gate_clock = lambda: clock["now"]
+        mock_pm.get_provider.return_value = provider
+
+        rail = "─" * 40
+        pane = ["❯ /compact", "  ⎿  Not enough messages to compact.", rail, "❯ ", rail]
+        hint = "  ❯ /compact        Free up context by summarizing the conversation so far"
+        composite = pane[:2] + [hint] + pane[2:]
+        backend.get_history.return_value = "\n".join(pane)  # the capture-pane read
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = "raw repaint fragments"
+        sm._buffer_changed_at["t1"] = -1000.0  # quiet: the stale-pane re-check may run
+        with sm._lock:
+            sm._feed_screen_locked("t1", "\r\n".join(composite))
+        composite_reads = []
+        real_detect_screen = sm._detect_screen
+
+        def counting_detect_screen(terminal_id, prov):
+            composite_reads.append(clock["now"])
+            return real_detect_screen(terminal_id, prov)
+
+        sm._detect_screen = counting_detect_screen  # type: ignore[method-assign]
+
+        ready_at = None
+        for t in range(1, 61):
+            clock["now"] = 1000.0 + t
+            if t % 3 == 0:
+                # The capture read is rate-limited on real time; release it on
+                # the 3 s cadence it has live instead of sleeping.
+                sm._last_stale_capture_check.pop("t1", None)
+            status = sm.get_status("t1")
+            if status != TerminalStatus.PROCESSING:
+                ready_at = t
+                break
+            assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+        assert ready_at is not None, "the valve never fired through the stale-pane re-check"
+        assert ready_at > TURN_END_GRACE_S
+        # One capture read to fall back, one to confirm, on the 3 s cadence.
+        assert ready_at <= TURN_END_GRACE_S + 2 * STALE_PROCESSING_CAPTURE_INTERVAL_S
+        assert status == TerminalStatus.IDLE
+        assert sm._last_status["t1"] == TerminalStatus.IDLE
+        assert len(composite_reads) == 1, "the poll re-check must reuse its verdict"
+        assert backend.get_history.call_count >= 3  # dispatch snapshot + fall back + confirm
+
+
+class TestCopilotBoxedComposerRecovery:
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            "● The utility asks before deleting: [y/n].",
+            "● For instance:\n  Continue? [y/n]",
+            "● The installer shows:\n  The prompt reads\n  Press enter to continue",
+            " ● APT asks for confirmation.\n\n   Do you want to continue? [Y/n]\n\n ● Task complete",
+            " ● ┌──────┬────────────────────────────────┐\n"
+            "   │ Tool │ Question                       │\n"
+            "   ├──────┼────────────────────────────────┤\n"
+            "   │ apt  │ Do you want to continue? [Y/n] │\n"
+            "   └──────┴────────────────────────────────┘",
+        ],
+    )
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_reported_choice_in_completed_reply_does_not_block_recovery(
+        self, mock_pm, mock_backend, layout, answer
+    ):
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+
+        provider = CopilotCliProvider("t1", "s", "w")
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        mock_backend.return_value = backend
+        composer = "❯\n" if layout == "prompt" else "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀▀▀▀▀\n"
+        backend.get_history.return_value = (
+            "❯ explain the confirmation prompt\n"
+            "   including [y/n]\n"
+            + answer
+            + "\n"
+            + composer
+            + "← open sidebar · Autopilot · Allow All · / commands · tab next tab\n"
+        )
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffer_changed_at["t1"] = time.monotonic() - STALE_PROCESSING_BUFFER_QUIET_S - 1
+        sm._processing_generation["t1"] = 0
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm._pending_stale_capture["t1"][0] == TerminalStatus.COMPLETED
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+
+    def test_confirmation_scheduling_during_shutdown_keeps_processing(self):
+        sm = StatusMonitor()
+        sm._loop = MagicMock()
+        sm._loop.call_soon_threadsafe.side_effect = RuntimeError("Event loop is closed")
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._capture_generation["t1"] = 3
+        candidate = (TerminalStatus.IDLE, 100.0, 3)
+        sm._pending_stale_capture["t1"] = candidate
+        with patch("cli_agent_orchestrator.services.status_monitor.bus.publish") as publish:
+            sm._schedule_stale_capture_confirmation("t1", 3)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert sm._pending_stale_capture["t1"] == candidate
+        assert not sm._stale_capture_handle
+        assert not sm._detect_tasks
+        sm._loop.call_later.assert_not_called()
+        publish.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("boundary", ["input", "candidate_cleared", "candidate_replaced"])
+    async def test_queued_confirmation_revalidates_before_capture(self, boundary):
+        sm = StatusMonitor()
+        sm._loop = asyncio.get_running_loop()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._capture_generation["t1"] = 3
+        sm._pending_stale_capture["t1"] = (TerminalStatus.IDLE, 100.0, 3)
+        handle = MagicMock()
+        sm._stale_capture_handle["t1"] = handle
+        with (
+            patch.object(sm, "get_status") as capture,
+            patch("cli_agent_orchestrator.services.status_monitor.bus.publish") as publish,
+        ):
+            sm._on_stale_capture_confirmation("t1", 3, handle)
+            # Invalidate after the timer fires but before its coroutine runs.
+            if boundary == "input":
+                sm.notify_input_sent("t1")
+            elif boundary == "candidate_cleared":
+                sm._pending_stale_capture.pop("t1")
+            else:
+                sm._pending_stale_capture["t1"] = (TerminalStatus.IDLE, 101.0, 4)
+            await asyncio.gather(*list(sm._detect_tasks))
+        capture.assert_not_called()
+        publish.assert_not_called()
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert not sm._stale_capture_handle
+
+    @pytest.mark.asyncio
+    async def test_confirmation_read_failure_keeps_processing_and_is_reported(self):
+        sm = StatusMonitor()
+        sm._loop = asyncio.get_running_loop()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._capture_generation["t1"] = 3
+        sm._pending_stale_capture["t1"] = (TerminalStatus.IDLE, 100.0, 3)
+        handle = MagicMock()
+        sm._stale_capture_handle["t1"] = handle
+        with (
+            patch.object(sm, "get_status", side_effect=RuntimeError("capture unavailable")),
+            patch.object(sm, "_schedule_stale_capture_confirmation") as reschedule,
+            patch("cli_agent_orchestrator.services.status_monitor.logger") as logger,
+            patch("cli_agent_orchestrator.services.status_monitor.bus.publish") as publish,
+        ):
+            sm._on_stale_capture_confirmation("t1", 3, handle)
+            await asyncio.gather(*list(sm._detect_tasks))
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert not sm._stale_capture_handle
+        logger.exception.assert_called_once_with("Stale capture confirmation failed for %s", "t1")
+        reschedule.assert_not_called()
+        publish.assert_not_called()
+
+    def test_cancelled_confirmation_cannot_remove_a_new_turn_timer(self):
+        sm = StatusMonitor()
+        old_handle = MagicMock()
+        current_handle = MagicMock()
+        sm._stale_capture_handle["t1"] = current_handle
+        sm._capture_generation["t1"] = 2
+        sm._pending_stale_capture["t1"] = (TerminalStatus.IDLE, 100.0, 2)
+        sm._on_stale_capture_confirmation("t1", 1, old_handle)
+        assert sm._stale_capture_handle["t1"] is current_handle
+        assert not sm._detect_tasks
+
+    @pytest.mark.parametrize(
+        "cached", [TerminalStatus.PROCESSING, TerminalStatus.WAITING_USER_ANSWER]
+    )
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_unearned_new_turn_never_schedules_a_capture(self, mock_pm, mock_backend, cached):
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+
+        provider = CopilotCliProvider("t1", "s", "w")
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        mock_backend.return_value = backend
+        sm = StatusMonitor()
+        sm._last_status["t1"] = cached
+        sm._processing_generation["t1"] = 0
+        sm._waiting_generation["t1"] = 0
+        sm._buffer_changed_at["t1"] = -1000
+        sm.notify_input_sent("t1")
+        with patch.object(sm, "_schedule_stale_capture_confirmation") as schedule:
+            assert sm.get_status("t1") == cached
+        backend.get_history.assert_not_called()
+        schedule.assert_not_called()
+
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_ready_box_requires_two_reads_and_busy_read_resets_candidate(
+        self, mock_pm, mock_backend, layout
+    ):
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+
+        provider = CopilotCliProvider("t1", "s", "w")
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        mock_backend.return_value = backend
+        composer = "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀▀▀▀▀\n" if layout == "box" else "────────\n❯\n────────\n"
+        ready = composer + ("← open sidebar · Autopilot · Allow All · / commands · tab next tab\n")
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = ""
+        sm._buffer_changed_at["t1"] = time.monotonic() - STALE_PROCESSING_BUFFER_QUIET_S - 1
+        sm._processing_generation["t1"] = 0
+
+        backend.get_history.return_value = ready
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert sm._pending_stale_capture["t1"][0] == TerminalStatus.IDLE
+        backend.get_history.return_value = "∙ Thinking (Esc to cancel)\n" + ready
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        assert "t1" not in sm._pending_stale_capture
+        backend.get_history.return_value = ready
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.IDLE
+        backend.get_history.assert_called_with("s", "w", strip_escapes=True, visible_only=True)
+
+
+class TestCopilotStaleWaitingCapture:
+    trust = "Confirm folder trust\n1. Yes\n2. Yes, and remember\n"
+    hint = "← open sidebar · Autopilot · Allow All · / commands · tab next tab"
+
+    @pytest.mark.parametrize("source", ["raw", "pane"])
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_framed_trust_is_waiting(self, mock_pm, mock_backend, source):
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+
+        provider = CopilotCliProvider("t1", "s", "w")
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        mock_backend.return_value = backend
+        trust = (
+            "╭────────────╮\n"
+            "│ Confirm folder trust │\n"
+            "│ Do you trust the files in this folder? │\n"
+            "│ ❯ 1. Yes │\n"
+            "╰────────────╯\n"
+        )
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        sm._buffers["t1"] = trust if source == "raw" else ""
+        sm._buffer_changed_at["t1"] = time.monotonic() - STALE_PROCESSING_BUFFER_QUIET_S - 1
+        sm._processing_generation["t1"] = 0
+        backend.get_history.return_value = trust
+        if source == "pane":
+            assert sm.get_status("t1") == TerminalStatus.PROCESSING
+            assert sm._pending_stale_capture["t1"][0] == TerminalStatus.WAITING_USER_ANSWER
+            sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("interruption", ["input", "idle", "reset"])
+    async def test_old_raw_dialog_verdict_cannot_cross_a_new_state(self, interruption):
+        sm = StatusMonitor()
+        sm._loop = asyncio.get_running_loop()
+        sm._buffers["t1"] = self.trust
+        sm._last_status["t1"] = TerminalStatus.WAITING_USER_ANSWER
+        sm._waiting_generation["t1"] = 0
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def deferred_detection(*args):
+            started.set()
+            await release.wait()
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        with patch(
+            "cli_agent_orchestrator.services.status_monitor.asyncio.to_thread", deferred_detection
+        ):
+            sm._on_raw_quiescent("t1")
+            await started.wait()
+            if interruption == "input":
+                sm.notify_input_sent("t1")
+            elif interruption == "idle":
+                sm._apply_detection("t1", TerminalStatus.IDLE)
+            else:
+                sm.reset_buffer("t1")
+            release.set()
+            await asyncio.gather(*list(sm._detect_tasks))
+
+        if interruption == "input":
+            assert sm._waiting_generation["t1"] == 0
+        elif interruption == "idle":
+            assert sm._last_status["t1"] == TerminalStatus.IDLE
+        else:
+            assert "t1" not in sm._last_status
+
+    @pytest.mark.parametrize("layout", ["prompt", "box"])
+    @pytest.mark.parametrize("redraw", ["lost", "cursor", "evicted"])
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_dismissed_trust_recovers_after_two_current_pane_reads(
+        self, mock_pm, mock_backend, mock_settings, layout, redraw
+    ):
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+
+        provider = CopilotCliProvider("t1", "s", "w")
+        mock_pm.get_provider.return_value = provider
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        mock_backend.return_value = backend
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        composer = "❯\n" if layout == "prompt" else "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀▀▀▀▀\n"
+        ready = composer + self.hint + "\n"
+        sm = StatusMonitor()
+        with patch.object(sm, "_running_loop", return_value=None):
+            sm._process_chunk("t1", self.trust)
+            assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+            if redraw != "lost":
+                if redraw == "evicted":
+                    mock_settings.return_value = {"state_buffer_max": 40}
+                # Stripping CSI does not reconstruct cursor-addressed rows.
+                sm._process_chunk("t1", "\x1b[2J\x1b[H❯\x1b[2;1H" + self.hint)
+        assert sm._last_status["t1"] == TerminalStatus.WAITING_USER_ANSWER
+        assert provider.get_status(ready) == TerminalStatus.IDLE
+        backend.get_history.return_value = ready
+        backend.get_history.reset_mock()
+        sm._buffer_changed_at["t1"] = -1000
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        assert sm._pending_stale_capture["t1"][0] == TerminalStatus.IDLE
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.IDLE
+        assert sm._last_status["t1"] == TerminalStatus.IDLE
+        backend.get_history.assert_called_with("s", "w", strip_escapes=True, visible_only=True)
+
+    @pytest.fixture
+    def waiting_monitor(self):
+        from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+
+        provider = CopilotCliProvider("t1", "s", "w")
+        backend = _backend(event_inbox=False)
+        backend.get_native_status.return_value = None
+        sm = StatusMonitor()
+        with (
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
+                return_value=provider,
+            ),
+            patch("cli_agent_orchestrator.backends.registry.get_backend", return_value=backend),
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.get_server_settings",
+                return_value={"state_buffer_max": 32768},
+            ),
+            patch.object(sm, "_running_loop", return_value=None),
+        ):
+            sm._process_chunk("t1", self.trust)
+            sm._buffer_changed_at["t1"] = -1000
+            backend.get_history.return_value = "❯\n" + self.hint
+            yield sm, provider, backend
+
+    def test_completed_table_recovers_cached_waiting(self, waiting_monitor):
+        sm, _, backend = waiting_monitor
+        backend.get_history.return_value = (
+            "❯ show the confirmation table\n"
+            " ● ┌──────┬────────────────────────────────┐\n"
+            "   │ Tool │ Question                       │\n"
+            "   ├──────┼────────────────────────────────┤\n"
+            "   │ apt  │ Do you want to continue? [Y/n] │\n"
+            "   └──────┴────────────────────────────────┘\n"
+            "────────\n❯\n────────\n" + self.hint
+        )
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        assert sm._pending_stale_capture["t1"][0] == TerminalStatus.COMPLETED
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.COMPLETED
+
+    @pytest.mark.parametrize("layout", ["prompt", "draft", "box"])
+    @pytest.mark.parametrize("placement", ["before", "after"])
+    def test_live_approval_prevents_recovery_and_breaks_ready_confirmation(
+        self, waiting_monitor, layout, placement
+    ):
+        sm, provider, backend = waiting_monitor
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        assert sm._pending_stale_capture["t1"][0] == TerminalStatus.IDLE
+        composer = (
+            "╻▄▄▄▄▄▄▄▄\n┃\n╹▀▀▀▀▀▀▀▀\n"
+            if layout == "box"
+            else "❯ draft\n" if layout == "draft" else "❯\n"
+        )
+        ready = composer + self.hint + "\n"
+        approval = "Allow this tool to run? [y/n]\n"
+        backend.get_history.return_value = (
+            approval + ready if placement == "before" else ready + approval
+        )
+        assert (
+            provider.probe_stale_processing_capture(backend.get_history.return_value)
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
+        for _ in range(2):
+            sm._last_stale_capture_check["t1"] = None
+            assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        backend.get_history.return_value = ready
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.IDLE
+
+    @pytest.mark.parametrize(
+        "pane",
+        [
+            "",
+            "╻▄▄▄▄▄▄▄▄\n┃\n",
+            "∙ Thinking (Esc to cancel)\n❯\n",
+        ],
+    )
+    def test_blank_incomplete_or_busy_read_cannot_confirm_ready(self, waiting_monitor, pane):
+        sm, provider, backend = waiting_monitor
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        ready = backend.get_history.return_value
+        backend.get_history.return_value = pane
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        backend.get_history.return_value = ready
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_waiting_recovery_is_opt_in_and_quiet_and_rate_limited(self, waiting_monitor):
+        sm, provider, backend = waiting_monitor
+        provider.supports_stale_waiting_capture = False
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        backend.get_history.assert_not_called()
+        provider.supports_stale_waiting_capture = True
+        sm._last_stale_capture_check["t1"] = None
+        sm._buffer_changed_at["t1"] = time.monotonic()
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        backend.get_history.assert_not_called()
+        sm._buffer_changed_at["t1"] = -1000
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        assert backend.get_history.call_count == 1
+
+    @pytest.mark.parametrize("during_read", [False, True])
+    def test_new_input_invalidates_waiting_capture_evidence(self, waiting_monitor, during_read):
+        sm, provider, backend = waiting_monitor
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        ready = backend.get_history.return_value
+        sm._last_stale_capture_check["t1"] = None
+        if during_read:
+
+            def new_input_then_ready(*args, **kwargs):
+                sm.notify_input_sent("t1")
+                return ready
+
+            backend.get_history.side_effect = new_input_then_ready
+        else:
+            sm.notify_input_sent("t1")
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        assert "t1" not in sm._pending_stale_capture
+        backend.get_history.side_effect = None
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        sm._process_chunk("t1", "\nConfirm folder trust\n")
+        sm._buffer_changed_at["t1"] = -1000
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.WAITING_USER_ANSWER
+        sm._last_stale_capture_check["t1"] = None
+        assert sm.get_status("t1") == TerminalStatus.IDLE

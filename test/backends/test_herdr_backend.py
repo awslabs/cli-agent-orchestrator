@@ -1418,3 +1418,22 @@ class TestEnvValueRedaction:
         msg = str(exc.value)
         assert "s3cr3t$token" not in msg
         assert "<redacted>" in msg
+
+
+@patch("subprocess.run")
+def test_failed_command_keeps_stderr_out_of_the_exception(mock_run, backend, caplog):
+    """The exception text reaches HTTP 500 bodies; stderr stays in the server log."""
+    import logging
+
+    mock_run.return_value = _completed(returncode=2)
+    mock_run.return_value.stderr = "error: cannot connect to /Users/op/.herdr/sock --token=abc"
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(TerminalBackendError) as excinfo:
+            backend._run_herdr(["workspace", "list"])
+    message = str(excinfo.value)
+    assert "herdr command failed" in message
+    assert "exit 2" in message
+    assert "/Users/op/.herdr/sock" not in message
+    assert "--token=abc" not in message
+    assert "/Users/op/.herdr/sock" in caplog.text

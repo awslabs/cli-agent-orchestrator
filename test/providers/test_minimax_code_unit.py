@@ -14,7 +14,7 @@ import yaml
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.minimax_code import (
-    MINIMAX_CODE_MODEL_IDS,
+    MINIMAX_CODE_DEFAULT_MODEL,
     MiniMaxCodeProvider,
     ProviderError,
 )
@@ -34,10 +34,6 @@ def make_provider(**kwargs) -> MiniMaxCodeProvider:
         agent_profile=kwargs.pop("agent_profile", "developer"),
         **kwargs,
     )
-
-
-def test_current_model_catalog():
-    assert MINIMAX_CODE_MODEL_IDS == ("MiniMax-M3", "MiniMax-M2.7")
 
 
 def test_prepare_runtime_isolates_auth_and_generates_private_mcp_plugin(
@@ -82,7 +78,10 @@ def test_prepare_runtime_isolates_auth_and_generates_private_mcp_plugin(
 
     digest = hashlib.sha256(b"deadbeef").hexdigest()
     assert data_dir == cao_home / "providers" / "minimax_code" / digest
-    assert (data_dir / "config.yaml").read_text() == "modelSource: managed\n"
+    assert yaml.safe_load((data_dir / "config.yaml").read_text()) == {
+        "modelSource": "managed",
+        "defaultModel": MINIMAX_CODE_DEFAULT_MODEL,
+    }
     assert (data_dir / "local-runtime.auth.json").read_text() == '{"token":"secret"}'
     assert (data_dir / "cli-auth" / "nested" / "session.json").read_text() == "secret-session"
     assert not (data_dir / "plugins" / "personal").exists()
@@ -180,6 +179,84 @@ def test_prepare_runtime_applies_model_to_terminal_local_config(
 
     config = yaml.safe_load((data_dir / "config.yaml").read_text())
     assert config["defaultModel"] == expected_model
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_source", ["token_plan", "minimax_api_key"])
+@pytest.mark.parametrize(
+    ("saved_model", "profile_model", "launch_model", "expected_model"),
+    [
+        (None, None, None, "minimax/MiniMax-M3"),
+        (None, "MiniMax-M3", None, "minimax/MiniMax-M3"),
+        ("minimax/MiniMax-M2.7", None, None, "minimax/MiniMax-M2.7"),
+        ("MiniMax-M2.7", None, None, "MiniMax-M2.7"),
+        ("custom_provider:local/custom-model", None, None, "custom_provider:local/custom-model"),
+        ("minimax/MiniMax-M2.7", "MiniMax-M3", None, "minimax/MiniMax-M3"),
+        ("minimax/MiniMax-M2.7", "profile/model", "MiniMax-M3", "minimax/MiniMax-M3"),
+        (None, None, "minimax_api/MiniMax-M3", "minimax_api/MiniMax-M3"),
+        (
+            None,
+            "MiniMax-M3",
+            "custom_provider:local/custom-model",
+            "custom_provider:local/custom-model",
+        ),
+        (None, None, "minimax/MiniMax-M2.7", "minimax/MiniMax-M2.7"),
+    ],
+)
+async def test_initialize_serializes_model_at_cli_boundary(
+    tmp_path, monkeypatch, model_source, saved_model, profile_model, launch_model, expected_model
+):
+    """Inspect the config selected by the real command delivered to the terminal backend."""
+    source = tmp_path / "source"
+    source.mkdir()
+    original = {
+        "minimaxModelSource": model_source,
+        "minimax_api": {"baseURL": "https://example.test/anthropic", "apiKey": "placeholder"},
+        "custom_provider": {"local": {"models": {"custom-model": {"attachment": True}}}},
+        "defaultModelThinking": {"effort": "high"},
+        "defaultModelVariant": "thinking",
+    }
+    if saved_model:
+        original["defaultModel"] = saved_model
+    original_text = yaml.safe_dump(original)
+    (source / "config.yaml").write_text(original_text)
+    monkeypatch.setenv("MINIMAX_DATA_DIR", str(source))
+    profile = AgentProfile(name="developer", description="Developer", model=profile_model)
+    provider = make_provider(model=launch_model)
+    delivered = []
+
+    def capture_command(session, window, command):
+        assert (session, window) == ("session", "window")
+        argv = shlex.split(command)
+        assert argv[0] == "env"
+        assert argv[2:4] == ["TERM=xterm-256color", "/usr/local/bin/mcode"]
+        data_dir = Path(argv[1].removeprefix("MINIMAX_DATA_DIR="))
+        assert data_dir != source
+        config = yaml.safe_load((data_dir / "config.yaml").read_text())
+        assert config == {**original, "defaultModel": expected_model}
+        if saved_model and not profile_model and not launch_model:
+            assert (data_dir / "config.yaml").read_text() == original_text
+        assert "Reply exactly CAO_MCODE_READY" in argv[4]
+        delivered.append(config)
+
+    with (
+        patch("cli_agent_orchestrator.providers.minimax_code.CAO_HOME_DIR", tmp_path / "cao"),
+        patch(
+            "cli_agent_orchestrator.providers.minimax_code.load_agent_profile", return_value=profile
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.minimax_code.shutil.which",
+            return_value="/usr/local/bin/mcode",
+        ),
+        patch("cli_agent_orchestrator.providers.minimax_code.wait_for_shell", return_value=True),
+        patch("cli_agent_orchestrator.providers.minimax_code.get_backend") as backend,
+        patch.object(provider, "_wait_for_bootstrap_ready", return_value=True),
+        patch("cli_agent_orchestrator.services.status_monitor.status_monitor.notify_input_sent"),
+    ):
+        backend.return_value.send_keys.side_effect = capture_command
+        assert await provider.initialize()
+    assert len(delivered) == 1
+    assert (source / "config.yaml").read_text() == original_text
 
 
 def test_prompt_submission_and_lifecycle_properties():
@@ -437,3 +514,43 @@ def test_prepare_runtime_refuses_symlinked_managed_ancestor(tmp_path: Path):
             provider._prepare_runtime()
 
     assert list(external.iterdir()) == []
+
+
+def test_the_profile_load_is_wrapped_in_plugin_delivery(tmp_path: Path, monkeypatch):
+    """Reproduced by review 3 on #584: MiniMax never saw installed plugins' MCP servers.
+
+    The provider key is the load-bearing assertion. ``ProviderType.MINIMAX_CODE``
+    is ``"mcode"``, not ``"minimax_code"`` — passing the module name would find no
+    ``PROVIDER_TRANSPORTS`` row and silently inherit the stdio-only default,
+    dropping every HTTP server this provider can in fact carry.
+    """
+    from cli_agent_orchestrator.models.provider import ProviderType
+
+    calls = []
+
+    def spy(profile, provider=None):
+        calls.append((profile, provider))
+        return profile
+
+    profile = AgentProfile(name="reviewer", description="Reviewer", system_prompt="Review.")
+    monkeypatch.setenv("MINIMAX_DATA_DIR", str(tmp_path / "seed"))
+    (tmp_path / "seed").mkdir()
+    provider = make_provider(agent_profile="reviewer")
+
+    with (
+        patch("cli_agent_orchestrator.providers.minimax_code.CAO_HOME_DIR", tmp_path),
+        patch("cli_agent_orchestrator.providers.minimax_code._with_plugin_mcp", spy),
+        patch(
+            "cli_agent_orchestrator.providers.minimax_code.load_agent_profile",
+            return_value=profile,
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.minimax_code.shutil.which",
+            return_value="/usr/local/bin/mcode",
+        ),
+    ):
+        provider._build_command()
+
+    assert calls, "minimax built its command without passing the profile through plugin delivery"
+    assert all(key == ProviderType.MINIMAX_CODE.value for _, key in calls), calls
+    assert all(key == "mcode" for _, key in calls), "the enum value is 'mcode', not 'minimax_code'"

@@ -7,7 +7,10 @@ import requests
 
 from cli_agent_orchestrator.models.memory import Memory
 from cli_agent_orchestrator.services import memory_gateway
-from cli_agent_orchestrator.services.memory_service import MemoryPartialWriteError
+from cli_agent_orchestrator.services.memory_service import (
+    ForgetResult,
+    MemoryPartialWriteError,
+)
 
 
 def _memory() -> Memory:
@@ -65,6 +68,31 @@ async def test_remote_store_serializes_context(monkeypatch):
     assert result.action == "created"
     assert post.call_args.args[0] == "http://memory-owner:9889/internal/memory/store"
     assert post.call_args.kwargs["json"]["terminal_context"]["terminal_id"] == "abc12345"
+
+
+@pytest.mark.asyncio
+async def test_remote_forget_reconstructs_typed_result(monkeypatch):
+    monkeypatch.setenv("CAO_MEMORY_API_URL", "http://memory-owner:9889")
+
+    async def run_inline(function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(memory_gateway.asyncio, "to_thread", run_inline)
+    response = Mock(status_code=200)
+    response.raise_for_status.return_value = None
+    response.json.return_value = {
+        "deleted": ForgetResult("deindexed", "vault", "CAO/topic.md").__dict__
+    }
+    with patch.object(memory_gateway.requests, "post", return_value=response):
+        result = await memory_gateway.forget_memory(
+            key="topic",
+            scope="project",
+            terminal_context=None,
+        )
+
+    assert result.action == "deindexed"
+    assert result.path == "CAO/topic.md"
+    assert bool(result) is True
 
 
 @pytest.mark.asyncio

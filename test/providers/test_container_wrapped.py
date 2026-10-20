@@ -68,7 +68,7 @@ def test_path_translation_unit():
     assert provider._translate_path("/unmapped/x.txt", profile) == "/unmapped/x.txt"
 
 
-@patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+@patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
 def test_build_command_with_container_profile(mock_load, tmp_path):
     """Task 2: with a ContainerConfig, the built command carries GUEST paths.
 
@@ -230,7 +230,7 @@ async def test_idle_timeout_prompt_handler(mock_backend, mock_time, mock_sleep):
 @pytest.mark.asyncio
 @patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
 @patch.object(ClaudeCodeProvider, "_build_claude_command", return_value="claude")
-@patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+@patch("cli_agent_orchestrator.providers.claude_code.agent_profiles.load_agent_profile")
 @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
 @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
 @patch(_BACKEND)

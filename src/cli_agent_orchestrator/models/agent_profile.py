@@ -39,7 +39,7 @@ class AgentProfile(BaseModel):
     description: str
     provider: Optional[str] = None  # Provider override (e.g. "claude_code", "kiro_cli")
     system_prompt: Optional[str] = None  # The markdown content
-    role: Optional[str] = None  # "supervisor", "developer", "reviewer"
+    role: Optional[str] = None  # "supervisor", "developer", "reviewer", "workflow_scout"
     engine: Optional[KiroEngine] = None  # Kiro v2/KAS selection; omitted resolves to v2.
 
     # CAO-native. Per-agent skill-catalog scope: when set, only skills whose name
@@ -101,6 +101,12 @@ class AgentProfile(BaseModel):
     # example one created by `hermes profile alias <profile>`). When omitted,
     # the Hermes provider launches the default `hermes` command.
     hermesProfile: Optional[str] = Field(default=None, min_length=1)
+
+    # Kimi Code-only. Omission inherits the operator's swarm default; false
+    # opts out. The provider requires a verified bounded Kimi executable before
+    # enabling swarm and never expands the profile's native tool allowlist.
+    kimiSwarm: Optional[bool] = Field(default=None, strict=True)
+    kimiSwarmMaxConcurrency: Optional[int] = Field(default=None, ge=1, le=10, strict=True)
 
     # Claude Code-only. Per-agent Claude Code knobs mapped to CLI flags at
     # launch: {"effort": "<low|medium|high|xhigh>"} -> `--effort <level>` and

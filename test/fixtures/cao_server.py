@@ -50,6 +50,7 @@ import importlib
 import json
 import os
 import pkgutil
+import shutil
 import signal
 import socket
 import socketserver
@@ -172,14 +173,21 @@ def _subprocess_env(
     port: int,
     *,
     extra: Optional[Mapping[str, str]] = None,
+    base_env: Optional[Mapping[str, str]] = None,
 ) -> dict[str, str]:
     """Compose the env passed to the subprocess.
 
     Starts from a copy of the parent env, deletes any leaked Auth0 vars (so a
     developer's exported ``AUTH0_DOMAIN`` doesn't accidentally enable auth in
     the no-auth variant), then applies the standard test overrides plus any
-    ``extra`` knobs.
+    ``extra`` knobs. ``base_env`` instead forwards an explicit allowlist unchanged,
+    for isolated ephemeral-agent evidence.
     """
+    # A B4 caller supplies its exact env -i allowlist; never inherit parent state.
+    if base_env is not None:
+        if extra:
+            raise ValueError("explicit environment cannot be combined with extra overrides")
+        return dict(base_env)
     env = os.environ.copy()
     for leaked in ("AUTH0_DOMAIN", "AUTH0_AUDIENCE", "CAO_AUTH_JWKS_URI"):
         env.pop(leaked, None)
@@ -367,6 +375,43 @@ def _seed_packaged_skills(home_dir: Path) -> None:
             shutil.copy2(entry, target)
 
 
+def _seed_workflow_settings(home_dir: Path) -> None:
+    """Turn workflow approval enforcement OFF in the redirected HOME (issue #583 Bolt 3).
+
+    ``approval-enforcement-default`` flipped ``workflow.require_approval`` to default ON, so a
+    script-tier run started against a freshly-seeded HOME is refused with 403 unless its plan has been
+    approved. The real-server tests exercise the run LIFECYCLE — submit, drive, cancel, list, resume,
+    detached observation — and none of them is about approval.
+
+    THIS HAS TO BE A FILE RATHER THAN AN ENVIRONMENT VARIABLE, and that is the asymmetry working as
+    designed rather than an inconvenience: ``CAO_WORKFLOW_REQUIRE_APPROVAL`` may only turn the gate
+    ON, so no ``extra_env`` knob can turn it off. A test harness that wants the gate off has to say so
+    in ``settings.json``, exactly as an operator would.
+
+    Seeded per server home, so it cannot leak into the developer's real ``~/.aws/``. A test that WANTS
+    the gate on either overwrites this file or approves the plan.
+    """
+    import json as _json
+
+    dest = home_dir / ".aws" / "cli-agent-orchestrator"
+    dest.mkdir(parents=True, exist_ok=True)
+    settings_path = dest / "settings.json"
+    existing = {}
+    if settings_path.exists():
+        try:
+            loaded = _json.loads(settings_path.read_text())
+            if isinstance(loaded, dict):
+                existing = loaded
+        except ValueError:
+            existing = {}
+    workflow_section = existing.get("workflow")
+    if not isinstance(workflow_section, dict):
+        workflow_section = {}
+    workflow_section.setdefault("require_approval", False)
+    existing["workflow"] = workflow_section
+    settings_path.write_text(_json.dumps(existing, indent=2))
+
+
 def _seed_omp_e2e_state(home_dir: Path) -> None:
     """Seed non-secret OMP setup state and assign profiles for real OMP E2E tests.
 
@@ -391,26 +436,86 @@ def _seed_omp_e2e_state(home_dir: Path) -> None:
             shutil.copy2(examples_dir / f"{name}.md", target)
 
 
+def _kiro_cli_seed_paths() -> list[Path]:
+    """HOME-relative paths kiro-cli must find to run logged in from a redirected HOME.
+
+    kiro-cli keeps its login and its state under ``$HOME``, so to the CLI the
+    managed server spawns a fresh HOME is a logged-out kiro: it drops into the
+    SSO device-login flow ("Opening browser...") and never reaches the agent
+    prompt, and CAO reports "Kiro CLI initialization timed out waiting for the
+    agent prompt". Measured with an IAM Identity Center login on macOS
+    (kiro-cli 2.25.0) and Linux (2.22.0): with these three present the same
+    invocation answers in a few seconds.
+
+    * ``.aws/sso`` -- the Identity Center token cache kiro reads through
+      ``aws-config`` (``sso/cache``).
+    * ``.local/bin`` -- kiro-cli launches its ``kiro-cli-chat`` helper from
+      ``$HOME/.local/bin`` and fails outright ("failed to launch
+      $HOME/.local/bin/kiro-cli-chat") when it is not there.
+    * the data dir -- ``Library/Application Support/kiro-cli`` on macOS,
+      ``.local/share/kiro-cli`` elsewhere (``data.sqlite3``, history). When
+      ``XDG_DATA_HOME`` is set it is absolute and shared by both HOMEs, so
+      there is nothing to seed.
+    """
+    paths = [Path(".aws") / "sso", Path(".local") / "bin"]
+    if sys.platform == "darwin":
+        paths.append(Path("Library") / "Application Support" / "kiro-cli")
+    elif not os.environ.get("XDG_DATA_HOME"):
+        paths.append(Path(".local") / "share" / "kiro-cli")
+    return paths
+
+
+def _seed_kiro_e2e_state(home_dir: Path, real_home: Optional[Path] = None) -> None:
+    """Link kiro-cli's login and helper paths from the real HOME into ``home_dir``.
+
+    Symlinks, not copies: no credential bytes land in the tmp HOME, and kiro
+    reads and refreshes its token in the real cache exactly as a normal run
+    does. Only paths that exist are linked, an existing destination is left
+    alone, and nothing happens at all when kiro-cli is not installed or the
+    two HOMEs are the same directory. ``real_home`` is the developer's HOME
+    (``$HOME`` of the test process) unless a test supplies one.
+    """
+    if shutil.which("kiro-cli") is None:
+        return
+    source_home = (
+        real_home if real_home is not None else Path(os.environ.get("HOME") or Path.home())
+    )
+    if source_home.resolve() == home_dir.resolve():
+        return
+    for rel in _kiro_cli_seed_paths():
+        src = source_home / rel
+        dest = home_dir / rel
+        if not src.exists() or dest.exists() or dest.is_symlink():
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.symlink_to(src, target_is_directory=True)
+
+
 def _start_cao_server(
     home_dir: Path,
     port: int,
     *,
     extra_env: Optional[Mapping[str, str]] = None,
+    base_env: Optional[Mapping[str, str]] = None,
     deadline: float = _HEALTH_TIMEOUT_DEFAULT,
 ) -> CaoServer:
     """Spawn a cao-server subprocess and return a managed ``CaoServer``.
 
     Used directly by both the session fixture and the self-tests that exercise
     parallelism / idempotency. Callers own the lifetime via the returned
-    ``stop`` callable.
+    ``stop`` callable. With ``base_env``, provider-state seeding is disabled so
+    the server never accesses the developer's HOME.
     """
     home_dir.mkdir(parents=True, exist_ok=True)
-    _seed_packaged_skills(home_dir)
-    _seed_omp_e2e_state(home_dir)
+    _seed_workflow_settings(home_dir)
+    if base_env is None:
+        _seed_packaged_skills(home_dir)
+        _seed_omp_e2e_state(home_dir)
+        _seed_kiro_e2e_state(home_dir)
     log_path = home_dir / "server.log"
     log_handle = open(log_path, "ab")  # noqa: SIM115 — handle lifetime is in stop()
 
-    env = _subprocess_env(home_dir, port, extra=extra_env)
+    env = _subprocess_env(home_dir, port, extra=extra_env, base_env=base_env)
     url = f"http://127.0.0.1:{port}"
 
     process = subprocess.Popen(
@@ -441,7 +546,12 @@ def _start_cao_server(
         _terminate(process, log_handle, stopped)
         _LIVE_SERVERS.discard(server)
 
-    db_path = home_dir / ".aws" / "cli-agent-orchestrator" / "db" / "cli-agent-orchestrator.db"
+    cao_home = (
+        Path(base_env["CAO_HOME_DIR"])
+        if base_env is not None
+        else home_dir / ".aws" / "cli-agent-orchestrator"
+    )
+    db_path = cao_home / "db" / "cli-agent-orchestrator.db"
     server = CaoServer(
         url=url,
         port=port,

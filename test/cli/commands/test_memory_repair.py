@@ -1,6 +1,6 @@
 """CLI tests for ``cao memory repair``."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from click.testing import CliRunner
 
@@ -35,7 +35,7 @@ def test_repair_is_dry_run_by_default() -> None:
         result = CliRunner().invoke(repair_cmd)
 
     assert result.exit_code == 0
-    service.reconcile.assert_called_once_with(apply=False)
+    service.reconcile.assert_called_once_with(apply=False, receipt_id=None)
     assert "mode=dry-run" in result.output
     assert "create_metadata" in result.output
 
@@ -61,7 +61,7 @@ def test_repair_apply_and_unresolved_exit_codes() -> None:
         result = CliRunner().invoke(repair_cmd, ["--apply"])
 
     assert result.exit_code == 1
-    service.reconcile.assert_called_once_with(apply=True)
+    service.reconcile.assert_called_once_with(apply=True, receipt_id=None)
     assert "mode=apply" in result.output
     assert "metadata header is malformed" in result.output
 
@@ -97,3 +97,30 @@ def test_repair_failure_also_renders_skipped_actionable_findings() -> None:
     assert result.exit_code != 0
     assert "fix the metadata header" in result.output
     assert "retry the repair" in result.output
+
+
+def test_repair_forwards_exact_receipt_in_dry_run_and_apply() -> None:
+    service = MagicMock()
+    service.reconcile.return_value = RepairReport(records=(), applied=False)
+    with patch(
+        "cli_agent_orchestrator.services.memory_reconciliation.MemoryReconciliationService",
+        return_value=service,
+    ):
+        dry_run = CliRunner().invoke(repair_cmd, ["--receipt", "receipt-123"])
+        applied = CliRunner().invoke(
+            repair_cmd,
+            ["--apply", "--receipt", "receipt-123"],
+        )
+
+    assert dry_run.exit_code == 0
+    assert applied.exit_code == 0
+    assert service.reconcile.call_args_list == [
+        call(
+            apply=False,
+            receipt_id="receipt-123",
+        ),
+        call(
+            apply=True,
+            receipt_id="receipt-123",
+        ),
+    ]
