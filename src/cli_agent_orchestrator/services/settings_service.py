@@ -116,11 +116,14 @@ EPHEMERAL_DEFAULTS = {
 
 def get_ephemeral_settings() -> Dict[str, Any]:
     """Read the operator-only block strictly, without environment overrides."""
+    from cli_agent_orchestrator.services.model_tiers import load_model_tiers
+
     settings = _load_or_raise()
     block = settings.get("ephemeral", {})
     if not isinstance(block, dict):
         block = {}
     result = {**EPHEMERAL_DEFAULTS, **block}
+    result["_model_tiers"] = load_model_tiers(settings)
     result["_ignored_policy"] = [
         "ephemeral." + key
         for key in ("max_tier", "default_tier", "max_effort", "default_effort")

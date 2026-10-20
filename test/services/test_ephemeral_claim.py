@@ -291,7 +291,7 @@ def test_unknown_claim_and_finalize_are_structured(claimed_store):
     env, _ = claimed_store
     for call in [
         lambda: claim(env, "Ramones-unknown_name-abcd"),
-        lambda: env[0].finalize("Ramones-unknown_name-abcd", "a" * 32),
+        lambda: env[0].finalize("Ramones-unknown_name-abcd", "a" * 32, {}),
     ]:
         with pytest.raises(env[0].EphemeralPolicyError) as exc:
             call()
@@ -304,7 +304,7 @@ def test_stale_finalize_guard_cannot_resurrect_claim(claimed_store):
     env[0].end_claim(name, token)
     before = database.get_ephemeral_agent(name)
     with pytest.raises(env[0].EphemeralPolicyError, match="claim_expired"):
-        env[0].finalize(name, token)
+        env[0].finalize(name, token, {})
     assert database.get_ephemeral_agent(name) == before
     assert not list((env[2] / "ephemeral/live").glob("*.tmp"))
 
@@ -338,7 +338,7 @@ def test_stale_claim_id_cannot_touch_a_newer_claim(claimed_store):
     )
     before = database.get_ephemeral_agent(name)
     with pytest.raises(env[0].EphemeralPolicyError, match="claim_expired"):
-        env[0].finalize(name, "a" * 32)
+        env[0].finalize(name, "a" * 32, {})
     config = env[0].read_settings()
     config["allowed_providers"] = ["codex"]
     with pytest.raises(env[0].EphemeralPolicyError, match="provider_not_allowed"):

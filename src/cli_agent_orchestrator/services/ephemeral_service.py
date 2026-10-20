@@ -21,6 +21,7 @@ from sqlalchemy.exc import IntegrityError
 
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.decisions.policy import PolicyBounds
 from cli_agent_orchestrator.models.ephemeral import TOOL_ATOMS, EphemeralSpec
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.services.secret_gate import scan_for_secrets
@@ -174,6 +175,15 @@ def require_enabled(settings: dict[str, Any]) -> None:
 
 def _positive_integer(value: Any) -> bool:
     return type(value) is int and value > 0
+
+
+def policy_bounds(settings: dict[str, Any]) -> PolicyBounds:
+    """Build the operator envelope from one ephemeral settings snapshot."""
+    return PolicyBounds(
+        default_tier=settings.get("default_tier"),
+        max_tier=settings.get("max_tier"),
+        allowed_providers=frozenset(settings["allowed_providers"]),
+    )
 
 
 def validate_block(settings: dict[str, Any]) -> None:
@@ -741,7 +751,7 @@ def _recheck_policy(row: dict[str, Any], settings: dict[str, Any], claim_id: Opt
         )
 
 
-def finalize(name: str, claim_id: str) -> None:
+def finalize(name: str, claim_id: str, values: dict[str, Any]) -> None:
     """Re-render verified stored spec before returning the claim to its caller."""
     row = database.get_ephemeral_agent(name)
     if row is None:
@@ -871,7 +881,7 @@ def claim_ephemeral_agent(
         won_claim = token
         _audit_update(row, "claimed")
         _recheck_policy(row, config, token)
-        finalize(name, token)
+        finalize(name, token, {})
         return dict(
             claim_id=token,
             provider=row["provider"],
