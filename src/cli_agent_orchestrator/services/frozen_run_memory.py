@@ -110,6 +110,7 @@ def frozen_memory_for(
         # None selects LIVE memory. A known script run whose durable admission
         # state is missing must instead supply an explicit empty block.
         if getattr(run_registry.get(run_id), "tier", None) == "script":
+            logger.warning("frozen memory: run '%s': run row missing; memory withheld", run_id)
             return ""
         return None
 

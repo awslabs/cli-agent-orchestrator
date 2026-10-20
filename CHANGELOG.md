@@ -158,8 +158,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Script runs now capture their agent-profile and memory-setting guard at admission,
   before the approval gate, so edits during the gate refuse later agent launches.
 - Script runs under approval enforcement now stop before spawning if their run row
-  cannot be recorded. A missing row for a known script run also refuses agent
-  launches and supplies no memory instead of falling back to live memory.
+  cannot be recorded. A known script run with a missing row supplies no memory
+  and logs a warning, whether enforcement is on or off. Its launch guard also
+  refuses fresh agent launches while approval is enforced.
 - Corrective workflow re-prompts now reuse the attempt's rendered prompt, so
   workflow inputs and earlier step outputs stay filled in when structured output
   is missing or invalid (#966).
