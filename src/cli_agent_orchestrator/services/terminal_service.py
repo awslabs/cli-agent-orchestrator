@@ -1786,6 +1786,7 @@ async def _create_terminal_unguarded(
         ):
             from cli_agent_orchestrator.providers import opencode_cli
             from cli_agent_orchestrator.utils.opencode_permissions import (
+                ALL_OPENCODE_TOOLS,
                 cao_tools_to_opencode_permission,
             )
 
@@ -1810,10 +1811,14 @@ async def _create_terminal_unguarded(
                 )
             else:
                 bounded = cao_tools_to_opencode_permission(allowed_tools)
+                # Iterate the full vocabulary, not installed_permission's own keys:
+                # OpenCode treats an omitted tool as allowed, so a `{}` or partial
+                # block (e.g. only `read: allow`) must be read as allowing every
+                # tool it does not explicitly deny.
                 wider = sorted(
                     tool
-                    for tool, verdict in installed_permission.items()
-                    if verdict == "allow" and bounded.get(tool) != "allow"
+                    for tool in ALL_OPENCODE_TOOLS
+                    if installed_permission.get(tool) != "deny" and bounded.get(tool) != "allow"
                 )
                 if wider:
                     raise InstalledPolicyExceedsAllowlistError(

@@ -556,6 +556,80 @@ async def test_opencode_unrestricted_delegator_without_an_installed_file_is_not_
 
 
 # ---------------------------------------------------------------------------
+# P2b: an installed `permission:` block that is readable but incomplete (an
+# empty dict, or a partial mapping) must still be read as allowing whatever
+# it does not explicitly deny -- OpenCode treats an omitted tool as allowed.
+# Found verifying the round-5 fix (fc4af221); not raised by the reviewer.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_opencode_empty_permission_block_defaults_every_tool_to_allow(
+    launch, tmp_path, monkeypatch
+):
+    """``permission: {}`` grants nothing explicitly, but OpenCode's own defaults
+    allow everything not denied, so a bounded create narrower than that must
+    still be refused rather than treated as "nothing wider"."""
+    import frontmatter
+
+    from cli_agent_orchestrator.providers import opencode_cli
+    from cli_agent_orchestrator.utils.delegation import InstalledPolicyExceedsAllowlistError
+
+    config = tmp_path / "opencode"
+    agents = config / "agents"
+    agents.mkdir(parents=True)
+    monkeypatch.setattr(opencode_cli, "OPENCODE_CONFIG_DIR", config)
+    _seed("0000beef", "reviewer", REVIEWER, REVIEWER)
+    (agents / "developer.md").write_text(
+        frontmatter.dumps(frontmatter.Post("x", description="d", mode="all", permission={}))
+    )
+    with pytest.raises(InstalledPolicyExceedsAllowlistError) as excinfo:
+        await create_terminal(
+            "opencode_cli",
+            "developer",
+            session_name="cao-sess",
+            new_session=False,
+            caller_id="0000beef",
+            allowed_tools=["fs_read"],
+        )
+    assert "bash" in excinfo.value.excess
+
+
+@pytest.mark.asyncio
+async def test_opencode_partial_permission_block_defaults_omitted_tools_to_allow(
+    launch, tmp_path, monkeypatch
+):
+    """``permission: {read: allow}`` says nothing about ``bash``; an omitted key
+    is not a deny, so the installed policy still grants it beyond a bounded
+    allowlist of only ``fs_read``."""
+    import frontmatter
+
+    from cli_agent_orchestrator.providers import opencode_cli
+    from cli_agent_orchestrator.utils.delegation import InstalledPolicyExceedsAllowlistError
+
+    config = tmp_path / "opencode"
+    agents = config / "agents"
+    agents.mkdir(parents=True)
+    monkeypatch.setattr(opencode_cli, "OPENCODE_CONFIG_DIR", config)
+    _seed("0000beef", "reviewer", REVIEWER, REVIEWER)
+    (agents / "developer.md").write_text(
+        frontmatter.dumps(
+            frontmatter.Post("x", description="d", mode="all", permission={"read": "allow"})
+        )
+    )
+    with pytest.raises(InstalledPolicyExceedsAllowlistError) as excinfo:
+        await create_terminal(
+            "opencode_cli",
+            "developer",
+            session_name="cao-sess",
+            new_session=False,
+            caller_id="0000beef",
+            allowed_tools=["fs_read"],
+        )
+    assert "bash" in excinfo.value.excess
+
+
+# ---------------------------------------------------------------------------
 # Round 4: Kiro Step 0d fails closed on a missing agent file; the idempotency
 # fingerprint hashes the delegating terminal.
 # ---------------------------------------------------------------------------
