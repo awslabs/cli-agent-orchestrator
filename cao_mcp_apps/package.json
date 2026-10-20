@@ -42,7 +42,7 @@
     "patch-package": "8.0.1",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
-    "sigma": "^3.0.3"
+    "sigma": "^4.0.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.63.0",
