@@ -119,7 +119,9 @@ def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
 
     try:
         status_response = requests.get(
-            f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout()
+            f"{API_BASE_URL}/terminals/{terminal_id}",
+            headers=mcp_utils._auth_headers() or None,
+            timeout=_mcp_timeout(),
         )
         status_response.raise_for_status()
         terminal = status_response.json()
@@ -151,6 +153,7 @@ def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
                 "message": answer,
                 "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
             },
+            headers=mcp_utils._auth_headers() or None,
             timeout=_mcp_timeout(),
         )
         response.raise_for_status()
@@ -179,6 +182,7 @@ def _try_send_hermes_prompt_answer(terminal_id: str, answer: str) -> Optional[Di
     output_response = requests.get(
         f"{API_BASE_URL}/terminals/{terminal_id}/output",
         params={"mode": "full"},
+        headers=mcp_utils._auth_headers() or None,
         timeout=_mcp_timeout(),
     )
     output_response.raise_for_status()
@@ -224,6 +228,7 @@ def _send_terminal_key(terminal_id: str, key: str) -> None:
     response = requests.post(
         f"{API_BASE_URL}/terminals/{terminal_id}/key",
         params={"key": key},
+        headers=mcp_utils._auth_headers() or None,
         timeout=_mcp_timeout(),
     )
     response.raise_for_status()
@@ -236,6 +241,7 @@ def _send_terminal_input(terminal_id: str, message: str) -> None:
             "message": message,
             "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
         },
+        headers=mcp_utils._auth_headers() or None,
         timeout=_mcp_timeout(),
     )
     response.raise_for_status()
@@ -280,7 +286,11 @@ def _refusal_envelope_fields(response: requests.Response) -> Dict[str, Any]:
 def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
     """Fetch a skill body from cao-server and return content or a structured error."""
     try:
-        response = requests.get(f"{API_BASE_URL}/skills/{name}", timeout=_mcp_timeout())
+        response = requests.get(
+            f"{API_BASE_URL}/skills/{name}",
+            headers=mcp_utils._auth_headers() or None,
+            timeout=_mcp_timeout(),
+        )
         response.raise_for_status()
         return response.json()["content"]
     except requests.HTTPError as exc:
@@ -1029,6 +1039,7 @@ async def emit_ui(
             "props": props or {},
             "terminal_id": terminal_id,
         },
+        headers=mcp_utils._auth_headers() or None,
         timeout=_mcp_timeout(),
     )
     if response.status_code == 400:
@@ -1252,7 +1263,9 @@ def _require_discovery_marker(own_terminal_id: str, action: str) -> Optional[Dic
     """
     try:
         response = requests.get(
-            f"{API_BASE_URL}/terminals/{own_terminal_id}", timeout=_mcp_timeout()
+            f"{API_BASE_URL}/terminals/{own_terminal_id}",
+            headers=mcp_utils._auth_headers() or None,
+            timeout=_mcp_timeout(),
         )
         response.raise_for_status()
         allowed_tools = response.json().get("allowed_tools")
@@ -1299,6 +1312,7 @@ def _list_siblings_impl(depth: Optional[int], cross_session: bool = False) -> Di
         response = requests.get(
             f"{API_BASE_URL}/terminals/{own_terminal_id}/siblings",
             params=params,
+            headers=mcp_utils._auth_headers() or None,
             timeout=_mcp_timeout(),
         )
         response.raise_for_status()
@@ -1324,6 +1338,7 @@ def _update_metadata_impl(metadata: Dict[str, Any]) -> Dict[str, Any]:
         response = requests.patch(
             f"{API_BASE_URL}/terminals/{own_terminal_id}/metadata",
             json={"metadata": metadata},
+            headers=mcp_utils._auth_headers() or None,
             timeout=_mcp_timeout(),
         )
         response.raise_for_status()
