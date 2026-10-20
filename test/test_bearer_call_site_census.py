@@ -1,4 +1,4 @@
-"""Every request to the local API carries the local bearer (#9013).
+"""Every request to the local API carries the local bearer (#990).
 
 ``test_bearer_scope_boundary.py`` (#822) polices one half of the bearer rule:
 an UNSCOPED ``_auth_headers()`` must never be paired with a URL that is not
@@ -11,7 +11,7 @@ This module polices the other half, which that skip left open: a call to the
 local API that sends NO bearer. Nearly every route the MCP server talks to
 carries a ``require_any_scope`` dependency, so on an auth-enabled server a
 bearer-less request gets ``401 missing bearer token``. Two of the call sites
-#9013 found were fail-closed authorization lookups
+#990 found were fail-closed authorization lookups
 (``_require_discovery_marker`` and the ``_target_binding_denial`` fetch in
 ``_send_user_prompt_answer``), where a 401 is swallowed by the surrounding
 ``except`` and re-emitted as a refusal -- so auth turned into a denial of
@@ -65,7 +65,9 @@ def _discover_bearer_helpers() -> set[str]:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                bodies[node.name] = ast.unparse(node)
+                # Body only: the ``def <name>`` line would let a helper match itself
+                # by substring (``elastic_worker_gateway_headers`` contains ``_headers``).
+                bodies[node.name] = ast.unparse(ast.Module(body=node.body, type_ignores=[]))
     found = {name for name, body in bodies.items() if "'Authorization'" in body}
     for _ in range(2):
         found |= {
@@ -211,8 +213,18 @@ def test_every_base_url_request_carries_a_bearer_helper():
 def test_the_known_bearer_helpers_are_discovered():
     """Guard the guard: if discovery silently returned an empty set, every call
     site would look unauthenticated (noisy) -- but if it over-matched, every
-    call site would look fine (silent). Pin the four real helpers."""
-    assert {"_auth_headers", "_auth_headers_for", "_headers", "_inbox_headers"} <= BEARER_HELPERS
+    call site would look fine (silent). Pin the exact set of real helpers:
+    every one of these writes or composes an ``Authorization`` header, and an
+    extra name here (e.g. ``elastic_worker_gateway_headers``, which sends no
+    bearer) would let a bearer-less call site pass the census."""
+    assert BEARER_HELPERS == {
+        "_auth_headers",
+        "_auth_headers_for",
+        "_build_headers",
+        "_headers",
+        "_inbox_headers",
+        "auth_headers_for",
+    }
     assert "_mcp_timeout" not in BEARER_HELPERS
 
 
@@ -236,7 +248,7 @@ def test_the_census_finds_the_sites_it_polices():
 
 
 def test_the_census_catches_a_stripped_header():
-    """Prove the guard bites: synthesise the shape #9013 found and re-run the rule."""
+    """Prove the guard bites: synthesise the shape #990 found and re-run the rule."""
     snippet = (
         "import requests\n"
         "API_BASE_URL = 'http://x'\n"

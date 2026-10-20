@@ -1,6 +1,6 @@
-"""The fail-closed authorization lookups authenticate their own API call (#9013).
+"""The fail-closed authorization lookups authenticate their own API call (#990).
 
-Two of the bearer-less call sites #9013 found were not merely noisy -- they
+Two of the bearer-less call sites #990 found were not merely noisy -- they
 were *silent*. ``_require_discovery_marker`` and the ``_target_binding_denial``
 fetch inside ``_send_user_prompt_answer`` are documented fail-closed lookups:
 they wrap their ``GET /terminals/{id}`` in a broad ``except`` and, on any
@@ -86,7 +86,7 @@ class TestDiscoveryMarkerLookup:
 
         If the bearer ever stops being attached, the gate does not report a
         transport problem -- it reports the caller as ungranted. That is the
-        whole reason these two sites were called out separately in #9013.
+        whole reason these two sites were called out separately in #990.
         """
         from cli_agent_orchestrator.mcp_server.server import _require_discovery_marker
 

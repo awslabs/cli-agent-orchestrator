@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **The MCP server sent no bearer on 14 of its calls to the local API** (#990). Ten
+  `requests` calls in `mcp_server/server.py` reached scope-guarded routes with no
+  `Authorization` header, so on an auth-enabled server each one got `401`. Two were
+  fail-closed authorization lookups whose 401 surfaced as a refusal: `list_siblings` and
+  `update_metadata` refused a profile that holds the `discovery` grant, and
+  `answer_user_prompt` refused everyone. All fourteen sites now use the existing bearer
+  helpers; a call-site census test keeps the rule enforced. No change when auth is off.
+
 - **Breaking / migration:** workflow approval enforcement now defaults ON for script-tier runs
   (#583 Bolt 3) (#699). The first run of each script plan is refused until
   an operator runs `cao workflow approve <plan_id>`; operators choosing the previous behaviour set
