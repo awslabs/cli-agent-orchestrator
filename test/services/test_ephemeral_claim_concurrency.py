@@ -124,3 +124,50 @@ def test_registry_survives_reconnect_and_lapses_lazily(file_store, monkeypatch):
     second = claim(env, name)
     assert second["replayed"] is False
     assert database.get_ephemeral_agent(name)["state"] == "claimed"
+
+
+def test_A_X3_stale_finalize_cannot_replace_new_claim(file_store, monkeypatch):
+    """A stalled renderer cannot overwrite the current claimer's live inode."""
+    import hashlib
+    from datetime import timedelta
+
+    env, name = file_store
+    service = env[0]
+    tokens = iter(range(1, 100))
+    monkeypatch.setattr(service.secrets, "token_hex", lambda n: f"{next(tokens):0{n * 2}x}")
+    written = threading.Event()
+    release = threading.Event()
+    writer = service._write_exclusive
+    first_thread = None
+
+    def hold(path, payload, owned):
+        writer(path, payload, owned)
+        if threading.get_ident() == first_thread and ".md." in path.name:
+            written.set()
+            assert release.wait(timeout=10)
+
+    monkeypatch.setattr(service, "_write_exclusive", hold)
+
+    def first():
+        nonlocal first_thread
+        first_thread = threading.get_ident()
+        return outcome(env, name)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        stale = pool.submit(first)
+        assert written.wait(timeout=10)
+        try:
+            monkeypatch.setattr(database, "_utcnow", lambda: NOW + timedelta(seconds=60))
+            current = claim(env, name)
+            live = env[2] / "ephemeral" / "live" / (name + ".md")
+            inode = live.stat().st_ino
+            contents = live.read_bytes()
+        finally:
+            release.set()
+        assert stale.result(timeout=10) == "claim_expired"
+    row = database.get_ephemeral_agent(name)
+    assert row["claim_id"] == current["claim_id"]
+    assert live.stat().st_ino == inode
+    assert live.read_bytes() == contents
+    assert row["profile_sha256"] == hashlib.sha256(contents).hexdigest()
+    assert not list(live.parent.glob("*.tmp"))

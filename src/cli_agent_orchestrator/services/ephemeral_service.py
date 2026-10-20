@@ -779,10 +779,11 @@ def finalize(name: str, claim_id: str, values: dict[str, Any]) -> None:
         )
         temp = EPHEMERAL_DIR / "live" / ("." + name + ".md." + secrets.token_hex(4) + ".tmp")
         _write_exclusive(temp, profile, owned)
-        os.replace(temp, EPHEMERAL_DIR / "live" / (name + ".md"))
         digest = hashlib.sha256(profile).hexdigest()
         with _transaction() as db:
             changed = _change(db, name, "claimed", dict(profile_sha256=digest), claim_id)
+            if changed:
+                os.replace(temp, EPHEMERAL_DIR / "live" / (name + ".md"))
         if not changed:
             raise EphemeralPolicyError("claim_expired", status_code=409)
         _audit_update(row, "finalized", profile_sha256=digest)
