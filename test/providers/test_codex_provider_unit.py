@@ -2372,6 +2372,44 @@ class TestCodexProviderMisc:
         message = provider.extract_last_message_from_script(output)
         assert message == "Hello\nSecond line"
 
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_dispatch_context_uses_one_baseline_and_redelivery_keeps_logical_id(
+        self, mock_get_backend
+    ):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._ends_turns_with_footer = True
+        backend = MagicMock()
+        backend.get_history.return_value = "› old message\n› Ask Codex to do anything\n"
+        mock_get_backend.return_value = backend
+
+        provider.notify_status_buffer_reset(4)
+        provider.mark_input_received()
+        logical_id = provider._logical_dispatch_id
+        provider.record_dispatched_message("new message")
+        provider.mark_redelivery_received()
+        provider.record_dispatched_message("new message")
+
+        assert provider._logical_dispatch_id == logical_id
+        assert provider._attribution_available is True
+        assert backend.get_history.call_count == 2
+        assert all(
+            call.kwargs["visible_only"] is True and call.kwargs["strip_escapes"] is True
+            for call in backend.get_history.call_args_list
+        )
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_failed_baseline_disables_attribution_without_raising(self, mock_get_backend):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._ends_turns_with_footer = True
+        mock_get_backend.return_value.get_history.side_effect = RuntimeError("capture failed")
+
+        provider.notify_status_buffer_reset(2)
+        provider.mark_input_received()
+        provider.record_dispatched_message("message")
+
+        assert provider._attribution_available is False
+        assert provider._dispatch_message is None
+
 
 class TestCodexProviderTrustPrompt:
     """Tests for Codex workspace trust prompt handling."""

@@ -1,0 +1,50 @@
+  2 Helium is an inert noble gas used to fill balloons and cool magnets.
+  3 Lithium is a soft metal used in rechargeable batteries.
+  4 Beryllium is a light, stiff metal used in aerospace components.
+  5 Boron is a metalloid essential for plant cell walls.
+  6 Carbon is the backbone of all known organic life.
+  7 Nitrogen makes up about 78 percent of Earth's atmosphere.
+  8 Oxygen is required for aerobic respiration in most organisms.
+  9 Fluorine is the most electronegative element of all.
+  10 Neon glows reddish-orange when electrified in signs.
+  11 Sodium is a reactive metal that combines with chlorine to form table salt.
+  12 Magnesium burns with a brilliant white flame.
+  13 Aluminium is a lightweight metal widely used in cans and aircraft.
+  14 Silicon is the basis of most semiconductor chips.
+  15 Phosphorus is a key component of DNA and ATP.
+  16 Sulfur is a yellow solid known for its distinctive smell when in compounds like hydrogen sulfide.
+  17 Chlorine is a greenish gas used to disinfect drinking water.
+  18 Argon is used as an inert shielding gas in welding.
+  19 Potassium is vital for nerve signaling and is found in bananas.
+  20 Calcium builds bones and teeth.
+  21 Scandium is used in high-strength aluminium alloys for sports equipment.
+  22 Titanium is strong, light, and resistant to corrosion.
+  23 Vanadium is added to steel to make it tougher.
+  24 Chromium gives stainless steel its shine and corrosion resistance.
+  25 Manganese is essential for steel production and several enzymes.
+  26 Iron is the main component of Earth's core and of hemoglobin's oxygen-binding site.
+  27 Cobalt gives glass and ceramics a deep blue color.
+  28 Nickel is used in coins and corrosion-resistant alloys.
+  29 Copper is an excellent conductor of electricity.
+  30 Zinc is used to galvanize steel against rust.
+  31 Gallium melts in your hand at just above room temperature.
+  32 Germanium was used in the first transistors.
+  33 Arsenic is a toxic metalloid with a long history as a poison.
+  34 Selenium is a trace nutrient also used in photocopiers and solar cells.
+  35 Bromine is one of only two elements that are liquid at room temperature.
+  36 Krypton is a noble gas used in some high-performance lighting.
+  37 Rubidium is a soft, highly reactive alkali metal used in atomic clocks.
+  38 Strontium produces brilliant red colors in fireworks.
+  39 Yttrium is used to make red phosphors and certain superconductors.
+  40 Zirconium is used in nuclear reactor fuel cladding because it absorbs few neutrons.
+  41 Niobium is used in superconducting magnets and jet engine alloys.
+  42 Molybdenum strengthens steel and is needed by many enzymes.
+  43 Technetium was the first element to be produced artificially.
+  44 Ruthenium is a hard platinum-group metal used in electrical contacts.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Model: Sonnet 5.5 | Thinking: medium | Context: [█░░░░░░░░░░░░░░░] 57k/1.0M (6%) | Session: <1m
+  ⎇ no git | cwd: /home/user/project
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents

@@ -123,8 +123,8 @@ Override via REST API, Web UI Settings page, `cao config set agents.dirs.<provid
 
 ### Ephemeral agents (`ephemeral`)
 
-Creation and owner-only HTTP launch are opt-in. `assign` and `handoff` still refuse
-ephemeral names.
+Creation and creator-owned launches are opt-in. `assign` and `handoff` launch
+creator-owned ephemeral names from the creator terminal.
 Only JSON `true` enables the tool, and agent terminals must restart to see it.
 
 | Setting | Default | Description |
@@ -445,6 +445,16 @@ These map to `network.*` / `auth.*` schema paths for documentation purposes, but
 | `CAO_CORS_ORIGINS` | `network.cors_origins` | comma-separated list |
 | `CAO_WS_ALLOWED_CLIENTS` | `network.ws_allowed_clients` | comma-separated list |
 | `CAO_WS_ALLOWED_ORIGINS` | `network.ws_allowed_origins` | comma-separated list |
+
+### Launch decisions
+
+`CAO_DECISION_MODEL_ROUTE`, `CAO_DECISION_EFFORT_ROUTE`, `CAO_DECISION_ON_TIMEOUT_MS` and
+`CAO_DECISION_CONFIDENCE_THRESHOLD` are read by the decision settings loader, not through
+`ConfigService`, and override the `decisions` block of `settings.json`. The chain above does not
+apply as written: `cao-server --decision <point>=<state>` sets the matching point-state variable
+(`CAO_DECISION_MODEL_ROUTE` or `CAO_DECISION_EFFORT_ROUTE`), so the flag and that variable are one
+layer, and the server keeps the values it started with until it restarts.
+See [Launch decisions](decisions.md#settings).
 
 ### Not yet routed through ConfigService
 

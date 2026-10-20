@@ -119,6 +119,7 @@ class Terminal(BaseModel):
             "list_siblings)."
         ),
     )
+    description: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = Field(
         None, description="Free-form, consumer-defined JSON describing what this terminal is doing"
     )

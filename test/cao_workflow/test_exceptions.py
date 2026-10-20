@@ -28,6 +28,8 @@ from cao_workflow import ShimHTTPError
         ),
         # Forward compatibility with the typed refusal introduced by PR #699.
         (409, "plan_inputs_changed", "resolved inputs no longer match"),
+        (403, "approval_required", "approve this plan before running"),
+        (503, "plan_identity_unavailable", "cannot freeze plan identity"),
         (502, "error", "terminal t-1 reached ERROR status"),
         (504, "timeout", "step on terminal t-1 did not complete within 600s"),
     ],

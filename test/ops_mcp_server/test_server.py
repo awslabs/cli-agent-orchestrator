@@ -324,7 +324,7 @@ class TestSessionLifecycleTools:
                 "session_name": "cao-generated",
                 "allowed_tools": "fs_read,execute_bash",
             },
-            json=None,
+            json={"description": None},
             timeout=_HTTP_TIMEOUT,
             headers=None,
         )

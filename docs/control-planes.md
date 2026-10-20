@@ -50,6 +50,15 @@ commands, statuses, delegation, and safety), and `cao <group> --help` gives exac
 syntax. The [session-management skill](../skills/cao-session-management/SKILL.md)
 adds profile discovery and worker communication.
 
+For in-session delegation, `cao agent assign --description "Review tests"` and
+`cao agent handoff --description "Review tests"` optionally label the new worker's
+responsibility. The in-session MCP tools `assign`, `handoff`, and `assign_elastic`
+accept the same optional `description` parameter. It is set on creation,
+normalized, and truncated to 64 Unicode code points; later tasks and terminal
+reuse do not overwrite it. Operators can edit it in Home or Agents. See the
+[canonical description contract](api.md#terminal-descriptions) for normalization,
+omission versus `null`, editing, and idempotency.
+
 ## Remote fleets
 
 `cao fleet` and `cao worker` manage agents that are not on this machine. Every

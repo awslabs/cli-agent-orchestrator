@@ -7,12 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Breaking / migration:** workflow approval enforcement now defaults ON for script-tier runs
+  (#583 Bolt 3) (#699). The first run of each script plan is refused until
+  an operator runs `cao workflow approve <plan_id>`; operators choosing the previous behaviour set
+  `workflow.require_approval: false` in `settings.json`. Script runs journaled before this upgrade
+  cannot launch further agent steps while approval enforcement is on; start a new run. With
+  approval enforcement off, those runs continue. Plan identifiers keep the `plan-v1:` scheme.
+
+- **Breaking / migration:** a fresh script run now executes a private copy of the approved source.
+  Modules beside the spec are not importable and `__file__` names the copy; this matches resume.
+- **Breaking / migration:** while approval is enabled, fresh agent steps in script runs refuse reserved
+  ephemeral profile names until #827 binds their definitions.
+- **Breaking / migration:** non-Git roots now bind the directory's canonical path into `plan_id`.
+  Moving or renaming such a directory requires a new approval; Git-repository plan identifiers are
+  unchanged.
+- **Breaking / migration:** plan approval binds the script source, its resolved inputs and the working
+  directory's state (the Git commit and worktree, or the canonical path of a non-Git directory). It
+  does not bind the content of agent profiles or memory: a later run of an approved plan uses their
+  current content (#827, #828).
+
 ### Added
 
 - `POST /sessions` and `POST /sessions/{session_name}/terminals` accept
   `lookup_only=true` with an `idempotency_key`: the request returns the terminal
   that key already committed, without waiting for it to initialize and without
   creating anything (404 when nothing is committed, 400 without a key) (#773).
+- Conversational workflow authoring: `cao workflow create` / `update` and the `workflow_create`,
+  `workflow_update`, `workflow_get` and `workflow_validate` MCP tools (#583 Bolt 3) (#699). Spec writes
+  are atomic and serialized per workflow, so two concurrent creates cannot both succeed and an update
+  with a stale `--expected-hash` is rejected at commit time. Lint warnings are shown on the default CLI
+  output. Every `cao workflow` HTTP verb and every workflow MCP tool forward
+  `CAO_AUTH_LOCAL_TOKEN` when API authentication is enabled. The Python workflow SDK's
+  run-step transport does not yet receive that credential; subprocess credential delivery
+  remains a separate security-boundary decision.
+
+- `assign` and `handoff` now launch ephemeral agents (#801) from their creator terminal: Claude Code by default, Codex when an operator allows it.
+- Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `ephemeral.enabled` stays off by default.
+- Persistent agent descriptions with creation-time CLI/MCP labels and editable
+  descriptions in Web UI Home and Agents (#942).
+
+- The publish workflow now refuses, in seconds, a release tag whose version
+  `pyproject.toml`, `uv.lock` and the devcontainer feature do not carry, and a
+  version the target index already serves: both TestPyPI and PyPI on a release,
+  only the chosen one on a manual dispatch (`scripts/assert_release_version.py`).
+  v2.5.1, v2.5.2 and v2.5.4 each spent ~80 minutes building wheels before TestPyPI
+  answered `400 File already exists`, because the tag sat on a commit that had not
+  been bumped. The failure text names the remedy for the situation it found.
 - Security regression tests derived from the review harnesses Augusto Santos
   (@gutosantos82) wrote while assessing CAO's CI security gates: a route-by-scope
   authorization matrix with auth enabled (every HTTP route x no/read/write/admin
@@ -21,7 +61,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#605), malformed-Origin (#656) and scheme-aware same-origin (#658) guards, and
   filesystem invariants for the per-terminal FIFO path (#823) and atomic-file
   modes under a concurrent writer (#821). `test/security/`. (#938)
-- Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `assign` and `handoff` still refuse them. `ephemeral.enabled` stays off by default.
 - Simulation-only cross-zone robot transport example (#845): existing CAO CLI
   supervisor, zone-operation, and checker agents share a persistent MuJoCo
   kinematic world through scoped MCP tools. Includes measured custody handoffs,
@@ -62,6 +101,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cao session status`, and the ops MCP `get_terminal_status` and
   `get_session_info` return both fields; `list_siblings` and the delegation
   tool results are unchanged (#810)
+- launch-decision platform, not yet wired: `model.route` (`small`/`medium`/
+  `large`) and `effort.route` (`low`/`medium`/`high`), each `off`, `shadow` or
+  `on`, all off by default. Deciders register under the `cao.deciders`
+  entry-point group; the built-in `fixed_table` looks a tier up by profile,
+  then role. The top-level `model_tiers` setting maps each provider's tiers to
+  model IDs. Shadow and on write content-free rows to a new `decision_records`
+  table (a keyed message hash, never the task text), kept 90 days. Operators
+  control it through `cao decisions`, `cao-server --decision`, the
+  `CAO_DECISION_*` variables and the ops MCP decision tools; the agent-facing
+  MCP server has none. No delegation calls it yet, so launches are unchanged.
+  See `docs/decisions.md` (#810)
 - pane-mode windows caption each pane with the terminal running in it.
   `pane_window` gets `pane-border-status` and a border format reading the
   `@cao_terminal` mark, so the caption survives an agent whose TUI sets its own
@@ -116,6 +166,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   started. A keyed replay of a create whose initialization failed answers 424
   with the cause, and a keyed replay no longer publishes `post_create_session`
   again (#773).
+- Corrective workflow re-prompts now reuse the attempt's rendered prompt, so
+  workflow inputs and earlier step outputs stay filled in when structured output
+  is missing or invalid (#966).
+- `claude_code` workers running with Claude Code's `prefersReducedMotion` setting
+  are no longer reported as completed while they work. That setting draws the
+  spinner with a static `●`, which both status paths read as a finished response,
+  so `handoff` and workflow steps tore the worker down about 2s after sending the
+  task. A `●` line whose ellipsis is followed by the spinner's status in
+  parentheses (a running hook, the elapsed time, the token count or `thinking`)
+  is now treated as a live spinner, whatever the message before it (#908).
+
 - Kiro profile installation now preserves profile-defined `resources` alongside
   CAO's default context and skill resources. Reinstall existing profiles to
   include their configured resources in the generated Kiro agent configuration
@@ -130,6 +191,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The pipes now get the reap grace to drain, and a warning names the case (#894).
   Timeout and cancel likewise settle once the script itself is gone, instead of
   waiting for that process, and a timed-out run closes the pipes too.
+- `cao launch` with an initial message no longer gives up on the first failed
+  poll of the delivery state (#882). A failed poll that is not a 4xx (a
+  connection error, a read timeout, a 5xx, or a reply that is not JSON) is
+  retried until the init allowance runs out, so `--async` no longer exits
+  non-zero for a task the server goes on to deliver. A 4xx still fails at once,
+  and a timeout after failed polls says the message may already have been
+  delivered.
 - Audit all tracked npm, Bun, uv, and Cargo dependency graphs in every CI run
   and weekly, including development dependencies and unfixed advisories. Block
   every HIGH/CRITICAL finding and scan error, and publish complete inventory and
@@ -204,6 +272,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `http-cache-semantics` to 4.3.0. Document the patch and disputed cache advisory,
   and run dependency regression checks as part of the existing site build
   without suppressing alerts or changing scan policy.
+
+- claude_code: a streaming answer no longer reads as a finished turn. The
+  newest Claude Code TUI draws no spinner while response text streams, so a
+  settled mid-answer frame read COMPLETED (a `⏺` still on screen) or IDLE (every
+  marker scrolled off), and `run_step` / `handoff` tore the worker down
+  mid-answer. After a dispatch, both the raw-stream and rendered-screen
+  detectors now require the end-of-turn summary (`✻ Worked for Ns`) as the
+  newest line above the input box before reporting a ready status, with a 15 s
+  fallback to the previous verdict for an end state that paints no summary.
+  While a terminal is PROCESSING, the status monitor's per-poll re-derivation
+  now reads Claude Code from its composited screen (the provider opts in with
+  `status_recheck_uses_screen`, #907) instead of the raw rolling window, whose
+  repaint fragments and size cap left no input box to anchor on. That re-check
+  reuses its verdict while the output is unchanged, so the 15 s fallback lands
+  at the next stale-pane re-check (#558) after the grace period (#865).
+
 - Address five baseline CodeQL alerts without suppressions: remove filesystem
   probes from plugin source-kind inference, confine Kiro policy-file inspection
   to its canonical agent directory, replace the flagged Kimi footer and swarm
@@ -268,6 +352,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   override configured, the guard and the probe also consult the default
   directory, so ownership records written there by earlier releases stay in
   force (#493).
+
+- **In-band provider refusals are now workflow step failures.** A provider
+  that exits cleanly after printing an error is classified as `provider_error`
+  instead of returning the refusal as a successful answer; `/terminals/run-step`
+  maps it to 502, and the structured kind survives journal settlement and status
+  rendering. (#638)
 
 - **Workflow script run-step refusals now retain their typed reason in run
   records.** When a structured HTTP error includes a string `detail.kind`,
@@ -597,6 +687,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of spinning on a cancelled task and never exiting (#823)
 
 ### Changed
+
+- A plain (non-Git) directory is now an approvable plan, keyed by its canonical path.
+
+- Script runs execute in, and fingerprint, one project root (#699): the run request's optional
+  `working_directory`, defaulting to cao-server's working directory. The CLI sends its current
+  directory (or `--working-directory`) and the MCP tools send the calling terminal's directory, so
+  script runs started from those clients now run in the caller's directory instead of cao-server's.
+  Agent steps that name neither a working directory nor a caller default to the run's root. A project
+  root outside Git is now an approvable plan instead of `plan_identity_unavailable`. Approvals granted
+  for a plan fingerprinted against a different directory must be granted again.
+
+- A script run refuses to launch further agent steps (HTTP 409, `kind: plan_inputs_changed`) when an
+  agent profile or the memory-enabled setting changed after the run's approval check (#699).
+
+- `cao workflow get` / `update` / `delete` validate and percent-encode workflow names;
+  `cao workflow validate --json` returns the `{ok: false, ...}` envelope on failure; `cao workflow
+  delete` gains `--json` (#699).
 
 - SECURITY.md now states the supported release line as 2.x (it said 1.x while
   2.5.x was on PyPI), guarded by `test/test_security_policy.py` against the

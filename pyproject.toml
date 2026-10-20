@@ -1,6 +1,6 @@
 [project]
 name = "cli-agent-orchestrator"
-version = "2.5.3"
+version = "2.5.4"
 description = "CLI Agent Orchestrator"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -137,6 +137,9 @@ kiro_cli_memory = "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory:KiroCl
 codex_memory = "cli_agent_orchestrator.plugins.builtin.codex_memory:CodexMemoryPlugin"
 event_log_publisher = "cli_agent_orchestrator.plugins.builtin.event_log_publisher:EventLogPublisher"
 mcp_apps = "cli_agent_orchestrator.plugins.builtin.mcp_apps:McpAppsPlugin"
+
+[project.entry-points."cao.deciders"]
+fixed_table = "cli_agent_orchestrator.decisions.fixed_table:FixedTableDecider"
 
 [project.urls]
 Homepage = "https://github.com/awslabs/cli-agent-orchestrator"
@@ -419,3 +422,22 @@ python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
 addopts = "--cov=src --cov-report=term-missing -m 'not e2e and not integration'"
+
+# NFR-3's 80% line floor is enforced in CI, NOT here (issue #583 Bolt 3, build-and-test).
+#
+# `fail_under` deliberately does NOT live in this file. `--cov` is in `addopts`
+# above, so it applies to EVERY pytest invocation -- and a single test file
+# reports roughly 24% coverage of the whole package. A `fail_under = 80` here
+# would therefore fail ordinary focused test runs.
+#
+# The default marker expression above also excludes integration tests, while
+# the coverage figure is measured over CI's explicitly selected `-m "not e2e"`
+# suite across `test/` and `examples/workflow/tests/`. The two invocations do
+# not measure the same test population, so a pyproject floor would enforce the
+# CI threshold against a different suite even on a full default local run.
+#
+# The floor is enforced instead by `--cov-fail-under=80` on that explicit CI
+# invocation in `.github/workflows/ci.yml`.
+#
+# NOTE for anyone reading ci.yml: the separate "Coverage ratchet" step there
+# belongs to cao_mcp_apps (the TypeScript subproject), not to this suite.

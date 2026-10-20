@@ -9,6 +9,7 @@ import { CustomSelect, SelectOption } from './CustomSelect'
 import { TerminalMeta } from '../api'
 import { StatusBadge } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
+import { AgentDescription } from './AgentDescription'
 
 export const FALLBACK_PROVIDERS = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'gemini_cli', 'hermes', 'kimi_cli', 'copilot_cli', 'opencode_cli', 'cursor_cli', 'grok_cli']
 
@@ -369,11 +370,17 @@ export function AgentPanel() {
                   <div className="flex items-center gap-2">
                     <button
                       onClick={() => setInboxTerminalId(t.id)}
-                      className="flex items-center gap-2 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-xs font-medium rounded-lg transition-colors"
+                      className="relative flex items-center gap-2 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-xs font-medium rounded-lg transition-colors"
                       title="View inbox"
+                      aria-label={(t.pending_inbox_count ?? 0) > 1 ? `Inbox: ${t.pending_inbox_count} pending messages` : 'Inbox'}
                     >
                       <Mail size={14} />
                       Inbox
+                      {(t.pending_inbox_count ?? 0) > 1 && (
+                        <span aria-hidden="true" className="pointer-events-none absolute -top-2.5 -right-1 flex h-4 min-w-4 items-center justify-center whitespace-nowrap rounded-full bg-red-600 px-1 text-[10px] font-semibold leading-none text-white">
+                          {t.pending_inbox_count}
+                        </span>
+                      )}
                     </button>
                     <button
                       onClick={() => openTerminal(t.id, t.provider, t.agent_profile)}
@@ -411,6 +418,14 @@ export function AgentPanel() {
                     </button>
                   </div>
                 </div>
+                <AgentDescription className="!mt-0.5" id={t.id} description={t.description} onSaved={description => {
+                  useStore.setState(state => ({ activeSessionDetail: state.activeSessionDetail ? {
+                    ...state.activeSessionDetail,
+                    terminals: state.activeSessionDetail.terminals.map(terminal => terminal.id === t.id ? { ...terminal, description } : terminal),
+                  } : null }))
+                  const selectedSession = useStore.getState().activeSession
+                  if (selectedSession) void selectSession(selectedSession)
+                }} />
                 {/* Working Directory Display */}
                 {terminalWorkDirs[t.id] && (
                   <div className="flex items-center gap-1.5" title={terminalWorkDirs[t.id]!}>

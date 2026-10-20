@@ -53,6 +53,17 @@ logger = logging.getLogger(__name__)
 
 VALID_SEARCH_MODES = ("metadata", "bm25", "hybrid")
 
+# #861: cap hybrid score/usage widening at 200 per source, never below the requested limit.
+HYBRID_CANDIDATE_MIN = 50
+HYBRID_CANDIDATE_MULTIPLIER = 3
+HYBRID_CANDIDATE_MAX = 200
+
+
+def _matches_all_terms(query: str, content: str) -> bool:
+    """Use metadata recall's case-insensitive, all-term substring predicate."""
+    content_lower = content.lower()
+    return all(term in content_lower for term in query.lower().split())
+
 
 MEMORY_DISABLED_MESSAGE = (
     "memory subsystem is disabled. Set memory.enabled=true in settings.json " "to re-enable."
@@ -2346,6 +2357,16 @@ class MemoryService:
     # Recall
     # -------------------------------------------------------------------------
 
+    def _bm25_scope_id(
+        self, scope: Optional[str], terminal_context: Optional[dict]
+    ) -> Optional[str]:
+        """Preserve BM25's context-bound scope-id resolution."""
+        return (
+            self.resolve_scope_id(scope, terminal_context)
+            if scope and scope != MemoryScope.GLOBAL.value and terminal_context
+            else None
+        )
+
     async def recall(
         self,
         query: Optional[str] = None,
@@ -2363,7 +2384,9 @@ class MemoryService:
         ``search_mode``:
           - ``metadata``: substring match against key/tags/content via index.md walk.
           - ``bm25``: BM25 ranking over wiki bodies (content-aware).
-          - ``hybrid``: metadata results first, then BM25 fills with what metadata missed.
+          - ``hybrid``: recency tops up metadata with BM25. Query score/usage
+            widens and ranks all-term candidates; partial BM25 hits only fill
+            slots left when fewer than ``limit`` all-term matches exist.
 
         ``sort_by`` (orthogonal to ``search_mode``):
           - ``recency``: Phase 1/2 ordering (``-updated_at`` + scope precedence).
@@ -2402,11 +2425,7 @@ class MemoryService:
         if search_mode == "bm25":
             if not query:
                 return []
-            scope_id = (
-                self.resolve_scope_id(scope, terminal_context)
-                if scope and scope != MemoryScope.GLOBAL.value and terminal_context
-                else None
-            )
+            scope_id = self._bm25_scope_id(scope, terminal_context)
             bm25_only = self._bm25_search(
                 query=query,
                 scope=scope,
@@ -2430,11 +2449,24 @@ class MemoryService:
                 policy=recall_policy,
             )
 
+        widen_candidates = search_mode == "hybrid" and bool(query) and sort_by in {"score", "usage"}
+        candidate_limit = (
+            max(
+                limit,
+                min(
+                    HYBRID_CANDIDATE_MAX,
+                    max(HYBRID_CANDIDATE_MIN, HYBRID_CANDIDATE_MULTIPLIER * limit),
+                ),
+            )
+            if widen_candidates
+            else limit
+        )
+
         metadata_results = await self._metadata_recall(
             query=query,
             scope=scope,
             memory_type=memory_type,
-            limit=limit,
+            limit=candidate_limit,
             terminal_context=terminal_context,
             scan_all=scan_all,
             policy=recall_policy,
@@ -2443,6 +2475,50 @@ class MemoryService:
         if search_mode == "metadata" or not query:
             return self._apply_sort_and_increment(
                 metadata_results,
+                scope,
+                sort_by,
+                limit,
+                include_related=include_related,
+                query=query,
+                terminal_context=terminal_context,
+                scan_all=scan_all,
+                policy=recall_policy,
+            )
+
+        if widen_candidates:
+            by_identity: dict[tuple, Memory] = {}
+            for memory in metadata_results:
+                by_identity.setdefault(self._identity(memory), memory)
+            # An untruncated metadata scan is a census of index-listed rows.
+            # Check possible truncation or a shortfall after identity deduplication.
+            if len(metadata_results) == candidate_limit or len(by_identity) < limit:
+                all_term_identities: set[tuple] = set()
+                bm25_results = self._bm25_search(
+                    query=query,
+                    scope=scope,
+                    scope_id=self._bm25_scope_id(scope, terminal_context),
+                    memory_type=memory_type,
+                    limit=candidate_limit,
+                    exclude_keys=set(),
+                    terminal_context=terminal_context,
+                    scan_all=scan_all,
+                    policy=recall_policy,
+                    all_terms_first=True,
+                    all_term_identities=all_term_identities,
+                )
+                partial_results = []
+                for memory in bm25_results:
+                    if self._identity(memory) in all_term_identities:
+                        by_identity.setdefault(self._identity(memory), memory)
+                    else:
+                        partial_results.append(memory)
+                if len(by_identity) < limit:
+                    for memory in partial_results:
+                        by_identity.setdefault(self._identity(memory), memory)
+                        if len(by_identity) >= limit:
+                            break
+            return self._apply_sort_and_increment(
+                list(by_identity.values()),
                 scope,
                 sort_by,
                 limit,
@@ -2469,11 +2545,7 @@ class MemoryService:
                 policy=recall_policy,
             )
 
-        scope_id = (
-            self.resolve_scope_id(scope, terminal_context)
-            if scope and scope != MemoryScope.GLOBAL.value and terminal_context
-            else None
-        )
+        scope_id = self._bm25_scope_id(scope, terminal_context)
         bm25_results = self._bm25_search(
             query=query,
             scope=scope,
@@ -2799,12 +2871,8 @@ class MemoryService:
                 file_content = resolved_wiki.read_text(encoding="utf-8")
 
                 # Query matching: check if query terms appear in content (case-insensitive)
-                if query:
-                    query_lower = query.lower()
-                    terms = query_lower.split()
-                    content_lower = file_content.lower()
-                    if not all(term in content_lower for term in terms):
-                        continue
+                if query and not _matches_all_terms(query, file_content):
+                    continue
 
                 # Parse memory from file
                 memory = self._parse_wiki_file(wiki_file, file_content, entry)
@@ -2827,10 +2895,8 @@ class MemoryService:
             )
             if memory is None:
                 continue
-            if query:
-                terms = query.lower().split()
-                if not all(term in memory.content.lower() for term in terms):
-                    continue
+            if query and not _matches_all_terms(query, memory.content):
+                continue
             results.append(memory)
 
         # Sort by updated_at descending
@@ -3115,8 +3181,17 @@ class MemoryService:
         vault_candidates: Optional[Sequence[VaultCandidate]] = None,
         max_body_chars: int = 4096,
         policy: Optional[VaultInjectionPolicy] = None,
+        all_terms_first: bool = False,
+        all_term_identities: Optional[set[tuple]] = None,
     ) -> list[Memory]:
         """Rank wiki bodies by BM25 against ``query``.
+
+        ``all_terms_first`` partitions matches before slicing, preserving BM25
+        order within each group. Native checks use raw wiki text; vault checks
+        use the loaded body, exactly as metadata recall does. This keeps partial
+        hits from consuming the widened all-term candidate budget. When supplied,
+        ``all_term_identities`` receives the returned all-term identities from
+        that same scored-text snapshot; it is untouched when the flag is False.
 
         Returns ``[]`` (and logs at debug) if ``rank_bm25`` is unavailable —
         callers must continue gracefully without it.
@@ -3264,18 +3339,29 @@ class MemoryService:
             ),
             key=lambda x: x[0],
             reverse=True,
-        )[:limit]
+        )
+        all_term_indexes = set()
+        if all_terms_first:
+            all_term_indexes = {
+                idx for _score, idx in ranked if _matches_all_terms(query, contents[idx])
+            }
+            ranked.sort(key=lambda item: item[1] not in all_term_indexes)
+        ranked = ranked[:limit]
 
         results: list[Memory] = []
         for _score, idx in ranked:
             if idx in vault_memories:
                 results.append(vault_memories[idx])
+                if all_term_identities is not None and idx in all_term_indexes:
+                    all_term_identities.add(self._identity(vault_memories[idx]))
                 continue
             wiki_file, entry = candidates[idx]
             assert wiki_file is not None
             memory = self._parse_wiki_file(wiki_file, contents[idx], entry)
             if memory:
                 results.append(memory)
+                if all_term_identities is not None and idx in all_term_indexes:
+                    all_term_identities.add(self._identity(memory))
         return results
 
     def _get_search_dirs(

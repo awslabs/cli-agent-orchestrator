@@ -56,7 +56,7 @@ class TestCreateTerminalProviderResolution:
                 "caller_id": "a1b2c3d4",
                 "working_directory": "/repo",
             },
-            json=None,
+            json={"description": None},
             headers=None,
             timeout=_mcp_timeout(),
         )
@@ -102,7 +102,7 @@ class TestCreateTerminalProviderResolution:
                 "caller_id": "a1b2c3d4",
                 "working_directory": "/repo",
             },
-            json=None,
+            json={"description": None},
             headers=None,
             timeout=_mcp_timeout(),
         )
@@ -230,6 +230,7 @@ class TestCreateTerminalProviderResolution:
                 "model": "gpt-5.1-codex",
             },
             json={
+                "description": None,
                 "initial_message": "Review the current change",
                 "initial_message_orchestration_type": "assign",
             },
@@ -270,7 +271,7 @@ class TestCreateTerminalProviderResolution:
                 "agent_profile": "reviewer",
                 "session_name": "cao-new-session",
             },
-            json={"initial_message": "Review the current change"},
+            json={"description": None, "initial_message": "Review the current change"},
             headers=None,
             timeout=_mcp_timeout(),
         )

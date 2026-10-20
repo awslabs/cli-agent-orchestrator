@@ -135,6 +135,11 @@ the full detector: discarding a non-PROCESSING verdict would not undo the turn b
 detectors commit while reaching it, and a half-drawn frame is exactly where that bookkeeping is
 wrong. Providers that do not opt in keep edge-only detection.
 
+The per-poll PROCESSING re-check in `get_status()` has a sibling opt-in,
+`status_recheck_uses_screen` (Codex and Claude Code today): the provider is re-read from the
+composited screen instead of the raw rolling buffer, and the verdict is reused until new output
+lands (`_redetect`). Everyone else keeps the raw re-check.
+
 Two buffer-reset primitives with different semantics:
 
 - **`reset_buffer(terminal_id)`** — clears the rolling byte buffer AND wipes `_last_status` and the `_allow_processing_revert` arm. Used by providers that relaunch a different CLI mode on the same `terminal_id` (e.g. Kiro's TUI → `--legacy-ui` fallback), where past status is deliberately forgotten.

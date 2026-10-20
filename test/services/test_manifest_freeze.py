@@ -234,3 +234,27 @@ def test_an_available_baseline_is_part_of_the_identity_and_unavailable_baselines
         },
     )
     assert manifest_freeze.build_manifest_json(source_hash="abc123", inputs={"k": "v"}) is None
+
+
+def test_non_git_plan_ids_bind_root_and_git_golden_is_unchanged(tmp_path, monkeypatch):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    sub = a / "sub"
+    sub.mkdir()
+    ids = [_frozen(cwd=str(root))["plan_id"] for root in [a, b, sub, "/"]]
+    assert len(set(ids)) == 4
+    assert _frozen(cwd=str(a))["plan_id"] == ids[0]
+    monkeypatch.setattr(
+        manifest_freeze,
+        "derive_baseline",
+        lambda root: {
+            "available": True,
+            "commit": "0123456789abcdef0123456789abcdef01234567",
+            "worktree_state": {"status": "clean"},
+        },
+    )
+    assert (
+        _frozen()["plan_id"]
+        == "plan-v1:a78d41d795d8f42cd5bf9d280e295a4b95dde82bb7dd87c6c977649f900b57c9"
+    )

@@ -98,6 +98,7 @@ class CopilotCliProvider(BaseProvider):
     """Provider for GitHub Copilot CLI."""
 
     supports_stale_processing_capture = True
+    supports_stale_waiting_capture = True
 
     @classmethod
     def honors_model(
@@ -487,7 +488,7 @@ class CopilotCliProvider(BaseProvider):
         # "❯ ... or ? for" + "shortcuts"
         if re.match(PROMPT_HELPER_CONTINUATION_PATTERN, stripped):
             return True
-        if stripped.startswith("╭") or stripped.startswith("╰") or stripped.startswith("│"):
+        if stripped.startswith("╭") or stripped.startswith("╰") or line.startswith("│"):
             return True
         # Copilot v1.0.31+ status bar: " autopilot · / commands    Claude Sonnet 4.6 · (0%)"
         if re.match(COPILOT_STATUS_BAR_PATTERN, stripped):
@@ -501,12 +502,55 @@ class CopilotCliProvider(BaseProvider):
         return False
 
     @staticmethod
-    def _is_busy_or_waiting_row(text: str) -> bool:
+    def _is_waiting_dialog_row(text: str) -> bool:
         stripped = text.strip().lower()
+        framed = re.fullmatch(r"│\s*(.*?)\s*│", stripped)
+        if framed:
+            stripped = framed.group(1).strip()
+        if re.match(ASSISTANT_PREFIX_PATTERN, stripped, re.IGNORECASE):
+            return False
         return bool(
-            re.search(COPILOT_BUSY_ROW_PATTERN, stripped)
-            or re.search(WAITING_PROMPT_PATTERN, stripped)
+            re.match(WAITING_PROMPT_PATTERN, stripped)
+            or re.search(r"\[\s*y\s*/\s*n\s*\]\s*$", stripped)
         )
+
+    @classmethod
+    def _is_busy_or_waiting_row(cls, text: str) -> bool:
+        if re.match(ASSISTANT_PREFIX_PATTERN, text.strip(), re.IGNORECASE):
+            return False
+        return bool(
+            re.search(COPILOT_BUSY_ROW_PATTERN, text.strip(), re.IGNORECASE)
+            or cls._is_waiting_dialog_row(text)
+        )
+
+    @classmethod
+    def _active_rows(cls, rows: list[str]) -> list[str]:
+        active = []
+        continuation_indent = None
+        for row in rows:
+            stripped = row.strip()
+            if re.match(USER_PROMPT_LINE_PATTERN, row):
+                continuation_indent = len(row) - len(row.lstrip())
+                continue
+            if cls._is_processing_line(row):
+                active.append(row)
+                continuation_indent = None
+                continue
+            if re.match(ASSISTANT_PREFIX_PATTERN, stripped, re.IGNORECASE):
+                continuation_indent = len(row) - len(row.lstrip())
+                continue
+            if not stripped:
+                continue
+            if (
+                continuation_indent is not None
+                and len(row) - len(row.lstrip()) > continuation_indent
+                and not re.search(COPILOT_BUSY_ROW_PATTERN, stripped, re.IGNORECASE)
+            ):
+                continue
+            continuation_indent = None
+            if cls._is_busy_or_waiting_row(row):
+                active.append(row)
+        return active
 
     @staticmethod
     def _is_hint_row(text: str) -> bool:
@@ -522,31 +566,61 @@ class CopilotCliProvider(BaseProvider):
 
     @staticmethod
     def _is_processing_line(line: str) -> bool:
-        return bool(re.match(PROCESSING_LINE_PATTERN, line.strip(), re.IGNORECASE))
+        stripped = line.strip()
+        if re.match(ASSISTANT_PREFIX_PATTERN, stripped, re.IGNORECASE) and not re.match(
+            r"^[●◐◑◒◓◉]\s*(?:thinking|working)\b", stripped, re.IGNORECASE
+        ):
+            return False
+        return bool(re.match(PROCESSING_LINE_PATTERN, stripped, re.IGNORECASE))
 
     @classmethod
     def _has_idle_prompt_near_end(cls, lines: list[str]) -> bool:
         return cls._unrecognized_rows_after_prompt(lines) == []
 
     @classmethod
+    def _last_composer_span(
+        cls, lines: list[str], *, include_draft: bool = False
+    ) -> Optional[tuple[int, int]]:
+        """Return the last prompt or boxed composer bounds (end exclusive)."""
+        span = None
+        for idx, line in enumerate(lines):
+            if re.match(IDLE_PROMPT_LINE_PATTERN, line):
+                span = (idx, idx + 1)
+            if idx + 3 >= len(lines):
+                continue
+            top = line.strip()
+            bottom = lines[idx + 2].strip()
+            if (
+                re.fullmatch(r"╻▄{8,}", top)
+                and (
+                    re.fullmatch(r"┃\s*", lines[idx + 1].strip())
+                    or (include_draft and re.fullmatch(r"┃\s+\S.*", lines[idx + 1].strip()))
+                )
+                and bottom == "╹" + "▀" * (len(top) - 1)
+                and re.search(COPILOT_HINT_BAR_PATTERN, lines[idx + 3].strip().lower())
+            ):
+                span = (idx, idx + 3)
+        return span
+
+    @classmethod
     def _unrecognized_rows_after_prompt(cls, lines: list[str]) -> Optional[list[str]]:
-        # Strip trailing empty lines — TUI providers (like Copilot) render in
-        # a fixed viewport at the top of the pane, leaving the bottom blank.
+        # TUI viewports can leave trailing blank rows below the composer.
         stripped = list(lines)
         while stripped and not stripped[-1].strip():
             stripped.pop()
-        if not stripped:
-            return None
-
         tail = stripped[-25:]
-        last_prompt_idx = -1
-        for idx, line in enumerate(tail):
-            if re.match(IDLE_PROMPT_LINE_PATTERN, line):
-                last_prompt_idx = idx
-        if last_prompt_idx < 0:
+        span = cls._last_composer_span(tail)
+        if span is None:
             return None
-
-        return cls._rows_outside_idle_chrome(tail[last_prompt_idx + 1 :])
+        start, end = span
+        unrecognized = cls._rows_outside_idle_chrome(tail[end:])
+        if end - start > 1:
+            # Copilot can keep the composer visible during execution or approval.
+            composer_start = len(stripped) - len(tail) + start
+            last_user = cls._find_last_user_line(stripped[:composer_start])
+            before = stripped[max(last_user, 0) : composer_start]
+            unrecognized.extend(cls._active_rows(before))
+        return unrecognized
 
     @classmethod
     def _rows_outside_idle_chrome(cls, rows: list[str]) -> list[str]:
@@ -582,15 +656,14 @@ class CopilotCliProvider(BaseProvider):
     def _normalize_post_user_lines(
         cls, lines: list[str], *, after_idle_prompt: bool = False
     ) -> list[str]:
-        last_prompt = max(
-            (idx for idx, line in enumerate(lines) if re.match(IDLE_PROMPT_LINE_PATTERN, line)),
-            default=-1,
-        )
+        span = cls._last_composer_span(lines)
+        last_prompt = span[0] if span is not None else -1
+        composer_end = span[1] if span is not None else 0
         if last_prompt < 0 and after_idle_prompt:
             return cls._rows_outside_idle_chrome(lines)
         body = [
             line
-            for line in lines[: last_prompt + 1 if last_prompt >= 0 else len(lines)]
+            for line in lines[: last_prompt if last_prompt >= 0 else len(lines)]
             if line.strip()
             and not cls._is_footer_line(line)
             and not re.match(IDLE_PROMPT_LINE_PATTERN, line)
@@ -598,7 +671,7 @@ class CopilotCliProvider(BaseProvider):
         trailing = (
             [
                 line
-                for line in cls._rows_outside_idle_chrome(lines[last_prompt + 1 :])
+                for line in cls._rows_outside_idle_chrome(lines[composer_end:])
                 if not cls._is_footer_line(line)
             ]
             if last_prompt >= 0
@@ -656,19 +729,13 @@ class CopilotCliProvider(BaseProvider):
 
         lines = output.splitlines()
         has_idle_prompt_at_end = self._has_idle_prompt_near_end(lines)
-        tail_output = "\n".join(lines[-40:])
-
-        waiting_matches = list(re.finditer(WAITING_PROMPT_PATTERN, tail_output, re.IGNORECASE))
-        idle_matches = list(
-            re.finditer(IDLE_PROMPT_LINE_PATTERN, tail_output, re.IGNORECASE | re.MULTILINE)
-        )
-        waiting_now = bool(waiting_matches)
-        if waiting_matches and idle_matches:
-            waiting_now = waiting_matches[-1].start() > idle_matches[-1].start()
-        if waiting_now and not has_idle_prompt_at_end:
-            return TerminalStatus.WAITING_USER_ANSWER
-
         last_user = self._find_last_user_line(lines)
+        recent_rows = lines[last_user if last_user >= 0 else max(0, len(lines) - 40) :]
+        waiting_now = any(
+            self._is_waiting_dialog_row(row) for row in self._active_rows(recent_rows)
+        )
+        if waiting_now:
+            return TerminalStatus.WAITING_USER_ANSWER
 
         if not has_idle_prompt_at_end:
             if last_user >= 0:
@@ -677,9 +744,9 @@ class CopilotCliProvider(BaseProvider):
                     return TerminalStatus.ERROR
             return TerminalStatus.PROCESSING
 
-        composer_index = max(
-            idx for idx, line in enumerate(lines) if re.match(IDLE_PROMPT_LINE_PATTERN, line)
-        )
+        composer_span = self._last_composer_span(lines)
+        assert composer_span is not None
+        composer_index = composer_span[0]
         before_composer = self._trim_tail_prompts(lines[:composer_index])
         if before_composer and self._is_processing_line(before_composer[-1]):
             return TerminalStatus.PROCESSING
@@ -708,8 +775,16 @@ class CopilotCliProvider(BaseProvider):
         return TerminalStatus.COMPLETED
 
     def probe_stale_processing_capture(self, output: str) -> TerminalStatus:
-        if not self._clean(output).strip():
+        cleaned = self._clean(output)
+        if not cleaned.strip():
             return TerminalStatus.UNKNOWN
+        lines = cleaned.splitlines()
+        span = self._last_composer_span(lines)
+        last_user = self._find_last_user_line(lines[: span[0]] if span else lines)
+        post_user = lines[max(last_user, 0) :]
+        # A composer below a dialog does not prove the dialog was dismissed.
+        if any(self._is_waiting_dialog_row(row) for row in self._active_rows(post_user)):
+            return TerminalStatus.WAITING_USER_ANSWER
         return self.get_status(output)
 
     def commit_stale_processing_capture(self, output: str, expected: TerminalStatus) -> bool:
@@ -718,9 +793,65 @@ class CopilotCliProvider(BaseProvider):
     def get_idle_pattern_for_log(self) -> str:
         return IDLE_PROMPT_PATTERN_LOG
 
+    @classmethod
+    def _without_composer_metadata(cls, lines: list[str]) -> list[str]:
+        """Remove anchored directory/session and leading thought metadata."""
+        span = cls._last_composer_span(lines)
+        if (
+            span is None
+            or not cls._has_idle_prompt_near_end(lines)
+            or not any(cls._is_hint_row(row) for row in lines[span[1] :])
+        ):
+            return lines
+        end = span[0]
+        while end and (
+            not lines[end - 1].strip() or re.fullmatch(r"[─-]{8,}", lines[end - 1].strip())
+        ):
+            end -= 1
+        if (
+            end < 3
+            or lines[end - 2].strip()
+            or lines[end - 3].strip()
+            or not re.fullmatch(
+                r"\s+(?:/|~/).+\s{3,}Session:\s+\d+(?:\.\d+)?\s+AIC used\s*",
+                lines[end - 1],
+            )
+        ):
+            return lines
+        cwd_index = end - 1
+        omitted = {cwd_index}
+        end = cwd_index
+        while end and not lines[end - 1].strip():
+            end -= 1
+        last_user = cls._find_last_user_line(lines[:end])
+        first_reply = next(
+            (
+                idx
+                for idx in range(last_user + 1, end)
+                if re.match(ASSISTANT_PREFIX_PATTERN, lines[idx].strip(), re.IGNORECASE)
+            ),
+            end,
+        )
+        for idx in range(last_user + 1, first_reply):
+            if not re.fullmatch(r"\s*⌄ Thought for \d+(?:\.\d+)?s\s*", lines[idx]):
+                continue
+            thought_rows = lines[idx + 1 : first_reply]
+            if (
+                first_reply < end
+                and any(row.lstrip().startswith("│") for row in thought_rows)
+                and all(not row.strip() or row.lstrip().startswith("│") for row in thought_rows)
+            ):
+                omitted.update(range(idx, first_reply))
+        return [row for idx, row in enumerate(lines) if idx not in omitted]
+
     def extract_last_message_from_script(self, script_output: str) -> str:
         clean_output = self._clean(script_output)
         lines = clean_output.splitlines()
+        span = self._last_composer_span(lines, include_draft=True)
+        if span is not None and span[1] - span[0] > 1 and lines[span[0] + 1].strip() != "┃":
+            lines = lines[: span[0]]
+        lines = self._without_composer_metadata(lines)
+        clean_output = "\n".join(lines)
         last_user = self._find_last_user_line(lines)
 
         if last_user >= 0:
@@ -737,6 +868,9 @@ class CopilotCliProvider(BaseProvider):
                 return message
             raise ValueError("No provider response content found in terminal output")
 
+        span = self._last_composer_span(lines)
+        if span is not None and span[1] - span[0] > 1:
+            clean_output = "\n".join(lines[: span[0]])
         matches = list(
             re.finditer(ASSISTANT_PREFIX_PATTERN, clean_output, re.IGNORECASE | re.MULTILINE)
         )

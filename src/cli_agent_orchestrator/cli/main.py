@@ -30,6 +30,7 @@ _COMMANDS: tuple[tuple[str, str, str, str, bool], ...] = (
         "Inspect and edit unified CAO configuration (settings.json).",
         False,
     ),
+    ("decisions", _PKG + "decisions", "decisions", "Manage local launch decisions.", False),
     ("env", _PKG + "env", "env", "Manage CAO environment variables.", False),
     ("fleet", _PKG + "fleet", "fleet", "Inspect and tear down a CAO fleet's workers.", False),
     ("flow", _PKG + "schedule", "flow", "[Deprecated] Alias for 'cao schedule'.", True),

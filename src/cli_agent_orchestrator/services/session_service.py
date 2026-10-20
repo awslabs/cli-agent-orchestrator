@@ -30,6 +30,7 @@ from cli_agent_orchestrator.backends.base import TerminalBackend, TerminalCleanu
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     delete_terminals_by_ids,
+    get_pending_inbox_counts,
     get_session_incarnation,
     get_session_incarnations,
     list_terminals_by_session,
@@ -60,6 +61,9 @@ from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 logger = logging.getLogger(__name__)
 
 
+_DESCRIPTION_UNSET = object()
+
+
 async def create_session(
     provider: str | None,
     agent_profile: str,
@@ -78,6 +82,7 @@ async def create_session(
     resume_session_id: str | None = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    description: Any = _DESCRIPTION_UNSET,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
@@ -118,6 +123,9 @@ async def create_session(
     else:
         resolved_provider = provider
 
+    if description is _DESCRIPTION_UNSET:
+        description = session_name or None
+
     # Passed only when set, so the ordinary create call stays
     # byte-identical for every existing caller (review on PR #773).
     lookup_kwargs: Dict[str, Any] = {"lookup_only": True} if lookup_only else {}
@@ -141,6 +149,7 @@ async def create_session(
         resume_session_id=resume_session_id,
         group=group,
         metadata=metadata,
+        description=description,
     )
     if lookup_only or last_create_was_replay():
         # A lookup, or a replay of an earlier keyed request, returned a terminal
@@ -511,7 +520,9 @@ def get_session(session_name: str) -> Dict:
         from cli_agent_orchestrator.services.status_monitor import status_monitor
         from cli_agent_orchestrator.services.terminal_service import reported_status
 
+        pending_counts = get_pending_inbox_counts([terminal["id"] for terminal in terminals])
         for terminal in terminals:
+            terminal["pending_inbox_count"] = pending_counts.get(terminal["id"], 0)
             failure = failures.get(str(terminal["id"]))
             if failure is not None:
                 terminal["deferred_init_failure"] = failure

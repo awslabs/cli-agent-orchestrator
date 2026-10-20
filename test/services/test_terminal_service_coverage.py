@@ -564,3 +564,51 @@ class TestDeleteTerminal:
 
         with pytest.raises(Exception, match="DB error"):
             delete_terminal("tid1")
+
+
+class TestGetOutputContext:
+    """Issue #638 review (fanhongy P3): the raw capture fed to the provider-error
+    classifier. Its ``None`` return is the "do not classify" contract, so every
+    branch must be pinned: a capture failure must never turn a real answer into a
+    step failure."""
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_no_metadata_returns_none(self, mock_meta):
+        from cli_agent_orchestrator.services.terminal_service import get_output_context
+
+        mock_meta.return_value = None
+
+        assert get_output_context("tid1") is None
+
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_rolling_buffer_is_returned(self, mock_meta, mock_monitor):
+        from cli_agent_orchestrator.services.terminal_service import get_output_context
+
+        mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
+        mock_monitor.get_buffer.return_value = "⏺ API Error: 400 nope\n❯"
+
+        assert get_output_context("tid1") == "⏺ API Error: 400 nope\n❯"
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_empty_buffer_falls_back_to_backend_history(
+        self, mock_meta, mock_monitor, mock_backend
+    ):
+        from cli_agent_orchestrator.services.terminal_service import get_output_context
+
+        mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
+        mock_monitor.get_buffer.return_value = ""
+        mock_backend.return_value.get_history.return_value = "raw scrollback"
+
+        assert get_output_context("tid1") == "raw scrollback"
+        mock_backend.return_value.get_history.assert_called_once_with("ses", "win")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_exception_is_swallowed_and_returns_none(self, mock_meta):
+        from cli_agent_orchestrator.services.terminal_service import get_output_context
+
+        mock_meta.side_effect = RuntimeError("db down")
+
+        assert get_output_context("tid1") is None

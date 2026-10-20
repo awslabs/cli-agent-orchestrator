@@ -16,9 +16,10 @@ backend alone, with no per-step tmux/herdr branching.
 Failure contract (RD-2.1 / REL-3.3): ``run_agent_step`` returns an
 ``AgentStepResult`` ONLY on success (status COMPLETED). Every failure mode —
 the readiness/completion wait timing out, the terminal reaching
-``TerminalStatus.ERROR`` — RAISES a narrow exception. It NEVER returns a falsy
-or ``None`` "success". The caller (engine) maps the raised exception to its 3x
-retry policy (FR-5.3); the HTTP handler maps it to an ``HTTPException``.
+``TerminalStatus.ERROR``, or an in-band provider refusal — RAISES a narrow
+exception. It NEVER returns a falsy or ``None`` "success". The caller (engine)
+maps the raised exception to its 3x retry policy (FR-5.3); the HTTP handler maps
+it to an ``HTTPException``.
 """
 
 import asyncio
@@ -31,8 +32,12 @@ from cli_agent_orchestrator.models.kiro_engine import KiroEngine, parse_kiro_eng
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
+from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
-from cli_agent_orchestrator.services import frozen_run_memory, terminal_service
+from cli_agent_orchestrator.services import frozen_run_memory, launch_guard, terminal_service
+from cli_agent_orchestrator.services.provider_error_classifier import (
+    classify_provider_error,
+)
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
 from cli_agent_orchestrator.services.terminal_service import OutputMode
@@ -116,15 +121,19 @@ async def _validate_reused_terminal(
 class StepExecutionError(Exception):
     """A step failed to complete successfully.
 
-    Raised for a readiness/completion timeout or a terminal that reached
-    ``TerminalStatus.ERROR``. Narrow by design so the caller (engine) can map
+    Raised for a readiness/completion timeout, a terminal that reached
+    ``TerminalStatus.ERROR``, or an in-band provider error (issue #638,
+    ``"provider_error"``). Narrow by design so the caller (engine) can map
     it to its retry policy and the API boundary can map it to an HTTPException.
 
     Carries two structured fields so callers never have to scrape the message:
 
     - ``kind`` distinguishes a worker that *ran long* (``"timeout"``) from one
-      that *crashed* (``"error"``, i.e. the terminal reached ERROR). The two
-      were previously indistinguishable — both surfaced as a 504 "timed out".
+      that *crashed* (``"error"``, i.e. the terminal reached ERROR) — the two
+      were previously indistinguishable, both surfacing as a 504 "timed out" —
+      and, additively, from one whose provider refused the call *in band*
+      (``"provider_error"``), which the step produced no answer for. A consumer
+      that switches on ``kind`` must therefore not assume only two members.
     - ``terminal_id`` is the live terminal the step ran on (when known), so a
       failed caller can report/clean it up without regex-scraping the message.
     """
@@ -442,6 +451,7 @@ async def run_agent_step(
     use_worktree: bool = False,
     job_id: Optional[str] = None,
     claim_id: Optional[str] = None,
+    description: Optional[str] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -566,8 +576,9 @@ async def run_agent_step(
         ``AgentStepResult`` with status COMPLETED — ONLY on success.
 
     Raises:
-        StepExecutionError: readiness/completion wait timed out (``kind="timeout"``)
-            or the terminal reached ``TerminalStatus.ERROR`` (``kind="error"``).
+        StepExecutionError: readiness/completion wait timed out (``kind="timeout"``),
+            the terminal reached ``TerminalStatus.ERROR`` (``kind="error"``), or the
+            provider refused the call in band (``kind="provider_error"``).
             ``terminal_id`` carries the live terminal so the caller can clean up.
         StepCancelledError: ``cancel_event`` fired during the completion wait
             (issue #409b) — a cancellation, NOT a run-failure (do not retry).
@@ -578,6 +589,11 @@ async def run_agent_step(
     terminal_id = reuse_terminal_id
 
     if created_here:
+        await asyncio.to_thread(
+            launch_guard.check,
+            (env_vars or {}).get("CAO_WORKFLOW_RUN_ID"),
+            agent,
+        )
         # Inherit working directory from supervisor when not explicitly set.
         # Without this, a handoff worker starts in the cao-server process CWD
         # instead of the supervisor's project directory. Best-effort: if
@@ -683,6 +699,7 @@ async def run_agent_step(
             model=model,
             use_worktree=use_worktree,
             claim_id=claim_id,
+            description=description,
         )
         terminal_id = terminal.id
 
@@ -789,10 +806,50 @@ async def run_agent_step(
         last_message = await asyncio.to_thread(
             terminal_service.get_output, terminal_id, OutputMode.LAST
         )
-    except BaseException:
+    except BaseException as exc:
         if teardown and created_here:
             await _best_effort_teardown(terminal_id, registry)
+        if isinstance(exc, OutputExtractionError):
+            # Keep rejection subtypes distinct: the prefix is context, not a retry.
+            raise type(exc)(f"terminal {terminal_id}: {exc}") from exc
         raise
+
+    # In-band provider-error classification (issue #638). The transport succeeded
+    # — the CLI printed the refusal and settled — so everything below would have
+    # reported a successful step carrying the ERROR TEXT as its answer, and a
+    # replay-safe resume would then serve that text forever without ever
+    # launching a terminal. Classify BEFORE the result is built so the step is
+    # NEVER journaled as a replayable completed outcome.
+    #
+    # Cheap first (P3): the two-argument call only runs the signature table, and it
+    # returns ``None`` for the overwhelming majority of steps -- ordinary answers,
+    # outputs past the length cap, providers with no scoped rows -- so the
+    # raw-context fetch (a terminal-metadata DB read plus a possible ``capture-pane``
+    # when the rolling buffer is empty) is deferred until a row actually matches.
+    # Only a candidate match pays for the capture, and only then is it re-read to
+    # confirm the line is provider chrome rather than a marker-owned answer.
+    provider_error = classify_provider_error(provider, last_message)
+    if provider_error is not None:
+        script_output = await asyncio.to_thread(terminal_service.get_output_context, terminal_id)
+        provider_error = classify_provider_error(
+            provider, last_message, script_output=script_output
+        )
+    if provider_error is not None:
+        # Unlike the crash/timeout paths above, the CLI here is HEALTHY and idle: it
+        # settled cleanly after printing a refusal, and the refusal text already
+        # travels on the exception (#638 criterion 2), so there is nothing left for
+        # an operator to inspect in the pane. Tear down a terminal THIS call created,
+        # or each retry of a YAML step leaks one idle CLI: the drive loop creates a
+        # fresh terminal every attempt (``teardown=True``) and only the LAST one stays
+        # referenced, and capped nodes (``max_terminals``) would block on the orphans.
+        # ``terminal_id`` still rides on the exception for reporting.
+        if teardown and created_here:
+            await _best_effort_teardown(terminal_id, registry)
+        raise StepExecutionError(
+            f"provider error ({provider_error.slug}) from {provider}: {provider_error.detail}",
+            kind=provider_error.kind,
+            terminal_id=terminal_id,
+        )
 
     result = AgentStepResult(
         terminal_id=terminal_id,
