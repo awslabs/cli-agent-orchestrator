@@ -153,6 +153,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Concurrent blocking script starts with the same run id now return a conflict
+  for the loser without changing the winning run's journal or live record.
 - Script runs now capture their agent-profile and memory-setting guard at admission,
   before the approval gate, so edits during the gate refuse later agent launches.
 - Script runs under approval enforcement now stop before spawning if their run row

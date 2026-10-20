@@ -33,6 +33,7 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1307,11 +1308,9 @@ async def run_script_workflow(
     register the live record; (2) spawn with the constructed env (INV-2); (3) drain
     both pipes concurrently while awaiting exit under the wall-clock bound, then
     give the drain ``WORKFLOW_SCRIPT_TERM_GRACE`` after the exit and close pipes a
-    background process still holds; (4) interpret the exit + sentinel scan. Only
-    the lint gate raises, and it raises exactly one type — ``ScriptLintError`` —
-    while a run failure/timeout returns a FAILED result instead. Naming the type
-    matters: it is the only exception a caller of this function must handle, so an
-    ``except Exception`` here would be both too broad and a silent way to swallow it.
+    background process still holds; (4) interpret the exit + sentinel scan.
+    Lint, approval and duplicate-id admission refusals raise before spawning;
+    a run failure/timeout returns a FAILED result instead.
     """
     # --- Step -1: validate the run_id key BEFORE any journal/registry/path use
     # (shared validator, mirrors base start_run at workflow_service.py:713). A
@@ -1357,7 +1356,7 @@ async def run_script_workflow(
     if capture_error is not None:
         raise capture_error
 
-    # --- Step 1: register the live record + journal the durable run row ---
+    # --- Step 1: journal the run before publishing its live record ---
     record = ScriptRunRecord(
         run_id=run_id,
         workflow_name=spec.name,
@@ -1376,7 +1375,8 @@ async def run_script_workflow(
     # NOT evicted on finalize, mirroring the base YAML registry, so a bounded
     # post-run status window keeps serving. Registry eviction/TTL is deferred to
     # U5/base scope (no per-tier eviction here).
-    run_registry[run_id] = record
+    # Publish only after the INSERT, so a duplicate loser cannot replace the
+    # winning live record while the journal rejects its admission.
 
     # The durable spec_snapshot carries the frozen source (resume reads it back).
     spec_snapshot = build_script_snapshot(
@@ -1405,11 +1405,18 @@ async def run_script_workflow(
             # it; reusing it rather than rebuilding is what makes checked-equals-stored true.
             manifest_json,
         )
+    except sqlite3.IntegrityError:
+        # Another admission can win after the route's availability check. Its
+        # row and live record belong to that run; never finalize or replace them.
+        raise KeyError(f"run_id '{run_id}' already exists") from None
     except Exception as e:  # noqa: BLE001 — a failed admission must settle before spawn
         if guard.get("approval_required", True) or approval_gate.is_workflow_approval_required():
             # An enforced run needs the durable guard and frozen-memory state.
             # Never expose the journal exception (which can include local paths).
-            logger.warning("journal: script insert_run failed; refusing script spawn")
+            logger.warning(
+                "journal: script insert_run failed; refusing script spawn (%s)", type(e).__name__
+            )
+            run_registry[run_id] = record
             return await _finalize(
                 record,
                 state=RunState.FAILED,
@@ -1417,7 +1424,13 @@ async def run_script_workflow(
                 error="Could not durably record this script run; no script was started. "
                 "Repair the run journal and start a new run.",
             )
-        logger.warning("journal: script insert_run for '%s' failed (run continues): %s", run_id, e)
+        logger.warning(
+            "journal: script insert_run for '%s' failed (run continues): %s",
+            run_id,
+            type(e).__name__,
+        )
+
+    run_registry[run_id] = record
 
     # --- Step 2: spawn (constructed env) + Step 3/4: drive, reap, interpret ---
     # Mark the drive live for the whole spawn->reap window so Gate-2 of a

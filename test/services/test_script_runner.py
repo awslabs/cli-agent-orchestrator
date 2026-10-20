@@ -1917,7 +1917,9 @@ async def test_partial_start_snapshot_deleted_on_materialize_error(monkeypatch, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enforced", [True, False], ids=["enforced", "opt-out"])
-async def test_insert_failure_stops_enforced_script_before_spawn(monkeypatch, tmp_path, enforced):
+async def test_insert_failure_stops_enforced_script_before_spawn(
+    monkeypatch, tmp_path, enforced, caplog
+):
     from cli_agent_orchestrator.services import approval_store, settings_service
 
     settings_service.SETTINGS_FILE.write_text(
@@ -1938,6 +1940,14 @@ async def test_insert_failure_stops_enforced_script_before_spawn(monkeypatch, tm
     result = await run_script_workflow(
         _FakeScriptSpec(), {}, "insert-failed", working_directory=str(tmp_path)
     )
+    warnings = [
+        entry
+        for entry in caplog.records
+        if entry.name == script_runner.logger.name and "insert_run" in entry.getMessage()
+    ]
+    assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
+    assert "RuntimeError" in warnings[0].getMessage()
+    assert private_path not in caplog.text
     if enforced:
         assert spawned == {}, "an approved run without its journal row must never spawn"
         assert result.state == RunState.FAILED
@@ -1953,3 +1963,82 @@ async def test_insert_failure_stops_enforced_script_before_spawn(monkeypatch, tm
     else:
         assert spawned
         assert result.state == RunState.COMPLETED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforced", [True, False], ids=["enforced", "opt-out"])
+async def test_duplicate_insert_preserves_winning_live_run(monkeypatch, tmp_path, enforced):
+    """A loser at the INSERT boundary must not settle or replace the winner."""
+    from cli_agent_orchestrator.services import approval_store, settings_service
+
+    settings_service.SETTINGS_FILE.write_text(
+        json.dumps({"workflow": {"require_approval": enforced}})
+    )
+    monkeypatch.setattr(approval_store, "approval_state", lambda plan: approval_store.APPROVED)
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles, "list_agent_profiles", lambda: []
+    )
+    monkeypatch.setattr(settings_service, "is_memory_enabled", lambda: False)
+    run_id = "duplicate-insert"
+    winner = _make_record(run_id, process=None, generation="7")
+    workflow_journal.insert_run(
+        run_id,
+        "winning-workflow",
+        '{"source":"winner"}',
+        '{"owner":"winner"}',
+        RunState.RUNNING.value,
+        winner.started_at,
+        "script",
+        "7",
+    )
+    before = workflow_journal.get_run(run_id)
+    script_runner.run_registry[run_id] = winner
+    script_runner._active_drives.add(run_id)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    conflict = None
+    try:
+        # The HTTP availability check can already have passed before the winner
+        # inserts. Exercise the real duplicate constraint at the engine boundary.
+        await run_script_workflow(_FakeScriptSpec(), {}, run_id, working_directory=str(tmp_path))
+    except KeyError as exc:
+        conflict = exc
+
+    assert workflow_journal.get_run(run_id) == before, "the winning row must remain untouched"
+    assert script_runner.run_registry[run_id] is winner
+    assert winner.state == RunState.RUNNING and winner.finished_at is None
+    assert run_id in script_runner._active_drives
+    assert spawned == {}
+    assert conflict is not None and "already exists" in str(conflict)
+
+
+@pytest.mark.asyncio
+async def test_insert_failure_refuses_when_enforcement_turns_on_after_capture(
+    monkeypatch, tmp_path
+):
+    from cli_agent_orchestrator.services import settings_service
+
+    settings_service.SETTINGS_FILE.write_text('{"workflow":{"require_approval":false}}')
+    real_capture = script_runner.launch_guard.capture
+    captured = []
+
+    def capture():
+        guard = real_capture()
+        captured.append(guard)
+        return guard
+
+    def insert_failure(*args, **kwargs):
+        assert json.loads(args[2])["launch_guard"] == {"approval_required": False}
+        settings_service.SETTINGS_FILE.write_text('{"workflow":{"require_approval":true}}')
+        raise RuntimeError(str(tmp_path / "private-journal-location"))
+
+    monkeypatch.setattr(script_runner.launch_guard, "capture", capture)
+    monkeypatch.setattr(workflow_journal, "insert_run", insert_failure)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    result = await run_script_workflow(
+        _FakeScriptSpec(), {}, "posture-flipped", working_directory=str(tmp_path)
+    )
+    assert captured == [{"approval_required": False}]
+    assert spawned == {}, "the current posture must be re-read before any spawn"
+    assert result.state == RunState.FAILED and result.kind == "error"
+    assert script_runner.run_registry["posture-flipped"].finished_at is not None
+    assert "posture-flipped" not in script_runner._active_drives
