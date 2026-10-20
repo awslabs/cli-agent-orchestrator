@@ -175,7 +175,12 @@ SHELL_PROMPT_ONLY_PATTERN = r"^[$%#>❯›»]\s*$"
 # tmux scrollback can still hold an old rejection from an earlier, already-fixed
 # config above a *later* launch that failed for an unrelated reason, and that
 # stale message must not be reported as explaining the current failure.
-LAUNCH_COMMAND_PATTERN = r"^[$%#>❯›»]\s*codex\b"
+# The prompt is normally prefixed (`operator@host:/repo$ codex ...`, zsh `%`, starship
+# `❯`), so the glyph is matched anywhere on the row, not only at column 0. The failure
+# direction of the wider match is a false negative (a rejection row that happens to
+# contain `$ codex` is taken as a launch line and the generic timeout stands), which is
+# the safe one.
+LAUNCH_COMMAND_PATTERN = r".*[$%#>❯›»]\s*codex\b"
 
 # Workspace trust/approval prompt shown when Codex opens a new directory.
 # Two known variants:

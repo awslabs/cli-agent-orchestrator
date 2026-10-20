@@ -1022,6 +1022,30 @@ class TestCodexConfigRejectionDiagnostic:
 
         assert message is None, "the stale config rejection must not be reported here"
 
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            "operator@host:/repo$ ",
+            "operator@host /repo % ",
+            "❯ ",
+        ],
+        ids=["bash-default", "zsh", "starship"],
+    )
+    def test_launch_boundary_is_found_behind_a_prefixed_prompt(self, prompt):
+        """The launch row CAO types is normally `user@host:/path$ codex ...`, not a bare `$`.
+        The boundary must still be found, or the bounding is inert for every real shell."""
+        pane = (
+            CONFIG_REJECTION_PANE
+            + "\n"
+            + prompt
+            + "codex --profile cao_reviewer --no-alt-screen --disable shell_snapshot\n"
+            "Error: could not connect to model provider\n" + prompt
+        )
+
+        message = _find_config_rejection(pane)
+
+        assert message is None, f"stale rejection reported behind prompt {prompt!r}"
+
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
