@@ -1266,22 +1266,19 @@ async def _drive_frozen(
 
 
 async def _persist_generation_best_effort(record: ScriptRunRecord) -> None:
-    """Persist a bumped generation on the timeout arm (best-effort, INV-4/INV-6).
+    """Persist a bumped generation while settling a run (best-effort, INV-4/INV-6).
 
-    Unlike the load-bearing pre-spawn/cancel bumps (which surface a persist
-    failure to the caller), the timeout-arm bump happens while finalizing a run
-    that already failed — a persist failure here only degrades the straggler
-    fence for an already-dead run, so it is logged + swallowed rather than raised.
+    Used by timeout and admission-cancel finalization. A persist failure degrades
+    the generation fence, so it is logged and swallowed rather than preventing
+    the run from settling.
     """
     from cli_agent_orchestrator.services.workflow_service import update_run_generation
 
     try:
         await asyncio.to_thread(update_run_generation, record.run_id, record.generation)
-    except (
-        Exception
-    ) as e:  # noqa: BLE001 — timeout-arm gen persist is best-effort; run already FAILED (INV-4)
+    except Exception as e:  # noqa: BLE001 — generation persist is best-effort (INV-4)
         logger.warning(
-            "journal: timeout-arm generation bump persist for run '%s' failed: %s",
+            "journal: generation bump persist for run '%s' failed: %s",
             record.run_id,
             e,
         )
