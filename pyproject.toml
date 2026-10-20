@@ -429,7 +429,10 @@ addopts = "--cov=src --cov-branch --cov-report=term-missing -m 'not e2e and not 
 # the condition never does. Measured cost on a 369-test subset: 49-57s without,
 # 54-57s with -- inside run-to-run noise, so no local-loop tax.
 #
-# NFR-3's 80% line floor is enforced in CI, NOT here (issue #583 Bolt 3, build-and-test).
+# NFR-3's 80% floor is enforced in CI, NOT here (issue #583 Bolt 3, build-and-test).
+# With `--cov-branch` on, that CI invocation enforces the BLENDED line+branch
+# figure against 80, not a line-only floor -- the line-only floor is the
+# ratchet's separate `python.floor_pct = 87.0` (see CAUTION below, #1005).
 #
 # `fail_under` deliberately does NOT live in this file. `--cov` is in `addopts`
 # above, so it applies to EVERY pytest invocation -- and a single test file
@@ -442,8 +445,9 @@ addopts = "--cov=src --cov-branch --cov-report=term-missing -m 'not e2e and not 
 # not measure the same test population, so a pyproject floor would enforce the
 # CI threshold against a different suite even on a full default local run.
 #
-# The floor is enforced instead by `--cov-fail-under=80` on that explicit CI
-# invocation in `.github/workflows/ci.yml`.
+# The blended floor is enforced instead by `--cov-fail-under=80` on that
+# explicit CI invocation in `.github/workflows/ci.yml`; the line-only floor is
+# the ratchet's `python.floor_pct` in `.coverage-baseline.json`, not this flag.
 #
 # NOTE for anyone reading ci.yml: the separate "Coverage ratchet" step there
 # belongs to cao_mcp_apps (the TypeScript subproject), not to this suite.

@@ -1,10 +1,16 @@
 #!/usr/bin/env node
-// Coverage ratchet: fail CI if measured line coverage regresses below the
-// floor recorded in .coverage-baseline.json.
+// Coverage ratchet: fail CI if measured coverage regresses below the floor
+// recorded in .coverage-baseline.json, for each metric that has one.
 //
-// Reads:
-//   - Python:   `coverage.json` produced by `pytest --cov --cov-report=json`
-//   - Frontend: `coverage/coverage-summary.json` produced by `vitest --coverage`
+// Metrics:
+//   - python:        line coverage, computed as covered_lines / num_statements
+//                     from `coverage.json` (pytest --cov --cov-report=json).
+//   - python-branch: branch coverage from the same report (#1005). Collected
+//                     and reported whenever `--cov-branch` ran, but seeded
+//                     with a null floor -- record-only until a full-suite run
+//                     establishes a real baseline.
+//   - frontend:       line coverage from `coverage/coverage-summary.json`
+//                     (vitest --coverage).
 //
 // A `null` floor means "not yet established" — the measured value is reported
 // but never fails the gate. Phase V raises the floors to lock gains.

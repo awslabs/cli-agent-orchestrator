@@ -70,12 +70,14 @@ jobs:
             --cov-report=term-missing \
             -v
         # --cov-branch (#1005) also makes --cov-fail-under read the BLENDED
-        # line+branch figure rather than line coverage. That is a strictly harder
-        # bar at the same number, not a weaker one, and the authoritative
-        # separately-floored line metric is the ratchet's (.coverage-baseline.json,
-        # python.floor_pct = 87.0) in the cao-mcp-apps job below. If the blend
-        # lands under 80 on a first run, lower THIS number -- do not drop the
-        # branch data, and do not touch the line floor.
+        # line+branch figure rather than line coverage. Whether that reads harder
+        # or softer than line-only depends on whether branch % is below or above
+        # line % that run (today: 89.28 branch vs 93.10 line, so blended is a
+        # harder bar at 80 -- not an invariant, just the current numbers). The
+        # authoritative, separately-floored line metric is the ratchet's
+        # (.coverage-baseline.json, python.floor_pct = 87.0) in the cao-mcp-apps
+        # job below. If the blend lands under 80 on a first run, lower THIS
+        # number -- do not drop the branch data, and do not touch the line floor.
 
       - name: Validate Markdown links
         run: uv run python scripts/validate_markdown_links.py
