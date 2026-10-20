@@ -891,6 +891,18 @@ def _extract_inputs(source: str) -> Dict[str, InputDecl]:
       literal with keys ``⊆ {type, required, default}``; ``type`` one of
       ``WORKFLOW_INPUT_TYPES``; a default whose type disagrees with ``type`` is a
       ``ValueError`` (reuses the shared author-time ``_default_matches_type``).
+
+    This function has NO length bound of its own (see
+    ``test_ast_parse_depth_guard.py``'s ``_ALLOWED_PARSER_CALLS`` entry for this
+    call site) -- both real callers run ``lint_script`` first and skip/refuse on its
+    oversize ``syntax`` finding, which keeps this ``ast.parse`` from ever actually
+    seeing input past ``SCRIPT_LINT_MAX_SOURCE_CHARS``. The ``RecursionError``/
+    ``MemoryError`` arms below are a backstop for that coupling, not the primary
+    defense (#969/#970): on a host whose ``ast.parse`` C-stack cliff is closer in
+    than ``SCRIPT_LINT_MAX_SOURCE_CHARS`` was measured against (observed on CPython
+    3.11 in CI, which raises ``RecursionError`` cleanly rather than segfaulting), a
+    source already past that cliff but still within the coupling's assumptions would
+    otherwise take the caller down with no exception to convert.
     """
     try:
         tree = ast.parse(source)
@@ -898,6 +910,10 @@ def _extract_inputs(source: str) -> Dict[str, InputDecl]:
         # SyntaxError is not a ValueError subclass; map it so the run-route
         # boundary (ValueError -> 400) and rebuild's ``except ValueError`` catch it.
         raise ValueError(f"malformed workflow script: {e}") from e
+    except RecursionError as e:
+        raise ValueError(f"workflow script is too deeply nested to parse: {e}") from e
+    except MemoryError as e:
+        raise ValueError(f"workflow script is too complex to parse: {e}") from e
 
     inputs_node: Optional[ast.expr] = None
     for stmt in tree.body:  # module-level statements only (no nested scopes)
