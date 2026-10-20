@@ -14,21 +14,19 @@ type AnyHandler = (payload: any) => void
 
 const { FakeSigma, getLastSigma, resetLastSigma } = vi.hoisted(() => {
   let last: any
-  // Fake camera records enable/disable calls so drag tests can assert the
+  // Fake camera counts writes to `enabled` so drag tests can assert the
   // camera was disabled during a drag and re-enabled after.
   class FakeCamera {
-    enabled = true
+    private isEnabled = true
     enableCalls = 0
     disableCalls = 0
-    enable() {
-      this.enabled = true
-      this.enableCalls++
-      return this
+    get enabled() {
+      return this.isEnabled
     }
-    disable() {
-      this.enabled = false
-      this.disableCalls++
-      return this
+    set enabled(value: boolean) {
+      this.isEnabled = value
+      if (value) this.enableCalls++
+      else this.disableCalls++
     }
   }
   class FakeSigmaImpl {
@@ -72,7 +70,7 @@ const { FakeSigma, getLastSigma, resetLastSigma } = vi.hoisted(() => {
   }
 })
 
-vi.mock('sigma', () => ({ default: FakeSigma }))
+vi.mock('sigma', () => ({ default: FakeSigma, DEFAULT_STYLES: { nodes: {}, edges: {} } }))
 
 // eslint-disable-next-line import/first
 import { MemoryPanel } from '../components/MemoryPanel'

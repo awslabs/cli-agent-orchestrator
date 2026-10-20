@@ -10,7 +10,7 @@
 import { useEffect, useRef, useState } from 'react'
 import Graph from 'graphology'
 import { circular } from 'graphology-layout'
-import Sigma from 'sigma'
+import Sigma, { DEFAULT_STYLES } from 'sigma'
 import { Brain, Download, RefreshCw, X } from 'lucide-react'
 import { api, ApiError, GraphView, MemoryDetail } from '../api'
 import { useStore } from '../store'
@@ -202,20 +202,28 @@ export function MemoryGraphView({ scope, scopeId }: MemoryGraphViewProps) {
 
     const graph = buildGraph(view)
     const sigma = new Sigma(graph, containerRef.current, {
-      renderLabels: true,
-      labelRenderedSizeThreshold: 0,
+      settings: {
+        renderLabels: true,
+        labelRenderedSizeThreshold: 0,
+        // Sigma v4 defaults to "positions"; keep node sizes in pixels.
+        itemSizesReference: 'screen',
+      },
+      // Sigma v4 sets the container cursor on hover, so the hover cursor
+      // comes from the node style.
+      styles: { nodes: { ...DEFAULT_STYLES.nodes, cursor: 'grab' } },
     })
     const container = containerRef.current
 
-    // ── Node dragging (Sigma v3 canonical pattern) ──────────────────────
-    // Sigma v3 does not move nodes on its own. On downNode we remember the
-    // node and DISABLE the camera so the pan gesture doesn't fight the drag;
-    // on moveBody we translate the pointer to graph coords and write x/y; on
-    // mouse-up we clear state and RE-ENABLE the camera. `dragRef.moved`
-    // distinguishes a drag from a click (see clickNode below).
+    // ── Node dragging ───────────────────────────────────────────────────
+    // Sigma's built-in node drag (enableNodeDrag) is off by default, so this
+    // view moves nodes itself. On downNode we remember the node and DISABLE
+    // the camera so the pan gesture doesn't fight the drag; on moveBody we
+    // translate the pointer to graph coords and write x/y; on mouse-up we
+    // clear state and RE-ENABLE the camera. `dragRef.moved` distinguishes a
+    // drag from a click (see clickNode below).
     sigma.on('downNode', ({ node }) => {
       dragRef.current = { node, moved: false }
-      sigma.getCamera().disable()
+      sigma.getCamera().enabled = false
     })
 
     sigma.on('moveBody', ({ event }) => {
@@ -237,7 +245,7 @@ export function MemoryGraphView({ scope, scopeId }: MemoryGraphViewProps) {
     // still read `moved` to tell a drag from a click.
     const endDrag = () => {
       if (dragRef.current.node) {
-        sigma.getCamera().enable()
+        sigma.getCamera().enabled = true
         // Keep `moved` so the clickNode that fires right after a drag is
         // suppressed; only null the node so a fresh downNode starts clean.
         dragRef.current.node = null
@@ -256,13 +264,8 @@ export function MemoryGraphView({ scope, scopeId }: MemoryGraphViewProps) {
       void openTopic(node)
     })
 
-    // Cursor affordance: grab on hover, grabbing while dragging.
-    sigma.on('enterNode', () => {
-      if (!dragRef.current.node) container.style.cursor = 'grab'
-    })
-    sigma.on('leaveNode', () => {
-      if (!dragRef.current.node) container.style.cursor = ''
-    })
+    // Cursor affordance: grab on hover (node style above), grabbing while
+    // dragging.
     sigma.on('downNode', () => {
       container.style.cursor = 'grabbing'
     })

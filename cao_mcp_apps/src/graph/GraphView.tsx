@@ -121,7 +121,10 @@ export function GraphView({
       return;
     }
     const graph = buildGraph(snapshot);
-    const sigma = new Sigma(graph, containerRef.current);
+    const sigma = new Sigma(graph, containerRef.current, {
+      // Sigma v4 defaults to "positions"; keep node sizes in pixels.
+      settings: { itemSizesReference: "screen" },
+    });
     sigma.on("clickNode", ({ node }) => {
       onOpenTopic?.(node, graph.getNodeAttributes(node));
     });
