@@ -51,10 +51,12 @@ its CI unit job both run ``-m 'not e2e'``, which DESELECTS every ``e2e``-marked 
 here would make this guard silently absent from build-and-test -- the precise #516 failure
 mode (green checks accompanying an unexercised feature) that #505's composition guards
 exist to prevent. ``integration``-marked tests DO run under ``-m 'not e2e'`` (so they run
-in CI build-and-test) yet are skipped by the documented fast unit loop
-(``-m 'not integration'``, DEVELOPMENT.md), which is exactly the "don't slow every unit
-run, but still RUN in build-and-test" contract this suite needs. These tests spawn a
-subprocess, so they belong out of the innermost loop but inside the merge gate.
+in CI build-and-test, and in the default contributor invocation too, per #1005) yet can be
+excluded from a fast, mocked-only inner loop with ``-m "not e2e and not integration"``
+(DEVELOPMENT.md), which is exactly the "don't slow that loop, but still RUN in
+build-and-test and by default" contract this suite needs. These tests spawn a subprocess,
+so they belong out of that opt-in fast loop but inside both the default run and the merge
+gate.
 
 Style: pytest parity with ``test/api/``; black + isort (line 100). Additive, test-only.
 """
