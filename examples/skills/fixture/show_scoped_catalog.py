@@ -10,6 +10,10 @@ run.sh installs the bundled profile there before calling this script, and
 exports a temporary ``CAO_HOME_DIR`` so the operator's own profile store is
 never read.
 
+``profile.skills`` is passed through verbatim, exactly like production:
+``None`` (no ``skills:`` key) means the full catalog, ``[]`` advertises
+nothing, and a non-empty list filters by name pattern.
+
 Exit codes: 0 the catalog block (possibly empty) was printed; 1 loading the
 profile failed.
 """
@@ -30,7 +34,7 @@ def main() -> int:
     except Exception as exc:
         print(f"error: could not load profile '{PROFILE_NAME}': {exc}", file=sys.stderr)
         return 1
-    print(build_skill_catalog(profile.skills or None))
+    print(build_skill_catalog(profile.skills))
     return 0
 
 

@@ -27,8 +27,10 @@ feature; it is not hidden setup for something else. The canonical reference is
   deterministic. The fixture helper scripts resolve the interpreter that ships
   `cao` (uv venvs place `python` next to the entry-point shims) and fall back
   to `python3`.
-- `--live` mode additionally requires: cao-server running, and the
-  `claude_code` CLI installed and authenticated.
+- `--live` mode additionally requires the `claude_code` CLI installed and
+  authenticated. The script starts and stops its own `cao-server` on a free
+  localhost port with the same temporary `CAO_HOME_DIR`; an already-running
+  operator server is not used.
 
 ## Isolation
 
@@ -58,12 +60,16 @@ Exit code `0`; any assertion failure exits `1` and names the step.
 
 ### Expected output (--live mode)
 
-After the deterministic steps, the script launches the bundled
-`skills_lifecycle_reviewer` profile headless on `claude_code`, polls the
-session to a terminal state (`IDLE`/`COMPLETED`; `ERROR` and
-`WAITING_USER_ANSWER` fail fast), then asserts the agent's captured output
-contains the skill's output-contract line. `CAO_SKILLS_LIVE_TIMEOUT` (default
-600s) and `CAO_SKILLS_POLL_INTERVAL` (default 5s) tune the polling.
+After the deterministic steps, the script starts a **dedicated** `cao-server`
+with the same temporary `CAO_HOME_DIR` and a free localhost port, then launches
+the bundled `skills_lifecycle_reviewer` profile headless on `claude_code`. It
+polls the session to a terminal state (`idle`/`completed`; `error` and
+`waiting_user_answer` fail fast), then reads the full captured response from
+JSON and asserts it contains the skill's output-contract line. The launch uses
+`--auto-approve`, which skips the headless confirmation while preserving the
+reviewer role's read-only tool policy; it deliberately does not use `--yolo`.
+`CAO_SKILLS_LIVE_TIMEOUT` (default 600s) and `CAO_SKILLS_POLL_INTERVAL`
+(default 5s) tune the polling.
 
 ## Why claude_code
 
@@ -105,7 +111,8 @@ overwrite. Editing an installed skill in place is covered in
 
 - The temporary `CAO_HOME_DIR` is removed by the script's exit trap in both
   modes.
-- In `--live` mode the session is shut down (`cao shutdown`) by the same trap.
+- In `--live` mode the dedicated cao-server and session are shut down by the
+  same trap.
 - Nothing else is created — no worktrees, no terminals outside the temporary
   home, no files in the repository.
 
@@ -117,8 +124,9 @@ uv run pytest examples/skills/tests/ -v
 
 - `test_skills_example.py` — deterministic, runs in normal CI: install,
   discovery, full-body retrieval, profile scoping (positive and empty-filter
-  negative), the reinstall guard, the fixture task (including its
-  failure behavior), and a `run.sh` smoke test.
+  negative), the reinstall guard, AST-backed fixture findings (including a
+  clean-fixture negative), the fixture's failure behavior, and a `run.sh`
+  smoke test.
 - `test_skills_live.py` — real-provider test, gated behind
   `CAO_RUN_LIVE_PROVIDER_TESTS=1` (never runs in CI or by default):
 

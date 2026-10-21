@@ -8,8 +8,6 @@ both bindings must be patched, and ``extra_skill_dirs`` must be pinned to
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 

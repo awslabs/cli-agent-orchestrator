@@ -24,8 +24,10 @@ from cli_agent_orchestrator.utils.skills import build_skill_catalog, load_skill_
 EXAMPLE_DIR = Path(__file__).resolve().parent.parent
 BUNDLED_SKILL_DIR = EXAMPLE_DIR / "python-review-checklist"
 BUNDLED_PROFILE = EXAMPLE_DIR / "profiles" / "skills_lifecycle_reviewer.md"
+DECOY_SKILL_DIR = EXAMPLE_DIR / "decoy-skill"
 PROFILE_NAME = "skills_lifecycle_reviewer"
 SKILL_NAME = "python-review-checklist"
+DECOY_NAME = "skills-lifecycle-decoy"
 
 
 @pytest.fixture(autouse=True)
@@ -74,13 +76,28 @@ def test_load_skill_content_returns_complete_body(installed_skill):
     assert content.rstrip().endswith("proof that this skill's guidance engaged.")
 
 
-def test_profile_scopes_catalog_to_bundled_skill(installed_skill):
+def test_profile_scopes_catalog_to_bundled_skill(installed_skill, isolated_skill_store):
+    from cli_agent_orchestrator.cli.commands.skills import add
+
+    decoy_dir = isolated_skill_store.parent / "decoy-source" / DECOY_NAME
+    decoy_dir.mkdir(parents=True)
+    (decoy_dir / "SKILL.md").write_text(
+        "---\n"
+        f"name: {DECOY_NAME}\n"
+        "description: A decoy skill used to prove catalog filtering\n"
+        "---\n\n# Decoy\n",
+        encoding="utf-8",
+    )
+    installed = CliRunner().invoke(add, [str(decoy_dir)])
+    assert installed.exit_code == 0, installed.output
+
     profile = parse_agent_profile_text(BUNDLED_PROFILE.read_text(encoding="utf-8"), PROFILE_NAME)
 
     assert profile.skills == [SKILL_NAME]
 
     catalog = build_skill_catalog(profile.skills)
     assert f"- **{SKILL_NAME}**:" in catalog
+    assert DECOY_NAME not in catalog
     # The negative direction: an explicitly empty profile skills list
     # advertises nothing at all.
     assert build_skill_catalog([]) == ""
@@ -119,7 +136,31 @@ def test_apply_checklist_reports_contract_line(installed_skill, isolated_home):
         timeout=120,
     )
     assert proc.returncode == 0, proc.stderr
+    assert "'re' is used but never imported" in proc.stdout
+    assert "mutable default argument" in proc.stdout
+    assert "bare 'except:' clause" in proc.stdout
+    assert "missing type hints" in proc.stdout
     assert "Checklist applied: 4/4 items" in proc.stdout
+
+
+def test_apply_checklist_clean_fixture_has_no_findings(installed_skill, isolated_home, tmp_path):
+    clean_fixture = tmp_path / "clean.md"
+    clean_fixture.write_text(
+        "```python\n"
+        "def add(left: int, right: int) -> int:\n"
+        "    return left + right\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, str(EXAMPLE_DIR / "fixture" / "apply_checklist.py"), str(clean_fixture)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "CAO_HOME_DIR": str(isolated_home)},
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "Checklist applied: 4/4 items"
 
 
 def test_apply_checklist_fails_without_skill(tmp_path):
