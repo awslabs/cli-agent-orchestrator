@@ -91,7 +91,14 @@ def _temp_db(tmp_path, monkeypatch):
         _migrate_workflow_run,
         _migrate_workflow_run_step,
     )
-    from cli_agent_orchestrator.services import workflow_service
+    from cli_agent_orchestrator.services import settings_service, workflow_service
+
+    # These tests exercise subprocess transport and fan-out, not plan approval.
+    # Keep their previous posture explicit now that approval defaults to enabled.
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(json.dumps({"workflow": {"require_approval": False}}))
+    monkeypatch.setattr(settings_service, "SETTINGS_FILE", settings_file)
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
 
     monkeypatch.setattr(
         "cli_agent_orchestrator.constants.DATABASE_FILE", tmp_path / "wf.db", raising=True

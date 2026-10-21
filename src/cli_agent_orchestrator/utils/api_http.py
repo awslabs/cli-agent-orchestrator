@@ -50,6 +50,7 @@ __all__ = [
     "get",
     "is_local_api",
     "post",
+    "put",
 ]
 
 
@@ -127,3 +128,7 @@ def post(url: str, **kwargs: Any) -> Response:
 
 def delete(url: str, **kwargs: Any) -> Response:
     return _send("DELETE", url, **kwargs)
+
+
+def put(url: str, **kwargs: Any) -> Response:
+    return _send("PUT", url, **kwargs)
