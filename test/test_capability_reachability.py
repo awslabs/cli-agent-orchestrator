@@ -155,6 +155,13 @@ class TestCapabilitiesAreReachable:
         missing_reason = [name for name, reason in ALLOWLIST.items() if not reason.strip()]
         assert not missing_reason, f"allowlist entries need a reason: {missing_reason}"
 
+        undeclared = sorted(set(ALLOWLIST) - _all_declared_names())
+        assert not undeclared, (
+            f"these ALLOWLIST entries name no capability any surface declares: {undeclared}. "
+            "The capability was likely deleted or renamed -- drop the stale entry, or it "
+            "will silently pre-silence a future dead capability that reuses the name."
+        )
+
         if not ALLOWLIST:
             return  # nothing to re-scan src/ for.
 
@@ -166,6 +173,16 @@ class TestCapabilitiesAreReachable:
             f"These now have a consumer: {stale}. Remove them from ALLOWLIST so the "
             "scan protects them from going dead again."
         )
+
+    def test_allowlist_entry_for_an_undeclared_name_is_caught(self, monkeypatch):
+        """Regression for #1005 P3-4: a deleted/renamed capability's entry must
+        not linger forever and silently pre-silence a future dead capability
+        that reuses the same name."""
+        monkeypatch.setitem(
+            ALLOWLIST, "supports_capability_that_was_deleted", "stale entry for this test"
+        )
+        with pytest.raises(AssertionError, match="no capability any surface declares"):
+            TestCapabilitiesAreReachable().test_allowlist_entries_are_still_needed()
 
 
 class TestNoStaleCapabilityReads:
