@@ -261,8 +261,9 @@ def vault_scan(fingerprints, dry_run):
 
     Scans the configured vault notes without changing files or derived rows.
     With --fingerprints, each credential-shaped span is listed as its pattern
-    name and SHA-256 so an operator can write a per-finding ``cao.secret_ok``
-    acceptance (#644). Fingerprints are shown only here, never stored.
+    name and SHA-256, the two values a per-finding cao.secret_ok acceptance in
+    that note's frontmatter needs. Fingerprints are shown only here, never
+    stored.
     """
     from cli_agent_orchestrator.services.secret_gate import redact_secrets_with_acceptances
     from cli_agent_orchestrator.services.vault.scan import scan_vault
