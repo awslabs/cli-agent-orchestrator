@@ -152,6 +152,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Vault configuration validation no longer queries the database. `VaultConfig` validators are
+  pure, so a `memory.vault` document with a project mapping validates on a fresh `CAO_HOME_DIR`
+  that has never run `init_db()`, and `cao config list` shows it without a database. Project
+  aliases are still canonicalised, and alias-equivalent mappings still refused, on the loading
+  path (`get_vault_config`) that owns a database; a guard test keeps every vault validator free
+  of `clients.database` (#644).
 - Corrective workflow re-prompts now reuse the attempt's rendered prompt, so
   workflow inputs and earlier step outputs stay filled in when structured output
   is missing or invalid (#966).
