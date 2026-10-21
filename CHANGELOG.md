@@ -41,6 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `ephemeral.enabled` stays off by default.
 - Persistent agent descriptions with creation-time CLI/MCP labels and editable
   descriptions in Web UI Home and Agents (#942).
+- `cao agent assign`, `handoff` and `send-message` accept `--message-file PATH` (`-` for
+  stdin) in place of the positional MESSAGE, the file/stdin input #616 asked for: read as UTF-8,
+  one trailing newline dropped, mutually exclusive with MESSAGE, and refused when empty.
 
 - The publish workflow now refuses, in seconds, a release tag whose version
   `pyproject.toml`, `uv.lock` and the devcontainer feature do not carry, and a
