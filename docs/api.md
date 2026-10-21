@@ -226,11 +226,14 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   directory the OS refuses to create is a `400` with a plain-language
   `detail` instead of a `500` from tmux. See
   [Working directory](working-directory.md).
-- `POST /sessions/{session_name}/label` prefix-normalizes its name the same
-  way `POST /sessions` does, so `demo` and `cao-demo` address one session.
+- `GET /sessions/{session_name}`, `DELETE /sessions/{session_name}` and
+  `POST /sessions/{session_name}/label` prefix-normalize their name the same
+  way `POST /sessions` does, so `demo` and `cao-demo` address one session on
+  every route.
 - `POST /sessions/{session_name}/label` with `{"label": "..."}` sets a
-  friendly display name for a session (trimmed, capped at 60 characters; an
-  empty string clears it). It is a pure display alias stored in
+  friendly display name for a session (trimmed; longer than 60 characters is
+  a `422`, a control character or line break is a `400`; an empty string
+  clears it). It is a pure display alias stored in
   `settings.json`, surfaced as `label` (or `null`) on `GET /sessions` and
   `GET /sessions/{session_name}`, and cleared when the session is deleted;
   nothing that references the real tmux session name is affected. Setting a

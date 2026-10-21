@@ -443,8 +443,10 @@ def set_session_label(session_name: str, label: str) -> Dict[str, str]:
 
     Stored separately from the tmux session name so nothing that references
     the real name (terminals, DB rows, the backend) is disturbed: a pure
-    display alias. Whitespace is trimmed and the label is capped at
-    ``SESSION_LABEL_MAX_LENGTH``. Returns the full label map after the update.
+    display alias. Whitespace is trimmed, the label is capped at
+    ``SESSION_LABEL_MAX_LENGTH`` and must be printable (``str.isprintable``):
+    a control character or line break is a ``ValueError``. Returns the full
+    label map after the update.
 
     Setting OR clearing a label over a settings.json that exists but cannot be
     read raises :class:`SettingsUnreadableError` and leaves the file untouched;
@@ -455,6 +457,12 @@ def set_session_label(session_name: str, label: str) -> Dict[str, str]:
     succeeded (haofeif / plauzy, #724 review).
     """
     clean = label.strip()[:SESSION_LABEL_MAX_LENGTH]
+    if not clean.isprintable():
+        # "ok\x1b[2J\nrm -rf /" was stored and echoed verbatim: the comment
+        # above promises one line in any listing, and a CLI that prints
+        # labels must not become an ANSI-escape injection sink (plauzy, #724).
+        # Validated before the lock, like every other writer's input.
+        raise ValueError("label must be printable: no control characters or line breaks")
 
     def update(settings: Dict[str, Any]) -> bool:
         labels = settings.get("session_labels", {})

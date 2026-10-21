@@ -904,9 +904,14 @@ class TestCreateSession:
         assert response.status_code == 201
         mock_svc.create_session.assert_called_once()
 
+    # "-leading" is deliberately absent here and on DELETE below: GET and
+    # DELETE now prefix-normalize like POST /sessions does (#724), so the
+    # effective name is "cao--leading" -- the very session a
+    # POST /sessions?session_name=-leading creates -- and tmux never sees a
+    # leading dash. POST /sessions/{name}/terminals keeps the raw check.
     @pytest.mark.parametrize(
         "bad_name",
-        ["evil:name", "evil.name", "-leading", "with space"],
+        ["evil:name", "evil.name", "with space"],
     )
     def test_get_session_rejects_unsafe_name(self, client, bad_name):
         """GET /sessions/{name} returns 400 for unsafe names (validation,
@@ -920,7 +925,7 @@ class TestCreateSession:
 
     @pytest.mark.parametrize(
         "bad_name",
-        ["evil:name", "evil.name", "-leading", "with space"],
+        ["evil:name", "evil.name", "with space"],
     )
     def test_delete_session_rejects_unsafe_name(self, client, bad_name):
         """DELETE /sessions/{name} returns 400 for unsafe names."""
@@ -930,6 +935,18 @@ class TestCreateSession:
         assert response.status_code == 400
         assert "session_name" in response.json()["detail"]
         mock_svc.delete_session.assert_not_called()
+
+    def test_get_and_delete_address_the_session_create_makes_from_a_leading_dash(self, client):
+        """``POST /sessions?session_name=-leading`` validates and creates the
+        EFFECTIVE name ``cao--leading``; GET and DELETE must reach that same
+        session from the same spelling instead of 400ing on the raw one."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.get_session.return_value = {"session": {"id": "cao--leading"}, "terminals": []}
+            mock_svc.delete_session.return_value = {"deleted": ["cao--leading"], "errors": []}
+            assert client.get("/sessions/-leading").status_code == 200
+            assert client.delete("/sessions/-leading").status_code == 200
+        mock_svc.get_session.assert_called_once_with("cao--leading")
+        assert mock_svc.delete_session.call_args.args[0] == "cao--leading"
 
     @pytest.mark.parametrize(
         "bad_name",
@@ -1013,7 +1030,7 @@ class TestGetSession:
         assert data["terminals"][0]["id"] == "abcd1234"
         assert [t["pending_inbox_count"] for t in data["terminals"]] == [123, 0]
         assert all(type(t["pending_inbox_count"]) is int for t in data["terminals"])
-        mock_svc.get_session.assert_called_once_with("test-session")
+        mock_svc.get_session.assert_called_once_with("cao-test-session")
 
     def test_get_session_not_found(self, client):
         """GET /sessions/{name} returns 404 for nonexistent session."""
@@ -1058,7 +1075,7 @@ class TestGetSession:
 
         assert response.status_code == 200
         assert get_session_calls, "session_service.get_session was never dispatched via to_thread"
-        assert get_session_calls[0].args[1] == "test-session"
+        assert get_session_calls[0].args[1] == "cao-test-session"
 
 
 class TestDeleteSession:
@@ -1397,7 +1414,7 @@ def test_launch_model_values_flow_through_real_sqlite_read_surfaces(client, tmp_
 
     database.create_terminal(
         "abc12345",
-        "surface-session",
+        "cao-surface-session",
         "worker-1",
         "codex",
         agent_profile="worker",
@@ -1406,7 +1423,7 @@ def test_launch_model_values_flow_through_real_sqlite_read_surfaces(client, tmp_
     )
     database.create_terminal(
         "def67890",
-        "surface-session",
+        "cao-surface-session",
         "worker-2",
         "mock_cli",
         agent_profile="worker",
@@ -1416,7 +1433,7 @@ def test_launch_model_values_flow_through_real_sqlite_read_surfaces(client, tmp_
 
     backend = MagicMock()
     backend.session_exists.return_value = True
-    backend.list_sessions.return_value = [{"id": "surface-session"}]
+    backend.list_sessions.return_value = [{"id": "cao-surface-session"}]
     monkeypatch.setattr(session_service, "get_backend", lambda: backend)
     monkeypatch.setattr(
         terminal_service.status_monitor,
@@ -1437,18 +1454,18 @@ def test_launch_model_values_flow_through_real_sqlite_read_surfaces(client, tmp_
             terminal_service.get_terminal("def67890"),
         ]
     )
-    assert_launch_values(session_service.get_session("surface-session")["terminals"])
+    assert_launch_values(session_service.get_session("cao-surface-session")["terminals"])
 
     terminal_response = client.get("/terminals/abc12345")
     ignored_response = client.get("/terminals/def67890")
     assert terminal_response.status_code == ignored_response.status_code == 200
     assert_launch_values([terminal_response.json(), ignored_response.json()])
 
-    session_response = client.get("/sessions/surface-session")
+    session_response = client.get("/sessions/cao-surface-session")
     assert session_response.status_code == 200
     assert_launch_values(session_response.json()["terminals"])
 
-    terminals_response = client.get("/sessions/surface-session/terminals")
+    terminals_response = client.get("/sessions/cao-surface-session/terminals")
     assert terminals_response.status_code == 200
     assert_launch_values(terminals_response.json())
 

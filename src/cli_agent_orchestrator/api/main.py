@@ -166,7 +166,10 @@ from cli_agent_orchestrator.services.profile_search import (
     DEFAULT_LIMIT as PROFILE_SEARCH_DEFAULT_LIMIT,
 )
 from cli_agent_orchestrator.services.provider_error_classifier import KIND_PROVIDER_ERROR
-from cli_agent_orchestrator.services.settings_service import SettingsUnreadableError
+from cli_agent_orchestrator.services.settings_service import (
+    SESSION_LABEL_MAX_LENGTH,
+    SettingsUnreadableError,
+)
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import (
@@ -196,7 +199,7 @@ from cli_agent_orchestrator.utils.skills import (
     load_skill_content,
     validate_skill_name,
 )
-from cli_agent_orchestrator.utils.terminal import validate_tmux_name
+from cli_agent_orchestrator.utils.terminal import ensure_session_prefix, validate_tmux_name
 
 logger = logging.getLogger(__name__)
 
@@ -3689,14 +3692,7 @@ async def create_session(
             # would become 68 chars and fail downstream validation. Check
             # the *effective* prefixed value here so the rejection happens
             # at the boundary with a clear message.
-            from cli_agent_orchestrator.constants import SESSION_PREFIX
-
-            effective = (
-                session_name
-                if session_name.startswith(SESSION_PREFIX)
-                else f"{SESSION_PREFIX}{session_name}"
-            )
-            validate_tmux_name(effective, "session_name")
+            validate_tmux_name(ensure_session_prefix(session_name), "session_name")
         if model is not None:
             _validate_model_id(model)
         if resume_session_id is not None:
@@ -3846,7 +3842,9 @@ async def list_sessions(
 
 
 class SessionLabelUpdate(BaseModel):
-    label: str = Field(..., max_length=1024)
+    # One cap, shared with the service: a longer label is a 422 here rather
+    # than a silent truncation to 60 on the way to disk (#724 review, twice).
+    label: str = Field(..., max_length=SESSION_LABEL_MAX_LENGTH)
 
 
 @app.post("/sessions/{session_name}/label")
@@ -3889,18 +3887,17 @@ async def set_session_label_endpoint(
     write would otherwise clear the label and then watch this request persist
     an orphan one, inherited by the next same-name session.
     """
-    from cli_agent_orchestrator.constants import SESSION_PREFIX
-
-    effective = (
-        session_name
-        if session_name.startswith(SESSION_PREFIX)
-        else f"{SESSION_PREFIX}{session_name}"
-    )
+    effective = ensure_session_prefix(session_name)
     try:
         validate_tmux_name(effective, "session_name")
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    labels = await asyncio.to_thread(_set_session_label_locked, effective, body.label)
+    try:
+        labels = await asyncio.to_thread(_set_session_label_locked, effective, body.label)
+    except ValueError as e:
+        # The service refuses a label with control characters (ANSI escapes,
+        # line breaks): stored verbatim it would be echoed into every listing.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return {"session_name": effective, "label": labels.get(effective)}
 
 
@@ -3923,8 +3920,13 @@ async def get_session(
     session_name: str,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    # Validate before entering the try block so a malformed name surfaces
-    # as 400 instead of being mapped to 404 by the not-found handler below.
+    # Same naming contract as POST /sessions and DELETE: a bare name is the
+    # caller's alias for the prefixed CAO session, so GET /sessions/demo reads
+    # cao-demo instead of 404ing right after POST /sessions/demo/label
+    # succeeded (plauzy, #724 review). Validate the EFFECTIVE name, before the
+    # try block, so a malformed name surfaces as 400 instead of being mapped
+    # to 404 by the not-found handler below.
+    session_name = ensure_session_prefix(session_name)
     try:
         validate_tmux_name(session_name, "session_name")
     except ValueError as e:
@@ -3952,18 +3954,15 @@ async def delete_session(
     session_name: str,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_ADMIN)),
 ) -> Dict:
-    try:
-        validate_tmux_name(session_name, "session_name")
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     # Same naming contract as POST /sessions: a bare name is the caller's alias
     # for the prefixed CAO session, never a reference to a personal tmux session
     # of that name. Canonicalise here so DELETE /sessions/dev tears down
     # cao-dev and can never reach an operator's own "dev".
-    from cli_agent_orchestrator.constants import SESSION_PREFIX
-
-    if not session_name.startswith(SESSION_PREFIX):
-        session_name = f"{SESSION_PREFIX}{session_name}"
+    session_name = ensure_session_prefix(session_name)
+    try:
+        validate_tmux_name(session_name, "session_name")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
         # Off the event loop: teardown is fully synchronous (tmux kills, FIFO
         # cleanup, DB writes) and has wedged the whole server — /health

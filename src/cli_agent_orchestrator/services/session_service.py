@@ -488,10 +488,13 @@ def get_session(session_name: str) -> Dict:
     try:
         terminals = list_terminals_by_session(session_name)
         backend_exists = get_backend().session_exists(session_name)
-        session_data = None
+        session_data: Optional[Dict[str, Any]] = None
         if backend_exists:
             tmux_sessions = get_backend().list_sessions()
-            session_data = next((s for s in tmux_sessions if s["id"] == session_name), None)
+            found = next((s for s in tmux_sessions if s["id"] == session_name), None)
+            # A copy: ``label`` is attached below, and that must not mutate
+            # the backend's own dict in place (plauzy, #724 review).
+            session_data = dict(found) if found is not None else None
 
         # A deferred-init failure tombstone deliberately outlives its provider
         # session so an external lifecycle owner can observe the real failure

@@ -970,6 +970,20 @@ class TestSessionLabels:
         assert settings_file.stat().st_ino == before, "a no-op label reset rewrote the file"
         assert json.loads(settings_file.read_text())["session_labels"] == {"cao-demo": "Run"}
 
+    def test_control_characters_are_rejected_before_the_lock(self, settings_file):
+        """Escapes and line breaks would be echoed verbatim into every listing
+        (plauzy, #724 review). Refused as a ValueError like every other bad
+        input, and nothing is written."""
+        with pytest.raises(ValueError, match="printable"):
+            settings_service.set_session_label("cao-demo", "ok\x1b[2J\nrm -rf /")
+        with pytest.raises(ValueError, match="printable"):
+            settings_service.set_session_label("cao-demo", "two\nlines")
+        assert not settings_file.exists()
+        # Ordinary punctuation and non-ASCII letters are fine.
+        assert settings_service.set_session_label("cao-demo", "Nightly triage: étape 2 (ok)") == {
+            "cao-demo": "Nightly triage: étape 2 (ok)"
+        }
+
     def test_label_is_capped(self, settings_file):
         long = "x" * (settings_service.SESSION_LABEL_MAX_LENGTH + 20)
         labels = settings_service.set_session_label("cao-demo", long)

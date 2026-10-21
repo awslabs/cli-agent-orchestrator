@@ -170,6 +170,38 @@ class TestSessionLabelEndpoint:
         resp = client.post("/sessions/cao-demo/label", json={})
         assert resp.status_code == 422
 
+    def test_label_over_the_cap_is_a_422_not_a_silent_truncation(
+        self, client, settings_file, backend
+    ):
+        """The Pydantic bound used to be 1024 while the service capped at 60,
+        so 61-1024 characters were silently truncated. One cap now."""
+        too_long = "x" * (settings_service.SESSION_LABEL_MAX_LENGTH + 1)
+        resp = client.post("/sessions/cao-demo/label", json={"label": too_long})
+        assert resp.status_code == 422
+        assert settings_service.get_session_labels() == {}
+        at_cap = "y" * settings_service.SESSION_LABEL_MAX_LENGTH
+        assert client.post("/sessions/cao-demo/label", json={"label": at_cap}).status_code == 200
+
+    def test_control_characters_are_a_400_and_store_nothing(self, client, settings_file, backend):
+        """``"ok\\x1b[2J\\nrm -rf /"`` was stored and echoed verbatim: an
+        ANSI-escape injection into any CLI listing that prints labels."""
+        resp = client.post("/sessions/cao-demo/label", json={"label": "ok\x1b[2J\nrm -rf /"})
+        assert resp.status_code == 400
+        assert "printable" in resp.json()["detail"]
+        assert settings_service.get_session_labels() == {}
+
+    def test_get_accepts_the_bare_name_the_label_endpoint_accepts(self, client, settings_file):
+        """``POST /sessions/demo/label`` succeeded (normalized to ``cao-demo``)
+        and ``GET /sessions/demo`` 404'd right after. One helper now, used by
+        create, GET, DELETE and label."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as svc:
+            svc.get_session.return_value = {"session": {"id": "cao-demo"}, "terminals": []}
+            assert client.get("/sessions/demo").status_code == 200
+            svc.get_session.assert_called_once_with("cao-demo")
+            svc.delete_session.return_value = {"deleted": ["cao-demo"], "errors": []}
+            assert client.delete("/sessions/demo").status_code == 200
+            assert svc.delete_session.call_args.args[0] == "cao-demo"
+
     def test_unknown_session_is_a_404_and_stores_nothing(self, client, settings_file, backend):
         """An orphan label is never read and never cleared; refuse it up front."""
         backend.session_exists.return_value = False

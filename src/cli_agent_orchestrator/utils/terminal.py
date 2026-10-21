@@ -50,6 +50,22 @@ def validate_tmux_name(name: str, kind: str = "name") -> str:
     return name
 
 
+def ensure_session_prefix(session_name: str) -> str:
+    """Return ``session_name`` under ``SESSION_PREFIX``, adding it when missing.
+
+    ``POST /sessions`` stores ``demo`` as ``cao-demo``; every other route that
+    takes a session name must address the same tmux session whichever
+    spelling the operator uses, or a bare name succeeds on one endpoint
+    (``POST /sessions/demo/label``) and 404s on the next (``GET
+    /sessions/demo``). One helper, used by create, GET, DELETE and the label
+    endpoint, instead of the same four-line block copied into each (plauzy,
+    #724 review). Idempotent: an already-prefixed name is returned as is.
+    """
+    if session_name.startswith(SESSION_PREFIX):
+        return session_name
+    return f"{SESSION_PREFIX}{session_name}"
+
+
 def generate_session_name() -> str:
     """Generate a unique session name with SESSION_PREFIX."""
     session_uuid = uuid.uuid4().hex[:8]
