@@ -39,6 +39,7 @@ from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
     list_terminal_ids_on_runtime,
     list_terminals_by_session,
+    terminal_exists,
 )
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.provider import ProviderType
@@ -417,7 +418,13 @@ async def runtime_channel(ws: WebSocket) -> None:
                         f"terminal.{frame.terminal_id}.status", {"status": frame.status.value}
                     )
                 else:
-                    logger.warning(
+                    # Every launch and delete sends some: a status pushed while
+                    # the launch is still starting, or as its teardown runs, is
+                    # for a terminal placed nowhere. Only a status for another
+                    # runtime's terminal is worth a warning.
+                    elsewhere = runtime_registry.placed_on(frame.terminal_id)
+                    logger.log(
+                        (logging.WARNING if elsewhere not in (None, runtime_id) else logging.DEBUG),
                         "ignoring status from runtime %s for terminal %s, which it does not run",
                         runtime_id,
                         frame.terminal_id,
@@ -553,7 +560,7 @@ def _record_launch(
     # The lock local creation and teardown take for a session name, so the
     # check and the row write are one step for every creator of that name.
     with session_lifecycle_lock(launched.session_name):
-        if get_terminal_metadata(launched.id) is not None:
+        if terminal_exists(launched.id):
             return f"terminal id {launched.id} is already in use"
         if list_terminals_by_session(launched.session_name):
             return f"session {launched.session_name} already exists"

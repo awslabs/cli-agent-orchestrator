@@ -545,6 +545,39 @@ class TestRemoteTerminal:
             "the pushed status",
         )
 
+    def test_only_a_status_for_another_runtimes_terminal_is_a_warning(
+        self, http, start_runtime, caplog
+    ):
+        # Every launch and delete pushes a status or two for a terminal placed
+        # nowhere yet (or any more): reported on #834 as noise in the log.
+        import logging
+
+        caplog.set_level(logging.DEBUG, logger="cli_agent_orchestrator.runtime_channel.server")
+        _remote_row("abcd1234", "rt-1")
+        _remote_row("abcd5678", "rt-2", session="cao-other")
+        registry_mod.runtime_registry.place("abcd5678", "rt-2")
+        runtime = start_runtime(statuses={"abcd1234": TerminalStatus.IDLE})
+        runtime.push(Status(terminal_id="beef9999", status=TerminalStatus.IDLE))
+        runtime.push(Status(terminal_id="abcd5678", status=TerminalStatus.IDLE))
+        # Frames are handled in order: once this one shows, the two above are done.
+        runtime.push(Status(terminal_id="abcd1234", status=TerminalStatus.PROCESSING))
+        _wait_for(
+            lambda: http.get("/terminals/abcd1234").json()["status"] == "processing",
+            "the last pushed status",
+        )
+        ignored = {(r.args[1], r.levelno) for r in caplog.records if "ignoring status" in r.msg}
+        assert ignored == {("beef9999", logging.DEBUG), ("abcd5678", logging.WARNING)}
+
+    def test_a_launch_and_delete_log_no_missing_row(self, http, start_runtime, caplog):
+        import logging
+
+        caplog.set_level(logging.WARNING)
+        start_runtime(script=_answer)
+        launched = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
+        assert launched.status_code == 201, launched.text
+        assert http.delete("/terminals/beef0001").status_code == 200
+        assert not [r for r in caplog.records if "metadata not found" in r.getMessage()]
+
     def test_a_failure_in_the_runtime_is_502_with_its_reason(self, http, start_runtime):
         _remote_row("abcd1234", "rt-1")
 

@@ -631,7 +631,9 @@ async def _amain() -> None:
 def main() -> None:
     from cli_agent_orchestrator.utils.logging import setup_logging
 
-    setup_logging(command="cao-bridge", label="cao-bridge")
+    # INFO on stderr too: in a runtime pod `kubectl logs` is the only view, and
+    # the channel's connects and reconnects are logged at INFO.
+    setup_logging(command="cao-bridge", label="cao-bridge", console_level=logging.INFO)
     try:
         asyncio.run(_amain())
     except (ChannelRefused, ReadinessStuck) as exc:

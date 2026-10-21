@@ -2188,6 +2188,15 @@ def delete_idempotency_key(key: str, expected_terminal_id: str) -> bool:
         return deleted > 0
 
 
+def terminal_exists(terminal_id: str) -> bool:
+    """Whether a row exists for ``terminal_id``. Quiet, unlike
+    ``get_terminal_metadata``: for callers that expect it may not."""
+    with SessionLocal() as db:
+        return (
+            db.query(TerminalModel.id).filter(TerminalModel.id == terminal_id).first() is not None
+        )
+
+
 def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
     """Get terminal metadata by ID."""
     import json as _json

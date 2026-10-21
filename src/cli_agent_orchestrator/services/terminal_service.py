@@ -59,6 +59,7 @@ from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam
     list_siblings_by_group_prefix,
     list_terminals_by_session,
     session_is_remote,
+    terminal_exists,
     update_last_active,
     update_terminal_deferred_init_external_owner,
     update_terminal_deferred_init_failure,
@@ -4945,7 +4946,8 @@ def _delete_remote(
     # restore the placement of a deleted terminal. A row that could not be
     # dropped keeps its placement: it still routes a retry.
     dropped = delete_terminal_row(terminal_id, row, registry=registry, routed=True)
-    current = get_terminal_metadata(terminal_id)
+    # Usually gone now, so asked quietly first: a missing row is not news here.
+    current = get_terminal_metadata(terminal_id) if terminal_exists(terminal_id) else None
     replaced = current is not None and (current.get("runtime_id"), current["tmux_session"]) != (
         row["runtime_id"],
         row["tmux_session"],

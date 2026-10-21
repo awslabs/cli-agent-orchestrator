@@ -385,6 +385,11 @@ class RuntimeRegistry:
         with self._lock:
             return self._placement.get(terminal_id) == runtime_id
 
+    def placed_on(self, terminal_id: str) -> Optional[str]:
+        """The runtime ``terminal_id`` is placed on, if any."""
+        with self._lock:
+            return self._placement.get(terminal_id)
+
     def reserve(self, terminal_id: str, runtime_id: str) -> None:
         """Mark a launch whose result arrived as being recorded (see ``is_known``)."""
         with self._lock:
