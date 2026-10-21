@@ -45,6 +45,9 @@ spec:
       containers:
         - name: cao-runtime
           image: cao-node
+          # tini as PID 1 reaps what the agents leave: cao-bridge does not, so
+          # each finished claude or cao-mcp-server would stay a zombie.
+          command: ["/usr/bin/tini", "--", "cao-entrypoint"]
           env:
             - name: CAO_NODE_MODE
               value: bridge

@@ -92,11 +92,11 @@ RUN set -eux; \
       apk upgrade --no-cache; \
       apk add --no-cache \
         bash ca-certificates-bundle coreutils curl diffutils findutils gawk git \
-        gnutar grep gzip procps py3.12-pip python-3.12 sed shadow tmux; \
+        gnutar grep gzip procps py3.12-pip python-3.12 sed shadow tini tmux; \
     elif command -v apt-get >/dev/null 2>&1; then \
       apt-get update; \
       apt-get install -y --no-install-recommends \
-        tmux git curl ca-certificates procps; \
+        tmux git curl ca-certificates procps tini; \
       rm -rf /var/lib/apt/lists/*; \
     else \
       echo "BASE_PROVIDER_IMAGE has neither apk nor apt-get" >&2; \
@@ -188,6 +188,11 @@ RUN if [ "${INSTALL_CLAUDE_CODE}" != "1" ]; then \
 # and CAO drives the interactive TUI. See "Provider credentials" in README.md.
 ARG INSTALL_KIRO_CLI=0
 ARG KIRO_CLI_VERSION=2.19.1
+# The archive's sha256 for that version, per architecture, as published beside
+# it (`<zip url>.sha256`): its install.sh runs as root, so a different archive
+# fails the build. Update both with KIRO_CLI_VERSION.
+ARG KIRO_CLI_SHA256_X86_64=2934536e5f91be98307c8a73a5aa207bc0253a3dcb1027456de4c4489eef8642
+ARG KIRO_CLI_SHA256_AARCH64=456b611020656d8609c116d1695d9135d1b8de0356a76bb4d40fe5a49babc6be
 RUN if [ "${INSTALL_KIRO_CLI}" = "1" ]; then \
       set -eux; \
       if command -v apk >/dev/null 2>&1; then \
@@ -198,6 +203,12 @@ RUN if [ "${INSTALL_KIRO_CLI}" = "1" ]; then \
       fi; \
       curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/kirocli.zip \
         "https://desktop-release.q.us-east-1.amazonaws.com/${KIRO_CLI_VERSION}/kirocli-$(uname -m)-linux-musl.zip"; \
+      case "$(uname -m)" in \
+        x86_64) expected="${KIRO_CLI_SHA256_X86_64}" ;; \
+        aarch64) expected="${KIRO_CLI_SHA256_AARCH64}" ;; \
+        *) echo "no kiro-cli checksum for $(uname -m)" >&2; exit 1 ;; \
+      esac; \
+      echo "${expected}  /tmp/kirocli.zip" | sha256sum -c -; \
       unzip -q /tmp/kirocli.zip -d /tmp; \
       # The installer copies into /usr/local/bin, which Wolfi's base lacks.
       mkdir -p /usr/local/bin; \
@@ -314,4 +325,7 @@ EXPOSE 9889
 HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${CAO_API_PORT:-9889}/health" || exit 1
 
+# tini is installed, not the entrypoint: the eks/ pods' teardown relies on
+# cao-server being PID 1. A pod whose PID 1 would be cao-bridge, which reaps no
+# children, runs tini first (see remote-runtime/runtime.yaml).
 ENTRYPOINT ["cao-entrypoint"]
