@@ -16,10 +16,9 @@ from fastmcp.exceptions import AuthorizationError
 from fastmcp.server.auth import require_scopes
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.dependencies import get_access_token
+from simulation import Identifier, World
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
-
-from simulation import Identifier, World
 
 VIEWER_HTML = Path(__file__).resolve().parent / "viewer.html"
 
