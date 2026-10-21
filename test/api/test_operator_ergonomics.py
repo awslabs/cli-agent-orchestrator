@@ -3,13 +3,16 @@ normalization at the session/terminal creation boundary, the server-side
 folder listing, per-session display labels, and the ``X-Server-Time`` header.
 """
 
+import asyncio
 import json
 import os
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from cli_agent_orchestrator.models.terminal import Terminal
@@ -210,6 +213,119 @@ class TestSessionLabelEndpoint:
             }
             assert client.get("/sessions").json()[0]["label"] == "Nightly triage"
             assert client.get("/sessions/cao-demo").json()["session"]["label"] == "Nightly triage"
+
+
+class TestSettingsWritersStayOffTheEventLoop:
+    """plauzy, #724 review, blocking item 2: the label endpoint ran a tmux
+    subprocess and a lock-polling settings write inline on the event loop, so
+    with another writer holding the settings lock a 10 ms heartbeat task on
+    the same loop ticked once in 1.8 s -- ``/health`` and every SSE stream
+    froze with it. ``POST /settings/agent-dirs`` and ``/skill-dirs`` inherited
+    the same wait once their writers went through ``_mutate``.
+
+    Driven over ASGI directly (not the sync TestClient, which runs the app on
+    its own portal thread and cannot observe the request loop) with a
+    heartbeat coroutine on the SAME loop as the request. The settings lock is
+    held by a plain thread for half a second; a handler that waits for it on
+    the loop stalls the heartbeat, one that waits on a worker thread does not.
+    """
+
+    _WRITES = [
+        pytest.param("/sessions/cao-demo/label", {"label": "Run"}, id="label"),
+        pytest.param("/settings/agent-dirs", {"extra_dirs": ["/x"]}, id="agent-dirs"),
+        pytest.param("/settings/skill-dirs", {"extra_dirs": ["/x"]}, id="skill-dirs"),
+    ]
+
+    @staticmethod
+    def _hold_settings_lock(release: threading.Event, holding: threading.Event) -> None:
+        from cli_agent_orchestrator.utils import atomic_file
+
+        lock_path = atomic_file._lock_path_for(settings_service.SETTINGS_FILE)
+        with atomic_file._file_lock(lock_path, timeout=5):
+            holding.set()
+            release.wait(5)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("url,body", _WRITES)
+    async def test_a_held_settings_lock_does_not_freeze_the_loop(
+        self, settings_file, backend, url, body
+    ):
+        from cli_agent_orchestrator.api.main import app
+        from cli_agent_orchestrator.plugins import PluginRegistry
+
+        release, holding = threading.Event(), threading.Event()
+        holder = threading.Thread(target=self._hold_settings_lock, args=(release, holding))
+        holder.start()
+        assert holding.wait(5), "lock holder never started"
+
+        ticks = 0
+
+        async def heartbeat() -> None:
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        pulse = asyncio.create_task(heartbeat())
+        # Scheduled ON the loop: if the handler blocks the loop this never
+        # fires, the holder times out after 5 s instead, and the tick count
+        # exposes the stall either way.
+        asyncio.get_running_loop().call_later(0.5, release.set)
+        try:
+            app.state.plugin_registry = PluginRegistry()
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://localhost"
+            ) as client:
+                resp = await client.post(url, json=body)
+        finally:
+            release.set()
+            pulse.cancel()
+            holder.join(5)
+        assert resp.status_code == 200, resp.text
+        assert ticks >= 20, f"the loop ticked {ticks} times while the writer waited for the lock"
+
+    @pytest.mark.asyncio
+    async def test_label_write_waits_for_a_teardown_holding_the_lifecycle_lock(
+        self, settings_file, backend
+    ):
+        """haofeif, #724 review, P3: the existence probe used to run outside
+        the per-session lifecycle lock, so a deletion could complete between
+        the probe and the write and the request would persist an orphan label
+        for the next same-name session to inherit. Probe and write now hold
+        the lock, so they cannot interleave with ``delete_session``."""
+        from cli_agent_orchestrator.api.main import app
+        from cli_agent_orchestrator.plugins import PluginRegistry
+        from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
+
+        release, holding = threading.Event(), threading.Event()
+
+        def teardown_in_progress() -> None:
+            with session_lifecycle_lock("cao-demo"):
+                holding.set()
+                release.wait(5)
+
+        holder = threading.Thread(target=teardown_in_progress)
+        holder.start()
+        assert holding.wait(5)
+        try:
+            app.state.plugin_registry = PluginRegistry()
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://localhost"
+            ) as client:
+                request = asyncio.create_task(
+                    client.post("/sessions/cao-demo/label", json={"label": "Run"})
+                )
+                await asyncio.sleep(0.3)
+                assert not request.done(), "the label write did not wait for the lifecycle lock"
+                backend.session_exists.assert_not_called()
+                release.set()
+                resp = await asyncio.wait_for(request, 5)
+        finally:
+            release.set()
+            holder.join(5)
+        assert resp.status_code == 200, resp.text
+        backend.session_exists.assert_called_once_with("cao-demo")
+        assert settings_service.get_session_labels() == {"cao-demo": "Run"}
 
 
 class TestWorkingDirectoryNormalizationAtTheBoundary:

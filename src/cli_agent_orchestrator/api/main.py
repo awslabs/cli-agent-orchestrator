@@ -3270,14 +3270,17 @@ async def set_agent_dirs_endpoint(
         set_extra_agent_dirs,
     )
 
+    # Each writer is a locked read-modify-write of settings.json that polls
+    # the file lock for up to 10 s when another writer holds it; inline on the
+    # event loop that wait froze every other request (plauzy, #724 review).
     if body.agent_dirs:
-        set_agent_dirs(body.agent_dirs)
+        await asyncio.to_thread(set_agent_dirs, body.agent_dirs)
     if body.extra_dirs is not None:
-        set_extra_agent_dirs(body.extra_dirs)
+        await asyncio.to_thread(set_extra_agent_dirs, body.extra_dirs)
     # After extras are persisted, so a just-added extra can be disabled in the
     # same request; set_disabled validates against the current known dirs.
     if body.disabled_dirs is not None:
-        set_disabled_agent_dirs(body.disabled_dirs)
+        await asyncio.to_thread(set_disabled_agent_dirs, body.disabled_dirs)
     return {
         "agent_dirs": get_agent_dirs(),
         "extra_dirs": get_extra_agent_dirs(),
@@ -3314,7 +3317,8 @@ async def set_skill_dirs_endpoint(
 
     result_extra: List[str] = []
     if body.extra_dirs is not None:
-        result_extra = set_extra_skill_dirs(body.extra_dirs)
+        # Off the loop for the same reason as POST /settings/agent-dirs.
+        result_extra = await asyncio.to_thread(set_extra_skill_dirs, body.extra_dirs)
     return {
         "skills_dir": str(SKILLS_DIR),
         "extra_dirs": result_extra or get_extra_skill_dirs(),
@@ -3872,6 +3876,18 @@ async def set_session_label_endpoint(
 
     A settings.json that exists but cannot be read makes the set a 500 with
     the file untouched, rather than the label-only file it used to become.
+
+    Off the event loop (plauzy, #724 review, blocking item 2): the existence
+    probe is a tmux subprocess and the write polls the settings file lock for
+    up to ``DEFAULT_LOCK_TIMEOUT_SECONDS`` (10 s). Run inline on this
+    ``async def`` they froze every other request -- ``/health``, every SSE
+    stream -- for as long as another writer held the lock (reproduced: one
+    heartbeat tick in 1.8 s). ``asyncio.to_thread``, as ``GET`` and ``DELETE
+    /sessions/{name}`` already do for the identical hazard (#382). Both steps
+    also run under the session's lifecycle lock (haofeif, #724 review, P3):
+    a teardown that completes between an unlocked existence check and the
+    write would otherwise clear the label and then watch this request persist
+    an orphan one, inherited by the next same-name session.
     """
     from cli_agent_orchestrator.constants import SESSION_PREFIX
 
@@ -3884,15 +3900,22 @@ async def set_session_label_endpoint(
         validate_tmux_name(effective, "session_name")
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    if body.label.strip() and not get_backend().session_exists(effective):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session '{effective}' not found",
-        )
+    labels = await asyncio.to_thread(_set_session_label_locked, effective, body.label)
+    return {"session_name": effective, "label": labels.get(effective)}
+
+
+def _set_session_label_locked(session_name: str, label: str) -> Dict[str, str]:
+    """Worker-thread half of ``POST /sessions/{name}/label``: probe and write under the lifecycle lock."""
+    from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
     from cli_agent_orchestrator.services.settings_service import set_session_label
 
-    labels = set_session_label(effective, body.label)
-    return {"session_name": effective, "label": labels.get(effective)}
+    with session_lifecycle_lock(session_name):
+        if label.strip() and not get_backend().session_exists(session_name):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session '{session_name}' not found",
+            )
+        return set_session_label(session_name, label)
 
 
 @app.get("/sessions/{session_name}")
