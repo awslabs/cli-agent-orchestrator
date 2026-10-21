@@ -641,7 +641,6 @@ def approve_cmd(plan_id, as_json):
       0  the plan is approved (whether this call approved it or found it already approved)
       1  the request was rejected or the server could not be reached
     """
-    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
     try:
         response = api_http.post(
             f"{API_BASE_URL}/workflows/plans/approve",
@@ -1000,7 +999,6 @@ def run_cmd(name_or_path, inputs, run_id, working_directory, detach, wait, as_js
     }
     if run_id is not None:
         payload["run_id"] = run_id
-    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
     _attach_terminal_caller(payload)
 
     # --- --wait: the retained blocking path (VR-2, FR-4.5). ------------------
