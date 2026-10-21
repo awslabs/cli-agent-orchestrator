@@ -74,6 +74,55 @@ WHEEL_MEMBER = WHEEL_WEB_UI_PREFIX + "index.html"
 # into the file name.
 _ASSET_URL_RE = re.compile(r"""(?:src|href)=["'](/[^"':?#]+)["']""")
 
+# hatchling never ships these, even when an `artifacts` glob matches them
+# (hatchling/builders/constants.py: EXCLUDED_FILES, EXCLUDED_DIRECTORIES). A `.DS_Store`
+# left in a committed directory (e.g. by macOS Finder) must not count as "on disk but
+# missing from the wheel" — that is not a packaging defect.
+_HATCHLING_EXCLUDED_FILES = frozenset({".DS_Store", ".git"})
+_HATCHLING_EXCLUDED_DIRS = frozenset(
+    {"__pycache__", ".git", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+)
+
+
+def _shippable_files(base: Path) -> list[Path]:
+    """Every file under ``base`` that hatchling could actually ship.
+
+    Excludes names/directories hatchling hard-excludes from every wheel regardless of
+    what `artifacts` matches, so a stray `.DS_Store` cannot produce a false "the wheel
+    is missing a file that's on disk" failure.
+    """
+    return [
+        p
+        for p in base.rglob("*")
+        if p.is_file()
+        and p.name not in _HATCHLING_EXCLUDED_FILES
+        and not _HATCHLING_EXCLUDED_DIRS.intersection(p.relative_to(base).parts[:-1])
+    ]
+
+
+def test_shippable_files_excludes_hatchling_excluded_names(tmp_path):
+    """A stray `.DS_Store` on disk must not be expected in the wheel.
+
+    hatchling drops these unconditionally (EXCLUDED_FILES/EXCLUDED_DIRECTORIES in
+    hatchling/builders/constants.py), even though an `artifacts` glob matches them. A
+    `.DS_Store` left in a committed directory by macOS Finder would otherwise make
+    `_built_web_ui_files()`/`_files_under()` expect a file the wheel can never contain,
+    and blame the `artifacts` glob for a difference that isn't a packaging defect.
+    """
+    (tmp_path / "index.html").write_text("<html></html>", encoding="utf-8")
+    (tmp_path / ".DS_Store").write_bytes(b"\x00")
+    cache_dir = tmp_path / "__pycache__"
+    cache_dir.mkdir()
+    (cache_dir / "mod.pyc").write_bytes(b"\x00")
+
+    found = {p.name for p in _shippable_files(tmp_path)}
+
+    assert found == {"index.html"}, (
+        f"_shippable_files() returned {found!r}; it must exclude files hatchling never "
+        "ships (.DS_Store) and files under directories hatchling never ships "
+        "(__pycache__), not just report everything rglob finds."
+    )
+
 
 def _built_web_ui_files() -> set[str]:
     """Every file Vite wrote under ``web_ui/``, as wheel-relative member names.
@@ -83,8 +132,7 @@ def _built_web_ui_files() -> set[str]:
     """
     return {
         WHEEL_WEB_UI_PREFIX + str(p.relative_to(WEB_UI_DIR).as_posix())
-        for p in WEB_UI_DIR.rglob("*")
-        if p.is_file()
+        for p in _shippable_files(WEB_UI_DIR)
     }
 
 

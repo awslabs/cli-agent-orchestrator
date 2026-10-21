@@ -39,7 +39,7 @@ from pathlib import Path
 # Reuses test_wheel_contents.py's `uv build` invocation so there is a single definition of
 # "how this repo builds a wheel for a packaging assertion" (CAO_TUI_AUTOBUILD=0 so no cargo
 # compile, 300s timeout, exit-code and .whl-produced checks).
-from test.test_wheel_contents import _build_wheel_members
+from test.test_wheel_contents import _build_wheel_members, _shippable_files
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = REPO_ROOT / "pyproject.toml"
@@ -87,9 +87,7 @@ def _files_under(root: str) -> set[str]:
     if not base.is_dir():
         return set()
     wheel_root = root[len(_SRC_PREFIX) :] if root.startswith(_SRC_PREFIX) else root
-    return {
-        f"{wheel_root}/{p.relative_to(base).as_posix()}" for p in base.rglob("*") if p.is_file()
-    }
+    return {f"{wheel_root}/{p.relative_to(base).as_posix()}" for p in _shippable_files(base)}
 
 
 def test_force_include_roots_are_globbed_whole() -> None:
