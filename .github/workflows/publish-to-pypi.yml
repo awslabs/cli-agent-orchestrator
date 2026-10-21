@@ -203,7 +203,7 @@ jobs:
 
       # The Web UI is built here too so each platform wheel carries it. Without this the
       # web_ui/** artifacts glob resolves empty and hatchling silently omits it (defect D1).
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: '20'
           cache: 'npm'
@@ -246,7 +246,7 @@ jobs:
       # (`[tool.cibuildwheel] test-command`) installs the wheel and RUNS `cao tui`, so a
       # wheel whose binary is missing, non-executable, or built for the wrong architecture
       # fails HERE rather than on an operator's machine (SR-1).
-      - uses: pypa/cibuildwheel@adba99c781d3746d38b3a09b1cf797965bcb7fe6  # v4.3.0
+      - uses: pypa/cibuildwheel@b3395e271a35f73dad77f21802abe9b986dfe299  # v4.3.1
         env:
           CIBW_ARCHS: ${{ matrix.archs }}
           # See `macos-target` in the matrix: this is what keeps delocate from rejecting a
@@ -272,7 +272,7 @@ jobs:
             python scripts/build_tui.py check --wheel "$w" --max-binary-bytes 10485760
           done
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           # Per-platform artifact names, merged by the publish jobs via `pattern:` +
           # `merge-multiple:`. A shared name would make the legs race each other.
@@ -291,7 +291,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: '20'
           cache: 'npm'
@@ -303,12 +303,12 @@ jobs:
           npm ci
           npm run build
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
 
       - name: Build sdist
         run: uv build --sdist
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: dist-sdist
           path: dist/*.tar.gz
@@ -336,7 +336,7 @@ jobs:
       # UNCHECKED. Worst on `publish-pypi`: a PyPI filename cannot be re-uploaded.
       # Found by the §12a reviewer for `wheel-matrix`. (#321)
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           pattern: dist-*
           merge-multiple: true
@@ -464,7 +464,7 @@ jobs:
       # UNCHECKED. Worst on `publish-pypi`: a PyPI filename cannot be re-uploaded.
       # Found by the §12a reviewer for `wheel-matrix`. (#321)
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           pattern: dist-*
           merge-multiple: true
@@ -516,7 +516,7 @@ jobs:
           fetch-depth: 0
           ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
 
       - name: Install the project
         run: uv sync --locked --all-extras --dev
