@@ -21,6 +21,8 @@ const ORPHAN_COLOR = '#9ca3af'
 const DEFAULT_NODE_COLOR = '#2563eb'
 const CONTRADICTION_COLOR = '#dc2626'
 const DEFAULT_EDGE_COLOR = '#94a3b8'
+// Set on the graph container during a node drag; styled in index.css.
+const DRAGGING_CLASS = 'cao-graph-dragging'
 
 // The graph endpoint requires a concrete, non-private provider scope. session /
 // agent are refused server-side (400, private tier), and '' (all scopes) can't
@@ -207,6 +209,9 @@ export function MemoryGraphView({ scope, scopeId }: MemoryGraphViewProps) {
         labelRenderedSizeThreshold: 0,
         // Sigma v4 defaults to "positions"; keep node sizes in pixels.
         itemSizesReference: 'screen',
+        // Sigma v4 rotates the camera on right-drag and blocks the context
+        // menu by default; keep the Sigma v3 right-click behavior.
+        enableCameraMouseRotation: false,
       },
       // Sigma v4 sets the container cursor on hover, so the hover cursor
       // comes from the node style.
@@ -221,9 +226,15 @@ export function MemoryGraphView({ scope, scopeId }: MemoryGraphViewProps) {
     // translate the pointer to graph coords and write x/y; on mouse-up we
     // clear state and RE-ENABLE the camera. `dragRef.moved` distinguishes a
     // drag from a click (see clickNode below).
+    //
+    // Cursor: Sigma v4 owns the container's inline cursor and rewrites it on
+    // every hover change, and hover flips between the node and the stage
+    // during this drag. The DRAGGING_CLASS rule in index.css (!important)
+    // keeps "grabbing" for the whole drag.
     sigma.on('downNode', ({ node }) => {
       dragRef.current = { node, moved: false }
       sigma.getCamera().enabled = false
+      container.classList.add(DRAGGING_CLASS)
     })
 
     sigma.on('moveBody', ({ event }) => {
@@ -246,6 +257,7 @@ export function MemoryGraphView({ scope, scopeId }: MemoryGraphViewProps) {
     const endDrag = () => {
       if (dragRef.current.node) {
         sigma.getCamera().enabled = true
+        container.classList.remove(DRAGGING_CLASS)
         // Keep `moved` so the clickNode that fires right after a drag is
         // suppressed; only null the node so a fresh downNode starts clean.
         dragRef.current.node = null
@@ -264,22 +276,12 @@ export function MemoryGraphView({ scope, scopeId }: MemoryGraphViewProps) {
       void openTopic(node)
     })
 
-    // Cursor affordance: grab on hover (node style above), grabbing while
-    // dragging.
-    sigma.on('downNode', () => {
-      container.style.cursor = 'grabbing'
-    })
-    sigma.on('upStage', () => {
-      container.style.cursor = ''
-    })
-    sigma.on('upNode', () => {
-      container.style.cursor = 'grab'
-    })
-
     sigmaRef.current = sigma
 
     return () => {
       sigma.kill()
+      // The container outlives this Sigma instance; do not leave a drag cursor.
+      container.classList.remove(DRAGGING_CLASS)
       sigmaRef.current = null
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
