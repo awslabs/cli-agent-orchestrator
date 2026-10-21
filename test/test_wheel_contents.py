@@ -70,8 +70,9 @@ WHEEL_MEMBER = WHEEL_WEB_UI_PREFIX + "index.html"
 # Vite writes these as ROOT-RELATIVE URLs, which the StaticFiles mount at `/` serves out of
 # the same `web_ui/` directory — so the leading slash maps to WHEEL_WEB_UI_PREFIX. Matches
 # any local root-relative reference (not just `/assets/*`) so dropped favicons are caught
-# too (issue #705 follow-up); excludes `?`/`#` so a querystring or fragment is not folded
-# into the file name.
+# too (issue #705 follow-up). The closing quote must immediately follow the path, so a
+# URL with a querystring or fragment (`?`/`#`) does not match at all, rather than
+# matching with the `?`/`#` suffix folded into the file name.
 _ASSET_URL_RE = re.compile(r"""(?:src|href)=["'](/[^"':?#]+)["']""")
 
 # hatchling never ships these, even when an `artifacts` glob matches them
