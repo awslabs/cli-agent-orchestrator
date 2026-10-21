@@ -243,6 +243,23 @@ class TestEnsureWorkingDirectory:
         finally:
             locked.chmod(0o755)
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+    def test_unwritable_parent_is_a_clear_error_from_the_mkdir_itself(self, tmp_path):
+        """Reaches the ``mkdir`` (the parent exists, is allowed and is readable,
+        so the policy check and the ``is_dir`` probe both pass) and has it fail:
+        the ``PermissionError`` out of ``mkdir`` must be the same 400-shaped
+        error, not a bare OSError. Added after a mutation check showed no test
+        exercised this wrapper."""
+        parent = tmp_path / "readonly"
+        parent.mkdir()
+        parent.chmod(0o555)
+        try:
+            with pytest.raises(WorkingDirectoryError, match="could not be created"):
+                ensure_working_directory(str(parent / "child"))
+            assert not (parent / "child").exists()
+        finally:
+            parent.chmod(0o755)
+
     def test_blocked_path_is_never_created(self):
         """The policy check runs inside ensure too, so a caller that skipped
         ``validate_working_directory`` still cannot mkdir under ``/tmp``."""
