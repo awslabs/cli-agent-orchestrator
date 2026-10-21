@@ -119,6 +119,49 @@ def _auth_headers_for(base_url: str) -> Dict[str, str]:
 # supervisor LLM remembering to hand-write its terminal ID into the message.
 ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "true").lower() == "true"
 
+# The two sender-ID suffixes. They are composed ONLY through
+# ``append_sender_suffix`` so the structured-prompt guard below applies to
+# every call site (test_sender_suffix_structured_prompt.py enforces this).
+ASSIGN_SUFFIX_TEMPLATE = (
+    "[Assigned by terminal {terminal_id}. "
+    "When done, send results back to terminal {terminal_id} using send_message]"
+)
+MESSAGE_SUFFIX_TEMPLATE = (
+    "[Message from terminal {terminal_id}. Use send_message MCP tool for any follow-up work.]"
+)
+
+
+def is_structured_prompt_invocation(message: str) -> bool:
+    """True when ``message`` is an ``@<prompt> [args]`` invocation, not prose.
+
+    kiro-cli dispatches any input whose first character is ``@`` as an MCP
+    prompt call (e.g. ``@agent-sop:code-analysis query="..."``): it strips the
+    ``@``, shlex-splits the ENTIRE remaining input (newlines included), takes
+    the first token as the prompt name and zips every further token
+    positionally onto the prompt's declared arguments. The grammar has no
+    terminator, so text appended anywhere after the invocation is read as
+    parameter values -- a trailing sender-ID suffix landed in the SOP's
+    optional ``thoroughness`` parameter as ``[Assigned`` (issue #70).
+
+    Only the first non-blank character decides: an ``@``-mention inside prose
+    (``Review @src/main.py``) is not an invocation and keeps its suffix.
+    """
+    return message.lstrip().startswith("@")
+
+
+def append_sender_suffix(message: str, template: str, terminal_id: str) -> str:
+    """Append the sender-ID suffix as its own paragraph, unless the message is a
+    structured prompt invocation that would absorb it as a parameter.
+
+    Suppressing the suffix loses only the in-message reminder: callback
+    routing is structural since issue #284 (``caller_id`` on the worker row,
+    ``send_message`` without ``receiver_id`` routes to the recorded caller).
+    """
+    if is_structured_prompt_invocation(message):
+        return message
+    return message + "\n\n" + template.format(terminal_id=terminal_id)
+
+
 # Terminal count threshold for cleanup nudge
 TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
 
@@ -2023,12 +2066,11 @@ def _assign_impl(
         # this here (not on the server) because the callback-instructions
         # suffix depends on ``CAO_TERMINAL_ID``, which lives in the calling
         # process's env (the supervisor-owned MCP subprocess, or a ``cao
-        # agent assign`` shell), not on the cao-server side.
+        # agent assign`` shell), not on the cao-server side. The helper leaves
+        # ``@<prompt> [args]`` invocations untouched (issue #70).
         if ENABLE_SENDER_ID_INJECTION:
-            worker_message = (
-                message
-                + f"\n\n[Assigned by terminal {current_terminal_id}. "
-                + f"When done, send results back to terminal {current_terminal_id} using send_message]"
+            worker_message = append_sender_suffix(
+                message, ASSIGN_SUFFIX_TEMPLATE, current_terminal_id
             )
         else:
             worker_message = message
@@ -2189,12 +2231,10 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
         # Auto-inject sender terminal ID suffix when enabled. Skipped when
         # CAO_TERMINAL_ID is unset — never inject 'unknown' as a routable
         # address (issue #284); _send_to_inbox raises a clear error for that
-        # case anyway.
+        # case anyway. The helper leaves ``@<prompt> [args]`` invocations
+        # untouched (issue #70).
         if ENABLE_SENDER_ID_INJECTION and own_terminal_id:
-            message += (
-                f"\n\n[Message from terminal {own_terminal_id}. "
-                "Use send_message MCP tool for any follow-up work.]"
-            )
+            message = append_sender_suffix(message, MESSAGE_SUFFIX_TEMPLATE, own_terminal_id)
 
         return _send_to_inbox(receiver_id, message)
     except requests.HTTPError as exc:
