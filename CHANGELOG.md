@@ -7,8 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **The MCP server sent no bearer on 14 of its calls to the local API** (#990). Ten
+  `requests` calls in `mcp_server/server.py` reached scope-guarded routes with no
+  `Authorization` header, so on an auth-enabled server each one got `401`. Two were
+  fail-closed authorization lookups whose 401 surfaced as a refusal: `list_siblings` and
+  `update_metadata` refused a profile that holds the `discovery` grant, and
+  `answer_user_prompt` refused everyone. All fourteen sites now use the existing bearer
+  helpers; a call-site census test keeps the rule enforced. No change when auth is off.
+
+- **Breaking / migration:** workflow approval enforcement now defaults ON for script-tier runs
+  (#583 Bolt 3) (#699). The first run of each script plan is refused until
+  an operator runs `cao workflow approve <plan_id>`; operators choosing the previous behaviour set
+  `workflow.require_approval: false` in `settings.json`. Script runs journaled before this upgrade
+  cannot launch further agent steps while approval enforcement is on; start a new run. With
+  approval enforcement off, those runs continue. Plan identifiers keep the `plan-v1:` scheme.
+
+- **Breaking / migration:** a fresh script run now executes a private copy of the approved source.
+  Modules beside the spec are not importable and `__file__` names the copy; this matches resume.
+- **Breaking / migration:** while approval is enabled, fresh agent steps in script runs refuse reserved
+  ephemeral profile names until #827 binds their definitions.
+- **Breaking / migration:** non-Git roots now bind the directory's canonical path into `plan_id`.
+  Moving or renaming such a directory requires a new approval; Git-repository plan identifiers are
+  unchanged.
+- **Breaking / migration:** plan approval binds the script source, its resolved inputs and the working
+  directory's state (the Git commit and worktree, or the canonical path of a non-Git directory). It
+  does not bind the content of agent profiles or memory: a later run of an approved plan uses their
+  current content (#827, #828).
+
 ### Added
 
+- Conversational workflow authoring: `cao workflow create` / `update` and the `workflow_create`,
+  `workflow_update`, `workflow_get` and `workflow_validate` MCP tools (#583 Bolt 3) (#699). Spec writes
+  are atomic and serialized per workflow, so two concurrent creates cannot both succeed and an update
+  with a stale `--expected-hash` is rejected at commit time. Lint warnings are shown on the default CLI
+  output. Every `cao workflow` HTTP verb and every workflow MCP tool forward
+  `CAO_AUTH_LOCAL_TOKEN` when API authentication is enabled. The Python workflow SDK's
+  run-step transport does not yet receive that credential; subprocess credential delivery
+  remains a separate security-boundary decision.
+
+- `assign` and `handoff` now launch ephemeral agents (#801) from their creator terminal: Claude Code by default, Codex when an operator allows it.
+- Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `ephemeral.enabled` stays off by default.
 - Persistent agent descriptions with creation-time CLI/MCP labels and editable
   descriptions in Web UI Home and Agents (#942).
 
@@ -27,7 +65,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#605), malformed-Origin (#656) and scheme-aware same-origin (#658) guards, and
   filesystem invariants for the per-terminal FIFO path (#823) and atomic-file
   modes under a concurrent writer (#821). `test/security/`. (#938)
-- Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `assign` and `handoff` still refuse them. `ephemeral.enabled` stays off by default.
 - Simulation-only cross-zone robot transport example (#845): existing CAO CLI
   supervisor, zone-operation, and checker agents share a persistent MuJoCo
   kinematic world through scoped MCP tools. Includes measured custody handoffs,
@@ -123,6 +160,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Corrective workflow re-prompts now reuse the attempt's rendered prompt, so
+  workflow inputs and earlier step outputs stay filled in when structured output
+  is missing or invalid (#966).
+- `claude_code` workers running with Claude Code's `prefersReducedMotion` setting
+  are no longer reported as completed while they work. That setting draws the
+  spinner with a static `●`, which both status paths read as a finished response,
+  so `handoff` and workflow steps tore the worker down about 2s after sending the
+  task. A `●` line whose ellipsis is followed by the spinner's status in
+  parentheses (a running hook, the elapsed time, the token count or `thinking`)
+  is now treated as a live spinner, whatever the message before it (#908).
+
+- `store_lesson` no longer decides the learning gate, authorizes itself, or opens
+  SQLite inside the agent's process. It writes through a new `POST /lessons`
+  route, finishing the boundary move #734 started for `report_outcome` and
+  `list_outcomes`: an unreadable `settings.json` now surfaces as a plain error
+  (503) instead of `disabled: true`, which `skills/cao-learning` tells agents to
+  skip silently — so a filesystem fault used to swallow the lesson with no trace.
+  A missing route or unreachable server is likewise an explicit failure, never
+  `disabled`: only a 404 carrying `cao.learning_disabled` reads as the gate. The
+  caller's profile and its `store_lesson` capability are now resolved on the
+  server from the terminal record and profile frontmatter, so the check no longer
+  depends on the agent process being able to read the profile store (#744).
 - Kiro profile installation now preserves profile-defined `resources` alongside
   CAO's default context and skill resources. Reinstall existing profiles to
   include their configured resources in the generated Kiro agent configuration
@@ -633,6 +692,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of spinning on a cancelled task and never exiting (#823)
 
 ### Changed
+
+- A plain (non-Git) directory is now an approvable plan, keyed by its canonical path.
+
+- Script runs execute in, and fingerprint, one project root (#699): the run request's optional
+  `working_directory`, defaulting to cao-server's working directory. The CLI sends its current
+  directory (or `--working-directory`) and the MCP tools send the calling terminal's directory, so
+  script runs started from those clients now run in the caller's directory instead of cao-server's.
+  Agent steps that name neither a working directory nor a caller default to the run's root. A project
+  root outside Git is now an approvable plan instead of `plan_identity_unavailable`. Approvals granted
+  for a plan fingerprinted against a different directory must be granted again.
+
+- A script run refuses to launch further agent steps (HTTP 409, `kind: plan_inputs_changed`) when an
+  agent profile or the memory-enabled setting changed after the run's approval check (#699).
+
+- `cao workflow get` / `update` / `delete` validate and percent-encode workflow names;
+  `cao workflow validate --json` returns the `{ok: false, ...}` envelope on failure; `cao workflow
+  delete` gains `--json` (#699).
 
 - SECURITY.md now states the supported release line as 2.x (it said 1.x while
   2.5.x was on PyPI), guarded by `test/test_security_policy.py` against the

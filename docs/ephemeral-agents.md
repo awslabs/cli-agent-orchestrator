@@ -1,7 +1,7 @@
 # Ephemeral agents
 
 This experimental feature creates bounded, creator-owned profiles within a session.
-`assign` and `handoff` still refuse ephemeral names in this release. For testing, the creator terminal can launch one through the HTTP API: claim it with `POST /ephemeral-agents/{name}/claim`, then create a terminal with the returned `claim_id`.
+The creator terminal launches a name with `assign` or `handoff`. Each name launches once.
 
 Keep `ephemeral.enabled` false outside testing. It defaults to false and will remain off
 through create/launch and model policy work. A default flip requires both lifecycle cleanup
@@ -79,6 +79,36 @@ boundary. Marker strings inside the brief remain unchanged. The fence sentence i
 
 ## Claim, launch and release
 
+`assign` claims the name and creates a worker in the creator's session. It returns while
+initialization and task delivery continue in the background. `handoff` claims the name,
+runs the task, and tears down its worker on success. Its early-terminal path also claims
+before creation; a nonblocking handoff leaves the worker alive for inspection and deletion.
+Both paths use the recorded provider and effective tools, without installed-profile
+resolution or tool inheritance. A per-call `model` override refuses before any claim.
+
+`assign` has no idempotency key. If an `assign` response is lost, a retry gets
+`already_claimed`. Check the terminal list for the first child (it is marked `ephemeral`),
+delete it if it is unwanted, and create a new agent. This check-and-delete step is required:
+a failed or lost response does not prove that no worker exists.
+
+If a `handoff` times out or the worker errors, the worker was launched and the name stays
+launched. The result carries its terminal id when the server reports one; otherwise find
+it in the terminal list, where it is marked `ephemeral`. Inspect or delete that terminal
+rather than creating a new agent while it may still be running.
+
+A retried `handoff` within the claim lease gets `already_claimed`; retry after
+`claim_lease_seconds` or create a new agent. A matching key on the early path can reattach
+to an already launched terminal, but does not deduplicate task delivery. The default
+blocking handoff does not forward an early-path idempotency key.
+
+Claude Code enforces the recorded native-tool list through `--disallowedTools`. Its prompt
+contains the creator preamble, the honesty fence, and the brief; its generated MCP config
+contains only the CAO server. Codex is an operator opt-in: its tools are advisory, it runs
+`--yolo`, and its temporary developer-instructions file is removed on provider cleanup.
+Neither provider makes the creator brief a privilege boundary.
+
+The HTTP contract remains available for clients implementing their own launch path:
+
 Claim with `POST /ephemeral-agents/{name}/claim?caller_id=<creator-terminal-id>` and a JSON
 body containing optional `idempotency_key`, `claim_id`, and `model`. A per-call model is
 refused; omit it to use the provider default. The server checks creator identity and
@@ -134,5 +164,5 @@ marked ephemeral and the existing delegation denial stays effective.
 > 3. **A privilege boundary.** A child with `execute_bash` or `fs_write` runs as the same OS user. It can call the local HTTP API directly with a `caller_id` it supplies itself, edit `settings.json`, or read `ephemeral/live/`.
 > 4. **Intersection for installed profiles** (#671).
 
-These guarantees apply to the owner-only HTTP launch. `assign` and `handoff` still
-refuse ephemeral names in this release; ephemeral creation by an ephemeral caller always refuses.
+These guarantees apply to creator-owned launches through `assign`, `handoff`, and the
+HTTP API. Ephemeral creation by an ephemeral caller always refuses.
