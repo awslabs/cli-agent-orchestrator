@@ -140,7 +140,7 @@ class Terminal(BaseModel):
         ),
     )
     memory_manager: Optional[Dict[str, Any]] = Field(
-        None,
+        default=None,
         description=(
             "Outcome of the memory_manager sidecar a POST /sessions request asked for "
             "(memory_manager=true): {state: 'scheduled' | 'refused', detail}. 'refused' "

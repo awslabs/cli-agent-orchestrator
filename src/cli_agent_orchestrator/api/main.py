@@ -25,6 +25,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    TypedDict,
     cast,
 )
 
@@ -816,7 +817,19 @@ class StepOutputRequest(BaseModel):
     )
 
 
-def _workflow_caller_kwargs(caller_id: Optional[str]) -> Dict[str, str]:
+class _WorkflowCallerKwargs(TypedDict, total=False):
+    """The one keyword ``_workflow_caller_kwargs`` may forward.
+
+    A TypedDict rather than ``Dict[str, str]`` so that ``**``-unpacking it into a
+    workflow entry point type-checks against that entry point's ``caller_id``
+    parameter only; a plain ``Dict[str, str]`` could, as far as mypy knows, fill
+    any parameter (``decisions``, say) with a ``str``.
+    """
+
+    caller_id: str
+
+
+def _workflow_caller_kwargs(caller_id: Optional[str]) -> _WorkflowCallerKwargs:
     """``{"caller_id": ...}`` when a terminal started the run, else ``{}``.
 
     The workflow service entry points take ``caller_id`` as an optional keyword;
