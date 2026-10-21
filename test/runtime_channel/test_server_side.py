@@ -180,6 +180,20 @@ class TestHandshake:
         frame = decode(_hello(statuses=statuses))
         assert isinstance(frame, Hello) and len(frame.statuses) == MAX_HELLO_TERMINALS
 
+    def test_a_hello_at_the_limit_is_handled(self, client, monkeypatch):
+        # Every listed terminal is processed: none is recorded here, so each
+        # gets one cleanup, and the server answers the hello.
+        from cli_agent_orchestrator.runtime_channel.protocol import MAX_HELLO_TERMINALS
+
+        cleanups = []
+        monkeypatch.setattr(server_mod, "_delete_unrecorded", lambda conn, t: cleanups.append(t))
+        statuses = {f"{n:08x}": "unknown" for n in range(MAX_HELLO_TERMINALS)}
+        with client.websocket_connect("/runtime/channel", headers=WS_HEADERS) as ws:
+            ws.send_text(_hello(statuses=statuses))
+            assert isinstance(decode(ws.receive_text()), Hello)
+            assert registry_mod.runtime_registry.connection("rt-1") is not None
+        assert sorted(cleanups) == sorted(statuses)
+
     def test_hello_places_the_runtimes_terminals_and_restores_their_status(self, client):
         _remote_row("abcd1234", "rt-1")
         with client.websocket_connect("/runtime/channel", headers=WS_HEADERS) as ws:
@@ -403,6 +417,58 @@ class TestRemoteTerminal:
         # Each names the session of the row it was routed by, so a runtime that
         # reused the id for a newer terminal does not act on that one.
         assert [c.session_name for c in runtime.received[1:]] == [LAUNCHED["session_name"]] * 5
+
+    def test_a_reused_id_refused_by_the_real_bridge_answers_502(
+        self, http, start_runtime, monkeypatch
+    ):
+        # Bridge.execute's session fence, joined to the server's mapping. Both
+        # sides share this test's database, so the runtime's own lookup is
+        # told apart by a context variable, which asyncio.to_thread carries.
+        import contextvars
+
+        in_runtime = contextvars.ContextVar("in_runtime", default=False)
+        real_lookup = database.get_terminal_metadata
+
+        def lookup(terminal_id):
+            if in_runtime.get():
+                # Under this id the runtime now runs a newer terminal.
+                return {**real_lookup(terminal_id), "tmux_session": "cao-newer"}
+            return real_lookup(terminal_id)
+
+        async def execute(self, command):
+            self.received.append(command)
+            if command.type == CommandType.LAUNCH:
+                return _answer(command)
+            in_runtime.set(True)
+            return await Bridge.execute(self, command)
+
+        def runtime_only_fails(real, what):
+            def call(*args, **kwargs):
+                if in_runtime.get():
+                    pytest.fail(what)
+                return real(*args, **kwargs)
+
+            return call
+
+        monkeypatch.setattr(database, "get_terminal_metadata", lookup)
+        monkeypatch.setattr(ScriptedRuntime, "execute", execute)
+        # The server routes through these too; only the runtime must not reach them.
+        for name, what in (
+            ("send_input", "reached the newer one"),
+            ("delete_terminal", "deleted the newer one"),
+        ):
+            real = getattr(terminal_service, name)
+            monkeypatch.setattr(terminal_service, name, runtime_only_fails(real, what))
+        start_runtime()
+        launched = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
+        assert launched.status_code == 201, launched.text
+
+        refused = http.post("/terminals/beef0001/input", params={"message": "hi"})
+        assert refused.status_code == 502, refused.text
+        assert "not found" in refused.json()["detail"]
+        # A delete for the older terminal: it is already gone there.
+        assert http.delete("/terminals/beef0001").status_code == 200
+        assert http.get("/terminals/beef0001").status_code == 404
 
     def test_the_working_directory_comes_from_the_runtime(self, http, start_runtime):
         _remote_row("abcd1234", "rt-1")
@@ -1780,9 +1846,11 @@ class TestDropCancellation:
         task = asyncio.ensure_future(server_mod._drop_lost("rt-1", ["t1"], conn))
         await asyncio.to_thread(started.wait, 5)
         task.cancel()  # the server is stopping
-        await asyncio.sleep(0.05)
+        for _ in range(3):  # a few loop turns: the handler starts waiting
+            await asyncio.sleep(0)
         task.cancel()  # and is cancelled again while it waits for the write
-        await asyncio.sleep(0.05)
+        for _ in range(3):
+            await asyncio.sleep(0)
         try:
             assert registry.drop_lock("rt-1").locked(), "released before the row write landed"
         finally:
@@ -2378,12 +2446,25 @@ class TestLaunchMetadata:
         row = database.get_terminal_metadata("beef0001")
         assert row["working_directory"] == "/home/cao/workspace/repo"
 
-    @pytest.mark.parametrize("reported", ["not sent", None, "", "repo", "/work/\x00x"])
+    @pytest.mark.parametrize(
+        "reported",
+        [
+            "not sent",
+            None,
+            "",
+            "repo",
+            "/work/\x00x",
+            "/work/repo\r\nINJECTED",
+            "/work/\x1b[31mred",
+            "/" + "a" * 4096,
+        ],
+    )
     def test_a_runtime_that_reports_no_working_directory_keeps_the_requested_one(
         self, http, start_runtime, reported
     ):
         # A cao-bridge from before this field: the request's, as before. So
-        # too for an empty, relative or NUL-holding path, which is not recorded.
+        # too for a path that is empty, relative, too long, or holds a control
+        # character, which is not recorded.
         launched = dict(LAUNCHED)
         if reported != "not sent":
             launched["working_directory"] = reported

@@ -166,9 +166,11 @@ async def _drop_lost(
                 # Shielded and looped, so a second cancellation cannot release
                 # the lock early. No `unknown` is published for a record
                 # dropped here: the server's consumers are stopping too.
+                # asyncio.wait never raises the write's own error, so only a
+                # cancellation is suppressed, and the first one is re-raised.
                 while not write.done():
-                    with contextlib.suppress(BaseException):
-                        await asyncio.shield(write)
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await asyncio.wait({write})
                 raise
             except Exception:  # noqa: BLE001 - kept for the next hello; the channel goes on
                 logger.warning(
@@ -436,6 +438,10 @@ class LaunchRequest(BaseModel):
     working_directory: Optional[str] = None
 
 
+#: Linux's PATH_MAX: a longer reported working directory is not a path.
+MAX_WORKING_DIRECTORY = 4096
+
+
 class _Launched(BaseModel):
     """The terminal a runtime reports it launched: checked before it is recorded."""
 
@@ -467,8 +473,14 @@ class _Launched(BaseModel):
     @classmethod
     def _plausible_directory(cls, value: Optional[str]) -> Optional[str]:
         # Runtime-asserted and only recorded, never used as a path here. One
-        # that is not absolute, or holds a NUL, is not recorded: the request's is.
-        if value and (not value.startswith("/") or "\x00" in value):
+        # that is not absolute, is longer than a path may be, or holds a
+        # control character (NUL, CR/LF, a terminal escape) is not recorded:
+        # the request's is.
+        if value and (
+            not value.startswith("/")
+            or len(value) > MAX_WORKING_DIRECTORY
+            or any(ord(c) < 0x20 or ord(c) == 0x7F for c in value)
+        ):
             return None
         return value
 

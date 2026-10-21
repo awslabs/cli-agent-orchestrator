@@ -18,7 +18,10 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 #: Bumped whenever a frame or command changes meaning. Both sides refuse a peer
 #: with a different version at hello, before any work is accepted. A new
 #: optional field that an older peer may omit or ignore is not a change of
-#: meaning and does not bump it: a bump would refuse every older peer.
+#: meaning and does not bump it: a bump would refuse every older peer. That
+#: holds only where ignoring the field is safe: one that grants, authenticates
+#: or restricts anything must be required, with a bump, since an older peer
+#: would silently ignore it.
 PROTOCOL_VERSION = 1
 
 
