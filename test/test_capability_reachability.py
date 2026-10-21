@@ -25,9 +25,11 @@ list entry, not new code.
 """
 
 import ast
+from functools import lru_cache
 from test.support.capability_scan import (
     REPO_ROOT,
     SRC_ROOT,
+    ScanResult,
     declared_capabilities,
     find_references,
     parse_cached,
@@ -100,6 +102,13 @@ CAPABILITY_PREFIXES = (
 NON_CAPABILITY_READS: dict[str, str] = {}
 
 
+@lru_cache(maxsize=None)
+def _scan(surface: str) -> tuple[ScanResult, ...]:
+    """Cache one surface's scan so the forward and allowlist tests, which both
+    scan every surface, do not each re-walk the same trees (#1005 P3-3)."""
+    return tuple(scan_surface(**SURFACES[surface]))
+
+
 def _all_declared_names() -> set[str]:
     names: set[str] = set()
     for kwargs in SURFACES.values():
@@ -119,7 +128,7 @@ class TestCapabilitiesAreReachable:
 
     @pytest.mark.parametrize("surface", sorted(SURFACES))
     def test_every_declared_capability_has_a_consumer(self, surface):
-        results = scan_surface(**SURFACES[surface])
+        results = _scan(surface)
         assert results, f"{surface}: scan found no declarations -- the guard has rotted"
 
         dead = [r for r in results if not r.reachable and r.capability.name not in ALLOWLIST]
@@ -150,10 +159,7 @@ class TestCapabilitiesAreReachable:
             return  # nothing to re-scan src/ for.
 
         reachable = {
-            r.capability.name
-            for surface in SURFACES
-            for r in scan_surface(**SURFACES[surface])
-            if r.reachable
+            r.capability.name for surface in SURFACES for r in _scan(surface) if r.reachable
         }
         stale = sorted(set(ALLOWLIST) & reachable)
         assert not stale, (
