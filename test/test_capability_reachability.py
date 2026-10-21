@@ -125,7 +125,8 @@ class TestCapabilitiesAreReachable:
         dead = [r for r in results if not r.reachable and r.capability.name not in ALLOWLIST]
         detail = "; ".join(
             f"{r.capability.name} declared {r.capability.where} "
-            f"({len(r.overrides)} override(s), 0 consumers)"
+            f"({len(r.overrides)} override(s), {len(r.consumers)} consumer(s), "
+            "all inside overriding files)"
             for r in dead
         )
         assert not dead, (
