@@ -1,7 +1,9 @@
 # Plan: a policy-driven robot work cell with CAO
 
-Status: draft for review. Branch `feature/robotics-policy-driven-cell`, cut from
-`main` at `bfad0d4b` (2026-10-20).
+Status: phases 0&ndash;3 implemented in sim (2026-10-21); see
+[section 10](#10-what-was-built-phase-0-results-and-decisions) for what changed
+from this draft. Branch `feature/robotics-policy-driven-cell`, cut from `main`
+at `bfad0d4b` (2026-10-20).
 
 ## 1. Why a second robotics example
 
@@ -171,3 +173,41 @@ flowchart TD
   plainly rather than imply a physical grasp.
 - **Runtime**: policy rollouts are slower than kinematic moves; budget each
   step and keep a run under about 10 minutes on a laptop.
+
+## 10. What was built: phase 0 results and decisions
+
+Spike on a laptop CPU (Apple silicon, no GPU), `strands-robots==0.5.3`:
+
+| Robot | Controller | Weights and licence | Result |
+| --- | --- | --- | --- |
+| Unitree G1 | Holosoma locomotion policy (`holosoma` provider, `target_velocity`) | Amazon FAR, Apache-2.0, downloaded on first run and checked by sha256 | Walks 1.9 m in 5 s and stays upright, faster than real time |
+| SO-101 | Inverse-kinematics primitives (`move_to`, `set_gripper`) plus a weld grasp assist | No checkpoint | Lifts the part 149 mm and places it in a bin |
+
+Decisions, answering section 8 with defaults:
+
+1. **CPU only.** Holosoma replaces GR00T WBC: it runs in real time on a CPU and
+   its weights are Apache-2.0, while the WBC checkpoints are under an NVIDIA
+   licence.
+2. **Mobile robot: the G1.** The Yahboom twin and the driver path move to
+   phase 4.
+3. **Scenario changed** from fetch &#8594; pick &#8594; deliver to a sorting
+   job with a safety interlock: the arm refuses to move while a humanoid is
+   inside its exclusion radius. Parts riding on a walking humanoid would need
+   a weld to the pelvis, a second simulator assist; the interlock gives the
+   supervisor a real planning decision instead.
+4. **One MuJoCo world per robot**, in a shared cell frame. A G1 world stepped
+   without its policy falls over, so the humanoid's world advances only while
+   Holosoma runs.
+5. **Steering**: the walk loop sends a base-frame `(vx, vy)` with zero yaw rate
+   in 2 s segments and checks the measured pelvis between segments. Shorter
+   segments did not converge, because the gait restarts on each call.
+6. **One process, no mesh** for v1. **Python 3.12** for this example only.
+7. **Tools** are simpler than the draft in section 5: `observe`,
+   `walk_to(robot, location)`, `pick_and_place(robot, part, bin)` and the
+   operator's `stop_cell`. Each motion returns `accepted`, and the agent polls
+   `observe` for the command record.
+
+Validated: 13 fast tests and the sim test pass, `demo.py rehearse` completes
+in about 20 s, and one live CAO run with Claude Code agents passed the checker
+(see the README). Still open from phase 3: Kiro CLI and Codex runs, recordings,
+and failure-injection scenarios. Phases 4 and 5 are not started.

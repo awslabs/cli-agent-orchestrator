@@ -1,0 +1,22 @@
+[project]
+name = "cao-policy-driven-cell"
+version = "0.1.0"
+description = "Simulation-only work cell where a learned policy and motion primitives move the robots, orchestrated by CAO agents"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+dependencies = [
+    "fastmcp==4.0.11",
+    "httpx2==2.13.1",
+    "pydantic>=2.11,<3",
+    "pyyaml==6.0.3",
+    "strands-robots[sim-mujoco,holosoma]==0.5.3",
+]
+
+[dependency-groups]
+dev = ["pytest==9.1.1"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+markers = ["sim: needs MuJoCo, Strands Robots and the Holosoma weights (slow)"]

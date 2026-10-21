@@ -1,0 +1,62 @@
+{
+  "locations": {
+    "bay": {
+      "x": 1.9,
+      "y": 0.3
+    },
+    "inspection": {
+      "x": 1.2,
+      "y": 1.0
+    },
+    "dock": {
+      "x": 0.6,
+      "y": -0.8
+    }
+  },
+  "humanoids": {
+    "g1": {
+      "model": "unitree_g1",
+      "policy": "holosoma",
+      "start": "bay"
+    }
+  },
+  "arms": {
+    "arm": {
+      "model": "so101",
+      "base": {
+        "x": 2.5,
+        "y": 0.0
+      },
+      "reach_m": 0.4,
+      "exclusion_radius_m": 0.8
+    }
+  },
+  "parts": {
+    "part_a": {
+      "at": {
+        "x": 2.52,
+        "y": -0.34
+      }
+    },
+    "part_b": {
+      "at": {
+        "x": 2.44,
+        "y": -0.33
+      }
+    }
+  },
+  "bins": {
+    "pass_bin": {
+      "x": 2.64,
+      "y": -0.26
+    },
+    "rework_bin": {
+      "x": 2.34,
+      "y": -0.24
+    }
+  },
+  "walk_tolerance_m": 0.25,
+  "bin_tolerance_m": 0.06,
+  "fallen_height_m": 0.55,
+  "walk_budget_s": 40.0
+}
