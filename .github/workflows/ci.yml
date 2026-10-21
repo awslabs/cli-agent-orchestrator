@@ -282,13 +282,21 @@ jobs:
       - name: Check import sorting with isort
         run: uv run isort --check-only src/ test/ examples/robotics/cross-zone-transport/
 
-      - name: Run type checker with mypy
-        run: uv run mypy src/
-        # Pre-existing repo-wide mypy errors (agent_scaffold/profile/
-        # memory_service — unrelated to AG-UI) are tolerated as non-blocking on
-        # main; this PR introduces none. Mirror main's policy so Code Quality
-        # stays green rather than silently making mypy a hard gate here.
-        continue-on-error: true
+      - name: Run type checker with mypy (ratchet)
+        # Issue #1005. This step used to be `uv run mypy src/` with
+        # `continue-on-error: true`, so a red type check blocked nothing and the
+        # repo's 177 pre-existing errors were indistinguishable from 178.
+        #
+        # The ratchet blocks on NEW errors only, measured per file per error code
+        # against the committed `mypy-baseline.json`. Pre-existing errors pass,
+        # counts that fall pass (and the step tells you to bank them with
+        # `--update`), counts that rise fail. The full `mypy src/` output is
+        # echoed to this log before the verdict.
+        #
+        # Deliberately NO `continue-on-error` here: that key is the entire
+        # difference between a gate and a decoration, and
+        # test/scripts/test_mypy_ratchet.py asserts it stays absent.
+        run: uv run python scripts/mypy_ratchet.py
 
   ag-ui-demo:
     name: AG-UI demo (shift-left recording)
