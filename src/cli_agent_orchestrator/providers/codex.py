@@ -18,7 +18,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.base import BaseProvider, ProviderExitedError
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils import agent_profiles
 from cli_agent_orchestrator.utils.mcp_resolution import (
@@ -1901,6 +1901,15 @@ class CodexProvider(BaseProvider):
         self.shell_baseline = await asyncio.to_thread(
             get_backend().get_pane_current_command, self.session_name, self.window_name
         )
+        if not self.shell_baseline:
+            # Said once, here, rather than on every readiness poll: without a
+            # baseline the exit-to-shell checks below and in get_status() have
+            # nothing to compare against and silently stand down (#1018).
+            logger.warning(
+                "Terminal %s: the pane's foreground process could not be read before launching "
+                "codex; an exit to the shell during startup cannot be detected",
+                self.terminal_id,
+            )
 
         # Send a warm-up command before launching codex.
         # Codex exits immediately in freshly-created tmux sessions where the shell
@@ -1964,11 +1973,21 @@ class CodexProvider(BaseProvider):
         # path can't let an assign/handoff paste the orchestrated task into the live login
         # menu -- the same composition hazard PR #539's review flagged for ClaudeCodeProvider's
         # own choice-prompt widening, fixed here the same way rather than left open.
+        #
+        # ``on_poll`` reads the pane's foreground process after every status
+        # poll (#1018): a codex that exits during startup leaves its
+        # `› Error: ...` line and the shell prompt in the pane, the `›` reads
+        # as an idle composer, and the status pipeline had no other way to tell
+        # that frame from a ready one until ``_initialized`` was already true.
+        # The task delivered on that verdict was executed by bash. The hook
+        # raises ProviderExitedError, which ends startup with the real reason
+        # instead of the init timeout, and which no ready status can outvote.
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.WAITING_USER_ANSWER},
             timeout=float(init_timeout),
             polling_interval=1.0,
+            on_poll=self._raise_if_exited_during_startup,
         ):
             # Interpolated, not the old hard-coded "60 seconds": the bound is
             # ``provider_init_timeout``, so an operator who changed it was told
@@ -2016,8 +2035,48 @@ class CodexProvider(BaseProvider):
             ".".join(str(part) for part in version) if any(version) else "(no banner)",
             self._ends_turns_with_footer,
         )
+        # The last word before readiness is declared belongs to the pane's
+        # foreground process, not to the frame: the re-reads above took up to
+        # a few seconds, and the reporter's codex died 150 ms after readiness.
+        await self._raise_if_exited_during_startup()
         self._initialized = True
         return True
+
+    async def _raise_if_exited_during_startup(self) -> None:
+        """Raise ``ProviderExitedError`` if the pane's foreground process is the shell again.
+
+        Awaited by the readiness wait after every status poll and once more
+        before ``_initialized`` is set. A fresh read every time -- never the
+        cached verdict -- because the caller is about to declare the terminal
+        ready and the next thing CAO does with a ready terminal is type the task
+        into it. No baseline (the lookup failed before launch) means no
+        comparison is possible; that case keeps the previous behaviour, and
+        ``initialize()`` has already logged it once.
+        """
+        if not self.shell_baseline:
+            return
+        if not await asyncio.to_thread(self._exited_to_shell, fresh=True):
+            return
+        tail = ""
+        try:
+            output = await asyncio.to_thread(
+                get_backend().get_history, self.session_name, self.window_name
+            )
+            rows = [row for row in strip_terminal_escapes(output or "").splitlines() if row.strip()]
+            tail = " | ".join(row.strip()[:160] for row in rows[-3:])
+        except Exception:  # noqa: BLE001 - the tail is diagnostic only
+            pass
+        logger.error(
+            "Terminal %s: codex exited during startup; the pane is back at the shell (%s). "
+            "Pane tail: %s",
+            self.terminal_id,
+            self.shell_baseline,
+            tail,
+        )
+        raise ProviderExitedError(
+            f"Codex exited during startup; the pane is back at the shell "
+            f"({self.shell_baseline}). Nothing was delivered. Pane tail: {tail}"
+        )
 
     def get_status(self, output: str) -> TerminalStatus:
         return self._get_status(output, rendered=False)
@@ -2050,12 +2109,22 @@ class CodexProvider(BaseProvider):
         # (e.g. "zsh") that was running before we launched codex. Returning
         # ERROR prevents the inbox service from typing a queued message into
         # the shell — which would execute it as arbitrary commands.
+        #
+        # A READY verdict is checked whether or not initialization has
+        # finished (#1018). It is the verdict initialize()'s readiness wait
+        # accepts, and the frame alone cannot be trusted to produce it: a codex
+        # that died during startup leaves `› Error: ...` above the shell prompt,
+        # and that `›` reads as an idle composer. Gating this on
+        # ``_initialized`` meant the one check that could veto the misreading
+        # was switched off for exactly the window in which it was needed, and
+        # the task was typed into bash. Non-ready verdicts keep the gate: before
+        # codex is exec'd the pane IS the shell by construction, nobody acts on
+        # PROCESSING/UNKNOWN, and the read costs a tmux round trip per frame.
+        ready_verdict = status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
         if (
-            self._initialized
-            and self.shell_baseline
-            and self._exited_to_shell(
-                fresh=status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
-            )
+            self.shell_baseline
+            and (self._initialized or ready_verdict)
+            and self._exited_to_shell(fresh=ready_verdict)
         ):
             return TerminalStatus.ERROR
         return status

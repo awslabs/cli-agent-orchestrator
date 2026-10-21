@@ -69,6 +69,30 @@ def frames(*sequence: str):
     return _next
 
 
+def pane_commands(*commands: str):
+    """A ``get_pane_current_command`` side effect that yields ``commands`` then repeats the last.
+
+    Same shape as ``frames``: a bare list exhausted inside ``asyncio.to_thread``
+    hangs the test instead of failing it.
+    """
+    remaining = list(commands)
+
+    def _next(*_args, **_kwargs):
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+    return _next
+
+
+def codex_launched(mock_backend, shell: str = "zsh", cli: str = "codex") -> None:
+    """Model the pane's foreground process across ``initialize()`` (#1018).
+
+    The baseline read sees the shell; every read after the launch sees codex.
+    ``initialize()`` now compares the two during startup, so a MagicMock that
+    answers the same object to both reads looks like a codex that exited.
+    """
+    mock_backend.return_value.get_pane_current_command.side_effect = pane_commands(shell, cli)
+
+
 SETTLED = "OpenAI Codex (v0.98.0)\n› "
 
 
@@ -119,6 +143,7 @@ class TestCodexProviderInitialization:
         self, mock_tmux, mock_wait_shell, mock_wait_status, mock_sleep
     ):
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         # A settled frame (idle composer): the handler returns on its first poll.
         # A banner-only frame would make it poll, with real sleeps, to the 60s cap.
@@ -160,6 +185,7 @@ class TestCodexProviderInitialization:
         self, mock_tmux, mock_wait_shell, mock_wait_status, mock_sleep
     ):
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = False
         mock_tmux.return_value.get_history.return_value = SETTLED
 
@@ -511,6 +537,7 @@ class TestCodexBuildCommand:
         self, mock_tmux, mock_load_profile, mock_wait_shell, mock_wait_status, mock_sleep, tmp_path
     ):
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         # A settled frame: on the bare banner the handler polls to its cap --
         # which, with a MagicMock profile, is float(MagicMock()) == 1.0, so the
@@ -2859,6 +2886,7 @@ class TestCodexProviderTrustPrompt:
     async def test_initialize_with_trust_prompt(self, mock_tmux, mock_wait_shell, mock_wait_status):
         """Test that initialize handles trust prompt during startup."""
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         # The dialog is gone from the frame after its Enter. A frame that never
         # changed would (correctly) run the handler to its cap and fail init.
@@ -2884,6 +2912,7 @@ class TestCodexProviderTrustPrompt:
     ):
         """Test that initialize handles v2 trust prompt (git worktree variant)."""
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         mock_tmux.return_value.get_history.side_effect = frames(
             "Note: You're in a subdirectory of a Git project. Trusting will apply\n"
@@ -2897,7 +2926,6 @@ class TestCodexProviderTrustPrompt:
             "Press enter to continue\n",
             SETTLED,
         )
-        mock_tmux.return_value.get_pane_current_command.return_value = "zsh"
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         with patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock):
@@ -3046,6 +3074,7 @@ class TestCodexProviderTrustPrompt:
         "the session doesn't even start" symptom) before anyone had a real chance to open
         the session and complete login. WAITING_USER_ANSWER must be in the target set."""
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         mock_tmux.return_value.get_history.return_value = SETTLED
 
@@ -3670,6 +3699,7 @@ class TestCodexProviderUpdateDialog:
     ):
         """initialize() sees the update dialog, sends '3'+Enter, then reaches ready."""
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         # frames(), not a bare list: initialize() now reads the pane once more
         # after the readiness wait to check no startup dialog is up, and a list
@@ -4996,8 +5026,15 @@ class TestCodexProviderExitDetection:
         assert status == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
-    def test_get_status_skips_exit_check_before_init(self, mock_tmux):
-        """Exit check skipped before initialization (avoids false ERROR on launch)."""
+    def test_get_status_ready_verdict_before_init_is_vetoed_by_the_pane_command(self, mock_tmux):
+        """A ready-looking frame on a pane whose foreground process is the shell is ERROR.
+
+        This test used to assert the opposite ("exit check gated on
+        _initialized"), and that gate is how #1018 happened: a codex that died
+        during startup left `› Error: ...` above the shell prompt, the `›` read
+        as an idle composer, and nothing could veto it until initialization --
+        which that very verdict completed -- so the task was typed into bash.
+        """
         mock_tmux.return_value.get_native_status.return_value = None
         mock_tmux.return_value.get_pane_current_command.return_value = "zsh"
 
@@ -5007,8 +5044,28 @@ class TestCodexProviderExitDetection:
         output = "OpenAI Codex (v0.98.0)\n› \n"
         status = provider.get_status(output)
 
-        # Should NOT be ERROR — exit check gated on _initialized
-        assert status == TerminalStatus.IDLE
+        assert status == TerminalStatus.ERROR
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_get_status_skips_exit_check_before_init_for_non_ready_verdicts(self, mock_tmux):
+        """Before codex is exec'd the pane IS the shell; a non-ready frame does not read it.
+
+        The gate that remains: between ``send_keys("codex ...")`` and codex's
+        exec the pane command still matches the baseline, and a PROCESSING or
+        UNKNOWN verdict is not one anyone acts on, so it costs no tmux round
+        trip and cannot produce a false ERROR on launch.
+        """
+        mock_tmux.return_value.get_native_status.return_value = None
+        mock_tmux.return_value.get_pane_current_command.return_value = "zsh"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = False
+        provider.shell_baseline = "zsh"
+        output = "echo ready\nready\n% codex --yolo --no-alt-screen\n"
+        status = provider.get_status(output)
+
+        assert status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.ERROR)
+        mock_tmux.return_value.get_pane_current_command.assert_not_called()
 
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_get_status_skips_exit_check_without_baseline(self, mock_tmux):
@@ -5035,9 +5092,9 @@ class TestCodexProviderExitDetection:
     ):
         """Initialize captures shell_baseline for exit detection."""
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         mock_tmux.return_value.get_history.return_value = SETTLED
-        mock_tmux.return_value.get_pane_current_command.return_value = "zsh"
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         await provider.initialize()
@@ -5302,6 +5359,7 @@ class TestCodexInitConfiguredTimeouts:
         # BaseProvider.get_init_timeout reads settings_service directly.
         mock_base_settings.return_value = mock_settings.return_value
         mock_wait_shell.return_value = True
+        codex_launched(mock_backend)
         mock_wait_status.return_value = True
         mock_backend.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
 
@@ -5341,6 +5399,7 @@ class TestCodexInitConfiguredTimeouts:
         # BaseProvider.get_init_timeout reads settings_service directly.
         mock_base_settings.return_value = mock_settings.return_value
         mock_wait_shell.return_value = True
+        codex_launched(mock_backend)
         mock_wait_status.return_value = False  # never reaches a ready status
         mock_backend.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
 
@@ -5590,6 +5649,7 @@ class TestCodexInitHonoursProfileTimeout:
         profile.codexProfile = None
         mock_load_profile.return_value = profile
         mock_wait_shell.return_value = True
+        codex_launched(mock_backend)
         mock_wait_status.return_value = True
         mock_backend.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
 
@@ -6012,6 +6072,7 @@ class TestOuterCapWithADialogUpFailsInitialization:
             "Press enter to continue\n"
         )
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         mock_tmux.return_value.get_history.return_value = update
 
@@ -6037,6 +6098,7 @@ class TestOuterCapWithADialogUpFailsInitialization:
             "  Press enter to continue\n"
         )
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         mock_tmux.return_value.get_history.return_value = login
 
@@ -6124,6 +6186,7 @@ class TestTransitionalIsAStartupOnlyState:
         start the handler's own loop would have ridden out.
         """
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         mock_tmux.return_value.get_history.side_effect = frames(
             self._LOGIN_HEADER_ONLY, self._LOGIN_COMPLETE
@@ -6145,6 +6208,7 @@ class TestTransitionalIsAStartupOnlyState:
         start, exactly as before -- just judged on the last re-read, not the
         first."""
         mock_wait_shell.return_value = True
+        codex_launched(mock_tmux)
         mock_wait_status.return_value = True
         mock_tmux.return_value.get_history.return_value = self._LOGIN_HEADER_ONLY
 

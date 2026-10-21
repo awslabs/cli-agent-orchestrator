@@ -3882,6 +3882,74 @@ def send_input(
     return True
 
 
+def _pane_back_at_shell(provider: Any, metadata: Dict[str, Any]) -> Optional[str]:
+    """Return the shell's name when the pane's foreground process is the pre-launch shell again.
+
+    The baseline is the provider's ``shell_baseline`` (captured by its
+    ``initialize()`` before it launched the CLI) or, for a provider rebuilt after
+    a cao-server restart, the ``shell_command`` persisted with the terminal.
+    With neither there is nothing to compare against and the answer is None:
+    providers that do not record a baseline keep the status-only guard. A
+    failed lookup is also None -- it is not evidence of an exit, and the
+    status guard still applies -- but it is logged, because silently skipping a
+    safety check is how #1018 happened in the first place.
+    """
+    baseline = getattr(provider, "shell_baseline", None) if provider is not None else None
+    if not isinstance(baseline, str) or not baseline:
+        baseline = metadata.get("shell_command")
+    if not isinstance(baseline, str) or not baseline:
+        return None
+    try:
+        current = get_backend().get_pane_current_command(
+            metadata["tmux_session"], metadata["tmux_window"]
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed probe must not block delivery
+        logger.warning(
+            "Could not read the pane's foreground process before delivering input (%r); "
+            "relying on the status guard alone",
+            exc,
+        )
+        return None
+    if isinstance(current, str) and current == baseline:
+        return baseline
+    return None
+
+
+def _refuse_if_provider_gone(terminal_id: str, provider: Any, metadata: Dict[str, Any]) -> None:
+    """Raise ``TerminalInputBlockedError`` unless the terminal can safely receive typed input.
+
+    Called immediately before the keystroke is sent (#1018). Two independent
+    checks, either of which refuses:
+
+    1. The monitor's current status is ERROR -- the same guard that already ran
+       at the top of ``dispatch_input``, re-read now because the first read is
+       stale by the time we type (the reporter measured 150 ms between readiness
+       and ERROR, and 700 ms more before the send).
+    2. The pane's foreground process is the shell that was running before the
+       CLI launched. This does not consult the provider's own ``get_status`` or
+       its ``_initialized`` flag, so it holds during startup, after a restart,
+       and for every provider that records a baseline, whatever its frame parser
+       made of the pane.
+    """
+    if status_monitor.get_status(terminal_id) == TerminalStatus.ERROR:
+        raise TerminalInputBlockedError(
+            f"Terminal {terminal_id} provider is in ERROR state "
+            "(provider process may have exited). Refusing to deliver input."
+        )
+    shell = _pane_back_at_shell(provider, metadata)
+    if shell is not None:
+        logger.error(
+            "Terminal %s: the pane's foreground process is the shell (%s) that was running "
+            "before the provider launched; the provider has exited. Refusing to deliver input.",
+            terminal_id,
+            shell,
+        )
+        raise TerminalInputBlockedError(
+            f"Terminal {terminal_id} is a bare shell ({shell}): the provider process has "
+            "exited and typed input would be executed as commands. Refusing to deliver input."
+        )
+
+
 def dispatch_input(
     terminal_id: str,
     message: str,
@@ -3974,6 +4042,19 @@ def dispatch_input(
         # internal <cao-memory> block that we paste into the TUI.
         original_message = message
         message = inject_memory_context(message, terminal_id, frozen_memory)
+
+        # THE LAST CHECK BEFORE TYPING (#1018). The status read above is now
+        # one memory-service call old, and it was only ever the monitor's
+        # cached verdict: the reporter's log shows the terminal flipping to
+        # ERROR 150 ms after readiness and the task being typed 700 ms later
+        # regardless. Re-read the status, and -- independently of any status
+        # and of whether the provider finished initializing -- compare the
+        # pane's foreground process with the shell that was running before the
+        # CLI launched. A pane whose foreground process is that shell again is
+        # a bare shell, and bash executes every line pasted into it. Everything
+        # between here and send_keys is in-memory bookkeeping, so a refusal
+        # here leaves no half-recorded dispatch behind.
+        _refuse_if_provider_gone(terminal_id, provider, metadata)
 
         # Check how many Enter keys the provider needs after paste
         enter_count = provider.paste_enter_count if provider else 1

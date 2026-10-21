@@ -6,7 +6,7 @@ import logging
 import re
 import time
 import uuid
-from typing import Callable, Optional, Union
+from typing import Awaitable, Callable, Optional, Union
 
 from cli_agent_orchestrator.constants import API_BASE_URL, SESSION_PREFIX
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -181,6 +181,8 @@ async def wait_until_status(
     target_status: "TerminalStatus | set[TerminalStatus]",
     timeout: float = 30.0,
     polling_interval: float = 1.0,
+    *,
+    on_poll: Optional[Callable[[], Awaitable[None]]] = None,
 ) -> bool:
     """Wait until terminal reaches target status by polling status_monitor.
 
@@ -194,6 +196,14 @@ async def wait_until_status(
     status_monitor.py), and on herdr it shells out to the herdr CLI. Offload each poll via
     asyncio.to_thread so that blocking I/O can't fork/exec on the shared event loop —
     matches the pattern GET /terminals/{id} (api/main.py) uses for the identical hazard.
+
+    ``on_poll`` is awaited after every status read and BEFORE the read is acted
+    on. It is how a caller abandons the wait for a reason the status cannot
+    express: a provider's ``initialize()`` passes its exit-to-shell check so a
+    CLI that dies during startup ends the wait with that fact instead of
+    burning the whole timeout (#1018) -- and so a ready status read from a pane
+    that is a bare shell is vetoed before this function can return True on it.
+    The hook aborts by raising; whatever it raises propagates unchanged.
     """
     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
@@ -205,6 +215,8 @@ async def wait_until_status(
     start = time.time()
     while time.time() - start < timeout:
         current = await asyncio.to_thread(status_monitor.get_status, terminal_id)
+        if on_poll is not None:
+            await on_poll()
         if current in targets:
             logger.info(f"wait_until_status [{terminal_id}]: reached {current.value}")
             return True
