@@ -57,7 +57,7 @@ dependencies = [
     # "session not found" — this bound is the belt to that suspenders, keeping
     # the broken releases from arriving silently on another machine. Raise it
     # once upstream zips non-strict or pads short rows.
-    "libtmux>=0.51.0,<0.53.1",
+    "libtmux>=0.51.0,<0.62.1",
     "click>=8.2.0",
     "python-dotenv>=1.2.2",
     "python-frontmatter>=1.1.0",
@@ -114,7 +114,7 @@ dependencies = [
 # provides RunAgentInput, EventEncoder, and the typed event models. When
 # absent the /agui/v1/run route returns 501 with an install hint.
 agui = [
-    "ag-ui-protocol>=0.1.19,<0.2.0",
+    "ag-ui-protocol>=0.1.19,<1.1.0",
 ]
 # Opt-in OpenTelemetry GenAI telemetry (telemetry/). The base install stays
 # lean: telemetry/otel.py no-ops when the SDK is absent, matching the

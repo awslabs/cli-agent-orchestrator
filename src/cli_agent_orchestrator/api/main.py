@@ -9280,6 +9280,145 @@ async def create_outcome_endpoint(
     return {"success": True, "outcome": outcome}
 
 
+class LessonCreateBody(BaseModel):
+    """A retrospective lesson destined for a NAMED profile's agent scope.
+
+    Unlike ``/internal/memory/store`` this route takes no ``terminal_context``:
+    the target scope is an argument (``target_agent_profile``), and the
+    caller's PROFILE is resolved here from its terminal record rather than
+    accepted as a tool argument, so a caller cannot simply name the profile it
+    wants to authorize as. ``source_terminal_id`` itself is still
+    client-chosen, same as ``POST /outcomes`` — this route does not bind the
+    caller to a request-authenticated principal, it only stops the capability
+    list from coming from the agent process.
+    """
+
+    target_agent_profile: str
+    content: str
+    # Lenient for the same reason as InternalMemoryStoreRequest.key: the MCP
+    # tool has always let MemoryService._sanitize_key normalize the key, and a
+    # strict reject here would 422 calls that used to succeed in-process.
+    key: Optional[LenientMemoryKey] = None
+    tags: str = ""
+    source_terminal_id: Optional[str] = None
+
+
+@app.post("/lessons")
+async def create_lesson_endpoint(
+    body: LessonCreateBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Any:
+    """Write a retrospective lesson into a named agent profile's scope.
+
+    The write path for ``store_lesson``, which used to instantiate
+    ``MemoryService()`` in the AGENT's process — so it failed outright for any
+    agent that does not share a filesystem with cao-server, and it decided the
+    learning gate locally, where an unreadable ``settings.json`` resolves to
+    "disabled" and ``skills/cao-learning`` tells agents to skip a ``disabled``
+    payload SILENTLY. Both gates now live here: ``_require_learning_enabled``
+    answers 404 (opted out, carrying ``LEARNING_DISABLED_CODE``) or 503
+    (settings unreadable), which the tool translates without inventing a
+    configuration story for a filesystem fault.
+
+    Cross-agent writes stay privileged: permanent ``feedback`` memory injected
+    into another agent's future sessions. The caller's profile is read from its
+    terminal record and must declare the ``store_lesson`` capability. Writing
+    to the caller's OWN scope needs no capability — that grants nothing beyond
+    ``memory_store(scope="agent")``.
+    """
+    from cli_agent_orchestrator.services.memory_service import (
+        MemoryDisabledError,
+        MemoryPartialWriteError,
+    )
+    from cli_agent_orchestrator.services.outcome_service import LEARNING_DISABLED_MESSAGE
+    from cli_agent_orchestrator.utils.agent_profiles import profile_declares_capability
+
+    # No separate _require_memory_enabled(): learning_status() already ANDs
+    # memory.enabled, so a disabled memory subsystem answers here with the
+    # learning gate's own discriminator rather than a bare "Memory system is
+    # disabled" 404 the tool could not tell from a missing route.
+    _require_learning_enabled()
+
+    target = (body.target_agent_profile or "").strip()
+    if not target:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="target_agent_profile is required"
+        )
+
+    # Fail closed: a resolved caller identity is REQUIRED. Accepting an
+    # anonymous caller would let anything with a write scope put permanent
+    # feedback into any profile's scope.
+    if not body.source_terminal_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="source_terminal_id is required to authorize a lesson write",
+        )
+    record = await asyncio.to_thread(get_terminal_metadata, body.source_terminal_id)
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"calling terminal {body.source_terminal_id!r} is not registered",
+        )
+    caller_profile = record.get("agent_profile")
+
+    if target != caller_profile:
+        try:
+            authorized = profile_declares_capability(caller_profile, "store_lesson")
+        except RuntimeError as e:
+            # A fault reading the profile STORE, not a known "no" — the same
+            # distinction _require_learning_enabled draws for settings.json.
+            # Answering 403 here would be this issue's own bug: a filesystem
+            # fault reported as a confident policy decision.
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"could not read profile {caller_profile!r} to authorize the write: {e}",
+            )
+        if not authorized:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"caller profile {caller_profile!r} is not authorized to store lessons "
+                    f"for {target!r}: cross-agent lesson writes require the 'store_lesson' "
+                    "capability in the caller's profile frontmatter"
+                ),
+            )
+
+    # agent_profile is the TARGET so resolve_scope_id lands the lesson in the
+    # worker's scope; the provenance fields still identify the actual caller.
+    lesson_context = {
+        "terminal_id": record["id"],
+        "session_name": record.get("tmux_session"),
+        "provider": record.get("provider"),
+        "agent_profile": target,
+    }
+    try:
+        memory = await _get_memory_service().store(
+            content=body.content,
+            scope=MemoryScope.AGENT.value,
+            memory_type=MemoryType.FEEDBACK.value,
+            key=body.key,
+            tags=body.tags,
+            terminal_context=lesson_context,
+        )
+    except MemoryPartialWriteError as error:
+        return _memory_partial_write_response(error)
+    except MemoryDisabledError:
+        # Race: the gate passed and memory was switched off before the write
+        # landed. LEARNING_DISABLED_MESSAGE rather than the memory message so
+        # the discriminator the tool matches on does not depend on which of the
+        # two gates fired (same reasoning as POST /outcomes).
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=LEARNING_DISABLED_MESSAGE)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return {
+        "success": True,
+        "key": memory.key,
+        "scope": memory.scope,
+        "scope_id": memory.scope_id,
+        "target_agent_profile": target,
+    }
+
+
 @app.get("/outcomes")
 async def list_outcomes_endpoint(
     session_name: Optional[str] = None,
