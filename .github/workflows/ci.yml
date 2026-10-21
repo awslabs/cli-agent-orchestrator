@@ -137,8 +137,8 @@ jobs:
       # web_ui/ build output), so running it on 3.10/3.11/3.12 would assert the same thing
       # three times and build the web UI three times to do it. It also keeps the repo's
       # primary test gate free of an npm-registry dependency. Follows the `CAO MCP Apps`
-      # job's existing in-file pattern: a Node build plus setup-uv/uv sync plus ONE
-      # targeted pytest file.
+      # job's existing in-file pattern: a Node build plus setup-uv/uv sync plus targeted
+      # pytest files.
       #
       # SCOPE: the pytest step names its files EXPLICITLY, so it closes the gap for THOSE
       # FILES and not for the class. Another web_ui-dependent test added elsewhere under
@@ -163,7 +163,7 @@ jobs:
       # other install site in this file passes both flags. Plain `uv sync` omits it and
       # yields ~58 spurious agui collection failures.
       - name: Install Python deps (for the wheel-contents packaging test)
-        run: uv sync --all-extras --dev
+        run: uv sync --locked --all-extras --dev
 
       - name: "Wheel-contents regression test (issues #610, #705)"
         # The skip-guard is the load-bearing half. test_wheel_contents.py SKIPS when the
@@ -180,8 +180,8 @@ jobs:
         # the repo root. The sibling steps in this job set `working-directory: web`; adding
         # it here would fail with `ModuleNotFoundError: No module named 'test'`.
         #
-        # Only this one file: the full suite already runs in `Unit Tests`, and the wheel
-        # build here is ~2s, so duplicating the suite would be pure waste.
+        # Only these two files: the full suite already runs in `Unit Tests`, and the
+        # wheel build here is ~2s, so duplicating the suite would be pure waste.
         run: |
           uv run python -c 'import test.test_wheel_contents as t; raise SystemExit(0 if t.web_ui_build_is_complete() else 1)' || {
             echo "The built web UI under src/cli_agent_orchestrator/web_ui/ is absent or incomplete" >&2
