@@ -235,6 +235,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-zero for a task the server goes on to deliver. A 4xx still fails at once,
   and a timeout after failed polls says the message may already have been
   delivered.
+- `cao session send`, the headless `cao launch` run, `cao worker send` and
+  `cao worker attach` no longer lose the agent's reply when one status poll
+  fails while they wait (#1016). The same rule as #882 applies: a connection
+  error, a read timeout, a 5xx or a reply that is not JSON is retried until the
+  send timeout, a 4xx fails at once, and a timeout after failed polls names the
+  last error. Broker errors from `FleetClient` now keep their HTTP status, so a
+  worker's 404 still fails at once.
 - Audit all tracked npm, Bun, uv, and Cargo dependency graphs in every CI run
   and weekly, including development dependencies and unfixed advisories. Block
   every HIGH/CRITICAL finding and scan error, and publish complete inventory and
