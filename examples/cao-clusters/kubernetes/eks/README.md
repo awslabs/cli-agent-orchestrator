@@ -164,8 +164,9 @@ Code from public registries and carries `entrypoint.sh`, which runs
 `cao init`, installs the profiles named in `CAO_INSTALL_PROFILES`, and execs
 `cao-server`. Nothing out-of-tree is required to reproduce it.
 
-Its base is Wolfi (`cgr.dev/chainguard/wolfi-base`, pinned by digest), not
-Debian. Amazon Inspector, which scans the image in ECR, reports a package
+Its runtime base is Wolfi (`cgr.dev/chainguard/wolfi-base`, pinned by digest),
+not Debian. `python:3.12-slim` only builds CAO's wheel, in a stage whose files
+do not ship. Amazon Inspector, which scans the image in ECR, reports a package
 vulnerability until the distribution ships a fixed build of it, and Debian 13
 had none for the curl, expat and zlib findings that the `python:3.12-slim`-based
 image carried (two critical, five high). Each build upgrades Wolfi's packages

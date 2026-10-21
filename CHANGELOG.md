@@ -71,7 +71,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cao-bridge` that cannot remove its readiness file exits rather than stay
   Ready while disconnected. Commands for a terminal name its session, so a
   command that outlived its terminal never reaches a newer one reusing the id,
-  and a hello lists at most 1024 terminals.
+  and a hello lists at most 1024 terminals. A launch that would take a
+  runtime past that many answers `429`, counting launches in flight. The
+  image installs `tini`, which the runtime pod runs as PID 1 to reap the
+  processes agents leave. `cao-bridge` logs at INFO to stderr, so
+  `kubectl logs` shows its connects and reconnects, and the warnings every
+  launch and delete used to log (a status for a terminal placed nowhere yet,
+  a row expected to be missing) are gone. The image checks the kiro-cli
+  archive's published sha256 before running its installer.
   `CAO_LOCAL_EXECUTION=0` stops the server starting agents
   itself, and `CAO_RUNTIME_LAUNCH_TIMEOUT` bounds a launch. An EKS example is
   in `examples/cao-clusters/kubernetes/remote-runtime/`. See
@@ -122,8 +129,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - The EKS example image (`examples/cao-clusters/kubernetes/eks/Dockerfile`)
-  builds on Wolfi (`cgr.dev/chainguard/wolfi-base`, pinned by digest) instead
-  of `python:3.12-slim`. Amazon Inspector reported two critical and five high
+  ships a Wolfi runtime base (`cgr.dev/chainguard/wolfi-base`, pinned by
+  digest) instead of `python:3.12-slim`, which now only builds CAO's wheel in
+  a stage that does not ship. Amazon Inspector reported two critical and five high
   findings on the Debian 13 image (curl, expat, zlib, gnupg2), none with a
   fixed build in Debian; the Wolfi image scanned with none. Node and npm come
   from the distribution rather than NodeSource, so no gnupg is installed, and

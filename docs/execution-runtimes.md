@@ -153,9 +153,13 @@ retried until the runtime confirms it (see [Commands](#commands)).
   starting, as it can with anything else the token is trusted with (below).
   A readiness file it cannot write only logs a warning: the runtime then
   reads not Ready while connected.
-- A hello lists at most 1024 terminals; a larger one is refused (close code
-  1002), so one hello cannot make the server start unbounded work. The bound
-  is per hello: reconnects are not rate-limited, so a token holder can still
+- A hello lists at most 1024 terminals; the server refuses a larger one
+  (close code 1002), so one hello cannot make the server start unbounded
+  work. `cao-bridge` never sends one: a runtime running more logs an error
+  and retries until enough are stopped. So a runtime runs at most 1024
+  terminals: a launch past that, counting launches in flight, answers `429`
+  (and `cao-bridge` itself refuses one, `502`). The bound on hellos is per
+  hello: reconnects are not rate-limited, so a token holder can still
   make the server start up to 1024 cleanups each time it reconnects.
 - The token is read once from `CAO_RUNTIME_TOKEN_FILE`, or from
   `CAO_RUNTIME_TOKEN`; both are then removed from the process environment.
@@ -213,6 +217,9 @@ retried until the runtime confirms it (see [Commands](#commands)).
   PTY WebSocket refuses one (close code `4004`).
 - The memory context added to a remote terminal's first input is resolved
   in the runtime, not from the server's memory store.
+- Agents on one runtime are not isolated from one another: they run as the
+  same user, in the same filesystem, and can read the runtime token. To keep
+  workers apart, give each its own runtime (one terminal per runtime).
 - A restarted `cao-bridge` process does not re-attach to tmux panes that
   outlived it, as a restarted `cao-server` does not for its local terminals.
   What follows depends on what the restarted bridge's hello lists:

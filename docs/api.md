@@ -219,8 +219,9 @@ strings. See [Control Planes](control-planes.md) for operator-facing choices.
   server has no token.
 - `POST /runtimes/{runtime_id}/terminals` launches a terminal in a connected
   runtime (`agent_profile`, optional `provider` and `working_directory`) and
-  returns `201` with the terminal. Like `GET /runtimes`, it takes the API
-  bearer when authentication is on.
+  returns `201` with the terminal, or `429` when the runtime already runs (or
+  is launching) 1024 terminals, the most its hello may list. Like
+  `GET /runtimes`, it takes the API bearer when authentication is on.
 - `GET /runtimes` lists the connected runtimes and the terminals placed on
   them.
 - With `CAO_LOCAL_EXECUTION=0`, routes that would start an agent beside the

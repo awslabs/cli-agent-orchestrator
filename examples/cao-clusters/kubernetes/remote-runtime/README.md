@@ -42,6 +42,16 @@ kustomize edit set image cao-node=<registry>/<repository>:<tag>
 
 ## Deploy
 
+The server's state volume uses the `gp3` StorageClass. A fresh EKS cluster,
+including one from [`../eks/iac/`](../eks/iac/), has only `gp2`, so create
+`gp3` first if it is missing, or the server stays Pending:
+
+```bash
+kubectl get storageclass gp3 || kubectl apply -f ../eks/storageclass-gp3.yaml
+```
+
+Then:
+
 ```bash
 kubectl apply -f namespace.yaml
 kubectl -n cao-remote create secret generic cao-runtime-token \
@@ -57,11 +67,33 @@ The runtime is Ready while its channel to the server is up. If `cao-bridge`
 cannot remove its readiness file once the channel goes, it exits, and so does
 each restart until the file can be removed.
 
-Claude Code on Bedrock needs AWS credentials in the runtime pod. Give the
-`cao-runtime` service account an IAM role that allows `bedrock:InvokeModel*`
-(see the annotation in `runtime.yaml`, and
-[Provider credentials](../eks/README.md#provider-credentials)). `mock_cli`
-needs no credentials.
+Claude Code on Bedrock needs AWS credentials in the runtime pod: an IAM role
+that allows `bedrock:InvokeModel*`, given to the `cao-runtime` service account
+in the `cao-remote` namespace. Either way works, and both work with the pod's
+`automountServiceAccountToken: false`:
+
+- EKS Pod Identity (needs the `eks-pod-identity-agent` add-on, and a role that
+  trusts `pods.eks.amazonaws.com`):
+
+  ```bash
+  aws eks create-pod-identity-association --cluster-name <cluster> \
+    --namespace cao-remote --service-account cao-runtime --role-arn <role-arn>
+  ```
+
+  The stack template in [`../eks/iac/`](../eks/iac/) creates associations for
+  the `../eks/` example's service accounts only, none for `cao-remote` or
+  `cao-runtime`: create this one yourself.
+- IRSA, on a cluster with an IAM OIDC provider (the stack template creates
+  none): uncomment the role annotation in `runtime.yaml`.
+
+See [Provider credentials](../eks/README.md#provider-credentials).
+`mock_cli` needs no credentials.
+
+Every agent on a runtime runs as the same user, in the same filesystem, and
+can read the runtime token (see
+[Security](../../../../docs/execution-runtimes.md#security)): agents on one
+runtime are not isolated from one another. To keep workers apart, give each
+its own runtime (one terminal per runtime); this example runs one runtime.
 
 ## Drive it
 
@@ -101,10 +133,18 @@ the token gets `401`.
 
 ## Cleanup
 
+Note the server's volume first: `gp3` from `../eks/storageclass-gp3.yaml`
+retains volumes, so deleting the claim leaves the PersistentVolume and its EBS
+volume behind, still billed.
+
 ```bash
+PV=$(kubectl -n cao-remote get pvc state-cao-server-0 -o jsonpath='{.spec.volumeName}')
+VOL=$(kubectl get pv $PV -o jsonpath='{.spec.csi.volumeHandle}')
 kubectl delete -k .
+kubectl delete pv $PV
+aws ec2 delete-volume --volume-id $VOL   # once it reads "available"
 ```
 
-This deletes the namespace too, and with it both token Secrets. The server's
-state volume uses the `gp3` storage class; if that class retains volumes,
-delete the released PersistentVolume as well.
+This deletes the namespace too, and with it both token Secrets. On a cluster
+where `gp3` deletes volumes (`reclaimPolicy: Delete`), `kubectl delete -k .`
+is enough.
