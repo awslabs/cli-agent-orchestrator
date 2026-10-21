@@ -45,6 +45,7 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId, TerminalStatus
 from cli_agent_orchestrator.plugins import PostCreateSessionEvent, PostCreateTerminalEvent
 from cli_agent_orchestrator.runtime_channel.protocol import (
+    MAX_HELLO_TERMINALS,
     PROTOCOL_VERSION,
     CommandType,
     Hello,
@@ -87,6 +88,11 @@ UNRECORDED_RETRY_MAX_DELAY = 60.0
 _unrecorded: Dict[RuntimeConnection, Set[str]] = {}
 # Likewise for launch settlements that outlive a cancelled request.
 _settlements: Set["asyncio.Task[Dict[str, Any]]"] = set()
+#: The most terminals a runtime may run: its hello must list every one, so a
+#: launch past this would leave it unable ever to hello again.
+MAX_RUNTIME_TERMINALS = MAX_HELLO_TERMINALS
+# Launches admitted on each runtime and not yet recorded or undone.
+_launching: Dict[str, int] = {}
 
 
 #: Seconds a launch may take, from the command to the runtime's result.
@@ -746,6 +752,26 @@ async def launch_on_runtime(
             detail=f"runtime {runtime_id} is not connected",
         )
 
+    # Admitted before the rows are read, and counted until the launch is
+    # recorded or undone: a launch that settles during the read was counted
+    # in flight, its row then read, or both. So concurrent launches can
+    # never take a runtime past the bound (at worst one is refused early).
+    _launching[runtime_id] = _launching.get(runtime_id, 0) + 1
+    in_flight = _launching[runtime_id]
+    admitted = False
+    try:
+        recorded = len(await asyncio.to_thread(list_terminal_ids_on_runtime, runtime_id))
+        if recorded + in_flight > MAX_RUNTIME_TERMINALS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"runtime {runtime_id} already runs {recorded} terminal(s), and "
+                f"{in_flight - 1} more are launching: at most {MAX_RUNTIME_TERMINALS}",
+            )
+        admitted = True
+    finally:
+        if not admitted:
+            _settle_admission(runtime_id)
+
     sent = asyncio.Event()
 
     async def launch_and_settle() -> Dict[str, Any]:
@@ -779,6 +805,7 @@ async def launch_on_runtime(
     operation = asyncio.ensure_future(launch_and_settle())
     _settlements.add(operation)
     operation.add_done_callback(_settlements.discard)
+    operation.add_done_callback(lambda done: _settle_admission(runtime_id))
     operation.add_done_callback(lambda done: done.cancelled() or done.exception())
     try:
         return await asyncio.shield(operation)
@@ -789,6 +816,15 @@ async def launch_on_runtime(
             # arrive; its late result is then deleted as an unrecorded launch.)
             operation.cancel()
         raise
+
+
+def _settle_admission(runtime_id: str) -> None:
+    """A launch on ``runtime_id`` was recorded, undone or refused."""
+    left = _launching.get(runtime_id, 0) - 1
+    if left > 0:
+        _launching[runtime_id] = left
+    else:
+        _launching.pop(runtime_id, None)
 
 
 @router.get("/runtimes")

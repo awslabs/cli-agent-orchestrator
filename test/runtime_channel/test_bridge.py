@@ -334,6 +334,21 @@ class TestExecute:
             await _bridge().execute(_command(CommandType.INPUT, session="cao-old", message="hi"))
 
     @pytest.mark.asyncio
+    async def test_a_launch_past_what_a_hello_may_list_is_refused(self, monkeypatch):
+        import cli_agent_orchestrator.clients.database as database
+        from cli_agent_orchestrator.runtime_channel.protocol import MAX_HELLO_TERMINALS
+
+        rows = [{"id": f"{n:08x}"} for n in range(MAX_HELLO_TERMINALS)]
+        monkeypatch.setattr(database, "list_all_terminals", lambda: rows)
+
+        async def create_terminal(**kwargs):
+            pytest.fail("launched past the bound")
+
+        monkeypatch.setattr(terminal_service, "create_terminal", create_terminal)
+        with pytest.raises(RuntimeError, match=f"at most {MAX_HELLO_TERMINALS}"):
+            await _bridge().execute(_command(CommandType.LAUNCH, None, agent_profile="developer"))
+
+    @pytest.mark.asyncio
     async def test_a_command_for_the_same_session_runs(self, monkeypatch):
         import cli_agent_orchestrator.clients.database as database
 
@@ -937,6 +952,46 @@ class TestConnection:
         bridge.stop()  # SIGTERM
         await asyncio.wait_for(running, 2)
         assert len(attempts) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_runtime_running_more_than_a_hello_may_list_says_so(self, monkeypatch, caplog):
+        # Before #834's admission bound such a runtime retried forever, logging
+        # only "runtime channel lost"; now nothing is sent, and the log says why.
+        from cli_agent_orchestrator.runtime_channel.bridge import TooManyTerminals
+        from cli_agent_orchestrator.runtime_channel.protocol import MAX_HELLO_TERMINALS
+
+        class NothingSent:
+            async def send(self, text):
+                pytest.fail("an oversized hello was sent")
+
+        bridge = _bridge()
+        bridge._current_statuses = lambda: {
+            f"{n:08x}": TerminalStatus.IDLE for n in range(MAX_HELLO_TERMINALS + 1)
+        }
+        with pytest.raises(TooManyTerminals, match="more than a hello may list"):
+            await bridge.serve(NothingSent())
+
+        attempts = []
+
+        class Connected:
+            async def __aenter__(self):
+                attempts.append(1)
+                return NothingSent()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(bridge_mod, "connect", lambda *args, **kwargs: Connected())
+        monkeypatch.setattr(bridge_mod, "BACKOFF_INITIAL", 0.01)
+        running = asyncio.ensure_future(bridge.run())
+        await asyncio.sleep(0.2)
+        bridge.stop()
+        await asyncio.wait_for(running, 5)
+        assert len(attempts) >= 2, "it keeps retrying, in case terminals are stopped"
+        assert any(
+            r.levelname == "ERROR" and "more than a hello may list" in r.getMessage()
+            for r in caplog.records
+        )
 
     @pytest.mark.asyncio
     async def test_a_server_speaking_another_version_is_fatal(self, tmp_path):

@@ -30,6 +30,7 @@ from websockets.uri import parse_uri
 from cli_agent_orchestrator.constants import CAO_HOME_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.runtime_channel.protocol import (
+    MAX_HELLO_TERMINALS,
     PROTOCOL_VERSION,
     RUNTIME_ID_PATTERN,
     Command,
@@ -62,6 +63,11 @@ class ChannelRefused(Exception):
 class ReadinessStuck(Exception):
     """The readiness file could not be removed: kept, it reports this runtime
     Ready with no channel to the server. Stopping fails closed."""
+
+
+class TooManyTerminals(Exception):
+    """This runtime runs more terminals than a hello may list, so it cannot
+    hello. It retries, in case some are stopped meanwhile."""
 
 
 class UnreportedLaunch(RuntimeError):
@@ -259,6 +265,17 @@ class Bridge:
 
         payload = command.payload
         if command.type == CommandType.LAUNCH:
+            from cli_agent_orchestrator.clients.database import list_all_terminals
+
+            # The server bounds launches too; this also covers terminals it
+            # does not know of yet. One more would leave this runtime unable
+            # ever to hello again.
+            running = len(await asyncio.to_thread(list_all_terminals))
+            if running >= MAX_HELLO_TERMINALS:
+                raise RuntimeError(
+                    f"this runtime already runs {running} terminals: at most "
+                    f"{MAX_HELLO_TERMINALS}"
+                )
             profile = payload["agent_profile"]
             provider = payload.get("provider") or resolve_provider(profile, DEFAULT_PROVIDER)
             terminal = await terminal_service.create_terminal(
@@ -358,6 +375,11 @@ class Bridge:
         self._handshaking = ws
         try:
             statuses = await asyncio.to_thread(self._current_statuses)
+            if len(statuses) > MAX_HELLO_TERMINALS:
+                raise TooManyTerminals(
+                    f"this runtime runs {len(statuses)} terminals, more than a hello "
+                    f"may list ({MAX_HELLO_TERMINALS}); stop some here to reconnect"
+                )
             await ws.send(
                 encode(
                     Hello(
@@ -426,6 +448,8 @@ class Bridge:
                 logger.warning("runtime channel rejected: %s", exc)
             except asyncio.CancelledError:
                 raise
+            except TooManyTerminals as exc:
+                logger.error("cannot connect to the server: %s", exc)
             except Exception as exc:  # noqa: BLE001 - network errors are retried
                 logger.warning("runtime channel lost: %s", exc)
             helloed_at = self._helloed_at

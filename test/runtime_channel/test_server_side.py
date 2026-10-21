@@ -2403,6 +2403,72 @@ class TestLaunchMetadata:
         assert reported["engine"] == "kas"
 
 
+class TestLaunchAdmission:
+    def test_a_launch_past_the_runtimes_bound_is_refused_before_it_is_sent(
+        self, http, start_runtime, monkeypatch
+    ):
+        # Its hello must list every terminal it runs: one past the bound and
+        # cao-bridge could never hello again.
+        monkeypatch.setattr(server_mod, "MAX_RUNTIME_TERMINALS", 2)
+        _remote_row("abcd0001", "rt-1", session="cao-one")
+        _remote_row("abcd0002", "rt-1", session="cao-two")
+        launches = []
+
+        def script(command):
+            if command.type == CommandType.LAUNCH:
+                launches.append(command)
+            return _answer(command)
+
+        start_runtime(script=script)
+        response = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
+        assert response.status_code == 429, response.text
+        assert "at most 2" in response.json()["detail"]
+        assert launches == [], "the launch was never sent"
+        assert not server_mod._launching, "a refused launch is not counted"
+
+    def test_a_runtime_below_its_bound_still_launches(self, http, start_runtime, monkeypatch):
+        monkeypatch.setattr(server_mod, "MAX_RUNTIME_TERMINALS", 2)
+        _remote_row("abcd0001", "rt-1", session="cao-one")
+        start_runtime(script=_answer)
+        response = http.post("/runtimes/rt-1/terminals", json={"agent_profile": "developer"})
+        assert response.status_code == 201, response.text
+        assert not server_mod._launching, "a recorded launch is no longer counted"
+
+    @pytest.mark.asyncio
+    async def test_a_launch_in_flight_counts_against_the_bound(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from fastapi import HTTPException
+
+        monkeypatch.setattr(server_mod, "MAX_RUNTIME_TERMINALS", 1)
+        registry = server_mod.runtime_registry
+        sent = []
+
+        async def send_text(text):
+            sent.append(decode(text))
+
+        conn = registry.register("rt-1", send_text)
+        registry.activate(conn)
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(plugin_registry=None)))
+        body = server_mod.LaunchRequest(agent_profile="developer")
+        first = asyncio.ensure_future(server_mod.launch_on_runtime("rt-1", body, request))
+        for _ in range(100):
+            if sent:
+                break
+            await asyncio.sleep(0.01)
+        assert sent, "the first launch was sent"
+        # No row yet: the first is still starting its agent, and is counted.
+        with pytest.raises(HTTPException) as refused:
+            await server_mod.launch_on_runtime("rt-1", body, request)
+        assert refused.value.status_code == 429
+        (launch,) = sent
+        conn.resolve(Result(op_id=launch.op_id, ok=False, error="no agent"))
+        with pytest.raises(HTTPException) as failed:
+            await first
+        assert failed.value.status_code == 502
+        assert not server_mod._launching, "a failed launch is no longer counted"
+
+
 class TestLocalCapacity:
     def test_remote_terminals_do_not_count_against_the_local_cap(self, monkeypatch):
         from cli_agent_orchestrator.services import terminal_service as ts
