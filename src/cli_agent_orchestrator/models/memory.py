@@ -166,6 +166,14 @@ class Memory(BaseModel):
     token_estimate: Optional[int] = Field(
         default=None, description="Approximate recall token count"
     )
+    redacted_patterns: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Names of secret patterns whose matches were replaced by "
+            "[REDACTED:<pattern>] before this content left the vault read "
+            "boundary (#644). Pattern names only; never the matched bytes."
+        ),
+    )
     action: Optional[str] = Field(
         default=None,
         exclude=True,

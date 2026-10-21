@@ -8759,6 +8759,7 @@ async def vault_status_endpoint(
                 "process_local_unmapped_project_identities": item.process_local_unmapped_project_identities,
                 "process_local_non_writable_write_refusals": item.process_local_non_writable_write_refusals,
                 "process_local_secret_gate_write_refusals": item.process_local_secret_gate_write_refusals,
+                "secret_acceptances": dict(item.secret_acceptances),
             }
             for item in get_vault_status(config, vault_id=vault_id)
         ],

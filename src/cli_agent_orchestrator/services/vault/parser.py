@@ -14,14 +14,21 @@ from cli_agent_orchestrator.models.relationship import (
     VALID_STATUSES,
     VALID_TYPES,
 )
-from cli_agent_orchestrator.services.secret_gate import scan_for_secrets
+from cli_agent_orchestrator.services.secret_gate import pattern_names, scan_for_secrets
 from cli_agent_orchestrator.services.vault.findings import FindingCode, finding_severity
 from cli_agent_orchestrator.services.vault.identity import validate_cao_key
 
 MAX_CAO_LINKS = 64
 MAX_CAO_LINK_TARGET_CHARS = 256
-_CAO_FIELDS = frozenset({"key", "type", "managed", "links"})
+MAX_CAO_SECRET_OK = 64
+_CAO_FIELDS = frozenset({"key", "type", "managed", "links", "secret_ok"})
 _CAO_LINK_FIELDS = frozenset({"to", "type", "status", "origin", "confidence"})
+# One acceptance names one finding: the pattern that fired and the SHA-256 of
+# the exact span it matched. Both members are required and nothing else is
+# allowed, so a bare ``secret_ok: true`` or a pattern-only entry is an invalid
+# cao block and the note is quarantined rather than silently trusted (#644).
+_CAO_SECRET_OK_FIELDS = frozenset({"pattern", "sha256"})
+_SHA256_HEX_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
 @dataclass(frozen=True)
@@ -203,6 +210,41 @@ def _validate_cao(cao: dict[str, Any]) -> None:
         raise ValueError("cao.links must be a list of at most 64 objects")
     for link in links or ():
         _validate_cao_link(link)
+    if "secret_ok" in cao:
+        _validate_secret_ok(cao["secret_ok"])
+
+
+def _validate_secret_ok(value: Any) -> None:
+    """Refuse every acceptance shape except a list of ``{pattern, sha256}`` objects."""
+    if not isinstance(value, list) or len(value) > MAX_CAO_SECRET_OK:
+        raise ValueError(
+            "cao.secret_ok must be a list of at most 64 {pattern, sha256} objects; "
+            "a boolean or a bare pattern name is not an acceptance"
+        )
+    known = set(pattern_names())
+    for entry in value:
+        if not isinstance(entry, dict) or set(entry) != _CAO_SECRET_OK_FIELDS:
+            raise ValueError("cao.secret_ok entries must have exactly pattern and sha256")
+        if not isinstance(entry["pattern"], str) or entry["pattern"] not in known:
+            raise ValueError("cao.secret_ok[].pattern must name a known secret pattern")
+        if not isinstance(entry["sha256"], str) or not _SHA256_HEX_RE.match(entry["sha256"]):
+            raise ValueError("cao.secret_ok[].sha256 must be 64 lowercase hex characters")
+
+
+def secret_acceptances(cao: Any) -> tuple[tuple[str, str], ...]:
+    """Return the validated ``(pattern, sha256)`` pairs of a ``cao`` block.
+
+    Fail-closed: anything that does not validate yields no acceptances, so a
+    read-time caller that sees frontmatter edited after reconcile redacts
+    everything rather than honouring a malformed entry.
+    """
+    if not isinstance(cao, dict) or "secret_ok" not in cao:
+        return ()
+    try:
+        _validate_secret_ok(cao["secret_ok"])
+    except ValueError:
+        return ()
+    return tuple((entry["pattern"], entry["sha256"]) for entry in cao["secret_ok"])
 
 
 def _validate_cao_link(link: Any) -> None:

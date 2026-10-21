@@ -5,6 +5,10 @@ the supplied content against a fixed, ordered list of named regexes and
 returns the NAME of the first matching pattern (or ``None`` if clean).
 ``redact_secrets`` replaces every match of every pattern with a
 ``[REDACTED:<name>]`` marker for the export ``--redact`` path (#345, D5).
+``redact_secrets_with_acceptances`` is the same cascade with a per-finding
+allowlist: a match whose ``(pattern name, sha256 of the matched span)`` pair
+is accepted passes raw, every other match is redacted (#644 AC10, the vault
+``secret_gate: "warn"`` chokepoint in ``services/vault/reader.py``).
 
 ``scan_for_secrets`` is used ONLY to reject credentials on
 ``scope="federated"`` writes — the machine-wide shared tier. This is a
@@ -12,9 +16,11 @@ heuristic deny-list, not entropy scoring; it errs toward catching common
 credential shapes.
 """
 
+import hashlib
 import re
 import unicodedata
-from typing import Any, Dict, List, Optional, Pattern, Tuple
+from dataclasses import dataclass
+from typing import Any, Collection, Dict, List, Optional, Pattern, Tuple
 
 # Ordered (name, compiled_regex) pairs. First match wins, so ordering is
 # stable and reproducible across calls. No entropy scoring. Vendor-specific
@@ -330,6 +336,83 @@ def redact_secrets(content: str) -> Tuple[str, List[str]]:
         if count:
             fired.append(name)
     return content, fired
+
+
+def pattern_names() -> Tuple[str, ...]:
+    """The ordered names of every credential pattern the gate knows.
+
+    This is the public view of the pattern table: the vault acceptance
+    validator refuses an acceptance naming a pattern that is not here, and the
+    parametrised redaction tests iterate it so a pattern added to the table is
+    covered without anyone remembering to add a test case.
+    """
+    return tuple(name for name, _pattern in _SECRET_PATTERNS)
+
+
+def span_sha256(span: str) -> str:
+    """Fingerprint of one matched span: lowercase hex SHA-256 of its UTF-8 bytes.
+
+    This is the value an operator writes into a vault note's
+    ``cao.secret_ok[].sha256`` to accept one specific finding. It is bound to
+    the exact bytes the pattern matched, so editing the credential, or a new
+    credential of the same shape appearing in the note, invalidates it.
+    """
+    return hashlib.sha256(span.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class SecretMatch:
+    """One pattern match met during a redaction cascade, content-free.
+
+    ``accepted`` is True when the caller's allowlist named this exact
+    ``(pattern, sha256)`` pair and the span was therefore left in place.
+    """
+
+    pattern: str
+    sha256: str
+    accepted: bool
+
+
+def redact_secrets_with_acceptances(
+    content: str, accepted: Collection[Tuple[str, str]]
+) -> Tuple[str, Tuple[SecretMatch, ...]]:
+    """:func:`redact_secrets` with a per-finding allowlist.
+
+    ``accepted`` holds ``(pattern_name, sha256)`` pairs as produced by
+    :func:`span_sha256` over the matched span. A match whose pair is present
+    is kept verbatim and reported with ``accepted=True``; every other match is
+    replaced by ``[REDACTED:<name>]`` exactly as :func:`redact_secrets` does.
+    With an empty allowlist the redacted text is identical to
+    ``redact_secrets(content)[0]``; a test asserts this over the pattern table.
+
+    The allowlist is deliberately pair-shaped. A pattern-only or boolean
+    acceptance would silently pass every future credential of that shape in
+    the note, so neither exists here: a caller that wants to accept a finding
+    must know the bytes it is accepting.
+
+    The cascade runs patterns in order over the progressively redacted text, so
+    the fingerprint of a later match is computed over text in which earlier,
+    non-accepted matches are already markers. The same function computes the
+    fingerprints the operator is shown and the ones the chokepoint checks, so
+    the two cannot drift.
+    """
+    if not content:
+        return content, ()
+    if _INVISIBLE.search(content):
+        content = _strip_invisible_inside_matches(content)
+    allow = {(str(name), str(digest)) for name, digest in accepted}
+    matches: List[SecretMatch] = []
+    for name, pattern in _SECRET_PATTERNS:
+
+        def _replace(match: "re.Match[str]", name: str = name) -> str:
+            span = match.group(0)
+            digest = span_sha256(span)
+            is_accepted = (name, digest) in allow
+            matches.append(SecretMatch(name, digest, is_accepted))
+            return span if is_accepted else f"[REDACTED:{name}]"
+
+        content = pattern.sub(_replace, content)
+    return content, tuple(matches)
 
 
 def redact_json_leaves(node: Any) -> Any:

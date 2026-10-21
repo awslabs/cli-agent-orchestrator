@@ -13,6 +13,10 @@ from typing import Optional
 from cli_agent_orchestrator.services.memory_reconciliation import (
     _first_symlink_component,
 )
+from cli_agent_orchestrator.services.secret_gate import (
+    SecretMatch,
+    redact_secrets_with_acceptances,
+)
 from cli_agent_orchestrator.services.vault.boundary import (
     is_excluded_relpath,
     is_supported_relpath,
@@ -26,6 +30,7 @@ from cli_agent_orchestrator.services.vault.parser import (
     ParseResult,
     classify_secret,
     parse_note,
+    secret_acceptances,
 )
 
 # Bounds the aggregate bytes opened in one scan even when independent config
@@ -195,6 +200,9 @@ def scan_vault(
         )
         if secret is not None:
             findings += (ScanFinding(secret[0], secret[2], secret[1]),)
+        findings += _acceptance_findings(
+            parsed, secret_gate=candidate.mapping.secret_gate, has_secret=secret is not None
+        )
 
         quarantined = any(finding.severity == "error" for finding in findings)
         notes.append(
@@ -544,6 +552,56 @@ def _sync_conflict_name(filename: str) -> bool:
         or lowered.endswith(".icloud")
         or lowered.startswith(".~lock.")
     )
+
+
+def _acceptance_findings(
+    parsed: ParseResult, *, secret_gate: str, has_secret: bool
+) -> tuple[ScanFinding, ...]:
+    """Report every ``cao.secret_ok`` entry: honoured per span, or inert and why.
+
+    The record is never silent (#644 AC10): an acceptance that passes raw bytes
+    is a ``secret_accepted`` finding per span, and one that matches nothing, or
+    sits on a ``reject`` mapping where acceptances are not honoured, is a
+    ``secret_acceptance_unmatched`` warning so the operator removes it or
+    changes the mapping. Details carry pattern names only, never bytes.
+    """
+    accepted = secret_acceptances(parsed.cao)
+    if not accepted:
+        return ()
+    findings: list[ScanFinding] = []
+    if secret_gate != "warn":
+        for pattern, _digest in accepted:
+            findings.append(
+                ScanFinding(
+                    FindingCode.SECRET_ACCEPTANCE_UNMATCHED,
+                    f"{pattern}: mapping secret_gate is not warn",
+                    finding_severity(FindingCode.SECRET_ACCEPTANCE_UNMATCHED, secret_gate="reject"),
+                )
+            )
+        return tuple(findings)
+    matches: tuple[SecretMatch, ...] = ()
+    if has_secret:
+        _text, matches = redact_secrets_with_acceptances(parsed.region.body, accepted)
+    honoured = {(m.pattern, m.sha256) for m in matches if m.accepted}
+    for match in matches:
+        if match.accepted:
+            findings.append(
+                ScanFinding(
+                    FindingCode.SECRET_ACCEPTED,
+                    match.pattern,
+                    finding_severity(FindingCode.SECRET_ACCEPTED, secret_gate="reject"),
+                )
+            )
+    for pattern, digest in accepted:
+        if (pattern, digest) not in honoured:
+            findings.append(
+                ScanFinding(
+                    FindingCode.SECRET_ACCEPTANCE_UNMATCHED,
+                    f"{pattern}: no current span matches",
+                    finding_severity(FindingCode.SECRET_ACCEPTANCE_UNMATCHED, secret_gate="reject"),
+                )
+            )
+    return tuple(findings)
 
 
 def _parse_findings(parsed: ParseResult) -> tuple[ScanFinding, ...]:

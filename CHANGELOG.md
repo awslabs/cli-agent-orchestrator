@@ -732,6 +732,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Vault `secret_gate: "warn"` no longer forwards raw secret matches to a model** (#644 AC10).
+  Under `warn` a secret-bearing note is still indexed and recallable, but every match is replaced by
+  `[REDACTED:<pattern_name>]` at the single vault read chokepoint, so automatic injection, explicit
+  recall, related-key expansion and BM25 ranking all see the marker, never the bytes. Raw bytes pass
+  only when the note's frontmatter carries a per-finding acceptance bound to the pattern name and the
+  SHA-256 of the matched span (`cao.secret_ok: [{pattern, sha256}]`); a boolean or pattern-only entry
+  quarantines the note. `cao memory vault scan --fingerprints` prints the values an acceptance needs;
+  `cao memory vault status` reports honoured acceptances (`secret_acceptances`, `secret_accepted`) and
+  inert ones (`secret_acceptance_unmatched`). The config-load warning for `warn` with `inject: true`
+  is retired because the pairing no longer carries exposure. `reject` is unchanged.
+  **Migration:** operators who relied on `warn` passing raw bytes to agents must add a per-finding
+  acceptance to each note for each span they want served raw; until then those spans are redacted.
+
 - New `Actions Security` CI job runs zizmor 1.30.1 over `.github/` on every PR
   and push to `main`, failing on Medium-or-higher findings. Accepted findings
   are listed with reasons in `.github/zizmor.yml` (checkout credential
