@@ -124,6 +124,75 @@ jobs:
         run: npm run build
         working-directory: web
 
+      # =================================================================================
+      # WHEEL-CONTENTS GATE (issues #610, #705) — this job is the ONLY place in CI where
+      # test/test_wheel_contents.py can execute at all.
+      #
+      # `Unit Tests` runs pytest but never builds the web UI, and this job built the web UI
+      # but ran no pytest. test_wheel_contents.py is gated on the built web UI existing, so
+      # dropped into `Unit Tests` it reports SKIPPED in all three legs and no job in the
+      # workflow runs it. Here it runs exactly once.
+      #
+      # WHY HERE and not in `Unit Tests`: the property under test is Python-version
+      # independent (does hatchling's `[tool.hatch.build] artifacts` glob cover the whole
+      # web_ui/ build output), so running it on 3.10/3.11/3.12 would assert the same thing
+      # three times and build the web UI three times to do it. It also keeps the repo's
+      # primary test gate free of an npm-registry dependency. Follows the `CAO MCP Apps`
+      # job's existing in-file pattern: a Node build plus setup-uv/uv sync plus targeted
+      # pytest files.
+      #
+      # SCOPE: the pytest step names its files EXPLICITLY, so it closes the gap for THOSE
+      # FILES and not for the class. Another web_ui-dependent test added elsewhere under
+      # test/ would still skip in `Unit Tests` and would not be collected here; wiring it
+      # in means naming it in this step too.
+      #
+      # test_hatch_artifacts_guard.py is listed alongside it, but is NOT dependent on this
+      # job: it never skips, so `Unit Tests` already runs it on 3.10/3.11/3.12. It is named
+      # here because this is the only job where `web_ui/` exists on disk, which is the only
+      # place its whole-directory wheel assertion can cover THAT root rather than skipping it.
+      # =================================================================================
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # `--all-extras --dev`, not plain `uv sync`: `agui` is an optional extra and every
+      # other install site in this file passes both flags. Plain `uv sync` omits it and
+      # yields ~58 spurious agui collection failures.
+      - name: Install Python deps (for the wheel-contents packaging test)
+        run: uv sync --locked --all-extras --dev
+
+      - name: "Wheel-contents regression test (issues #610, #705)"
+        # The skip-guard is the load-bearing half. test_wheel_contents.py SKIPS when the
+        # built web UI is absent, and a skip keeps this job GREEN — the same false
+        # assurance the test exists to remove. `npm run build` exiting 0 while writing an
+        # incomplete tree is a failure this step exists to catch, so assert the
+        # precondition instead of trusting it.
+        #
+        # The guard calls `web_ui_build_is_complete()` from the test module rather than
+        # re-testing paths in shell: one source of truth, and it checks index.html AND
+        # every asset index.html loads (#705), not just the entry point.
+        #
+        # That import resolves `test` from the CURRENT DIRECTORY, so this step must stay at
+        # the repo root. The sibling steps in this job set `working-directory: web`; adding
+        # it here would fail with `ModuleNotFoundError: No module named 'test'`.
+        #
+        # Only these two files: the full suite already runs in `Unit Tests`, and the
+        # wheel build here is ~2s, so duplicating the suite would be pure waste.
+        run: |
+          uv run python -c 'import test.test_wheel_contents as t; raise SystemExit(0 if t.web_ui_build_is_complete() else 1)' || {
+            echo "The built web UI under src/cli_agent_orchestrator/web_ui/ is absent or incomplete" >&2
+            echo "after 'npm run build' (index.html missing, or it references assets that were" >&2
+            echo "not written). test/test_wheel_contents.py would SKIP rather than run, leaving" >&2
+            echo "this job green with the packaging assertion unexecuted (issues #610, #705)." >&2
+            exit 1
+          }
+          uv run pytest test/test_wheel_contents.py test/test_hatch_artifacts_guard.py --no-cov -q
+
   aidlc-portfolio-example:
     name: AI-DLC Portfolio Example
     runs-on: ubuntu-latest
