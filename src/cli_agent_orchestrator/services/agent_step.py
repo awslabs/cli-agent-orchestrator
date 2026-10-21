@@ -32,8 +32,9 @@ from cli_agent_orchestrator.models.kiro_engine import KiroEngine, parse_kiro_eng
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
+from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
-from cli_agent_orchestrator.services import frozen_run_memory, terminal_service
+from cli_agent_orchestrator.services import frozen_run_memory, launch_guard, terminal_service
 from cli_agent_orchestrator.services.provider_error_classifier import (
     classify_provider_error,
 )
@@ -588,6 +589,11 @@ async def run_agent_step(
     terminal_id = reuse_terminal_id
 
     if created_here:
+        await asyncio.to_thread(
+            launch_guard.check,
+            (env_vars or {}).get("CAO_WORKFLOW_RUN_ID"),
+            agent,
+        )
         # Inherit working directory from supervisor when not explicitly set.
         # Without this, a handoff worker starts in the cao-server process CWD
         # instead of the supervisor's project directory. Best-effort: if
@@ -800,9 +806,12 @@ async def run_agent_step(
         last_message = await asyncio.to_thread(
             terminal_service.get_output, terminal_id, OutputMode.LAST
         )
-    except BaseException:
+    except BaseException as exc:
         if teardown and created_here:
             await _best_effort_teardown(terminal_id, registry)
+        if isinstance(exc, OutputExtractionError):
+            # Keep rejection subtypes distinct: the prefix is context, not a retry.
+            raise type(exc)(f"terminal {terminal_id}: {exc}") from exc
         raise
 
     # In-band provider-error classification (issue #638). The transport succeeded

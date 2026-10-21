@@ -279,6 +279,28 @@ NEW_TUI_SPINNER_PATTERN = r"[✶✢✽✻✳·*][^\n]*ing…"
 # ("* Remember to deploy…") or the version footer ("· latest: … update…")
 # sitting directly above the box from being misread as a live spinner.
 NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+\w*ing\b.*…")
+# Live spinner under Claude Code's prefersReducedMotion setting (GH #908): the
+# animated glyph is replaced by a static "●", e.g. "● Leavening… (running
+# UserPromptSubmit hook)" or "● Sublimating… (12s · ↓ 300 tokens)". "●" is also
+# the response marker, so the glyph alone proves nothing, and the message before
+# the ellipsis can be anything: a default verb ("Dilly-dallying", "Beboppin'"),
+# a custom spinnerVerbs entry, or the in-progress task's activeForm ("Running
+# the test suite"). Anchor on the status in the parentheses instead, which only
+# the spinner prints: it opens with the hook suffix ("running … hook"), the
+# elapsed time ("12s", "1m 3s"), the token count ("↓ 300 tokens"), "thinking" /
+# "thought for Ns", or the older "esc to interrupt". A response like
+# "● Analyzing… the diff is fine" and the tool-call line
+# "● Calling cao-mcp-server… (ctrl+o to expand)" do not match.
+_REDUCED_MOTION_STATUS = (
+    r"(?:running[ \t][^)\n]*\bhooks?\b"
+    r"|\d+(?:\.\d+)?[smhd]\b"
+    r"|(?:[↓↑][ \t]*)?[\d.,]+[kmb]?[ \t]+tokens\b"
+    r"|thinking\b|thought[ \t]+for\b"
+    r"|esc[ \t]+to[ \t]+interrupt\b)"
+)
+REDUCED_MOTION_SPINNER_PATTERN = re.compile(
+    r"^[ \t]*●[ \t]+[^\n]*…[ \t]+\(" + _REDUCED_MOTION_STATUS, re.MULTILINE
+)
 
 
 class ClaudeCodeProvider(BaseProvider):
@@ -1060,14 +1082,19 @@ class ClaudeCodeProvider(BaseProvider):
             # summary. Treating that tail as completed mis-reports an active
             # MCP call as COMPLETED (and the StatusMonitor ready-latch then
             # pins it until the next input).
-            if _last_summary is not None and not re.search(
-                r"[✶✢✽✻✳·*][ \t]+\w*ing\b[^\n]*…", _tail[_last_summary.end() :]
+            _after_summary = _tail[_last_summary.end() :] if _last_summary else ""
+            if (
+                _last_summary is not None
+                and not re.search(r"[✶✢✽✻✳·*][ \t]+\w*ing\b[^\n]*…", _after_summary)
+                and not REDUCED_MOTION_SPINNER_PATTERN.search(_after_summary)
             ):
                 _boxless_completion_tail = True
         if _sep_positions and not _boxless_completion_tail:
             pre_sep_lines = output[: _sep_positions[-1]].rstrip("\n").split("\n")
             for line in reversed(pre_sep_lines):
-                if re.search(r"[✶✢✽✻✳·][^\n]*\u2026", line):
+                if re.search(
+                    r"[✶✢✽✻✳·][^\n]*\u2026", line
+                ) or REDUCED_MOTION_SPINNER_PATTERN.search(line):
                     return TerminalStatus.PROCESSING  # spinner before another separator
                 if _sep_re.search(line):
                     break  # hit another separator first -- spinner is from a completed task
@@ -1191,7 +1218,9 @@ class ClaudeCodeProvider(BaseProvider):
                     or EFFORT_FOOTER_LINE_PATTERN.match(line)
                 ):
                     continue
-                if NEW_TUI_BOX_SPINNER_PATTERN.search(line):
+                if NEW_TUI_BOX_SPINNER_PATTERN.search(
+                    line
+                ) or REDUCED_MOTION_SPINNER_PATTERN.search(line):
                     return TerminalStatus.PROCESSING
                 break
             # No spinner is drawn while text streams; see NEW_TUI_BOX_SUMMARY_PATTERN.
@@ -1366,7 +1395,10 @@ class ClaudeCodeProvider(BaseProvider):
         # then latches and starves InboxService (delivers only on IDLE/COMPLETED).
         # The raw get_status() path already switched to the tight pattern for the
         # same reason; the screen path must match.
-        if any(NEW_TUI_BOX_SPINNER_PATTERN.search(ln) for ln in bottom):
+        if any(
+            NEW_TUI_BOX_SPINNER_PATTERN.search(ln) or REDUCED_MOTION_SPINNER_PATTERN.search(ln)
+            for ln in bottom
+        ):
             return TerminalStatus.PROCESSING
 
         bottom_joined = "\n".join(bottom)

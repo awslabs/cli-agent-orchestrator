@@ -20,9 +20,13 @@ reaches its data over the REST surface only.
 """
 
 import json as _json
+import os
+import pathlib
+import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import click
 
@@ -32,6 +36,7 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_EVENTS_CONNECT_TIMEOUT,
     WORKFLOW_EVENTS_MAX_RECONNECTS,
     WORKFLOW_EVENTS_READ_TIMEOUT,
+    WORKFLOW_NAME_RE,
     WORKFLOW_POLL_INTERVAL_SECONDS,
     WORKFLOW_RUN_REQUEST_TIMEOUT,
     WORKFLOW_STEP_REQUEST_TIMEOUT,
@@ -44,20 +49,395 @@ from cli_agent_orchestrator.utils.workflow_events import SseFrame, parse_sse_fra
 _TERMINAL_RUN_STATES = frozenset({"completed", "failed", "cancelled"})
 
 
-def _extract_detail(response: api_http.Response, fallback: str) -> str:
-    """Pull the FastAPI ``detail`` string out of an error response."""
+def _authentication_failure_detail(
+    response: api_http.Response,
+    auth_headers: dict[str, str] | None,
+) -> str | None:
+    """Explain a 401 without exposing the configured credential."""
+    if response.status_code != 401:
+        return None
+    if auth_headers:
+        return (
+            "cao-server rejected the configured local authentication credential; "
+            "replace CAO_AUTH_LOCAL_TOKEN with a valid token"
+        )
+    return (
+        "cao-server requires authentication; configure CAO_AUTH_LOCAL_TOKEN "
+        "with a token for this server"
+    )
+
+
+def _render_lint_findings(findings: object) -> str:
+    """Render a 422 ``findings`` body into one human-readable line per finding.
+
+    All FOUR ``LintFinding`` fields, because ``line`` is a REQUIRED 1-based anchor (FR-2.3) and
+    dropping it would discard the field the finding exists to provide.
+
+    NEVER echoes source. ``_echo_spec_result`` records the reason and it applies verbatim here: "a spec
+    may contain credentials the operator pasted by mistake, and terminal output is the easiest place for
+    that to leak." A finding names a line so the AUTHOR can look -- the finding locates, the author
+    reads.
+
+    DUPLICATED, deliberately, with ``utils/orchestration.py::_render_lint_findings``.
+    ``render_findings`` returns ``List[dict]`` rather than strings and there is no shared renderer to
+    reuse, so unifying would mean the CLI importing orchestration internals or a new module, for two
+    call sites. The trigger for consolidating is a THIRD caller, not a second -- the same call Bolt 2
+    made for its never-raises git wrapper.
+    """
+    if not isinstance(findings, list):
+        return ""
+    lines = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        lines.append(
+            f"{finding.get('severity', '?')} {finding.get('rule_id', '?')} "
+            f"at line {finding.get('line', '?')}: {finding.get('message', '')}"
+        )
+    return "; ".join(lines)
+
+
+def _approval_refusal_envelope(response: api_http.Response) -> dict | None:
+    """Return the MCP-compatible JSON envelope for an approval refusal, if present."""
     try:
         body = response.json()
-        if isinstance(body, dict) and "detail" in body:
-            return str(body["detail"])
     except ValueError:
-        pass
+        return None
+    if not isinstance(body, dict):
+        return None
+    detail = body.get("detail")
+    if not isinstance(detail, dict):
+        return None
+
+    kind = detail.get("kind")
+    if kind not in ("approval_required", "plan_identity_unavailable"):
+        return None
+    message = detail.get("message")
+    refusal = {
+        "ok": False,
+        "class": kind,
+        "plan_id": detail.get("plan_id"),
+        "error": (
+            message if isinstance(message, str) and message else f"status {response.status_code}"
+        ),
+    }
+    if kind == "approval_required" and refusal["plan_id"]:
+        refusal["error"] = _approval_refusal_message(refusal)
+    return refusal
+
+
+def _approval_refusal_message(refusal: dict) -> str:
+    """Turn an approval refusal into a message that names the next action, or "" if not one.
+
+    Issue #583 Bolt 3 (``authoring-sequence``) -- the APPROVE step of FR-10's sequence. A 403 here is
+    not a permission problem to escalate: a ``plan_id`` is computed at RUN START, so the first run of a
+    new or changed plan is refused BY DESIGN, and the remedy is one command a human runs.
+
+    THE TWO KINDS GET DIFFERENT REMEDIES AND MUST NOT BE CONFLATED:
+
+    * ``approval_required`` -> present the identifier and command as the human operator's action,
+      and STOP. There is deliberately no retry: a loop around a human authorisation gate is a bypass by
+      repetition.
+    * ``plan_identity_unavailable`` -> CAO could not complete its own freeze. There is NO identifier to
+      approve, so presenting an approval prompt would send someone looking for a plan to grant when the
+      correct action is to retry.
+
+    Returns "" when the body is not a refusal, so the caller falls back to its ordinary error path --
+    including against an OLDER server that still sends a string ``detail``.
+    """
+    kind = refusal["class"]
+    message = refusal["error"]
+    if kind == "plan_identity_unavailable":
+        return (
+            f"{message}\n"
+            "No plan identifier could be computed, so there is nothing to approve. "
+            "The reason above says what to change."
+        )
+    if kind == "approval_required":
+        plan_id = refusal["plan_id"]
+        if not plan_id:
+            return ""
+        command = f"cao workflow approve {plan_id}"
+        if (
+            command not in message
+            or "human approval" not in message
+            or "Approve it with" in message
+        ):
+            message = (
+                f"Plan '{plan_id}' needs human approval before it can run: "
+                + f"an operator approves it with `{command}`, then runs it again."
+            )
+        footer = "Approval is a human decision; an agent must not grant it."
+        if not message.endswith(footer):
+            message += "\n" + footer
+        return str(message)
+    return ""
+
+
+def _extract_detail(response: api_http.Response, fallback: str) -> str:
+    """Pull a human-readable message out of a FastAPI error response.
+
+    ``detail`` IS NOT ALWAYS A STRING on this API, and the object arm is why this function changed at
+    issue #583 Bolt 3 (``authoring-sequence``). Two object shapes exist, and the set is CLOSED --
+    check ``api/main.py`` before adding a third, because a third shape is a third body contract:
+
+    * ``{kind, plan_id, message}`` -- an approval refusal (403) or a failed freeze (503).
+    * ``{findings: [...]}`` -- a 422 lint failure on the run path.
+
+    THE PREVIOUS VERSION RETURNED ``str(body["detail"])``, which for an object printed a Python dict
+    repr at a human. That is the LOUD failure of the two readers; the MCP server's equivalent fell
+    through to its fallback and lost the identifier silently.
+
+    THE STRING ARM IS PERMANENT, NOT LEGACY -- removing it would not be a cleanup. Most of this API
+    still returns a string ``detail``; only three routes carry an object, for one condition each.
+
+    A ``list`` FALLS THROUGH, and that shape is live rather than hypothetical: FastAPI's own
+    request-validation errors produce ``{"detail": [{"loc": ..., "msg": ...}]}``. Subscripting one with
+    a string key raises, so the ``isinstance`` ladder is what keeps an unfamiliar shape a fallback
+    instead of a traceback.
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        return fallback
+    if not isinstance(body, dict):
+        return fallback
+    detail = body.get("detail")
+    if isinstance(detail, dict):
+        message = detail.get("message")
+        if isinstance(message, str) and message:
+            return message
+        rendered = _render_lint_findings(detail.get("findings"))
+        return rendered or fallback
+    if isinstance(detail, str) and detail:
+        return detail
     return fallback
+
+
+#: HTTP status -> the refusal class carried in the ``--json`` error envelope for the authoring verbs
+#: (issue #583 Bolt 3, ``authoring-cli-verbs``). A CLOSED set: the classes exist so a script can branch
+#: without parsing prose, which is why exit codes stay uniform at 1 rather than growing a private
+#: taxonomy the other thirteen verbs do not have.
+_AUTHORING_ERROR_CLASSES = {
+    400: "invalid_request",
+    404: "not_found",
+}
+
+
+def _emit_json_failure(envelope: dict) -> None:
+    """Write exactly one JSON failure document to stdout, then preserve exit status 1."""
+    click.echo(_json.dumps(envelope, indent=2))
+    raise click.exceptions.Exit(1)
+
+
+def _quoted_workflow_name(name: str, as_json: bool) -> str:
+    """Validate a bare workflow name and return its URL-safe path segment."""
+    if re.fullmatch(WORKFLOW_NAME_RE, name):
+        return quote(name, safe="")
+
+    message = f"invalid workflow name '{name}': must match [A-Za-z0-9_-]{{1,64}}"
+    if as_json:
+        _emit_json_failure(
+            {
+                "ok": False,
+                "class": "invalid_request",
+                "message": message,
+            }
+        )
+    raise click.ClickException(message)
+
+
+def _authoring_failure(
+    response: api_http.Response,
+    as_json: bool,
+    fallback: str,
+    operation: str,
+    auth_headers: dict[str, str] | None = None,
+) -> "click.ClickException":
+    """Build the exception for a refused authoring call, honouring ``--json``.
+
+    Exit stays 1 for every class (matching every other ``cao workflow`` verb); the machine-readable
+    distinction rides the envelope instead. Create and update use the same vocabulary as MCP:
+    ``already_exists`` and ``stale_hash`` respectively. Lint failures arrive as 400 invalid-request
+    responses; there is no live authoring 422 branch.
+    """
+    detail = _authentication_failure_detail(response, auth_headers) or _extract_detail(
+        response, fallback
+    )
+    if not as_json:
+        return click.ClickException(detail)
+    error_class = _AUTHORING_ERROR_CLASSES.get(response.status_code, "error")
+    if response.status_code == 409:
+        error_class = "already_exists" if operation == "create" else "stale_hash"
+    envelope = {
+        "ok": False,
+        "class": error_class,
+        "status": response.status_code,
+        "message": detail,
+    }
+    _emit_json_failure(envelope)
+    raise AssertionError("unreachable")
+
+
+def _auth_not_configured(
+    exc: api_http.AuthNotConfiguredError, as_json: bool
+) -> "click.ClickException":
+    """Report an authentication refusal without labelling the server unreachable."""
+    if as_json:
+        _emit_json_failure({"ok": False, "class": "auth_not_configured", "message": str(exc)})
+    return click.ClickException(str(exc))
+
+
+def _unreachable(exc: Exception, as_json: bool) -> "click.ClickException":
+    """A transport failure is not a refusal, and must not read like one.
+
+    The operator's action differs completely — start the server versus fix the spec — so this carries
+    its own class rather than being folded into the refusal set above.
+    """
+    if not as_json:
+        return click.ClickException(f"could not reach cao-server: {exc}")
+    _emit_json_failure(
+        {"ok": False, "class": "unreachable", "message": f"could not reach cao-server: {exc}"}
+    )
+    raise AssertionError("unreachable")
+
+
+def _echo_spec_result(record: dict, as_json: bool, verb: str) -> None:
+    """Report a successful create/update.
+
+    The ``content_hash`` is printed deliberately: ``update`` REQUIRES an ``--expected-hash``, so handing
+    the new one back is what keeps the next call a one-liner instead of forcing a ``cao workflow get``
+    in between. The SOURCE is never echoed — a spec may contain credentials the operator pasted by
+    mistake, and terminal output is the easiest place for that to leak.
+    """
+    if as_json:
+        click.echo(_json.dumps({**record, "ok": True}, indent=2))
+        return
+    click.echo(f"{verb} {record['name']}")
+    click.echo(f"  path: {record.get('path')}")
+    click.echo(f"  hash: {record.get('content_hash')}")
+    rendered_findings = _render_lint_findings(record.get("findings"))
+    if rendered_findings:
+        click.echo(f"  {rendered_findings}")
 
 
 @click.group()
 def workflow():
     """Author and inspect CAO workflow specs."""
+
+
+@workflow.command(name="create", short_help="Create a Python workflow spec.")
+@click.argument("name")
+@click.option(
+    "--from-file",
+    "from_file",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="Path to the Python source for the new spec.",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
+def create_cmd(name, from_file, as_json):
+    """Create a NEW workflow spec named NAME from a Python source file.
+
+    Refuses to overwrite an existing spec — use `cao workflow update` for that. Python only; a
+    YAML-tier name is refused with a message naming the restriction.
+
+    The source is sent as TEXT and the SERVER decides where it lands: validation, the lint gate, path
+    containment, the atomic write and the index update all happen there. This command opens exactly one
+    file — the one you named — and never touches the spec directory itself.
+
+    Prints the new spec's `content_hash`, which is what `cao workflow update` will want next.
+
+    Exit codes:
+      0  created
+      1  refused, or the request errored (`--json` carries a machine-readable class)
+    """
+    try:
+        source = pathlib.Path(from_file).read_text()
+    except (OSError, ValueError) as e:
+        raise click.ClickException(f"could not read {from_file}: {e}")
+
+    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
+    try:
+        response = api_http.post(
+            f"{API_BASE_URL}/workflows",
+            json={"name": name, "source": source},
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
+    except api_http.exceptions.RequestException as e:
+        raise _unreachable(e, as_json)
+
+    if response.status_code not in (200, 201):
+        # The server's own message is surfaced verbatim rather than replaced by a generic phrase: the
+        # over-cap refusal names the actual byte limit, and the YAML refusal names the restriction.
+        # Substituting "invalid request" here would throw away the only actionable part.
+        raise _authoring_failure(
+            response, as_json, f"status {response.status_code}", "create", auth_headers
+        )
+
+    _echo_spec_result(response.json(), as_json, "created")
+
+
+@workflow.command(name="update", short_help="Update a Python workflow spec.")
+@click.argument("name")
+@click.option(
+    "--from-file",
+    "from_file",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="Path to the replacement Python source.",
+)
+@click.option(
+    "--expected-hash",
+    "expected_hash",
+    required=True,
+    help="The content_hash you believe the spec currently has (see `cao workflow get`).",
+)
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
+def update_cmd(name, from_file, expected_hash, as_json):
+    """Replace an EXISTING workflow spec's source, refusing a stale update.
+
+    Refuses to create — use `cao workflow create` for that.
+
+    `--expected-hash` IS REQUIRED AND IS NEVER COMPUTED FOR YOU, deliberately. It is your assertion
+    about what you believe you are replacing, and that assertion is the whole mechanism: a hash derived
+    from the file about to be overwritten would always match, so the check would pass unconditionally
+    and a concurrent edit between read and write is exactly what would slip through. There is no
+    `--force` for the same reason — an unguarded path that exists is a path that gets used.
+
+    Get the current hash from `cao workflow get NAME` (it is on the `Hash:` line), or from the
+    `hash` field this command and `create` print on success.
+
+    Exit codes:
+      0  updated
+      1  refused, or the request errored (`--json` carries a machine-readable class)
+    """
+    quoted_name = _quoted_workflow_name(name, as_json)
+    try:
+        source = pathlib.Path(from_file).read_text()
+    except (OSError, ValueError) as e:
+        raise click.ClickException(f"could not read {from_file}: {e}")
+
+    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
+    try:
+        response = api_http.put(
+            f"{API_BASE_URL}/workflows/{quoted_name}",
+            json={"source": source, "expected_hash": expected_hash},
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
+    except api_http.exceptions.RequestException as e:
+        raise _unreachable(e, as_json)
+
+    if response.status_code != 200:
+        raise _authoring_failure(
+            response, as_json, f"status {response.status_code}", "update", auth_headers
+        )
+
+    _echo_spec_result(response.json(), as_json, "updated")
 
 
 @workflow.command(name="validate")
@@ -75,20 +455,26 @@ def validate_cmd(file, as_json):
       0  spec is valid (pass or pass_reserved)
       1  spec failed validation, or the request errored
     """
+    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
     try:
         response = api_http.post(
             f"{API_BASE_URL}/workflows/validate",
             json={"path": file},
             timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
-        raise click.ClickException(f"could not reach cao-server: {e}")
+        raise _unreachable(e, as_json)
 
-    if response.status_code == 400:
-        # Out-of-policy path / unreadable source — surfaced as a hard error.
-        raise click.ClickException(_extract_detail(response, "invalid request"))
     if response.status_code != 200:
-        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+        raise _authoring_failure(
+            response,
+            as_json,
+            f"status {response.status_code}",
+            "validate",
+            auth_headers,
+        )
 
     result = response.json()
     if as_json:
@@ -121,8 +507,12 @@ def list_cmd(scan_dir, as_json):
         params["dir"] = scan_dir
     try:
         response = api_http.get(
-            f"{API_BASE_URL}/workflows", params=params, timeout=MCP_REQUEST_TIMEOUT
+            f"{API_BASE_URL}/workflows",
+            params=params,
+            timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -157,15 +547,22 @@ def list_cmd(scan_dir, as_json):
 @click.argument("name")
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the spec as JSON.")
 def get_cmd(name, as_json):
-    """Show the parsed/validated spec for a workflow name or file path.
-
-    Requires a running cao-server.
-    """
+    """Show the parsed and validated spec for an indexed workflow name."""
+    quoted_name = _quoted_workflow_name(name, as_json)
+    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
     try:
-        response = api_http.get(f"{API_BASE_URL}/workflows/{name}", timeout=MCP_REQUEST_TIMEOUT)
+        response = api_http.get(
+            f"{API_BASE_URL}/workflows/{quoted_name}",
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
+    authentication_detail = _authentication_failure_detail(response, auth_headers)
+    if authentication_detail:
+        raise click.ClickException(authentication_detail)
     if response.status_code == 404:
         raise click.ClickException(f"unknown workflow '{name}'")
     if response.status_code == 400:
@@ -178,9 +575,22 @@ def get_cmd(name, as_json):
         click.echo(_json.dumps(spec, indent=2))
         return
     click.echo(f"Name:        {spec['name']}")
-    click.echo(f"Mode:        {spec['mode']}")
+    mode = spec.get("mode") or ("script" if "source" in spec else None)
+    if mode:
+        click.echo(f"Mode:        {mode}")
     click.echo(f"Description: {spec.get('description', '') or '(none)'}")
-    click.echo(f"Steps:       {len(spec.get('steps', []))}")
+    steps = spec.get("steps")
+    if isinstance(steps, list):
+        click.echo(f"Steps:       {len(steps)}")
+    # issue #583 Bolt 3 (``authoring-cli-verbs``): ``cao workflow update`` requires an
+    # ``--expected-hash`` and this was the only place a human could have found it — it was in the
+    # ``--json`` output all along but absent from the table, so the required flag would have meant
+    # piping through jq for the one verb that needs it most. GUARDED rather than unconditional: a YAML
+    # spec carries no content_hash, and printing "Hash: None" on every YAML spec would be noise that
+    # reads like a defect.
+    content_hash = spec.get("content_hash")
+    if content_hash:
+        click.echo(f"Hash:        {content_hash}")
     for step in spec.get("steps", []):
         click.echo(f"  - {step['id']} ({step['provider']}/{step['agent']})")
 
@@ -195,8 +605,8 @@ def approve_cmd(plan_id, as_json):
 
     A plan identifier is computed at RUN START from the workflow's execution-affecting fields, so a
     NEW OR CHANGED PLAN IS REFUSED ONCE before it can be approved: run it, copy the plan_id from the
-    refusal, approve it here, run again. Approval enforcement is off by default — this command is
-    only consequential once `workflow.require_approval` is enabled.
+    refusal, and have an operator record approval here before running again. Approval enforcement is
+    on by default for script workflows unless an operator has disabled enforcement.
 
     Approving twice is harmless and changes nothing: the original approver and timestamp are kept and
     reported back, so "already approved" is distinguishable from "just approved by me".
@@ -215,6 +625,7 @@ def approve_cmd(plan_id, as_json):
       0  the plan is approved (whether this call approved it or found it already approved)
       1  the request was rejected or the server could not be reached
     """
+    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
     try:
         response = api_http.post(
             f"{API_BASE_URL}/workflows/plans/approve",
@@ -223,6 +634,8 @@ def approve_cmd(plan_id, as_json):
             json={"plan_id": plan_id},
             timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -251,24 +664,35 @@ def approve_cmd(plan_id, as_json):
 @workflow.command(name="delete")
 @click.argument("name")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
-def delete_cmd(name, yes):
-    """Delete a workflow's spec file and its index row.
-
-    Requires a running cao-server.
-    """
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
+def delete_cmd(name, yes, as_json):
+    """Delete a workflow's spec file and its index row."""
+    quoted_name = _quoted_workflow_name(name, as_json)
     if not yes:
         click.confirm(f"Delete workflow '{name}'?", abort=True)
+    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
     try:
-        response = api_http.delete(f"{API_BASE_URL}/workflows/{name}", timeout=MCP_REQUEST_TIMEOUT)
+        response = api_http.delete(
+            f"{API_BASE_URL}/workflows/{quoted_name}",
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
+    authentication_detail = _authentication_failure_detail(response, auth_headers)
+    if authentication_detail:
+        raise click.ClickException(authentication_detail)
     if response.status_code == 404:
         raise click.ClickException(f"unknown workflow '{name}'")
     if response.status_code == 400:
         raise click.ClickException(_extract_detail(response, "invalid request"))
     if response.status_code not in (200, 204):
         raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+    if as_json:
+        click.echo(_json.dumps({"ok": True, "name": name}, indent=2))
+        return
     click.echo(f"deleted '{name}'")
 
 
@@ -378,15 +802,38 @@ def _render_result(result):
             click.echo(f"  {warning}")
 
 
+#: The human phrasing of each failure classification (issue #583 Bolt 3, ``failure-classification``).
+#: PHRASED AS AN ACTION rather than echoing the enum, because the taxonomy exists to answer "what do I
+#: do next" and a human line that makes the reader translate a token has not finished that job. The
+#: machine-readable value stays the raw enum in ``--json``, which is what FR-10's criterion and the
+#: branch-on-the-field contract require.
+#:
+#: An UNKNOWN key is deliberately absent from this map, so a future fourth value degrades to silence in
+#: the human view while still appearing in ``--json`` — better than printing a token no phrasing was
+#: written for.
+_CLASSIFICATION_ACTIONS = {
+    "transient": "Retry — transient failure",
+    "artifact_defect": "Fix the spec — artifact defect",
+    "cancelled": "Cancelled by a human",
+}
+
+
 def _render_failure_envelope(envelope):
     """Human-render the U9 failure envelope beneath a failed/cancelled result (FR-7.1).
 
     A no-op when ``envelope`` is absent (a completed/non-terminal run carries none).
     The ``next_command`` hint points the operator at the diagnostic command.
+
+    The ``what to do`` line is issue #583's FR-10 classification, rendered as an action. It sits above
+    ``error kind`` deliberately: the kind is the CAUSE and the classification is the NEXT ACTION, and an
+    operator scanning a failure wants the second first.
     """
     if not envelope:
         return
     click.echo("Failure:")
+    action = _CLASSIFICATION_ACTIONS.get(envelope.get("classification"))
+    if action:
+        click.echo(f"  what to do:         {action}")
     click.echo(f"  failing step:       {envelope.get('failing_step') or '(none)'}")
     click.echo(f"  attempt:            {envelope.get('attempt')}")
     click.echo(f"  error kind:         {envelope.get('error_kind') or '(none)'}")
@@ -442,8 +889,11 @@ def _poll_to_terminal(run_id, as_json):
     while True:
         try:
             response = api_http.get(
-                f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=MCP_REQUEST_TIMEOUT
+                f"{API_BASE_URL}/workflows/runs/{run_id}",
+                timeout=MCP_REQUEST_TIMEOUT,
             )
+        except api_http.AuthNotConfiguredError as exc:
+            raise _auth_not_configured(exc, as_json)
         except api_http.exceptions.RequestException as e:
             transport_failures += 1
             if transport_failures > 1:
@@ -460,6 +910,9 @@ def _poll_to_terminal(run_id, as_json):
         if response.status_code == 404:
             raise click.ClickException(f"unknown run '{run_id}'")
         if response.status_code != 200:
+            refusal = _approval_refusal_envelope(response)
+            if refusal:
+                raise click.ClickException(_approval_refusal_message(refusal))
             raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
 
         # A successful poll resets the bounded-retry budget.
@@ -489,6 +942,12 @@ def _poll_to_terminal(run_id, as_json):
 @click.option("--input", "inputs", multiple=True, help="Run input as k=v (repeatable).")
 @click.option("--run-id", "run_id", default=None, help="Optional explicit run id.")
 @click.option(
+    "--working-directory",
+    type=click.Path(file_okay=False, path_type=str),
+    default=None,
+    help="Project root for script execution and approval fingerprinting.",
+)
+@click.option(
     "--detach",
     is_flag=True,
     default=False,
@@ -501,7 +960,7 @@ def _poll_to_terminal(run_id, as_json):
     help="Block on the server inline until the run finishes (the retained blocking path).",
 )
 @click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
-def run_cmd(name_or_path, inputs, run_id, detach, wait, as_json):
+def run_cmd(name_or_path, inputs, run_id, working_directory, detach, wait, as_json):
     """Run a workflow.
 
     By default `run` SUBMITS the run asynchronously, prints the run id
@@ -518,9 +977,14 @@ def run_cmd(name_or_path, inputs, run_id, detach, wait, as_json):
       1  run reached FAILED / CANCELLED, or the request errored
     """
     parsed = _parse_inputs(inputs)
-    payload = {"name_or_path": name_or_path, "inputs": parsed}
+    payload = {
+        "name_or_path": name_or_path,
+        "inputs": parsed,
+        "working_directory": os.path.abspath(working_directory or os.getcwd()),
+    }
     if run_id is not None:
         payload["run_id"] = run_id
+    auth_headers = api_http.auth_headers_for(API_BASE_URL) or None
 
     # --- --wait: the retained blocking path (VR-2, FR-4.5). ------------------
     # ``--wait`` blocks on the server inline until the whole workflow finishes, so
@@ -533,12 +997,20 @@ def run_cmd(name_or_path, inputs, run_id, detach, wait, as_json):
                 json=payload,
                 timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
             )
+        except api_http.AuthNotConfiguredError as exc:
+            raise _auth_not_configured(exc, as_json)
         except api_http.exceptions.RequestException as e:
             raise click.ClickException(f"could not reach cao-server: {e}")
         if response.status_code == 404:
             raise click.ClickException(
                 _extract_detail(response, f"unknown workflow '{name_or_path}'")
             )
+        # The APPROVE step of FR-10's sequence: name the identifier and the command, never just 403.
+        refusal = _approval_refusal_envelope(response)
+        if refusal:
+            if as_json:
+                _emit_json_failure(refusal)
+            raise click.ClickException(_approval_refusal_message(refusal))
         if response.status_code != 200:
             raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
         result = response.json()
@@ -556,11 +1028,19 @@ def run_cmd(name_or_path, inputs, run_id, detach, wait, as_json):
             json=payload,
             timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 404:
         raise click.ClickException(_extract_detail(response, f"unknown workflow '{name_or_path}'"))
+    # The APPROVE step of FR-10's sequence: name the identifier and the command, never just 403.
+    refusal = _approval_refusal_envelope(response)
+    if refusal:
+        if as_json:
+            _emit_json_failure(refusal)
+        raise click.ClickException(_approval_refusal_message(refusal))
     if response.status_code != 202:
         raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
 
@@ -630,6 +1110,8 @@ def _resolve_latest_run_id():
             params={"limit": 1},
             timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, False)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
     if response.status_code != 200:
@@ -659,8 +1141,11 @@ def status_cmd(run_id, as_json):
 
     try:
         response = api_http.get(
-            f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=MCP_REQUEST_TIMEOUT
+            f"{API_BASE_URL}/workflows/runs/{run_id}",
+            timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -696,8 +1181,12 @@ def runs_cmd(state, limit, as_json):
         params["limit"] = limit
     try:
         response = api_http.get(
-            f"{API_BASE_URL}/workflows/runs", params=params, timeout=MCP_REQUEST_TIMEOUT
+            f"{API_BASE_URL}/workflows/runs",
+            params=params,
+            timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -764,8 +1253,11 @@ def result_cmd(run_id, as_json):
     """
     try:
         response = api_http.get(
-            f"{API_BASE_URL}/workflows/runs/{run_id}/result", timeout=MCP_REQUEST_TIMEOUT
+            f"{API_BASE_URL}/workflows/runs/{run_id}/result",
+            timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -828,11 +1320,20 @@ def resume_cmd(run_id, decide, as_json):
             json={"decisions": decisions} if decisions else None,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
     if response.status_code == 404:
         raise click.ClickException(f"unknown run '{run_id}'")
+    # A resume is gated too (the fifth check in resume_script_run's admission ladder), so the same
+    # actionable refusal applies -- a resume of a run whose plan was never approved is refused.
+    refusal = _approval_refusal_envelope(response)
+    if refusal:
+        if as_json:
+            _emit_json_failure(refusal)
+        raise click.ClickException(_approval_refusal_message(refusal))
     if response.status_code != 200:
         raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
 
@@ -949,6 +1450,8 @@ def step_cmd(run_id, step_id, prompt_file, prompt_override, as_json):
             json=payload,
             timeout=WORKFLOW_STEP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -978,8 +1481,11 @@ def cancel_cmd(run_id):
     """
     try:
         response = api_http.post(
-            f"{API_BASE_URL}/workflows/runs/{run_id}/cancel", timeout=MCP_REQUEST_TIMEOUT
+            f"{API_BASE_URL}/workflows/runs/{run_id}/cancel",
+            timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, False)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 
@@ -1037,7 +1543,12 @@ def _events_route_or_run_missing(run_id: str) -> click.ClickException:
     than asserting a server capability it could not verify.
     """
     try:
-        probe = api_http.get(f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=MCP_REQUEST_TIMEOUT)
+        probe = api_http.get(
+            f"{API_BASE_URL}/workflows/runs/{run_id}",
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, False)
     except api_http.exceptions.RequestException:
         return click.ClickException(f"unknown run '{run_id}'")
     if probe.status_code == 200:
@@ -1153,7 +1664,8 @@ def _final_events_status(run_id: str):
     """
     try:
         response = api_http.get(
-            f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=MCP_REQUEST_TIMEOUT
+            f"{API_BASE_URL}/workflows/runs/{run_id}",
+            timeout=MCP_REQUEST_TIMEOUT,
         )
     except api_http.AuthNotConfiguredError as exc:
         # A missing credential is not a lost socket: surface it (exit 1) rather
@@ -1183,6 +1695,8 @@ def _events_batch_read(run_id: str, after_seq, as_json: bool) -> None:
             params=params,
             timeout=MCP_REQUEST_TIMEOUT,
         )
+    except api_http.AuthNotConfiguredError as exc:
+        raise _auth_not_configured(exc, as_json)
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"could not reach cao-server: {e}")
 

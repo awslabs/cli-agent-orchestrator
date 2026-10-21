@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 from types import SimpleNamespace
 
@@ -218,11 +219,12 @@ def script_run_env(client, monkeypatch, tmp_path):
         lambda name_or_path, scan_dir=None: spec,
     )
 
-    spy = {"called": False, "inputs": None}
+    spy = {"called": False, "inputs": None, "working_directory": None}
 
-    async def _fake_run(spec_arg, inputs, run_id):
+    async def _fake_run(spec_arg, inputs, run_id, *, working_directory=None):
         spy["called"] = True
         spy["inputs"] = inputs
+        spy["working_directory"] = working_directory
         return _result(state=RunState.COMPLETED)
 
     monkeypatch.setattr(script_runner, "run_script_workflow", _fake_run)
@@ -275,17 +277,119 @@ def test_script_run_oversized_inputs_400_pre_journal(client, script_run_env):
     assert script_run_env["journal"].get_run("runD") is None
 
 
-def test_script_run_resolved_inputs_passed_to_runner(client, script_run_env):
+def test_script_run_resolved_inputs_passed_to_runner(client, script_run_env, tmp_path):
     # A valid run reaches the runner with the RESOLVED map (defaults filled),
     # not the raw request body.
     resp = client.post(
         "/workflows/runs",
-        json={"name_or_path": "scr", "inputs": {"topic": "birds"}, "run_id": "runE"},
+        json={
+            "name_or_path": "scr",
+            "inputs": {"topic": "birds"},
+            "run_id": "runE",
+            "working_directory": str(tmp_path),
+        },
     )
     assert resp.status_code == 200
     assert script_run_env["spy"]["called"] is True
     # ``note`` is optional with no default -> omitted; ``topic`` kept.
     assert script_run_env["spy"]["inputs"] == {"topic": "birds"}
+    assert script_run_env["spy"]["working_directory"] == str(tmp_path.resolve())
+
+
+@pytest.mark.parametrize("working_directory", ("", "\x00bad", "relative/path", "~/project"))
+def test_workflow_run_request_rejects_invalid_supplied_root(working_directory):
+    from pydantic import ValidationError
+
+    from cli_agent_orchestrator.api.main import WorkflowRunRequest
+
+    with pytest.raises(ValidationError):
+        WorkflowRunRequest(name_or_path="scr", working_directory=working_directory)
+
+
+@pytest.mark.parametrize("kind", ("file", "missing"))
+def test_script_request_rejects_non_directory_root(client, script_run_env, tmp_path, kind):
+    root = tmp_path / kind
+    if kind == "file":
+        root.write_text("not a directory")
+
+    response = client.post(
+        "/workflows/runs",
+        json={
+            "name_or_path": "scr",
+            "inputs": {"topic": "birds"},
+            "working_directory": str(root),
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "working_directory must name an existing directory"
+    assert str(root) not in response.text
+
+
+@pytest.mark.parametrize("root", ("/", "/etc"))
+def test_script_request_refuses_blocked_root_before_runner(client, script_run_env, root):
+    response = client.post(
+        "/workflows/runs",
+        json={
+            "name_or_path": "scr",
+            "inputs": {"topic": "birds"},
+            "working_directory": root,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "working_directory must not be a blocked system directory"
+    assert script_run_env["spy"]["called"] is False
+
+
+def test_script_request_accepts_normal_temp_subdirectory(client, script_run_env, tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    response = client.post(
+        "/workflows/runs",
+        json={
+            "name_or_path": "scr",
+            "inputs": {"topic": "birds"},
+            "working_directory": str(root),
+        },
+    )
+
+    assert response.status_code == 200
+    assert script_run_env["spy"]["called"] is True
+    assert script_run_env["spy"]["working_directory"] == os.path.realpath(root)
+
+
+def test_script_request_canonicalizes_root_before_runner(client, script_run_env, tmp_path):
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_root, target_is_directory=True)
+
+    response = client.post(
+        "/workflows/runs",
+        json={
+            "name_or_path": "scr",
+            "inputs": {"topic": "birds"},
+            "working_directory": str(alias),
+        },
+    )
+
+    assert response.status_code == 200
+    assert script_run_env["spy"]["working_directory"] == os.path.realpath(alias)
+
+
+def test_omitted_script_root_uses_server_working_directory(
+    client, script_run_env, monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+
+    response = client.post(
+        "/workflows/runs",
+        json={"name_or_path": "scr", "inputs": {"topic": "birds"}},
+    )
+
+    assert response.status_code == 200
+    assert script_run_env["spy"]["working_directory"] == os.path.realpath(tmp_path)
 
 
 def test_blocking_script_start_returns_approval_refusal(client, monkeypatch):
@@ -304,7 +408,7 @@ def test_blocking_script_start_returns_approval_refusal(client, monkeypatch):
         lambda name_or_path, scan_dir=None: spec,
     )
 
-    async def _refuse(spec_arg, inputs, run_id):
+    async def _refuse(spec_arg, inputs, run_id, *, working_directory=None):
         raise approval_gate.PlanApprovalRequiredError(
             "Plan 'plan-v1:blocked' has not been approved.",
             plan_id="plan-v1:blocked",
@@ -318,7 +422,87 @@ def test_blocking_script_start_returns_approval_refusal(client, monkeypatch):
     )
 
     assert response.status_code == 403
-    assert "plan-v1:blocked" in response.json()["detail"]
+    detail = response.json()["detail"]
+
+    # REWRITTEN at issue #583 Bolt 3 (``authoring-sequence``). This asserted
+    # ``"plan-v1:blocked" in response.json()["detail"]``, which read the identifier out of a PROSE
+    # sentence. FR-10's sequence needs it as a FIELD: a refused start writes no run row, so
+    # ``workflow_plan_approval(run_id)`` -- the only structured carrier -- has nothing to read on the
+    # first run of a new plan, which by design is every newly authored workflow.
+    assert detail["kind"] == "approval_required"
+    # BYTE-IDENTICAL round trip, not a substring match. The caller's next act is to pass this to
+    # ``cao workflow approve``, and that command records why a normalisation is dangerous: "a
+    # normalisation is how two distinct plans could share one approval."
+    assert detail["plan_id"] == "plan-v1:blocked"
+    assert "plan-v1:blocked" in detail["message"], "the prose is kept verbatim alongside the field"
+    # An EXACT set (not a subset check): extend it when a field is added deliberately, because an
+    # exact set is what makes an UNINTENTIONAL field -- the manifest, the inputs, the spec path --
+    # show up as a failure. Relaxing this is the tempting move precisely because it never fails again.
+    assert set(detail) == {"kind", "plan_id", "message"}
+
+
+def test_script_start_returns_503_when_the_plan_identity_is_unavailable(client, monkeypatch):
+    """Issue #583 Bolt 3: a failed freeze is a CAO fault, not a permission problem.
+
+    The status is the deliverable. Enforcement now defaults on, so this path is reachable in a default
+    installation, and an operator or agent that reads 403 here will go looking for an approval to
+    grant when the identifier they would approve was never readable.
+    """
+    from cli_agent_orchestrator.models.workflow import ScriptSpec
+    from cli_agent_orchestrator.services import approval_gate, script_runner
+
+    spec = ScriptSpec(
+        name="scr",
+        path="/tmp/scr.py",
+        source="def main():\n    pass\n",
+        content_hash="deadbeef",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.workflow_spec_service.get_workflow",
+        lambda name_or_path, scan_dir=None: spec,
+    )
+
+    async def _refuse(spec_arg, inputs, run_id, *, working_directory=None):
+        raise approval_gate.PlanIdentityUnavailableError(
+            "This script-tier run has no readable plan identifier in its frozen execution manifest."
+        )
+
+    monkeypatch.setattr(script_runner, "run_script_workflow", _refuse)
+
+    response = client.post(
+        "/workflows/runs",
+        json={"name_or_path": "scr", "inputs": {}, "run_id": "identity-unavailable"},
+    )
+
+    assert response.status_code == 503, (
+        f"expected 503, got {response.status_code}: 403 would assert the caller lacked permission "
+        "for a freeze that CAO itself failed to complete"
+    )
+    # REWRITTEN at issue #583 Bolt 3 (``authoring-sequence``), and the history matters because the
+    # original was deliberate. It asserted ``isinstance(response.json()["detail"], str)`` with the
+    # reason: "this unit deliberately does not change the response shape, so the CLI's
+    # _extract_detail and any external client keep working unmodified."
+    #
+    # That PURPOSE is honoured and is what the replacement pins; only the WORDING changed. Both
+    # ``detail`` readers were updated in the same change (``_extract_detail`` and
+    # ``_extract_error_detail``), so neither degrades -- the CLI still prints one clean sentence and
+    # the MCP surface still returns a real message rather than "status 503". An external client that
+    # reads ``detail`` as a string on these three routes DOES break; that is a documented,
+    # human-approved break, and it is not novel -- this same route already returns
+    # ``detail={"findings": [...]}`` on a 422 lint failure.
+    #
+    # A shape check would have been the weak replacement: ``isinstance(detail, dict)`` passes for
+    # ``{}``. This asserts CONTENT.
+    detail = response.json()["detail"]
+    assert detail["kind"] == "plan_identity_unavailable", (
+        "the freeze failed, so the caller did nothing wrong -- an agent branching on this field must "
+        "retry rather than hunt for an approval to grant"
+    )
+    assert (
+        "plan_id" in detail
+    ), "present-and-null, never absent, so one reader handles both statuses"
+    assert detail["plan_id"] is None, "there is no identifier to approve; that IS the condition"
+    assert detail["message"], "the prose survives verbatim as the human-readable half"
 
 
 @pytest.mark.asyncio
@@ -333,7 +517,7 @@ async def test_blocking_script_manifest_freeze_is_offloaded_from_event_loop(monk
     observed = {}
     event_loop_thread_id = threading.get_ident()
 
-    def blocking_manifest(*, source_hash, inputs):
+    def blocking_manifest(*, source_hash, inputs, cwd=None):
         observed["manifest_thread_id"] = threading.get_ident()
         probe_started.set()
         observed["sentinel_ran_while_blocked"] = same_loop_sentinel.wait(timeout=1)
@@ -345,7 +529,7 @@ async def test_blocking_script_manifest_freeze_is_offloaded_from_event_loop(monk
             await asyncio.sleep(0)
         same_loop_sentinel.set()
 
-    async def _drive(record, path, env):
+    async def _drive(record, path, env, *, working_directory=None):
         return _result()
 
     spec = ScriptSpec(
@@ -354,7 +538,11 @@ async def test_blocking_script_manifest_freeze_is_offloaded_from_event_loop(monk
         source="def main():\n    pass\n",
         content_hash="deadbeef",
     )
-    monkeypatch.setattr(manifest_freeze, "build_manifest_json", blocking_manifest)
+    monkeypatch.setattr(
+        manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: manifest_freeze.FrozenManifest((blocking_manifest)(**kwargs)),
+    )
     monkeypatch.setattr(
         script_runner, "lint_script", lambda source, path: SimpleNamespace(status="pass")
     )
@@ -822,6 +1010,19 @@ def async_script_env(client, monkeypatch, tmp_path):
     workflow_service.run_registry.clear()
     workflow_service._active_drives.clear()
 
+    # issue #583 Bolt 3 (``approval-enforcement-default``): approval enforcement now defaults ON, so
+    # a script-tier submit is refused with 403 unless the plan is approved. Every test on this fixture
+    # exercises SUBMIT MECHANICS -- 202-and-drives, a 409 integrity error, manifest freezing, a 422
+    # lint failure -- and none of them is about approval. Turned off through the REAL setting rather
+    # than by patching ``ensure_plan_approved`` out, so the gate's disabled path is still genuinely
+    # exercised here and a regression in it would surface rather than be hidden.
+    from cli_agent_orchestrator.services import settings_service
+
+    gate_off = tmp_path / "settings.json"
+    gate_off.write_text(json.dumps({"workflow": {"require_approval": False}}))
+    monkeypatch.setattr(settings_service, "SETTINGS_FILE", gate_off)
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
+
     spec = ScriptSpec(
         name="scr",
         path="/tmp/scr.py",
@@ -835,28 +1036,108 @@ def async_script_env(client, monkeypatch, tmp_path):
 
     prepared = {"called": False}
 
-    async def _fake_prepared(record, spec_path, env):
+    async def _fake_prepared(record, *, source, env, working_directory=None):
         prepared["called"] = True
+        prepared["working_directory"] = working_directory
         workflow_journal.update_run_state(
             record.run_id, RunState.COMPLETED.value, workflow_service._now()
         )
         return _result(state=RunState.COMPLETED)
 
     monkeypatch.setattr(script_runner, "run_script_workflow_prepared", _fake_prepared)
-    yield {"prepared": prepared, "spec": spec, "script_runner": script_runner}
+    yield {
+        "prepared": prepared,
+        "spec": spec,
+        "script_runner": script_runner,
+        "root": str(tmp_path),
+    }
     workflow_service.run_registry.clear()
     workflow_service._active_drives.clear()
 
 
-def test_submit_script_tier_202_and_drives(client, async_script_env):
+def test_submit_manifest_freeze_failure_runs_when_approval_is_disabled(
+    client, async_script_env, monkeypatch
+):
+    """The explicit approval opt-out preserves manifest freeze's best-effort contract."""
+    from cli_agent_orchestrator.services import manifest_freeze
+
+    monkeypatch.setattr(
+        manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: manifest_freeze.FrozenManifest((lambda **kwargs: None)(**kwargs)),
+    )
+
+    response = client.post(
+        "/workflows/runs:submit",
+        json={
+            "name_or_path": "scr",
+            "inputs": {},
+            "run_id": "async-without-manifest",
+            "working_directory": async_script_env["root"],
+        },
+    )
+
+    assert response.status_code == 202
+    row = workflow_journal.get_run("async-without-manifest")
+    assert row is not None
+    assert row.manifest_json is None
+
+
+def test_submit_manifest_freeze_failure_is_503_when_approval_is_required(
+    client, async_script_env, monkeypatch, tmp_path
+):
+    """A missing identity remains fail-closed under the default approval posture."""
+    from cli_agent_orchestrator.services import manifest_freeze, settings_service
+
+    gate_on = tmp_path / "gate-on.json"
+    gate_on.write_text(json.dumps({"workflow": {"require_approval": True}}))
+    monkeypatch.setattr(settings_service, "SETTINGS_FILE", gate_on)
+    monkeypatch.setattr(
+        manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: manifest_freeze.FrozenManifest((lambda **kwargs: None)(**kwargs)),
+    )
+
+    response = client.post(
+        "/workflows/runs:submit",
+        json={
+            "name_or_path": "scr",
+            "inputs": {},
+            "run_id": "async-missing-identity",
+            "working_directory": async_script_env["root"],
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["kind"] == "plan_identity_unavailable"
+    assert workflow_journal.get_run("async-missing-identity") is None
+
+
+def test_submit_script_tier_202_and_drives(client, async_script_env, monkeypatch):
     """CR-2: a script spec is submittable async, journals tier=script, and reaches
     its prepared entry."""
+    from cli_agent_orchestrator.services import manifest_freeze
+
+    manifest_cwds = []
+    monkeypatch.setattr(
+        manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: manifest_freeze.FrozenManifest(
+            (lambda **kwargs: manifest_cwds.append(kwargs["cwd"]) or None)(**kwargs)
+        ),
+    )
     resp = client.post(
         "/workflows/runs:submit", json={"name_or_path": "scr", "inputs": {}, "run_id": "async-scr"}
     )
     assert resp.status_code == 202
     row = workflow_journal.get_run("async-scr")
     assert row is not None and row.tier == "script"
+    snapshot = json.loads(row.spec_snapshot)
+    expected_root = os.path.realpath(os.getcwd())
+    assert manifest_cwds == [expected_root]
+    assert snapshot["working_directory"] == expected_root
+    assert workflow_service.run_registry["async-scr"].working_directory == expected_root
+    assert async_script_env["prepared"]["working_directory"] == expected_root
     final = None
     for _ in range(100):
         client.get("/workflows/runs/async-scr")
@@ -866,6 +1147,38 @@ def test_submit_script_tier_202_and_drives(client, async_script_env):
             break
     assert final == "completed"
     assert async_script_env["prepared"]["called"] is True
+
+
+def test_submit_persists_launch_guard(client, async_script_env, monkeypatch):
+    from cli_agent_orchestrator.services import approval_gate, launch_guard
+
+    monkeypatch.setattr(approval_gate, "ensure_plan_approved", lambda **kwargs: None)
+    monkeypatch.setattr(
+        launch_guard.settings_service,
+        "is_workflow_approval_required",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        launch_guard.agent_profiles,
+        "list_agent_profiles",
+        lambda: [{"name": "developer"}],
+    )
+    monkeypatch.setattr(
+        launch_guard.agent_profiles,
+        "_read_agent_profile_source",
+        lambda name: "profile source",
+    )
+    monkeypatch.setattr(launch_guard.settings_service, "is_memory_enabled", lambda: False)
+
+    response = client.post(
+        "/workflows/runs:submit",
+        json={"name_or_path": "scr", "inputs": {}, "run_id": "async-guard"},
+    )
+
+    assert response.status_code == 202
+    snapshot = json.loads(workflow_journal.get_run("async-guard").spec_snapshot)
+    assert snapshot["launch_guard"]["memory_enabled"] is False
+    assert set(snapshot["launch_guard"]["profiles"]) == {"developer"}
 
 
 def test_submit_script_manifest_freezes_resolved_inputs(client, async_script_env, monkeypatch):
@@ -884,14 +1197,18 @@ def test_submit_script_manifest_freezes_resolved_inputs(client, async_script_env
         workflow_spec_service, "get_workflow", lambda name_or_path, scan_dir=None: spec
     )
 
-    def _capture_manifest(*, source_hash, inputs):
+    def _capture_manifest(*, source_hash, inputs, cwd=None):
         captured["manifest_inputs"] = inputs
         return '{"plan_id":"plan-v1:resolved-inputs"}'
 
-    def _capture_schedule(record, spec_arg, run_id, tier, inputs):
+    def _capture_schedule(record, spec_arg, run_id, tier, inputs, **kwargs):
         captured["scheduled_inputs"] = inputs
 
-    monkeypatch.setattr(manifest_freeze, "build_manifest_json", _capture_manifest)
+    monkeypatch.setattr(
+        manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: manifest_freeze.FrozenManifest((_capture_manifest)(**kwargs)),
+    )
     monkeypatch.setattr(api_main, "_schedule_background_drive", _capture_schedule)
 
     response = client.post(
@@ -924,7 +1241,7 @@ async def test_submit_script_manifest_freeze_is_offloaded_from_event_loop(monkey
     observed = {}
     event_loop_thread_id = threading.get_ident()
 
-    def blocking_manifest(*, source_hash, inputs):
+    def blocking_manifest(*, source_hash, inputs, cwd=None):
         observed["manifest_thread_id"] = threading.get_ident()
         probe_started.set()
         observed["sentinel_ran_while_blocked"] = same_loop_sentinel.wait(timeout=1)
@@ -945,13 +1262,17 @@ async def test_submit_script_manifest_freeze_is_offloaded_from_event_loop(monkey
     monkeypatch.setattr(workflow_spec_service, "get_workflow", lambda name_or_path: spec)
     monkeypatch.setattr(workflow_service, "_validate_inputs", lambda spec, inputs: inputs)
     monkeypatch.setattr(workflow_service, "_now", lambda: "2026-01-01T00:00:00Z")
-    monkeypatch.setattr(manifest_freeze, "build_manifest_json", blocking_manifest)
+    monkeypatch.setattr(
+        manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: manifest_freeze.FrozenManifest((blocking_manifest)(**kwargs)),
+    )
     monkeypatch.setattr(
         script_runner, "lint_script", lambda source, path: SimpleNamespace(status="pass")
     )
     monkeypatch.setattr(api_main.approval_gate, "ensure_plan_approved", lambda **kwargs: None)
     monkeypatch.setattr(workflow_journal, "insert_run", lambda *args: None)
-    monkeypatch.setattr(api_main, "_schedule_background_drive", lambda *args: None)
+    monkeypatch.setattr(api_main, "_schedule_background_drive", lambda *args, **kwargs: None)
 
     body = api_main.WorkflowRunRequest(name_or_path="scr", inputs={}, run_id="manifest-submit")
     submit_task = asyncio.create_task(api_main.submit_workflow_run_endpoint(body, []))
@@ -2022,7 +2343,13 @@ def test_failure_envelope_adds_no_persisted_column(client, read_surface_db):
 def test_failure_envelope_json_shape_stable_across_surfaces(client, read_surface_db):
     """U9-T8 (ST-1 / NFR-3): the ``--json`` (REST body) envelope has the fixed field
     set and a next_command hint whose shape does not drift — the same shape the CLI
-    and MCP surfaces spread verbatim."""
+    and MCP surfaces spread verbatim.
+
+    ``classification`` was added by issue #583 Bolt 3 (``failure-classification``), FR-10's second Pass
+    criterion. THE EXACT-SET ASSERTION IS KEPT DELIBERATELY: relaxing it to a subset check would remove
+    this test's teeth for the sake of one intentional addition, and an exact set is what makes an
+    UNintentional field appear as a failure. Extend the set when a field is added on purpose.
+    """
     _seed_run(
         "shape",
         RunState.FAILED.value,
@@ -2035,7 +2362,486 @@ def test_failure_envelope_json_shape_stable_across_surfaces(client, read_surface
         "failing_step",
         "attempt",
         "error_kind",
+        "classification",
         "terminal_reference",
         "next_command",
     }
     assert env["next_command"] == "cao workflow result shape"
+
+
+_ROOT_POLICY_CASES = ("root", "etc", "private-etc", "usr-lib", "subtree", "symlink")
+
+
+def _root_policy_path(tmp_path, case):
+    if case == "normal":
+        path = tmp_path / "normal-project"
+        path.mkdir(exist_ok=True)
+        return str(path)
+    if case == "symlink":
+        path = tmp_path / "system-alias"
+        path.symlink_to("/etc", target_is_directory=True)
+        return str(path)
+    path = {
+        "root": "/",
+        "etc": "/etc",
+        "private-etc": "/private/etc",
+        "usr-lib": "/usr/lib",
+        "subtree": "/etc/ssh",
+    }[case]
+    if not os.path.isdir(path):
+        pytest.skip(f"policy test directory is absent: {path}")
+    return path
+
+
+@pytest.mark.parametrize("endpoint", ["/workflows/runs", "/workflows/runs:submit"])
+@pytest.mark.parametrize("case", _ROOT_POLICY_CASES)
+def test_script_root_shared_policy_refuses_before_drive_and_journal(
+    client, request, tmp_path, endpoint, case
+):
+    is_submit = endpoint.endswith(":submit")
+    env = request.getfixturevalue("async_script_env" if is_submit else "script_run_env")
+    root = _root_policy_path(tmp_path, case)
+    run_id = f"root-policy-{case}"
+    response = client.post(
+        endpoint,
+        json={
+            "name_or_path": "scr",
+            "inputs": {} if is_submit else {"topic": "birds"},
+            "run_id": run_id,
+            "working_directory": root,
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == "working_directory must not be a blocked system directory"
+    assert root not in response.text
+    assert env["prepared" if is_submit else "spy"]["called"] is False
+    assert workflow_journal.get_run(run_id) is None
+
+
+@pytest.mark.parametrize("case", (*_ROOT_POLICY_CASES, "normal"))
+def test_script_root_policy_matches_shared_validator(tmp_path, case):
+    from fastapi import HTTPException
+
+    from cli_agent_orchestrator.api.main import _script_root
+    from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
+
+    root = _root_policy_path(tmp_path, case)
+    try:
+        expected = resolve_and_validate_path(root, description="working_directory")
+    except ValueError:
+        with pytest.raises(HTTPException) as refused:
+            _script_root(root)
+        assert refused.value.status_code == 422
+        assert refused.value.detail == "working_directory must not be a blocked system directory"
+        assert root not in refused.value.detail
+    else:
+        assert _script_root(root) == expected
+
+
+def test_script_root_any_validator_valueerror_is_path_free(
+    client, script_run_env, tmp_path, monkeypatch
+):
+    import cli_agent_orchestrator.api.main as api_main
+
+    root = tmp_path / "normal"
+    root.mkdir()
+
+    def refuse(path, **kwargs):
+        assert path == os.path.realpath(root)
+        assert kwargs == {"description": "working_directory"}
+        raise ValueError(f"sensitive validator reason for {path}")
+
+    monkeypatch.setattr(api_main, "resolve_and_validate_path", refuse, raising=False)
+    response = client.post(
+        "/workflows/runs",
+        json={
+            "name_or_path": "scr",
+            "inputs": {"topic": "birds"},
+            "run_id": "validator-valueerror",
+            "working_directory": str(root),
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "working_directory must not be a blocked system directory"
+    assert str(root) not in response.text
+    assert "sensitive validator reason" not in response.text
+    assert script_run_env["spy"]["called"] is False
+    assert workflow_journal.get_run("validator-valueerror") is None
+
+
+def test_omitted_script_root_checks_shared_policy(client, script_run_env, monkeypatch):
+    monkeypatch.chdir("/etc")
+    response = client.post(
+        "/workflows/runs",
+        json={"name_or_path": "scr", "inputs": {"topic": "birds"}, "run_id": "blocked-default"},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "working_directory must not be a blocked system directory"
+    assert "/etc" not in response.text
+    assert script_run_env["spy"]["called"] is False
+    assert workflow_journal.get_run("blocked-default") is None
+
+
+@pytest.mark.parametrize("endpoint", ["/workflows/runs", "/workflows/runs:submit"])
+def test_shared_policy_accepts_normal_temp_subdirectory(client, request, tmp_path, endpoint):
+    is_submit = endpoint.endswith(":submit")
+    env = request.getfixturevalue("async_script_env" if is_submit else "script_run_env")
+    root = _root_policy_path(tmp_path, "normal")
+    response = client.post(
+        endpoint,
+        json={
+            "name_or_path": "scr",
+            "inputs": {} if is_submit else {"topic": "birds"},
+            "run_id": "normal-root-policy",
+            "working_directory": root,
+        },
+    )
+    assert response.status_code == (202 if is_submit else 200), response.text
+    assert env["prepared" if is_submit else "spy"]["working_directory"] == os.path.realpath(root)
+
+
+@pytest.mark.asyncio
+async def test_submit_queued_run_executes_admitted_bytes(monkeypatch, tmp_path):
+    """A spec update while submit waits for a permit cannot change admitted bytes."""
+    import hashlib
+    from pathlib import Path
+
+    import httpx
+
+    from cli_agent_orchestrator.api import main as api_main
+    from cli_agent_orchestrator.clients.database import (
+        _migrate_workflow_index,
+        _migrate_workflow_run,
+        _migrate_workflow_run_step,
+    )
+    from cli_agent_orchestrator.services import (
+        approval_store,
+        launch_guard,
+        script_runner,
+        settings_service,
+        workflow_journal,
+        workflow_spec_service,
+    )
+
+    db = tmp_path / "queued.db"
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db)
+    monkeypatch.setattr(approval_store, "DATABASE_FILE", db)
+    _migrate_workflow_run()
+    _migrate_workflow_run_step()
+    _migrate_workflow_index()
+    settings_service.SETTINGS_FILE.write_text('{"workflow": {"require_approval": true}}')
+    monkeypatch.setattr(launch_guard.agent_profiles, "list_agent_profiles", lambda: [])
+    monkeypatch.setattr(launch_guard.settings_service, "is_memory_enabled", lambda: False)
+    specs = tmp_path / "specs"
+    specs.mkdir()
+    monkeypatch.setattr(workflow_spec_service, "WORKFLOW_SPEC_DIR", specs)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_SCRATCH_DIR", tmp_path / "scratch")
+    source_a = 'print(\'CAO_WORKFLOW_OUTPUT:{"ran": "A"}\')\n'
+    source_b = 'print(\'CAO_WORKFLOW_OUTPUT:{"ran": "B"}\')\n'
+    spec = workflow_spec_service.create_workflow("queued", source_a)
+    semaphore = asyncio.Semaphore(1)
+    await semaphore.acquire()
+    monkeypatch.setattr(api_main, "_drive_semaphore", semaphore)
+    observed = {}
+
+    async def drive(record, path, env, *, working_directory=None):
+        observed["bytes"] = Path(path).read_bytes()
+        observed["path"] = path
+        return await script_runner._finalize(record, state=RunState.COMPLETED, kind=None)
+
+    monkeypatch.setattr(script_runner, "_drive_process", drive)
+    workflow_service.run_registry.clear()
+    workflow_service._active_drives.clear()
+    body = {
+        "name_or_path": spec.name,
+        "inputs": {},
+        "run_id": "queued-approved",
+        "working_directory": str(tmp_path),
+    }
+    tasks = []
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api_main.app), base_url="http://localhost"
+        ) as client:
+            refusal = await client.post("/workflows/runs:submit", json=body)
+            assert refusal.status_code == 403
+            plan_id = refusal.json()["detail"]["plan_id"]
+            approval_store.grant(plan_id, "test-operator")
+            response = await client.post("/workflows/runs:submit", json=body)
+            assert response.status_code == 202
+            tasks = [
+                task
+                for task in api_main._background_drives
+                if task.get_name() == "workflow-drive-queued-approved"
+            ]
+            assert len(tasks) == 1
+            await asyncio.sleep(0)  # let the scheduled drive reach the held semaphore
+            assert not tasks[0].done()
+            assert not observed
+            update = await client.put(
+                f"/workflows/{spec.name}",
+                json={"source": source_b, "expected_hash": spec.content_hash},
+            )
+            assert update.status_code == 200
+            assert Path(spec.path).read_text() == source_b
+            semaphore.release()
+            await asyncio.wait_for(tasks[0], timeout=5)
+        assert observed["bytes"] == source_a.encode("utf-8")
+        row = workflow_journal.get_run(body["run_id"])
+        manifest = json.loads(row.manifest_json)
+        snapshot = json.loads(row.spec_snapshot)
+        assert (
+            hashlib.sha256(observed["bytes"]).hexdigest()
+            == manifest["source_hash"]
+            == snapshot["content_hash"]
+            == spec.content_hash
+        )
+        assert manifest["plan_id"] == plan_id
+        assert row.state == "completed"
+        assert not Path(observed["path"]).exists()
+    finally:
+        if semaphore.locked():
+            semaphore.release()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        workflow_service.run_registry.clear()
+        workflow_service._active_drives.clear()
+
+
+@pytest.mark.parametrize("endpoint", ["/workflows/runs", "/workflows/runs:submit"])
+def test_non_git_approval_cannot_transfer_to_another_root(
+    client, async_script_env, tmp_path, monkeypatch, endpoint
+):
+    from cli_agent_orchestrator.services import (
+        approval_gate,
+        approval_store,
+        launch_guard,
+        manifest_freeze,
+        script_runner,
+    )
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    spec = async_script_env["spec"]
+    manifest = manifest_freeze.build_manifest_json(
+        source_hash=spec.content_hash, inputs={}, cwd=str(a)
+    )
+    approved = json.loads(manifest)["plan_id"]
+    monkeypatch.setattr(approval_gate, "is_workflow_approval_required", lambda: True)
+    monkeypatch.setattr(
+        approval_store,
+        "approval_state",
+        lambda plan: approval_store.APPROVED if plan == approved else approval_store.ABSENT,
+    )
+    monkeypatch.setattr(launch_guard, "capture", lambda: {"profiles": {}, "memory_enabled": False})
+
+    async def drive(record, source, env, *, working_directory=None):
+        return _result(state=RunState.COMPLETED)
+
+    monkeypatch.setattr(script_runner, "_drive_frozen", drive)
+    ok = client.post(
+        endpoint,
+        json={"name_or_path": "scr", "inputs": {}, "run_id": "root-a", "working_directory": str(a)},
+    )
+    assert ok.status_code == (202 if endpoint.endswith(":submit") else 200), ok.text
+    row = workflow_journal.get_run("root-a")
+    frozen = json.loads(row.manifest_json)
+    snapshot = json.loads(row.spec_snapshot)
+    refused = client.post(
+        endpoint,
+        json={"name_or_path": "scr", "inputs": {}, "run_id": "root-b", "working_directory": str(b)},
+    )
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["detail"]["plan_id"] != approved
+    assert workflow_journal.get_run("root-b") is None
+    assert (
+        frozen["repo_baseline"]["root"]
+        == snapshot["working_directory"]
+        == workflow_service.run_registry["root-a"].working_directory
+        == os.path.realpath(a)
+    )
+
+
+@pytest.mark.parametrize("endpoint", ["/workflows/runs", "/workflows/runs:submit"])
+@pytest.mark.parametrize("size", [2048, 65 * 1024 * 1024], ids=["small-test-budget", "real-65MiB"])
+def test_untracked_budget_503_has_no_retry_or_path(
+    client, async_script_env, tmp_path, monkeypatch, endpoint, size
+):
+    import subprocess
+
+    from cli_agent_orchestrator.services import approval_gate
+    from cli_agent_orchestrator.utils import git_baseline
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "--no-gpg-sign",
+            "-qm",
+            "init",
+        ],
+        cwd=root,
+        check=True,
+    )
+    path = root / "large-untracked.bin"
+    path.touch()
+    os.truncate(path, size)
+    if size == 2048:
+        monkeypatch.setattr(git_baseline, "_UNTRACKED_HASH_BUDGET_BYTES", 1024)
+    monkeypatch.setattr(approval_gate, "is_workflow_approval_required", lambda: True)
+    response = client.post(
+        endpoint,
+        json={
+            "name_or_path": "scr",
+            "inputs": {},
+            "run_id": "budget-refused",
+            "working_directory": str(root),
+        },
+    )
+    assert response.status_code == 503, response.text
+    detail = response.json()["detail"]
+    assert set(detail) == {"kind", "plan_id", "message"}
+    assert detail["kind"] == "plan_identity_unavailable" and detail["plan_id"] is None
+    assert "64 MiB" in detail["message"]
+    assert "gitignore" in detail["message"].lower()
+    assert "Retry" not in detail["message"]
+    assert str(tmp_path) not in response.text and str(path) not in response.text
+    assert workflow_journal.get_run("budget-refused") is None
+
+
+@pytest.mark.parametrize("endpoint", ["/workflows/runs", "/workflows/runs:submit"])
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "untracked_too_large",
+        "untracked_unsupported",
+        "repository_unreadable",
+        "git_unavailable",
+        "git_timeout",
+        "changed_during_snapshot",
+        "internal",
+        "no_recorded_identity",
+        "profiles_unreadable",
+    ],
+)
+def test_each_freeze_reason_has_fixed_path_free_503(
+    client, async_script_env, tmp_path, monkeypatch, endpoint, reason
+):
+    from cli_agent_orchestrator.services import approval_gate, manifest_freeze
+
+    monkeypatch.setattr(approval_gate, "is_workflow_approval_required", lambda: True)
+    monkeypatch.setattr(
+        manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: manifest_freeze.FrozenManifest(None, reason),
+    )
+    response = client.post(
+        endpoint,
+        json={
+            "name_or_path": "scr",
+            "inputs": {},
+            "run_id": "reason-refused",
+            "working_directory": str(tmp_path),
+        },
+    )
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"] == {
+        "kind": "plan_identity_unavailable",
+        "plan_id": None,
+        "message": approval_gate._identity_message(reason),
+    }
+    assert "retry-after" not in response.headers
+    assert str(tmp_path) not in response.text
+    assert workflow_journal.get_run("reason-refused") is None
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read chmod 000 files")
+@pytest.mark.parametrize("endpoint", ["/workflows/runs", "/workflows/runs:submit"])
+def test_unreadable_untracked_file_is_deterministic_path_free_503(
+    client, async_script_env, tmp_path, monkeypatch, endpoint
+):
+    import subprocess
+
+    from cli_agent_orchestrator.services import approval_gate
+    from cli_agent_orchestrator.utils import git_baseline
+
+    root = tmp_path / "permission-repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "--no-gpg-sign",
+            "-qm",
+            "init",
+        ],
+        cwd=root,
+        check=True,
+    )
+    path = root / "unreadable-private-marker.bin"
+    path.write_bytes(b"build output")
+    path.chmod(0)
+    monkeypatch.setattr(approval_gate, "is_workflow_approval_required", lambda: True)
+    try:
+        response = client.post(
+            endpoint,
+            json={
+                "name_or_path": "scr",
+                "inputs": {},
+                "run_id": "permission-refused",
+                "working_directory": str(root),
+            },
+        )
+        assert response.status_code == 503, response.text
+        detail = response.json()["detail"]
+        assert set(detail) == {"kind", "plan_id", "message"}
+        assert detail["kind"] == "plan_identity_unavailable" and detail["plan_id"] is None
+        assert "Retry" not in detail["message"]
+        assert "unreadable" in detail["message"]
+        assert str(root) not in response.text and str(path) not in response.text
+        assert git_baseline.derive_baseline(str(root))["reason"] == "untracked_unsupported"
+        assert workflow_journal.get_run("permission-refused") is None
+    finally:
+        path.chmod(0o600)
+
+
+@pytest.mark.parametrize("endpoint", ["/workflows/runs", "/workflows/runs:submit"])
+@pytest.mark.parametrize(
+    "value",
+    ["relative/PRIVATE_ROOT_MARKER", "~PRIVATE_ROOT_MARKER", "/PRIVATE_ROOT_MARKER\x00", ""],
+)
+def test_working_directory_field_422_drops_input_and_context(client, endpoint, value):
+    response = client.post(endpoint, json={"name_or_path": "scr", "working_directory": value})
+    assert response.status_code == 422
+    errors = response.json()["detail"]
+    assert errors
+    for error in errors:
+        assert error["loc"] == ["body", "working_directory"]
+        assert "input" not in error and "ctx" not in error
+    assert "PRIVATE_ROOT_MARKER" not in response.text
+
+
+def test_working_directory_sanitizer_leaves_other_fields_stock(client):
+    invalid = {"not_a_string": True}
+    response = client.post("/workflows/runs", json={"name_or_path": invalid})
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert error["loc"] == ["body", "name_or_path"]
+    assert error["input"] == invalid
