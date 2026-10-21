@@ -28,8 +28,13 @@ THREE DIRECTIONS, so the class is closed rather than one more instance:
   3. `test_force_include_roots_ship_whole_into_the_wheel` — build a real wheel and assert
      every file present under each root is a member. Per-root skip when the root is absent
      (unbuilt output in a plain checkout), with a non-vacuity assertion so an all-absent tree
-     cannot pass. `ext_apps/static/` is committed, so this direction has teeth in EVERY job,
-     including the `Unit Tests` legs where test_wheel_contents.py can only skip.
+     cannot pass. `ext_apps/static/` is committed, so this direction always has at least one
+     root to check, including in the `Unit Tests` legs where test_wheel_contents.py can only
+     skip — but for that one root it can only catch a `packages`/exclude regression, not an
+     `artifacts`-glob regression: the directory is tracked (not gitignored), so it ships via
+     normal packaging regardless of what its `artifacts` entry says. Only a gitignored root
+     (like `web_ui/`, present only after the `web-build` job's `npm run build`) actually
+     exercises the `artifacts`-glob failure mode this direction exists to catch.
 """
 
 from __future__ import annotations
@@ -183,8 +188,9 @@ def test_force_include_roots_are_under_a_packaged_tree() -> None:
 
     `_files_under()` derives wheel member names by stripping `src/`, which is only correct
     because `packages` (pyproject.toml:155) is `src/`-rooted. If a root moves out from under
-    `src/`, the whole-directory assertion above would compare the wrong names and pass
-    regardless of what shipped.
+    `src/`, the whole-directory assertion above would compare against the wrong member
+    names and FAIL on every file under that root — not a silent pass, but a confusing
+    failure that looks like a packaging regression instead of a stale path in this file.
     """
     for root in sorted(FORCE_INCLUDE_ROOTS):
         assert root.startswith(_SRC_PREFIX), (
