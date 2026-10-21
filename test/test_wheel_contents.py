@@ -8,11 +8,12 @@ matches nothing as a silent no-op — no error, no warning — when the ``npm ru
 step that populates it was skipped or failed.
 
 This proves the OTHER HALF of the fix: that the packaging config, when actually fed a
-built web UI, really does put it in the wheel. The release workflow fails loudly if
-``npm run build`` produced no ``index.html`` (the release-time half of this fix); this
-test instead exercises the real ``uv build`` -> hatchling pipeline end to end, so a
-regression in the packaging config itself (a typo'd glob, a dropped ``packages`` entry)
-is caught here even if the web build itself succeeded.
+built web UI, really does put it in the wheel. A release-time check that fails loudly if
+``npm run build`` produced no ``index.html`` is tracked separately (issues #610/#618,
+not yet merged to ``main``); this test instead exercises the real ``uv build`` ->
+hatchling pipeline end to end, so a regression in the packaging config itself (a typo'd
+glob, a dropped ``packages`` entry) is caught here even if the web build itself
+succeeded.
 
 WHY IT ASSERTS A FILE SET AND NOT ``index.html`` (issue #705)
 -------------------------------------------------------------
