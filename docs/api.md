@@ -236,7 +236,9 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   nothing that references the real tmux session name is affected. Setting a
   label for a session that does not exist is a `404`; clearing is accepted
   regardless, since a session killed outside CAO leaves its label behind and
-  this is the only way to remove it.
+  this is the only way to remove it. Setting or clearing over a
+  `settings.json` that exists but cannot be read is a `500` with nothing
+  changed on disk; session deletion logs that same condition and completes.
 - `POST /sessions` accepts optional `group`/`metadata` at creation, opting a
   session's initial terminal into peer discovery (a mid-session worker uses
   `PATCH /terminals/{terminal_id}/group`/`metadata` instead — see below).

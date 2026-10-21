@@ -1486,6 +1486,42 @@ class TestDeleteSession:
     @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_delete_session_completes_cleanly_over_an_unreadable_settings_file(
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_capture,
+        mock_dismantle,
+        mock_delete_row,
+        mock_delete_terminals_by_ids,
+        caplog,
+    ):
+        """plauzy, #724 review, item 4: with settings.json as a directory the
+        label clear raised a bare IsADirectoryError, ``delete_session`` filed it
+        under ``errors[]``, and ``DELETE /sessions/{name}`` answered 409
+        "cleanup deferred ... retry after residual Grok processes exit" for a
+        fully completed teardown, on every retry. An unreadable settings file
+        is a warning here: nothing was written, nothing was lost."""
+        from cli_agent_orchestrator.services import settings_service
+
+        settings_service.SETTINGS_FILE.mkdir()  # the autouse fixture points this at tmp_path
+        mock_get_backend.return_value.session_exists_strict.return_value = True
+        mock_get_backend.return_value.kill_session.return_value = True
+        mock_list_terminals.return_value = [{"id": "terminal1"}]
+
+        with caplog.at_level(logging.WARNING):
+            result = delete_session("cao-test")
+
+        assert result == {"deleted": ["cao-test"], "errors": []}
+        assert "Not clearing label for cao-test" in caplog.text
+        assert settings_service.SETTINGS_FILE.is_dir()
+
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_when_backend_session_already_gone(
         self,
         mock_get_backend,

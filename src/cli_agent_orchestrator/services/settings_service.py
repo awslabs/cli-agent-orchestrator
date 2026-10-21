@@ -446,10 +446,13 @@ def set_session_label(session_name: str, label: str) -> Dict[str, str]:
     display alias. Whitespace is trimmed and the label is capped at
     ``SESSION_LABEL_MAX_LENGTH``. Returns the full label map after the update.
 
-    Setting a label over a settings.json that exists but cannot be read raises
-    :class:`SettingsUnreadableError` and leaves the file untouched. Clearing
-    one in that state is a warning and a no-op instead: session teardown clears
-    unconditionally, nothing can be written safely, and nothing has been lost.
+    Setting OR clearing a label over a settings.json that exists but cannot be
+    read raises :class:`SettingsUnreadableError` and leaves the file untouched;
+    the two callers decide what that means. The HTTP endpoint reports it (a
+    200 for a clear that changed nothing would hide a broken file and let the
+    old label reappear once it is repaired). Session teardown logs it and
+    completes: nothing was written, nothing was lost, and the teardown itself
+    succeeded (haofeif / plauzy, #724 review).
     """
     clean = label.strip()[:SESSION_LABEL_MAX_LENGTH]
 
@@ -471,13 +474,7 @@ def set_session_label(session_name: str, label: str) -> Dict[str, str]:
         settings["session_labels"] = labels
         return True
 
-    try:
-        settings = _mutate(update)
-    except SettingsUnreadableError as e:
-        if clean:
-            raise
-        logger.warning(f"Not clearing label for {session_name}: {e}")
-        return {}
+    settings = _mutate(update)
     labels = settings.get("session_labels", {})
     return labels if isinstance(labels, dict) else {}
 

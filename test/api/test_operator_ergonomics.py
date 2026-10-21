@@ -203,6 +203,21 @@ class TestSessionLabelEndpoint:
         assert str(settings_file) not in resp.text
         assert settings_file.read_bytes() == before
 
+    def test_clearing_over_an_unreadable_settings_file_is_a_500_not_a_silent_200(
+        self, client, settings_file, backend
+    ):
+        """haofeif, #724 review, P3: a blank label used to suppress the
+        unreadable-file error globally, so this endpoint answered 200 with
+        ``label: null`` although no bytes changed, and the old label came back
+        once the file was repaired. An explicit clear now surfaces it; only
+        session teardown treats it as best-effort."""
+        settings_file.write_text('{"session_labels": {"cao-demo": "Old"},}')  # trailing comma
+        before = settings_file.read_bytes()
+        resp = client.post("/sessions/cao-demo/label", json={"label": ""})
+        assert resp.status_code == 500
+        assert "settings.json could not be read" in resp.json()["detail"]
+        assert settings_file.read_bytes() == before
+
     def test_list_and_get_surface_the_label(self, client, settings_file):
         settings_service.set_session_label("cao-demo", "Nightly triage")
         with patch("cli_agent_orchestrator.api.main.session_service") as svc:

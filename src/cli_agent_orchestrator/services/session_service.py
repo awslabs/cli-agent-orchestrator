@@ -51,6 +51,7 @@ from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_even
 from cli_agent_orchestrator.services.session_env import clear_session_env
 from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
 from cli_agent_orchestrator.services.settings_service import (
+    SettingsUnreadableError,
     get_session_labels,
     set_session_label,
 )
@@ -864,6 +865,16 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
             # completed teardown.
             try:
                 set_session_label(session_name, "")
+            except SettingsUnreadableError as e:
+                # settings.json exists but cannot be read (a directory, EACCES,
+                # a syntax error). Nothing was written and nothing was lost --
+                # the label, if any, is inside the file nobody can read -- and
+                # the teardown itself is complete, so this is a warning, not an
+                # entry in errors[]: an entry there makes DELETE /sessions/{name}
+                # answer 409 "cleanup deferred ... retry after residual Grok
+                # processes exit" on every retry, pointing the operator at Grok
+                # instead of at the file (plauzy, #724 review, item 4).
+                logger.warning(f"Not clearing label for {session_name}: {e}")
             except Exception as e:
                 logger.warning(f"Failed to clear label for {session_name}: {e}")
                 result["errors"].append(

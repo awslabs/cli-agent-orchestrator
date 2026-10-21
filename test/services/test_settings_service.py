@@ -1,8 +1,7 @@
 """Tests for settings_service module."""
 
 import json
-import threading
-import logging
+import os
 import threading
 from pathlib import Path
 from unittest.mock import patch
@@ -821,6 +820,22 @@ class TestWritersFailClosed:
             write()
         assert settings_file.is_dir()
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+    @pytest.mark.parametrize("write", _WRITERS)
+    def test_a_permission_denied_file_is_refused_and_preserved(self, settings_file, write):
+        """EACCES on settings.json itself: ``locked_atomic_rewrite`` pre-reads
+        the target before ``compute`` runs, so the PermissionError surfaces
+        there and must be mapped like EISDIR and undecodable bytes, not escape
+        as a raw traceback (gutosantos82 / plauzy, #724 review)."""
+        settings_file.write_text('{"keep": 1}')
+        settings_file.chmod(0o000)
+        try:
+            with pytest.raises(settings_service.SettingsUnreadableError):
+                write()
+        finally:
+            settings_file.chmod(0o600)
+        assert settings_file.read_text() == '{"keep": 1}'
+
     @pytest.mark.parametrize("write", _WRITERS)
     def test_an_absent_file_is_still_created(self, settings_file, write):
         """ "Absent" stays distinct from "unreadable": defaults are the right
@@ -932,18 +947,18 @@ class TestSessionLabels:
         # not create or rewrite settings.json on every session delete.
         assert not settings_file.exists()
 
-    def test_teardown_clear_leaves_an_unparseable_settings_file_alone(self, settings_file, caplog):
-        """``delete_session`` clears a label unconditionally. Over a file that
-        exists but does not parse, the clear must neither rewrite it (#737)
-        nor turn every teardown into an error: nothing can be written safely
-        and nothing has been lost, so it is a warning and a no-op."""
+    def test_clearing_over_an_unparseable_settings_file_is_refused_and_preserved(
+        self, settings_file
+    ):
+        """A clear is a write like any other: over a file that exists but does
+        not parse it must neither rewrite the file (#737) nor pretend to have
+        succeeded. The service raises; ``delete_session`` is the one caller
+        that downgrades this to a warning (haofeif, #724 review, P3)."""
         settings_file.write_text('{"terminal": {"backend": "tmux"},}')  # trailing comma
-        before = settings_file.read_text()
-
-        with caplog.at_level(logging.WARNING, logger=settings_service.__name__):
-            assert settings_service.set_session_label("cao-gone", "") == {}
-        assert settings_file.read_text() == before
-        assert "Not clearing label for cao-gone" in caplog.text
+        before = settings_file.read_bytes()
+        with pytest.raises(settings_service.SettingsUnreadableError):
+            settings_service.set_session_label("cao-gone", "")
+        assert settings_file.read_bytes() == before
 
     def test_resetting_the_same_label_does_not_rewrite(self, settings_file):
         """The no-op guard must actually skip the write, not merely produce the
