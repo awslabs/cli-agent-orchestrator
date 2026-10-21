@@ -65,6 +65,7 @@ jobs:
             -m "not e2e" \
             --cov=src/cli_agent_orchestrator \
             --cov-report=xml \
+            --cov-fail-under=80 \
             --cov-report=term-missing \
             -v
 
@@ -216,6 +217,7 @@ jobs:
             -m "not e2e" \
             --cov=src/cli_agent_orchestrator \
             --cov-report=json \
+            --cov-fail-under=80 \
             -q
 
       - name: Coverage ratchet
