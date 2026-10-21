@@ -249,10 +249,18 @@ fi
 step "remove both skills and verify the isolated store is clean"
 cao skills remove "${SKILL_NAME}" >/dev/null
 cao skills remove "${DECOY_NAME}" >/dev/null
-cao skills list | grep -q "No skills found" || fail "skills still listed after removal"
 [ ! -e "${CAO_HOME_DIR}/skills/${SKILL_NAME}" ] \
     || fail "${SKILL_NAME} directory still present after removal"
 [ ! -e "${CAO_HOME_DIR}/skills/${DECOY_NAME}" ] \
     || fail "${DECOY_NAME} directory still present after removal"
+if [ "${LIVE}" -eq 0 ]; then
+    cao skills list | grep -q "No skills found" || fail "skills still listed after removal"
+else
+    # A running cao-server seeds built-in skills into its isolated home. Only
+    # our two example skills must disappear; those built-ins belong to CAO.
+    if cao skills list | grep -E "${SKILL_NAME}|${DECOY_NAME}"; then
+        fail "example skills still listed after removal"
+    fi
+fi
 
 echo "[skills-example] OK: full skill lifecycle verified" >&2

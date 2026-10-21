@@ -18,7 +18,7 @@ feature; it is not hidden setup for something else. The canonical reference is
 | Load full body | `load_skill` MCP tool / `load_skill_content` | The complete Markdown body, output contract included |
 | Profile linkage | profile `skills: [python-review-checklist]` | `build_skill_catalog(profile.skills)` — the exact call terminal launch makes — advertises only this skill |
 | Fixture task | `fixture/apply_checklist.py` | `Checklist applied: 4/4 items` — observable behavior derived from the skill guidance |
-| Remove | `cao skills remove python-review-checklist` | `cao skills list` reports `No skills found`; the store is empty |
+| Remove | `cao skills remove python-review-checklist` (and the example decoy) | Both example skills disappear; default mode reports `No skills found`, while live mode may still list server-seeded built-ins |
 
 ## Prerequisites
 
