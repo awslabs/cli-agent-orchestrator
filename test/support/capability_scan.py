@@ -285,7 +285,15 @@ def python_files(root: Path, *, exclude: Iterable[Path] = ()) -> list[Path]:
 
 
 def _declared_names(tree: ast.AST) -> Iterator[tuple[str, int]]:
-    """Names this module DEFINES: assignment targets and def/class names."""
+    """Names this module DEFINES: assignment targets and def/class names.
+
+    ``ast.walk`` visits every node in the tree, including a Store-context
+    ``Attribute`` nested inside an ``AnnAssign`` or tuple-unpacked ``Assign``
+    target (``self.x: bool = True``, ``self.x, self._y = True, 1``). The final
+    check below catches those directly instead of enumerating every target
+    shape, so an annotated or tuple-unpacked ``self.<flag>`` override is
+    recorded too (#1005 P2-1).
+    """
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             yield node.name, node.lineno
@@ -293,10 +301,11 @@ def _declared_names(tree: ast.AST) -> Iterator[tuple[str, int]]:
             yield node.target.id, node.lineno
         elif isinstance(node, ast.Assign):
             for target in node.targets:
-                if isinstance(target, ast.Name):
-                    yield target.id, target.lineno
-                elif isinstance(target, ast.Attribute):
-                    yield target.attr, target.lineno
+                for sub in ast.walk(target):
+                    if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                        yield sub.id, sub.lineno
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store):
+            yield node.attr, node.lineno
 
 
 def _docstring_nodes(tree: ast.AST) -> set[int]:

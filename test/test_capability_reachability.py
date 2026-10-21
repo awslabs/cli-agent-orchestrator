@@ -282,6 +282,40 @@ class TestConsumerLiteralPrecision:
             f"a Store-context attribute assignment must not count as a consumer: {assignment!r}"
         )
 
+    @pytest.mark.parametrize(
+        "assignment",
+        [
+            "self.supports_probe: bool = True\n",
+            "self.supports_probe, self._x = True, 1\n",
+        ],
+    )
+    def test_annotated_or_tuple_override_is_recorded_as_an_override(self, tmp_path, assignment):
+        """Regression for #1005 P2-1: an annotated or tuple-unpacked ``self.x =
+        ...`` must register as an OVERRIDE, so a same-file read of it does not
+        count as an outside consumer."""
+        declaring = tmp_path / "base.py"
+        declaring.write_text("class Base:\n    supports_probe: bool = False\n")
+        impl = tmp_path / "impl.py"
+        impl.write_text(
+            "class Impl(Base):\n"
+            f"    def __init__(self):\n        {assignment}"
+            "    def decide(self):\n        return self.supports_probe\n"
+        )
+
+        refs = find_references(
+            ["supports_probe"],
+            declaring_module=declaring,
+            implementation_files=[impl],
+            search_files=[declaring, impl],
+            include_strings=True,
+        )
+        result = refs["supports_probe"]
+        assert result.overrides, f"expected impl.py to register as an override: {assignment!r}"
+        assert not result.reachable, (
+            "a same-file read of an annotated or tuple-unpacked override must not make "
+            f"the capability reachable: {assignment!r}"
+        )
+
     def test_self_call_inside_the_only_override_is_not_reachable(self, tmp_path):
         """Regression for P2-2 kind 1 (the live ``wait_until_input_ready`` shape):
         a self-call inside the sole overriding implementation proves only that
