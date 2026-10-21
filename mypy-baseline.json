@@ -1,0 +1,88 @@
+{
+  "_comment": "Per-file, per-error-code mypy baseline for scripts/mypy_ratchet.py (issue #1005). This number may only go DOWN. Regenerate with `python scripts/mypy_ratchet.py --update`; raising any count needs a reviewer's explicit sign-off in the PR.",
+  "mypy_version": "mypy 2.4.0 (compiled: yes)",
+  "targets": [
+    "src/"
+  ],
+  "total_errors": 177,
+  "files": {
+    "src/cli_agent_orchestrator/api/main.py": {
+      "call-arg": 1
+    },
+    "src/cli_agent_orchestrator/cli/commands/profile.py": {
+      "assignment": 2
+    },
+    "src/cli_agent_orchestrator/cli/main.py": {
+      "operator": 1
+    },
+    "src/cli_agent_orchestrator/clients/tmux.py": {
+      "union-attr": 1
+    },
+    "src/cli_agent_orchestrator/mcp_server/server.py": {
+      "arg-type": 10,
+      "call-arg": 4,
+      "union-attr": 1
+    },
+    "src/cli_agent_orchestrator/providers/kimi_cli.py": {
+      "no-any-return": 1
+    },
+    "src/cli_agent_orchestrator/services/agent_scaffold.py": {
+      "no-any-return": 1,
+      "var-annotated": 1
+    },
+    "src/cli_agent_orchestrator/services/agui/approval_bridge.py": {
+      "operator": 3
+    },
+    "src/cli_agent_orchestrator/services/agui/run_plane.py": {
+      "arg-type": 22,
+      "assignment": 11,
+      "call-arg": 36
+    },
+    "src/cli_agent_orchestrator/services/agui/stream_reader.py": {
+      "assignment": 1
+    },
+    "src/cli_agent_orchestrator/services/flow_service.py": {
+      "arg-type": 1
+    },
+    "src/cli_agent_orchestrator/services/memory_relationship_service.py": {
+      "arg-type": 2,
+      "call-overload": 3,
+      "misc": 1
+    },
+    "src/cli_agent_orchestrator/services/memory_service.py": {
+      "arg-type": 1,
+      "assignment": 2,
+      "call-arg": 2
+    },
+    "src/cli_agent_orchestrator/services/profile_validator.py": {
+      "no-any-return": 1
+    },
+    "src/cli_agent_orchestrator/services/session_service.py": {
+      "no-redef": 1
+    },
+    "src/cli_agent_orchestrator/services/terminal_service.py": {
+      "arg-type": 1,
+      "call-arg": 2
+    },
+    "src/cli_agent_orchestrator/services/vault/migrate.py": {
+      "arg-type": 9,
+      "index": 2
+    },
+    "src/cli_agent_orchestrator/services/vault/reader.py": {
+      "arg-type": 14,
+      "assignment": 1
+    },
+    "src/cli_agent_orchestrator/utils/agent_profiles.py": {
+      "arg-type": 20
+    },
+    "src/cli_agent_orchestrator/utils/api_http.py": {
+      "no-any-return": 1
+    },
+    "src/cli_agent_orchestrator/utils/orchestration.py": {
+      "call-arg": 16
+    },
+    "src/cli_agent_orchestrator/utils/skills.py": {
+      "arg-type": 1
+    }
+  }
+}
