@@ -168,6 +168,12 @@ def _hermetic_cao_env(monkeypatch, tmp_path):
     monkeypatch.setattr(settings_service, "SETTINGS_FILE", tmp_path / "settings.json")
     monkeypatch.setattr(settings_service, "_server_settings_cache", None)
     monkeypatch.setattr(settings_service, "_server_settings_mtime_ns", -1)
+    # The server lock (#406) lives beside settings.json in the real home. Every
+    # in-process ``lifespan`` run would otherwise contend with a cao-server the
+    # developer has running, so each test locks its own file.
+    from cli_agent_orchestrator.utils import server_lock
+
+    monkeypatch.setattr(server_lock, "SERVER_LOCK_FILE", tmp_path / "server.lock")
 
     # server.py defaults sender_id to "supervisor" when unset
     monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)
