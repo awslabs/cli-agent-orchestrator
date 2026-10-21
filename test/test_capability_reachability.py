@@ -317,6 +317,29 @@ class TestConsumerLiteralPrecision:
             f"the capability reachable: {assignment!r}"
         )
 
+    def test_declaring_module_own_read_is_not_a_consumer(self, tmp_path):
+        """Regression for #1005 P3-2: the declaring module's own internal reads
+        are excluded wholesale, even with no override anywhere."""
+        declaring = tmp_path / "base.py"
+        declaring.write_text(
+            "class Base:\n"
+            "    supports_probe: bool = False\n"
+            "    def decide(self):\n"
+            "        return self.supports_probe\n"
+        )
+
+        refs = find_references(
+            ["supports_probe"],
+            declaring_module=declaring,
+            implementation_files=[],
+            search_files=[declaring],
+            include_strings=True,
+        )
+        result = refs["supports_probe"]
+        assert (
+            not result.reachable
+        ), "a read inside the declaring module itself must not count as a consumer"
+
     def test_self_call_inside_the_only_override_is_not_reachable(self, tmp_path):
         """Regression for P2-2 kind 1 (the live ``wait_until_input_ready`` shape):
         a self-call inside the sole overriding implementation proves only that
@@ -380,6 +403,33 @@ class TestEventEmissionRequiresInstantiation:
         assert not results["post_probe"].reachable, (
             "a @hook subscriber alone must not prove the event is ever emitted -- "
             "nothing in src/ instantiates PostProbeEvent"
+        )
+
+    def test_event_instantiated_only_in_declaring_module_is_not_reachable(self, tmp_path):
+        """Regression for #1005 P3-2: the declaring module's own instantiation
+        does not count either -- ``events.py`` naming its own event proves
+        nothing about a decision path outside it."""
+        declaring = tmp_path / "events.py"
+        declaring.write_text(
+            "class CaoEvent:\n    pass\n\n\n"
+            'class PostProbeEvent(CaoEvent):\n    event_type: str = "post_probe"\n\n\n'
+            "PostProbeEvent()\n"
+        )
+
+        results = {
+            r.capability.name: r
+            for r in scan_surface(
+                declaring_module=declaring,
+                class_name="CaoEvent",
+                kinds=("event_type",),
+                implementation_glob="*.py",
+                include_strings=True,
+                search_root=tmp_path,
+            )
+        }
+        assert not results["post_probe"].reachable, (
+            "instantiating the event class inside its own declaring module must not "
+            "count as a consumer"
         )
 
     def test_instantiated_event_is_reachable(self, tmp_path):
