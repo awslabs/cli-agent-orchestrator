@@ -1141,6 +1141,35 @@ to an issue or a pull request.
 
 ## See the robots move
 
+### Watch it live in a browser
+
+While the controller runs, it serves a read-only **live view** on the same
+`127.0.0.1` address. Open its base URL in a browser:
+
+```
+http://127.0.0.1:8766/
+```
+
+Use the `--port` you prepared with if it is not `8766`; the controller prints
+the exact URL (`LIVE VIEW: ...`) when it starts. The page polls the controller's
+`observe()` a few times a second and draws a top-down map of the zones, the
+shared dock, the carts, and the parcel, so you watch the carts move **as the
+agents act**. A side panel highlights **which agent is acting** right now - the
+zone worker that is carrying, offering, or accepting - next to an action log of
+every command. It serves only simulation state (measured poses, custody, and
+command history, never a credential), needs no GPU or display, and so works
+where the `--record` pictures cannot, such as macOS without the OpenGL
+libraries.
+
+On a remote host, such as a browser IDE, forward the port first: in VS Code or
+code-server use the **Ports** panel, or `ssh -L 8766:127.0.0.1:8766 <host>`. Do
+not publish it on a public interface.
+
+The rest of this section is the saved **picture** record, which complements the
+live view: `--record` writes PNGs you can keep and replay after the run.
+
+### Saved pictures with `--record`
+
 `demo.py serve --record DIR` saves pictures of the MuJoCo world. Step 3 uses
 this option. The directory must be new or empty. The pictures come from a
 fixed overview camera. They do not change the simulation.
