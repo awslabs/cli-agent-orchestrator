@@ -85,6 +85,7 @@ async def create_session(
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     description: Any = _DESCRIPTION_UNSET,
+    create_working_directory: bool = False,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
@@ -114,6 +115,10 @@ async def create_session(
     mechanics. A caller supplying the same key on a retry gets back the
     SAME terminal this function already created for it, without a second
     tmux window or provider process.
+
+    ``create_working_directory`` (#724): forwarded as-is to ``create_terminal``,
+    which validates the directory against the path policy and creates it only
+    once every check that can refuse the request has passed.
     """
     if initial_message == "":
         raise ValueError("initial_message must not be empty")
@@ -148,6 +153,7 @@ async def create_session(
         group=group,
         metadata=metadata,
         description=description,
+        create_working_directory=create_working_directory,
     )
     dispatch_plugin_event(
         registry,

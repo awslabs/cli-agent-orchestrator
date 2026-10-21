@@ -156,8 +156,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Operator ergonomics on the HTTP API: `working_directory` on `POST /sessions`
   and `POST /sessions/{name}/terminals` accepts the spellings an operator
   pastes from a browser on WSL (quoted, `~`, Windows drive paths mapped to the
-  `/mnt` interop mount) and creates a missing folder, bounded and only after
-  every cheaper validation; `GET /fs/dirs` lists server-side subdirectories
+  `/mnt` interop mount) and creates a missing folder under the same path
+  policy as the MCP tools, at the point of use after every check that can
+  refuse the request; `GET /fs/dirs` lists server-side subdirectories
   for a folder picker; `POST /sessions/{name}/label` gives a session a display
   alias surfaced on the session listings; every handled response carries an
   `X-Server-Time` header, exposed through CORS, so a browser can correct for

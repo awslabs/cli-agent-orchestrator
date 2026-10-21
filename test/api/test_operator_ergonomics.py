@@ -4,6 +4,8 @@ folder listing, per-session display labels, and the ``X-Server-Time`` header.
 """
 
 import json
+import os
+import uuid
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -12,6 +14,7 @@ import pytest
 
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.services import settings_service
+from cli_agent_orchestrator.utils.paths import WorkingDirectoryError
 
 
 @pytest.fixture
@@ -271,7 +274,10 @@ class TestWorkingDirectoryNormalizationAtTheBoundary:
         assert not target.exists(), "a rejected request left a directory tree behind"
         svc.create_session.assert_not_called()
 
-    def test_create_session_creates_a_missing_folder(self, client, tmp_path):
+    def test_create_session_asks_the_service_to_create_a_missing_folder(self, client, tmp_path):
+        """The boundary creates NOTHING (plauzy, #724 review): it forwards the
+        normalized path and the create flag, and terminal_service makes the
+        directory at the point of use, after the checks that can 404/409/429."""
         target = tmp_path / "new" / "project"
         with patch("cli_agent_orchestrator.api.main.session_service") as svc:
             svc.create_session = AsyncMock(return_value=self._terminal())
@@ -284,8 +290,96 @@ class TestWorkingDirectoryNormalizationAtTheBoundary:
                 },
             )
         assert resp.status_code == 201
-        assert target.is_dir()
+        assert not target.exists(), "the HTTP boundary must not create directories"
         assert svc.create_session.call_args.kwargs["working_directory"] == str(target)
+        assert svc.create_session.call_args.kwargs["create_working_directory"] is True
+
+    @pytest.mark.parametrize("endpoint", ["session", "terminal"])
+    def test_blocked_system_path_is_a_400_and_never_created(self, client, endpoint):
+        """``/tmp`` is in the repository's blocked set. The old helper created
+        ``/tmp/<new>`` at the boundary and the backend's ``allow_create=False``
+        check then accepted the now-existing path: an unconfined mkdir for any
+        write-scope token. The policy check now runs first, side-effect free
+        (plauzy, #724 review, blocking item 1)."""
+        target = Path("/tmp") / f"cao-724-{uuid.uuid4().hex}"
+        try:
+            with (
+                patch("cli_agent_orchestrator.api.main.terminal_service") as ts,
+                patch("cli_agent_orchestrator.api.main.session_service") as svc,
+            ):
+                ts.create_terminal = AsyncMock()
+                svc.create_session = AsyncMock()
+                resp = self._create(client, endpoint, str(target))
+            assert resp.status_code == 400, resp.json()
+            assert "not allowed" in resp.json()["detail"]
+            assert not target.exists(), "a blocked path was created"
+            ts.create_terminal.assert_not_called()
+            svc.create_session.assert_not_called()
+        finally:
+            if target.exists():  # pragma: no cover - only on a failed assertion
+                target.rmdir()
+
+    @pytest.mark.parametrize("endpoint", ["session", "terminal"])
+    def test_component_over_name_max_is_a_400_not_a_500(self, client, endpoint, tmp_path):
+        """Under the 4096 total cap but over the OS's 255 per component:
+        ``Path.exists()`` raised ``OSError(36)`` and both endpoints answered
+        ``500 File name too long`` (plauzy, #724 review, blocking item 3)."""
+        target = tmp_path / ("x" * 300)
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as ts,
+            patch("cli_agent_orchestrator.api.main.session_service") as svc,
+        ):
+            ts.create_terminal = AsyncMock()
+            svc.create_session = AsyncMock()
+            resp = self._create(client, endpoint, str(target))
+        assert resp.status_code == 400, resp.json()
+        assert "folder name longer than" in resp.json()["detail"]
+        assert not os.path.exists(target)  # Path.exists itself raises ENAMETOOLONG
+        ts.create_terminal.assert_not_called()
+        svc.create_session.assert_not_called()
+
+    @pytest.mark.parametrize("endpoint", ["session", "terminal"])
+    def test_windows_path_that_leaves_its_drive_is_a_400(self, client, endpoint, tmp_path):
+        mnt = tmp_path / "mnt"
+        (mnt / "c").mkdir(parents=True)
+        with (
+            patch("cli_agent_orchestrator.utils.paths.Path.is_dir", return_value=True),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as ts,
+            patch("cli_agent_orchestrator.api.main.session_service") as svc,
+        ):
+            ts.create_terminal = AsyncMock()
+            svc.create_session = AsyncMock()
+            resp = self._create(client, endpoint, r"C:\..\..\Windows")
+        assert resp.status_code == 400, resp.json()
+        assert "leaves drive C:" in resp.json()["detail"]
+        ts.create_terminal.assert_not_called()
+        svc.create_session.assert_not_called()
+
+    def test_working_directory_error_from_the_terminal_service_is_a_400_not_a_404(
+        self, client, tmp_path
+    ):
+        """The point-of-use mkdir can still fail (EACCES on a parent, a
+        read-only filesystem). ``POST /sessions/{name}/terminals`` maps a bare
+        ValueError to 404 "session not found"; a refused directory must come
+        out as the 400 it is."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as ts:
+            ts.create_terminal = AsyncMock(
+                side_effect=WorkingDirectoryError("Folder '/x' could not be created: EACCES")
+            )
+            resp = self._create(client, "terminal", str(tmp_path))
+        assert resp.status_code == 400
+        assert "could not be created" in resp.json()["detail"]
+
+    @staticmethod
+    def _create(client, endpoint, working_directory):
+        params = {
+            "provider": "kiro_cli",
+            "agent_profile": "developer",
+            "working_directory": working_directory,
+        }
+        if endpoint == "session":
+            return client.post("/sessions", params=params)
+        return client.post("/sessions/cao-demo/terminals", params=params)
 
     def test_create_terminal_in_session_normalizes_too(self, client, tmp_path):
         with (
@@ -304,6 +398,7 @@ class TestWorkingDirectoryNormalizationAtTheBoundary:
             )
         assert resp.status_code == 201, resp.json()
         assert ts.create_terminal.call_args.kwargs["working_directory"] == str(tmp_path)
+        assert ts.create_terminal.call_args.kwargs["create_working_directory"] is True
 
     def test_create_terminal_rejected_request_creates_no_directory(self, client, tmp_path):
         """Same rule as ``POST /sessions``: the normalization can CREATE, so a

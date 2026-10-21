@@ -137,6 +137,10 @@ from cli_agent_orchestrator.utils.enforcement import (
     native_providers,
 )
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
+from cli_agent_orchestrator.utils.paths import (
+    ensure_working_directory,
+    validate_working_directory,
+)
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
@@ -1051,6 +1055,7 @@ async def create_terminal(
     idempotency_key: Optional[str] = None,
     claim_id: Optional[str] = None,
     description: Optional[str] = None,
+    create_working_directory: bool = False,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -1274,6 +1279,8 @@ async def create_terminal(
 
     Raises:
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
+        WorkingDirectoryError: If ``create_working_directory`` is set and the
+            directory is refused by the path policy or cannot be created.
         IdempotencyKeyConflict: If ``idempotency_key`` was already used for a
             different request (surfaced as HTTP 409 by both create endpoints)
         TerminalRecordCorruptError: If the terminal a key maps to has a stored
@@ -1307,6 +1314,7 @@ async def create_terminal(
             description=description,
             idempotency_key=idempotency_key,
             claim_id=claim_id,
+            create_working_directory=create_working_directory,
             ephemeral_state=state,
         )
     except BaseException as exc:
@@ -1341,6 +1349,7 @@ async def _create_terminal_unguarded(
     idempotency_key: Optional[str] = None,
     claim_id: Optional[str] = None,
     description: Optional[str] = None,
+    create_working_directory: bool = False,
     *,
     ephemeral_state: _EphemeralLaunchState,
 ) -> Terminal:
@@ -1606,7 +1615,17 @@ async def _create_terminal_unguarded(
         # so resolving earlier would both launch tmux in the pre-worktree directory
         # (defeating the isolation #100 provides) and persist that stale path as the
         # terminal's working_directory. This is the effective launch cwd either way.
-        resolved_working_directory = _resolve_working_directory(working_directory)
+        if create_working_directory and working_directory is not None:
+            # The HTTP create endpoints (#724): the operator may point at a
+            # directory that does not exist yet. Apply the SAME path policy the
+            # backend applies (blocked system directories, judged on the nearest
+            # existing ancestor when the target is missing) but create nothing
+            # here: the mkdir waits until the locked section below has passed
+            # the duplicate-session / session-not-found checks, so a rejected
+            # request leaves no directory behind.
+            resolved_working_directory = validate_working_directory(working_directory)
+        else:
+            resolved_working_directory = _resolve_working_directory(working_directory)
 
         # Normalize the session name BEFORE anything keys off it: the lifecycle
         # lock below is per session NAME, so it must be taken on the SAME string
@@ -1747,6 +1766,12 @@ async def _create_terminal_unguarded(
 
                     session_incarnation_id = uuid.uuid4().hex
 
+                    if create_working_directory:
+                        # Point of use (#724): every check that can refuse this
+                        # request has passed, so creating the operator's
+                        # directory now cannot leave an orphan behind.
+                        ensure_working_directory(resolved_working_directory)
+
                     # Create new tmux session with initial window
                     effective_env = dict(env_vars or {})
                     get_backend().create_session(
@@ -1777,6 +1802,9 @@ async def _create_terminal_unguarded(
                     # CAO_WORKFLOW_RUN_ID must reach the window even when it
                     # joins an existing session (issue #408).
                     effective_env = {**get_session_env(session_name), **(env_vars or {})}
+                    if create_working_directory:
+                        # Point of use, as in the new-session branch above.
+                        ensure_working_directory(resolved_working_directory)
                     created_window_name = get_backend().create_window(
                         session_name,
                         window_name,

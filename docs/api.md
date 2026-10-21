@@ -214,12 +214,18 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   the way an operator types it into a browser field: surrounding quotes
   (Explorer's "Copy as path") are stripped, `~` is expanded, and on WSL a
   Windows drive path (`C:\x\y` or `C:/x/y`) is translated to the interop
-  mount (`/mnt/c/x/y`) when that drive is mounted. A missing directory is
-  created, bounded by a path-length and depth cap and performed only after the
-  request's cheaper validations pass, so a request that is rejected anyway
-  leaves nothing behind; a relative path, an existing non-directory, or an
-  unmounted drive is rejected as a `400` with a plain-language `detail`
-  instead of a `500` from tmux.
+  mount (`/mnt/c/x/y`) when that drive is mounted. The normalization itself
+  touches nothing on disk. The result is checked against the same path policy
+  as the MCP tools (a missing target is judged by its nearest existing
+  ancestor, so `/tmp/new` and `/etc/new` are refused), and a missing directory
+  is created only once the session or terminal is actually being created,
+  after the duplicate-session, session-not-found and terminal-cap checks, so a
+  request that is rejected at any point leaves nothing behind. A relative
+  path, an existing non-directory, an unmounted drive, a Windows path that
+  walks out of its drive, a folder name over the 255-byte limit, or a
+  directory the OS refuses to create is a `400` with a plain-language
+  `detail` instead of a `500` from tmux. See
+  [Working directory](working-directory.md).
 - `POST /sessions/{session_name}/label` prefix-normalizes its name the same
   way `POST /sessions` does, so `demo` and `cao-demo` address one session.
 - `POST /sessions/{session_name}/label` with `{"label": "..."}` sets a

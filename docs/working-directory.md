@@ -28,14 +28,24 @@ on WSL works as typed:
 | `C:/Users/me/proj` | `/mnt/c/Users/me/proj` |
 | `~/proj` | `/home/me/proj` |
 | `/home/me/scratch/../proj` | `/home/me/proj` (`scratch` is never created) |
-| `/home/me/new-proj` (missing) | created, then used |
+| `/home/me/new-proj` (missing) | created when the session or terminal is actually created, then used |
 
 A relative path, a `~user` for a user that does not exist, an existing
 non-directory (a file, FIFO, socket or device),
-or a Windows drive that is not mounted under `/mnt` is rejected with a `400`
-and a plain-language `detail`. Creation is bounded by a path-length and depth
-cap, and runs only after the request's cheaper validations pass. The MCP `handoff`/
-`assign` `working_directory` parameter is unchanged.
+a Windows drive that is not mounted under `/mnt`, a Windows path whose `..`
+would leave that drive, or a folder name over the filesystem's 255-byte limit
+is rejected with a `400` and a plain-language `detail`.
+
+A missing directory is judged by the same path policy as everything else on
+this page (the nearest existing ancestor must not be a blocked system
+directory, so `/tmp/new-proj` and `/etc/new-proj` are refused) and is created
+only at the moment the session or terminal is created, after every check that
+can refuse the request (name validation, duplicate session, session not found,
+the terminal cap): a rejected request leaves nothing behind. Creation is
+bounded by a depth cap, and a directory the OS cannot create (a parent that is
+a file or not traversable, a read-only filesystem) is a `400`, not a `500`. The
+MCP `handoff`/`assign` `working_directory` parameter is unchanged: it never
+creates anything.
 
 ## Usage Example
 

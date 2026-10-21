@@ -186,7 +186,11 @@ from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, reso
 from cli_agent_orchestrator.utils.forwarded_env import ForwardedEnvError, validate_forwarded_env
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
-from cli_agent_orchestrator.utils.paths import normalize_working_directory
+from cli_agent_orchestrator.utils.paths import (
+    WorkingDirectoryError,
+    normalize_working_directory,
+    validate_working_directory,
+)
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
     load_skill_content,
@@ -3187,11 +3191,15 @@ async def list_directories(
         # ``normalize_working_directory`` returns None for a blank or
         # quotes-only value, which must fall back to the documented home
         # default -- ``Path("")`` would silently resolve to the server's CWD.
-        normalized = normalize_working_directory(path, create_missing=False) if path else None
+        normalized = normalize_working_directory(path) if path else None
         resolved = Path(normalized) if normalized else Path.home()
         resolved = resolved.resolve()
+        # Both probes sit inside the try: a component over NAME_MAX makes
+        # exists()/is_dir() raise OSError, which the arm below turns into a 400.
+        if not resolved.exists():
+            raise ValueError(f"Folder does not exist: {resolved}")
         if not resolved.is_dir():
-            raise ValueError(f"Not a folder: {resolved}")
+            raise ValueError(f"{str(resolved)!r} is not a folder")
         visible: List[str] = []
         hidden: List[str] = []
         for entry in sorted(resolved.iterdir(), key=lambda e: e.name.lower()):
@@ -3706,10 +3714,15 @@ async def create_session(
         # Accept the spellings an operator actually types into a browser field
         # (``~``, Explorer-quoted, Windows drive paths on WSL) and reject an
         # unusable one as a clear 400 here, instead of a 500 deep in tmux.
-        # Deliberately LAST among the validations: this call can create the
-        # directory, and a request that some cheaper check was going to reject
-        # must not leave a tree behind (gutosantos82, #724 review).
+        # Both calls are side-effect free: the normalization is lexical and
+        # the policy check (blocked system directories, judged on the nearest
+        # existing ancestor for a missing target -- #345 D5) only reads. The
+        # directory itself is created by terminal_service at the point of use,
+        # after the duplicate-session and terminal-cap checks, so a request
+        # rejected anywhere along the way leaves nothing behind (plauzy, #724).
         working_directory = normalize_working_directory(working_directory)
+        if working_directory is not None:
+            validate_working_directory(working_directory)
 
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
@@ -3731,6 +3744,7 @@ async def create_session(
             resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
+            create_working_directory=True,
             **(
                 {"description": body.description}
                 if body and "description" in body.model_fields_set
@@ -4078,12 +4092,14 @@ async def create_terminal_in_session(
                     ),
                 )
 
-        # Same operator-typed spellings POST /sessions accepts (see there).
-        # Last among the validations for the same reason as there: this call
-        # can create the directory, and a request one of the checks above was
-        # going to reject must not leave a tree behind.
+        # Same operator-typed spellings POST /sessions accepts (see there), and
+        # the same side-effect-free policy check. Creation happens inside
+        # terminal_service once the session-not-found and terminal-cap checks
+        # have passed, so a rejected request never leaves a tree behind.
         try:
             working_directory = normalize_working_directory(working_directory)
+            if working_directory is not None:
+                validate_working_directory(working_directory)
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -4105,6 +4121,7 @@ async def create_terminal_in_session(
             use_worktree=use_worktree,
             idempotency_key=idempotency_key,
             claim_id=claim_id,
+            create_working_directory=True,
         )
         return result
     except HTTPException:
@@ -4122,6 +4139,11 @@ async def create_terminal_in_session(
         # These subclass ValueError, so they must precede the generic arm below —
         # a rejected configuration is a bad request, not a missing resource. Matches
         # POST /sessions, which already returns 400 for the identical failure.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except WorkingDirectoryError as e:
+        # Also a ValueError subclass, also ahead of the generic arm: a working
+        # directory the policy refuses or the OS cannot create at the point of
+        # use (#724) is a bad request, not a missing session.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except TerminalLimitError as e:
         # Node is at its tracked-terminal cap (CAO_MAX_TERMINALS) — a capacity
