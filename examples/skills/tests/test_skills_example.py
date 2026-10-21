@@ -24,7 +24,6 @@ from cli_agent_orchestrator.utils.skills import build_skill_catalog, load_skill_
 EXAMPLE_DIR = Path(__file__).resolve().parent.parent
 BUNDLED_SKILL_DIR = EXAMPLE_DIR / "python-review-checklist"
 BUNDLED_PROFILE = EXAMPLE_DIR / "profiles" / "skills_lifecycle_reviewer.md"
-DECOY_SKILL_DIR = EXAMPLE_DIR / "decoy-skill"
 PROFILE_NAME = "skills_lifecycle_reviewer"
 SKILL_NAME = "python-review-checklist"
 DECOY_NAME = "skills-lifecycle-decoy"

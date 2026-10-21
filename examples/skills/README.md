@@ -43,7 +43,7 @@ the temporary home is deleted on exit.
 
 ```bash
 ./run.sh            # deterministic lifecycle — no server, no credentials
-./run.sh --live     # + one real claude_code session (needs cao-server)
+./run.sh --live     # + one real claude_code session (needs the authenticated claude CLI)
 ```
 
 ### Expected output (default mode)
