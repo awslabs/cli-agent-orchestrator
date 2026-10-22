@@ -22,7 +22,6 @@ from hypothesis import strategies as st
 
 from cli_agent_orchestrator.constants import SCRIPT_LINT_MAX_SOURCE_CHARS
 from cli_agent_orchestrator.models.workflow import LintFinding, ScriptValidationResult
-from cli_agent_orchestrator.services import script_lint as script_lint_module
 from cli_agent_orchestrator.services.script_lint import lint_script
 
 
@@ -103,15 +102,14 @@ class TestSyntaxRule:
             assert f.rule_id == "syntax"
             assert f.severity == "error"
 
-    def test_recursion_error_arm_is_fail_closed_syntax(self, monkeypatch):
+    def test_recursion_error_arm_is_fail_closed_syntax(self, scoped_ast_parse):
         # Deterministic coverage of the RecursionError arm on ALL supported
         # versions: sys.setrecursionlimit does not gate CPython's C parser, so
         # instead force ast.parse to raise RecursionError and assert the arm
-        # converts it to a fail-closed syntax ERROR anchored at line 1.
-        def _raise(*args, **kwargs):
-            raise RecursionError("maximum recursion depth exceeded")
-
-        monkeypatch.setattr(script_lint_module.ast, "parse", _raise)
+        # converts it to a fail-closed syntax ERROR anchored at line 1. The fake
+        # is scoped to this one source (see ``scoped_ast_parse``): a global fake
+        # would also break pytest's own failure rendering (#970 review, P3-3).
+        scoped_ast_parse("a.b.c\n", RecursionError("maximum recursion depth exceeded"))
         result = lint_script("a.b.c\n", "deep.py")
         assert result.status == "fail"
         f = result.findings[0]
@@ -140,16 +138,16 @@ class TestOversizeSourceGuard:
     the length cap rejects first) is asserted in-process.
     """
 
-    def test_oversize_source_is_rejected_before_ast_parse(self, monkeypatch):
+    def test_oversize_source_is_rejected_before_ast_parse(self, scoped_ast_parse):
         # Ordering is the invariant: the cap is worthless if the parse has
-        # already run by the time it is checked. A parse that raises loudly
-        # proves it was never reached.
-        def _must_not_run(*args, **kwargs):  # pragma: no cover - asserts absence
-            raise AssertionError("ast.parse ran on a source over the cap")
-
-        monkeypatch.setattr(script_lint_module.ast, "parse", _must_not_run)
+        # already run by the time it is checked. Record the parser's calls for
+        # THIS source and assert there were none once lint_script returns --
+        # recording, not raising from inside the subject, so a regression is an
+        # ordinary red test rather than an INTERNALERROR (#970 review, P3-3).
         source = "#" + "x" * SCRIPT_LINT_MAX_SOURCE_CHARS + "\n"
+        parse_calls = scoped_ast_parse(source)
         result = lint_script(source, "big.py")
+        assert parse_calls == [], "ast.parse ran on a source over the cap"
         assert result.status == "fail"
         assert [f.rule_id for f in result.findings] == ["syntax"]
         assert str(SCRIPT_LINT_MAX_SOURCE_CHARS) in result.findings[0].message

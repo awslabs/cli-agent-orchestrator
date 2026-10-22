@@ -228,38 +228,81 @@ def test_pathological_nesting_crashes_no_child_interpreter(tmp_path: Path) -> No
     assert "SURVIVED" in proc.stdout
 
 
-def test_extract_inputs_converts_recursion_error_to_value_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_extract_inputs_converts_recursion_error_to_value_error(scoped_ast_parse) -> None:
     """The backstop arm in ``_extract_inputs`` must fire, not just be unreachable.
 
     The child-process probe above measures a REAL interpreter cliff, which is host- and
     version-dependent (see the module docstring) -- on a host whose cliff sits further out,
     that probe passes via a successful parse and never exercises these ``except`` arms at
-    all. Monkeypatching ``ast.parse`` forces the arm deterministically, on every host.
+    all. Faking ``ast.parse`` forces the arm deterministically, on every host. The fake is
+    scoped to this one source: a process-wide fake also breaks pytest's own failure
+    rendering and turns a red test into ``INTERNALERROR`` (#970 review, P3-3).
     """
 
-    def _raise(*_args: object, **_kwargs: object) -> ast.Module:
-        raise RecursionError("maximum recursion depth exceeded")
-
-    monkeypatch.setattr(wss.ast, "parse", _raise)
+    scoped_ast_parse("INPUTS = {}\n", RecursionError("maximum recursion depth exceeded"))
     with pytest.raises(ValueError, match="too deeply nested"):
         wss._extract_inputs("INPUTS = {}\n")
 
 
-def test_extract_inputs_converts_memory_error_to_value_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_extract_inputs_converts_memory_error_to_value_error(scoped_ast_parse) -> None:
     """Same backstop, the other arm: see
     ``test_extract_inputs_converts_recursion_error_to_value_error`` for why this must be
     forced rather than relied on to fire naturally."""
 
-    def _raise(*_args: object, **_kwargs: object) -> ast.Module:
-        raise MemoryError("out of memory")
-
-    monkeypatch.setattr(wss.ast, "parse", _raise)
+    scoped_ast_parse("INPUTS = {}\n", MemoryError("out of memory"))
     with pytest.raises(ValueError, match="too complex"):
         wss._extract_inputs("INPUTS = {}\n")
+
+
+# --- The tooling half of the class: no test may fake the parser for the whole process ---
+
+_TEST_ROOT = _REPO_ROOT / "test"
+_SANCTIONED_PARSE_FAKE = _TEST_ROOT / "services" / "conftest.py"  # ``scoped_ast_parse``
+
+
+def _fakes_ast_parse(call: ast.Call) -> bool:
+    """True for ``monkeypatch.setattr(<x>.ast, "parse", ...)``, ``setattr(ast, "parse", ...)``,
+    ``patch.object(ast, "parse", ...)`` and the string forms ``setattr("...ast.parse", ...)``
+    / ``patch("...ast.parse")``."""
+
+    func = _dotted(call.func).split(".")[-1]
+    if func not in {"setattr", "patch", "object"}:
+        return False
+    args = list(call.args)
+    for i, arg in enumerate(args):
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            if arg.value == "ast.parse" or arg.value.endswith(".ast.parse"):
+                return True
+        elif _dotted(arg).split(".")[-1] == "ast" and i + 1 < len(args):
+            nxt = args[i + 1]
+            if isinstance(nxt, ast.Constant) and nxt.value == "parse":
+                return True
+    return False
+
+
+def test_no_test_fakes_ast_parse_globally() -> None:
+    """Every fake of ``ast.parse`` in ``test/`` goes through ``scoped_ast_parse``.
+
+    ``<module>.ast`` is the ``ast`` module, so a direct ``setattr(mod.ast, "parse", fake)``
+    replaces the parser for pytest too; when the test then fails, pytest's assertion
+    renderer calls the fake, it raises again, and the session dies with ``INTERNALERROR``
+    and the rest of the run unexecuted (#970 review, P3-3). Three tests in this PR had that
+    shape; the fixture scopes the fake to one source and delegates the rest to the real
+    parser, and this scan keeps a fourth from landing.
+    """
+
+    offenders: List[str] = []
+    for path in sorted(_TEST_ROOT.rglob("*.py")):
+        if path == _SANCTIONED_PARSE_FAKE:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and _fakes_ast_parse(node):
+                offenders.append(f"{path.relative_to(_REPO_ROOT).as_posix()}:{node.lineno}")
+    assert not offenders, (
+        "these tests replace ast.parse for the whole process; use the scoped_ast_parse "
+        f"fixture (test/services/conftest.py) instead: {offenders}"
+    )
 
 
 def test_oversize_rejection_keeps_the_rule_id_extract_inputs_skips_on() -> None:
