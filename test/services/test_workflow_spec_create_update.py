@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from cli_agent_orchestrator.clients.database import _migrate_workflow_index
+from cli_agent_orchestrator.constants import SCRIPT_LINT_MAX_SOURCE_CHARS, WORKFLOW_MAX_SPEC_BYTES
 from cli_agent_orchestrator.models.workflow import TierCollisionError
 from cli_agent_orchestrator.services import workflow_spec_service as svc
 
@@ -225,6 +226,27 @@ def test_refuses_a_spec_with_a_lint_error_and_says_which_rule(tmp_path: Path) ->
     """
     with pytest.raises(ValueError, match="lint errors and would not be runnable"):
         svc.create_workflow("broken", "def oops(\n", scan_dir=str(tmp_path))
+    assert _entries(tmp_path) == []
+
+
+def test_lint_refusal_carries_each_finding_message(tmp_path: Path) -> None:
+    """The 400 detail must say WHAT is wrong, not just which rule and line (#970 P3-1).
+
+    A valid script over SCRIPT_LINT_MAX_SOURCE_CHARS (but under WORKFLOW_MAX_SPEC_BYTES)
+    used to be refused as bare "syntax (line 1)", so an author had no way to learn that the
+    size was the problem. The message that lint_script renders for the validate route must
+    reach create and update too.
+    """
+    body = "".join(f"STEP_{i} = 'value {i}'\n" for i in range(9000))
+    source = "from cao_workflow import step\n" + body
+    compile(source, "big.py", "exec")  # valid Python; only the size is wrong
+    assert SCRIPT_LINT_MAX_SOURCE_CHARS < len(source) <= WORKFLOW_MAX_SPEC_BYTES
+    with pytest.raises(ValueError) as excinfo:
+        svc.create_workflow("big", source, scan_dir=str(tmp_path))
+    detail = str(excinfo.value)
+    assert "syntax (line 1): " in detail
+    assert f"source is {len(source)} characters" in detail
+    assert f"over the {SCRIPT_LINT_MAX_SOURCE_CHARS}-character limit" in detail
     assert _entries(tmp_path) == []
 
 

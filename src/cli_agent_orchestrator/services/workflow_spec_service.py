@@ -1120,8 +1120,14 @@ def _validated_script_spec(name: str, source: str, target_path: str) -> ScriptSp
         raise ValueError(f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)")
     result = lint_script(source, target_path)
     if result.status == "fail":
+        # rule_id, line AND message: this string is the 400 detail of POST /workflows and
+        # PUT /workflows/{name}, and without the message a valid-but-oversize script showed
+        # only "syntax (line 1)" with no way to learn about the character limit (#970
+        # review P3-1). The validate route already returns the full finding.
         errors = "; ".join(
-            f"{f.rule_id} (line {f.line})" for f in result.findings if f.severity == "error"
+            f"{f.rule_id} (line {f.line}): {f.message}"
+            for f in result.findings
+            if f.severity == "error"
         )
         raise ValueError(f"workflow '{name}' has lint errors and would not be runnable: {errors}")
     inputs = _extract_inputs(source)  # AST-only; never executes the module (SR-3A3-8)

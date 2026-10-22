@@ -163,6 +163,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Workflow scripts over 131,072 characters (128 KiB) now fail `validate`, `create`, `update`,
+  `run` and `submit` with a `syntax` finding that names the size and the limit, instead of being
+  parsed. On CPython 3.10 `ast.parse` segfaults the interpreter on deeply nested source and no
+  exception can catch it, so the linter and the `INPUTS` extractor each refuse oversize source
+  before parsing. A script between 128 KiB and the 256 KiB spec budget that ran before this
+  release must be split (#969).
 - Vault scan now re-reads a note whose size, mtime or ctime changed across the read window up to
   three times with a short backoff, as ADR-006 specifies, instead of skipping it on the first
   torn read. A note saved by Obsidian during a reconcile is indexed from the clean re-read; a

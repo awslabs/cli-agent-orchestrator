@@ -75,6 +75,10 @@ Every workflow follows the same path. No step is optional.
      `422`, but which the shim does not check before sending — so a typo fails that step
      mid-run rather than up front). See the authoring guide's recovery-policy section — a
      policy is a *declaration*, never a permission.
+   - **Scripts over 131,072 characters (128 KiB) fail validation** with a `syntax` error
+     before they are parsed. The limit is a crash guard for CPython 3.10's parser, not a
+     style rule; split a script that large into smaller ones. The spec byte budget
+     (256 KiB) still applies on top.
 3. **Run** — with an explicit, pre-announced `--run-id` so it can be cancelled.
    **Workflows are NEVER auto-run by an agent.** The user approves each run.
 4. **Status / cancel / resume** — `cao workflow status <run-id>`,
