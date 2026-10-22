@@ -72,7 +72,7 @@ def ensure_test_agent(kiro_cli_available):
         "tools": ["fs_read", "execute_bash"],
         "allowedTools": ["fs_read"],
         "resources": [],
-        "useLegacyMcpJson": False,
+        "includeMcpJson": False,
         "mcpServers": {},
     }
     with open(agent_file, "w") as f:

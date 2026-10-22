@@ -200,10 +200,14 @@ uv run isort --check-only src/ test/
 
 ### Type Checking
 
-The project uses `mypy` for static type checking:
+The project uses `mypy` for static type checking, gated by a per-file ratchet against a
+committed baseline (see [CONTRIBUTING.md](CONTRIBUTING.md#type-checking-the-mypy-ratchet)):
 
 ```bash
-# Run type checker
+# Run the blocking gate (what CI runs)
+uv run python scripts/mypy_ratchet.py
+
+# Run mypy directly for raw, unfiltered output
 uv run mypy src/
 ```
 
@@ -213,7 +217,7 @@ uv run mypy src/
 # Format, sort imports, type check, and run tests
 uv run black src/ test/
 uv run isort src/ test/
-uv run mypy src/
+uv run python scripts/mypy_ratchet.py
 uv run pytest -v
 ```
 
@@ -258,7 +262,7 @@ uv run pytest test/ --ignore=test/providers/test_kiro_cli_integration.py \
 ```bash
 uv run black src/ test/
 uv run isort src/ test/
-uv run mypy src/
+uv run python scripts/mypy_ratchet.py
 ```
 
 ### 6. Commit and Push

@@ -46,6 +46,7 @@ class TestListSiblingsImpl:
         mock_get.assert_called_once_with(
             "http://127.0.0.1:9889/terminals/caller-abc/siblings",
             params={},
+            headers=None,
             timeout=_mcp_timeout(),
         )
 
@@ -63,6 +64,7 @@ class TestListSiblingsImpl:
         mock_get.assert_called_once_with(
             "http://127.0.0.1:9889/terminals/caller-abc/siblings",
             params={"depth": 2},
+            headers=None,
             timeout=_mcp_timeout(),
         )
 
@@ -83,6 +85,7 @@ class TestListSiblingsImpl:
         mock_get.assert_called_once_with(
             "http://127.0.0.1:9889/terminals/caller-abc/siblings",
             params={"cross_session": "true"},
+            headers=None,
             timeout=_mcp_timeout(),
         )
 
@@ -100,6 +103,7 @@ class TestListSiblingsImpl:
         mock_get.assert_called_once_with(
             "http://127.0.0.1:9889/terminals/caller-abc/siblings",
             params={},
+            headers=None,
             timeout=_mcp_timeout(),
         )
 
@@ -165,6 +169,7 @@ class TestUpdateMetadataImpl:
         mock_patch.assert_called_once_with(
             "http://127.0.0.1:9889/terminals/caller-abc/metadata",
             json={"metadata": {"task": "reviewing PR"}},
+            headers=None,
             timeout=_mcp_timeout(),
         )
 

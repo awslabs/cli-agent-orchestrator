@@ -20,7 +20,12 @@ on:
     branches: [ main, develop ]
     paths:
       - 'src/cli_agent_orchestrator/providers/codex.py'
-      - 'test/providers/test_codex_provider_unit.py'
+      # Globbed, not a per-file list: a single hardcoded filename meant every
+      # Codex test outside test_codex_provider_unit.py (the completion-footer
+      # suite, the #739 startup-chrome invariant) was invisible to this
+      # workflow, and so was any file a future fix adds. The run step below
+      # expands the same glob.
+      - 'test/providers/test_codex_*.py'
       - 'test/providers/fixtures/codex_*.txt'
       - 'pyproject.toml'
       - '.github/workflows/test-codex-provider.yml'
@@ -28,7 +33,12 @@ on:
     branches: [ main, develop ]
     paths:
       - 'src/cli_agent_orchestrator/providers/codex.py'
-      - 'test/providers/test_codex_provider_unit.py'
+      # Globbed, not a per-file list: a single hardcoded filename meant every
+      # Codex test outside test_codex_provider_unit.py (the completion-footer
+      # suite, the #739 startup-chrome invariant) was invisible to this
+      # workflow, and so was any file a future fix adds. The run step below
+      # expands the same glob.
+      - 'test/providers/test_codex_*.py'
       - 'test/providers/fixtures/codex_*.txt'
       - 'pyproject.toml'
       - '.github/workflows/test-codex-provider.yml'
@@ -46,7 +56,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -59,7 +69,7 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
-          uv run pytest test/providers/test_codex_provider_unit.py \
+          uv run pytest test/providers/test_codex_*.py \
             --cov=src/cli_agent_orchestrator/providers/codex.py \
             --cov-report=xml \
             --cov-report=term-missing \
@@ -84,7 +94,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
