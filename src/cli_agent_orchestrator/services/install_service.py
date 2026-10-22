@@ -2015,6 +2015,11 @@ def install_agent(
                 toolsSettings=profile.toolsSettings,
                 hooks=profile.hooks,
                 model=profile.model,
+                # The profile keeps its historical ``useLegacyMcpJson`` spelling;
+                # the installed spec gets Kiro CLI's current ``includeMcpJson``.
+                # Unset in the profile means the historical default, False, so
+                # a profile that never mentioned it installs exactly as before.
+                includeMcpJson=bool(profile.useLegacyMcpJson),
             )
             agent_file = KIRO_AGENTS_DIR / f"{safe_filename}.json"
             agent_file.write_text(

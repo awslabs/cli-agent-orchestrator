@@ -20,7 +20,12 @@ on:
     branches: [ main, develop ]
     paths:
       - 'src/cli_agent_orchestrator/providers/codex.py'
-      - 'test/providers/test_codex_provider_unit.py'
+      # Globbed, not a per-file list: a single hardcoded filename meant every
+      # Codex test outside test_codex_provider_unit.py (the completion-footer
+      # suite, the #739 startup-chrome invariant) was invisible to this
+      # workflow, and so was any file a future fix adds. The run step below
+      # expands the same glob.
+      - 'test/providers/test_codex_*.py'
       - 'test/providers/fixtures/codex_*.txt'
       - 'pyproject.toml'
       - '.github/workflows/test-codex-provider.yml'
@@ -28,7 +33,12 @@ on:
     branches: [ main, develop ]
     paths:
       - 'src/cli_agent_orchestrator/providers/codex.py'
-      - 'test/providers/test_codex_provider_unit.py'
+      # Globbed, not a per-file list: a single hardcoded filename meant every
+      # Codex test outside test_codex_provider_unit.py (the completion-footer
+      # suite, the #739 startup-chrome invariant) was invisible to this
+      # workflow, and so was any file a future fix adds. The run step below
+      # expands the same glob.
+      - 'test/providers/test_codex_*.py'
       - 'test/providers/fixtures/codex_*.txt'
       - 'pyproject.toml'
       - '.github/workflows/test-codex-provider.yml'
@@ -59,7 +69,7 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
-          uv run pytest test/providers/test_codex_provider_unit.py \
+          uv run pytest test/providers/test_codex_*.py \
             --cov=src/cli_agent_orchestrator/providers/codex.py \
             --cov-report=xml \
             --cov-report=term-missing \
