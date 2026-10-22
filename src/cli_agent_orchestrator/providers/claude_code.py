@@ -1522,6 +1522,53 @@ class ClaudeCodeProvider(BaseProvider):
     # etc. must NOT trigger the stop condition.
     _SOL_IDLE_RE = re.compile(r"^\s*(?:\x1b\[[0-9;]*m)*[>❯](?:\x1b\[[0-9;]*m)*[\s\xa0]")
 
+    # The boxed input prompt's rail (the "────" lines above and below ❯).
+    _COMPOSER_RAIL_RE = re.compile(r"─{8,}")
+    # The prompt row inside the box: the glyph, then a space / NBSP (the TUI
+    # renders "❯\xa0"), then the first row of the text; or the bare glyph.
+    _COMPOSER_PROMPT_RE = re.compile(r"^[ \t]*[>❯](?:[ \t\xa0]+(.*)|[ \t\xa0]*)$")
+    # Placeholder the empty box shows: ❯ Try "fix typecheck errors"
+    _COMPOSER_PLACEHOLDER_RE = re.compile(r'^Try "[^"]*"$')
+
+    def extract_current_composer(self, rendered_pane: str) -> Optional[str]:
+        """Return the text sitting unsubmitted in the boxed ❯ prompt, if the box is on screen.
+
+        Issue #78 (PR #1004 review, P2-1): the inbox recovery can only send the
+        bare Enter that submits a paste whose Enter was swallowed when the
+        provider can read its own composer; without this method claude_code
+        had no recovery at all and the next inbox message was pasted on top of
+        the first ({MSG1}{MSG2}).
+
+        The composer is everything between the box's two rails: the ❯ row
+        (minus the glyph) plus the indented continuation rows a wrapped or
+        multi-line paste occupies (real captures: fixtures/COMPOSER_FIXTURES.md).
+        Transcript echoes of earlier prompts sit ABOVE the top rail and are
+        never included. Returns "" for an empty box (bare ❯ or the
+        ``Try "..."`` placeholder) and None when no box is on screen -- a
+        mid-turn frame has no composer to read, and guessing one from
+        transcript text is exactly what ``_message_visible_in_box`` forbids.
+        """
+        rows = rendered_pane.splitlines()
+        rails = [index for index, row in enumerate(rows) if self._COMPOSER_RAIL_RE.search(row)]
+        if len(rails) < 2:
+            return None
+        top, bottom = rails[-2], rails[-1]
+        body = rows[top + 1 : bottom]
+        prompt_index = next((index for index, row in enumerate(body) if row.strip()), None)
+        # The ❯ row must sit right under the top rail (one blank row tolerated,
+        # as in NEW_TUI_BOX_PATTERN); anything else between two rails is not
+        # the input box.
+        if prompt_index is None or prompt_index > 1:
+            return None
+        match = self._COMPOSER_PROMPT_RE.match(body[prompt_index])
+        if match is None:
+            return None
+        first = (match.group(1) or "").strip()
+        if self._COMPOSER_PLACEHOLDER_RE.match(first):
+            first = ""
+        continuation = [row.strip() for row in body[prompt_index + 1 :] if row.strip()]
+        return "\n".join([first] + continuation).strip()
+
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Claude's final response message using the ⏺/● response marker."""
         # Find all matches of the response pattern (legacy ⏺ or newest-TUI ●).

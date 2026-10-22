@@ -1702,3 +1702,172 @@ class TestInboxRecoveryNeverDuplicates:
         # with no log at all. Now the helper gets past the probe and records
         # that it could not recover.
         assert "composer cannot be read" in caplog.text, "a silent false confirmation is the bug"
+
+
+class TestSwallowedEnterRecoveryOnRealComposers:
+    """PR #1004 review, P2-1: the #78 pile-up for claude_code and kiro_cli.
+
+    Same real-code harness as TestInboxRecoveryNeverDuplicates, but the pane
+    renders the REAL capture of each TUI holding the unsubmitted MSG1 (see
+    fixtures/COMPOSER_FIXTURES.md) while the paste sits in its composer. With a
+    composer reader the recovery sends the bare Enter, MSG1 is submitted on its
+    own, and MSG2 lands in an empty composer -- instead of the {MSG1}{MSG2}
+    result the issue reports.
+    """
+
+    FIXTURES = TestInboxRecoveryNeverDuplicates.FIXTURES
+    MSG1 = "MSG1: refactor module A so the retry policy lives in one place"
+    MSG2 = "MSG2: write tests for module B"
+
+    class _Pane(TestInboxRecoveryNeverDuplicates._Pane):
+        """Shows the captured 'MSG1 unsubmitted' frame while MSG1 is in the composer."""
+
+        def __init__(self, idle_screen, msg1_screen, msg1):
+            super().__init__(idle_screen)
+            self.msg1_screen, self.msg1 = msg1_screen, msg1
+
+        def get_history(self, *a, **k):
+            return self.msg1_screen if self.composer == self.msg1 else self.screen
+
+    @pytest.mark.parametrize(
+        "provider_type, idle_fixture, composer_fixture",
+        [
+            (
+                "claude_code",
+                "claude_code_865_startup_idle.txt",
+                "claude_code_composer_single_line.txt",
+            ),
+            (
+                "kiro_cli",
+                "kiro_cli_tui_2_25_idle_output.txt",
+                "kiro_cli_tui_composer_single_line.txt",
+            ),
+        ],
+    )
+    def test_two_messages_arrive_as_two_prompts_not_one_pile_up(
+        self, provider_type, idle_fixture, composer_fixture
+    ):
+        import sys
+
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+        from cli_agent_orchestrator.services import terminal_service as ts
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+        from cli_agent_orchestrator.utils.text import strip_terminal_escapes
+
+        provider = TestInboxRecoveryNeverDuplicates._make_provider(
+            ProviderManager.provider_class(provider_type)
+        )
+        pane = self._Pane(
+            strip_terminal_escapes((self.FIXTURES / idle_fixture).read_text()),
+            (self.FIXTURES / composer_fixture).read_text(),
+            self.MSG1,
+        )
+        queue = [_make_message(1, message=self.MSG1), _make_message(2, message=self.MSG2)]
+        sm = MagicMock()
+        sm.get_status.return_value = TerminalStatus.IDLE
+        sm.output_generation.return_value = 7
+        sm.probe_execution_evidence.return_value = False
+        sm.status_observation.side_effect = lambda tid: (
+            StatusObservation(TerminalStatus.PROCESSING, 100)
+            if pane.submitted
+            else StatusObservation(TerminalStatus.IDLE, 7)
+        )
+
+        def pending(tid, limit=1):
+            return queue[:limit]
+
+        def mark(message_id, status):
+            if status == MessageStatus.DELIVERED:
+                queue[:] = [m for m in queue if m.id != message_id]
+
+        provider_module = sys.modules[type(provider).__module__]
+        with (
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRM_TIMEOUT", 0.0
+            ),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+                side_effect=pending,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.update_message_status",
+                side_effect=mark,
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", sm),
+            patch("cli_agent_orchestrator.services.inbox_service.get_backend", return_value=pane),
+            patch.object(ts, "status_monitor", sm),
+            patch.object(ts, "get_backend", return_value=pane),
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "s", "tmux_window": "w", "provider": provider_type},
+            ),
+            patch.object(ts.provider_manager, "get_provider", return_value=provider),
+            patch.object(ts, "inject_memory_context", side_effect=lambda m, *a: m),
+            patch.object(ts, "update_last_active"),
+            patch.object(ts, "send_special_key", side_effect=lambda tid, key: pane.press_enter()),
+            patch.object(ts, "dispatch_plugin_event"),
+            patch.object(provider_module, "get_backend", return_value=pane, create=True),
+        ):
+            svc = InboxService()
+            svc.deliver_pending("term-1", registry=MagicMock())  # MSG1, Enter swallowed
+            # The reconcile sweep / next status event delivers MSG2 later.
+            sm.status_observation.side_effect = lambda tid: (
+                StatusObservation(TerminalStatus.PROCESSING, 200)
+                if len(pane.submitted) == 2
+                else StatusObservation(TerminalStatus.IDLE, 7)
+            )
+            # MSG2's own Enter lands (only MSG1's frame is captured for real).
+            svc.deliver_pending("term-1", registry=MagicMock())  # MSG2
+
+        assert pane.submitted == [self.MSG1, self.MSG2], "each message must reach the agent alone"
+        assert pane.composer == ""
+
+
+class TestInboxRecoveryCoverageByProvider:
+    """Which providers can recover a swallowed inbox submit, enumerated.
+
+    The recovery needs either a composer reader (bare Enter) or a direct probe
+    plus a composer reader (full re-send). A provider with neither gets no
+    recovery: the drop is logged and the message stays in its composer until
+    the next delivery piles on top (#78). That is a known limitation per
+    provider, not an accident, so adding a provider makes its author pick a
+    side here instead of silently joining the no-recovery set.
+    """
+
+    # Providers that currently have NO inbox recovery. Remove an entry when the
+    # provider gains extract_current_composer; the test fails if one is missing
+    # or stale.
+    NO_RECOVERY = {
+        "antigravity_cli",
+        "copilot_cli",
+        "cursor_cli",
+        "grok_cli",
+        "hermes",
+        "kimi_cli",
+        "omp",
+        "mock_cli",
+        # Probe but no composer reader: the probe can confirm a working agent
+        # but nothing can be re-sent safely (P2-3), so a swallowed Enter is only
+        # logged.
+        "opencode_cli",
+        "mcode",
+    }
+
+    def test_every_provider_either_reads_its_composer_or_is_listed(self):
+        from cli_agent_orchestrator.providers.base import BaseProvider
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+
+        without_reader = set()
+        for provider_type in ProviderType:
+            cls = ProviderManager.provider_class(provider_type.value)
+            if cls.extract_current_composer is BaseProvider.extract_current_composer:
+                without_reader.add(provider_type.value)
+        assert without_reader == self.NO_RECOVERY, (
+            "Providers without extract_current_composer changed. If one gained a reader, "
+            "remove it from NO_RECOVERY; if a new provider has none, add it with a note."
+        )
+
+    def test_the_issue_78_reporters_have_a_composer_reader(self):
+        assert "claude_code" not in self.NO_RECOVERY
+        assert "kiro_cli" not in self.NO_RECOVERY

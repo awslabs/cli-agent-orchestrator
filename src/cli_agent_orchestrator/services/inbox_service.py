@@ -286,10 +286,16 @@ class InboxService:
                     else:
                         # Still holding the per-terminal delivery lock,
                         # deliberately: the pile-up in #78 ({MSG1}{MSG2} in one
-                        # composer) is exactly a second delivery landing while
-                        # the first sits unsubmitted. Eager delivery is excluded
-                        # because its receiver was already PROCESSING -- "left
-                        # the ready state" proves nothing there.
+                        # composer) is a second delivery landing while the first
+                        # sits unsubmitted. The lock only DELAYS that second
+                        # delivery until this confirmation ends; what prevents
+                        # the pile-up is a recovery that submits the first paste
+                        # (bare Enter), which needs the provider to read its
+                        # composer -- see _confirm_submitted. Other terminals
+                        # are not held: each delivery runs on its own thread.
+                        # Eager delivery is excluded because its receiver was
+                        # already PROCESSING -- "left the ready state" proves
+                        # nothing there.
                         self._confirm_submitted(
                             terminal_id,
                             combined,
