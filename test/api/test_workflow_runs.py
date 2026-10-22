@@ -2636,7 +2636,11 @@ def test_non_git_approval_cannot_transfer_to_another_root(
         "approval_state",
         lambda plan: approval_store.APPROVED if plan == approved else approval_store.ABSENT,
     )
-    monkeypatch.setattr(launch_guard, "capture", lambda: {"profiles": {}, "memory_enabled": False})
+    monkeypatch.setattr(
+        launch_guard,
+        "capture",
+        lambda profile_set=None: {"profiles": {}, "memory_enabled": False},
+    )
 
     async def drive(record, source, env, *, working_directory=None):
         return _result(state=RunState.COMPLETED)
@@ -2930,6 +2934,15 @@ def test_admission_guard_refuses_profile_edited_during_gate(
 def test_admission_capture_failure_preserves_gate_precedence(
     client, async_script_env, monkeypatch, tmp_path, endpoint, approved
 ):
+    """An unreadable profile store refuses admission as 503 ``plan_identity_unavailable`` in BOTH arms.
+
+    #1014 wrote this test when the profile set was outside plan identity, so an unreadable store
+    only failed ``launch_guard.capture`` and the unapproved arm could still answer 403 with a plan_id to
+    approve. Since plan-v2 (#827) the profile set IS part of the ``plan_id``: when it cannot be read no
+    identifier exists, so there is nothing a 403 could name, and the freeze refuses first under the closed
+    ``profiles_unreadable`` reason (PR #1000, P2-1). The ``approved`` axis is kept to show the answer no
+    longer depends on approval state. The refusal still writes no run row and leaks no path.
+    """
     from cli_agent_orchestrator.services import approval_gate, launch_guard, settings_service
 
     settings_service.SETTINGS_FILE.write_text('{"workflow":{"require_approval":true}}')
@@ -2955,10 +2968,9 @@ def test_admission_capture_failure_preserves_gate_precedence(
             "working_directory": str(tmp_path),
         },
     )
-    assert response.status_code == (503 if approved else 403), response.text
-    assert response.json()["detail"]["kind"] == (
-        "plan_identity_unavailable" if approved else "approval_required"
-    )
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["kind"] == "plan_identity_unavailable"
+    assert "agent profile set" in response.json()["detail"]["message"]
     assert str(tmp_path) not in response.text
     assert workflow_journal.get_run("capture-failed") is None
     assert "capture-failed" not in workflow_service.run_registry
