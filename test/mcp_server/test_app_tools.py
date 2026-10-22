@@ -129,7 +129,7 @@ def _capture_post(recorder: List[Dict[str, Any]]):
     """Build a fake ``requests.post`` recording (url, params) and returning {}."""
 
     def _fake_post(url: str, params=None, headers=None, timeout=None):
-        recorder.append({"url": url, "params": params})
+        recorder.append({"url": url, "params": params, "timeout": timeout})
         resp = MagicMock()
         resp.raise_for_status.return_value = None
         resp.json.return_value = {"success": True, "id": "newterm1", "session_name": "cao-x"}
@@ -162,6 +162,88 @@ def test_submit_command_routes_create_session() -> None:
     assert calls[0]["params"]["agent_profile"] == "dev"
     assert calls[0]["params"]["provider"] == "kiro_cli"
     assert result["terminal_id"] == "newterm1"
+
+
+def test_create_session_gesture_allows_for_synchronous_provider_init() -> None:
+    """Issue #710: ``POST /sessions`` here is answered only AFTER init.
+
+    The gesture carries no ``initial_message``, and ``POST /sessions`` defers
+    initialization only when one is present -- so cao-server holds the response
+    until ``provider.initialize()`` returns. On ``_mcp_timeout()`` (30s by
+    default, against a 60s-and-up init budget) a successful create came back as
+    a transport timeout while the server went on to finish the session, so the
+    operator was told a session that exists had failed to be created.
+
+    The budget must be derived from ``provider_init_timeout`` and must widen only
+    the READ half, so an unreachable cao-server still reports promptly.
+    """
+
+    calls: List[Dict[str, Any]] = []
+    with (
+        patch.object(app_tools.requests, "post", _capture_post(calls)),
+        patch(
+            "cli_agent_orchestrator.services.settings_service.get_server_settings",
+            return_value={"provider_init_timeout": 60, "mcp_request_timeout": 30},
+        ),
+    ):
+        result = app_tools._submit_command_impl("create_session", {"agent_profile": "dev"})
+
+    assert result["success"] is True
+    timeout = calls[0]["timeout"]
+    assert isinstance(timeout, tuple), f"expected a (connect, read) tuple, got {timeout!r}"
+    connect, read = timeout
+    assert connect == 5.0
+    assert read > 60
+
+
+def test_create_session_gesture_timeout_follows_provider_init_timeout() -> None:
+    """Raising ``provider_init_timeout`` moves this budget with it.
+
+    The derivation issue #710 asked for, instead of a second constant that
+    drifts away from the server's own init budget.
+    """
+
+    reads = []
+    for init_timeout in (60, 240):
+        calls: List[Dict[str, Any]] = []
+        with (
+            patch.object(app_tools.requests, "post", _capture_post(calls)),
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_server_settings",
+                return_value={
+                    "provider_init_timeout": init_timeout,
+                    "mcp_request_timeout": 30,
+                },
+            ),
+        ):
+            app_tools._submit_command_impl("create_session", {"agent_profile": "dev"})
+        reads.append(calls[0]["timeout"][1])
+
+    assert reads[1] > reads[0]
+
+
+def test_non_creating_gestures_stay_on_the_ordinary_mcp_timeout() -> None:
+    """Only the create is widened (issue #710).
+
+    ``send_message`` and ``interrupt`` are answered immediately, so they keep the
+    flat ``mcp_request_timeout`` scalar -- widening those would only delay
+    reporting a wedged server.
+    """
+
+    for kind, payload in (
+        ("send_message", {"terminal_id": "abcd1234", "message": "hi"}),
+        ("interrupt", {"terminal_id": "abcd1234"}),
+    ):
+        calls: List[Dict[str, Any]] = []
+        with (
+            patch.object(app_tools.requests, "post", _capture_post(calls)),
+            patch(
+                "cli_agent_orchestrator.utils.orchestration.get_server_settings",
+                return_value={"provider_init_timeout": 60, "mcp_request_timeout": 30},
+            ),
+        ):
+            app_tools._submit_command_impl(kind, payload)
+        assert calls[0]["timeout"] == 30.0, f"{kind} should stay on mcp_request_timeout"
 
 
 def test_submit_command_routes_send_message_to_inbox() -> None:
