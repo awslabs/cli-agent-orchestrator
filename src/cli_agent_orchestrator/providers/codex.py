@@ -1180,6 +1180,11 @@ class CodexProvider(BaseProvider):
         # The cached result of the exit check (see _exited_to_shell).
         self._exit_checked_at: Optional[float] = None
         self._exited = False
+        # Set by initialize() once the codex command has been sent. Before that
+        # the pane IS the shell by construction, so a ready-looking frame (a
+        # `❯` prompt theme reads as an idle composer) must not be vetoed into
+        # ERROR by the pane command (#1018 review, P3-2).
+        self._launched = False
         # Dispatch attribution is provider-local and intentionally ephemeral.
         # Screen parsing only reads snapshots; lifecycle hooks own mutations.
         self._dispatch_lock = threading.Lock()
@@ -1933,6 +1938,9 @@ class CodexProvider(BaseProvider):
         await asyncio.to_thread(
             get_backend().send_keys, self.session_name, self.window_name, command
         )
+        # From here on a pane whose foreground process is the shell again means
+        # codex exited; before this line it meant codex had not started.
+        self._launched = True
 
         # Handle workspace trust prompt if it appears (new/untrusted directories).
         # The handler's bounds now come from settings rather than a hard-coded
@@ -2110,20 +2118,24 @@ class CodexProvider(BaseProvider):
         # ERROR prevents the inbox service from typing a queued message into
         # the shell — which would execute it as arbitrary commands.
         #
-        # A READY verdict is checked whether or not initialization has
-        # finished (#1018). It is the verdict initialize()'s readiness wait
-        # accepts, and the frame alone cannot be trusted to produce it: a codex
-        # that died during startup leaves `› Error: ...` above the shell prompt,
-        # and that `›` reads as an idle composer. Gating this on
-        # ``_initialized`` meant the one check that could veto the misreading
-        # was switched off for exactly the window in which it was needed, and
-        # the task was typed into bash. Non-ready verdicts keep the gate: before
-        # codex is exec'd the pane IS the shell by construction, nobody acts on
-        # PROCESSING/UNKNOWN, and the read costs a tmux round trip per frame.
+        # A READY verdict is checked from the moment the codex command has been
+        # sent, not only once initialization has finished (#1018). It is the
+        # verdict initialize()'s readiness wait accepts, and the frame alone
+        # cannot be trusted to produce it: a codex that died during startup
+        # leaves `› Error: ...` above the shell prompt, and that `›` reads as
+        # an idle composer. Gating this on ``_initialized`` meant the one check
+        # that could veto the misreading was switched off for exactly the
+        # window in which it was needed, and the task was typed into bash.
+        # ``_launched`` keeps the veto off before the launch: the pane is the
+        # shell then by construction, and a `❯` prompt theme (pure, starship,
+        # powerlevel10k) reads as an idle composer, which would otherwise show a
+        # false ERROR during the warm-up. Non-ready verdicts keep the
+        # ``_initialized`` gate: nobody acts on PROCESSING/UNKNOWN, and the read
+        # costs a tmux round trip per frame.
         ready_verdict = status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
         if (
             self.shell_baseline
-            and (self._initialized or ready_verdict)
+            and (self._initialized or (ready_verdict and self._launched))
             and self._exited_to_shell(fresh=ready_verdict)
         ):
             return TerminalStatus.ERROR

@@ -205,6 +205,7 @@ class TestCodexReadinessVerdictOnBareShell:
         mock_backend.return_value.get_pane_current_command.return_value = "bash"
         provider = CodexProvider("1e293d67", "test-session", "window-0")
         provider.shell_baseline = "bash"
+        provider._launched = True
         assert provider._initialized is False
 
         assert provider.get_status(EXITED_FRAME) == TerminalStatus.ERROR
@@ -215,8 +216,66 @@ class TestCodexReadinessVerdictOnBareShell:
         mock_backend.return_value.get_pane_current_command.return_value = "codex"
         provider = CodexProvider("1e293d67", "test-session", "window-0")
         provider.shell_baseline = "bash"
+        provider._launched = True
 
         assert provider.get_status(COMPOSER_FRAME) == TerminalStatus.IDLE
+
+    # A `❯` prompt theme (pure, starship, powerlevel10k) matches the idle
+    # composer glyph, so the shell's own prompt reads as a ready frame.
+    FANCY_PROMPT_FRAME = "$ echo ready\nready\n~/proj on main\n❯ \n"
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_fancy_shell_prompt_before_launch_is_not_a_false_error(self, mock_backend):
+        """Before the codex command is sent the pane IS the shell; the veto must stay off.
+
+        Review of #1018 (P3-2): with the veto applied from the baseline read
+        onward, a `❯` prompt during the 2 s warm-up flipped IDLE to ERROR and a
+        status reader saw a short false ERROR before codex drew its composer.
+        """
+        mock_backend.return_value.get_pane_current_command.return_value = "zsh"
+        provider = CodexProvider("1e293d67", "test-session", "window-0")
+        provider.shell_baseline = "zsh"
+        assert provider._launched is False
+
+        assert provider.get_status(self.FANCY_PROMPT_FRAME) == TerminalStatus.IDLE
+        mock_backend.return_value.get_pane_current_command.assert_not_called()
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_fancy_shell_prompt_after_launch_is_an_exit(self, mock_backend):
+        """The same frame after the codex command was sent is a codex that exited."""
+        mock_backend.return_value.get_pane_current_command.return_value = "zsh"
+        provider = CodexProvider("1e293d67", "test-session", "window-0")
+        provider.shell_baseline = "zsh"
+        provider._launched = True
+
+        assert provider.get_status(self.FANCY_PROMPT_FRAME) == TerminalStatus.ERROR
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_initialize_marks_launched_when_the_codex_command_is_sent(
+        self, mock_backend, mock_wait_shell, mock_wait_status, mock_sleep
+    ):
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        backend = mock_backend.return_value
+        backend.get_history.return_value = COMPOSER_FRAME
+        backend.get_pane_current_command.side_effect = pane_commands("bash", "codex")
+        provider = CodexProvider("1e293d67", "test-session", "window-0", None)
+        seen: list[bool] = []
+
+        def _send_keys(_session, _window, keys, **_kwargs):
+            seen.append(provider._launched)
+
+        backend.send_keys.side_effect = _send_keys
+
+        await provider.initialize()
+
+        # Not launched at the warm-up echo nor at the codex command itself; launched after.
+        assert seen == [False, False]
+        assert provider._launched is True
 
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_pre_launch_non_ready_verdict_does_not_read_the_pane(self, mock_backend):

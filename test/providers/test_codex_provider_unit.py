@@ -5040,6 +5040,7 @@ class TestCodexProviderExitDetection:
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         provider._initialized = False
+        provider._launched = True  # the codex command has been sent
         provider.shell_baseline = "zsh"
         output = "OpenAI Codex (v0.98.0)\n› \n"
         status = provider.get_status(output)
