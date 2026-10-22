@@ -78,10 +78,13 @@ MODULE_SCOPE = "<module>"
 WHOLE_MODULE = "*"
 
 # Prose reasons for the four state modules ``mcp_server/`` actually imports
-# today. Kept as documentation only -- ``FORBIDDEN_STATE_MODULES`` below is
-# derived by scanning, so a service that starts getting imported by
-# ``mcp_server/`` is caught even without an entry here; add one anyway when
-# that happens, to keep the failure message specific.
+# today. Documentation only: ``FORBIDDEN_STATE_MODULES`` below is derived by
+# scanning, so a module that starts getting imported by ``mcp_server/`` is
+# caught even without an entry here (it gets the generic reason); add one
+# when that happens, to keep the failure message specific. The one thing
+# this map is held to is accuracy: ``test_known_reasons_name_derived_modules``
+# fails if an entry names a module the scan no longer derives, so a reason
+# cannot outlive the import it describes.
 _KNOWN_STATE_MODULE_REASONS: Dict[str, str] = {
     # Writes memory metadata rows and wiki files: SessionLocal,
     # MemoryMetadataModel, record_project_alias (memory_service.py:299, :391,
@@ -427,12 +430,6 @@ def _forbidden_root(target: str) -> Optional[str]:
         if target == suffix or target.endswith(f".{suffix}"):
             return suffix
     return None
-
-
-def _is_forbidden(target: str) -> bool:
-    """True if an import target names a forbidden state client or state module."""
-
-    return _forbidden_root(target) is not None
 
 
 def _forbidden_hits(site: ImportSite) -> Iterator[Tuple[str, Tuple[str, ...]]]:
@@ -781,11 +778,22 @@ def test_over_broad_pin_is_reported_stale() -> None:
     assert any("'store_lesson'" in s and "no import matches" in s for s in stale)
 
 
-def test_every_forbidden_state_service_has_a_reason() -> None:
-    """Documentation gate: each forbidden service records what it opens."""
+def test_known_reasons_name_derived_modules() -> None:
+    """Every hand-written reason must describe a module the scan still derives.
 
-    missing = sorted(name for name, reason in FORBIDDEN_STATE_MODULES.items() if not reason.strip())
-    assert not missing, f"FORBIDDEN_STATE_MODULES entries without a reason: {missing}"
+    The derivation fills in a generic reason for any module without an entry,
+    so "every entry has a reason" can never fail and is not asserted. What
+    can rot is the other direction: a module stops importing a client (as
+    services/vault/config.py did in #1031) and its prose reason lingers,
+    describing an import that no longer exists. That is the stale-pin failure
+    mode again, so it is held to the same standard.
+    """
+
+    stale = sorted(set(_KNOWN_STATE_MODULE_REASONS) - set(FORBIDDEN_STATE_MODULES))
+    assert not stale, (
+        "_KNOWN_STATE_MODULE_REASONS names modules the scan no longer derives; "
+        f"delete these entries: {stale}"
+    )
 
 
 def test_forbidden_state_modules_cover_modules_not_imported_by_mcp_server() -> None:
