@@ -42,8 +42,11 @@ from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 logger = logging.getLogger(__name__)
 
 # Poll interval for the submit-confirmation wait. Short because the common case
-# is a healthy delivery that is already PROCESSING on the first or second read;
-# the cost of a dropped delivery is bounded by INBOX_SUBMIT_CONFIRM_TIMEOUT.
+# is a healthy delivery that is already PROCESSING on the first or second read.
+# A dropped delivery costs INBOX_SUBMIT_CONFIRM_TIMEOUT for the first wait plus
+# one more per recovery actually sent, so up to
+# INBOX_SUBMIT_CONFIRM_TIMEOUT * (1 + INBOX_SUBMIT_MAX_RESUBMITS) -- all of it
+# on that one terminal's delivery thread, under that terminal's lock.
 _SUBMIT_CONFIRM_POLL_INTERVAL = 0.25
 
 # Statuses proving the receiver consumed this delivery (left its ready state).
@@ -380,12 +383,12 @@ class InboxService:
         composer does not still hold the first paste, the re-send would join the
         two copies and submit both (PR #1004 review, P2-3). A provider with
         neither ``extract_current_composer`` nor a probe therefore gets no
-        recovery at all, only the log line. ``screen_may_show_previous_turn``:
+        recovery at all, only the log line; which providers those are is
+        enumerated in ``TestInboxRecoveryCoverageByProvider``
+        (test/services/test_inbox_service.py). ``screen_may_show_previous_turn``:
         an inbox receiver usually still shows its last turn's completion
         marker, so a probe that cannot tell turns apart must not read that as
-        pickup -- see Open questions in the report: for kiro_cli and
-        claude_code even that branch is currently inert because neither
-        implements ``extract_current_composer``.
+        pickup.
 
         Returns True when the delivery was confirmed (or the receiver was found
         already working), False when it stayed unconfirmed. The message is left
