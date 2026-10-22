@@ -1,0 +1,9 @@
+› ACK: agente disponible
+
+  [Message from terminal worker. Use send_message MCP tool for any follow-up work.]
+
+  Worked for <1s • 7:46 AM
+
+› Ask Codex to do anything
+
+  gpt-6 max · /tmp/project                       ⚠ 1 warning · f2 to view

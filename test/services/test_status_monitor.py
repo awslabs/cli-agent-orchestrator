@@ -10,6 +10,7 @@ import asyncio
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -138,6 +139,93 @@ class TestPollerRecheckInput:
             )
 
         assert sm.get_status("t1") == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_codex_empty_dispatched_turn_transitions_processing_to_completed(
+        self, mock_codex_backend
+    ):
+        """A real Codex screen verdict is applied and published by the monitor."""
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+
+        fixture = (
+            Path(__file__).parents[1] / "providers/fixtures/codex_empty_turn_completed.txt"
+        ).read_text()
+        backend = MagicMock()
+        backend.get_history.return_value = "› Previous task\n› Ask Codex to do anything\n"
+        mock_codex_backend.return_value = backend
+        provider = CodexProvider("t1", "session", "window")
+        provider._codex_version = (0, 162, 1)
+        provider._ends_turns_with_footer = True
+        provider.notify_status_buffer_reset(3)
+        provider.mark_input_received()
+        provider.record_dispatched_message(
+            "ACK: agente disponible\n\n"
+            "[Message from terminal worker. Use send_message MCP tool for any follow-up work.]"
+        )
+        detected = provider.get_status_from_screen(fixture.splitlines())
+        assert detected == TerminalStatus.COMPLETED
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+        with patch("cli_agent_orchestrator.services.status_monitor.bus") as bus:
+            assert sm._apply_detection("t1", detected)
+
+        assert sm._last_status["t1"] == TerminalStatus.COMPLETED
+        bus.publish.assert_called_once_with(
+            "terminal.t1.status", {"status": TerminalStatus.COMPLETED.value}
+        )
+
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    def test_codex_old_reply_and_footer_without_bar_do_not_complete_new_dispatch(
+        self, mock_codex_backend
+    ):
+        """A historical completion keeps PROCESSING latched until new output ends."""
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+
+        status_bar = "  gpt-6 max · /tmp/project                       ⚠ 1 warning · f2 to view"
+        composer = "› Ask Codex to do anything"
+        previous = [
+            "› Previous task",
+            "• Previous answer",
+            "  Worked for 2s • 4:19 PM",
+            composer,
+            status_bar,
+        ]
+        backend = MagicMock()
+        backend.get_history.return_value = "\n".join(previous)
+        mock_codex_backend.return_value = backend
+        provider = CodexProvider("t1", "session", "window")
+        provider._codex_version = (0, 162, 1)
+        provider._ends_turns_with_footer = True
+        provider.notify_status_buffer_reset(3)
+        provider.mark_input_received()
+        provider.record_dispatched_message("new task")
+
+        monitor = StatusMonitor()
+        monitor._last_status["t1"] = TerminalStatus.PROCESSING
+        old_frame = previous[:-1]
+        old_verdict = provider.get_status_from_screen(old_frame)
+        with patch("cli_agent_orchestrator.services.status_monitor.bus") as bus:
+            assert old_verdict == TerminalStatus.UNKNOWN
+            assert monitor._apply_detection("t1", old_verdict)
+            assert monitor._last_status["t1"] == TerminalStatus.PROCESSING
+            bus.publish.assert_not_called()
+
+            completed_frame = [
+                *previous[:-2],
+                "• New answer after the previous turn",
+                "  Worked for 5s • 4:20 PM",
+                composer,
+                status_bar,
+            ]
+            completed_verdict = provider.get_status_from_screen(completed_frame)
+            assert completed_verdict == TerminalStatus.COMPLETED
+            assert monitor._apply_detection("t1", completed_verdict)
+
+        assert monitor._last_status["t1"] == TerminalStatus.COMPLETED
+        bus.publish.assert_called_once_with(
+            "terminal.t1.status", {"status": TerminalStatus.COMPLETED.value}
+        )
 
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")

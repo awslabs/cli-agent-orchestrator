@@ -16,3 +16,11 @@ body {
   outline-offset: 2px;
 }
 
+/* Memory graph node drag (MemoryGraphView). Sigma v4 rewrites the container's
+   inline cursor on each hover change, so this rule must be !important and
+   must also cover Sigma's child layers. */
+.cao-graph-dragging,
+.cao-graph-dragging * {
+  cursor: grabbing !important;
+}
+

@@ -1,6 +1,7 @@
 """Tests for the event-driven InboxService."""
 
 import asyncio
+import textwrap
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -229,6 +230,129 @@ def _make_message(id=1, receiver_id="term-1", message="hello", status=MessageSta
         status=status,
         created_at=datetime.now(),
     )
+
+
+class TestCodexEmptyTurnInboxIntegration:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("word_wrapped", [False, True])
+    async def test_ack_empty_turn_notice_two_empty_turn_notice_three_deliver_once_in_order(
+        self, word_wrapped
+    ):
+        """A real Codex completion verdict wakes inbox delivery for each notice."""
+        from cli_agent_orchestrator.providers.codex import CodexProvider
+
+        loop = asyncio.get_running_loop()
+        event_bus = EventBus()
+        event_bus.set_loop(loop)
+        status_monitor = StatusMonitor()
+        status_monitor._last_status["term-1"] = TerminalStatus.IDLE
+        provider = CodexProvider("term-1", "session", "window")
+        provider._codex_version = (0, 162, 1)
+        provider._ends_turns_with_footer = True
+        messages = [
+            _make_message(1, message="ACK: agente disponible"),
+            _make_message(2, message="Segundo aviso: sigo disponible"),
+            _make_message(3, message="Tercer aviso: sin tareas pendientes"),
+        ]
+        message_states = {message.id: MessageStatus.PENDING for message in messages}
+        delivered_texts = []
+        current_capture = {"text": "› Previous task\n› Ask Codex to do anything\n"}
+        sends = asyncio.Queue()
+
+        def completed_capture(message):
+            echo = (
+                textwrap.fill(message, width=20, initial_indent="› ", subsequent_indent="  ")
+                if word_wrapped
+                else f"› {message}"
+            )
+            return (
+                f"{echo}\n"
+                "  Worked for <1s • 7:46 AM\n"
+                "› Ask Codex to do anything\n"
+                "  gpt-6 max · /tmp/project                       ⚠ 1 warning · f2 to view"
+            )
+
+        def pending(_receiver_id, limit=1):
+            return [
+                message
+                for message in messages
+                if message_states[message.id] == MessageStatus.PENDING
+            ][:limit]
+
+        def update(message_id, status):
+            message_states[message_id] = status
+
+        backend = MagicMock()
+        backend.get_history.side_effect = lambda *args, **kwargs: current_capture["text"]
+
+        def send_input(_terminal_id, message):
+            delivered_texts.append(message)
+            status_monitor.notify_input_sent("term-1")
+            provider.notify_status_buffer_reset(len(delivered_texts))
+            provider.mark_input_received()
+            provider.record_dispatched_message(message)
+            status_monitor._apply_detection("term-1", TerminalStatus.PROCESSING)
+            loop.call_soon_threadsafe(sends.put_nowait, message)
+
+        service = InboxService()
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.bus", event_bus),
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", status_monitor),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+                side_effect=pending,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.update_message_status",
+                side_effect=update,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.terminal_service.send_input",
+                side_effect=send_input,
+            ),
+            patch("cli_agent_orchestrator.services.status_monitor.bus", event_bus),
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
+                return_value=provider,
+            ),
+            patch("cli_agent_orchestrator.providers.codex.get_backend", return_value=backend),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_older_than"
+            ) as recovery_poll,
+        ):
+            subscriber = asyncio.create_task(service.run())
+            try:
+                await asyncio.sleep(0)  # Let InboxService subscribe to status events.
+                await asyncio.to_thread(service.deliver_pending, "term-1")
+                first = await asyncio.wait_for(sends.get(), timeout=2)
+                assert first == messages[0].message
+
+                for expected in messages[1:]:
+                    capture = completed_capture(delivered_texts[-1])
+                    current_capture["text"] = capture
+                    detected = provider.get_status_from_screen(capture.splitlines())
+                    assert detected == TerminalStatus.COMPLETED
+                    status_monitor._apply_detection("term-1", detected)
+
+                    delivered = await asyncio.wait_for(sends.get(), timeout=2)
+                    assert delivered == expected.message
+
+                final_capture = completed_capture(delivered_texts[-1])
+                current_capture["text"] = final_capture
+                assert (
+                    provider.get_status_from_screen(final_capture.splitlines())
+                    == TerminalStatus.COMPLETED
+                )
+
+                assert delivered_texts == [message.message for message in messages]
+                assert message_states == {
+                    message.id: MessageStatus.DELIVERED for message in messages
+                }
+                recovery_poll.assert_not_called()
+            finally:
+                subscriber.cancel()
+                await asyncio.gather(subscriber, return_exceptions=True)
+                event_bus.set_loop(None)
 
 
 class TestDeliverPending:
@@ -659,8 +783,46 @@ class TestPollOpenCodePendingMessages:
 class TestReconcileOrphanedMessages:
     """Tests for the provider-agnostic inbox reconciliation sweep (issue #131)."""
 
+    @patch("cli_agent_orchestrator.services.inbox_service.fail_orphaned_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_older_than")
-    def test_reconciles_stale_receivers(self, mock_list_receivers):
+    def test_sweep_fails_and_logs_messages_whose_receiver_row_is_gone(
+        self, mock_list_receivers, mock_fail_orphans, caplog
+    ):
+        """An undeliverable message stops claiming PENDING and says so (#708)."""
+        mock_list_receivers.return_value = []
+        mock_fail_orphans.return_value = ["msg-1", "msg-2"]
+
+        svc = InboxService()
+        svc.deliver_pending = MagicMock()
+        with caplog.at_level("WARNING", logger="cli_agent_orchestrator.services.inbox_service"):
+            svc.reconcile_orphaned_messages()
+
+        mock_fail_orphans.assert_called_once_with(INBOX_RECONCILE_GRACE_SECONDS)
+        svc.deliver_pending.assert_not_called()
+        assert "msg-1, msg-2" in caplog.text
+        assert "receiver terminal no longer exists" in caplog.text
+
+    @patch("cli_agent_orchestrator.services.inbox_service.fail_orphaned_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_older_than")
+    def test_sweep_still_delivers_when_the_orphan_pass_fails(
+        self, mock_list_receivers, mock_fail_orphans
+    ):
+        """The orphan pass is bookkeeping; it must never block delivery."""
+        mock_list_receivers.return_value = ["receiver-1"]
+        mock_fail_orphans.side_effect = RuntimeError("db locked")
+
+        svc = InboxService()
+        svc.deliver_pending = MagicMock()
+        svc.reconcile_orphaned_messages()
+
+        svc.deliver_pending.assert_called_once_with("receiver-1", registry=None)
+
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.fail_orphaned_pending_messages",
+        return_value=[],
+    )
+    @patch("cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_older_than")
+    def test_reconciles_stale_receivers(self, mock_list_receivers, mock_fail_orphans):
         """Sweep attempts delivery for each receiver with an orphaned message."""
         mock_list_receivers.return_value = ["receiver-1", "receiver-2"]
 
@@ -674,8 +836,12 @@ class TestReconcileOrphanedMessages:
             call("receiver-2", registry=None),
         ]
 
+    @patch(
+        "cli_agent_orchestrator.services.inbox_service.fail_orphaned_pending_messages",
+        return_value=[],
+    )
     @patch("cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_older_than")
-    def test_survives_per_receiver_failure(self, mock_list_receivers):
+    def test_survives_per_receiver_failure(self, mock_list_receivers, mock_fail_orphans):
         """One failed receiver does not stop the sweep."""
         mock_list_receivers.return_value = ["receiver-1", "receiver-2"]
 

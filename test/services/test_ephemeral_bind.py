@@ -706,11 +706,8 @@ def test_no_claim_handler_text_still_refuses(runtime_store):
 
     _, name, backend, factory = runtime_store
     with pytest.raises(ValueError) as exc:
-        orchestration._refuse_ephemeral_target_without_claim(name)
-    assert (
-        str(exc.value)
-        == "Ephemeral targets cannot be launched through assign or handoff in this version."
-    )
+        orchestration._require_claim(name, None)
+    assert str(exc.value) == "Ephemeral targets cannot be launched without a claim."
     backend.create_window.assert_not_called()
     factory.assert_not_called()
 

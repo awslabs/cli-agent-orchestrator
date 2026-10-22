@@ -3080,3 +3080,108 @@ class TestClaudeCodeTurnEndGate:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.supports_screen_detection is True
         assert provider.status_recheck_uses_screen is True
+
+
+class TestClaudeCodeReducedMotionSpinner:
+    """GH #908: with prefersReducedMotion the spinner glyph is a static "●".
+
+    "●" is also the response marker, so before the fix both status paths read
+    the live spinner as a finished response and returned COMPLETED about 2s
+    after the task was sent, which made handoff tear the worker down.
+    """
+
+    BOX = "─" * 60
+
+    def _p(self):
+        return ClaudeCodeProvider("test123", "test-session", "window-0")
+
+    def _screen(self, line):
+        return ["❯ review the diff", line, self.BOX, "❯ ", self.BOX, "  ? for shortcuts"]
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "● Leavening… (running UserPromptSubmit hook)",
+            "● Sublimating… (12s · ↓ 300 tokens · esc to interrupt)",
+            # The in-progress task's activeForm replaces the verb.
+            "● Running the test suite… (12s · ↓ 300 tokens)",
+            # Default verbs with "-" or "'".
+            "● Dilly-dallying… (12s · ↓ 300 tokens)",
+            "● Beboppin'… (thinking)",
+            # A multi-word spinnerVerbs entry, past a minute.
+            "● Reticulating splines… (1m 3s · ↑ 1.2k tokens)",
+            # Before the elapsed time shows, and a hook suffix with its own "…".
+            "● Leavening… (↓ 40 tokens · thought for 2s)",
+            "● Leavening… (thought for 2s)",
+            "● Leavening… (running stop hooks… 1/3)",
+            # The status a teammate's spinner shows.
+            "● Leavening… (esc to interrupt reviewer)",
+        ],
+    )
+    def test_reduced_motion_spinner_is_processing(self, line):
+        screen = self._screen(line)
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+        assert self._p().get_status("\n".join(screen)) == TerminalStatus.PROCESSING
+
+    def test_styled_reduced_motion_spinner_is_processing_on_raw_path(self):
+        output = "\n".join(
+            self._screen("\x1b[2m●\x1b[0m Leavening… (running UserPromptSubmit hook)")
+        )
+        assert self._p().get_status(output) == TerminalStatus.PROCESSING
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            # A response that opens with a gerund and an ellipsis, no "(".
+            "● Analyzing… the diff is fine, approved.",
+            # The MCP tool-call line: its parentheses hold no spinner status.
+            "● Calling cao-mcp-server… (ctrl+o to expand)",
+            "● Fixed the flaky test… (see the notes below)",
+            "● Done. Approved.",
+        ],
+    )
+    def test_response_marker_lines_stay_completed(self, line):
+        screen = self._screen(line)
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+        assert self._p().get_status("\n".join(screen)) == TerminalStatus.COMPLETED
+
+    def test_reduced_motion_spinner_after_interim_summary_is_processing(self):
+        """Mirrors test_live_spinner_after_interim_summary_in_tail_is_processing."""
+        box = "─" * 30
+        output = (
+            "● Working on the report…\n"
+            "● Misting… (10s · ↑ 12 tokens)\n" + box + "\n✻ Pondered for 8s\n"
+            "● Churning… (2s · ↑ 4 tokens)\n❯ \n"
+        )
+        assert self._p().get_status(output) == TerminalStatus.PROCESSING
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "● Leavening… (running UserPromptSubmit hook)",
+            "● Running the test suite… (12s · ↓ 300 tokens)",
+            "● Dilly-dallying… (12s · ↓ 300 tokens)",
+        ],
+    )
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_static_reduced_motion_spinner_outlasts_turn_end_grace(self, mock_backend, line):
+        """After a dispatch, the turn-end gate holds a frame with no summary at
+        PROCESSING for TURN_END_GRACE_S and then gives the legacy verdict. A hook
+        spinner does not repaint, so without its own match the "●" frame read
+        COMPLETED once the grace ran out, while the same frame with "✻" stays
+        PROCESSING."""
+        from cli_agent_orchestrator.providers.claude_code import TURN_END_GRACE_S
+
+        mock_backend.get_native_status.return_value = None
+        mock_backend.supports_event_inbox.return_value = False
+        mock_backend.get_history.return_value = ""
+        provider = self._p()
+        provider.mark_input_received()
+        clock = {"now": 1000.0}
+        provider._turn_gate_clock = lambda: clock["now"]
+        screen = self._screen(line)
+
+        for _ in range(2):
+            assert provider.get_status_from_screen(screen) == TerminalStatus.PROCESSING
+            assert provider.get_status("\n".join(screen)) == TerminalStatus.PROCESSING
+            clock["now"] += TURN_END_GRACE_S + 1

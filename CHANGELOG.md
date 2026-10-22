@@ -7,10 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **The MCP server sent no bearer on 14 of its calls to the local API** (#990). Ten
+  `requests` calls in `mcp_server/server.py` reached scope-guarded routes with no
+  `Authorization` header, so on an auth-enabled server each one got `401`. Two were
+  fail-closed authorization lookups whose 401 surfaced as a refusal: `list_siblings` and
+  `update_metadata` refused a profile that holds the `discovery` grant, and
+  `answer_user_prompt` refused everyone. All fourteen sites now use the existing bearer
+  helpers; a call-site census test keeps the rule enforced. No change when auth is off.
+
+- **Breaking / migration:** workflow approval enforcement now defaults ON for script-tier runs
+  (#583 Bolt 3) (#699). The first run of each script plan is refused until
+  an operator runs `cao workflow approve <plan_id>`; operators choosing the previous behaviour set
+  `workflow.require_approval: false` in `settings.json`. Script runs journaled before this upgrade
+  cannot launch further agent steps while approval enforcement is on; start a new run. With
+  approval enforcement off, those runs continue. Plan identifiers keep the `plan-v1:` scheme.
+
+- **Breaking / migration:** a fresh script run now executes a private copy of the approved source.
+  Modules beside the spec are not importable and `__file__` names the copy; this matches resume.
+- **Breaking / migration:** reserved ephemeral names are refused as fresh script-run agent steps
+  while approval is enforced: they have no installed definition for the launch guard to digest.
+- **Breaking / migration:** non-Git roots now bind the directory's canonical path into `plan_id`.
+  Moving or renaming such a directory requires a new approval; Git-repository plan identifiers are
+  unchanged.
+- **Breaking / migration:** plan approval binds the script source, its resolved inputs and the working
+  directory's state (the Git commit and worktree, or the canonical path of a non-Git directory). It
+  does not bind the content of agent profiles or memory: a later run of an approved plan uses their
+  current content (#827, #828).
+
 ### Added
 
+- Conversational workflow authoring: `cao workflow create` / `update` and the `workflow_create`,
+  `workflow_update`, `workflow_get` and `workflow_validate` MCP tools (#583 Bolt 3) (#699). Spec writes
+  are atomic and serialized per workflow, so two concurrent creates cannot both succeed and an update
+  with a stale `--expected-hash` is rejected at commit time. Lint warnings are shown on the default CLI
+  output. Every `cao workflow` HTTP verb and every workflow MCP tool forward
+  `CAO_AUTH_LOCAL_TOKEN` when API authentication is enabled. The Python workflow SDK's
+  run-step transport does not yet receive that credential; subprocess credential delivery
+  remains a separate security-boundary decision.
+
+- `assign` and `handoff` now launch ephemeral agents (#801) from their creator terminal: Claude Code by default, Codex when an operator allows it.
+- Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `ephemeral.enabled` stays off by default.
 - Persistent agent descriptions with creation-time CLI/MCP labels and editable
   descriptions in Web UI Home and Agents (#942).
+- `cao agent assign`, `handoff` and `send-message` accept `--message-file PATH` (`-` for
+  stdin) in place of the positional MESSAGE, the file/stdin input #616 asked for: read as UTF-8,
+  one trailing newline dropped, mutually exclusive with MESSAGE, and refused when empty.
 
 - The publish workflow now refuses, in seconds, a release tag whose version
   `pyproject.toml`, `uv.lock` and the devcontainer feature do not carry, and a
@@ -27,7 +68,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#605), malformed-Origin (#656) and scheme-aware same-origin (#658) guards, and
   filesystem invariants for the per-terminal FIFO path (#823) and atomic-file
   modes under a concurrent writer (#821). `test/security/`. (#938)
-- Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `assign` and `handoff` still refuse them. `ephemeral.enabled` stays off by default.
 - Simulation-only cross-zone robot transport example (#845): existing CAO CLI
   supervisor, zone-operation, and checker agents share a persistent MuJoCo
   kinematic world through scoped MCP tools. Includes measured custody handoffs,
@@ -133,6 +173,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workers with the same server config share one entry (owners listed under
   `caoTerminalIds`), and leftover per-terminal entries are removed at the next
   launch (#940).
+- Vault scan now re-reads a note whose size, mtime or ctime changed across the read window up to
+  three times with a short backoff, as ADR-006 specifies, instead of skipping it on the first
+  torn read. A note saved by Obsidian during a reconcile is indexed from the clean re-read; a
+  note still changing after the bound is recorded as `unstable_skipped` with the attempt count in
+  the finding detail and its prior row is left intact (#644).
+- Vault configuration validation no longer queries the database. `VaultConfig` validators are
+  pure, so a `memory.vault` document with a project mapping validates on a fresh `CAO_HOME_DIR`
+  that has never run `init_db()`, and `cao config list` shows it without a database. Project
+  aliases are still canonicalised, and alias-equivalent mappings still refused, on the loading
+  path (`get_vault_config`) that owns a database; a guard test keeps every vault validator free
+  of `clients.database` (#644).
+- `cao-server` now refuses to start when another `cao-server` already owns the
+  same `CAO_HOME_DIR`, whatever port either uses. The server takes an exclusive
+  `flock` on `server.lock` in the data directory before the database, recovery
+  sweeps, terminal registry, status monitor or port bind, holds it for the
+  process lifetime, and the second instance exits non-zero naming the owning
+  PID, port and start time. Previously the port was the only guard, and a
+  second server on another port silently marked the first server's in-flight
+  launches as interrupted, double-delivered inbox messages on the herdr
+  backend, and could tear down the first server's tmux panes. Two servers on
+  one data directory are unsupported; use a separate `CAO_HOME_DIR` and
+  `--port` per server (#406, #709).
+- Concurrent blocking script starts with the same run id now return a conflict
+  for the loser without changing the winning run's journal or live record.
+- Script runs under approval enforcement now stop before spawning if their run row
+  cannot be recorded. A known script run with a missing row supplies no memory
+  and logs a warning, whether enforcement is on or off. Its launch guard also
+  refuses fresh agent launches while approval is enforced.
+- Kiro CLI agent specs installed by CAO now carry `includeMcpJson`, the name Kiro CLI documents, instead of the retired `useLegacyMcpJson` alias, which Kiro rejected as a duplicate field whenever another writer added the canonical key (#1026). The profile field keeps its `useLegacyMcpJson` spelling and is now actually forwarded into the spec; previously it was accepted and ignored.
+- Corrective workflow re-prompts now reuse the attempt's rendered prompt, so
+  workflow inputs and earlier step outputs stay filled in when structured output
+  is missing or invalid (#966).
+- `claude_code` workers running with Claude Code's `prefersReducedMotion` setting
+  are no longer reported as completed while they work. That setting draws the
+  spinner with a static `●`, which both status paths read as a finished response,
+  so `handoff` and workflow steps tore the worker down about 2s after sending the
+  task. A `●` line whose ellipsis is followed by the spinner's status in
+  parentheses (a running hook, the elapsed time, the token count or `thinking`)
+  is now treated as a live spinner, whatever the message before it (#908).
+
+- `store_lesson` no longer decides the learning gate, authorizes itself, or opens
+  SQLite inside the agent's process. It writes through a new `POST /lessons`
+  route, finishing the boundary move #734 started for `report_outcome` and
+  `list_outcomes`: an unreadable `settings.json` now surfaces as a plain error
+  (503) instead of `disabled: true`, which `skills/cao-learning` tells agents to
+  skip silently — so a filesystem fault used to swallow the lesson with no trace.
+  A missing route or unreachable server is likewise an explicit failure, never
+  `disabled`: only a 404 carrying `cao.learning_disabled` reads as the gate. The
+  caller's profile and its `store_lesson` capability are now resolved on the
+  server from the terminal record and profile frontmatter, so the check no longer
+  depends on the agent process being able to read the profile store (#744).
 - Kiro profile installation now preserves profile-defined `resources` alongside
   CAO's default context and skill resources. Reinstall existing profiles to
   include their configured resources in the generated Kiro agent configuration
@@ -154,6 +245,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-zero for a task the server goes on to deliver. A 4xx still fails at once,
   and a timeout after failed polls says the message may already have been
   delivered.
+- `cao session send`, the headless `cao launch` run, `cao worker send` and
+  `cao worker attach` no longer lose the agent's reply when one status poll
+  fails while they wait (#1016). The same rule as #882 applies: a connection
+  error, a read timeout, a 5xx or a reply that is not JSON is retried until the
+  send timeout, a 4xx fails at once, and a timeout after failed polls names the
+  last error. Broker errors from `FleetClient` now keep their HTTP status, so a
+  worker's 404 still fails at once.
 - Audit all tracked npm, Bun, uv, and Cargo dependency graphs in every CI run
   and weekly, including development dependencies and unfixed advisories. Block
   every HIGH/CRITICAL finding and scan error, and publish complete inventory and
@@ -644,6 +742,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A plain (non-Git) directory is now an approvable plan, keyed by its canonical path.
+
+- Script runs execute in, and fingerprint, one project root (#699): the run request's optional
+  `working_directory`, defaulting to cao-server's working directory. The CLI sends its current
+  directory (or `--working-directory`) and the MCP tools send the calling terminal's directory, so
+  script runs started from those clients now run in the caller's directory instead of cao-server's.
+  Agent steps that name neither a working directory nor a caller default to the run's root. A project
+  root outside Git is now an approvable plan instead of `plan_identity_unavailable`. Approvals granted
+  for a plan fingerprinted against a different directory must be granted again.
+
+- While approval is enforced, a script run refuses to launch further agent steps (HTTP 409,
+  `kind: plan_inputs_changed`) when an agent profile or the memory-enabled setting changes after
+  the admission snapshot. That snapshot is captured before the approval check (#699).
+
+- `cao workflow get` / `update` / `delete` validate and percent-encode workflow names;
+  `cao workflow validate --json` returns the `{ok: false, ...}` envelope on failure; `cao workflow
+  delete` gains `--json` (#699).
+
 - SECURITY.md now states the supported release line as 2.x (it said 1.x while
   2.5.x was on PyPI), guarded by `test/test_security_policy.py` against the
   version in `pyproject.toml`, and documents how maintainers handle a report:
@@ -685,6 +801,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- A profile's `tools:` allowlist is now enforced for every CAO MCP tool, not
+  just the delegation tools (`assign`, `handoff`, `assign_elastic`,
+  `create_ephemeral_agent`, `workflow_run`/`resume`/`start`) that #769/#811
+  already checked. Provider-native tool restrictions can't name an MCP tool
+  (`get_disallowed_tools` skips every `@`-prefixed entry), so a bound terminal
+  whose allowlist omitted `@cao-mcp-server` could still reach `memory_store`,
+  `memory_forget`, `delete_terminal`, `workflow_cancel`, and the rest of the
+  surface. One `on_call_tool` middleware now gates every `cao-mcp-server` tool
+  on the caller's allowlist, deferring to the same policy function #769 added,
+  so a tool registered later is covered by default. The callback protocol
+  (`send_message`, `complete_assignment`, `workflow_return`,
+  `answer_user_prompt`) and the independently-granted `discovery` tools
+  (`list_siblings`, `update_metadata`) are carved out, matching documented
+  behavior. Denied calls now surface as an MCP `ToolError` rather than a
+  `{"success": false, "error": ...}` result for the previously-gated seven.
+  `cao-ops-mcp-server` is unaffected — it is a separate, operator-granted
+  control plane. (#671)
 - New `Actions Security` CI job runs zizmor 1.30.1 over `.github/` on every PR
   and push to `main`, failing on Medium-or-higher findings. Accepted findings
   are listed with reasons in `.github/zizmor.yml` (checkout credential
