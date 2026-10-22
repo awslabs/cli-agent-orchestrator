@@ -299,11 +299,11 @@ def _service_modules() -> List[Path]:
     return sorted(_SERVICES_DIR.rglob("*.py"))
 
 
-def _module_name(path: Path) -> str:
+def _module_name(path: Path, package_root: Path = _PACKAGE_ROOT) -> str:
     """Dotted module name for a path under the package root."""
 
-    rel = path.relative_to(_PACKAGE_ROOT).with_suffix("")
-    return "cli_agent_orchestrator." + ".".join(rel.parts)
+    rel = path.relative_to(package_root).with_suffix("")
+    return package_root.name + "." + ".".join(rel.parts)
 
 
 def _parse(path: Path) -> ast.AST:
@@ -363,19 +363,24 @@ def _imports_state_client_directly(target: str) -> bool:
     return False
 
 
-def _derive_forbidden_state_services() -> Dict[str, str]:
+def _derive_forbidden_state_services(
+    module_paths: Optional[Iterable[Path]] = None, package_root: Path = _PACKAGE_ROOT
+) -> Dict[str, str]:
     """AST-scan services/ for every module that opens a state client itself.
 
     An mcp_server module importing one of these has the same non-HTTP path to
     the database as importing the client directly (the gap #744 found in
     ``store_lesson``). Scanning finds every such service, not just the ones
     mcp_server/ happens to import today, so the next tool that reaches for
-    one of the other 21 is caught without editing this file.
+    a service nothing in mcp_server/ imports yet is caught without editing
+    this file. ``module_paths``/``package_root`` exist so the derivation can
+    be proven on a synthetic package (``test_derivation_finds_exactly_the_
+    modules_that_name_a_client``); the real set is derived with the defaults.
     """
 
     derived: Dict[str, str] = {}
-    for module_path in _service_modules():
-        name = _module_name(module_path)
+    for module_path in _service_modules() if module_paths is None else module_paths:
+        name = _module_name(module_path, package_root)
         tree = _parse(module_path)
         if any(
             _imports_state_client_directly(target)
@@ -770,6 +775,47 @@ def test_forbidden_state_services_cover_services_not_imported_by_mcp_server() ->
     )
     missing = [name for name in bypass_candidates if name not in FORBIDDEN_STATE_SERVICES]
     assert not missing, f"derived FORBIDDEN_STATE_SERVICES is missing: {missing}"
-    # 24 after #1031 made services/vault/config.py client-free. (P3-1 removes
-    # this count in the next commit: it is a snapshot, not a contract.)
-    assert len(FORBIDDEN_STATE_SERVICES) == 24
+    # No size assertion on purpose: the set tracks services/ as it changes
+    # (#1031 shrank it by making vault/config.py client-free; a new
+    # database-backed service grows it) and neither is a boundary regression.
+    # The derivation itself is proven on a synthetic package below.
+
+
+def test_derivation_finds_exactly_the_modules_that_name_a_client(tmp_path: Path) -> None:
+    """The derived set is every module that names a client itself, one hop deep.
+
+    Run on a synthetic package so the assertion is about the derivation, not a
+    snapshot of today's services/: a function-scope import, a module-scope
+    import and a relative import are all found; a client-free module is not;
+    a module that imports a forbidden *service* is not (one hop); a file
+    outside the scanned paths is not.
+    """
+
+    pkg = tmp_path / "fakepkg"
+    services = pkg / "services"
+    services.mkdir(parents=True)
+    (services / "opens_db_in_function.py").write_text(
+        "def store(x):\n"
+        "    from cli_agent_orchestrator.clients.database import SessionLocal\n"
+        "    return SessionLocal\n"
+    )
+    (services / "opens_tmux_at_module.py").write_text(
+        "from cli_agent_orchestrator.clients import tmux\n"
+    )
+    (services / "opens_db_relative.py").write_text("from ..clients.database import SessionLocal\n")
+    (services / "pure.py").write_text("import os\nfrom fakepkg.utils import helper\n")
+    (services / "one_hop_away.py").write_text(
+        "from fakepkg.services.opens_db_in_function import store\n"
+    )
+    outside = pkg / "api"
+    outside.mkdir()
+    (outside / "unscanned.py").write_text("from cli_agent_orchestrator.clients.database import x\n")
+
+    derived = _derive_forbidden_state_services(sorted(services.rglob("*.py")), package_root=pkg)
+
+    assert sorted(derived) == [
+        "fakepkg.services.opens_db_in_function",
+        "fakepkg.services.opens_db_relative",
+        "fakepkg.services.opens_tmux_at_module",
+    ]
+    assert all(reason for reason in derived.values())
