@@ -131,6 +131,13 @@ class StatusMonitor:
         # Per-terminal monotonic timestamp of the last mid-burst PROCESSING probe
         # (PYTE_MIDBURST_PROBE_S rate limit); absent until the first probe.
         self._midburst_probe_at: Dict[str, float] = {}
+        # Per-terminal capture generation at the last notify_input_sent, i.e. where
+        # the current turn begins. Every chunk of the turn advances the capture
+        # generation past it, so "PROCESSING was observed in THIS turn" is
+        # ``_processing_generation > _dispatch_generation``; a stamp at or below
+        # it predates the turn's own output (#814). Absent means never dispatched
+        # (fresh terminal, or state lost on restart) and any stamp counts.
+        self._dispatch_generation: Dict[str, int] = {}
         # Per-terminal monotonic timestamp of the last stale-PROCESSING capture-pane
         # attempt — the STALE_PROCESSING_CAPTURE_INTERVAL_S rate limit. Absence is None,
         # deliberately NOT 0.0: time.monotonic()'s reference point is arbitrary, so a 0.0
@@ -652,13 +659,25 @@ class StatusMonitor:
         restricted to providers that opt in with
         ``supports_midburst_processing_probe`` and promise a side-effect-free
         predicate; everyone else keeps edge-only detection.
+
+        The "already PROCESSING, nothing to add" skip is keyed on PROCESSING
+        being OBSERVED in this turn (``_processing_observed_this_turn_locked``),
+        not on the status field reading PROCESSING. ``assume_processing_on_dispatch``
+        publishes PROCESSING from the paste onward with ``processing_evidence=False``
+        — an optimistic latch, not an observation — so keying on the field alone
+        silently disabled the probe for exactly the turn it covers (#814). The
+        turn, not the chunk, is the unit: a key of "stamped at the current capture
+        generation" is true only inside the chunk that stamped it and never on the
+        next, so it silently removed the skip instead and the probe ran every
+        PYTE_MIDBURST_PROBE_S for the whole busy turn.
         """
         if provider is None or not getattr(provider, "supports_midburst_processing_probe", False):
             return
 
         now = time.monotonic()
         with self._lock:
-            if self._last_status.get(terminal_id) == TerminalStatus.PROCESSING:
+            generation = self._capture_generation.get(terminal_id, 0)
+            if self._processing_observed_this_turn_locked(terminal_id):
                 return
             last_probe = self._midburst_probe_at.get(terminal_id)
             if last_probe is not None and now - last_probe < PYTE_MIDBURST_PROBE_S:
@@ -677,7 +696,29 @@ class StatusMonitor:
             logger.exception("Error probing mid-burst status for %s", terminal_id)
             return
         if busy:
-            self._apply_detection(terminal_id, TerminalStatus.PROCESSING)
+            self._apply_detection(
+                terminal_id, TerminalStatus.PROCESSING, capture_generation=generation
+            )
+
+    def _processing_observed_this_turn_locked(self, terminal_id: str) -> bool:
+        """True when the cached PROCESSING was earned by THIS turn's output.
+
+        Caller MUST hold ``self._lock``. The latch field carries two meanings —
+        observed, and asserted optimistically by ``notify_input_sent`` — and only
+        the ``_processing_generation`` stamp tells them apart (#814). A stamp is
+        this turn's when it is newer than the generation recorded at dispatch:
+        every chunk of the turn advances the capture generation past that mark,
+        while a stamp at or below it came from a frame rendered before any of
+        this turn's output. Every reader that wants to stop looking because the
+        terminal is "already busy" goes through here; the field alone is not
+        evidence.
+        """
+        if self._last_status.get(terminal_id) != TerminalStatus.PROCESSING:
+            return False
+        observed_at = self._processing_generation.get(terminal_id)
+        if observed_at is None:
+            return False
+        return observed_at > self._dispatch_generation.get(terminal_id, 0)
 
     def _on_screen_quiescent(self, terminal_id: str, provider) -> None:
         """Quiescence timer fired: output stopped, so the screen has settled.
@@ -734,12 +775,24 @@ class StatusMonitor:
             self._bursting[terminal_id] = True
             handle = self._quiesce_handle.pop(terminal_id, None)
             last_status = self._last_status.get(terminal_id)
+            # The dispatch latch reads PROCESSING before any evidence (#814): a
+            # field-keyed debounce would stop looking at exactly the chunks that
+            # carry the turn's real PROCESSING marker.
+            latched_unobserved = (
+                last_status == TerminalStatus.PROCESSING
+                and not self._processing_observed_this_turn_locked(terminal_id)
+            )
         self._cancel_quiesce_handle(handle)
 
         # While terminal is ready/armed, detect on every chunk so the
         # IDLE→PROCESSING transition is never missed (prevents stale-IDLE
         # delivery by InboxService). Once PROCESSING is observed, debounce.
-        if not was_bursting or last_status in _STICKY_READY_STATUSES or last_status is None:
+        if (
+            not was_bursting
+            or last_status in _STICKY_READY_STATUSES
+            or last_status is None
+            or latched_unobserved
+        ):
             detected = self._detect_status(terminal_id, buffer)
             self._apply_detection(terminal_id, detected, capture_generation=capture_generation)
 
@@ -954,6 +1007,12 @@ class StatusMonitor:
             self._confirmed_stale_capture_commit.pop(terminal_id, None)
             self._capture_generation[terminal_id] = self._capture_generation.get(terminal_id, 0) + 1
             capture_handle = self._stale_capture_handle.pop(terminal_id, None)
+            # The previous turn's mid-burst probe throttle must not carry over: it
+            # would otherwise swallow the new turn's first probe opportunity (#814).
+            self._midburst_probe_at.pop(terminal_id, None)
+            # Where this turn begins; a PROCESSING stamp has to get past it to count
+            # as this turn's observation (see _processing_observed_this_turn_locked).
+            self._dispatch_generation[terminal_id] = self._capture_generation[terminal_id]
             # ``_idle_from_completed`` is deliberately NOT cleared here. The marker
             # says the current IDLE is a previous COMPLETED with its box scrolled
             # off, and arming does not change what is on screen. Clearing it on
@@ -1055,6 +1114,7 @@ class StatusMonitor:
             self._waiting_generation.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
             self._midburst_probe_at.pop(terminal_id, None)
+            self._dispatch_generation.pop(terminal_id, None)
             self._screens.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
             self._recheck_cache.pop(terminal_id, None)
@@ -1087,6 +1147,7 @@ class StatusMonitor:
             self._waiting_generation.pop(terminal_id, None)
             self._allow_processing_revert.pop(terminal_id, None)
             self._midburst_probe_at.pop(terminal_id, None)
+            self._dispatch_generation.pop(terminal_id, None)
             # Drop the rendered screen too so the relaunched CLI mode is
             # detected against a fresh viewport, not the failed attempt's.
             self._screens.pop(terminal_id, None)

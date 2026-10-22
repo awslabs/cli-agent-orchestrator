@@ -3,6 +3,7 @@
 import asyncio
 import dataclasses
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -12,6 +13,9 @@ import click
 from cli_agent_orchestrator.constants import MEMORY_ARCHIVE_DEFAULT_FORMAT
 from cli_agent_orchestrator.models.memory import MemoryScope, MemoryType
 from cli_agent_orchestrator.services.memory_service import MemoryDisabledError, MemoryService
+from cli_agent_orchestrator.services.settings_service import is_non_accessing_inspection_enabled
+
+logger = logging.getLogger(__name__)
 
 
 def _get_memory_service() -> MemoryService:
@@ -390,12 +394,74 @@ def vault_migrate(scope, scope_id, do_apply, delete_source, confirm_delete_sourc
     default=False,
     help="Show memories from all projects, not just the current working directory.",
 )
-def list_memories(scope, memory_type, scan_all):
+@click.option("--query", default=None, help="Query for the --explain relevance diagnostic.")
+@click.option(
+    "--explain",
+    is_flag=True,
+    default=False,
+    help="Compare default and relevance recall without recording access; requires --query.",
+)
+@click.option(
+    "--limit",
+    type=click.IntRange(1, 100),
+    default=10,
+    show_default=True,
+    help="Top-result limit for --explain.",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    show_default=True,
+    help="Output format for --explain.",
+)
+def list_memories(scope, memory_type, scan_all, query, explain, limit, output_format):
     """List stored memories.
 
     By default shows global memories and memories for the current working directory.
     Use --all to show memories across all projects.
     """
+    if explain and (not query or not query.strip()):
+        raise click.UsageError("--explain requires --query.")
+    if query is not None and not explain:
+        raise click.UsageError("--query requires --explain.")
+    if not explain:
+        context = click.get_current_context()
+        for parameter, flag in (("limit", "--limit"), ("output_format", "--format")):
+            if context.get_parameter_source(parameter) is click.core.ParameterSource.COMMANDLINE:
+                raise click.UsageError(f"{flag} requires --explain.")
+    if explain:
+        from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+        if not is_memory_enabled():
+            raise click.ClickException("Memory is disabled (memory.enabled=false).")
+        try:
+            diagnostic = _run_async(
+                _get_memory_service().recall_explain(
+                    query=query,
+                    scope=scope,
+                    memory_type=memory_type,
+                    limit=limit,
+                    terminal_context=_cwd_context(),
+                    scan_all=scan_all,
+                )
+            )
+        except Exception as e:
+            logger.debug("Memory explain failed: %s", e, exc_info=True)
+            debug = os.environ.get("CAO_LOG_LEVEL", "").strip().upper() == "DEBUG"
+            if debug:
+                click.echo(f"Explain detail ({type(e).__name__}): {e}", err=True)
+            hint = "details above" if debug else "re-run with CAO_LOG_LEVEL=DEBUG for details"
+            raise click.ClickException(f"Explain failed ({type(e).__name__}); {hint}") from e
+        if diagnostic is None:
+            raise click.ClickException("Explain is disabled (memory.explain_enabled=false).")
+        if output_format == "json":
+            click.echo(json.dumps(diagnostic))
+        else:
+            _print_explain_table(diagnostic)
+        return
+
     svc = _get_memory_service()
     try:
         terminal_context = {"cwd": os.path.realpath(os.getcwd())}
@@ -406,6 +472,7 @@ def list_memories(scope, memory_type, scan_all):
                 limit=100,
                 terminal_context=terminal_context,
                 scan_all=scan_all,
+                record_access=not is_non_accessing_inspection_enabled(),
             )
         )
     except Exception as e:
@@ -423,7 +490,32 @@ def list_memories(scope, memory_type, scan_all):
     for mem in memories:
         updated = mem.updated_at.strftime("%Y-%m-%d %H:%M")
         tags = mem.tags if mem.tags else ""
-        click.echo(f"{mem.key:<30} {mem.scope:<10} {mem.memory_type:<12} {tags:<20} {updated}")
+        marker = f"  [{mem.lifecycle_status}]" if mem.lifecycle_status is not None else ""
+        click.echo(
+            f"{mem.key:<30} {mem.scope:<10} {mem.memory_type:<12} {tags:<20} {updated}{marker}"
+        )
+
+
+def _print_explain_table(diagnostic: dict) -> None:
+    """Render only the content-minimizing diagnostic fields."""
+    click.echo(f"Query: {diagnostic['query']}")
+    click.echo(
+        f"Pool: {diagnostic['pool_size']}  Candidates/source: {diagnostic['candidate_limit']}"
+    )
+    header = f"{'KEY':<30} {'SCOPE':<10} {'SRC':<8} {'TIER':<10} {'LEX':>6} {'AGE×':>6} {'REL':>6} {'REL#':>5} {'DEF#':>5} {'REC':>5} {'SUP':>5} {'INJ':>9}"
+    click.echo(header)
+    click.echo("-" * len(header))
+    for row in diagnostic["candidates"]:
+        rel_rank = row["relevance_rank"] if row["relevance_rank"] is not None else "-"
+        def_rank = row["recency_rank"] if row["recency_rank"] is not None else "-"
+        click.echo(
+            f"{row['key']:<30} {row['scope']:<10} {row['source_kind']:<8} {row['tier']:<10} "
+            f"{row['lexical']:>6.4f} {row['recency_factor']:>6.4f} {row['relevance']:>6.4f} "
+            f"{rel_rank!s:>5} {def_rank!s:>5} {str(row['recovered']):>5} {str(row['superseded']):>5} {row['injection']:>9}"
+        )
+    click.echo(
+        f"Lexical degenerate: {str(bool(diagnostic.get('lexical_degenerate', False))).lower()}"
+    )
 
 
 @memory.command()
@@ -441,7 +533,12 @@ def show(key, scope):
     try:
         memories = _run_async(
             svc.recall(
-                query=key, scope=scope, limit=100, terminal_context=_cwd_context(), scan_all=True
+                query=key,
+                scope=scope,
+                limit=100,
+                terminal_context=_cwd_context(),
+                scan_all=True,
+                record_access=not is_non_accessing_inspection_enabled(),
             )
         )
     except Exception as e:
@@ -463,6 +560,8 @@ def show(key, scope):
     click.echo(f"Tags:    {match.tags or '(none)'}")
     click.echo(f"Created: {match.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
     click.echo(f"Updated: {match.updated_at.strftime('%Y-%m-%d %H:%M:%S')}")
+    if match.lifecycle_status is not None:
+        click.echo(f"Status:  {match.lifecycle_status}")
     click.echo(f"File:    {match.file_path}")
     click.echo()
     click.echo(match.content)

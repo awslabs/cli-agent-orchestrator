@@ -32,6 +32,13 @@ from cli_agent_orchestrator.ops_mcp_server.server import (
     shutdown_session,
 )
 
+# What ``synchronous_create_timeout`` is stubbed to return in the launch tests
+# below: ``POST /sessions`` WITHOUT ``initial_message`` is answered only after
+# provider init, so its budget is derived from ``provider_init_timeout`` rather
+# than being ``_HTTP_TIMEOUT`` (issue #710).
+_SYNC_CREATE_TIMEOUT = (5.0, 430.0)
+_SYNC_CREATE_BUDGET = "cli_agent_orchestrator.ops_mcp_server.server.synchronous_create_timeout"
+
 
 class InstallPayload(TypedDict):
     """Typed payload used for InstallResult assertions."""
@@ -304,6 +311,7 @@ class TestSessionLifecycleTools:
                 "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
                 return_value=_response(json_data={"id": "term-123"}),
             ) as mock_request,
+            patch(_SYNC_CREATE_BUDGET, return_value=_SYNC_CREATE_TIMEOUT),
         ):
             result = await _launch_session_impl(
                 agent_profile="developer",
@@ -325,7 +333,7 @@ class TestSessionLifecycleTools:
                 "allowed_tools": "fs_read,execute_bash",
             },
             json={"description": None},
-            timeout=_HTTP_TIMEOUT,
+            timeout=_SYNC_CREATE_TIMEOUT,
             headers=None,
         )
 
@@ -336,6 +344,7 @@ class TestSessionLifecycleTools:
                 "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
                 return_value=_response(json_data={"id": "term-456"}),
             ) as mock_request,
+            patch(_SYNC_CREATE_BUDGET, return_value=_SYNC_CREATE_TIMEOUT),
         ):
             result = await launch_session(
                 agent_profile="developer",
@@ -360,9 +369,68 @@ class TestSessionLifecycleTools:
                 "working_directory": "/workspace/project",
             },
             json=None,
-            timeout=_HTTP_TIMEOUT,
+            timeout=_SYNC_CREATE_TIMEOUT,
             headers=None,
         )
+
+    async def test_launch_session_without_a_message_sizes_the_create_from_provider_init(
+        self,
+    ) -> None:
+        """Issue #710 (review on PR #1002, P2-1). Without ``initial_message``
+        cao-server holds ``POST /sessions`` until ``provider.initialize()``
+        returns, so the budget must be derived from ``provider_init_timeout``
+        for THIS profile -- a flat 300s read was below a successful Antigravity
+        init (370s at stock settings). The connect half stays short so a dead
+        server still reports promptly."""
+        reads = []
+        for init_timeout in (60, 240):
+            with (
+                patch(
+                    "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+                    return_value=_response(json_data={"id": "term-sync"}),
+                ) as mock_request,
+                patch(
+                    "cli_agent_orchestrator.services.settings_service.get_server_settings",
+                    return_value={
+                        "provider_init_timeout": init_timeout,
+                        "mcp_request_timeout": 30,
+                    },
+                ),
+                patch(
+                    "cli_agent_orchestrator.utils.agent_profiles.load_launch_profile",
+                    side_effect=FileNotFoundError("no override on this box"),
+                ),
+            ):
+                result = await launch_session(agent_profile="developer", session_name="sync")
+
+            assert result.success is True
+            timeout = mock_request.call_args.kwargs["timeout"]
+            assert timeout != _HTTP_TIMEOUT
+            assert isinstance(timeout, tuple), f"expected (connect, read), got {timeout!r}"
+            connect, read = timeout
+            assert connect == 5
+            assert read > 300, "the flat 300s read was below a successful Antigravity init"
+            reads.append(read)
+
+        assert reads[1] > reads[0], "raising provider_init_timeout must move the budget"
+
+    async def test_launch_session_with_a_message_keeps_the_ordinary_budget(self) -> None:
+        """With ``initial_message`` the server defers init and answers at once,
+        so widening this budget would only slow down reporting a wedged server."""
+        with (
+            patch(
+                "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+                return_value=_response(json_data={"id": "term-deferred"}),
+            ) as mock_request,
+            patch(_SYNC_CREATE_BUDGET) as mock_budget,
+        ):
+            result = await launch_session(
+                agent_profile="developer", session_name="deferred", initial_message="go"
+            )
+
+        assert result.success is True
+        assert mock_request.call_args.kwargs["timeout"] == _HTTP_TIMEOUT
+        mock_budget.assert_not_called()
 
     async def test_launch_session_result_includes_provider_from_api_response(self) -> None:
         """The Terminal model's provider field should be surfaced on LaunchResult."""
@@ -429,10 +497,13 @@ class TestSessionLifecycleTools:
         """Forwarded env vars ride the JSON body (never the URL/params), the
         same wire shape as ``cao launch --env``."""
         env_vars = {"DEV_ACCOUNT": "123456789012", "BASE_URL": "http://localhost:8080"}
-        with patch(
-            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
-            return_value=_response(json_data={"id": "term-env"}),
-        ) as mock_request:
+        with (
+            patch(
+                "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+                return_value=_response(json_data={"id": "term-env"}),
+            ) as mock_request,
+            patch(_SYNC_CREATE_BUDGET, return_value=_SYNC_CREATE_TIMEOUT),
+        ):
             result = await launch_session(
                 agent_profile="developer",
                 session_name="env-session",
@@ -453,7 +524,7 @@ class TestSessionLifecycleTools:
                 "session_name": "env-session",
             },
             json={"env_vars": env_vars},
-            timeout=_HTTP_TIMEOUT,
+            timeout=_SYNC_CREATE_TIMEOUT,
             headers=None,
         )
         # A forwarded value must not leak into the URL or query params.
