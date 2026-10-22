@@ -41,10 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking / migration:** script-run plan identifiers move from `plan-v1:` to `plan-v2:` and now
   bind the installed agent profile set — every installed profile's source text plus the files
   `cao install` wrote for it (the Kiro agent JSON, the Copilot and OpenCode agent files, the shared
-  OpenCode `opencode.json`, the installed context copy) — because a step's system prompt and tool policy come from those files, not from the
-  script (#827, first acceptance criterion). Every stored `plan-v1` approval stops matching: the first
-  new run of each plan is refused with its `plan-v2` identifier until an operator approves it again.
-  A run frozen and approved before the upgrade still resumes on its stored `plan-v1` identifier.
+  OpenCode `opencode.json`, the installed context copy) — because a step's system prompt and tool
+  policy come from those files, not from the script (#827, first acceptance criterion). Every stored
+  `plan-v1` approval stops matching: the first new run of each plan is refused with its `plan-v2`
+  identifier until an operator approves it again. A run frozen and approved before the upgrade still
+  resumes on its stored `plan-v1` identifier, and its launch guard record (which has no scheme
+  marker) keeps checking each agent launch under the rule it was admitted with, the profile text
+  alone; new runs record `launch-guard-v2`.
   Editing or installing any profile, and a CAO upgrade that changes a bundled profile, moves every
   `plan_id`. An entry the launch path cannot serve (a symlink leaving the store, a `..` name) is
   digested by name only; a profile store CAO cannot read refuses the run as `profiles_unreadable`.

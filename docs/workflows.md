@@ -477,7 +477,10 @@ and discarded; it is never written to the manifest as its own value.
 > profiles were never examined, so it cannot satisfy the new scheme. This does **not** reach a run that
 > was already frozen and approved before the upgrade and left resumable: resume reuses that run's
 > frozen `plan_id` verbatim rather than recomputing it, so an approved `plan-v1` resume still proceeds
-> on its original approval. Re-approve each plan once it is run fresh.
+> on its original approval. Its per-run launch guard record carries no scheme marker, so each of its
+> agent launches is still checked under the rule it was admitted with (the profile text alone, without
+> the installed files); new runs record `launch-guard-v2` and are checked under the full rule.
+> Re-approve each plan once it is run fresh.
 
 ### It is on by default
 
