@@ -147,6 +147,15 @@ from cli_agent_orchestrator.utils.terminal import (
 
 logger = logging.getLogger(__name__)
 
+#: Every orchestration-type value that marks input as machine-originated, derived
+#: from the enum rather than hand-enumerated (#896). The dialog guard in
+#: ``send_input`` used to test ``{ASSIGN, HANDOFF}`` and ``SEND_MESSAGE`` walked
+#: past it into an open AskUserQuestion dialog. Deriving the set means a member
+#: added to ``OrchestrationType`` later inherits the guard the day it is defined;
+#: test/services/test_orchestrated_input_guard_invariants.py pins that per member
+#: and test/test_callsite_lint_rules.py refuses a return to a literal subset.
+_ORCHESTRATED_INPUT_VALUES = frozenset(t.value for t in OrchestrationType)
+
 _DEFERRED_INIT_FAILURE_MESSAGE_MAX = 4096
 _DEFERRED_INIT_FAILURE_SCAN_MAX = 16384
 _DEFERRED_INIT_FAILURE_PERSIST_ATTEMPTS = 3
@@ -3954,20 +3963,15 @@ def dispatch_input(
                     reason=TerminalInputBlockedReason.PROVIDER_ERROR,
                 )
 
+            # Any orchestration type is machine-originated input (#896): an inbox
+            # delivery is just as much so as an assign, and the dialog cannot
+            # tell them apart -- it ate the paste and the trailing Enter answered
+            # the question. Only a real answer_user_prompt call or the operator
+            # typing by hand (no orchestration type, so an empty value here) may
+            # resolve a prompt.
             if (
                 provider.blocks_orchestrated_input_while_waiting_user_answer is True
-                and orchestration_value
-                in {
-                    OrchestrationType.ASSIGN.value,
-                    OrchestrationType.HANDOFF.value,
-                    # send_message too (#896): an inbox delivery is just as much
-                    # machine-originated input as an assign, and the dialog
-                    # cannot tell them apart -- it ate the paste and the trailing
-                    # Enter answered the question. Only a real answer_user_prompt
-                    # call or the operator typing by hand (no orchestration type,
-                    # so not in this set) may resolve a prompt.
-                    OrchestrationType.SEND_MESSAGE.value,
-                }
+                and orchestration_value in _ORCHESTRATED_INPUT_VALUES
                 and current_status == TerminalStatus.WAITING_USER_ANSWER
             ):
                 raise TerminalInputBlockedError(
