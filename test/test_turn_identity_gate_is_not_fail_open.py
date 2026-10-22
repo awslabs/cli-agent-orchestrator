@@ -204,6 +204,10 @@ def _finished_turn():
     observation.output_generation = 8
     monitor.status_observation.return_value = observation
     monitor.get_status.return_value = TerminalStatus.COMPLETED
+    # Nothing has landed since the send: the gate's unbounded state (P2-2). A bare
+    # MagicMock here coerces to int 1 through the Terminal model and reads as a
+    # server restart instead.
+    monitor.output_generation.return_value = 8
     return monitor
 
 

@@ -161,6 +161,21 @@ class Terminal(BaseModel):
             "the generation, and None on a server that does not report it."
         ),
     )
+    output_generation: Optional[int] = Field(
+        default=None,
+        description=(
+            "The terminal's CURRENT output generation (StatusMonitor.output_generation()), "
+            "reported alongside ``status_generation`` so a client can tell three cases "
+            "apart against the dispatch boundary of a send: equal to it, nothing has "
+            "landed since the send; above it while ``status_generation`` is still at or "
+            "below it, output landed but the status was never re-earned, which is either "
+            "a turn so fast its PROCESSING was never sampled or a repaint of the previous "
+            "frame and the server cannot tell which, so a client must bound its wait rather "
+            "than refuse until timeout (#735 review, P2-2); below it, the server's counter "
+            "was reset (restart) and the boundary no longer shares its timeline. None for "
+            "event-inbox backends (herdr) and on a server that does not report it."
+        ),
+    )
     last_active: Optional[datetime] = Field(None, description="Last active timestamp (UTC)")
 
     @field_validator("last_active")

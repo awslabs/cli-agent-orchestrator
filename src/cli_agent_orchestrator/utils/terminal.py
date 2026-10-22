@@ -12,6 +12,15 @@ from cli_agent_orchestrator.constants import API_BASE_URL, SESSION_PREFIX
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.utils import api_http
 
+# How long ``poll_until_done`` keeps refusing a ready status whose stamp never
+# moved past the dispatch boundary AFTER output has landed since the send, before
+# it concludes the turn finished without a sampled PROCESSING and degrades to the
+# frame-based wait. Same budget the server gives a worker to show its first
+# PROCESSING before it resubmits (``terminal_service._DEFERRED_SUBMIT_CONFIRM_TIMEOUT``);
+# the two gates read the same stamp and answer the same question, "has this turn
+# been seen yet", so one bound describes both.
+STAMP_GRACE_SECONDS = 8.0
+
 logger = logging.getLogger(__name__)
 
 # Allowlist for tmux session/window names. tmux uses ':' and '.' as target
@@ -246,6 +255,7 @@ def poll_until_done(
     idle_stable_polls: int = 3,
     read_status: Optional[Callable[[str], Optional[str]]] = None,
     min_generation: Optional[int] = None,
+    stamp_grace: float = STAMP_GRACE_SECONDS,
 ) -> None:
     """Poll terminal status until the agent is done, errored, or timeout.
 
@@ -277,6 +287,27 @@ def poll_until_done(
     deliberately leaves ``_last_status`` alone), and a bare COMPLETED returned
     immediately with the previous turn's answer (#735, #407).
 
+    The refusal is BOUNDED, because the latch does not stamp every turn: an
+    unchanged COMPLETED -> COMPLETED re-detection and the COMPLETED -> IDLE ->
+    COMPLETED round trip both keep the previous turn's stamp by design
+    (``StatusMonitor._apply_detection_locked``), so a fast turn whose spinner and
+    answer land in one chunk, sent from the COMPLETED a previous send left, ends
+    with ``status_generation`` still at or below the boundary. The server cannot
+    tell that from a repaint of the previous frame; its own gate resubmits after
+    a deadline, which a CLI must never do. So this wait also reads the terminal's
+    CURRENT ``output_generation`` and, once output has landed since the send
+    (counter above the boundary) with the stamp still not past it, gives the stamp
+    ``stamp_grace`` seconds to move. If it does not, the wait prints a warning on
+    stderr, stops refusing readings and finishes on the frame-based rules above:
+    the answer printed may then be the previous turn's, and the warning says so.
+    While NOTHING has landed since the send (counter equal to the boundary) the
+    refusal has no bound -- there is no turn to be done yet, and finishing on the
+    previous frame there is exactly #735. A counter BELOW the boundary cannot
+    happen within one cao-server lifetime (the boundary was sampled from it), so
+    it means the server restarted and its stamps no longer share the boundary's
+    timeline; the wait warns and degrades at once instead of refusing every
+    reading until the timeout.
+
     Omitted — or when the server reports no ``status_generation``, which is the
     case for an older cao-server and for event-inbox backends (herdr) whose status
     is derived on demand — the wait degrades to the frame-based behaviour above
@@ -300,6 +331,10 @@ def poll_until_done(
     start = time.time()
     consecutive_idle = 0
     observed_working = False
+    # The turn-identity gate; switched off for the rest of this wait (with a
+    # warning) when the stamp provably cannot or did not move -- see docstring.
+    gate_engaged = min_generation is not None
+    stamp_grace_started: Optional[float] = None
     while True:
         elapsed = time.time() - start
         if elapsed > timeout:
@@ -322,8 +357,11 @@ def poll_until_done(
                 status = payload.get("status")
                 raw_generation = payload.get("status_generation")
                 generation = raw_generation if isinstance(raw_generation, int) else None
+                raw_current = payload.get("output_generation")
+                current_generation = raw_current if isinstance(raw_current, int) else None
             if (
-                min_generation is not None
+                gate_engaged
+                and min_generation is not None
                 and generation is not None
                 and generation <= min_generation
                 and status != TerminalStatus.ERROR.value
@@ -331,9 +369,46 @@ def poll_until_done(
                 # Earned at or before the send's dispatch boundary: this describes
                 # the frame the previous turn left, not the turn being waited on.
                 # Not "done", and not evidence that this turn started either.
-                consecutive_idle = 0
-                time.sleep(polling_interval)
-                continue
+                if current_generation is not None and current_generation < min_generation:
+                    # The counter the boundary was sampled from has gone backwards:
+                    # the server restarted, and no stamp it issues from now on is
+                    # comparable with this boundary. Refusing on would wait out the
+                    # whole timeout for a turn that may well be finished.
+                    click.echo(
+                        f"Warning: cao-server's output generation for terminal {terminal_id} "
+                        f"is below this send's dispatch boundary (server restarted?); "
+                        "cannot tell this turn's status from the previous one, waiting "
+                        "on the frame instead.",
+                        err=True,
+                    )
+                    gate_engaged = False
+                elif current_generation is not None and current_generation > min_generation:
+                    # Output has landed since the send but the status was not
+                    # re-earned: a turn too fast for its PROCESSING to be sampled,
+                    # or a repaint of the previous frame while the worker starts.
+                    # Give the stamp ``stamp_grace`` to move, then stop refusing.
+                    now = time.time()
+                    if stamp_grace_started is None:
+                        stamp_grace_started = now
+                    if now - stamp_grace_started < stamp_grace:
+                        consecutive_idle = 0
+                        time.sleep(polling_interval)
+                        continue
+                    click.echo(
+                        f"Warning: terminal {terminal_id} produced output after the send "
+                        f"but its status was not re-earned within {stamp_grace:g}s; "
+                        "finishing on the current frame, which may still be the "
+                        "previous turn's answer.",
+                        err=True,
+                    )
+                    gate_engaged = False
+                else:
+                    # Nothing has landed since the send (or the server does not say):
+                    # there is no turn to be done yet. Unbounded by design -- ending
+                    # here on the previous frame is #735 itself.
+                    consecutive_idle = 0
+                    time.sleep(polling_interval)
+                    continue
             if status == TerminalStatus.COMPLETED.value:
                 return
             if status == TerminalStatus.ERROR.value:

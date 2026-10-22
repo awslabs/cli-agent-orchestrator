@@ -20,6 +20,7 @@ with the PREVIOUS turn's COMPLETED. These tests drive the real ``StatusMonitor``
 that window and assert that the CLI's own wait logic does not treat it as done.
 """
 
+import time
 from unittest.mock import MagicMock, patch
 
 import click
@@ -96,20 +97,24 @@ def test_status_after_dispatch_is_the_previous_turns_completed(get_backend, moni
 def _http_reader(monitor, boundary, script):
     """A fake ``GET /terminals/{id}`` sourced from a real StatusMonitor.
 
-    ``script`` is called with the 1-based read number and may advance the monitor
-    before the reading is taken, so a test describes a turn's timeline rather
-    than hand-rolling status payloads.
+    Reads the same three things ``terminal_service.get_terminal`` puts on the wire,
+    in the same order: the (status, stamp) pair in one lock, then the current
+    output counter. ``script`` is called with the 1-based read number and may
+    advance the monitor before the reading is taken, so a test describes a turn's
+    timeline rather than hand-rolling status payloads.
     """
     reads = []
 
     def get(url, timeout=None):
         reads.append(url)
         script(len(reads))
+        observation = monitor.status_observation(TERMINAL_ID)
         response = MagicMock()
         response.raise_for_status.return_value = None
         response.json.return_value = {
-            "status": monitor.get_status(TERMINAL_ID).value,
-            "status_generation": monitor.status_generation(TERMINAL_ID),
+            "status": observation.status.value,
+            "status_generation": observation.output_generation,
+            "output_generation": monitor.output_generation(TERMINAL_ID),
         }
         return response
 
@@ -179,6 +184,10 @@ def test_poll_until_done_refuses_an_ordinary_repaint_of_a_stale_completion(get_b
     "generation went backwards means the server restarted" and disengaged
     itself here, which reopens #735 in the common case: the previous turn's
     stale COMPLETED must still be refused.
+
+    The repaint lands BEFORE the boundary is sampled, so after the send the
+    counter equals the boundary: nothing has landed for this turn, and the
+    refusal is unbounded in that state (the bounded cases are below).
     """
     get_backend.return_value = _tmux_backend()
     with monitor._lock:
@@ -226,6 +235,217 @@ def test_an_error_is_honoured_regardless_of_generation(get_backend, monitor):
     with patch("cli_agent_orchestrator.utils.terminal.api_http.get", return_value=response):
         with pytest.raises(click.ClickException, match="ERROR"):
             poll_until_done(TERMINAL_ID, timeout=5.0, polling_interval=0.01, min_generation=8)
+
+
+# ---------------------------------------------------------------------------
+# P2-2 (round-1 review of PR #999): the refusal must be bounded.
+#
+# The tests above hand-set the latch. These drive the REAL latch through
+# ``_process_chunk`` with a buffer-parsing provider, because the defect lives in
+# two transitions ``_apply_detection_locked`` deliberately does not stamp:
+# COMPLETED -> COMPLETED (an unchanged re-detection) and the COMPLETED -> IDLE ->
+# COMPLETED round trip. A turn that finishes through either keeps the previous
+# turn's stamp, and a gate that refuses such a reading unconditionally makes
+# `cao session send` wait out its whole timeout on a turn that is done.
+# ---------------------------------------------------------------------------
+
+
+class _RawProvider:
+    """A provider whose verdict is a marker in the tail of the rolling buffer."""
+
+    supports_screen_detection = False
+
+    def get_status(self, buffer):
+        tail = buffer[-200:]
+        if "<DONE>" in tail:
+            return TerminalStatus.COMPLETED
+        if "<SPIN>" in tail:
+            return TerminalStatus.PROCESSING
+        if "<PROMPT>" in tail:
+            return TerminalStatus.IDLE
+        return TerminalStatus.UNKNOWN
+
+
+@pytest.fixture
+def chunk_driven():
+    """A real StatusMonitor whose latch only moves through ``_process_chunk``.
+
+    With no event loop running, detection runs inline on every chunk, as it does
+    in production while the status is ready.
+    """
+    with (
+        patch("cli_agent_orchestrator.backends.registry.get_backend") as get_backend,
+        patch(
+            "cli_agent_orchestrator.services.status_monitor.provider_manager.get_provider",
+            return_value=_RawProvider(),
+        ),
+        patch(
+            "cli_agent_orchestrator.services.status_monitor.get_server_settings",
+            return_value={"state_buffer_max": 32768},
+        ),
+    ):
+        get_backend.return_value = _tmux_backend()
+        yield StatusMonitor()
+
+
+def _dispatch(sm):
+    """What ``dispatch_input`` does around the paste: arm, clear, sample the boundary."""
+    sm.notify_input_sent(TERMINAL_ID)
+    sm.clear_rolling_buffer(TERMINAL_ID)
+    return sm.output_generation(TERMINAL_ID)
+
+
+def _finish_a_first_turn(sm):
+    _dispatch(sm)
+    sm._process_chunk(TERMINAL_ID, "task one <SPIN>")
+    sm._process_chunk(TERMINAL_ID, " answer one <DONE>")
+    assert sm.status_observation(TERMINAL_ID).status == TerminalStatus.COMPLETED
+
+
+# Every way the latch can reach COMPLETED for a new turn WITHOUT moving the stamp
+# past the dispatch boundary. If ``_apply_detection_locked`` grows another
+# unstamped transition, add it here: the gate must stay bounded across the class.
+UNSTAMPED_COMPLETIONS = [
+    pytest.param(["task two <SPIN> answer two <DONE>"], id="completed-to-completed-in-one-chunk"),
+    pytest.param(
+        ["task two <PROMPT>", " <SPIN> answer two <DONE>"],
+        id="completed-to-idle-to-completed-round-trip",
+    ),
+]
+
+
+@pytest.mark.parametrize("turn_two", UNSTAMPED_COMPLETIONS)
+def test_a_completion_the_latch_does_not_stamp_still_ends_the_wait_within_the_grace(
+    chunk_driven, turn_two, capsys
+):
+    """P2-2: the gate must not refuse a finished turn until the timeout.
+
+    Before the fix both parametrizations raised "Timed out" however long the
+    timeout was; the merge-base wait returned at once.
+    """
+    sm = chunk_driven
+    _finish_a_first_turn(sm)
+    boundary = _dispatch(sm)
+    for chunk in turn_two:
+        sm._process_chunk(TERMINAL_ID, chunk)
+
+    # The shape the review named: output landed for this turn, the status reads
+    # COMPLETED, and the stamp is still the previous turn's.
+    observation = sm.status_observation(TERMINAL_ID)
+    assert observation.status == TerminalStatus.COMPLETED
+    assert observation.output_generation <= boundary
+    assert sm.output_generation(TERMINAL_ID) > boundary
+
+    reads, get = _http_reader(sm, boundary, lambda n: None)
+    with patch("cli_agent_orchestrator.utils.terminal.api_http.get", side_effect=get):
+        started = time.monotonic()
+        poll_until_done(
+            TERMINAL_ID,
+            timeout=10.0,
+            polling_interval=0.01,
+            min_generation=boundary,
+            stamp_grace=0.2,
+        )
+        elapsed = time.monotonic() - started
+
+    assert elapsed < 5.0, f"the gate held for {elapsed:.1f}s past a finished turn"
+    assert len(reads) > 1, "the stale reading was accepted at once; the gate did not engage"
+    err = capsys.readouterr().err
+    assert "not re-earned" in err and "previous turn" in err, err
+
+
+def test_a_completion_whose_processing_was_sampled_needs_no_grace_and_no_warning(
+    chunk_driven, capsys
+):
+    """Control: the ordinary turn is stamped, so it finishes on the stamp alone."""
+    sm = chunk_driven
+    _finish_a_first_turn(sm)
+    boundary = _dispatch(sm)
+    sm._process_chunk(TERMINAL_ID, "task two <SPIN>")
+    sm._process_chunk(TERMINAL_ID, " answer two <DONE>")
+    assert sm.status_observation(TERMINAL_ID).output_generation > boundary
+
+    reads, get = _http_reader(sm, boundary, lambda n: None)
+    with patch("cli_agent_orchestrator.utils.terminal.api_http.get", side_effect=get):
+        poll_until_done(
+            TERMINAL_ID,
+            timeout=10.0,
+            polling_interval=0.01,
+            min_generation=boundary,
+            stamp_grace=60.0,  # never reached: the stamp itself opens the gate
+        )
+
+    assert len(reads) == 1
+    assert capsys.readouterr().err == ""
+
+
+def test_within_the_grace_the_previous_turns_completion_is_still_refused(chunk_driven):
+    """The bound must not be a bypass: #735's own shape -- the paste echoed, the
+    worker has not started, the screen still shows the previous answer -- is
+    refused for the whole grace."""
+    sm = chunk_driven
+    _finish_a_first_turn(sm)
+    boundary = _dispatch(sm)
+    sm._process_chunk(TERMINAL_ID, "task two")  # the echo: output landed, no verdict
+    observation = sm.status_observation(TERMINAL_ID)
+    assert observation.status == TerminalStatus.COMPLETED
+    assert observation.output_generation <= boundary < sm.output_generation(TERMINAL_ID)
+
+    reads, get = _http_reader(sm, boundary, lambda n: None)
+    with patch("cli_agent_orchestrator.utils.terminal.api_http.get", side_effect=get):
+        with pytest.raises(click.ClickException, match="Timed out"):
+            poll_until_done(
+                TERMINAL_ID,
+                timeout=0.2,
+                polling_interval=0.01,
+                min_generation=boundary,
+                stamp_grace=30.0,
+            )
+    assert len(reads) > 1
+
+
+def test_with_no_output_since_the_send_the_refusal_has_no_bound(chunk_driven, capsys):
+    """Nothing has landed: there is no turn to be done yet, so the grace never
+    starts, however short it is. Ending here on the previous frame IS #735."""
+    sm = chunk_driven
+    _finish_a_first_turn(sm)
+    boundary = _dispatch(sm)
+    assert sm.output_generation(TERMINAL_ID) == boundary
+
+    reads, get = _http_reader(sm, boundary, lambda n: None)
+    with patch("cli_agent_orchestrator.utils.terminal.api_http.get", side_effect=get):
+        with pytest.raises(click.ClickException, match="Timed out"):
+            poll_until_done(
+                TERMINAL_ID,
+                timeout=0.3,
+                polling_interval=0.01,
+                min_generation=boundary,
+                stamp_grace=0.01,
+            )
+    assert len(reads) > 1
+    assert capsys.readouterr().err == ""
+
+
+def test_a_server_restart_degrades_at_once_with_a_warning(capsys):
+    """After a cao-server restart every generation starts again from 0, so the
+    counter sits BELOW the boundary this send was given -- impossible within one
+    server lifetime. Refusing on would wait out the whole timeout (review note);
+    the wait must say what happened and fall back to the frame-based rules."""
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {
+        "status": TerminalStatus.COMPLETED.value,
+        "status_generation": 0,
+        "output_generation": 0,
+    }
+
+    with patch("cli_agent_orchestrator.utils.terminal.api_http.get", return_value=response):
+        started = time.monotonic()
+        poll_until_done(TERMINAL_ID, timeout=10.0, polling_interval=0.01, min_generation=8)
+        elapsed = time.monotonic() - started
+
+    assert elapsed < 2.0
+    assert "restarted" in capsys.readouterr().err
 
 
 def test_send_input_wrapper_still_keeps_its_bool_contract():
