@@ -222,6 +222,7 @@ class TestHandoffOutcomes:
             "terminal_id",
             "job_id",
             "pending",
+            "rule",
         }
         assert "model" not in result.model_dump()
         assert "model_honored" not in result.model_dump()

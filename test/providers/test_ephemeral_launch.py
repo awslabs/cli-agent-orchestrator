@@ -1,6 +1,7 @@
 """Launch paths must not turn an unavailable ephemeral into a native agent."""
 
 import json
+from test.services.test_ephemeral_service import create_store  # noqa: F401
 from test.utils.test_agent_profiles_ephemeral import DOCUMENT, NAME, stores  # noqa: F401
 from unittest.mock import AsyncMock, Mock
 
@@ -193,3 +194,45 @@ async def test_installed_profile_passes_launch_refusal(stores, monkeypatch):
     with pytest.raises(RuntimeError, match="installed launch reached allocation"):
         await service.create_terminal("claude_code", "ordinary", session_name="cao-session")
     reached.assert_called_once()
+
+
+@pytest.mark.parametrize("provider_name", ["claude_code", "codex"])
+def test_recorded_profile_prompt_tools_and_cleanup(create_store, monkeypatch, provider_name):
+    import shlex
+    from test.services.test_ephemeral_service import CALLER, SPEC, create
+
+    from cli_agent_orchestrator.services import ephemeral_service
+    from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
+
+    env = create_store
+    env[4]["ephemeral"]["allowed_providers"] = ["claude_code", "codex"]
+    name = create(env, {**SPEC, "provider": provider_name})["name"]
+    tools = ["fs_read", "@cao-mcp-server"]
+    module = claude_code if provider_name == "claude_code" else codex
+    cls = module.ClaudeCodeProvider if provider_name == "claude_code" else module.CodexProvider
+    monkeypatch.setattr(module, "CAO_HOME_DIR", env[2])
+    provider = cls("eeeeeeee", "cao-session", "child", name, allowed_tools=tools)
+    profile = (
+        provider._load_profile() if provider_name == "claude_code" else provider._try_load_profile()
+    )
+    prefix, suffix = ephemeral_service.render_prompt_parts(name, CALLER, SPEC["purpose"], tools)
+    assert profile.system_prompt == prefix + SPEC["brief"] + suffix
+    assert ephemeral_service.FENCE_SENTENCE in profile.system_prompt
+    if provider_name == "claude_code":
+        command = provider._build_claude_command(profile)
+        args = shlex.split(command.split("; ")[-1])
+        blocked = [args[i + 1] for i, arg in enumerate(args) if arg == "--disallowedTools"]
+        assert blocked == get_disallowed_tools("claude_code", tools)
+        prompt_file = env[2] / "tmp" / "eeeeeeee.prompt"
+        assert prompt_file.read_text() == profile.system_prompt
+        config = json.loads((env[2] / "tmp" / "eeeeeeee.mcp.json").read_text())
+        assert set(config["mcpServers"]) == {"cao-mcp-server"}
+        assert config["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "eeeeeeee"
+    else:
+        command = provider._build_codex_command()
+        assert "--yolo" in command
+        prompt_file = provider._developer_instructions_file_path()
+        assert json.loads(prompt_file.read_text()).endswith(profile.system_prompt)
+        assert prompt_file.stat().st_mode & 0o777 == 0o600
+        provider.cleanup()
+        assert not prompt_file.exists()

@@ -173,14 +173,21 @@ def _subprocess_env(
     port: int,
     *,
     extra: Optional[Mapping[str, str]] = None,
+    base_env: Optional[Mapping[str, str]] = None,
 ) -> dict[str, str]:
     """Compose the env passed to the subprocess.
 
     Starts from a copy of the parent env, deletes any leaked Auth0 vars (so a
     developer's exported ``AUTH0_DOMAIN`` doesn't accidentally enable auth in
     the no-auth variant), then applies the standard test overrides plus any
-    ``extra`` knobs.
+    ``extra`` knobs. ``base_env`` instead forwards an explicit allowlist unchanged,
+    for isolated ephemeral-agent evidence.
     """
+    # A B4 caller supplies its exact env -i allowlist; never inherit parent state.
+    if base_env is not None:
+        if extra:
+            raise ValueError("explicit environment cannot be combined with extra overrides")
+        return dict(base_env)
     env = os.environ.copy()
     for leaked in ("AUTH0_DOMAIN", "AUTH0_AUDIENCE", "CAO_AUTH_JWKS_URI"):
         env.pop(leaked, None)
@@ -188,6 +195,11 @@ def _subprocess_env(
     env.update(
         {
             "HOME": str(home_dir),
+            # Explicit rather than derived from HOME inside the subprocess: a
+            # developer's exported CAO_HOME_DIR used to leak through and point
+            # the test server at the real home. With the server lock (#406)
+            # that leak is now a refused start instead of silent sharing.
+            "CAO_HOME_DIR": str(home_dir / ".aws" / "cli-agent-orchestrator"),
             "CAO_API_HOST": "127.0.0.1",
             "CAO_API_PORT": str(port),
             "CAO_A2A_DISABLED": "true",
@@ -368,6 +380,43 @@ def _seed_packaged_skills(home_dir: Path) -> None:
             shutil.copy2(entry, target)
 
 
+def _seed_workflow_settings(home_dir: Path) -> None:
+    """Turn workflow approval enforcement OFF in the redirected HOME (issue #583 Bolt 3).
+
+    ``approval-enforcement-default`` flipped ``workflow.require_approval`` to default ON, so a
+    script-tier run started against a freshly-seeded HOME is refused with 403 unless its plan has been
+    approved. The real-server tests exercise the run LIFECYCLE — submit, drive, cancel, list, resume,
+    detached observation — and none of them is about approval.
+
+    THIS HAS TO BE A FILE RATHER THAN AN ENVIRONMENT VARIABLE, and that is the asymmetry working as
+    designed rather than an inconvenience: ``CAO_WORKFLOW_REQUIRE_APPROVAL`` may only turn the gate
+    ON, so no ``extra_env`` knob can turn it off. A test harness that wants the gate off has to say so
+    in ``settings.json``, exactly as an operator would.
+
+    Seeded per server home, so it cannot leak into the developer's real ``~/.aws/``. A test that WANTS
+    the gate on either overwrites this file or approves the plan.
+    """
+    import json as _json
+
+    dest = home_dir / ".aws" / "cli-agent-orchestrator"
+    dest.mkdir(parents=True, exist_ok=True)
+    settings_path = dest / "settings.json"
+    existing = {}
+    if settings_path.exists():
+        try:
+            loaded = _json.loads(settings_path.read_text())
+            if isinstance(loaded, dict):
+                existing = loaded
+        except ValueError:
+            existing = {}
+    workflow_section = existing.get("workflow")
+    if not isinstance(workflow_section, dict):
+        workflow_section = {}
+    workflow_section.setdefault("require_approval", False)
+    existing["workflow"] = workflow_section
+    settings_path.write_text(_json.dumps(existing, indent=2))
+
+
 def _seed_omp_e2e_state(home_dir: Path) -> None:
     """Seed non-secret OMP setup state and assign profiles for real OMP E2E tests.
 
@@ -452,22 +501,26 @@ def _start_cao_server(
     port: int,
     *,
     extra_env: Optional[Mapping[str, str]] = None,
+    base_env: Optional[Mapping[str, str]] = None,
     deadline: float = _HEALTH_TIMEOUT_DEFAULT,
 ) -> CaoServer:
     """Spawn a cao-server subprocess and return a managed ``CaoServer``.
 
     Used directly by both the session fixture and the self-tests that exercise
     parallelism / idempotency. Callers own the lifetime via the returned
-    ``stop`` callable.
+    ``stop`` callable. With ``base_env``, provider-state seeding is disabled so
+    the server never accesses the developer's HOME.
     """
     home_dir.mkdir(parents=True, exist_ok=True)
-    _seed_packaged_skills(home_dir)
-    _seed_omp_e2e_state(home_dir)
-    _seed_kiro_e2e_state(home_dir)
+    _seed_workflow_settings(home_dir)
+    if base_env is None:
+        _seed_packaged_skills(home_dir)
+        _seed_omp_e2e_state(home_dir)
+        _seed_kiro_e2e_state(home_dir)
     log_path = home_dir / "server.log"
     log_handle = open(log_path, "ab")  # noqa: SIM115 — handle lifetime is in stop()
 
-    env = _subprocess_env(home_dir, port, extra=extra_env)
+    env = _subprocess_env(home_dir, port, extra=extra_env, base_env=base_env)
     url = f"http://127.0.0.1:{port}"
 
     process = subprocess.Popen(
@@ -498,7 +551,12 @@ def _start_cao_server(
         _terminate(process, log_handle, stopped)
         _LIVE_SERVERS.discard(server)
 
-    db_path = home_dir / ".aws" / "cli-agent-orchestrator" / "db" / "cli-agent-orchestrator.db"
+    cao_home = (
+        Path(base_env["CAO_HOME_DIR"])
+        if base_env is not None
+        else home_dir / ".aws" / "cli-agent-orchestrator"
+    )
+    db_path = cao_home / "db" / "cli-agent-orchestrator.db"
     server = CaoServer(
         url=url,
         port=port,
