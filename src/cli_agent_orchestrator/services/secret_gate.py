@@ -168,7 +168,21 @@ def _invisible_character_class() -> str:
 _INVISIBLE = re.compile(f"[{_invisible_character_class()}]")
 
 
+def _has_invisible(content: str) -> bool:
+    """Whether ``content`` holds any character of the invisible class.
+
+    The class search is a character class with one entry per code point and
+    costs about 1.5 ms per 7.5 KB, which every vault load used to pay. Every
+    code point in the class is above U+007F (the lowest is the soft hyphen,
+    U+00AD; a test pins this), so ASCII text is answered by ``str.isascii``,
+    a flag check, and the search runs only on text that could contain one.
+    """
+    return not content.isascii() and _INVISIBLE.search(content) is not None
+
+
 def _strip_invisible(content: str) -> str:
+    if content.isascii():
+        return content
     return _INVISIBLE.sub("", content)
 
 
@@ -325,7 +339,7 @@ def redact_secrets(content: str) -> Tuple[str, List[str]]:
     """
     if not content:
         return content, []
-    if _INVISIBLE.search(content):
+    if _has_invisible(content):
         # An invisible character may be hiding a credential from the patterns;
         # remove the ones inside any such credential so the loop below sees,
         # and redacts, the whole token. Invisible characters elsewhere stay.
@@ -534,7 +548,7 @@ def fingerprint_secrets(content: str) -> SecretFingerprints:
     The vault reader uses this two-step form so that a note's acceptances are
     parsed only when the body has a match to apply them to.
     """
-    if content and _INVISIBLE.search(content):
+    if content and _has_invisible(content):
         content = _strip_invisible_inside_matches(content)
     return SecretFingerprints(content)
 

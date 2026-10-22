@@ -358,6 +358,35 @@ def test_three_level_nesting_blames_the_nearest_unaccepted_match():
     assert matches[1].blocked_by == chain[2]
 
 
+def test_reader_parses_frontmatter_only_when_the_body_has_a_match(tmp_path, monkeypatch):
+    """P3: a clean note costs one cascade; frontmatter is parsed only to apply acceptances."""
+    from cli_agent_orchestrator.services.vault import reader as reader_module
+
+    _service, _session_factory, vault_root, warn_config, vault = _warn_renderer(
+        tmp_path, monkeypatch
+    )
+    calls: list[str] = []
+    real_parse_note = reader_module.parse_note
+
+    def _counting_parse_note(text, **kwargs):
+        calls.append(text)
+        return real_parse_note(text, **kwargs)
+
+    monkeypatch.setattr(reader_module, "parse_note", _counting_parse_note)
+
+    _write_note(vault_root, "nothing credential-shaped here")
+    _reconcile(vault, "warn-clean")
+    recalled = _recall(warn_config)
+    assert recalled is not None and "credential-shaped" in recalled.content
+    assert calls == []
+
+    _write_note(vault_root, _SECRET_BODY)
+    _reconcile(vault, "warn-secret")
+    recalled = _recall(warn_config)
+    assert recalled is not None and "[REDACTED:secret_assignment]" in recalled.content
+    assert len(calls) == 1
+
+
 # ---------------------------------------------------------------------------
 # Per-finding acceptance
 # ---------------------------------------------------------------------------
