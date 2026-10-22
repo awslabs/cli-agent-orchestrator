@@ -1600,10 +1600,13 @@ class TestMidBurstProcessingProbe:
     def test_no_probe_once_processing(self):
         sm = self._bursting_monitor()
         sm._last_status["t1"] = TerminalStatus.PROCESSING
-        # PROCESSING earned in this generation, which is what the skip means
-        # (#814). In production _apply_detection stamps this alongside the
-        # status; only the optimistic dispatch latch leaves it behind.
-        sm._processing_generation["t1"] = sm._capture_generation.get("t1", 0)
+        # PROCESSING observed in THIS turn, which is what the skip means (#814):
+        # a stamp newer than the dispatch generation. In production the turn's
+        # own chunk advances the capture generation and _apply_detection stamps
+        # it alongside the status; only the optimistic dispatch latch leaves the
+        # stamp behind.
+        sm._capture_generation["t1"] = 1  # the turn's first chunk landed
+        sm._processing_generation["t1"] = 1
         provider = self._probing_provider([True])
         sm._bursting["t1"] = True
         sm._schedule_screen_detection("t1", provider)
@@ -1802,18 +1805,22 @@ class TestMidBurstProcessingProbe:
         assert sm._processing_generation.get("t1") == generation
 
     def test_evidence_backed_processing_is_not_reprobed(self):
-        """Once PROCESSING is earned in THIS generation the probe adds nothing.
+        """Once PROCESSING is observed in THIS turn the probe adds nothing.
 
         The narrowing in #814 only distinguishes the optimistic dispatch latch
-        from earned PROCESSING; it does not make the probe run against a
-        terminal the edges already proved busy.
+        from observed PROCESSING; it does not make the probe run against a
+        terminal the edges already proved busy. "This turn" means from the
+        turn's own output: the stamp has to be newer than the generation
+        recorded at dispatch (see TestLatchSkipsThroughProcessChunk).
         """
         sm = self._bursting_monitor()
         provider = self._probing_provider([True])
 
         sm.notify_input_sent("t1")
-        sm._apply_detection("t1", TerminalStatus.PROCESSING)  # real evidence
-        assert sm._processing_generation["t1"] == sm._capture_generation["t1"]
+        with sm._lock:
+            sm._capture_generation["t1"] += 1  # the turn's first chunk landed
+        sm._apply_detection("t1", TerminalStatus.PROCESSING)  # real evidence from it
+        assert sm._processing_generation["t1"] > sm._dispatch_generation["t1"]
 
         sm._bursting["t1"] = True
         sm._schedule_screen_detection("t1", provider)
@@ -1864,6 +1871,129 @@ class TestMidBurstProcessingProbe:
         sm._bursting["t1"] = True
         sm._schedule_screen_detection("t1", provider)
         assert provider.probe_processing_from_screen.call_count == 1
+
+
+class TestLatchSkipsThroughProcessChunk:
+    """#814 through the production path: chunks enter via ``_process_chunk``.
+
+    Every chunk advances ``_capture_generation``, so a skip keyed on "the
+    PROCESSING stamp equals the current generation" can only be true in the same
+    chunk that stamped it -- never on the next one. Mid-burst the two values
+    always differ and the skip is dead: the probe runs every
+    PYTE_MIDBURST_PROBE_S for the whole busy turn (review of PR #998). The unit
+    that stays constant across a turn is the dispatch, so "already observed
+    working" must be keyed on the stamp being newer than the turn's dispatch
+    generation. These tests drive the same chunk sequence production does and
+    would not have passed with the per-chunk key.
+    """
+
+    @staticmethod
+    def _screen_monitor(rising_edge_verdict):
+        sm = StatusMonitor()
+        sm._loop = MagicMock()  # a loop exists -> edge-debounced path, as in production
+        sm._arm_quiesce_timer = lambda *a, **k: None
+        sm._cancel_quiesce_handle = lambda *a, **k: None
+        sm._detect_screen = lambda tid, prov: rising_edge_verdict
+        provider = MagicMock()
+        provider.supports_screen_detection = True
+        provider.supports_midburst_processing_probe = True
+        provider.probe_processing_from_screen.return_value = True
+        return sm, provider
+
+    @staticmethod
+    def _raw_monitor(verdicts):
+        sm = StatusMonitor()
+        sm._loop = MagicMock()
+        sm._arm_quiesce_timer = lambda *a, **k: None
+        sm._cancel_quiesce_handle = lambda *a, **k: None
+        calls = []
+
+        def detect(tid, buf):
+            calls.append(buf)
+            return verdicts[len(calls) - 1]
+
+        sm._detect_status = detect
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        return sm, provider, calls
+
+    @staticmethod
+    def _chunk(sm, provider, text):
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as mock_pm,
+            patch(
+                "cli_agent_orchestrator.services.status_monitor.get_server_settings",
+                return_value={"state_buffer_max": 50000},
+            ),
+            patch("cli_agent_orchestrator.services.status_monitor.bus", MagicMock()),
+        ):
+            mock_pm.get_provider.return_value = provider
+            sm._process_chunk("t1", text)
+
+    def test_no_reprobe_after_evidence_through_process_chunk(self):
+        """Evidence on the rising edge: no probe for the rest of the turn."""
+        sm, provider = self._screen_monitor(TerminalStatus.PROCESSING)
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm.notify_input_sent("t1", assume_processing=True)
+        self._chunk(sm, provider, "\x1b[H• Working (0s)")  # rising edge: evidence stamped
+        assert sm._processing_generation.get("t1") is not None
+        for i in range(3):
+            sm._midburst_probe_at.pop("t1", None)  # > PYTE_MIDBURST_PROBE_S between chunks
+            self._chunk(sm, provider, f"\x1b[H• Working ({i}s)")
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert provider.probe_processing_from_screen.call_count == 0
+
+    def test_dispatch_latch_without_evidence_is_probed_once_then_skipped(self):
+        """The #814 window: latched without evidence, the probe runs -- once."""
+        sm, provider = self._screen_monitor(TerminalStatus.UNKNOWN)  # torn rising-edge frame
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm.notify_input_sent("t1", assume_processing=True)
+        self._chunk(sm, provider, "\x1b[H(torn frame)")
+        assert sm._processing_generation.get("t1") is None
+        self._chunk(sm, provider, "\x1b[H• Working (0s)")  # #814: the probe must run
+        assert provider.probe_processing_from_screen.call_count == 1
+        assert sm._processing_generation.get("t1") is not None
+        sm._midburst_probe_at.pop("t1", None)
+        self._chunk(sm, provider, "\x1b[H• Working (1s)")  # evidence earned: skip
+        assert provider.probe_processing_from_screen.call_count == 1
+
+    def test_evidence_from_before_this_turns_output_does_not_suppress_the_probe(self):
+        """A stamp AT the dispatch generation predates every chunk of the turn.
+
+        Only the quiescence timer can stamp there: it fires after the dispatch
+        but reads the frame the previous turn left. That is the previous turn's
+        spinner, not this one's, so the probe must still run -- the same
+        "previous turn's PROCESSING credited to this turn" class as #814.
+        """
+        sm, provider = self._screen_monitor(TerminalStatus.UNKNOWN)
+        sm._last_status["t1"] = TerminalStatus.PROCESSING  # previous turn still working
+        sm.notify_input_sent("t1", assume_processing=True)
+        dispatch_generation = sm._capture_generation["t1"]
+        sm._apply_detection("t1", TerminalStatus.PROCESSING)  # quiescence, pre-output frame
+        assert sm._processing_generation["t1"] == dispatch_generation
+        self._chunk(sm, provider, "\x1b[H(torn frame)")  # rising edge: no evidence
+        self._chunk(sm, provider, "\x1b[H• Working (0s)")
+        assert provider.probe_processing_from_screen.call_count == 1
+
+    def test_raw_path_under_dispatch_latch_keeps_detecting_until_evidence(self):
+        """The raw path has the same skip: once the status field reads
+        PROCESSING it stops per-chunk detection until quiescence. Under the
+        dispatch latch the field reads PROCESSING before any evidence, so the
+        turn's genuine PROCESSING marker was never looked at (review of #998).
+        """
+        sm, provider, calls = self._raw_monitor(
+            [TerminalStatus.UNKNOWN, TerminalStatus.PROCESSING, TerminalStatus.PROCESSING]
+        )
+        sm._last_status["t1"] = TerminalStatus.COMPLETED
+        sm.notify_input_sent("t1", assume_processing=True)
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING  # latched, unobserved
+        self._chunk(sm, provider, "echo of the paste")  # rising edge: UNKNOWN
+        assert len(calls) == 1
+        self._chunk(sm, provider, "● Working on task...")  # mid-burst: must still detect
+        assert len(calls) == 2, "latched-but-unobserved PROCESSING must not debounce"
+        assert sm._processing_generation["t1"] == sm._capture_generation["t1"]
+        self._chunk(sm, provider, "● Working on task... (1s)")  # observed: debounce
+        assert len(calls) == 2
 
 
 class TestOutputGenerationIsOutputOnly:

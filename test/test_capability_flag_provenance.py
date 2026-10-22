@@ -28,7 +28,12 @@ STATUS_MONITOR = REPO_ROOT / "src/cli_agent_orchestrator/services/status_monitor
 ASSUMABLE = {"PROCESSING", "WAITING_USER_ANSWER"}
 # Reading any of these in the same function proves the author considered
 # provenance rather than trusting the field.
-PROVENANCE = {"_processing_generation", "_waiting_generation", "processing_evidence"}
+PROVENANCE = {
+    "_processing_generation",
+    "_waiting_generation",
+    "processing_evidence",
+    "_processing_observed_this_turn_locked",
+}
 
 # Functions that read the latch field for something other than an evidence
 # decision. Each needs a reason, and the reason must survive a reviewer.
