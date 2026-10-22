@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from importlib import resources
 from pathlib import Path
@@ -378,6 +378,15 @@ and refused every script run as ``internal`` (the P2-1 finding on PR #1000).
 """
 
 
+_ABSENT_ARTIFACT_SENTINEL = b"\x02absent-installed-artifact"
+"""Digested in place of an installed provider artifact that does not exist for a profile name.
+
+Absence is part of the identity: a Kiro agent JSON appearing for a profile that had none changes what
+``kiro-cli chat --agent <name>`` does, so "no file" and "a file" must digest differently, and "no file"
+must differ from an empty file.
+"""
+
+
 @dataclass(frozen=True)
 class ProfileEntry:
     """What the launch path would do with one listed profile name, read exactly once.
@@ -385,24 +394,79 @@ class ProfileEntry:
     ``source`` is the raw text ``load_agent_profile`` would parse, or ``None`` when the reader refuses
     the entry (not found under any root it may serve from, name rejected, containment failed, not
     UTF-8). ``None`` is a classification, not an error: it is the same answer the launch path gives.
+
+    ``artifacts`` maps each path-free label from ``install_service.installed_artifact_paths`` (a
+    provider's per-agent file, the installed context copy) to that file's bytes, or ``None`` when it does
+    not exist. These are the files a provider READS AT LAUNCH that CAO wrote at ``cao install`` time and
+    does not regenerate: for the default provider (Kiro) they carry the tool policy — ``tools``,
+    ``allowedTools``, ``hooks``, ``mcpServers`` — and the system prompt, so a plan identity that bound
+    only the CAO profile left the default provider's actual behaviour outside it (PR #1000, P2-2).
     """
 
     source: Optional[str]
+    artifacts: Mapping[str, Optional[bytes]] = field(default_factory=dict)
+
+
+def _read_artifact_bytes(path: Path) -> Optional[bytes]:
+    """Bytes of an installed artifact, ``None`` when nothing a provider could read is there.
+
+    A missing file, or a directory where a file belongs, is "absent" — the provider cannot read it as its
+    agent file either. Any other ``OSError`` (a permission fault) propagates: see
+    :func:`read_profile_entry`.
+    """
+    try:
+        return path.read_bytes()
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+        return None
 
 
 def read_profile_entry(name: str) -> ProfileEntry:
-    """Read one listed profile the way the launch path reads it.
+    """Read one listed profile the way the launch path reads it, plus the files ``cao install`` left for it.
 
     Catches exactly the two exceptions ``load_agent_profile`` documents as the reader's own refusals
     (``FileNotFoundError``, ``ValueError`` — which includes ``UnicodeDecodeError``) and turns them into
-    ``source=None``. Anything else — ``PermissionError``, ``IsADirectoryError``, an I/O fault — is an
-    inability to READ the store rather than a verdict about the entry, and propagates so the caller can
-    fail closed with an honest reason (``manifest_freeze`` reports ``profiles_unreadable``).
+    ``source=None``. Anything else — ``PermissionError``, an I/O fault, on the profile or on an
+    artifact — is an inability to READ the store rather than a verdict about the entry, and propagates
+    so the caller can fail closed with an honest reason (``manifest_freeze`` reports
+    ``profiles_unreadable``).
+
+    The artifact set comes from ``install_service.installed_artifact_paths`` so that the installer's
+    sinks and plan identity are one list; ``test_install_ownership_guard`` pins that list against what a
+    real install reports. Imported lazily: ``install_service`` imports this module.
     """
+    from cli_agent_orchestrator.services.install_service import installed_artifact_paths
+
     try:
-        return ProfileEntry(source=_read_agent_profile_source(name))
+        source: Optional[str] = _read_agent_profile_source(name)
     except (FileNotFoundError, ValueError):
-        return ProfileEntry(source=None)
+        source = None
+    artifacts = {
+        label: _read_artifact_bytes(path) for label, path in installed_artifact_paths(name).items()
+    }
+    return ProfileEntry(source=source, artifacts=artifacts)
+
+
+def _frame(digest: "hashlib._Hash", data: bytes) -> None:
+    digest.update(f"{len(data)}{_PROFILE_FRAME_SEP}".encode("utf-8"))
+    digest.update(data)
+
+
+def profile_entry_digest(entry: ProfileEntry) -> str:
+    """Digest of ONE entry — its source (or the refused sentinel) and every installed artifact (or the
+    absent sentinel), each length-framed, artifacts in label order.
+
+    This is the per-profile value the launch guard records and re-checks at every agent launch
+    (``launch_guard``), and the per-name component :func:`profile_set_digest` folds into ``plan_id``.
+    One function for both, so the guard cannot see a different profile than the identity did.
+    """
+    digest = hashlib.sha256()
+    source = entry.source if entry.source is not None else _UNLOADABLE_SENTINEL
+    _frame(digest, source.encode("utf-8"))
+    for label in sorted(entry.artifacts):
+        content = entry.artifacts[label]
+        _frame(digest, label.encode("utf-8"))
+        _frame(digest, content if content is not None else _ABSENT_ARTIFACT_SENTINEL)
+    return PROFILE_SET_DIGEST_PREFIX + digest.hexdigest()
 
 
 def read_profile_set() -> Dict[str, ProfileEntry]:
@@ -434,6 +498,11 @@ def profile_set_digest(profile_set: Optional[Mapping[str, ProfileEntry]] = None)
     place (see ``plan_identifier``'s module docstring). A digest scoped to "the profiles this plan uses"
     would need a list that cannot be produced when it is needed.
 
+    EVERY ENTRY CARRIES ITS INSTALLED ARTIFACTS. The CAO profile is not the only file a step's behaviour
+    comes from: ``cao install`` writes the provider's per-agent file (Kiro's JSON holds the tool policy,
+    Copilot's ``.agent.md`` holds the prompt) and a context copy, and the provider reads those at launch
+    without CAO regenerating them. See :class:`ProfileEntry`.
+
     THE NAME IS DIGESTED ALONGSIDE THE CONTENT. Content alone would make "profile ``reviewer`` deleted
     and profile ``writer`` added with its text" indistinguishable from a rename, and the profile a step
     names is resolved by name at launch.
@@ -462,12 +531,8 @@ def profile_set_digest(profile_set: Optional[Mapping[str, ProfileEntry]] = None)
         profile_set = read_profile_set()
     digest = hashlib.sha256()
     for name in sorted(profile_set):
-        entry = profile_set[name]
-        source = entry.source if entry.source is not None else _UNLOADABLE_SENTINEL
-        for component in (name, source):
-            encoded = component.encode("utf-8")
-            digest.update(f"{len(encoded)}{_PROFILE_FRAME_SEP}".encode("utf-8"))
-            digest.update(encoded)
+        _frame(digest, name.encode("utf-8"))
+        _frame(digest, profile_entry_digest(profile_set[name]).encode("utf-8"))
     return PROFILE_SET_DIGEST_PREFIX + digest.hexdigest()
 
 

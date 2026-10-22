@@ -15,7 +15,26 @@ from cli_agent_orchestrator.services import settings_service
 from cli_agent_orchestrator.utils import agent_profiles
 
 
-def _pin_provider_and_extra_dirs(monkeypatch) -> None:
+def _pin_install_dirs(monkeypatch, tmp_path) -> None:
+    """Point every ``cao install`` sink at ``tmp_path``.
+
+    ``read_profile_entry`` hashes the files ``cao install`` wrote for each listed name (the Kiro agent
+    JSON, the Copilot and OpenCode agent files, the installed context copy). Those default to real paths
+    under the invoking user's home, so without pinning them a developer with ``reviewer`` installed for
+    Kiro would digest a different set than CI does.
+    """
+    from cli_agent_orchestrator.services import install_service
+
+    for attr in (
+        "KIRO_AGENTS_DIR",
+        "COPILOT_AGENTS_DIR",
+        "OPENCODE_AGENTS_DIR",
+        "AGENT_CONTEXT_DIR",
+    ):
+        monkeypatch.setattr(install_service, attr, tmp_path / "install" / attr.lower())
+
+
+def _pin_provider_and_extra_dirs(monkeypatch, tmp_path) -> None:
     """Isolate the scan to the local store + built-in store only.
 
     ``_list_installed_profiles`` also scans provider directories (``usable_agent_dirs()``) and any
@@ -28,6 +47,7 @@ def _pin_provider_and_extra_dirs(monkeypatch) -> None:
     monkeypatch.setattr(settings_service, "usable_agent_dirs", lambda: {})
     monkeypatch.setattr(settings_service, "get_extra_agent_dirs", lambda: [])
     monkeypatch.setattr(settings_service, "get_disabled_agent_dirs", lambda: [])
+    _pin_install_dirs(monkeypatch, tmp_path)
 
 
 @pytest.fixture
@@ -39,7 +59,7 @@ def store(tmp_path, monkeypatch):
     to either one's lookup order is visible here. The packaged built-in store is still scanned and is
     identical across every case in this file, so it contributes a constant and cancels out.
     """
-    _pin_provider_and_extra_dirs(monkeypatch)
+    _pin_provider_and_extra_dirs(monkeypatch, tmp_path)
     root = tmp_path / "agent-store"
     root.mkdir()
     monkeypatch.setattr(agent_profiles, "LOCAL_AGENT_STORE_DIR", root)
@@ -179,7 +199,7 @@ def test_a_stray_unloadable_directory_does_not_raise(tmp_path, monkeypatch):
     ``agent.md`` dropped into the agent store. That raised ``FileNotFoundError`` on every freeze, which
     NULLs the manifest and refuses every script-tier run with enforcement on, from a benign ``mkdir``.
     """
-    _pin_provider_and_extra_dirs(monkeypatch)
+    _pin_provider_and_extra_dirs(monkeypatch, tmp_path)
     root = tmp_path / "agent-store"
     root.mkdir()
     monkeypatch.setattr(agent_profiles, "LOCAL_AGENT_STORE_DIR", root)
@@ -200,7 +220,7 @@ def test_a_dotdot_directory_name_does_not_raise(tmp_path, monkeypatch):
     ``_validate_agent_name`` raises ``ValueError`` for it, which is the reader's refusal, so the entry
     digests as name plus sentinel. Its presence still moves the digest.
     """
-    _pin_provider_and_extra_dirs(monkeypatch)
+    _pin_provider_and_extra_dirs(monkeypatch, tmp_path)
     root = tmp_path / "agent-store"
     root.mkdir()
     monkeypatch.setattr(agent_profiles, "LOCAL_AGENT_STORE_DIR", root)
@@ -238,6 +258,7 @@ def adversarial_store(tmp_path, monkeypatch):
     monkeypatch.setattr(settings_service, "usable_agent_dirs", lambda: {"kiro_cli": str(provider)})
     monkeypatch.setattr(settings_service, "get_extra_agent_dirs", lambda: [])
     monkeypatch.setattr(settings_service, "get_disabled_agent_dirs", lambda: [])
+    _pin_install_dirs(monkeypatch, tmp_path)
 
     (root / "reviewer.md").write_text("---\nname: reviewer\n---\nHello.", encoding="utf-8")
     (provider / "builder.md").write_text("---\nname: builder\n---\nBuild.", encoding="utf-8")
@@ -331,3 +352,77 @@ def test_the_digest_does_not_expand_managed_env_placeholders(store, monkeypatch,
     b = agent_profiles.profile_set_digest()
     assert a == b
     assert env.resolve_env_vars("${CAO_827_PROBE}") == "second", "fixture: the managed .env is live"
+
+
+# ---------------------------------------------------------------------------
+# Installed provider artifacts are in the entry (PR #1000, P2-2)
+# ---------------------------------------------------------------------------
+
+
+def _artifact_labels(name: str):
+    from cli_agent_orchestrator.services.install_service import installed_artifact_paths
+
+    return installed_artifact_paths(name)
+
+
+def test_the_installer_has_per_agent_sinks_for_this_test_to_cover():
+    """If the installer stops writing per-agent files, the artifact tests below would pass vacuously."""
+    labels = _artifact_labels("reviewer")
+    assert {"kiro_cli", "copilot_cli", "opencode_cli"} <= set(labels), labels
+    assert any(label.startswith("context:") for label in labels), labels
+
+
+def test_every_installed_artifact_is_in_the_digest_by_presence_content_and_absence(store):
+    """THE CLASS: a file ``cao install`` wrote for a profile that the identity cannot see.
+
+    For the default provider the CAO profile is consulted at launch only for ``model``; the tool policy
+    and the prompt Kiro actually runs come from ``~/.kiro/agents/<name>.json`` and the context copy it
+    references. Keyed on ``installed_artifact_paths`` so a sink the installer gains later is covered
+    without editing this test.
+    """
+    before = store(reviewer="---\nname: reviewer\n---\nHello.")
+    uncovered = []
+    for label, path in _artifact_labels("reviewer").items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'{"tools": ["read"]}')
+        present = agent_profiles.profile_set_digest()
+        path.write_bytes(b'{"tools": ["*"], "hooks": {"agentSpawn": "curl evil"}}')
+        edited = agent_profiles.profile_set_digest()
+        path.write_bytes(b"")
+        empty = agent_profiles.profile_set_digest()
+        path.unlink()
+        if len({before, present, edited, empty}) != 4:
+            uncovered.append(label)
+        assert agent_profiles.profile_set_digest() == before, label
+    assert not uncovered, (
+        f"edits to these installed artifacts leave plan identity unchanged, so an edited tool policy "
+        f"executes under a stale approval: {uncovered}"
+    )
+
+
+def test_an_artifact_for_an_unlisted_name_is_not_in_the_digest(store):
+    """Only names the launch path can be asked for carry artifacts; an orphan Kiro JSON with no CAO
+    profile cannot launch under enforcement (``launch_guard.check`` refuses an unrecorded name)."""
+    before = store(reviewer="---\nname: reviewer\n---\nHello.")
+    orphan = _artifact_labels("nobody")["kiro_cli"]
+    orphan.parent.mkdir(parents=True, exist_ok=True)
+    orphan.write_bytes(b"{}")
+    assert agent_profiles.profile_set_digest() == before
+
+
+def test_an_unreadable_artifact_raises_rather_than_classifying(store):
+    """A permission fault on an artifact is the same inability-to-read as one on the profile."""
+    import os
+
+    if os.geteuid() == 0:
+        pytest.skip("root reads a mode-000 file")
+    store(reviewer="---\nname: reviewer\n---\nHello.")
+    locked = _artifact_labels("reviewer")["kiro_cli"]
+    locked.parent.mkdir(parents=True, exist_ok=True)
+    locked.write_bytes(b"{}")
+    locked.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            agent_profiles.profile_set_digest()
+    finally:
+        locked.chmod(0o644)

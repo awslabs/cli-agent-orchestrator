@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from typing import Any, Dict, Optional
 
@@ -14,12 +13,25 @@ class PlanInputsChangedError(Exception):
     """An agent profile or the memory setting changed after approval."""
 
 
+def _entry_digest(entry: agent_profiles.ProfileEntry) -> Optional[str]:
+    """The per-profile value recorded at admission and re-checked at every launch.
+
+    ``None`` when the launch path refuses the name (no source to bind; the launch would fail anyway).
+    Otherwise the SAME per-entry digest plan identity folds into ``plan_id`` — source plus every
+    installed provider artifact — so an edit to the Kiro agent JSON or the Copilot agent file mid-run is
+    caught here exactly as an edit to the CAO profile is (PR #1000, P2-2).
+    """
+    if entry.source is None:
+        return None
+    return agent_profiles.profile_entry_digest(entry)
+
+
 def _profile_digest(name: str) -> Optional[str]:
     try:
-        raw = agent_profiles._read_agent_profile_source(name)
+        entry = agent_profiles.read_profile_entry(name)
     except Exception:
         return None
-    return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return _entry_digest(entry)
 
 
 _UNREADABLE_MESSAGE = "This run's recorded launch state is unreadable; start a new run."

@@ -1144,6 +1144,33 @@ def _provider_artifact_path(provider: str, profile_name: str) -> Optional[Path]:
     return None
 
 
+def installed_artifact_paths(profile_name: str) -> Dict[str, Path]:
+    """Every per-profile file ``install_agent`` writes that a provider reads at launch, by path-free label.
+
+    One entry per provider with a per-agent sink (:func:`_provider_artifact_path`, keyed by the
+    ``ProviderType`` value) and one ``context:<n>`` entry per directory in :func:`_context_lookup_dirs`
+    (the configured directory, then the legacy default while an override is active), resolved the way
+    the ownership guard resolves a copy (:func:`_installed_context_copy_path`).
+
+    This is a PLAN-IDENTITY input list (#827, PR #1000 P2-2). A Kiro step starts as
+    ``kiro-cli chat --agent <name>``; Kiro reads ``tools``, ``allowedTools``, ``toolsSettings``,
+    ``hooks`` and ``mcpServers`` from the JSON written here and the system prompt from the context copy
+    that JSON references by ``file://``. A Copilot step reads its prompt from ``<name>.agent.md``. CAO
+    consults its own profile at launch only for ``model``. So these files decide what an approved plan
+    executes, and ``agent_profiles.read_profile_entry`` hashes each one (or its absence) into the entry.
+    Labels, not paths, so the digest does not depend on the machine.
+    ``test_install_ownership_guard`` pins this list against the files a real install reports.
+    """
+    paths: Dict[str, Path] = {}
+    for provider in ProviderType:
+        path = _provider_artifact_path(provider.value, profile_name)
+        if path is not None:
+            paths[provider.value] = path
+    for index, directory in enumerate(_context_lookup_dirs()):
+        paths[f"context:{index}"] = _installed_context_copy_path(profile_name, directory)
+    return paths
+
+
 def _entry_occupying(path: Path) -> Optional[str]:
     """Name of the directory entry ``path`` lands on under that directory's own rules.
 

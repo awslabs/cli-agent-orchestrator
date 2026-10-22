@@ -681,6 +681,24 @@ class TestProviderArtifactPathMirrorsTheInstaller:
     def test_providers_without_a_per_agent_file_probe_nothing(self) -> None:
         assert install_service._provider_artifact_path("claude_code", "x") is None
 
+    @pytest.mark.parametrize("provider", ["opencode_cli", "kiro_cli", "copilot_cli", "claude_code"])
+    def test_plan_identity_sees_every_file_the_install_reports(
+        self, runner: CliRunner, workspace: Dict[str, Any], provider: str
+    ) -> None:
+        """``installed_artifact_paths`` is the list plan identity hashes for a profile (#827, PR #1000
+        P2-2). Every file a real install REPORTS — the per-agent file and the context copy — must be in
+        it, or an install sink exists whose edits leave ``plan_id`` unchanged."""
+        store = workspace["local_store"]
+        _write_profile(store / "alpha.md", name="mirror_me", body="You are an agent.")
+        result = install_service.install_agent("alpha", provider)
+        assert result.success, result.message
+        identity_paths = set(install_service.installed_artifact_paths("mirror_me").values())
+        reported = {Path(result.context_file)}
+        if result.agent_file is not None:
+            reported.add(Path(result.agent_file))
+        missing = {p for p in reported if p not in identity_paths}
+        assert not missing, f"installed but outside plan identity: {missing}"
+
 
 class TestEntryOccupying:
     def test_missing_path_is_free(self, tmp_path: Path) -> None:

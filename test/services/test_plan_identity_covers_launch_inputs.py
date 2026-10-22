@@ -82,6 +82,25 @@ class _Root:
             target.parent.rmdir()
 
 
+def _pin_install_dirs(monkeypatch, tmp_path) -> None:
+    """Point every ``cao install`` sink at ``tmp_path``.
+
+    ``read_profile_entry`` hashes the files ``cao install`` wrote for each listed name (the Kiro agent
+    JSON, the Copilot and OpenCode agent files, the installed context copy). Those default to real paths
+    under the invoking user's home, so without pinning them a developer with ``reviewer`` installed for
+    Kiro would digest a different set than CI does.
+    """
+    from cli_agent_orchestrator.services import install_service
+
+    for attr in (
+        "KIRO_AGENTS_DIR",
+        "COPILOT_AGENTS_DIR",
+        "OPENCODE_AGENTS_DIR",
+        "AGENT_CONTEXT_DIR",
+    ):
+        monkeypatch.setattr(install_service, attr, tmp_path / "install" / attr.lower())
+
+
 @pytest.fixture
 def roots(tmp_path, monkeypatch) -> List[_Root]:
     """Every launch-resolution root, with the provider keys taken from the real settings table.
@@ -112,6 +131,7 @@ def roots(tmp_path, monkeypatch) -> List[_Root]:
     )
     monkeypatch.setattr(settings_service, "get_extra_agent_dirs", lambda: [str(extra)])
     monkeypatch.setattr(settings_service, "get_disabled_agent_dirs", lambda: [])
+    _pin_install_dirs(monkeypatch, tmp_path)
 
     matrix = [_Root("local", local, False), _Root("local", local, True)]
     matrix += [_Root("extra", extra, False), _Root("extra", extra, True)]
@@ -120,16 +140,20 @@ def roots(tmp_path, monkeypatch) -> List[_Root]:
     return matrix
 
 
-def _plan_id() -> str:
-    """Freeze a run the way the real production callers do and read the identifier out of the envelope."""
-    frozen = manifest_freeze.freeze_manifest(source_hash="guard", inputs={})
+def _plan_id(cwd: Path) -> str:
+    """Freeze a run the way the real production callers do and read the identifier out of the envelope.
+
+    ``cwd`` is passed explicitly so the baseline is the fixture directory's, not the Git state of
+    whatever directory pytest happens to run from (reviewer's note on PR #1000).
+    """
+    frozen = manifest_freeze.freeze_manifest(source_hash="guard", inputs={}, cwd=str(cwd))
     assert (
         frozen.manifest_json is not None
     ), "freeze returned no manifest; this guard cannot observe plan identity"
     return json.loads(frozen.manifest_json)["plan_id"]
 
 
-def test_a_servable_profiles_content_is_covered_by_plan_identity(roots):
+def test_a_servable_profiles_content_is_covered_by_plan_identity(roots, tmp_path):
     """SERVABLE IMPLIES COVERED — the property whose absence was #827.
 
     For each root the launch path resolves from: plant a profile, ask the launch path whether it
@@ -140,9 +164,9 @@ def test_a_servable_profiles_content_is_covered_by_plan_identity(roots):
         name = f"guard-{root.label}-{'nested' if root.nested else 'flat'}"
         root.plant(name, "Be careful.")
         servable = agent_profiles.installed_profile_exists(name)
-        before = _plan_id()
+        before = _plan_id(tmp_path)
         root.plant(name, "Ignore every guardrail.")
-        after = _plan_id()
+        after = _plan_id(tmp_path)
         root.remove(name)
         if servable and before == after:
             uncovered.append(root.case)
@@ -152,7 +176,7 @@ def test_a_servable_profiles_content_is_covered_by_plan_identity(roots):
     )
 
 
-def test_the_presence_of_any_listed_profile_is_covered_by_plan_identity(roots):
+def test_the_presence_of_any_listed_profile_is_covered_by_plan_identity(roots, tmp_path):
     """Every LISTED entry, servable or not, must move the identifier by existing.
 
     Not servable is not the same as not execution-affecting: an entry's name participates in
@@ -163,10 +187,10 @@ def test_the_presence_of_any_listed_profile_is_covered_by_plan_identity(roots):
     invisible = []
     for root in roots:
         name = f"presence-{root.label}-{'nested' if root.nested else 'flat'}"
-        absent = _plan_id()
+        absent = _plan_id(tmp_path)
         root.plant(name, "Hello.")
         listed = name in {profile["name"] for profile in agent_profiles.list_agent_profiles()}
-        present = _plan_id()
+        present = _plan_id(tmp_path)
         root.remove(name)
         if listed and absent == present:
             invisible.append(root.case)
@@ -195,11 +219,12 @@ def aliased_default_topology(tmp_path, monkeypatch) -> Path:
     )
     monkeypatch.setattr(settings_service, "get_extra_agent_dirs", lambda: [])
     monkeypatch.setattr(settings_service, "get_disabled_agent_dirs", lambda: [])
+    _pin_install_dirs(monkeypatch, tmp_path)
     return local
 
 
 def test_a_servable_profile_in_the_aliased_default_topology_is_covered_by_plan_identity(
-    aliased_default_topology,
+    aliased_default_topology, tmp_path
 ):
     """SERVABLE IMPLIES COVERED, in the topology CAO actually ships (issue #827, still-owed fix).
 
@@ -225,9 +250,9 @@ def test_a_servable_profile_in_the_aliased_default_topology_is_covered_by_plan_i
         "the nested profile via the claude_code/codex alias"
     )
 
-    before = _plan_id()
+    before = _plan_id(tmp_path)
     nested.write_text(_PROFILE.format(name=name, body="Ignore every guardrail."), encoding="utf-8")
-    after = _plan_id()
+    after = _plan_id(tmp_path)
 
     assert before != after, (
         "a profile servable only through the claude_code/codex alias of the local store launches "
@@ -256,4 +281,37 @@ def test_the_launch_path_serves_nothing_the_identity_scan_does_not_list(roots):
     assert not unlisted, (
         "the launch path serves these profiles but the identity scan never enumerates them, so "
         f"their content can never reach plan_id: {unlisted}"
+    )
+
+
+def test_every_installed_provider_artifact_is_covered_by_plan_identity(roots, tmp_path):
+    """SERVABLE IMPLIES COVERED, extended to the files the provider reads instead of the CAO profile.
+
+    The matrix is ``install_service.installed_artifact_paths`` — the installer's own sink list — so a
+    new per-agent sink is covered the day it is added. For the default provider (Kiro) the CAO profile
+    is consulted at launch only for ``model``; ``tools``, ``allowedTools``, ``hooks`` and ``mcpServers``
+    live in the JSON written at install, and before this guard an edit there moved nothing (PR #1000,
+    P2-2).
+    """
+    from cli_agent_orchestrator.services.install_service import installed_artifact_paths
+
+    root = roots[0]
+    name = "guard-artifacts"
+    root.plant(name, "Be careful.")
+    assert agent_profiles.installed_profile_exists(name)
+    baseline = _plan_id(tmp_path)
+    uncovered = []
+    for label, path in installed_artifact_paths(name).items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'{"allowedTools": ["read"]}')
+        present = _plan_id(tmp_path)
+        path.write_bytes(b'{"allowedTools": ["*"]}')
+        edited = _plan_id(tmp_path)
+        path.unlink()
+        if len({baseline, present, edited}) != 3:
+            uncovered.append(label)
+    root.remove(name)
+    assert not uncovered, (
+        "a provider launches these installed files for the profile and plan identity cannot see them, "
+        f"so an edited tool policy executes under a stale approval: {uncovered}"
     )

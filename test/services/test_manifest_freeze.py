@@ -265,7 +265,7 @@ def test_non_git_plan_ids_bind_root_and_git_golden_is_unchanged(tmp_path, monkey
     )
     assert (
         _frozen()["plan_id"]
-        == "plan-v2:f388e14e1f0a7b24472daf237adf9d9e586070f1c7c6a3105558f06409fab3e7"
+        == "plan-v2:fd79bdd97e084a834e4e9f3210b76756adadd1303eb5241be4a03e02cca3dbd3"
     )
 
 
@@ -288,6 +288,16 @@ def _store(tmp_path, monkeypatch, **profiles) -> None:
     monkeypatch.setattr(settings_service, "usable_agent_dirs", lambda: {})
     monkeypatch.setattr(settings_service, "get_extra_agent_dirs", lambda: [])
     monkeypatch.setattr(settings_service, "get_disabled_agent_dirs", lambda: [])
+    # The installed-artifact sinks default to real paths under the user's home (PR #1000, P2-2).
+    from cli_agent_orchestrator.services import install_service
+
+    for attr in (
+        "KIRO_AGENTS_DIR",
+        "COPILOT_AGENTS_DIR",
+        "OPENCODE_AGENTS_DIR",
+        "AGENT_CONTEXT_DIR",
+    ):
+        monkeypatch.setattr(install_service, attr, tmp_path / "install" / attr.lower())
     store = tmp_path / "agent-store"
     store.mkdir(exist_ok=True)
     for stale in store.glob("*.md"):
