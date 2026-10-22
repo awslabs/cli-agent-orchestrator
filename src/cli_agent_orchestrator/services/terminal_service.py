@@ -76,6 +76,7 @@ from cli_agent_orchestrator.constants import (
     PIPE_LIVENESS_TAIL_LINES,
     SESSION_PREFIX,
     TERMINAL_LOG_DIR,
+    TURN_START_CONFIRM_SECONDS,
 )
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
@@ -2897,7 +2898,9 @@ async def _surface_deferred_init_failure(
 # never started and NO exception raised — the supervisor then waits on a
 # callback that can never arrive. Confirm the worker actually began processing
 # and re-submit if it did not.
-_DEFERRED_SUBMIT_CONFIRM_TIMEOUT = 8.0  # per-attempt wait for the PROCESSING edge
+_DEFERRED_SUBMIT_CONFIRM_TIMEOUT = (
+    TURN_START_CONFIRM_SECONDS  # per-attempt wait for the PROCESSING edge
+)
 _DEFERRED_SUBMIT_MAX_RESUBMITS = 3
 # Statuses proving the worker accepted the task (left the ready IDLE state).
 # WAITING_USER_ANSWER counts: the worker consumed the input and is now asking.

@@ -8,7 +8,11 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
-from cli_agent_orchestrator.constants import API_BASE_URL, SESSION_PREFIX
+from cli_agent_orchestrator.constants import (
+    API_BASE_URL,
+    SESSION_PREFIX,
+    TURN_START_CONFIRM_SECONDS,
+)
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.utils import api_http
 
@@ -18,8 +22,8 @@ from cli_agent_orchestrator.utils import api_http
 # frame-based wait. Same budget the server gives a worker to show its first
 # PROCESSING before it resubmits (``terminal_service._DEFERRED_SUBMIT_CONFIRM_TIMEOUT``);
 # the two gates read the same stamp and answer the same question, "has this turn
-# been seen yet", so one bound describes both.
-STAMP_GRACE_SECONDS = 8.0
+# been seen yet", so one shared constant describes both.
+STAMP_GRACE_SECONDS = TURN_START_CONFIRM_SECONDS
 
 if TYPE_CHECKING:
     from cli_agent_orchestrator.utils.fleet import BrokerRequestError
@@ -367,6 +371,10 @@ def poll_until_done(
     # warning) when the stamp provably cannot or did not move -- see docstring.
     gate_engaged = min_generation is not None
     stamp_grace_started: Optional[float] = None
+    # Why the most recent reading was refused by the gate, for the timeout
+    # message: an operator who waited 300 s deserves to know the status never
+    # moved past the previous turn, not just that time ran out.
+    last_refusal: Optional[str] = None
     last_error: Optional[str] = None
     while True:
         elapsed = time.time() - start
@@ -374,6 +382,8 @@ def poll_until_done(
             message = f"Timed out after {int(elapsed)}s waiting for terminal {terminal_id}"
             if last_error is not None:
                 message += f"; the last poll failed: {last_error}"
+            elif last_refusal is not None:
+                message += f"; {last_refusal}"
             raise click.ClickException(message)
         try:
             generation: Optional[int] = None
@@ -434,6 +444,10 @@ def poll_until_done(
                 if stamp_grace_started is None:
                     stamp_grace_started = now
                 if now - stamp_grace_started < stamp_grace:
+                    last_refusal = (
+                        "output landed after the send but the status was not re-earned "
+                        "for this turn"
+                    )
                     consecutive_idle = 0
                     time.sleep(polling_interval)
                     continue
@@ -449,9 +463,14 @@ def poll_until_done(
                 # Nothing has landed since the send (or the server does not say):
                 # there is no turn to be done yet. Unbounded by design -- ending
                 # here on the previous frame is #735 itself.
+                last_refusal = (
+                    "no output has landed since the send, so the status still "
+                    "describes the previous turn"
+                )
                 consecutive_idle = 0
                 time.sleep(polling_interval)
                 continue
+        last_refusal = None
         if status == TerminalStatus.COMPLETED.value:
             return
         if status == TerminalStatus.ERROR.value:

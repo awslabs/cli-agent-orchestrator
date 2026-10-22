@@ -69,6 +69,15 @@ DEFAULT_PROVIDER = ProviderType.KIRO_CLI.value
 # Higher values provide more context but increase memory usage
 TMUX_HISTORY_LINES = 200
 
+# How long a wait gives a worker to show the first status EARNED for a newly
+# dispatched turn before concluding it will not: the server's deferred-init
+# confirmation uses it per attempt before resubmitting
+# (``terminal_service._DEFERRED_SUBMIT_CONFIRM_TIMEOUT``), and `cao session send`
+# uses it as the grace before it stops refusing an unstamped ready status
+# (``utils.terminal.STAMP_GRACE_SECONDS``). Both read the same stamp and ask the
+# same question, so one constant keeps them equal (#735).
+TURN_START_CONFIRM_SECONDS = 8.0
+
 # Scrollback floor CAO raises the operator's shared tmux server's global
 # ``history-limit`` to before it creates a pane.
 #

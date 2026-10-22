@@ -415,7 +415,7 @@ def test_with_no_output_since_the_send_the_refusal_has_no_bound(chunk_driven, ca
 
     reads, get = _http_reader(sm, boundary, lambda n: None)
     with patch("cli_agent_orchestrator.utils.terminal.api_http.get", side_effect=get):
-        with pytest.raises(click.ClickException, match="Timed out"):
+        with pytest.raises(click.ClickException, match="Timed out") as exc:
             poll_until_done(
                 TERMINAL_ID,
                 timeout=0.3,
@@ -425,6 +425,9 @@ def test_with_no_output_since_the_send_the_refusal_has_no_bound(chunk_driven, ca
             )
     assert len(reads) > 1
     assert capsys.readouterr().err == ""
+    # The timeout says WHY the gate held (re-review note): the operator should
+    # not have to infer "the status never moved" from "time ran out".
+    assert "no output has landed since the send" in exc.value.message
 
 
 def test_a_transient_poll_failure_during_the_gated_wait_neither_aborts_nor_opens_the_gate(
