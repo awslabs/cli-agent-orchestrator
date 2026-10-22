@@ -5,6 +5,7 @@ import json
 import click
 
 from cli_agent_orchestrator.services.config_service import ConfigService
+from cli_agent_orchestrator.services.settings_service import SettingsUnreadableError
 
 
 def _coerce(value: str):
@@ -50,6 +51,17 @@ def set_cmd(key, value):
     """Set config KEY to VALUE, persisting it to settings.json."""
     try:
         result = ConfigService.set(key, _coerce(value))
+    except SettingsUnreadableError as exc:
+        # settings.json exists but cannot be read or parsed, so the writer
+        # refused rather than publishing its one key over unknown content
+        # (GH #737). Say so and exit non-zero: this used to warn at a level
+        # nobody sees, echo the new value, and exit 0 having deleted the file's
+        # other sections.
+        raise click.ClickException(
+            f"{exc}\n"
+            f"Nothing was written — {ConfigService.path()} is unchanged. "
+            "Fix the file (or move it aside) and re-run."
+        )
     except (ValueError, KeyError) as exc:
         # settings_service setters raise ValueError/KeyError for invalid keys
         # or out-of-range values (e.g. memory.flush_threshold). Surface a clean
