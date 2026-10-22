@@ -529,16 +529,19 @@ class TestHerdrBackendCommands:
         assert "--format" not in cmd
 
     @patch("subprocess.run")
-    def test_get_history_full_history_requests_an_explicit_depth(self, mock_run, backend):
-        """full_history must ask for a depth, not rely on a flagless read (#728).
+    def test_get_history_full_history_requests_exactly_what_herdr_can_return(
+        self, mock_run, backend
+    ):
+        """full_history must ask for herdr's read ceiling, no more, no less (#728).
 
-        A flagless ``pane read`` was assumed to return the whole scrollback, but
-        it was measured returning roughly a screenful: on get_output's
-        escalation ladder this rung returned 80 lines right after the 5000-line
-        rung returned 604, so the deepest rung lost content shallower rungs had
-        already read.
+        A flagless ``pane read`` returns a screenful (herdr defaults ``--lines``
+        to 80), which is why the deepest rung of get_output's ladder read LESS
+        than the 5000-line rung before it. But herdr also clamps every read to
+        1000 lines (v0.9.5 ``src/app/api_helpers.rs:117``), so asking for more
+        than that is a lie in the argv: the request looks deep and the reply
+        is still 1000 lines. Ask for the ceiling itself.
         """
-        from cli_agent_orchestrator.constants import TMUX_HISTORY_LIMIT
+        from cli_agent_orchestrator.constants import HERDR_PANE_READ_MAX_LINES
 
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
         tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
@@ -556,11 +559,13 @@ class TestHerdrBackendCommands:
         cmd = mock_run.call_args_list[-1][0][0]
         assert "--lines" in cmd, "the deepest rung must name a line count"
         requested = int(cmd[cmd.index("--lines") + 1])
-        assert requested == TMUX_HISTORY_LIMIT
-        assert requested > 5000, (
-            "full_history must reach at least as deep as get_output's deepest "
-            "tail rung (_ESCALATION_STEPS[-1] == 5000)"
-        )
+        assert requested == HERDR_PANE_READ_MAX_LINES == backend.max_history_lines
+
+    def test_max_history_lines_is_herdrs_documented_read_clamp(self, backend):
+        """The cap get_output clips its ladder to must be the number herdr
+        enforces, not CAO's tmux floor: ``lines.min(1000)`` in herdr v0.9.5
+        ``src/app/api_helpers.rs:117`` (default 80 at ``:118``)."""
+        assert backend.max_history_lines == 1000
 
     @patch("subprocess.run")
     def test_get_pane_working_directory(self, mock_run, backend):

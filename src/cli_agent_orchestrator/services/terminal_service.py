@@ -4171,6 +4171,22 @@ def get_output_context(terminal_id: str) -> Optional[str]:
         return None
 
 
+def _backend_read_cap(backend: Any) -> Optional[int]:
+    """How many lines one ``get_history`` call can return on ``backend``, or ``None``.
+
+    Read from ``TerminalBackend.max_history_lines`` (#728). ``None`` means the
+    backend did not declare a usable ceiling, and ``get_output`` then climbs the
+    whole ladder as before. That tolerance exists for the test doubles that
+    stand in for a backend; the shipped backends all declare one, and
+    ``test/backends/test_history_read_cap.py`` enumerates them so a new one
+    cannot ship without it.
+    """
+    cap = getattr(backend, "max_history_lines", None)
+    if isinstance(cap, bool) or not isinstance(cap, int) or cap <= 0:
+        return None
+    return cap
+
+
 def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     """Get terminal output.
 
@@ -4195,9 +4211,13 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
 
     Otherwise, extraction uses an escalating fetch strategy: start with a
     small capture window and widen until the response marker is found.
-    Steps: 200 -> 500 -> 1000 -> 5000.  If no marker is found at 5000 lines,
-    the raw tail is returned with a [PARTIAL RESPONSE] prefix so the caller
-    knows the output may be incomplete.
+    Steps: 200 -> 500 -> 1000 -> 5000, clipped to the backend's own read
+    ceiling (``TerminalBackend.max_history_lines``: 50000 on tmux, 1000 on
+    herdr), then one full-scrollback read. If no marker is found anywhere, the
+    deepest capture is returned with a [PARTIAL RESPONSE] prefix when it fills
+    at least 90% of the deepest depth this backend can serve (the marker was
+    likely pushed out), or a [NO RESPONSE] prefix when it is sparser than that
+    (the agent likely produced no text response).
     """
     # Escalation steps used when the provider does not declare extraction_tail_lines.
     _ESCALATION_STEPS = [200, 500, 1000, 5000]
@@ -4269,12 +4289,13 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             last_err = None
             full_output = ""
             # Deepest capture seen across every rung, by line count. The ladder
-            # is NOT guaranteed monotonic: a backend's deepest rung can return
-            # LESS than a shallower one (reported on herdr, where the flagless
-            # full_history read returned 80 lines right after the 5000-line
-            # rung returned 604 — #728). The raw fallback below must publish
-            # the most content any rung managed to read, not whatever the last
-            # rung happened to return.
+            # is not guaranteed monotonic by the backend contract: a deepest
+            # rung CAN return less than a shallower one (seen on herdr, where
+            # the then-flagless full_history read returned 80 lines right
+            # after the 5000-line rung returned 604 — #728; HerdrBackend now
+            # asks for its ceiling explicitly). The raw fallback below must
+            # publish the most content any rung managed to read, not whatever
+            # the last rung happened to return.
             best_output = ""
             best_lines = 0
 
@@ -4284,7 +4305,19 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                 if lines > best_lines:
                     best_output, best_lines = candidate, lines
 
-            for step_lines in _ESCALATION_STEPS:
+            # Clip the ladder to what this backend can return from one read.
+            # A rung above the ceiling costs a round trip and hands back the
+            # same bytes as the rung below it: herdr clamps every read to
+            # 1000 lines, so its 5000-line rung was dead weight (#728).
+            read_cap = _backend_read_cap(get_backend())
+            if read_cap is None:
+                steps = list(_ESCALATION_STEPS)
+            else:
+                # A ceiling below the shallowest rung: read what there is.
+                steps = [s for s in _ESCALATION_STEPS if s <= read_cap] or [read_cap]
+            deepest_reachable = steps[-1]
+
+            for step_lines in steps:
                 full_output = get_backend().get_history(
                     metadata["tmux_session"],
                     metadata["tmux_window"],
@@ -4293,7 +4326,7 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                 _remember(full_output)
                 try:
                     result = provider.extract_last_message_from_script(full_output)
-                    if step_lines > _ESCALATION_STEPS[0]:
+                    if step_lines > steps[0]:
                         logger.debug(
                             "get_output: %s marker found at %d lines",
                             terminal_id,
@@ -4354,9 +4387,13 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             # response" for a worker that in fact produced thousands of lines
             # (#728). A supervisor reads that label as a worker failure and
             # re-delegates the whole task.
+            # And against the deepest depth THIS backend can serve, not the
+            # ladder's nominal top: with the threshold fixed at 90% of 5000, a
+            # herdr pane that overflowed its entire 1000-line readable depth
+            # could never be labelled an overflow (#728).
             full_output = best_output
             actual_lines = best_lines
-            overflow_threshold = int(_ESCALATION_STEPS[-1] * 0.9)
+            overflow_threshold = int(deepest_reachable * 0.9)
             if actual_lines >= overflow_threshold:
                 logger.warning(
                     "get_output: %s response marker not found, buffer near-full "

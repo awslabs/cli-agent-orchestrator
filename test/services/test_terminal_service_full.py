@@ -2920,33 +2920,132 @@ class TestGetOutput:
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_get_output_last_keeps_the_deepest_capture_when_the_ladder_is_not_monotonic(
+    def test_get_output_last_clips_the_ladder_and_threshold_to_the_backends_read_cap(
         self, mock_get_metadata, mock_tmux, mock_status_monitor, mock_provider_manager
     ):
-        """A deeper rung that reads SHALLOWER than an earlier one must not shrink
-        what the supervisor receives (#728).
+        """A backend that can only return N lines per read must be classified
+        against N, not against the deepest rung it can never reach (#728).
 
-        Reported on the herdr backend: the flagless ``full_history`` rung
-        returned 80 lines right after the 5000-line rung returned 604. Counting
-        the final read's lines then reports "sparse buffer -> the agent produced
-        no text response" for a worker that actually produced thousands of
-        lines, and the supervisor re-delegates the whole task.
+        herdr clamps every ``pane read`` to 1000 lines (herdr v0.9.5
+        ``src/app/api_helpers.rs:117``). Against the fixed 4500-line threshold
+        a herdr pane that overflowed its whole readable depth was reported as
+        "sparse buffer -> the agent produced no text response", and the
+        supervisor re-delegated a task the worker had finished.
         """
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
         }
         mock_status_monitor.get_buffer.return_value = "buffered output"
+        mock_tmux.max_history_lines = 1000
 
-        deep_tail = "\n".join(f"worker line {i}" for i in range(4800))
+        def clamped_history(*args, **kwargs):
+            # The pane holds far more than the cap; herdr hands back the cap.
+            requested = kwargs.get("tail_lines") or 1000
+            return "\n".join(f"worker line {i}" for i in range(min(requested, 1000)))
+
+        mock_tmux.get_history.side_effect = clamped_history
+        mock_provider = MagicMock(
+            spec=[
+                "extract_last_message_from_script",
+                "extraction_retries",
+            ]
+        )  # no extraction_tail_lines attribute → escalation path
+        mock_provider.extract_last_message_from_script.side_effect = ValueError("no marker")
+        mock_provider_manager.get_provider.return_value = mock_provider
+
+        result = get_output("test1234", OutputMode.LAST)
+
+        # 1000 lines is >= 90% of the 1000 the backend can serve: overflow.
+        assert result.startswith("[PARTIAL RESPONSE"), result[:120]
+        assert "1000 lines retrieved" in result
+        assert "worker line 999" in result
+        # The rung above the cap is dead weight on this backend and is skipped.
+        requested = [c.kwargs.get("tail_lines") for c in mock_tmux.get_history.call_args_list]
+        assert 5000 not in requested, requested
+        assert requested[:3] == [200, 500, 1000], requested
+        # 3 rungs within the cap + 1 full_history attempt.
+        assert mock_tmux.get_history.call_count == 4
+        _, last_kwargs = mock_tmux.get_history.call_args
+        assert last_kwargs.get("full_history") is True
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_output_last_sparse_pane_under_the_read_cap_is_still_no_response(
+        self, mock_get_metadata, mock_tmux, mock_status_monitor, mock_provider_manager
+    ):
+        """The numbers #728 reported on herdr: the 5000-line rung returned 604
+        lines and the flagless full read returned 80.
+
+        herdr serves up to 1000 lines, so a 604-line read means the pane HELD
+        604 lines, with no marker among them. Read depth is not what lost that
+        reply, and this code cannot recover it; the honest label is NO RESPONSE
+        with the full 604 lines attached. This test documents that gap so the
+        herdr half of #728 is tracked as its own defect, not claimed here.
+        """
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_status_monitor.get_buffer.return_value = "buffered output"
+        mock_tmux.max_history_lines = 1000
+
+        held = "\n".join(f"worker line {i}" for i in range(604))
+
+        def herdr_like_history(*args, **kwargs):
+            requested = kwargs.get("tail_lines") or 1000
+            return "\n".join(held.split("\n")[-min(requested, 1000) :])
+
+        mock_tmux.get_history.side_effect = herdr_like_history
+        mock_provider = MagicMock(
+            spec=[
+                "extract_last_message_from_script",
+                "extraction_retries",
+            ]
+        )  # no extraction_tail_lines attribute → escalation path
+        mock_provider.extract_last_message_from_script.side_effect = ValueError("no marker")
+        mock_provider_manager.get_provider.return_value = mock_provider
+
+        result = get_output("test1234", OutputMode.LAST)
+
+        assert result.startswith("[NO RESPONSE")
+        assert "604 lines in buffer" in result
+        # Everything the pane held is handed back, not a screenful of it.
+        assert "worker line 0" in result and "worker line 603" in result
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_output_last_keeps_the_deepest_capture_when_the_ladder_is_not_monotonic(
+        self, mock_get_metadata, mock_tmux, mock_status_monitor, mock_provider_manager
+    ):
+        """A deeper rung that reads SHALLOWER than an earlier one must not shrink
+        what the supervisor receives (#728).
+
+        Shaped like the herdr report (a capped backend whose final full read
+        came back as a screenful): the rungs return the 1000-line cap, the
+        full_history read returns 80 lines. Counting the final read's lines
+        would report "sparse buffer -> no text response" for a worker that
+        filled the whole readable depth.
+        """
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_status_monitor.get_buffer.return_value = "buffered output"
+        mock_tmux.max_history_lines = 1000
+
+        deep_tail = "\n".join(f"worker line {i}" for i in range(1000))
 
         def history_side_effect(*args, **kwargs):
             if kwargs.get("full_history"):
-                # The clamped last rung: roughly a screenful.
+                # A misbehaving last rung: roughly a screenful.
                 return "\n".join(f"tail line {i}" for i in range(80))
-            if kwargs.get("tail_lines") == 5000:
-                return deep_tail
-            return "short capture"
+            requested = kwargs.get("tail_lines") or 1000
+            return "\n".join(deep_tail.split("\n")[-min(requested, 1000) :])
 
         mock_tmux.get_history.side_effect = history_side_effect
         mock_provider = MagicMock(
@@ -2960,13 +3059,14 @@ class TestGetOutput:
 
         result = get_output("test1234", OutputMode.LAST)
 
-        # Classified from the deepest capture (4800 lines >= 4500), not from the
+        # Classified from the deepest capture (1000 lines >= 900), not from the
         # 80 lines the final rung returned.
         assert result.startswith("[PARTIAL RESPONSE")
         assert "buffer overflow likely" in result
-        assert "4800 lines retrieved" in result
+        assert "1000 lines retrieved" in result
         # And the content handed back is the deepest capture, not the shallowest.
-        assert "worker line 4799" in result
+        assert "worker line 999" in result
+        assert "tail line 0" not in result
 
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")

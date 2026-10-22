@@ -345,6 +345,24 @@ class TerminalBackend(ABC):
         """
         ...
 
+    @property
+    @abstractmethod
+    def max_history_lines(self) -> int:
+        """The most lines one :meth:`get_history` call can return on this backend.
+
+        ``get_output`` escalates through read depths (200 -> 500 -> 1000 ->
+        5000 lines) and, when no response marker is found at any of them,
+        labels the result "overflow" or "no response" against a threshold
+        derived from the deepest depth. That only means something if the
+        backend can actually serve that depth: a rung above the backend's
+        ceiling returns the same bytes as the rung below it, and an overflow
+        that filled the whole readable depth is then reported as "the agent
+        produced no text response" (#728, herdr). Each backend states its
+        ceiling here and ``get_output`` clips the ladder and the threshold to
+        it. Must be at least the shallowest rung.
+        """
+        ...
+
     @abstractmethod
     def get_pane_working_directory(self, session_name: str, window_name: str) -> Optional[str]:
         """Get the current working directory of a pane.

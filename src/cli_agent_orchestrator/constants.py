@@ -89,6 +89,15 @@ TMUX_HISTORY_LINES = 200
 # allocates scrollback lazily, per pane, as output arrives.
 TMUX_HISTORY_LIMIT = 50000
 
+# The most lines herdr returns from one ``pane read``, whatever ``--lines`` asks
+# for: herdr clamps the request server-side (``lines.min(1000)``, herdr v0.9.5
+# ``src/app/api_helpers.rs:117``; the flagless default is 80 at ``:118``).
+# ``HerdrBackend.max_history_lines`` reports this so ``get_output`` clips its
+# escalation ladder and overflow threshold to a depth the backend can actually
+# serve; a rung above it returns the same 1000 lines as the rung below (#728).
+# Not operator-tunable: it is herdr's number, not CAO's.
+HERDR_PANE_READ_MAX_LINES = 1000
+
 # Foreground commands to treat as bracketed-paste INCOMPATIBLE.
 # (\x1b[200~...\x1b[201~). send_keys(force_bracketed_paste=True) checks the
 # pane's live #{pane_current_command} against this set before wrapping, so a

@@ -28,7 +28,7 @@ from cli_agent_orchestrator.backends.base import (
 )
 from cli_agent_orchestrator.constants import (
     BRACKETED_PASTE_INCOMPATIBLE_SHELLS,
-    TMUX_HISTORY_LIMIT,
+    HERDR_PANE_READ_MAX_LINES,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
@@ -721,6 +721,14 @@ class HerdrBackend(TerminalBackend):
 
     # --- Output ---
 
+    @property
+    def max_history_lines(self) -> int:
+        # herdr clamps every ``pane read`` to 1000 lines server-side, whatever
+        # ``--lines`` asks for (see the constant). Reporting the real ceiling
+        # lets get_output skip its 5000-line rung here and classify an
+        # exhausted ladder against 1000, not 5000 (#728).
+        return HERDR_PANE_READ_MAX_LINES
+
     def get_history(
         self,
         session_name: str,
@@ -742,15 +750,14 @@ class HerdrBackend(TerminalBackend):
             # get_status() before that fallback is reached.
             args.extend(["--source", "recent", "--lines", "50"])
         elif full_history:
-            # Ask for a depth explicitly. A flagless `pane read` was assumed to
-            # mean "full scrollback", but it was measured returning roughly a
-            # screenful: on the get_output escalation ladder the flagless
-            # full_history rung returned 80 lines immediately after the
-            # 5000-line rung returned 604, so the deepest rung lost content the
-            # shallower ones had already read (#728). Request the configured
-            # scrollback depth instead, so this rung is at least as deep as
-            # every rung before it.
-            args.extend(["--source", "recent", "--lines", str(TMUX_HISTORY_LIMIT)])
+            # Ask for herdr's read ceiling explicitly. A flagless `pane read`
+            # was assumed to mean "full scrollback", but herdr defaults
+            # ``--lines`` to 80, so on the get_output ladder this rung returned
+            # 80 lines right after the 5000-line rung returned 604 (#728). And
+            # herdr clamps every read to HERDR_PANE_READ_MAX_LINES, so asking
+            # for more than that would only make the argv look deeper than the
+            # reply can be. This is the deepest read herdr offers.
+            args.extend(["--source", "recent", "--lines", str(HERDR_PANE_READ_MAX_LINES)])
         elif tail_lines:
             args.extend(["--source", "recent", "--lines", str(tail_lines)])
         else:
