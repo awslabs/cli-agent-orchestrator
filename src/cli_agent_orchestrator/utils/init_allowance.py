@@ -20,24 +20,14 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Tuple
 
 # Provider init is not one wait of ``provider_init_timeout`` (T). A successful
-# path legitimately spans several T-bounded phases: Claude's shell wait +
-# startup-prompt handler + readiness wait is 3T (+ settle), Kimi's is up to
-# T + 2*max(120, T), Kiro's legacy fallback 4T. An allowance has to cover the
-# longest of those or a valid init blows the client deadline while the server
-# goes on to finish the work.
+# path legitimately spans several T-bounded phases. The longest that scales
+# with T is about 3T: Claude's shell wait + startup-prompt handler outer cap +
+# readiness wait (``claude_code.initialize``), and Kimi's shell wait + two
+# phases of ``max(120, T)`` once T >= 120 (``kimi_cli.initialize``). Kiro's is
+# 2T (``kiro_cli.initialize``; the 4T ``--legacy-ui`` retry that an earlier
+# version of this comment cited was removed in #691). The fourth T is margin
+# for settle time and for the event loop being busy with other creates.
 _INIT_PHASES = 4
-
-# Antigravity's successful path (``antigravity_cli.initialize``) does not scale
-# with T at the stock T=60: a 10s shell wait, then a startup-dialog phase
-# capped at ``max(180, T)``, then a separate readiness phase capped at
-# ``max(180, T)``. At defaults that is 10 + 2*180 = 370s, which is LONGER than
-# ``_INIT_PHASES * T`` (240s) -- a plain ``_INIT_PHASES * T`` allowance would
-# make a successful init look like a failure at the exact 300s a prior version
-# of this budget granted. ``init_allowance`` takes the max of the two shapes so
-# neither a large-T provider's linear cost nor Antigravity's fixed floor is
-# ever underpriced.
-_ANTIGRAVITY_SHELL_WAIT_S = 10.0
-_ANTIGRAVITY_PHASE_FLOOR_S = 180.0
 
 # Worst case of the server's confirm-and-resubmit loop after a send
 # (``_DEFERRED_SUBMIT_CONFIRM_TIMEOUT`` x (1 + ``_DEFERRED_SUBMIT_MAX_RESUBMITS``)
@@ -88,21 +78,57 @@ def resolve_init_timeout(
     return int(override) if override is not None else base
 
 
+def _antigravity_successful_init_s(timeout: int) -> float:
+    """Longest SUCCESSFUL ``antigravity_cli.initialize`` at init timeout ``timeout``.
+
+    A fixed shell wait, then a startup-dialog phase and a readiness phase each
+    capped at ``max(floor, T)`` -- and the dialog handler returns rather than
+    raising at its cap, so hitting all three caps is still a successful init.
+    At the stock T=60 this is 10 + 2*180 = 370s, LONGER than the linear
+    ``_INIT_PHASES * T`` (240s); a plain linear allowance would make a
+    successful Antigravity init look like a failure. The floors are read from
+    the provider module so a change there moves this bound with it.
+    """
+
+    from cli_agent_orchestrator.providers import antigravity_cli
+
+    return antigravity_cli.SHELL_WAIT_TIMEOUT_S + 2 * max(
+        antigravity_cli.READY_TIMEOUT_FLOOR_S, timeout
+    )
+
+
+def _kimi_successful_init_s(timeout: int) -> float:
+    """Longest SUCCESSFUL ``kimi_cli.initialize`` at init timeout ``timeout``.
+
+    A shell wait of up to T, then a startup-dialog phase and a readiness phase
+    each capped at ``max(floor, T)``. At the stock T=60 this is 60 + 2*120 =
+    300s. The floor is read from the provider module.
+    """
+
+    from cli_agent_orchestrator.providers import kimi_cli
+
+    return timeout + 2 * max(kimi_cli.READY_TIMEOUT_FLOOR_S, timeout)
+
+
 def init_allowance(
     agent_profile: Optional[str] = None,
     settings: Optional[Dict[str, Any]] = None,
 ) -> int:
     """Seconds a client should allow for server-side init plus delivery confirmation.
 
-    Takes the larger of the linear ``_INIT_PHASES * T`` bound and Antigravity's
-    fixed-floor shape (``_ANTIGRAVITY_SHELL_WAIT_S + 2 * max(_ANTIGRAVITY_PHASE_FLOOR_S, T)``)
-    so a successful init on either shape of provider stays inside the budget.
+    Takes the largest of the linear ``_INIT_PHASES * T`` bound and the two
+    fixed-floor provider shapes (Antigravity, Kimi) so a successful init on any
+    known shape of provider stays inside the budget, then adds the delivery
+    confirmation headroom.
     """
 
     timeout = resolve_init_timeout(agent_profile, settings)
-    linear_bound = _INIT_PHASES * timeout
-    fixed_floor_bound = _ANTIGRAVITY_SHELL_WAIT_S + 2 * max(_ANTIGRAVITY_PHASE_FLOOR_S, timeout)
-    return int(max(linear_bound, fixed_floor_bound)) + _DELIVERY_CONFIRM_ALLOWANCE
+    bound = max(
+        _INIT_PHASES * timeout,
+        _antigravity_successful_init_s(timeout),
+        _kimi_successful_init_s(timeout),
+    )
+    return int(bound) + _DELIVERY_CONFIRM_ALLOWANCE
 
 
 def synchronous_create_timeout(

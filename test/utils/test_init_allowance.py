@@ -10,6 +10,8 @@ true if it is DERIVED from it rather than written down a second time.
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from cli_agent_orchestrator.utils.init_allowance import (
     _CONNECT_TIMEOUT_S,
     init_allowance,
@@ -83,12 +85,31 @@ def test_resolve_init_timeout_falls_back_when_ephemeral_profile_unavailable():
 
 def test_init_allowance_covers_more_than_one_init_phase():
     """A successful init legitimately spans several ``provider_init_timeout``
-    waits (Claude 3T + settle, Kiro's legacy fallback 4T), so an allowance of
-    exactly T is short for a path that still succeeds. At the stock T=60, the
-    Antigravity-shaped fixed floor (10 + 2*180 = 370) exceeds the linear 4T
-    (240), so it is the one that sets the budget."""
+    waits (Claude's shell wait + startup-prompt handler + readiness wait is 3T;
+    Kiro's is 2T), so an allowance of exactly T is short for a path that still
+    succeeds. At the stock T=60, the Antigravity-shaped fixed floor
+    (10 + 2*180 = 370) exceeds the linear 4T (240), so it is the one that sets
+    the budget."""
+    from cli_agent_orchestrator.providers import antigravity_cli
+
     assert init_allowance(None, _SETTINGS) > 60
-    assert init_allowance(None, _SETTINGS) == 10 + 2 * 180 + 60
+    assert (
+        init_allowance(None, _SETTINGS)
+        == antigravity_cli.SHELL_WAIT_TIMEOUT_S + 2 * antigravity_cli.READY_TIMEOUT_FLOOR_S + 60
+    )
+
+
+def test_init_allowance_linear_bound_is_three_phases_plus_margin():
+    """Review on PR #1002, P3-3: the stated basis of the linear bound. The
+    longest T-scaling successful path is about 3T (Claude; Kimi once T >= 120),
+    and Kiro's is 2T -- the 4T ``--legacy-ui`` retry an earlier comment cited
+    was removed in #691. The bound must still cover 3T with margin, and once T
+    is past every fixed floor it must be exactly linear in T."""
+    from cli_agent_orchestrator.utils.init_allowance import _INIT_PHASES
+
+    assert _INIT_PHASES >= 3 + 1
+    big = dict(_SETTINGS, provider_init_timeout=1000)
+    assert init_allowance(None, big) == _INIT_PHASES * 1000 + 60
 
 
 def test_init_allowance_scales_with_provider_init_timeout():
@@ -101,25 +122,51 @@ def test_init_allowance_scales_with_provider_init_timeout():
     assert init_allowance(None, settings_600) == 2 * init_allowance(None, settings_300) - 60
 
 
-def test_init_allowance_covers_antigravity_cli_successful_init():
-    """``antigravity_cli.initialize`` is a 10s shell wait, then a startup-dialog
-    phase capped at ``max(180, T)``, then a readiness phase capped at
-    ``max(180, T)`` -- and the handler returns rather than raising at its outer
-    cap, so hitting all three caps is still a SUCCESSFUL init
-    (``antigravity_cli.py``). The allowance must cover that path or a
-    successful init is reported as a client-side failure."""
-    t = _SETTINGS["provider_init_timeout"]
-    antigravity_init_cost = 10.0 + 2 * max(180.0, t)
-    assert init_allowance(None, _SETTINGS) >= antigravity_init_cost
+@pytest.mark.parametrize("t", [1, 60, 120, 179, 180, 181, 300, 600])
+def test_init_allowance_covers_antigravity_cli_successful_init(t):
+    """``antigravity_cli.initialize`` is a fixed shell wait, then a startup-dialog
+    phase capped at ``max(floor, T)``, then a readiness phase capped at
+    ``max(floor, T)`` -- and the handler returns rather than raising at its outer
+    cap, so hitting all three caps is still a SUCCESSFUL init. The allowance
+    must cover that path at every T or a successful init is reported as a
+    client-side failure. The floors are the provider's own constants (review on
+    PR #1002, P3-3), so raising one there fails this test until the allowance
+    follows."""
+    from cli_agent_orchestrator.providers import antigravity_cli
+
+    settings = dict(_SETTINGS, provider_init_timeout=t)
+    antigravity_init_cost = antigravity_cli.SHELL_WAIT_TIMEOUT_S + 2 * max(
+        antigravity_cli.READY_TIMEOUT_FLOOR_S, t
+    )
+    assert init_allowance(None, settings) >= antigravity_init_cost
 
 
-def test_init_allowance_covers_kimi_cli_successful_init():
+@pytest.mark.parametrize("t", [1, 60, 119, 120, 121, 300, 600])
+def test_init_allowance_covers_kimi_cli_successful_init(t):
     """``kimi_cli.initialize`` is a shell wait up to T, then a startup-dialog
-    phase and a readiness phase each capped at ``max(120, T)``
-    (``kimi_cli.py``). The allowance must cover that path too."""
-    t = _SETTINGS["provider_init_timeout"]
-    kimi_init_cost = t + 2 * max(120.0, t)
-    assert init_allowance(None, _SETTINGS) >= kimi_init_cost
+    phase and a readiness phase each capped at ``max(floor, T)``. The allowance
+    must cover that path at every T; the floor is the provider's own constant."""
+    from cli_agent_orchestrator.providers import kimi_cli
+
+    settings = dict(_SETTINGS, provider_init_timeout=t)
+    kimi_init_cost = t + 2 * max(kimi_cli.READY_TIMEOUT_FLOOR_S, t)
+    assert init_allowance(None, settings) >= kimi_init_cost
+
+
+def test_init_allowance_floors_are_the_provider_modules_constants():
+    """Review on PR #1002, P3-3: the allowance must not carry its own copy of a
+    provider floor. The provider constants are the ones ``initialize`` spends,
+    so a change there must change the allowance here without a second edit."""
+    from cli_agent_orchestrator.providers import antigravity_cli, kimi_cli
+
+    with (
+        patch.object(antigravity_cli, "READY_TIMEOUT_FLOOR_S", 1000.0),
+        patch.object(antigravity_cli, "SHELL_WAIT_TIMEOUT_S", 7.0),
+    ):
+        assert init_allowance(None, _SETTINGS) == int(7.0 + 2 * 1000.0) + 60
+
+    with patch.object(kimi_cli, "READY_TIMEOUT_FLOOR_S", 2000.0):
+        assert init_allowance(None, _SETTINGS) == int(60 + 2 * 2000.0) + 60
 
 
 def test_synchronous_create_timeout_widens_only_the_read_half():
