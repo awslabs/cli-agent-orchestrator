@@ -646,15 +646,19 @@ class TestSendSync:
     @patch("cli_agent_orchestrator.cli.commands.session.api_http.post")
     @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
     def test_send_sync_poll_request_exception(self, mock_get, mock_post, mock_time, runner):
-        """Poll failure raises ClickException."""
+        """A poll failure that will not clear on retry (a 4xx) raises ClickException.
+
+        A connection error or a 5xx is retried instead (#1016), see
+        test/cli/commands/test_poll_failures.py.
+        """
         resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
         pre_send_status_resp = MagicMock(status_code=200)
         pre_send_status_resp.json.return_value = {"status": "idle"}
-        mock_get.side_effect = [
-            resolve_resp,
-            pre_send_status_resp,
-            requests.exceptions.ConnectionError("refused"),
-        ]
+        gone_resp = MagicMock(status_code=404)
+        gone_resp.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            "404 Not Found", response=MagicMock(status_code=404)
+        )
+        mock_get.side_effect = [resolve_resp, pre_send_status_resp, gone_resp]
         mock_post.return_value = MagicMock(status_code=200)
         mock_time.time.return_value = 0
         mock_time.sleep = MagicMock()

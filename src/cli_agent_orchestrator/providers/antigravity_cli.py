@@ -75,6 +75,16 @@ logger = logging.getLogger(__name__)
 # registered (or unregistered) server.
 _MCP_CONFIG_WRITE_LOCK = threading.Lock()
 
+# The successful-init shape of ``initialize``: a shell wait of
+# ``SHELL_WAIT_TIMEOUT_S``, then a startup-dialog phase and a readiness phase
+# each capped at ``max(READY_TIMEOUT_FLOOR_S, provider_init_timeout)``. A
+# CLIENT prices its wait for a synchronous create from these
+# (``utils.init_allowance``, issue #710), so they are module constants here,
+# next to the code that spends them, rather than a copy over there that a
+# change here would silently leave short.
+SHELL_WAIT_TIMEOUT_S = 10.0
+READY_TIMEOUT_FLOOR_S = 180.0
+
 
 def _log_cleanup_exception(fut: asyncio.Future) -> None:
     """Done-callback for the offloaded _unregister_mcp_servers future."""
@@ -655,8 +665,10 @@ class AntigravityCliProvider(BaseProvider):
         (see its docstring): so nothing in initialize() blocks the shared
         event loop under concurrent session creation.
         """
-        if not await wait_for_shell(self.terminal_id, timeout=10.0):
-            raise TimeoutError("Shell initialization timed out after 10 seconds")
+        if not await wait_for_shell(self.terminal_id, timeout=SHELL_WAIT_TIMEOUT_S):
+            raise TimeoutError(
+                f"Shell initialization timed out after {SHELL_WAIT_TIMEOUT_S:g} seconds"
+            )
 
         command = await asyncio.to_thread(self._build_agy_command)
 
@@ -677,7 +689,7 @@ class AntigravityCliProvider(BaseProvider):
         # _build_agy_command above already raised its own ProviderError on a
         # genuine load failure before this point.
         init_timeout = self.get_init_timeout(self._try_load_profile())
-        default_ready_timeout = 180.0
+        default_ready_timeout = READY_TIMEOUT_FLOOR_S
 
         # Accept the workspace-trust dialog if agy shows one (first launch in an
         # untrusted cwd). Unanswered it blocks init — the picker never reads IDLE.

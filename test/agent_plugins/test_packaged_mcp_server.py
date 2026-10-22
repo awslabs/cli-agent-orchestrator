@@ -136,12 +136,30 @@ class TestCommandAndPin:
         assert builder.main(["--check"]) == 1
         assert "pin" in capsys.readouterr().err
 
+    @staticmethod
+    def _pypi_answers(monkeypatch, code):
+        """Stand in for PyPI's JSON API answering ``code``, so no test reaches the network."""
+        import urllib.error
+
+        def answer(url, *args, **kwargs):
+            raise urllib.error.HTTPError(url, code, "stand-in", {}, None)
+
+        monkeypatch.setattr(builder.urllib.request, "urlopen", answer)
+
     def test_an_unpublished_version_fails_the_build(self, monkeypatch):
         """Requirement 19.5 — never write a pin uvx cannot resolve."""
         monkeypatch.setattr(builder, "package_version", lambda: "0.0.0-never-published")
+        self._pypi_answers(monkeypatch, 404)
 
         with pytest.raises(builder.BuildError, match="not published"):
             builder.verify_published("0.0.0-never-published")
+
+    def test_a_pypi_server_error_fails_rather_than_writing_unverified(self, monkeypatch):
+        """A 5xx is "could not check", which is not "verified" either."""
+        self._pypi_answers(monkeypatch, 503)
+
+        with pytest.raises(builder.BuildError, match="Could not verify"):
+            builder.verify_published("2.4.1")
 
     def test_an_unreachable_pypi_also_fails_rather_than_writing_unverified(self, monkeypatch):
         """ "Could not check" is not "verified"."""
