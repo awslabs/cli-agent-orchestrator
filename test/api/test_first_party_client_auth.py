@@ -21,9 +21,14 @@ workflow`` verbs. ``test/test_bearer_call_site_census.py`` scans source text for
 ``requests.<verb>(`` calls, so it cannot see a client that goes through ``api_http`` or
 ``urllib``.
 
-So this module is the generic version: a parametrised case per first-party client surface
-that drives the REAL client entry point against the REAL route table with auth enabled, and
-asserts no request the client made was refused at the auth boundary (401/403). It does not
+So this module is the generic version: it SAMPLES the first-party clients, one or more entry
+points per attachment point (each client module's ``_auth_headers()``, ``api_http._send``
+for the CLI, the ``urllib`` shim for the script tier), drives the REAL client entry point
+against the REAL route table with auth enabled, and asserts no request the client made was
+refused at the auth boundary (401/403). The sampling unit is the attachment point, not the
+call site: a module whose every call goes through one helper is covered by one case that
+goes through that helper, and the census (which does see every ``requests`` call site) is
+what proves the other call sites use the same helper. It does not
 assert the call SUCCEEDS — an admitted request may still 404 or 500 because no tmux session,
 no skill and no live terminal exist in a unit test. The only claim is that the client got
 past the gate, which is the one thing nothing else checks.
@@ -55,6 +60,22 @@ says the fix is absent, and lifts itself the moment the fix lands. If the probe 
 in either direction the strict marker still goes red, so a stale probe cannot rot into a
 permanent exemption either. ``test_known_broken_markers_lift_themselves`` enumerates the
 class: no surface may carry an xfail that was not built this way.
+
+First-party callers that have NO case here, and why:
+
+* The ``utils/orchestration.py`` local arms other than ``send_message``: ``handoff`` and
+  ``assign`` create a terminal (``POST /sessions``, ``POST /sessions/{name}/terminals``)
+  and then wait on it, which needs a tmux backend and a live provider. They share
+  ``_auth_headers()`` with the ``send_message`` case, which is the most-used arm.
+* The other ``api_http`` CLI commands (``cao info``, ``cao launch``, ``cao shutdown``,
+  ``cao terminal``) and the ``api_http`` helpers in ``utils/terminal.py``: every one goes
+  through ``api_http._send``, which is what the ``cao session list`` case covers. The
+  census cannot see these at all, which is why one of them is here.
+* The other ``@mcp.tool`` functions in ``mcp_server/server.py`` and ``ops_mcp_server``:
+  each goes through the helper its module's cases exercise; the census pins the
+  per-call-site convention.
+* The clients that are not Python: ``web/src/api.ts`` and ``tui/``. They carry their own
+  token handling and are outside a pytest file's reach.
 
 Surfaces deliberately NOT covered, with reasons:
 
@@ -97,6 +118,7 @@ from cli_agent_orchestrator.mcp_server import server as mcp_server
 from cli_agent_orchestrator.ops_mcp_server import server as ops_server
 from cli_agent_orchestrator.security import auth as auth_module
 from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.utils import orchestration
 
 LOCAL_TOKEN = "first-party-client-auth-local-token"
 
@@ -468,6 +490,12 @@ SURFACES: List[_Surface] = [
         hops=(("POST", "/terminals/run-step"),),
         credential=_some_credential,
         marks=(_BROKEN_SCRIPT_TIER,),
+    ),
+    # --- orchestration, local arm: a worker replying to its recorded caller ----
+    _Surface(
+        id="orchestration.send_message",
+        drive=lambda: orchestration._send_message_impl(receiver_id=None, message="gate"),
+        hops=(("GET", _OWN), ("POST", f"/terminals/{CALLER_ID}/inbox/messages")),
     ),
     # --- the other client modules ---------------------------------------------
     _Surface(
