@@ -228,15 +228,8 @@ def test_enum_subset_literals_are_deliberate() -> None:
     """Every partial-Enum membership literal under ``src/`` is explained (#896)."""
     sources = cl.parse_sources()
     sites = cl.enum_subset_sites(sources)
-    marked = {}
-    unmarked = []
-    for site in sites:
-        module = next(m for m in sources if m.relpath == site.relpath)
-        reason = cl.inline_marker(module, site.line, "subset-ok")
-        if reason is not None:
-            marked[site.key] = reason
-        else:
-            unmarked.append(site)
+    marked = cl.marked_sites(sites, "subset-ok", sources)
+    unmarked = [site for site in sites if site.key not in marked]
 
     cl.check_against_allowlist(
         rule="enum-subset",
@@ -431,16 +424,21 @@ def test_suspect_timeout_rows_are_named_not_buried() -> None:
 
 STALENESS_FUNC = "poll_until_done"
 STALENESS_KWARG = "min_generation"
+#: Inline opt-out for a ``poll_until_done`` call that cannot pass the floor. Same
+#: shape as rule 1's ``subset-ok``: ``# staleness-ok: <reason>`` on the call's
+#: line or the two above it (``cl.inline_marker``). This is the ONE opt-out
+#: mechanism for the staleness gate; PR #999 briefly carried its own
+#: ``turn-boundary: ungated`` marker read by a second lint, which was retired in
+#: favour of this rule so that a reviewer finds one convention.
+STALENESS_MARKER = "staleness-ok"
 
-#: Call sites that may legitimately poll without a generation floor once the
-#: parameter exists. Empty on purpose: no site has been reviewed for an opt-out
-#: yet, because the parameter does not exist on main (see the test below).
+#: Table form of the opt-out, for an idiom that repeats inside one module. Empty
+#: on purpose: every reviewed opt-out today is a one-off and carries the inline
+#: marker at the site instead (``cli/commands/launch.py`` headless wait after a
+#: server-confirmed initial delivery; ``cli/commands/worker.py`` ``send`` and
+#: ``attach``, whose broker status route carries no generation).
 STALENESS_OPT_OUT: dict = {}
 
-#: The complete census of ``poll_until_done`` call sites as of this commit.
-#: This half of the rule bites *today*: a new caller fails the test and the
-#: author is told, at the moment they add it, that this poll has a staleness
-#: obligation. Without it rule 3 would be dormant until #812 merges.
 STALENESS_CALL_SITES = {
     ("cli_agent_orchestrator/cli/commands/launch.py", STALENESS_FUNC): (
         "initial-delivery wait after launch"
@@ -460,9 +458,11 @@ STALENESS_REMEDY = (
     "`poll_until_done` decides 'the agent is done' from whatever the terminal "
     "shows now. Without a floor on which turn that frame belongs to, a frame "
     "from before your input was sent reads as a finished turn (#735). Pass "
-    f"`{STALENESS_KWARG}=` the generation you are waiting past, or add this "
-    "site to STALENESS_OPT_OUT with a reason why a stale frame is acceptable "
-    "here."
+    f"`{STALENESS_KWARG}=` the generation you are waiting past (the "
+    "`dispatch_boundary` that POST /terminals/{id}/input returned for the send). "
+    f"If this site genuinely cannot derive one, put `# {STALENESS_MARKER}: <reason>` "
+    "on the call or the line above it, or for a repeating idiom add a row to "
+    "STALENESS_OPT_OUT, saying why a stale frame is acceptable here."
 )
 
 
@@ -487,33 +487,30 @@ def test_poll_until_done_call_site_census_is_complete() -> None:
 
 
 def test_every_poll_until_done_passes_a_generation_floor() -> None:
-    """Once ``min_generation`` exists, every call site must pass it (#735).
+    """Every ``poll_until_done`` call site passes ``min_generation`` or opts out (#735).
 
-    Deliberately conditional. ``min_generation`` does not exist anywhere on
-    main: ``poll_until_done`` at ``utils/terminal.py`` declares
-    ``(terminal_id, timeout, polling_interval, idle_stable_polls, read_status)``
-    and ``grep -r min_generation src test`` is empty. The generation concept
-    arrives with PR #812 (``joeguo/735-turn-sequence``), which is still open.
-
-    Asserting the kwarg today would fail all four call sites for a parameter
-    that cannot be passed, so the test skips while the contract is absent and
-    starts enforcing it the moment #812 adds the parameter -- which is exactly
-    when a call site could forget it. The census test above keeps the rule from
-    being dormant in the meantime.
+    The parameter landed with PR #999 (``POST /terminals/{id}/input`` returns the
+    turn's ``dispatch_boundary``; ``cao session send`` passes it here), so this
+    rule is ARMED: it used to skip while the contract was absent, and now fails
+    outright if the parameter ever disappears again, because the call sites
+    that pass it would then be broken rather than merely ungated. A site that
+    cannot derive a floor says why at the site with ``# staleness-ok: <reason>``
+    (or, for a repeating idiom, a row in ``STALENESS_OPT_OUT``).
     """
     declared = cl.declared_parameters(STALENESS_FUNC)
     if not declared:
         pytest.fail(f"{STALENESS_FUNC} is no longer defined under src/; update this rule.")
-    if STALENESS_KWARG not in declared:
-        pytest.skip(
-            f"{STALENESS_FUNC} has no {STALENESS_KWARG} parameter on this tree "
-            f"(declares {sorted(declared)}). The #735 staleness contract arrives "
-            "with PR #812; this rule activates automatically when it does."
-        )
+    assert STALENESS_KWARG in declared, (
+        f"{STALENESS_FUNC} lost its {STALENESS_KWARG} parameter (declares "
+        f"{sorted(declared)}); the #735 staleness contract from PR #999 has regressed."
+    )
 
+    sources = cl.parse_sources()
+    sites = cl.missing_kwarg_sites(STALENESS_FUNC, STALENESS_KWARG, sources)
     cl.check_against_allowlist(
         rule="staleness-gate",
-        sites=cl.missing_kwarg_sites(STALENESS_FUNC, STALENESS_KWARG),
+        sites=sites,
         allowlist=STALENESS_OPT_OUT,
+        marked=cl.marked_sites(sites, STALENESS_MARKER, sources),
         remedy=STALENESS_REMEDY,
     )

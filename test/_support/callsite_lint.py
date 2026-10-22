@@ -214,6 +214,31 @@ def inline_marker(module: Module, lineno: int, prefix: str) -> Optional[str]:
     return None
 
 
+def marked_sites(
+    sites: Iterable[Site],
+    prefix: str,
+    sources: Optional[Sequence[Module]] = None,
+) -> Dict[Tuple[str, ...], str]:
+    """``{site.key: reason}`` for every site that carries an inline ``# <prefix>: <reason>``.
+
+    The one way a rule reads its inline opt-out markers, so every rule spells
+    them the same way (``subset-ok``, ``staleness-ok``) and :func:`inline_marker`'s
+    two-line lookback applies to all of them. Keys are the sites' line-free
+    keys, so the result feeds :func:`check_against_allowlist`'s ``marked``.
+    """
+    srcs = parse_sources() if sources is None else sources
+    by_path = {module.relpath: module for module in srcs}
+    marked: Dict[Tuple[str, ...], str] = {}
+    for site in sites:
+        module = by_path.get(site.relpath)
+        if module is None:
+            continue
+        reason = inline_marker(module, site.line, prefix)
+        if reason is not None:
+            marked[site.key] = reason
+    return marked
+
+
 # ---------------------------------------------------------------------------
 # The ratchet
 # ---------------------------------------------------------------------------
