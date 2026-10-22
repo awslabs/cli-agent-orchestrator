@@ -26,7 +26,7 @@ Eager delivery allows messages to be delivered during **PROCESSING**, eliminatin
 inter-turn gap. It also covers **WAITING_USER_ANSWER**, but only for providers whose
 `blocks_orchestrated_input_while_waiting_user_answer` is False.
 
-A provider that sets that property (Claude Code, MiniMax Code) is declaring that its
+A provider that sets that property (e.g. Claude Code, Codex, MiniMax Code) is declaring that its
 choice widget consumes pasted text as the answer to the open dialog. Delivering there
 loses the message — it is marked DELIVERED but never reaches the agent — and the
 trailing Enter submits whichever option is highlighted, so an inbox message would

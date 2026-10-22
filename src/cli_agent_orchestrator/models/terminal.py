@@ -46,26 +46,27 @@ class TerminalInputBlockedError(Exception):
     unchanged so every existing `from cli_agent_orchestrator.services.terminal_service import
     TerminalInputBlockedError` caller keeps working without edits.
 
-    Three distinct raise sites share this one exception:
-    1. services/terminal_service.py's send_input(): the terminal's provider process has exited
-       (status ERROR) -- refuse to type into what is now a bare shell, since queued input would
-       execute as arbitrary commands. Raised with
-       ``reason=TerminalInputBlockedReason.PROVIDER_ERROR``.
-    2. services/terminal_service.py's send_input(), separately: an orchestrated (assign/handoff)
-       message would answer a prompt still showing WAITING_USER_ANSWER -- refuse, since only a
-       real answer_user_prompt call (or the operator themselves) should resolve it. This guard
-       only actually fires for a given provider once that provider's own
+    Two raise sites share this one exception, both in services/terminal_service.py's
+    send_input(), and each sets ``reason`` so the catcher can tell them apart:
+    1. The terminal's provider process has exited (status ERROR) -- refuse to type into what is
+       now a bare shell, since queued input would execute as arbitrary commands. Raised with
+       ``reason=TerminalInputBlockedReason.PROVIDER_ERROR``. Permanent: no later sweep can
+       deliver into a bare shell, so inbox_service marks the batch FAILED.
+    2. An orchestrated message -- any ``OrchestrationType`` (assign, handoff, send_message, and
+       any member added later; the set is derived from the enum, see #896) -- would answer a
+       prompt still showing WAITING_USER_ANSWER -- refuse, since only a real answer_user_prompt
+       call (or the operator themselves) should resolve it. This guard only actually fires for a
+       given provider once that provider's own
        ``blocks_orchestrated_input_while_waiting_user_answer`` property opts in (see
        providers/base.py) -- claude_code did not opt in until PR #539's round-2 fix, so before
        that an orchestrated message reaching a claude_code terminal parked on
        WAITING_USER_ANSWER was NOT refused here; it was pasted straight into the live prompt.
-       Raised with ``reason=TerminalInputBlockedReason.WAITING_USER_ANSWER``.
-    3. providers/*.py's own initialize(): the CLI reached a real, alive, interactive state that
-       isn't {IDLE, COMPLETED} but IS a recognized "something is asking a question" signal
-       (WAITING_USER_ANSWER) -- or, for the outermost fallback, genuinely never resolved within
-       the init timeout despite the terminal staying alive and producing output the whole time.
-       Raised with ``reason=None``; nothing downstream of initialize() needs the distinction.
-    All three are "this terminal needs a human, not a teardown" -- see terminal_service.py's own
+       Raised with ``reason=TerminalInputBlockedReason.WAITING_USER_ANSWER``. Transient: the
+       dialog will close, so inbox_service keeps the batch PENDING for the next sweep.
+    No provider raises this from initialize() today (providers/claude_code.py's init timeout
+    raises a bare TimeoutError on purpose); ``reason`` defaults to ``None`` only so a caller
+    outside this tree can still construct the exception without classifying it.
+    Both sites are "this terminal needs a human, not a teardown" -- see terminal_service.py's own
     _schedule_deferred_init, which catches this exception specifically to leave the terminal
     running instead of tearing it down the way any other exception from initialize() (or from the
     send_input it triggers on the deferred-init path) would.

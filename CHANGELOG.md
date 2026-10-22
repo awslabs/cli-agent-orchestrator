@@ -163,6 +163,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Inbox delivery no longer types a queued message into an open user-answer dialog (#896). With
+  `CAO_EAGER_INBOX_DELIVERY=true`, a message for a Claude Code terminal sitting in
+  WAITING_USER_ANSWER was pasted into the AskUserQuestion dialog, marked DELIVERED, and the
+  trailing Enter answered the question. Eager delivery now holds the message while a provider
+  that declares `blocks_orchestrated_input_while_waiting_user_answer` shows a dialog, and
+  `send_input`'s dialog guard covers every `OrchestrationType` (including `send_message`), not
+  a hand-written subset. A refusal caused by an open dialog keeps the message PENDING for the
+  next IDLE/COMPLETED event or reconcile sweep instead of marking it FAILED.
 - Vault scan now re-reads a note whose size, mtime or ctime changed across the read window up to
   three times with a short backoff, as ADR-006 specifies, instead of skipping it on the first
   torn read. A note saved by Obsidian during a reconcile is indexed from the clean re-read; a

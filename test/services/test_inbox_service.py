@@ -842,12 +842,14 @@ class TestEagerInboxDelivery:
         """send_input's dialog guard refuses mid-send -> PENDING, decided from the
         exception's own reason rather than a second status read (#896).
 
-        Before this fix the except branch re-sampled status_monitor.get_status()
-        to decide PENDING vs FAILED. On herdr that call shells out to the herdr
-        CLI and returns UNKNOWN on any error, which would misclassify this exact,
+        At the merge base there was no dedicated handler at all: the generic
+        ``except Exception`` marked the batch FAILED. An intermediate revision of
+        this fix added a handler that re-sampled status_monitor.get_status() to
+        decide PENDING vs FAILED. On herdr that call shells out to the herdr CLI
+        and returns UNKNOWN on any error, which would misclassify this exact,
         provably-transient refusal as FAILED and strand the message permanently
         -- the outcome the handler exists to prevent. Call count asserted at 1
-        proves the decision no longer depends on that second, unreliable read.
+        proves the decision does not depend on a second, unreliable read.
         """
         mock_get.return_value = [_make_message()]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE

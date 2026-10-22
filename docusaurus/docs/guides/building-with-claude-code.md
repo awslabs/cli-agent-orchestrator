@@ -83,7 +83,7 @@ export CAO_EAGER_INBOX_DELIVERY=true
 cao-server
 ```
 
-With eager delivery enabled, messages are delivered to Claude Code terminals even during PROCESSING or WAITING_USER_ANSWER states, so the agent picks them up the instant it finishes its current turn.
+With eager delivery enabled, messages are delivered to Claude Code terminals during PROCESSING, so the agent picks them up the instant it finishes its current turn. WAITING_USER_ANSWER is excluded: Claude Code's Ink Select widget would consume the paste as the dialog's answer (issue #896), so the message is held until the dialog closes.
 
 ## Native Agent Routing
 
