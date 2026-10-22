@@ -214,7 +214,9 @@ change with what you accept: they come from one acceptance-free pass over the
 note, and acceptances are applied to that result. Accepting only the inner pair
 leaves the outer match redacted and reports `secret_acceptance_unmatched`
 naming the fingerprint still needed. `secret_accepted` and `spans_passed` count
-only spans the agent actually received.
+only spans the agent actually received. Line endings inside a span do not
+affect its fingerprint, so a note saved with CRLF gets the same values as one
+saved with LF.
 
 For managed writes, the gate checks the authored body and CAO-generated
 `cao` metadata before publishing. Preserved user frontmatter is not scanned or

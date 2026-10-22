@@ -370,8 +370,18 @@ def span_sha256(span: str) -> str:
     ``cao.secret_ok[].sha256`` to accept one specific finding. It is bound to
     the exact bytes the pattern matched, so editing the credential, or a new
     credential of the same shape appearing in the note, invalidates it.
+
+    Line endings inside the span are normalised to LF first. ``bearer_token``
+    and ``secret_assignment`` allow a line break between the key and the
+    value, the vault scan hashes the LF-normalised note while the reader hashes
+    the file as written, and a CRLF note would otherwise print a fingerprint
+    the reader could never match.
     """
-    return hashlib.sha256(span.encode("utf-8")).hexdigest()
+    return hashlib.sha256(_normalize_line_endings(span).encode("utf-8")).hexdigest()
+
+
+def _normalize_line_endings(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 @dataclass(frozen=True)

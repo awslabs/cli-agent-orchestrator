@@ -129,6 +129,9 @@ _NESTED: dict[str, tuple[str, str, tuple[str, ...]]] = {
     ),
 }
 _ENV_TOKEN_BODY, _ENV_TOKEN_VALUE, _ENV_TOKEN_CHAIN = _NESTED["github_token_env"]
+# ``bearer_token`` allows a line break between key and value; scan hashes the
+# LF-normalised note, the reader hashes the file as written.
+_CRLF_SPAN_BODY = "token:\r\n  abcdef0123456789ABCDEF"
 _FINGERPRINT_LINE = re.compile(r"pattern=(\S+) sha256=([0-9a-f]{64})(?: inside=(\S+))?")
 
 
@@ -385,6 +388,42 @@ def test_reader_parses_frontmatter_only_when_the_body_has_a_match(tmp_path, monk
     recalled = _recall(warn_config)
     assert recalled is not None and "[REDACTED:secret_assignment]" in recalled.content
     assert len(calls) == 1
+
+
+def test_fingerprint_is_independent_of_line_endings_inside_the_span():
+    lf = _CRLF_SPAN_BODY.replace("\r\n", "\n")
+    assert span_sha256(_CRLF_SPAN_BODY) == span_sha256(lf)
+    assert fingerprint_secrets(_CRLF_SPAN_BODY).fingerprints == fingerprint_secrets(lf).fingerprints
+    text, matches = redact_secrets_with_acceptances(
+        _CRLF_SPAN_BODY, fingerprint_secrets(lf).fingerprints
+    )
+    assert text == _CRLF_SPAN_BODY
+    assert [m.passed for m in matches] == [True]
+
+
+def test_crlf_note_accepts_the_fingerprint_scan_printed(tmp_path, monkeypatch):
+    """A span that crosses a CRLF line break is served raw with the printed fingerprint."""
+    from cli_agent_orchestrator.cli.commands import memory as memory_cli
+
+    _service, session_factory, vault_root, warn_config, vault = _warn_renderer(
+        tmp_path, monkeypatch
+    )
+    _write_note(vault_root, _CRLF_SPAN_BODY)
+    printed = _printed_fingerprints(memory_cli, monkeypatch, warn_config, vault)
+    assert [p for p, _h, _i in printed] == ["bearer_token"]
+    _write_note(
+        vault_root, _CRLF_SPAN_BODY, cao_extra=_acceptances_yaml([(p, h) for p, h, _i in printed])
+    )
+    _reconcile(vault, "warn-crlf")
+
+    recalled = _recall(warn_config)
+
+    assert recalled is not None
+    assert "abcdef0123456789ABCDEF" in recalled.content
+    assert "[REDACTED" not in recalled.content
+    assert _findings(session_factory)["secret_accepted"] == ["bearer_token"]
+    assert "secret_acceptance_unmatched" not in _findings(session_factory)
+    assert _counter_values(session_factory)["secret_acceptance.spans_passed"] == 1
 
 
 # ---------------------------------------------------------------------------
