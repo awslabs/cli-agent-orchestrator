@@ -782,9 +782,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Install-time providers.** A delegated Kiro CLI or OpenCode CLI launch
     whose installed agent file grants more than the bounded allowlist is
     refused with the reinstall remedy, because those providers run the
-    installed file, not the request. A bounded Kiro launch whose agent file is
-    missing or unreadable is refused the same way (fail closed) rather than
-    skipping the comparison; operator launches keep the launch-time warning.
+    installed file, not the request. A bounded Kiro or OpenCode launch whose
+    agent file is missing, unreadable or unparseable is refused the same way
+    (fail closed) rather than skipping the comparison; operator launches keep
+    the launch-time warning.
   - **Vocabulary.** MCP references are compared with the resolver's selector
     semantics (`@plugin-*` covers `@plugin-search`, `@server` covers
     `@server/tool`; a pattern-shaped child entry is covered only by an identical
