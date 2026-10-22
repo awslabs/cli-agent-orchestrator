@@ -236,6 +236,11 @@ uv run python scripts/mypy_ratchet.py
 uv run pytest -v
 ```
 
+A ruff F841 (local assigned but never read) is not always dead code to delete. It can be
+a value the code was supposed to read: issue #752 was exactly that, a computed readiness
+marker that nothing consulted, and the fix (#992) was to read it, not remove it. Before
+deleting the assignment, ask what should have been reading it.
+
 ### Validate Markdown Links
 
 Validate maintained local Markdown paths and heading fragments:
