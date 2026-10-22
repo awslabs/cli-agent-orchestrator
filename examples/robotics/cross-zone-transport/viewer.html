@@ -63,6 +63,8 @@
   .agent .role { color: var(--muted); font-size: 12px; }
   .agent .act { font-size: 12.5px; margin-top: 2px; }
   .agent .act.live { color: var(--accent); font-weight: 600; }
+  .agent.recent { border-color: var(--amber); box-shadow: 0 0 0 1px var(--amber); }
+  .agent .act.recent { color: var(--amber); font-weight: 600; }
   .log { font-size: 12.5px; }
   .log .row { display: flex; gap: 8px; padding: 4px 0; border-bottom: 1px dashed var(--edge); }
   .log .op { font-weight: 600; }
@@ -115,6 +117,15 @@ function describe(cmd) {
   if (cmd.operation === "offer")  return `offering custody of ${a[0]} to ${a[1]} zone`;
   if (cmd.operation === "accept") return `accepting custody of ${a[0]} with ${a[1]}`;
   return cmd.operation;
+}
+
+// Past-tense summary for a command that just finished (offer/accept finish instantly).
+function describePast(cmd) {
+  const a = cmd.arguments || [];
+  if (cmd.operation === "move")   return `moved ${a[0]} to ${a[2]}`;
+  if (cmd.operation === "offer")  return `offered custody of ${a[0]} to ${a[1]} zone`;
+  if (cmd.operation === "accept") return `accepted custody of ${a[0]} with ${a[1]}`;
+  return cmd.operation + " finished";
 }
 
 function render(state) {
@@ -185,10 +196,29 @@ function render(state) {
   }
 
   // ---- who is acting ----
+  // offer/accept finish synchronously, so they never show as accepted/running in a
+  // snapshot. Highlight live motion (accepted/running moves), a pending custody offer
+  // read from the payload, and commands that finished within a short recency window.
   const cmds = (state.commands || []).slice();
+  const nowMs = state.observed_at ? Date.parse(state.observed_at) : Date.now();
+  const RECENT_MS = 4000;
   const active = cmds.filter(c => c.status === "accepted" || c.status === "running");
-  const actingZone = active.length ? active[active.length - 1].actor : null;
-  const actingCmd = active.length ? active[active.length - 1] : null;
+  const liveCmd = active.length ? active[active.length - 1] : null;
+  const liveZone = liveCmd ? liveCmd.actor : null;
+
+  let offer = null; // pending custody handoff, taken from the payload
+  for (const [pname, p] of Object.entries(state.payloads || {})) {
+    if (p.offer) { offer = { ...p.offer, payload: pname }; break; }
+  }
+
+  const recentByZone = {}; // the latest command each actor finished within the window
+  for (const c of cmds) {
+    if (c.status !== "finished" || !c.updated_at) continue;
+    const age = nowMs - Date.parse(c.updated_at);
+    if (age < 0 || age > RECENT_MS) continue;
+    const prev = recentByZone[c.actor];
+    if (!prev || Date.parse(c.updated_at) > Date.parse(prev.updated_at)) recentByZone[c.actor] = c;
+  }
   const anyFinishedMove = cmds.some(c => c.operation === "move" && c.status === "finished");
 
   const roster = [{ id: "supervisor", role: "plans the job, delegates each leg" }];
@@ -198,20 +228,25 @@ function render(state) {
   const box = document.getElementById("agents");
   box.innerHTML = "";
   for (const a of roster) {
-    const acting = a.zone && a.zone === actingZone && !state.stopped;
-    const div = document.createElement("div");
-    div.className = "agent" + (acting ? " acting" : "");
-    const color = a.zone ? (zoneColor[a.zone] || "#8b98a5") : (a.id === "supervisor" ? "#a371f7" : "#8b98a5");
-    const who = a.zone ? `${a.zone} zone worker` : (a.id[0].toUpperCase() + a.id.slice(1));
-    let act = "", live = false;
-    if (acting) { act = describe(actingCmd); live = true; }
-    else if (a.id === "supervisor") act = anyFinishedMove ? "waiting for the current leg" : "planning the legs";
+    const z = a.zone;
+    let cls = "", act = "", mark = "";
+    if (z && !state.stopped) {
+      if (liveZone === z) { cls = "live"; mark = "\u25b6 "; act = describe(liveCmd); }
+      else if (offer && offer.from_zone === z) { cls = "live"; mark = "\u25b6 "; act = `offering custody of ${offer.payload} to ${offer.to_zone} zone`; }
+      else if (offer && offer.to_zone === z) { cls = "recent"; act = `offered custody - ready to accept from ${offer.from_zone}`; }
+      else if (recentByZone[z]) { cls = "recent"; act = "just " + describePast(recentByZone[z]); }
+      else act = "idle";
+    } else if (a.id === "supervisor") act = anyFinishedMove ? "waiting for the current leg" : "planning the legs";
     else if (a.id === "checker") act = state.stopped ? "run stopped" : "waiting to verify";
     else act = "idle";
+    const div = document.createElement("div");
+    div.className = "agent" + (cls === "live" ? " acting" : cls === "recent" ? " recent" : "");
+    const color = z ? (zoneColor[z] || "#8b98a5") : (a.id === "supervisor" ? "#a371f7" : "#8b98a5");
+    const who = z ? `${z} zone worker` : (a.id[0].toUpperCase() + a.id.slice(1));
     div.innerHTML =
       `<span class="dot" style="background:${color}"></span>` +
       `<div><div class="who">${who}</div><div class="role">${a.role}</div>` +
-      `<div class="act${live ? " live" : ""}">${live ? "\u25b6 " : ""}${act}</div></div>`;
+      `<div class="act${cls ? " " + cls : ""}">${mark}${act}</div></div>`;
     box.appendChild(div);
   }
 
@@ -236,7 +271,7 @@ let fails = 0;
 async function poll() {
   const conn = document.getElementById("conn");
   try {
-    const r = await fetch("/state", { cache: "no-store" });
+    const r = await fetch("state", { cache: "no-store" });  // page-relative: keeps a proxy path prefix
     if (!r.ok) throw new Error("HTTP " + r.status);
     render(await r.json());
     fails = 0;
