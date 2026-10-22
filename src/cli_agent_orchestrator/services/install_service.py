@@ -1652,14 +1652,20 @@ def installed_opencode_permission(
     launch (``terminal_service.create_terminal``, Step 0d), mirroring
     :func:`installed_kiro_tools`. ``agents_dir`` defaults to
     ``OPENCODE_AGENTS_DIR``; the launch path passes the directory the provider
-    will actually point OpenCode at. ``None`` when no agent file exists or it
-    carries no dict-valued ``permission``.
+    will actually point OpenCode at. ``None`` when no agent file exists, its
+    front matter does not parse, or it carries no dict-valued ``permission``.
+
+    Every way the file can fail to yield a policy maps to ``None`` so the
+    bounded-launch gate refuses with the ``cao install`` remedy; an exception
+    escaping here would surface as a 500 instead. ``frontmatter.load`` raises
+    ``yaml.YAMLError`` subclasses (parser, scanner, composer) for bad YAML,
+    which are not ``ValueError``; ``UnicodeDecodeError`` is.
     """
     base = Path(agents_dir) if agents_dir is not None else OPENCODE_AGENTS_DIR
     agent_file = base / f"{to_opencode_agent_id(profile_name)}.md"
     try:
         permission = frontmatter.load(agent_file).metadata.get("permission")
-    except (OSError, ValueError):
+    except (OSError, ValueError, yaml.YAMLError):
         return None
     if not isinstance(permission, dict) or not all(
         isinstance(k, str) and isinstance(v, str) for k, v in permission.items()

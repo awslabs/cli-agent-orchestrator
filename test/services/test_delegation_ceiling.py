@@ -630,6 +630,107 @@ async def test_opencode_partial_permission_block_defaults_omitted_tools_to_allow
 
 
 # ---------------------------------------------------------------------------
+# Round 6: an OpenCode agent file whose front matter does not parse must take
+# the same refusal as a missing file, not escape Step 0d as a 500. @haofeif
+# re-review at 95e580fd, P3.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_opencode_bounded_launch_with_unparseable_front_matter_is_refused(
+    launch, opencode_install
+):
+    """``frontmatter.load`` raises ``yaml.YAMLError`` for bad YAML, which is not a
+    ``ValueError``. Before the fix that escaped ``installed_opencode_permission``
+    and Step 0d, so the API answered 500 instead of the refusal with the install
+    remedy. The reader must answer None so the same fail-closed path applies."""
+    from cli_agent_orchestrator.providers import opencode_cli
+    from cli_agent_orchestrator.utils.delegation import InstalledPolicyExceedsAllowlistError
+
+    _seed("0000beef", "reviewer", REVIEWER, REVIEWER)
+    (opencode_cli.OPENCODE_CONFIG_DIR / "agents" / "developer.md").write_text(
+        "---\npermission: [unclosed\nmode: all\n---\nbody\n"
+    )
+    with pytest.raises(InstalledPolicyExceedsAllowlistError) as excinfo:
+        await create_terminal(
+            "opencode_cli",
+            "developer",
+            session_name="cao-sess",
+            new_session=False,
+            caller_id="0000beef",
+            allowed_tools=["fs_read"],
+        )
+    message = str(excinfo.value)
+    assert "no installed OpenCode agent file" in message
+    assert "cao install developer --provider opencode_cli" in message
+    assert excinfo.value.status_code == 403
+
+
+# The class behind that P3: "CAO cannot read the installed policy" is not one
+# exception type per reader but every way a file on disk can fail to yield a
+# policy. Both readers must answer None for all of them, because an exception
+# escaping either one turns the fail-closed refusal into a 500 with no remedy.
+# Enumerated here so the next parser quirk is caught by a table row, not a
+# reviewer.
+_CORRUPT_OPENCODE_FILES = {
+    "yaml_parser_error": b"---\npermission: [unclosed\nmode: all\n---\nbody\n",
+    "yaml_scanner_error_tab_indent": b"---\npermission:\n\tbash: allow\n---\nbody\n",
+    "yaml_composer_error_undefined_alias": b"---\na: &x [1]\npermission: *y\n---\n",
+    "scalar_front_matter": b"---\njust a string\n---\nbody\n",
+    "list_front_matter": b"---\n- a\n- b\n---\nbody\n",
+    "non_utf8_bytes": b"---\npermission: \xff\xfe\n---\n",
+    "empty_file": b"",
+    "no_front_matter": b"just a body with no block\n",
+    "permission_is_a_string": b"---\npermission: allow\n---\n",
+    "permission_values_not_strings": b"---\npermission: {bash: {x: y}}\n---\n",
+}
+
+_CORRUPT_KIRO_FILES = {
+    "json_decode_error": b"{not json",
+    "non_utf8_bytes": b"\xff\xfe",
+    "empty_file": b"",
+    "top_level_list": b"[1, 2]",
+    "tools_not_a_list": b'{"tools": "fs_read"}',
+    "tools_not_all_strings": b'{"tools": ["fs_read", 1]}',
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_CORRUPT_OPENCODE_FILES))
+def test_installed_opencode_permission_answers_none_for_every_corrupt_file(tmp_path, shape):
+    from cli_agent_orchestrator.services.install_service import installed_opencode_permission
+
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    (agents / "developer.md").write_bytes(_CORRUPT_OPENCODE_FILES[shape])
+    assert installed_opencode_permission("developer", agents) is None
+
+
+def test_installed_opencode_permission_answers_none_for_a_directory(tmp_path):
+    from cli_agent_orchestrator.services.install_service import installed_opencode_permission
+
+    agents = tmp_path / "agents"
+    (agents / "developer.md").mkdir(parents=True)
+    assert installed_opencode_permission("developer", agents) is None
+
+
+@pytest.mark.parametrize("shape", sorted(_CORRUPT_KIRO_FILES))
+def test_installed_kiro_tools_answers_none_for_every_corrupt_file(tmp_path, monkeypatch, shape):
+    from cli_agent_orchestrator.services import install_service
+
+    monkeypatch.setattr(install_service, "KIRO_AGENTS_DIR", str(tmp_path))
+    (tmp_path / "developer.json").write_bytes(_CORRUPT_KIRO_FILES[shape])
+    assert install_service.installed_kiro_tools("developer") is None
+
+
+def test_installed_kiro_tools_answers_none_for_a_directory(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services import install_service
+
+    monkeypatch.setattr(install_service, "KIRO_AGENTS_DIR", str(tmp_path))
+    (tmp_path / "developer.json").mkdir()
+    assert install_service.installed_kiro_tools("developer") is None
+
+
+# ---------------------------------------------------------------------------
 # Round 4: Kiro Step 0d fails closed on a missing agent file; the idempotency
 # fingerprint hashes the delegating terminal.
 # ---------------------------------------------------------------------------
