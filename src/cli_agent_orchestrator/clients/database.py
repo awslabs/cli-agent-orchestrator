@@ -3013,17 +3013,28 @@ def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]
 
 
 def get_inbox_messages(
-    receiver_id: str, limit: int = 10, status: Optional[MessageStatus] = None
+    receiver_id: str,
+    limit: int = 10,
+    status: Optional[MessageStatus] = None,
+    sender_id: Optional[str] = None,
+    newest_first: bool = False,
 ) -> List[InboxMessage]:
-    """Get inbox messages with optional status filter ordered by created_at ASC (oldest first).
+    """Get inbox messages with optional status and sender filters.
+
+    Ordered by created_at ascending (oldest first) unless ``newest_first`` is set.
+    ``limit`` is applied after ordering. The defaults match historical callers,
+    including ``get_pending_messages``.
 
     Args:
         receiver_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10)
         status: Optional filter by message status (None = all statuses)
+        sender_id: Optional filter by sender id (None = all senders)
+        newest_first: When True, order by created_at descending so ``limit``
+            keeps the newest messages. Defaults to False.
 
     Returns:
-        List of inbox messages ordered by creation time (oldest first)
+        List of inbox messages ordered by creation time
     """
     with SessionLocal() as db:
         query = db.query(InboxModel).filter(InboxModel.receiver_id == receiver_id)
@@ -3031,7 +3042,13 @@ def get_inbox_messages(
         if status is not None:
             query = query.filter(InboxModel.status == status.value)
 
-        messages = query.order_by(InboxModel.created_at.asc()).limit(limit).all()
+        if sender_id is not None:
+            query = query.filter(InboxModel.sender_id == sender_id)
+
+        created_at_order = (
+            InboxModel.created_at.desc() if newest_first else InboxModel.created_at.asc()
+        )
+        messages = query.order_by(created_at_order).limit(limit).all()
 
         return [
             InboxMessage(
