@@ -5,10 +5,11 @@ import logging
 import os
 import re
 import stat
+from dataclasses import dataclass
 from enum import Enum
 from importlib import resources
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Mapping, Optional, Set
 
 import frontmatter
 
@@ -358,28 +359,73 @@ PROFILE_SET_DIGEST_PREFIX = "sha256:"
 _PROFILE_FRAME_SEP = ":"
 
 _UNLOADABLE_SENTINEL = "\x02unloadable-profile-entry"
-"""Digested in place of source text for an entry that is genuinely unservable — not merely one
-``list_agent_profiles()`` marked ``loadable: False`` (issue #827 fixup).
+"""Digested in place of source text for a listed entry the LAUNCH PATH refuses to serve (issue #827).
 
-A directory listed without an ``agent.md`` (e.g. a stray ``old-backups/`` folder) is exactly the case
-the lister itself already decided never to recommend or load — ``load_agent_profile()`` raises
-``FileNotFoundError`` for it by design, not by accident. Calling ``_read_agent_profile_source`` on it
-anyway turned a benign, pre-classified "not loadable" entry into a digest-wide exception, which NULLs
-every manifest and refuses every script run with enforcement on. The sentinel still makes the entry's
-presence, absence, and NAME part of the digest (so adding/removing such a stray entry still moves the
-identifier), it just does not attempt to read content the lister already said cannot be loaded.
+The lister and the reader disagree about some entries, by design: the lister follows symlinks and
+does not check the name, while the reader applies ``_safe_join`` containment and
+``_validate_agent_name``. A symlinked ``helper.md`` pointing outside the store, a ``v1..v2.md`` file, a
+directory without ``agent.md`` — each is LISTED, and ``load_agent_profile`` raises for each at launch.
+Such an entry is not a profile a step can run, so there is no content to bind; but its presence, its
+absence and its NAME still change which name resolves to what, so it is digested as name plus this
+sentinel rather than skipped.
 
-``loadable`` ALONE IS THE WRONG PROXY, though: in the default directory topology ``claude_code`` and
-``codex`` alias ``LOCAL_AGENT_STORE_DIR`` (see ``settings_service.py`` vs ``constants.py``), so the local
-scan claims that path first and a nested ``<name>/agent.md`` entry is listed ``loadable: False`` — yet
-the reader's fall-through to ``usable_agent_dirs()`` resolves it fine at launch. Trusting ``loadable``
-verbatim would hash the sentinel for a profile that is actually served, leaving its content outside plan
-identity. ``profile_set_digest`` therefore falls back to ``installed_profile_exists`` before treating an
-entry as unservable.
+The verdict "refused" is taken from the reader itself (:func:`read_profile_entry` calls the same
+``_read_agent_profile_source`` that ``load_agent_profile`` calls), not from the lister's ``loadable``
+flag, so the digest cannot classify an entry differently from the launch path. The previous shape —
+trust ``loadable``, fall back to ``installed_profile_exists``, and RAISE for anything else — turned
+every entry in the gap between the two rules into a digest-wide exception that NULLed every manifest
+and refused every script run as ``internal`` (the P2-1 finding on PR #1000).
 """
 
 
-def profile_set_digest() -> str:
+@dataclass(frozen=True)
+class ProfileEntry:
+    """What the launch path would do with one listed profile name, read exactly once.
+
+    ``source`` is the raw text ``load_agent_profile`` would parse, or ``None`` when the reader refuses
+    the entry (not found under any root it may serve from, name rejected, containment failed, not
+    UTF-8). ``None`` is a classification, not an error: it is the same answer the launch path gives.
+    """
+
+    source: Optional[str]
+
+
+def read_profile_entry(name: str) -> ProfileEntry:
+    """Read one listed profile the way the launch path reads it.
+
+    Catches exactly the two exceptions ``load_agent_profile`` documents as the reader's own refusals
+    (``FileNotFoundError``, ``ValueError`` — which includes ``UnicodeDecodeError``) and turns them into
+    ``source=None``. Anything else — ``PermissionError``, ``IsADirectoryError``, an I/O fault — is an
+    inability to READ the store rather than a verdict about the entry, and propagates so the caller can
+    fail closed with an honest reason (``manifest_freeze`` reports ``profiles_unreadable``).
+    """
+    try:
+        return ProfileEntry(source=_read_agent_profile_source(name))
+    except (FileNotFoundError, ValueError):
+        return ProfileEntry(source=None)
+
+
+def read_profile_set() -> Dict[str, ProfileEntry]:
+    """One read of the FULL installed profile set: every listed name and the launch path's verdict on it.
+
+    This is the single read both plan identity (:func:`profile_set_digest`) and the per-run launch
+    guard build from, so the two cannot describe different snapshots of the store. Raises ``OSError``
+    (other than ``FileNotFoundError``) when an entry cannot be read; the entry's NAME is logged — it is
+    an operator-chosen filename, not a path — because a retry cannot help and the operator has to find
+    the entry to fix it.
+    """
+    snapshot: Dict[str, ProfileEntry] = {}
+    for profile in list_agent_profiles():
+        name = profile["name"]
+        try:
+            snapshot[name] = read_profile_entry(name)
+        except OSError:
+            logger.warning("agent profile entry cannot be read: name=%r", name)
+            raise
+    return snapshot
+
+
+def profile_set_digest(profile_set: Optional[Mapping[str, ProfileEntry]] = None) -> str:
     """Digest the FULL installed agent profile set — every name and its raw source text (issue #827).
 
     Why the full set rather than the profiles a plan happens to name: script-tier steps are DISCOVERED
@@ -394,26 +440,30 @@ def profile_set_digest() -> str:
 
     RAW SOURCE, NOT THE PARSED ``AgentProfile``. Parsing normalises away fields a future version may
     start honouring, and an unparseable profile still has to produce a stable identity rather than an
-    exception. ``resolve_env_vars`` is deliberately NOT applied: it would pull the launching process's
-    environment into the digest, so an unrelated variable change would invalidate every approval.
+    exception. ``resolve_env_vars`` is deliberately NOT applied: it substitutes ``${VAR}`` placeholders
+    from the managed CAO ``.env`` file (``utils/env.py``), which is where credentials live, and a digest
+    of the substituted text would put a hash of each credential into an identifier that is logged,
+    displayed and stored. The cost is documented in ``docs/workflows.md``: a ``cao env set`` that changes
+    a referenced value does not change ``plan_id``.
 
-    AN ENTRY THE LISTER MARKED ``loadable: False`` AND THAT IS ALSO UNREACHABLE VIA
-    ``installed_profile_exists`` digests as its name plus a fixed sentinel rather than its
-    (unreadable-by-design) source — see :data:`_UNLOADABLE_SENTINEL`. For every other entry this RAISES
-    rather than skipping, which is the fail-closed direction: a profile that vanishes
-    between the scan and the read (a race, not a classification) leaves the SET INDETERMINATE, and
-    silently omitting it would let a digest describe a profile set that is not the one on disk. The
-    caller (``manifest_freeze``) turns that exception into a NULL manifest, which the approval gate
-    refuses. This covers per-entry read failures; it does not make the upstream LISTING itself
-    fail-closed — ``_list_installed_profiles`` already swallows a built-in-store enumeration failure
-    into a smaller valid-looking set (unchanged by this issue), so this digest can be a coherent hash of
-    whatever that scan returned without being a guarantee that the scan itself never dropped anything.
+    AN ENTRY THE LAUNCH PATH REFUSES digests as its name plus a fixed sentinel — see
+    :data:`_UNLOADABLE_SENTINEL`. That includes a profile that vanishes between the scan and the read:
+    the resulting identity differs from both "present with its text" and "absent", so it can match no
+    approval granted for either state, which is the fail-closed property the previous raise bought at
+    the price of refusing every run for every persistent stray entry.
+
+    ``profile_set`` is the snapshot :func:`read_profile_set` returned, when the caller already holds
+    one; otherwise the set is read here. This does not make the upstream LISTING itself fail-closed —
+    ``_list_installed_profiles`` already swallows a built-in-store enumeration failure into a smaller
+    valid-looking set (unchanged by this issue), so this digest can be a coherent hash of whatever that
+    scan returned without being a guarantee that the scan itself never dropped anything.
     """
+    if profile_set is None:
+        profile_set = read_profile_set()
     digest = hashlib.sha256()
-    for profile in sorted(list_agent_profiles(), key=lambda p: p["name"]):
-        name = profile["name"]
-        servable = profile.get("loadable", True) or installed_profile_exists(name)
-        source = _read_agent_profile_source(name) if servable else _UNLOADABLE_SENTINEL
+    for name in sorted(profile_set):
+        entry = profile_set[name]
+        source = entry.source if entry.source is not None else _UNLOADABLE_SENTINEL
         for component in (name, source):
             encoded = component.encode("utf-8")
             digest.update(f"{len(encoded)}{_PROFILE_FRAME_SEP}".encode("utf-8"))
@@ -457,10 +507,10 @@ def _read_agent_profile_source(agent_name: str) -> str:
 def installed_profile_exists(agent_name: str) -> bool:
     """Probe installed stores without reserved-name routing or environment expansion.
 
-    Catches ``ValueError`` as well as ``FileNotFoundError``: a listed name containing ``..`` (e.g. a
-    stray ``v1..v2`` directory under the agent store) makes ``_validate_agent_name`` raise rather than
-    return ``False``, which would otherwise propagate out of ``profile_set_digest`` and NULL every
-    manifest (issue #827 fixup).
+    Catches ``ValueError`` as well as ``FileNotFoundError``: a name containing ``..`` makes
+    ``_validate_agent_name`` raise, and for a probe that is the same answer as "not installed". An
+    ``OSError`` other than not-found (a permission fault, say) is NOT caught: it is an inability to
+    read the store, not a verdict about the name, and the caller decides what that means.
     """
     try:
         _read_installed_agent_profile_source(agent_name)

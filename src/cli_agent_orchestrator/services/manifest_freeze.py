@@ -109,11 +109,17 @@ def freeze_manifest(
         # outside the script at launch time, so the transitive-coverage argument below does not reach
         # it: rewriting a profile changed no byte of the script and therefore no byte of the plan_id.
         #
-        # RAISES ON AN UNREADABLE PROFILE, and the outer ``except`` is what makes that correct rather
-        # than merely tolerable: an indeterminate profile set becomes a None manifest, which becomes a
-        # NULL column, which the approval gate refuses. The failure direction is the same fail-closed
-        # one the module docstring already claims for an unavailable baseline.
-        profile_set = profile_set_digest()
+        # An entry the launch path REFUSES (a symlink escaping the store, a ``..`` name, a directory
+        # without ``agent.md``) is digested as a sentinel, not raised: it is a classification the reader
+        # itself made, and a persistent stray entry must not refuse every script run. An entry that
+        # cannot be READ (``PermissionError`` and kin) is a different thing — CAO cannot know what the
+        # set is — and fails closed under its own closed reason so the operator is told to look at the
+        # profile store rather than to retry a CAO-side failure (PR #1000, P2-1).
+        try:
+            profile_set = profile_set_digest()
+        except OSError:
+            logger.warning("manifest freeze unavailable profile set: reason=profiles_unreadable")
+            return FrozenManifest(None, "profiles_unreadable")
 
         # Six of FR-8's nine fields are None here because they have no run-level source in this tier
         # (see the module docstring). ``plan_identifier`` renders a None scalar as a distinct

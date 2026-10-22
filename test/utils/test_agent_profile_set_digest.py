@@ -7,6 +7,8 @@ lets an edited profile execute under a stale approval, which is the hole #827 ex
 tests below pin both directions and the fail-closed path between them.
 """
 
+import os
+
 import pytest
 
 from cli_agent_orchestrator.services import settings_service
@@ -127,21 +129,45 @@ def test_framing_is_injective_where_a_naive_join_would_collide(store, monkeypatc
     assert len(digests) == 2
 
 
-def test_an_unreadable_profile_raises_rather_than_being_skipped(store, monkeypatch):
-    """FAIL CLOSED. An indeterminate set must never be digested as a smaller, readable one.
+def test_a_profile_that_vanishes_mid_scan_gets_an_identity_that_matches_neither_state(
+    store, monkeypatch
+):
+    """FAIL CLOSED without refusing every run: a vanished entry digests as name plus sentinel.
 
-    A profile that vanishes between the scan and the read is the realistic case (an install or an
-    uninstall racing a run's admission). Skipping it would produce an identifier describing a profile
-    set that is not the one on disk; if that identifier matched an older approval, the run would
-    proceed. ``manifest_freeze`` turns this exception into a NULL manifest, which the gate refuses.
+    A profile that disappears between the scan and the read is the race case. It must not be SKIPPED —
+    an identifier describing a smaller set could match the approval granted for that smaller set. It
+    also need not RAISE: the sentinel identity differs from both "present with its text" and "absent",
+    so it matches no approval granted for either, and it does so without turning a one-off race into a
+    refusal of every script run (PR #1000, P2-1).
     """
-    store(reviewer="---\nname: reviewer\n---\nA.")
+    body = "---\nname: reviewer\n---\nA."
+    present = store(reviewer=body)
+    absent = store()
+
+    store(reviewer=body)
 
     def _vanished(_name):
         raise FileNotFoundError("removed mid-scan")
 
     monkeypatch.setattr(agent_profiles, "_read_agent_profile_source", _vanished)
-    with pytest.raises(FileNotFoundError):
+    raced = agent_profiles.profile_set_digest()
+    assert raced not in {present, absent}
+
+
+def test_an_entry_that_cannot_be_read_raises_the_os_error(store, monkeypatch):
+    """A fault READING the store is not a verdict about an entry, and must not be laundered into one.
+
+    ``FileNotFoundError`` and ``ValueError`` are the reader's own refusals and classify the entry.
+    ``PermissionError`` means CAO cannot know what the set is, so the digest cannot be computed at all;
+    ``manifest_freeze`` turns this into the closed ``profiles_unreadable`` reason rather than ``internal``.
+    """
+    store(reviewer="---\nname: reviewer\n---\nA.")
+
+    def _locked(_name):
+        raise PermissionError("mode 000")
+
+    monkeypatch.setattr(agent_profiles, "_read_agent_profile_source", _locked)
+    with pytest.raises(PermissionError):
         agent_profiles.profile_set_digest()
 
 
@@ -171,12 +197,8 @@ def test_a_dotdot_directory_name_does_not_raise(tmp_path, monkeypatch):
     """A ``..``-containing directory name is a benign naming accident, not a reason to NULL every
     manifest (issue #827 fixup).
 
-    Before this fix, ``installed_profile_exists`` only caught ``FileNotFoundError``. A listed name
-    containing ``..`` makes ``_validate_agent_name`` raise ``ValueError`` instead, which propagated
-    straight out of ``profile_set_digest``'s ``loadable or installed_profile_exists(name)`` fallback —
-    unlike the plain stray-directory case above, which never calls ``installed_profile_exists`` because
-    ``loadable`` short-circuits it. With approval enforcement default-on, that exception refuses every
-    script-tier run until the directory is removed.
+    ``_validate_agent_name`` raises ``ValueError`` for it, which is the reader's refusal, so the entry
+    digests as name plus sentinel. Its presence still moves the digest.
     """
     _pin_provider_and_extra_dirs(monkeypatch)
     root = tmp_path / "agent-store"
@@ -192,14 +214,120 @@ def test_a_dotdot_directory_name_does_not_raise(tmp_path, monkeypatch):
     assert before != after
 
 
-def test_the_digest_ignores_the_launching_process_environment(store, monkeypatch):
+# ---------------------------------------------------------------------------
+# One rule for "servable": the digest classifies an entry exactly as the launch path does (PR #1000, P2-1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def adversarial_store(tmp_path, monkeypatch):
+    """A local store plus one provider directory, each holding a valid profile and the entries the
+    lister accepts but the reader refuses: a symlinked file and a symlinked directory that both resolve
+    outside their root, and a file whose name contains ``..``.
+
+    Before the fix each of these NULLed every manifest (``FileNotFoundError`` or ``ValueError`` escaping
+    ``profile_set_digest``), so CAO refused every script run as ``internal`` while
+    ``load_agent_profile("reviewer")`` kept working.
+    """
+    root = tmp_path / "agent-store"
+    provider = tmp_path / "kiro-agents"
+    outside = tmp_path / "dotfiles"
+    for d in (root, provider, outside):
+        d.mkdir()
+    monkeypatch.setattr(agent_profiles, "LOCAL_AGENT_STORE_DIR", root)
+    monkeypatch.setattr(settings_service, "usable_agent_dirs", lambda: {"kiro_cli": str(provider)})
+    monkeypatch.setattr(settings_service, "get_extra_agent_dirs", lambda: [])
+    monkeypatch.setattr(settings_service, "get_disabled_agent_dirs", lambda: [])
+
+    (root / "reviewer.md").write_text("---\nname: reviewer\n---\nHello.", encoding="utf-8")
+    (provider / "builder.md").write_text("---\nname: builder\n---\nBuild.", encoding="utf-8")
+    (outside / "helper.md").write_text("---\nname: helper\n---\nOutside.", encoding="utf-8")
+    (outside / "planner").mkdir()
+    (outside / "planner" / "agent.md").write_text("---\nname: planner\n---\nDir.", encoding="utf-8")
+
+    def plant_strays():
+        (root / "helper.md").symlink_to(outside / "helper.md")
+        (provider / "planner").symlink_to(outside / "planner", target_is_directory=True)
+        (root / "reviewer.v1..v2.md").write_text("---\nname: r\n---\nX.", encoding="utf-8")
+        return ["helper", "planner", "reviewer.v1..v2"]
+
+    return root, plant_strays
+
+
+def _launch_path_refuses(name: str) -> bool:
+    try:
+        agent_profiles.load_agent_profile(name)
+    except (FileNotFoundError, ValueError):
+        return True
+    return False
+
+
+def test_the_digest_classifies_every_listed_entry_exactly_as_the_launch_path_does(
+    adversarial_store,
+):
+    """THE CLASS: a digest verdict that differs from the launch path's is the whole P2-1 bug.
+
+    For every listed name, ``read_profile_entry`` must say ``source is None`` exactly when
+    ``load_agent_profile`` refuses the name. Keyed on the lister's output rather than on a hand-written
+    list, so an entry shape neither side anticipated is still checked.
+    """
+    _root, plant_strays = adversarial_store
+    strays = plant_strays()
+    listed = {p["name"] for p in agent_profiles.list_agent_profiles()}
+    assert set(strays) <= listed, "fixture assumption broken: the lister should list every stray"
+    assert any(
+        p["loadable"] for p in agent_profiles.list_agent_profiles() if p["name"] in strays
+    ), (
+        "fixture assumption broken: at least one stray should be listed loadable, which is the gap "
+        "between lister and reader this test exists for"
+    )
+
+    disagreements = {
+        name
+        for name in listed
+        if (agent_profiles.read_profile_entry(name).source is None) != _launch_path_refuses(name)
+    }
+    assert not disagreements, disagreements
+
+
+def test_stray_entries_do_not_null_the_digest_but_their_presence_still_moves_it(adversarial_store):
+    _root, plant_strays = adversarial_store
+    before = agent_profiles.profile_set_digest()
+    plant_strays()
+    after = agent_profiles.profile_set_digest()
+    assert before != after
+    assert agent_profiles.load_agent_profile("reviewer").name == "reviewer"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+def test_an_unreadable_file_raises_permission_error_rather_than_classifying(adversarial_store):
+    """Mode ``000`` is an inability to read, not a refusal, and propagates as the ``OSError`` it is."""
+    root, _plant_strays = adversarial_store
+    locked = root / "locked.md"
+    locked.write_text("---\nname: locked\n---\nX.", encoding="utf-8")
+    locked.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            agent_profiles.profile_set_digest()
+    finally:
+        locked.chmod(0o644)
+
+
+def test_the_digest_does_not_expand_managed_env_placeholders(store, monkeypatch, tmp_path):
     """``resolve_env_vars`` is deliberately not applied to the raw source.
 
-    Expanding it would pull the launching process's environment into plan identity, so an unrelated
-    variable change — a new PATH entry, a rotated token — would invalidate every approval.
+    It substitutes ``${VAR}`` from the managed CAO ``.env`` file (``cao env set``), which is where
+    credentials live; a digest of the substituted text would carry a hash of each credential into an
+    identifier that is logged, displayed and stored. The documented cost is that a changed managed
+    value does not move ``plan_id`` (see ``docs/workflows.md``, "What an approval does not cover").
     """
-    monkeypatch.setenv("CAO_827_PROBE", "first")
+    from cli_agent_orchestrator.utils import env
+
+    env_file = tmp_path / "cao.env"
+    monkeypatch.setattr(env, "CAO_ENV_FILE", env_file)
+    env_file.write_text("CAO_827_PROBE=first\n", encoding="utf-8")
     a = store(reviewer="---\nname: reviewer\n---\nUses ${CAO_827_PROBE}.")
-    monkeypatch.setenv("CAO_827_PROBE", "second")
+    env_file.write_text("CAO_827_PROBE=second\n", encoding="utf-8")
     b = agent_profiles.profile_set_digest()
     assert a == b
+    assert env.resolve_env_vars("${CAO_827_PROBE}") == "second", "fixture: the managed .env is live"

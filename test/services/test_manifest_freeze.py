@@ -359,19 +359,43 @@ def test_an_unchanged_profile_set_leaves_the_plan_id_stable(tmp_path, monkeypatc
     assert _frozen()["plan_id"] == _frozen()["plan_id"]
 
 
-def test_an_unreadable_profile_set_fails_the_freeze_closed(monkeypatch, caplog):
-    """An INDETERMINATE profile set must not be silently digested as a smaller one.
+def test_an_unreadable_profile_set_fails_the_freeze_closed_as_profiles_unreadable(
+    monkeypatch, caplog
+):
+    """A store CAO cannot READ is refused under its own closed reason, not ``internal``.
 
-    A profile that vanishes between the scan and the read is the realistic case. Omitting it would
-    produce an identifier describing a profile set that is not the one on disk — and if that identifier
-    happened to match an older approval, the run would proceed. Raising becomes a NULL manifest, which
-    the approval gate refuses.
+    ``internal`` tells the operator "this is a CAO-side failure, retry"; a ``PermissionError`` on a profile
+    entry does not go away on retry and is not CAO's fault. ``profiles_unreadable`` already exists in the
+    closed vocabulary and its message names the profile set (PR #1000, P2-1).
     """
+
+    def _locked(_name):
+        raise PermissionError("mode 000")
+
+    monkeypatch.setattr(agent_profiles, "_read_agent_profile_source", _locked)
+    with caplog.at_level("WARNING"):
+        frozen = manifest_freeze.freeze_manifest(source_hash="h", inputs={})
+    assert frozen.manifest_json is None
+    assert frozen.unavailable_reason == "profiles_unreadable"
+    assert any("profiles_unreadable" in r.message for r in caplog.records)
+    assert not any("mode 000" in r.message for r in caplog.records)
+
+
+def test_a_profile_that_vanishes_mid_scan_still_freezes_to_an_identity_matching_neither_state(
+    tmp_path, monkeypatch
+):
+    """The race case is fail-closed WITHOUT a NULL manifest: the vanished entry digests as a sentinel,
+    so the identifier matches neither the approval for "present" nor the one for "absent"."""
+    body = "---\nname: reviewer\n---\nA."
+    _store(tmp_path, monkeypatch, reviewer=body)
+    present = _frozen()["plan_id"]
+    _store(tmp_path, monkeypatch)
+    absent = _frozen()["plan_id"]
+    _store(tmp_path, monkeypatch, reviewer=body)
 
     def _vanished(_name):
         raise FileNotFoundError("profile removed mid-scan")
 
     monkeypatch.setattr(agent_profiles, "_read_agent_profile_source", _vanished)
-    with caplog.at_level("WARNING"):
-        assert manifest_freeze.build_manifest_json(source_hash="h", inputs={}) is None
-    assert any("manifest freeze failed" in r.message for r in caplog.records)
+    raced = _frozen()["plan_id"]
+    assert raced not in {present, absent}
