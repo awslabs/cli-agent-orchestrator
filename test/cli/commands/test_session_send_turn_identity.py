@@ -6,15 +6,15 @@ Nothing in that exchange names the turn that was sent:
 
 - ``POST /terminals/{id}/input`` answers ``{"success": true}``; the dispatch
   boundary ``terminal_service.dispatch_input`` already computes is thrown away by
-  the ``send_input`` wrapper (terminal_service.py:3853).
+  the ``send_input`` wrapper.
 - ``GET /terminals/{id}`` reports ``status`` with no indication of which output it
   was earned from, even though ``StatusMonitor.status_observation`` can supply
-  exactly that pair (status_monitor.py:903).
+  exactly that pair.
 - ``poll_until_done`` returned on the first COMPLETED it saw, whatever turn it
   belonged to.
 
-``notify_input_sent`` deliberately leaves ``_last_status`` alone (status_monitor.py:936,
-and see the ``output_generation`` docstring at :858), so for the whole window between a
+``notify_input_sent`` deliberately leaves ``_last_status`` alone (see it and the
+``output_generation`` docstring in status_monitor.py), so for the whole window between a
 dispatch and the new turn's first applied PROCESSING the server answers the CLI's poll
 with the PREVIOUS turn's COMPLETED. These tests drive the real ``StatusMonitor`` through
 that window and assert that the CLI's own wait logic does not treat it as done.
@@ -44,7 +44,7 @@ def _latch(sm, status, generation):
 
     ``_apply_detection`` persists to the terminals table; these tests exercise the
     in-memory latch and the generation stamp only, so they set the same fields the
-    locked core would (status_monitor.py:459, :490).
+    locked core (``_apply_detection_locked``) would.
     """
     sm._output_generation[TERMINAL_ID] = generation
     with sm._lock:
@@ -178,7 +178,7 @@ def test_poll_until_done_refuses_an_ordinary_repaint_of_a_stale_completion(get_b
 
     One more chunk lands and bumps ``output_generation`` without re-stamping the
     still-COMPLETED status -- ``_apply_detection_locked`` deliberately does not
-    re-stamp an unchanged re-detection (status_monitor.py:388-396). So
+    re-stamp an unchanged re-detection (``_apply_detection``). So
     ``status_generation < boundary`` is the ordinary steady state after any
     repaint, not evidence of a restart. An earlier version of this gate inferred
     "generation went backwards means the server restarted" and disengaged
