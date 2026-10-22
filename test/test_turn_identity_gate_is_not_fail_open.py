@@ -15,29 +15,37 @@
 
 The first test below is a call-shape lint, not coverage of the defect class: it
 pins every dispatch-then-wait *call shape* it can see in ``src/`` -- a dispatch
-and a wait reachable from the same function body -- allowlisted with a written
-reason where it is sound. It does not see a dispatch helper split across two
-functions, or a bespoke inline poll loop that never calls one of ``WAITS`` by
-name. One live sibling of exactly that uncaught shape:
-``services/memory_service.py``'s reused-curator path (around line 4219) calls
-``send_input`` and then polls with its own inline ``for _ in range(30)`` loop
-instead of ``poll_until_done`` -- the same defect, impact bounded (not
-eliminated) by the ``output_before`` watermark above it. It is not in
-``UNGATED_WAITS`` because the lint never considers it a dispatch-then-wait site
-in the first place; recorded here instead, pending either extending the lint to
-see bespoke loops or filing it as its own issue.
+and a wait reachable from the same function body. A site that is ungated on
+purpose says so where it lives, with a ``turn-boundary: ungated -- <reason>``
+comment inside the function (see ``UNGATED_MARKER``); the lint matches that
+comment, not the file path or the function name, so a rename or a move changes
+nothing here (round-1 review of PR #999, P3-1). It does not see a dispatch
+helper split across two functions, or a bespoke inline poll loop that never
+calls one of ``WAITS`` by name. One live sibling of exactly that uncaught shape:
+``services/memory_service.py``'s reused-curator path calls ``send_input`` and
+then polls with its own inline ``for _ in range(30)`` loop instead of
+``poll_until_done`` -- the same defect, impact bounded (not eliminated) by the
+``output_before`` watermark above it. The lint never considers it a
+dispatch-then-wait site in the first place; recorded here instead, pending
+either extending the lint to see bespoke loops or filing it as its own issue.
 
-The second test closes the other half structurally: it deliberately never names
+The lint core (``_ungated_sites``) takes source text, so the shapes it must
+accept and refuse are pinned on snippets in ``test_lint_core_judges_each_shape``
+rather than only on whatever ``src/`` happens to contain today.
+
+The last test closes the other half structurally: it deliberately never names
 the wire field, so it cannot be satisfied by a rename on both sides of one seam.
 """
 
 from __future__ import annotations
 
 import ast
+import textwrap
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import click
 import pytest
 
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
@@ -52,40 +60,12 @@ INPUT_ROUTE = "/input"
 WAITS = {"poll_until_done", "_wait_for_completion", "wait_until_terminal_status"}
 # Keyword names that carry a turn boundary into a wait.
 BOUNDARY_KWARGS = {"min_generation", "dispatch_generation", "min_output_generation"}
-
-# Dispatch-then-wait sites that do NOT pass a boundary, each with the reason it
-# is sound (or the issue that tracks it). A NEW ungated site fails this test
-# until it is either gated or explained here -- that is the whole point.
-UNGATED_WAITS: dict[tuple[str, str], str] = {
-    (
-        "cli/commands/worker.py",
-        "send",
-    ): "Remote path: the broker's terminal_status route reports a status string only, so "
-    "poll_until_done's read_status override cannot carry a generation and degrades to the "
-    "frame-based wait by design (utils/terminal.py:290). Closing it needs a broker route "
-    "change -- tracked as the #735 follow-up, not fixed on this branch.",
-    (
-        "cli/commands/worker.py",
-        "attach",
-    ): "Same remote read_status override as `cao worker send` above.",
-    (
-        "services/agent_step.py",
-        "run_agent_step",
-    ): "LIVE SIBLING of #735, not fixed here: _wait_for_completion polls "
-    "status_monitor.get_status() and returns on the first COMPLETED (agent_step.py:243) "
-    "after send_input discarded the boundary, so a workflow step reusing an existing "
-    "terminal can settle on the previous turn's completion. Filed separately; gating it "
-    "means threading dispatch_input's boundary through run_agent_step.",
-}
-
-
-def _iter_functions():
-    for path in sorted(SRC.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        rel = path.relative_to(SRC).as_posix()
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                yield rel, node
+# A dispatch-then-wait site that passes no boundary ON PURPOSE carries this
+# comment inside the function, followed by the reason (or the issue tracking
+# it). Living at the site, it moves with a rename and dies with a deletion, so
+# there is no allowlist here to go stale. A NEW ungated site fails the lint
+# until it is either gated or marked -- that is the whole point.
+UNGATED_MARKER = "turn-boundary: ungated"
 
 
 def _name_of(node):
@@ -145,16 +125,48 @@ def _wait_calls(nodes):
 
 
 def _names_a_live_boundary(call):
-    """True if ``call`` passes a boundary keyword with a value other than a
-    literal ``None`` -- spelling the keyword with a disabling constant must not
-    read as gated."""
+    """True if ``call`` passes a boundary keyword whose value is computed, not written.
+
+    A turn boundary is sampled at dispatch time, so it can only ever arrive as a
+    name or an expression. Any literal -- ``None`` (the gate's off switch), ``0``,
+    ``8`` -- spells the keyword without naming a turn and must not read as gated
+    (review P3-1: ``min_generation=0`` used to pass).
+    """
     for kw in call.keywords:
         if kw.arg not in BOUNDARY_KWARGS:
             continue
-        if isinstance(kw.value, ast.Constant) and kw.value.value is None:
+        if isinstance(kw.value, ast.Constant):
             continue
         return True
     return False
+
+
+def _ungated_sites(rel, source):
+    """Lint core: (offenders, sites seen) for one module's source text.
+
+    An offender is a function that dispatches and waits in the same body, passes
+    no live boundary to any of its waits, and carries no ``UNGATED_MARKER``
+    comment anywhere in its own lines.
+    """
+    tree = ast.parse(source, filename=rel)
+    lines = source.splitlines()
+    offenders = []
+    seen = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        nodes = _body(fn)
+        waits = list(_wait_calls(nodes))
+        if not waits or not _dispatches(nodes):
+            continue
+        seen.append(f"{rel}:{fn.lineno} {fn.name}()")
+        if any(_names_a_live_boundary(call) for _, call in waits):
+            continue
+        own_lines = lines[fn.lineno - 1 : fn.end_lineno]
+        if any(UNGATED_MARKER in line for line in own_lines):
+            continue
+        offenders.append(f"{rel}:{fn.lineno} {fn.name}()")
+    return offenders, seen
 
 
 def test_every_dispatch_then_wait_site_consults_a_turn_boundary():
@@ -165,17 +177,12 @@ def test_every_dispatch_then_wait_site_consults_a_turn_boundary():
     sends and then waits without naming the turn has the same defect.
     """
     offenders = []
-    seen = set()
-    for rel, fn in _iter_functions():
-        nodes = _body(fn)
-        waits = list(_wait_calls(nodes))
-        if not waits or not _dispatches(nodes):
-            continue
-        site = (rel, fn.name)
-        seen.add(site)
-        gated = any(_names_a_live_boundary(call) for _, call in waits)
-        if not gated and site not in UNGATED_WAITS:
-            offenders.append(f"{rel}:{fn.lineno} {fn.name}()")
+    seen = []
+    for path in sorted(SRC.rglob("*.py")):
+        rel = path.relative_to(SRC).as_posix()
+        found, sites = _ungated_sites(rel, path.read_text(encoding="utf-8"))
+        offenders.extend(found)
+        seen.extend(sites)
 
     assert not offenders, (
         "These sites dispatch input and then wait for the turn to finish without "
@@ -183,16 +190,80 @@ def test_every_dispatch_then_wait_site_consults_a_turn_boundary():
         "COMPLETED -- which is genuinely the terminal's status until this turn's "
         "first PROCESSING is applied -- ends the wait at once (#735, #407):\n  "
         + "\n  ".join(offenders)
-        + "\nPass the dispatch boundary (e.g. min_generation=) or add the site to "
-        "UNGATED_WAITS with the reason it is sound."
+        + "\nPass the dispatch boundary (e.g. min_generation=) or, if the site is "
+        f"sound without one, say why in a `# {UNGATED_MARKER} -- <reason>` comment "
+        "inside the function."
     )
-    # The allowlist must not outlive its entries, or it silently stops being a record.
-    assert not (set(UNGATED_WAITS) - seen), (
-        "UNGATED_WAITS names sites that no longer dispatch-then-wait; drop them: "
-        f"{sorted(set(UNGATED_WAITS) - seen)}"
-    )
-    # And the lint must actually be looking at something.
+    # The lint must actually be looking at something.
     assert seen, "found no dispatch-then-wait sites at all -- the call-name sets are stale"
+
+
+_SNIPPET = """
+def ungated(tid):
+    send_input(tid, "go")
+    poll_until_done(tid, 30)
+
+def marked(tid):
+    send_input(tid, "go")
+    # {marker} -- the status here comes from a route with no generation
+    poll_until_done(tid, 30)
+
+def literal_zero(tid):
+    send_input(tid, "go")
+    poll_until_done(tid, 30, min_generation=0)
+
+def literal_none(tid):
+    send_input(tid, "go")
+    poll_until_done(tid, 30, min_generation=None)
+
+def gated(tid):
+    boundary = dispatch_input(tid, "go")
+    poll_until_done(tid, 30, min_generation=boundary)
+
+async def gated_via_to_thread(tid):
+    boundary = await asyncio.to_thread(dispatch_input, tid, "go")
+    await asyncio.to_thread(poll_until_done, tid, 30, min_generation=boundary)
+
+def only_waits(tid):
+    poll_until_done(tid, 30)
+
+def marked_outside(tid):
+    send_input(tid, "go")
+    poll_until_done(tid, 30)
+# {marker} -- a comment after the function does not mark it
+"""
+
+
+def test_lint_core_judges_each_shape():
+    """Pin what the lint refuses and accepts, independent of today's src/.
+
+    The review found two soft spots: a literal ``min_generation=0`` read as
+    gated, and the exemption list was keyed by file path and function name so a
+    rename failed the lint with no behaviour change. Both are pinned here: a
+    literal never gates, and the marker exempts a site only from inside it.
+    """
+    source = textwrap.dedent(_SNIPPET.format(marker=UNGATED_MARKER))
+    offenders, seen = _ungated_sites("snippet.py", source)
+    offending = {o.split()[1] for o in offenders}
+    considered = {s.split()[1] for s in seen}
+
+    assert offending == {"ungated()", "literal_zero()", "literal_none()", "marked_outside()"}
+    assert considered == offending | {"marked()", "gated()", "gated_via_to_thread()"}
+    assert "only_waits()" not in considered, "a wait with no dispatch is not a site"
+
+
+def test_a_renamed_or_moved_marked_site_is_still_exempt():
+    """The exemption travels with the code, not with a (path, name) key."""
+    marked = textwrap.dedent(f"""
+        def {{name}}(tid):
+            send_input(tid, "go")
+            # {UNGATED_MARKER} -- reason lives here
+            poll_until_done(tid, 30)
+        """)
+    for rel, name in (("cli/commands/worker.py", "send"), ("elsewhere/renamed.py", "deliver")):
+        offenders, seen = _ungated_sites(rel, marked.format(name=name))
+        assert not offenders, (rel, name)
+        assert len(seen) == 1
 
 
 @pytest.fixture
@@ -261,14 +332,19 @@ def test_the_status_a_client_reads_still_carries_which_turn_earned_it(_finished_
         response.json.return_value = body
         return response
 
-    import click
-
+    # An ungated wait returns on this COMPLETED at the first read. The gate, fed
+    # the body above, must refuse it for the whole (short) timeout instead: that
+    # raise IS the assertion, so it is spelled out rather than left to
+    # ``pytest.raises`` with a read count beside it (review P3-1).
     with patch("cli_agent_orchestrator.utils.terminal.api_http.get", side_effect=get):
-        with pytest.raises(click.ClickException):  # times out: never this turn's completion
+        try:
             poll_until_done("term735", timeout=0.05, polling_interval=0.01, min_generation=8)
-
-    assert len(reads) >= 1, (
-        "GET /terminals/{id}'s body no longer tells poll_until_done which turn the "
-        "status was earned from, so the #735 gate silently degraded to the frame-based "
-        "wait and a send can again finish on the previous turn's COMPLETED"
-    )
+        except click.ClickException as exc:
+            assert "Timed out" in exc.message, exc.message
+        else:
+            pytest.fail(
+                "GET /terminals/{id}'s body no longer tells poll_until_done which turn "
+                "the status was earned from, so the #735 gate silently degraded to the "
+                "frame-based wait and finished on the previous turn's COMPLETED after "
+                f"{len(reads)} read(s)"
+            )
