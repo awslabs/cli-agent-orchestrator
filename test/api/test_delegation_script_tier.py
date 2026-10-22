@@ -132,14 +132,17 @@ class TestRunStepHandler:
         assert resp.status_code == 200
         assert m_run.call_args.kwargs["delegating_terminal_id"] is None
 
-    @pytest.mark.usefixtures("isolated_memory_db")
-    def test_reviewer_started_script_cannot_launch_a_developer_step(
-        self, client, monkeypatch, isolated_journal
-    ):
-        """End to end through the REAL run_agent_step and create_terminal: the
-        script's developer step is refused with 403 against the reviewer's stored
-        ceiling, and the script record's step settles FAILED with the refusal."""
-        from cli_agent_orchestrator.models.workflow import StepState
+    @staticmethod
+    def _launch_capable(monkeypatch):
+        """Arm a reviewer-started script run ``r3`` whose developer step WOULD launch.
+
+        Everything after the refusal point is mocked so that, if the bound were
+        dropped, the developer would LAUNCH (200, a stored row with execute_bash)
+        and the assertions fail on that observation, not on a mock raising first
+        (review of the first version of this test). Returns the backend mock so
+        the test can assert no window was created.
+        """
+        from cli_agent_orchestrator.services import agent_step
 
         db_create_terminal(
             "0000beef", "cao-s", "rev", "claude_code", "reviewer", REVIEWER, delegate_tools=REVIEWER
@@ -147,12 +150,6 @@ class TestRunStepHandler:
         monkeypatch.setitem(workflow_service.run_registry, "r3", _record("r3", "0000beef"))
         profiles = {"developer": AgentProfile(name="developer", description="d", role="developer")}
         monkeypatch.setattr(f"{_TS}.agent_profiles.load_agent_profile", lambda n: profiles[n])
-        # Launch-capable: everything after the refusal point is mocked so that, if
-        # the bound were dropped, the developer would LAUNCH (200, a stored row
-        # with execute_bash) and the assertions below fail on that observation,
-        # not on a mock raising first (review of the first version of this test).
-        from cli_agent_orchestrator.services import agent_step
-
         provider = AsyncMock()
         provider.initialize.return_value = True
         pm = MagicMock()
@@ -176,12 +173,15 @@ class TestRunStepHandler:
         monkeypatch.setattr(
             "cli_agent_orchestrator.api.main.terminal_service.get_output", lambda *a, **kw: "done"
         )
+        return backend
 
+    @staticmethod
+    def _post_developer_step(client):
         with patch(
             "cli_agent_orchestrator.services.workflow_service.check_generation",
             return_value=None,
         ):
-            resp = client.post(
+            return client.post(
                 TERMINALS_RUN_STEP_ROUTE,
                 json={
                     "provider": "claude_code",
@@ -191,21 +191,83 @@ class TestRunStepHandler:
                     "env_vars": _env("r3"),
                 },
             )
+
+    @staticmethod
+    def _developer_rows():
+        from cli_agent_orchestrator.clients import database
+
+        with database.SessionLocal() as session:
+            return (
+                session.query(database.TerminalModel).filter_by(agent_profile="developer").count()
+            )
+
+    @pytest.mark.usefixtures("isolated_memory_db")
+    def test_reviewer_started_script_cannot_launch_a_developer_step(
+        self, client, monkeypatch, isolated_journal
+    ):
+        """End to end through the REAL run_agent_step and create_terminal: the
+        script's developer step is refused with 403 against the reviewer's stored
+        ceiling, and the script record's step settles FAILED with the refusal.
+
+        The run carries the admission snapshot ``launch_guard.capture`` records at
+        script admission (#1014), so the launch guard admits the step and the
+        delegation ceiling is the check that refuses. Without that row the guard
+        refuses first with 409 (next test) and this path is never reached."""
+        import json
+
+        from cli_agent_orchestrator.models.workflow import StepState
+        from cli_agent_orchestrator.services import launch_guard
+
+        backend = self._launch_capable(monkeypatch)
+        workflow_journal.insert_run(
+            "r3",
+            "wf",
+            json.dumps({"launch_guard": launch_guard.capture()}),
+            "{}",
+            "running",
+            "t",
+            tier="script",
+            caller_id="0000beef",
+        )
+
+        resp = self._post_developer_step(client)
         assert resp.status_code == 403, resp.text
         detail = resp.json()["detail"]
         assert "Delegation refused" in detail and "0000beef" in detail
         assert "fs_*, execute_bash, web_fetch" in detail
         backend.create_window.assert_not_called()
-        from cli_agent_orchestrator.clients import database
-
-        with database.SessionLocal() as session:
-            developers = (
-                session.query(database.TerminalModel).filter_by(agent_profile="developer").count()
-            )
-        assert developers == 0, "no developer row may exist: the launch must not have happened"
+        assert (
+            self._developer_rows() == 0
+        ), "no developer row may exist: the launch must not have happened"
         step = workflow_service.run_registry["r3"].step_states["step-1"]
         assert step.state == StepState.FAILED
         assert "Delegation refused" in (step.error or "")
+
+    @pytest.mark.usefixtures("isolated_memory_db")
+    def test_run_without_an_admission_snapshot_is_refused_409_before_the_ceiling(
+        self, client, monkeypatch, isolated_journal
+    ):
+        """Pin the order when BOTH refusals apply. A live script record with no
+        journal row has no recorded admission state, so ``launch_guard.check``
+        (#1014) refuses with 409 ``plan_inputs_changed`` before ``create_terminal``
+        ever compares the developer's allowlist with the reviewer's ceiling. The
+        admission check wins on purpose: a run CAO cannot prove it admitted must be
+        restarted whatever its steps ask for, and both refusals happen before any
+        launch, so the order changes only which message the operator reads. Either
+        way nothing launches."""
+        backend = self._launch_capable(monkeypatch)
+        assert workflow_journal.get_run("r3") is None
+
+        resp = self._post_developer_step(client)
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["kind"] == "plan_inputs_changed"
+        assert "recorded launch state is unreadable" in detail["message"]
+        assert "Delegation refused" not in resp.text
+        backend.create_window.assert_not_called()
+        assert (
+            self._developer_rows() == 0
+        ), "no developer row may exist: the launch must not have happened"
 
 
 class TestRoutesCarryTheCaller:
