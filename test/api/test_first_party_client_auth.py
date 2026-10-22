@@ -28,6 +28,15 @@ assert the call SUCCEEDS — an admitted request may still 404 or 500 because no
 no skill and no live terminal exist in a unit test. The only claim is that the client got
 past the gate, which is the one thing nothing else checks.
 
+Each surface declares every hop it is meant to make (``_Surface.hops``) and the test
+asserts each one occurred, so a client that stops after its first request cannot pass on
+the strength of that request alone. The two-hop tools (``answer_user_prompt``,
+``list_siblings``, ``update_metadata``) first ``GET /terminals/{own}`` and give up if the
+row is missing, so the fixture stubs the terminal service with one row for ``TERMINAL_ID``
+-- waiting on a user answer, unrestricted tools, created by ``CALLER_ID`` -- and the
+no-op writes behind ``/input``, ``/siblings`` and ``/metadata``. The routes, and their
+auth dependencies, are the real ones; only the service layer under them is stubbed.
+
 Auth mode: local-token (#706, ``security/auth.py``). ``CAO_AUTH_LOCAL_TOKEN`` alone switches
 ``is_auth_enabled()`` on for the server AND is what ``get_local_bearer()`` hands the client,
 and a match grants the full scope set. That isolates the single variable this module is
@@ -87,14 +96,20 @@ from cli_agent_orchestrator.mcp_server import app_tools
 from cli_agent_orchestrator.mcp_server import server as mcp_server
 from cli_agent_orchestrator.ops_mcp_server import server as ops_server
 from cli_agent_orchestrator.security import auth as auth_module
+from cli_agent_orchestrator.services import terminal_service
 
 LOCAL_TOKEN = "first-party-client-auth-local-token"
 
 # Passes the TerminalId path pattern (``^[a-f0-9]{8}$``) so a refusal can only come
 # from the auth dependency, never from path validation.
 TERMINAL_ID = "abcdef12"
+# The terminal recorded as having created TERMINAL_ID via assign/handoff.
+CALLER_ID = "0badcafe"
 
 REFUSED = (401, 403)
+
+# One (method, path) the client is expected to put on the wire.
+_Expected = Tuple[str, str]
 
 
 @dataclass
@@ -207,6 +222,39 @@ def _new_boundary() -> _ApiBoundary:
     return _ApiBoundary(TestClient(app, base_url="http://localhost"), [])
 
 
+def _terminal_row(terminal_id: str) -> Dict[str, Any]:
+    """What ``GET /terminals/{id}`` serves for any id the clients ask about.
+
+    Shaped so every two-hop tool proceeds to its second call: ``status`` lets
+    ``answer_user_prompt`` go on to ``POST .../input``; ``allowed_tools=None`` is the
+    unrestricted grant ``_require_discovery_marker`` accepts; ``caller_id`` gives a
+    reply-to-caller ``send_message`` an address.
+    """
+    return {
+        "id": terminal_id,
+        "name": "worker",
+        "provider": "claude_code",
+        "session_name": "first-party-client-auth",
+        "agent_profile": "developer",
+        "caller_id": CALLER_ID if terminal_id == TERMINAL_ID else None,
+        "allowed_tools": None,
+        "status": "waiting_user_answer",
+        "metadata": {},
+    }
+
+
+def _stub_terminal_service(monkeypatch) -> None:
+    """One terminal row, and inert writes, under the REAL terminal routes."""
+    monkeypatch.setattr(terminal_service, "get_terminal", _terminal_row)
+    monkeypatch.setattr(terminal_service, "update_metadata", lambda terminal_id, metadata: True)
+    monkeypatch.setattr(
+        terminal_service,
+        "list_siblings",
+        lambda caller_id, depth=None, cross_session=False: [],
+    )
+    monkeypatch.setattr(terminal_service, "send_input", lambda *args, **kwargs: True)
+
+
 @pytest.fixture
 def boundary(monkeypatch):
     """Auth on (local-token mode), and every client's HTTP wired to the real app.
@@ -224,8 +272,10 @@ def boundary(monkeypatch):
     assert auth_module.is_local_token_mode() is True
     assert auth_module.get_local_bearer() == LOCAL_TOKEN
 
-    # The tools that act on "my own terminal" need an identity to act as.
+    # The tools that act on "my own terminal" need an identity to act as, and a row
+    # for it on the server so their second hop is reached (see _terminal_row).
     monkeypatch.setenv("CAO_TERMINAL_ID", TERMINAL_ID)
+    _stub_terminal_service(monkeypatch)
 
     adapter = _new_boundary()
     for verb in ("get", "post", "put", "patch", "delete", "request"):
@@ -360,6 +410,9 @@ class _Surface:
 
     id: str
     drive: Callable[[], Any]
+    # Every request the entry point is meant to make. The test asserts each one was
+    # seen, so a case covers exactly the hops it names and no fewer.
+    hops: Tuple[_Expected, ...]
     credential: Callable[[Optional[str]], bool] = _this_nodes_bearer
     marks: Tuple[Any, ...] = ()
 
@@ -367,42 +420,52 @@ class _Surface:
         return pytest.param(self, id=self.id, marks=self.marks)
 
 
+_OWN = f"/terminals/{TERMINAL_ID}"
+
 SURFACES: List[_Surface] = [
     # --- mcp_server tools: the #990 class, fixed by #991 ---------------------
     _Surface(
         id="mcp.load_skill",
         drive=lambda: _call(_tool(mcp_server, "load_skill"), name="cao-memory"),
+        hops=(("GET", "/skills/cao-memory"),),
     ),
     _Surface(
         id="mcp.emit_ui",
         drive=lambda: _call(_tool(mcp_server, "emit_ui"), component="progress", props={"pct": 1}),
+        hops=(("POST", "/agui/v1/emit_ui"),),
     ),
     _Surface(
         id="mcp.answer_user_prompt",
         drive=lambda: _call(
             _tool(mcp_server, "answer_user_prompt"), terminal_id=TERMINAL_ID, answer="1"
         ),
+        hops=(("GET", _OWN), ("POST", f"{_OWN}/input")),
     ),
     _Surface(
         id="mcp.list_siblings",
         drive=lambda: _call(_tool(mcp_server, "list_siblings"), depth=None, cross_session=False),
+        hops=(("GET", _OWN), ("GET", f"{_OWN}/siblings")),
     ),
     _Surface(
         id="mcp.update_metadata",
         drive=lambda: _call(_tool(mcp_server, "update_metadata"), metadata={"doing": "gate"}),
+        hops=(("GET", _OWN), ("PATCH", f"{_OWN}/metadata")),
     ),
     _Surface(
         id="mcp.workflow_list",
         drive=lambda: _call(_tool(mcp_server, "workflow_list")),
+        hops=(("GET", "/workflows/runs"),),
     ),
     _Surface(
         id="mcp.workflow_status",
         drive=lambda: _call(_tool(mcp_server, "workflow_status"), run_id="run-9007"),
+        hops=(("GET", "/workflows/runs/run-9007"),),
     ),
     # --- script tier: the shim cannot see a credential at all (#829) ---------
     _Surface(
         id="script_tier.run_step",
         drive=_shim_run_step,
+        hops=(("POST", "/terminals/run-step"),),
         credential=_some_credential,
         marks=(_BROKEN_SCRIPT_TIER,),
     ),
@@ -410,18 +473,22 @@ SURFACES: List[_Surface] = [
     _Surface(
         id="ops_mcp.list_profiles",
         drive=lambda: _call(_tool(ops_server, "list_profiles")),
+        hops=(("GET", "/agents/profiles"),),
     ),
     _Surface(
         id="ops_mcp.list_sessions",
         drive=lambda: _call(_tool(ops_server, "list_sessions")),
+        hops=(("GET", "/sessions"),),
     ),
     _Surface(
         id="mcp_apps.render_dashboard",
         drive=lambda: app_tools._render_dashboard_impl(),
+        hops=(("GET", "/sessions"),),
     ),
     _Surface(
         id="cli.session_list",
         drive=lambda: _cli(cli_session.session, ["list"]),
+        hops=(("GET", "/sessions"),),
     ),
 ]
 
@@ -436,6 +503,12 @@ def test_first_party_client_is_not_refused_at_the_auth_boundary(boundary, surfac
     assert boundary.hops, (
         "the client made no HTTP call, so this case proves nothing -- the entry point "
         "short-circuited before its request (check the fixture's env and arguments)"
+    )
+    seen = {(hop.method.upper(), hop.path) for hop in boundary.hops}
+    missing = [hop for hop in surface.hops if hop not in seen]
+    assert not missing, (
+        f"the client never made {missing}, so this case does not cover them -- it stopped "
+        "after: " + "; ".join(str(h) for h in boundary.hops)
     )
     refused = [hop for hop in boundary.hops if hop.status in REFUSED]
     assert not refused, "refused at the auth boundary: " + "; ".join(str(h) for h in refused)
@@ -453,6 +526,18 @@ def test_first_party_client_sends_its_credential_on_every_hop(boundary, surface)
     assert boundary.hops
     bare = [hop for hop in boundary.hops if not surface.credential(hop.bearer)]
     assert not bare, "sent no / wrong credential: " + "; ".join(str(h) for h in bare)
+
+
+def test_every_surface_declares_the_hops_it_covers():
+    """The class guard for "covers only its first hop": a case must name what it covers.
+
+    A surface with no declared hops would fall back to "made at least one call", which is
+    the shape that let three two-hop tools pass on their lookup alone.
+    """
+    for surface in SURFACES:
+        assert surface.hops, f"{surface.id}: declares no hops"
+        for method, path in surface.hops:
+            assert method == method.upper() and path.startswith("/"), (surface.id, method, path)
 
 
 def test_known_broken_markers_lift_themselves():
