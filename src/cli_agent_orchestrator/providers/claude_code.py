@@ -295,6 +295,12 @@ NEW_TUI_SPINNER_PATTERN = r"[✶✢✽✻✳·*][^\n]*ing…"
 # word boundary to assert there.
 _SPINNER_VERB = r"(?:\w*ing\b|[\w'’-]*(?:ing|in['’])(?=…))"
 NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+" + _SPINNER_VERB + r".*…")
+# The same spinner shape, anywhere in the boxless tail after an interim summary
+# (see get_status): the cleaned raw stream can leave the spinner mid-line, so
+# no line-start anchor. Built from _SPINNER_VERB so the "-" / "'" default verbs
+# ("✢ Dilly-dallying…") are a live spinner here too; a plain "\w*ing\b" let
+# them read COMPLETED after "✻ Pondered for 8s" (PR #975 review, P3-4).
+AFTER_SUMMARY_SPINNER_PATTERN = re.compile(r"[✶✢✽✻✳·*][ \t]+" + _SPINNER_VERB + r"[^\n]*…")
 # Live spinner under Claude Code's prefersReducedMotion setting (GH #908): the
 # animated glyph is replaced by a static "●", e.g. "● Leavening… (running
 # UserPromptSubmit hook)" or "● Sublimating… (12s · ↓ 300 tokens)". "●" is also
@@ -1114,7 +1120,7 @@ class ClaudeCodeProvider(BaseProvider):
             _after_summary = _tail[_last_summary.end() :] if _last_summary else ""
             if (
                 _last_summary is not None
-                and not re.search(r"[✶✢✽✻✳·*][ \t]+\w*ing\b[^\n]*…", _after_summary)
+                and not AFTER_SUMMARY_SPINNER_PATTERN.search(_after_summary)
                 and not REDUCED_MOTION_SPINNER_PATTERN.search(_after_summary)
             ):
                 _boxless_completion_tail = True

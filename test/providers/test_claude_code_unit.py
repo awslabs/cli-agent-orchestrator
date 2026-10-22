@@ -2422,17 +2422,40 @@ class TestClaudeCodeMcpCallNotCompleted:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status(output) == TerminalStatus.PROCESSING
 
-    def test_live_spinner_after_interim_summary_in_tail_is_processing(self):
+    @pytest.mark.parametrize(
+        "verb",
+        [
+            "Churning",
+            # Default verbs carrying "-" / "'" (PR #975 review, P3-4): the
+            # after-summary check used a plain "\\w*ing\\b", so these read
+            # COMPLETED after an interim summary while "Churning" did not.
+            "Dilly-dallying",
+            "Beboppin'",
+            "Beboppin’",
+        ],
+    )
+    def test_live_spinner_after_interim_summary_in_tail_is_processing(self, verb):
         """A live spinner AFTER an interim summary in the post-separator tail
         keeps the turn PROCESSING (the summary is interim, not final)."""
         box = "─" * 30
         output = (
             "● Working on the report…\n"
             "✢ Misting… (10s · ↑ 12 tokens)\n" + box + "\n✻ Pondered for 8s\n"
-            "✢ Churning… (2s · ↑ 4 tokens)\n❯ \n"
+            f"✢ {verb}… (2s · ↑ 4 tokens)\n❯ \n"
         )
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_hyphenated_prose_bullet_after_interim_summary_does_not_hold_processing(self):
+        """The widened verb class must not reopen the bullet gap in this check:
+        a settled hyphenated bullet after the final summary is still COMPLETED."""
+        box = "─" * 30
+        output = (
+            "● Working on the report…\n" + box + "\n✻ Worked for 8s\n"
+            "● Notes:\n* Long-running jobs now stop after 30 minutes…\n❯ \n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
 
     def test_summary_without_following_spinner_still_completed(self):
         """No live spinner after the summary → boxless completion still wins."""
