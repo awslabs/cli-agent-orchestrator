@@ -396,11 +396,13 @@ class ProfileEntry:
     UTF-8). ``None`` is a classification, not an error: it is the same answer the launch path gives.
 
     ``artifacts`` maps each path-free label from ``install_service.installed_artifact_paths`` (a
-    provider's per-agent file, the installed context copy) to that file's bytes, or ``None`` when it does
-    not exist. These are the files a provider READS AT LAUNCH that CAO wrote at ``cao install`` time and
-    does not regenerate: for the default provider (Kiro) they carry the tool policy — ``tools``,
-    ``allowedTools``, ``hooks``, ``mcpServers`` — and the system prompt, so a plan identity that bound
-    only the CAO profile left the default provider's actual behaviour outside it (PR #1000, P2-2).
+    provider's per-agent file, the shared OpenCode ``opencode.json``, the installed context copy) to
+    that file's bytes, or ``None`` when it does not exist. These are the files a provider READS AT
+    LAUNCH that CAO wrote at ``cao install`` time and does not regenerate: for the default provider
+    (Kiro) they carry the tool policy — ``tools``, ``allowedTools``, ``hooks``, ``mcpServers`` — and the
+    system prompt, so a plan identity that bound only the CAO profile left the default provider's actual
+    behaviour outside it (PR #1000, P2-2); for OpenCode the MCP server commands and the agent's tool
+    grant live in the shared ``opencode.json`` (PR #1000 round 2, P2-1).
     """
 
     source: Optional[str]

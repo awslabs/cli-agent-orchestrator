@@ -40,8 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   content.
 - **Breaking / migration:** script-run plan identifiers move from `plan-v1:` to `plan-v2:` and now
   bind the installed agent profile set — every installed profile's source text plus the files
-  `cao install` wrote for it (the Kiro agent JSON, the Copilot and OpenCode agent files, the installed
-  context copy) — because a step's system prompt and tool policy come from those files, not from the
+  `cao install` wrote for it (the Kiro agent JSON, the Copilot and OpenCode agent files, the shared
+  OpenCode `opencode.json`, the installed context copy) — because a step's system prompt and tool policy come from those files, not from the
   script (#827, first acceptance criterion). Every stored `plan-v1` approval stops matching: the first
   new run of each plan is refused with its `plan-v2` identifier until an operator approves it again.
   A run frozen and approved before the upgrade still resumes on its stored `plan-v1` identifier.

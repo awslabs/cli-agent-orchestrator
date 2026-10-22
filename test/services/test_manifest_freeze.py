@@ -265,7 +265,7 @@ def test_non_git_plan_ids_bind_root_and_git_golden_is_unchanged(tmp_path, monkey
     )
     assert (
         _frozen()["plan_id"]
-        == "plan-v2:fd79bdd97e084a834e4e9f3210b76756adadd1303eb5241be4a03e02cca3dbd3"
+        == "plan-v2:c89991b472d5f8aed662a8677d00770f3ae19224d17c95112f3863545f248d38"
     )
 
 
@@ -298,6 +298,13 @@ def _store(tmp_path, monkeypatch, **profiles) -> None:
         "AGENT_CONTEXT_DIR",
     ):
         monkeypatch.setattr(install_service, attr, tmp_path / "install" / attr.lower())
+    # The shared OpenCode config is an installed artifact too (PR #1000 round 2, P2-1); unpinned, the
+    # digest would read, and the artifact tests would WRITE, ~/.aws/opencode/opencode.json.
+    from cli_agent_orchestrator.utils import opencode_config
+
+    monkeypatch.setattr(
+        opencode_config, "OPENCODE_CONFIG_FILE", tmp_path / "install" / "opencode.json"
+    )
     store = tmp_path / "agent-store"
     store.mkdir(exist_ok=True)
     for stale in store.glob("*.md"):

@@ -467,9 +467,9 @@ and discarded; it is never written to the manifest as its own value.
 > digest therefore covers **every installed profile**, not just the ones a script happens to use. The
 > practical consequence: `cao install <anything>`, or editing any profile in your agent store or any
 > file `cao install` wrote for a profile (the Kiro agent JSON, the Copilot or OpenCode agent file, the
-> installed context copy), invalidates every existing approval and the next run of each plan is
-> refused until re-approved. The packaged built-in profiles are in the set too, so a CAO upgrade that
-> changes a bundled profile also moves every `plan_id`.
+> shared OpenCode `opencode.json`, the installed context copy), invalidates every existing approval and
+> the next run of each plan is refused until re-approved. The packaged built-in profiles are in the set
+> too, so a CAO upgrade that changes a bundled profile also moves every `plan_id`.
 
 > **Migration: new runs move to `plan-v2`; approved `plan-v1` resumes still pass.** A `plan_id` computed after
 > upgrading always uses the new `plan-v2:` scheme, so the first NEW run of every plan is refused until
@@ -624,7 +624,9 @@ rather than what survived the redaction rules of the day.
 
 An approval binds four things: the script source, its resolved inputs, the state of the run's
 working directory when the run is admitted, and the installed agent profile set (every profile's
-source text plus the files `cao install` wrote for it). For a Git repository the directory state is
+source text plus the files `cao install` wrote for it, including the shared OpenCode `opencode.json`,
+which is bound whole because OpenCode reads the whole file, so an edit to your own key in it also moves
+every `plan_id`). For a Git repository the directory state is
 the commit and the worktree changes, not the path, so two checkouts in the same state share one
 approval. For a directory outside any Git repository it is only the directory's canonical path.
 

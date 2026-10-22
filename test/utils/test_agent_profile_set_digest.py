@@ -32,6 +32,13 @@ def _pin_install_dirs(monkeypatch, tmp_path) -> None:
         "AGENT_CONTEXT_DIR",
     ):
         monkeypatch.setattr(install_service, attr, tmp_path / "install" / attr.lower())
+    # The shared OpenCode config is an installed artifact too (PR #1000 round 2, P2-1); unpinned, the
+    # digest would read, and the artifact tests would WRITE, ~/.aws/opencode/opencode.json.
+    from cli_agent_orchestrator.utils import opencode_config
+
+    monkeypatch.setattr(
+        opencode_config, "OPENCODE_CONFIG_FILE", tmp_path / "install" / "opencode.json"
+    )
 
 
 def _pin_provider_and_extra_dirs(monkeypatch, tmp_path) -> None:
@@ -368,7 +375,7 @@ def _artifact_labels(name: str):
 def test_the_installer_has_per_agent_sinks_for_this_test_to_cover():
     """If the installer stops writing per-agent files, the artifact tests below would pass vacuously."""
     labels = _artifact_labels("reviewer")
-    assert {"kiro_cli", "copilot_cli", "opencode_cli"} <= set(labels), labels
+    assert {"kiro_cli", "copilot_cli", "opencode_cli", "opencode_cli:config"} <= set(labels), labels
     assert any(label.startswith("context:") for label in labels), labels
 
 

@@ -385,6 +385,13 @@ def _pinned_store(tmp_path, monkeypatch):
         "AGENT_CONTEXT_DIR",
     ):
         monkeypatch.setattr(install_service, attr, tmp_path / "install" / attr.lower())
+    # The shared OpenCode config is an installed artifact too (PR #1000 round 2, P2-1); unpinned, the
+    # digest would read, and the artifact tests would WRITE, ~/.aws/opencode/opencode.json.
+    from cli_agent_orchestrator.utils import opencode_config
+
+    monkeypatch.setattr(
+        opencode_config, "OPENCODE_CONFIG_FILE", tmp_path / "install" / "opencode.json"
+    )
     monkeypatch.setattr(
         launch_guard.settings_service, "is_workflow_approval_required", lambda: True
     )
