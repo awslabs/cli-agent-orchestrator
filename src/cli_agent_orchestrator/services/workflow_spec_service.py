@@ -41,6 +41,7 @@ import yaml
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import (
+    SCRIPT_LINT_MAX_SOURCE_CHARS,
     WORKFLOW_INPUT_TYPES,
     WORKFLOW_MAX_SPEC_BYTES,
     WORKFLOW_NAME_RE,
@@ -892,18 +893,30 @@ def _extract_inputs(source: str) -> Dict[str, InputDecl]:
       ``WORKFLOW_INPUT_TYPES``; a default whose type disagrees with ``type`` is a
       ``ValueError`` (reuses the shared author-time ``_default_matches_type``).
 
-    This function has NO length bound of its own (see
-    ``test_ast_parse_depth_guard.py``'s ``_ALLOWED_PARSER_CALLS`` entry for this
-    call site) -- both real callers run ``lint_script`` first and skip/refuse on its
-    oversize ``syntax`` finding, which keeps this ``ast.parse`` from ever actually
-    seeing input past ``SCRIPT_LINT_MAX_SOURCE_CHARS``. The ``RecursionError``/
-    ``MemoryError`` arms below are a backstop for that coupling, not the primary
-    defense (#969/#970): on a host whose ``ast.parse`` C-stack cliff is closer in
-    than ``SCRIPT_LINT_MAX_SOURCE_CHARS`` was measured against (observed on CPython
-    3.11 in CI, which raises ``RecursionError`` cleanly rather than segfaulting), a
-    source already past that cliff but still within the coupling's assumptions would
-    otherwise take the caller down with no exception to convert.
+    Bounded on its own (#969, #970 review P2-1): a source over
+    ``SCRIPT_LINT_MAX_SOURCE_CHARS`` is refused before ``ast.parse`` runs. Both real
+    callers (``_read_script_spec``, ``_validated_script_spec``) run ``lint_script``
+    first and skip or refuse on its oversize ``syntax`` finding, so in practice this
+    check does not fire -- but "lint runs first" is a coupling between two functions,
+    not a bound, and on CPython 3.10 a parse past the host's C-stack cliff segfaults
+    with no exception to convert. 256 KiB of ``a.b.b...`` (the most the read path's
+    byte budget admits) is past that cliff on every 3.10 host measured. Same unit
+    (characters) and same constant as the linter's cap, so the two parser entry
+    points can never disagree about which source is admissible;
+    ``test_ast_parse_depth_guard.py`` checks that a comparison against the constant
+    precedes every parser call in ``src/``.
+
+    The ``RecursionError``/``MemoryError`` arms below cover what the bound admits:
+    CPython 3.11+ gates the AST build and raises ``RecursionError`` well under the
+    cap, and a right-recursive construct (a chain of unary operators) overflows the
+    parser's fixed stack with ``MemoryError`` at about 6,000 levels on every
+    supported minor.
     """
+    if len(source) > SCRIPT_LINT_MAX_SOURCE_CHARS:
+        raise ValueError(
+            f"workflow script is {len(source)} characters, over the "
+            f"{SCRIPT_LINT_MAX_SOURCE_CHARS}-character limit; split it into smaller scripts"
+        )
     try:
         tree = ast.parse(source)
     except SyntaxError as e:

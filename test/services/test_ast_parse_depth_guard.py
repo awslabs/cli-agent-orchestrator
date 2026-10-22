@@ -38,7 +38,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, NamedTuple, Set, Tuple
 
 import pytest
 
@@ -56,34 +56,38 @@ _PARSER_CALLS = frozenset({"ast.parse", "ast.literal_eval", "compile", "exec", "
 
 # Every parser call in ``src/``, keyed by (path relative to src/, enclosing qualname, call
 # target) -- the target is part of the key so a SECOND, different parser call added inside an
-# already-allowlisted function is still caught -- with the bound that keeps its input finite.
-# A NEW entry means a parser call landed with no length bound in front of it -- add the bound
-# first, then the row.
-_ALLOWED_PARSER_CALLS: Dict[Tuple[str, str, str], str] = {
+# already-allowlisted function is still caught. The value names the constant the enclosing
+# function compares its input against BEFORE the call, plus why; the test checks that the
+# comparison really exists (a row is a claim, the scan is the proof -- #970 review P2-1 found
+# a row whose "bound" was another function's ordering). A NEW entry means a parser call landed
+# with no length bound in front of it -- add the bound first, then the row.
+_ALLOWED_PARSER_CALLS: Dict[Tuple[str, str, str], Tuple[str, str]] = {
     (
         "cli_agent_orchestrator/services/script_lint.py",
         "lint_script",
         "ast.parse",
-    ): "SCRIPT_LINT_MAX_SOURCE_CHARS, checked before the parse in the same function",
+    ): (
+        "SCRIPT_LINT_MAX_SOURCE_CHARS",
+        "checked before the parse in the same function; the verdict is a syntax finding",
+    ),
     (
         "cli_agent_orchestrator/services/workflow_spec_service.py",
         "_extract_inputs",
         "ast.parse",
     ): (
-        "NO BOUND OF ITS OWN -- borrows lint_script's. Both callers run lint_script first "
-        "and bail on its oversize finding: _read_script_spec (:1012) skips extraction when "
-        "a rule_id == 'syntax' finding exists, _validated_script_spec (:1087) raises on "
-        "status == 'fail'. test_oversize_rejection_keeps_the_rule_id_extract_inputs_skips_on "
-        "pins that coupling; giving the oversize rejection its own rule_id reopens #969."
+        "SCRIPT_LINT_MAX_SOURCE_CHARS",
+        "checked before the parse in the same function; the verdict is a ValueError. Until "
+        "#970's P2-1 fix this row borrowed lint_script's cap through the callers' lint-first "
+        "ordering, and 256 KiB of a.b.b... reached ast.parse and segfaulted CPython 3.10.",
     ),
     (
         "cli_agent_orchestrator/services/workflow_spec_service.py",
         "_extract_inputs",
         "ast.literal_eval",
     ): (
-        "Same shield as the ast.parse row above: these calls only run on sub-nodes of the "
-        "tree that call already produced, so they inherit its coupling to lint_script's "
-        "oversize rejection rather than needing a bound of their own."
+        "SCRIPT_LINT_MAX_SOURCE_CHARS",
+        "same check as the ast.parse row above: these calls only run on sub-nodes of the "
+        "tree that call already produced.",
     ),
 }
 
@@ -117,11 +121,18 @@ def _import_aliases(tree: ast.Module) -> Dict[str, str]:
     return aliases
 
 
-def _qualname_of_parser_calls(tree: ast.Module) -> List[Tuple[str, str]]:
-    """Collect (canonical call target, enclosing qualname) for each parser call."""
+class _ParserCall(NamedTuple):
+    target: str  # canonical dotted call target, e.g. ``ast.parse``
+    qualname: str  # enclosing def/class chain, or ``<module>``
+    lineno: int
+    scope: ast.AST  # the enclosing def/class node (or the module) the bound must live in
+
+
+def _parser_calls(tree: ast.Module) -> List[_ParserCall]:
+    """Collect every parser call with its enclosing scope, in source order."""
 
     aliases = _import_aliases(tree)
-    found: List[Tuple[str, str]] = []
+    found: List[_ParserCall] = []
 
     def canonical(node: ast.expr) -> str:
         parts = _dotted(node).split(".")
@@ -129,38 +140,80 @@ def _qualname_of_parser_calls(tree: ast.Module) -> List[Tuple[str, str]]:
             parts[0] = aliases[parts[0]]
         return ".".join(parts)
 
-    def visit(node: ast.AST, scope: str) -> None:
+    def visit(node: ast.AST, scope: str, scope_node: ast.AST) -> None:
         for child in ast.iter_child_nodes(node):
-            inner = scope
+            inner, inner_node = scope, scope_node
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 inner = f"{scope}.{child.name}" if scope else child.name
+                inner_node = child
             if isinstance(child, ast.Call) and canonical(child.func) in _PARSER_CALLS:
-                found.append((canonical(child.func), scope or "<module>"))
-            visit(child, inner)
+                found.append(
+                    _ParserCall(
+                        canonical(child.func), scope or "<module>", child.lineno, scope_node
+                    )
+                )
+            visit(child, inner, inner_node)
 
-    visit(tree, "")
+    visit(tree, "", tree)
     return found
 
 
-def test_every_ast_parse_site_is_allowlisted_with_a_length_bound() -> None:
-    """Enumerate the class, not the instance: no unbounded parser call may exist in src/."""
+def _bound_is_checked_before(scope: ast.AST, bound: str, call_lineno: int) -> bool:
+    """True when ``scope`` compares something against ``bound`` on a line before the call.
 
-    seen: Set[Tuple[str, str, str]] = set()
+    Deliberately syntactic: a ``Compare`` whose left side or any comparator is the named
+    constant (``len(source) > SCRIPT_LINT_MAX_SOURCE_CHARS``). It does not prove the branch
+    refuses the input -- the unit tests on each site do that -- only that a bound is
+    present in the SAME function as the parse, so that no caller's ordering is relied on.
+    """
+
+    for node in ast.walk(scope):
+        if isinstance(node, ast.Compare) and node.lineno < call_lineno:
+            operands = [node.left, *node.comparators]
+            if any(_dotted(operand).split(".")[-1] == bound for operand in operands):
+                return True
+    return False
+
+
+def test_every_ast_parse_site_is_allowlisted_with_a_length_bound() -> None:
+    """Enumerate the class, not the instance: no unbounded parser call may exist in src/.
+
+    Two checks. The allowlist must equal the set of parser calls found (a new call, or a
+    stale row, fails). AND each allowlisted call's enclosing function must compare its
+    input against the named bound before the call -- so a row cannot claim a bound that
+    lives in some other function (#970 review P2-1: the ``_extract_inputs`` row said
+    "borrows lint_script's", and 256 KiB of nesting reached its ``ast.parse``).
+    """
+
+    seen: Dict[Tuple[str, str, str], _ParserCall] = {}
     for path in sorted(_SRC_ROOT.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         rel = path.relative_to(_SRC_ROOT).as_posix()
-        for target, qualname in _qualname_of_parser_calls(tree):
-            seen.add((rel, qualname, target))
+        for call in _parser_calls(tree):
+            # First occurrence wins: the bound must precede the EARLIEST call of that
+            # target in the function.
+            seen.setdefault((rel, call.qualname, call.target), call)
 
     expected = set(_ALLOWED_PARSER_CALLS)
-    unbounded = sorted(f"{p}::{q}::{t}" for p, q, t in seen - expected)
+    unbounded = sorted(f"{p}::{q}::{t}" for p, q, t in set(seen) - expected)
     assert not unbounded, (
         "new parser call on possibly-untrusted text with no recorded length bound: "
         f"{unbounded}. Bound the input BEFORE the parse (see SCRIPT_LINT_MAX_SOURCE_CHARS "
         "and #969), then add the site to _ALLOWED_PARSER_CALLS."
     )
-    stale = sorted(f"{p}::{q}::{t}" for p, q, t in expected - seen)
+    stale = sorted(f"{p}::{q}::{t}" for p, q, t in expected - set(seen))
     assert not stale, f"_ALLOWED_PARSER_CALLS has rotted; these sites are gone: {stale}"
+
+    unguarded = [
+        f"{p}::{q}::{t} (line {seen[(p, q, t)].lineno}) has no comparison against {bound} "
+        "before the call in the same function"
+        for (p, q, t), (bound, _why) in _ALLOWED_PARSER_CALLS.items()
+        if not _bound_is_checked_before(seen[(p, q, t)].scope, bound, seen[(p, q, t)].lineno)
+    ]
+    assert not unguarded, (
+        "an allowlisted parser call relies on a bound outside its own function; that is a "
+        f"coupling, not a bound (#969, #970 P2-1): {unguarded}"
+    )
 
 
 # Driven in a CHILD interpreter on purpose: if the guard regresses this segfaults, and a
@@ -186,22 +239,19 @@ else:
     sys.exit("oversize source was accepted by the write-path gate")
 
 # 3. The read path admits up to WORKFLOW_MAX_SPEC_BYTES, which is NOT a crash guard --
-#    it is a byte budget. Parse a worst-case dense source at exactly that bound, since
-#    that is the deepest tree _extract_inputs can ever be handed if the lint-cap
-#    coupling above it is ever bypassed. Research measured this to survive with only
-#    ~1.3x of margin to the segfault cliff on this host; CPython 3.11 on the CI runner
-#    hits a RecursionError here instead (its cliff is further out than this host's, so
-#    it raises cleanly rather than overflowing the C stack). Either outcome -- a
-#    successful parse, or _extract_inputs' own RecursionError/MemoryError handling
-#    converting the overrun into a ValueError -- is "control returned", which is what
-#    this probe exists to prove; only an uncaught crash (segfault or an unconverted
-#    exception) is a real regression.
+#    it is a byte budget. A dense source at exactly that size is 131,071 nesting levels,
+#    which is PAST the measured CPython 3.10 cliff (about 130,700 levels on both hosts
+#    measured, see SCRIPT_LINT_MAX_SOURCE_CHARS). Until #970's P2-1 fix this parse
+#    segfaulted here on 3.10; _extract_inputs now refuses it on its own length bound
+#    before ast.parse runs, and that refusal is what this step asserts.
 worst_case = "a" + ".b" * ((WORKFLOW_MAX_SPEC_BYTES - 2) // 2) + "\\n"
 assert len(worst_case) <= WORKFLOW_MAX_SPEC_BYTES
 try:
     wss._extract_inputs(worst_case)
 except ValueError:
     pass
+else:
+    sys.exit("_extract_inputs parsed a source over SCRIPT_LINT_MAX_SOURCE_CHARS")
 print("SURVIVED")
 """
 
@@ -305,19 +355,38 @@ def test_no_test_fakes_ast_parse_globally() -> None:
     )
 
 
-def test_oversize_rejection_keeps_the_rule_id_extract_inputs_skips_on() -> None:
-    """``_extract_inputs``' uncapped ``ast.parse`` is shielded only by this taxonomy."""
+def test_extract_inputs_refuses_oversize_source_before_parsing(scoped_ast_parse) -> None:
+    """P2-1: ``_extract_inputs`` owns its bound; it does not borrow the callers' lint-first order."""
 
-    # FLAT oversize source, not a deep one: this assertion runs in-process, and the whole
-    # point of the class is that a deep source would take this process down rather than
-    # report. Depth belongs in the subprocess test above; here only the LENGTH branch
-    # matters, and length is what the guard keys on.
+    # FLAT oversize source: this runs in-process, and a deep one would take the process
+    # down rather than report. Depth is the child probe's job; here only the LENGTH branch
+    # matters, and the recorded parser calls prove it fired BEFORE the parse.
+    source = "x = 1\n" * (SCRIPT_LINT_MAX_SOURCE_CHARS // 6 + 1)
+    assert len(source) > SCRIPT_LINT_MAX_SOURCE_CHARS
+    parse_calls = scoped_ast_parse(source)
+    with pytest.raises(ValueError, match=f"over the {SCRIPT_LINT_MAX_SOURCE_CHARS}-character"):
+        wss._extract_inputs(source)
+    assert parse_calls == [], "ast.parse ran on a source over the cap"
+
+
+def test_oversize_rejection_keeps_the_rule_id_extract_inputs_skips_on() -> None:
+    """The oversize verdict stays a ``syntax`` ERROR, which both callers key on.
+
+    No longer what keeps ``_extract_inputs`` safe (it has its own bound since P2-1), but
+    still load-bearing for behaviour: ``_read_script_spec`` skips extraction on a
+    ``rule_id == "syntax"`` finding so a broken file on disk still loads with its finding
+    intact, and ``_validated_script_spec`` refuses on ``status == "fail"``. Give the
+    oversize rejection its own rule_id and the read path would extract (and refuse) instead
+    of degrading gracefully.
+    """
+
     result = lint_script("x = 1\n" * (SCRIPT_LINT_MAX_SOURCE_CHARS // 6 + 1), "flat.py")
     oversize = [f for f in result.findings if "over the" in f.message]
     assert len(oversize) == 1, result.findings
-    # workflow_spec_service.py:1012 keys its skip on this exact rule_id ...
+    # _read_script_spec keys its skip on this exact rule_id ...
     assert oversize[0].rule_id == "syntax"
-    # ... and :1087 keys its raise on status == "fail", which needs this severity.
+    # ... and _validated_script_spec keys its raise on status == "fail", which needs this
+    # severity.
     assert oversize[0].severity == "error"
     assert result.status == "fail"
 
