@@ -277,21 +277,39 @@ def test_the_narrow_handler_must_precede_the_broad_one_in_the_api():
     against the source because the runtime symptom is indistinguishable from correct behaviour at any
     single call site.
     """
+    import ast
     from pathlib import Path
 
     import cli_agent_orchestrator.api.main as api_main
 
     source = Path(api_main.__file__).read_text()
-    narrow = "except approval_gate.PlanIdentityUnavailableError"
-    broad = "except approval_gate.PlanApprovalRequiredError"
 
-    narrow_positions = [i for i in range(len(source)) if source.startswith(narrow, i)]
-    broad_positions = [i for i in range(len(source)) if source.startswith(broad, i)]
+    def handler_name(handler):
+        expression = handler.type
+        if (
+            isinstance(expression, ast.Attribute)
+            and isinstance(expression.value, ast.Name)
+            and expression.value.id == "approval_gate"
+        ):
+            return expression.attr
+        return None
 
-    assert len(narrow_positions) == 3, "all three gate call sites must transport the narrow cause"
-    assert len(broad_positions) == 3
-    for narrow_at, broad_at in zip(narrow_positions, broad_positions):
-        assert narrow_at < broad_at, (
+    # Only the three HTTP gate boundaries pair these handlers. A capture error
+    # deferred until after the gate has its own narrow-only handler inside one
+    # boundary; it does not transport an HTTP refusal and must not count as one.
+    gates = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Try)
+        and any(handler_name(handler) == "PlanApprovalRequiredError" for handler in node.handlers)
+    ]
+    assert len(gates) == 3, "all three gate call sites must transport the narrow cause"
+    for gate in gates:
+        names = [handler_name(handler) for handler in gate.handlers]
+        assert names.count("PlanIdentityUnavailableError") == 1
+        assert names.index("PlanIdentityUnavailableError") < names.index(
+            "PlanApprovalRequiredError"
+        ), (
             "the PlanIdentityUnavailableError clause must come first at every site; ordered after "
             "its base class it is dead code and the response is silently 403"
         )

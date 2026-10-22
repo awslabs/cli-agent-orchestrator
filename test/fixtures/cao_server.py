@@ -195,6 +195,11 @@ def _subprocess_env(
     env.update(
         {
             "HOME": str(home_dir),
+            # Explicit rather than derived from HOME inside the subprocess: a
+            # developer's exported CAO_HOME_DIR used to leak through and point
+            # the test server at the real home. With the server lock (#406)
+            # that leak is now a refused start instead of silent sharing.
+            "CAO_HOME_DIR": str(home_dir / ".aws" / "cli-agent-orchestrator"),
             "CAO_API_HOST": "127.0.0.1",
             "CAO_API_PORT": str(port),
             "CAO_A2A_DISABLED": "true",

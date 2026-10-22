@@ -2845,3 +2845,120 @@ def test_working_directory_sanitizer_leaves_other_fields_stock(client):
     error = response.json()["detail"][0]
     assert error["loc"] == ["body", "name_or_path"]
     assert error["input"] == invalid
+
+
+@pytest.mark.parametrize("endpoint", ["/workflows/runs", "/workflows/runs:submit"])
+def test_admission_guard_refuses_profile_edited_during_gate(
+    client, async_script_env, monkeypatch, tmp_path, endpoint
+):
+    """Both starts must retain the profile state from before the gate returns."""
+    from unittest.mock import AsyncMock
+
+    from cli_agent_orchestrator.constants import TERMINALS_RUN_STEP_ROUTE
+    from cli_agent_orchestrator.services import (
+        agent_step,
+        approval_gate,
+        launch_guard,
+        script_runner,
+        settings_service,
+    )
+
+    settings_service.SETTINGS_FILE.write_text('{"workflow":{"require_approval":true}}')
+    profile = tmp_path / "worker.md"
+    profile.write_text("admitted profile")
+    monkeypatch.setattr(
+        launch_guard.agent_profiles, "list_agent_profiles", lambda: [{"name": "developer"}]
+    )
+    monkeypatch.setattr(
+        launch_guard.agent_profiles, "_read_agent_profile_source", lambda name: profile.read_text()
+    )
+    monkeypatch.setattr(settings_service, "is_memory_enabled", lambda: False)
+    real_gate = approval_gate.ensure_plan_approved
+    monkeypatch.setattr(
+        approval_gate.approval_store,
+        "approval_state",
+        lambda plan: approval_gate.approval_store.APPROVED,
+    )
+    gates = []
+
+    def gate_then_edit(**kwargs):
+        real_gate(**kwargs)
+        gates.append("approved")
+        profile.write_text("edited after approval")
+
+    monkeypatch.setattr(approval_gate, "ensure_plan_approved", gate_then_edit)
+
+    # Admission and durable INSERT are real; stop the script drive to launch the
+    # agent explicitly through the real run-step route after admission.
+    async def hold_run(record, *args, **kwargs):
+        return _result(state=RunState.RUNNING)
+
+    monkeypatch.setattr(script_runner, "_drive_frozen", hold_run)
+    monkeypatch.setattr(script_runner, "run_script_workflow_prepared", hold_run)
+    create = AsyncMock(side_effect=ValueError("terminal creation reached"))
+    monkeypatch.setattr(agent_step.terminal_service, "create_terminal", create)
+    response = client.post(
+        endpoint,
+        json={
+            "name_or_path": "scr",
+            "run_id": "admission-edit",
+            "working_directory": str(tmp_path),
+        },
+    )
+    assert response.status_code == (202 if endpoint.endswith(":submit") else 200), response.text
+    assert gates == ["approved"]
+    assert workflow_journal.get_run("admission-edit") is not None
+    response = client.post(
+        TERMINALS_RUN_STEP_ROUTE,
+        json={
+            "provider": "kiro_cli",
+            "agent": "developer",
+            "prompt": "work",
+            "env_vars": {"CAO_WORKFLOW_RUN_ID": "admission-edit", "CAO_WORKFLOW_GENERATION": "1"},
+        },
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["kind"] == "plan_inputs_changed"
+    assert response.json()["detail"]["message"].startswith(
+        "Agent profile 'developer' changed after"
+    )
+    create.assert_not_called()
+
+
+@pytest.mark.parametrize("endpoint", ["/workflows/runs", "/workflows/runs:submit"])
+@pytest.mark.parametrize("approved", [False, True])
+def test_admission_capture_failure_preserves_gate_precedence(
+    client, async_script_env, monkeypatch, tmp_path, endpoint, approved
+):
+    from cli_agent_orchestrator.services import approval_gate, launch_guard, settings_service
+
+    settings_service.SETTINGS_FILE.write_text('{"workflow":{"require_approval":true}}')
+    monkeypatch.setattr(
+        approval_gate.approval_store,
+        "approval_state",
+        lambda plan: (
+            approval_gate.approval_store.APPROVED
+            if approved
+            else approval_gate.approval_store.ABSENT
+        ),
+    )
+
+    def unreadable():
+        raise OSError(str(tmp_path / "private-profile-path"))
+
+    monkeypatch.setattr(launch_guard.agent_profiles, "list_agent_profiles", unreadable)
+    response = client.post(
+        endpoint,
+        json={
+            "name_or_path": "scr",
+            "run_id": "capture-failed",
+            "working_directory": str(tmp_path),
+        },
+    )
+    assert response.status_code == (503 if approved else 403), response.text
+    assert response.json()["detail"]["kind"] == (
+        "plan_identity_unavailable" if approved else "approval_required"
+    )
+    assert str(tmp_path) not in response.text
+    assert workflow_journal.get_run("capture-failed") is None
+    assert "capture-failed" not in workflow_service.run_registry
