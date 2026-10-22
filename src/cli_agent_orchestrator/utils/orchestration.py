@@ -28,7 +28,7 @@ import re
 import time
 import uuid
 from collections.abc import Mapping
-from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple, Union
 
 import requests
 
@@ -50,6 +50,7 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.description import normalize_description
+from cli_agent_orchestrator.utils.init_allowance import synchronous_create_timeout
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_session_name_for_key,
@@ -122,15 +123,6 @@ ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "true")
 # Terminal count threshold for cleanup nudge
 TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
 
-# Generous client-side timeout for a SYNCHRONOUS (non-deferred) terminal create
-# call, used by handoff's early-terminal-id path (review on PR #634, issue #616).
-# Provider init (shell warm-up + CLI startup + MCP registration + auth) can
-# legitimately take up to ~45s server-side -- well past _mcp_timeout()'s 30s
-# default. That default was never a problem before because nothing called
-# _create_terminal non-deferred in production (assign always uses
-# defer_init=True); this is the first caller of that path, so it gets its own
-# padded timeout rather than silently inheriting one sized for something else.
-_HANDOFF_CREATE_TIMEOUT_S = 150.0
 _TERMINAL_ID_PATTERN = re.compile(r"^[a-f0-9]{8}$")
 
 
@@ -696,7 +688,7 @@ def _create_terminal(
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
     model: Optional[str] = None,
     use_worktree: bool = False,
-    create_timeout: Optional[float] = None,
+    create_timeout: Optional[Union[float, Tuple[float, float]]] = None,
     idempotency_key: Optional[str] = None,
     claim: Optional[EphemeralClaim] = None,
     description: Optional[str] = None,
@@ -721,9 +713,11 @@ def _create_terminal(
             ``None`` (default) keeps today's behavior (``_mcp_timeout()``,
             30s), which is fine for ``defer_init=True`` (assign's path:
             returns in <2s by design) but too short for a SYNCHRONOUS create
-            that waits out ``provider.initialize()`` (up to ~45s) -- pass an
-            explicit, larger value for that case (see
-            ``_HANDOFF_CREATE_TIMEOUT_S``).
+            that waits out ``provider.initialize()`` -- pass
+            ``synchronous_create_timeout(agent_profile)`` from
+            ``utils.init_allowance`` for that case (issue #710), as handoff
+            does. A ``(connect, read)`` tuple is accepted as ``requests`` takes
+            it, so only the read half is widened.
         defer_init: If True, tell
             cao-server to skip the ``provider.initialize()`` wait and return
             as soon as the tmux window and DB record exist. Provider init
@@ -1692,6 +1686,12 @@ async def _handoff_impl(
         # GET); reassigning ``provider`` to its return value uses whatever it
         # actually persisted on the terminal as the source of truth for the
         # reuse call below, rather than assuming the two resolutions agree.
+        # This create is SYNCHRONOUS (no defer_init), so cao-server does not
+        # answer until ``provider.initialize()`` returns; the client budget has
+        # to be derived from the ``provider_init_timeout`` the server is itself
+        # waiting out, not written down a second time (issue #710). It used to
+        # be a flat 150s (#634), which was below a successful Claude init at
+        # 3T=180s, let alone Kimi's 300s or Antigravity's 370s.
         claim_kwargs: Dict[str, Any] = {"claim": claim} if claim is not None else {}
         terminal_id, provider = _create_terminal(
             agent_profile,
@@ -1699,7 +1699,7 @@ async def _handoff_impl(
             engine=engine,
             model=model,
             use_worktree=use_worktree,
-            create_timeout=_HANDOFF_CREATE_TIMEOUT_S,
+            create_timeout=synchronous_create_timeout(agent_profile),
             idempotency_key=idempotency_key,
             description=description,
             **claim_kwargs,

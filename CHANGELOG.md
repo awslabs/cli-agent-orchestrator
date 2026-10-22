@@ -163,6 +163,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Every client call that creates a session or terminal synchronously (`cao launch` without
+  `--headless`, `cao agent handoff`, the `launch_agent` app gesture and the `cao-ops`
+  `launch_session` tool without a message) now sizes its wait from `provider_init_timeout`
+  and the profile's override of it, through one shared derivation, instead of from
+  `mcp_request_timeout` or a per-site literal (30s, 150s, 300s). A successful but slow
+  provider init was being reported to the caller as a transport failure while cao-server went
+  on building the worker, so a retry collided with a session that already existed. Only the
+  read half of the request timeout widens; an unreachable server still reports in 5s. A guard
+  test enumerates every create call site and fails on one that neither defers init nor derives
+  its budget. `GET /health` now reports the server's `provider_init_timeout` so an operator can
+  check that a client on another host sees the same value (#710).
 - Vault scan now re-reads a note whose size, mtime or ctime changed across the read window up to
   three times with a short backoff, as ADR-006 specifies, instead of skipping it on the first
   torn read. A note saved by Obsidian during a reconcile is indexed from the clean re-read; a

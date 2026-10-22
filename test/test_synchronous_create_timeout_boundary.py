@@ -69,27 +69,6 @@ _BRANCHES = (ast.If, ast.Try, ast.While, ast.For, ast.AsyncFor, ast.Match)
 # caller, so the obligation passes to every caller (checked separately below).
 _DELEGATING_HELPERS = ("_create_terminal", "_create_session")
 
-# Live instances of this class that #710 deliberately did NOT fix, keyed by
-# ``<relative path>::<enclosing function>`` and carrying the literal that is
-# still short. Each needs its own issue. ``test_known_short_sites_are_still_short``
-# asserts the literal is still present and still below the allowance, so fixing
-# one of these fails this test until its entry is deleted -- the allowlist can
-# only shrink.
-_KNOWN_SHORT: Dict[str, Tuple[str, str]] = {
-    "utils/orchestration.py::_handoff_impl": (
-        "_HANDOFF_CREATE_TIMEOUT_S = 150.0",
-        "handoff's synchronous create keeps its #634 literal; that path is being "
-        "reworked in #773, which should adopt init_allowance() instead of a third "
-        "hard-coded number.",
-    ),
-    "ops_mcp_server/server.py::_launch_session_impl": (
-        "_HTTP_TIMEOUT = (5, 300)",
-        "cao-ops launch_session omits initial_message when the caller sends no "
-        "message, so it takes the synchronous path on a flat 300s read budget. "
-        "Sibling of #710, not in its scope -- needs its own issue.",
-    ),
-}
-
 
 def _shape(node: ast.AST) -> str:
     """Reduce a string literal or f-string to a comparable route shape."""
@@ -210,8 +189,6 @@ def _classify_call(key: str, call: ast.Call) -> str:
     defer = keywords.get("defer_init")
     if isinstance(defer, ast.Constant) and defer.value is True:
         return "deferred"
-    if key in _KNOWN_SHORT:
-        return "known-short"
     return "unsized"
 
 
@@ -226,15 +203,13 @@ def test_every_synchronous_create_site_sizes_its_wait_from_provider_init_timeout
             continue  # delegating helper: the obligation is on its callers
         if defers:
             continue
-        if key in _KNOWN_SHORT:
-            continue
         unsized.append(key)
     assert not unsized, (
         "create call site(s) neither defer init nor size their wait from "
         "provider_init_timeout (issue #710). Pass "
         "``synchronous_create_timeout(...)`` from "
         "``cli_agent_orchestrator.utils.init_allowance``, or tell the server to "
-        f"defer, or record the site in _KNOWN_SHORT with an issue: {sorted(unsized)}"
+        f"defer unconditionally: {sorted(unsized)}"
     )
 
 
@@ -269,25 +244,6 @@ def test_the_enumeration_still_sees_the_known_create_sites():
         assert expected in sites, (
             f"{expected} is no longer enumerated as a create call site; the guard "
             "for issue #710 has gone blind -- update the scanner, not this list"
-        )
-
-
-def test_known_short_sites_are_still_short():
-    """The allowlist can only shrink: a fixed site must be removed from it."""
-
-    stock = {"provider_init_timeout": 60, "mcp_request_timeout": 30}
-    allowance = init_allowance(None, stock)
-    for key, (literal, reason) in _KNOWN_SHORT.items():
-        relpath = key.split("::", 1)[0]
-        source = (_PACKAGE_ROOT / relpath).read_text()
-        assert literal in source, (
-            f"{key} no longer carries {literal!r} -- if it now derives its budget "
-            f"from provider_init_timeout, delete its _KNOWN_SHORT entry. ({reason})"
-        )
-        numbers = [float(match) for match in re.findall(r"\d+(?:\.\d+)?", literal)]
-        assert max(numbers) < allowance, (
-            f"{key}'s literal {literal!r} now covers the {allowance}s allowance; "
-            "point it at init_allowance() and delete its _KNOWN_SHORT entry"
         )
 
 
