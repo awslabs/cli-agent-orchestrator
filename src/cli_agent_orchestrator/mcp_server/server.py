@@ -41,10 +41,7 @@ from cli_agent_orchestrator.services.memory_service import (
     MemoryDisabledError,
     MemoryPartialWriteError,
 )
-from cli_agent_orchestrator.services.outcome_service import (
-    LEARNING_DISABLED_CODE,
-    LEARNING_DISABLED_MESSAGE,
-)
+from cli_agent_orchestrator.services.outcome_service import LEARNING_DISABLED_CODE
 from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT
 from cli_agent_orchestrator.utils.caller_tools import (
     caller_effective_allowed_tools as _caller_effective_allowed_tools,
@@ -119,7 +116,9 @@ def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
 
     try:
         status_response = requests.get(
-            f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout()
+            f"{API_BASE_URL}/terminals/{terminal_id}",
+            headers=mcp_utils._auth_headers() or None,
+            timeout=_mcp_timeout(),
         )
         status_response.raise_for_status()
         terminal = status_response.json()
@@ -151,6 +150,7 @@ def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
                 "message": answer,
                 "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
             },
+            headers=mcp_utils._auth_headers() or None,
             timeout=_mcp_timeout(),
         )
         response.raise_for_status()
@@ -179,6 +179,7 @@ def _try_send_hermes_prompt_answer(terminal_id: str, answer: str) -> Optional[Di
     output_response = requests.get(
         f"{API_BASE_URL}/terminals/{terminal_id}/output",
         params={"mode": "full"},
+        headers=mcp_utils._auth_headers() or None,
         timeout=_mcp_timeout(),
     )
     output_response.raise_for_status()
@@ -224,6 +225,7 @@ def _send_terminal_key(terminal_id: str, key: str) -> None:
     response = requests.post(
         f"{API_BASE_URL}/terminals/{terminal_id}/key",
         params={"key": key},
+        headers=mcp_utils._auth_headers() or None,
         timeout=_mcp_timeout(),
     )
     response.raise_for_status()
@@ -236,6 +238,7 @@ def _send_terminal_input(terminal_id: str, message: str) -> None:
             "message": message,
             "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
         },
+        headers=mcp_utils._auth_headers() or None,
         timeout=_mcp_timeout(),
     )
     response.raise_for_status()
@@ -280,7 +283,11 @@ def _refusal_envelope_fields(response: requests.Response) -> Dict[str, Any]:
 def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
     """Fetch a skill body from cao-server and return content or a structured error."""
     try:
-        response = requests.get(f"{API_BASE_URL}/skills/{name}", timeout=_mcp_timeout())
+        response = requests.get(
+            f"{API_BASE_URL}/skills/{name}",
+            headers=mcp_utils._auth_headers() or None,
+            timeout=_mcp_timeout(),
+        )
         response.raise_for_status()
         return response.json()["content"]
     except requests.HTTPError as exc:
@@ -1029,6 +1036,7 @@ async def emit_ui(
             "props": props or {},
             "terminal_id": terminal_id,
         },
+        headers=mcp_utils._auth_headers() or None,
         timeout=_mcp_timeout(),
     )
     if response.status_code == 400:
@@ -1252,7 +1260,9 @@ def _require_discovery_marker(own_terminal_id: str, action: str) -> Optional[Dic
     """
     try:
         response = requests.get(
-            f"{API_BASE_URL}/terminals/{own_terminal_id}", timeout=_mcp_timeout()
+            f"{API_BASE_URL}/terminals/{own_terminal_id}",
+            headers=mcp_utils._auth_headers() or None,
+            timeout=_mcp_timeout(),
         )
         response.raise_for_status()
         allowed_tools = response.json().get("allowed_tools")
@@ -1299,6 +1309,7 @@ def _list_siblings_impl(depth: Optional[int], cross_session: bool = False) -> Di
         response = requests.get(
             f"{API_BASE_URL}/terminals/{own_terminal_id}/siblings",
             params=params,
+            headers=mcp_utils._auth_headers() or None,
             timeout=_mcp_timeout(),
         )
         response.raise_for_status()
@@ -1324,6 +1335,7 @@ def _update_metadata_impl(metadata: Dict[str, Any]) -> Dict[str, Any]:
         response = requests.patch(
             f"{API_BASE_URL}/terminals/{own_terminal_id}/metadata",
             json={"metadata": metadata},
+            headers=mcp_utils._auth_headers() or None,
             timeout=_mcp_timeout(),
         )
         response.raise_for_status()
@@ -1529,27 +1541,6 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.warning(f"Failed to get terminal context for memory tools: {e}")
         return None
-
-
-def _caller_has_store_lesson_capability(caller_profile: Optional[str]) -> bool:
-    """True when the caller's PROFILE declares the ``store_lesson`` capability.
-
-    Server-side authorization for cross-agent lesson writes: the profile name
-    comes from the terminal's registered record (never tool arguments), and
-    the capability list comes from the profile file's frontmatter — an
-    operator-owned artifact a worker cannot edit through MCP. Fails closed on
-    any lookup error.
-    """
-    if not caller_profile:
-        return False
-    try:
-        from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-
-        profile = load_agent_profile(caller_profile)
-        return "store_lesson" in (profile.capabilities or [])
-    except Exception as e:  # noqa: BLE001 — authz check fails closed
-        logger.warning(f"store_lesson capability lookup failed for {caller_profile!r}: {e}")
-        return False
 
 
 CAO_MCP_SERVER_SELECTOR = "@cao-mcp-server"
@@ -2070,6 +2061,43 @@ async def memory_forget(
         return {"success": False, "error": str(e)}
 
 
+def _partial_write_payload(exc: Exception) -> Optional[Dict[str, Any]]:
+    """Rebuild the typed partial-write payload from an HTTP error body.
+
+    ``MemoryPartialWriteError`` used to be raised in this process, so the tool
+    could read its fields directly. Over HTTP the route answers 500 with
+    ``_memory_partial_write_response``'s shape; a partial write is a repairable
+    on-disk state with a ``repair_command``, so it must keep surfacing as that
+    rather than collapsing into a generic 500 string. Returns ``None`` when the
+    body is not a partial-write report, leaving ordinary translation to run.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    try:
+        body = response.json()
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(body, dict) or body.get("error_kind") != MemoryPartialWriteError.error_kind:
+        return None
+    partial = body.get("partial_write")
+    if not isinstance(partial, dict):
+        return None
+    return {
+        "success": False,
+        "error_kind": body["error_kind"],
+        "error": str(
+            MemoryPartialWriteError(
+                key=str(partial.get("key")),
+                scope=str(partial.get("scope")),
+                scope_id=partial.get("scope_id"),
+                file_path=str(partial.get("file_path")),
+            )
+        ),
+        "partial_write": partial,
+    }
+
+
 def _outcome_tool_error(
     exc: Exception, fallback: str, *, extra: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
@@ -2265,7 +2293,7 @@ async def store_lesson(
     memory type is always 'feedback' (permanent), and the target profile is
     recorded verbatim as the scope id.
 
-    Cross-agent writes are authorized server-side: the CALLER's profile
+    Cross-agent writes are authorized by cao-server: the CALLER's profile
     (resolved from its terminal record, never from tool arguments) must
     declare the ``store_lesson`` capability in its frontmatter. Writing to
     the caller's OWN scope needs no capability — that grants nothing beyond
@@ -2274,80 +2302,54 @@ async def store_lesson(
     Requires memory.learning_enabled=true; returns a disabled payload
     otherwise.
     """
-    from cli_agent_orchestrator.services.memory_service import MemoryService
-    from cli_agent_orchestrator.services.settings_service import is_learning_enabled
+    target = (target_agent_profile or "").strip()
+    if not target:
+        return {"success": False, "error": "target_agent_profile is required"}
+
+    # The terminal ID only; cao-server resolves the record, the caller's
+    # profile and the capability check itself. This tool deliberately does NOT
+    # call _get_terminal_context_from_env() and forward a resolved profile
+    # directly: the caller profile is the authorization input, so letting the
+    # agent process name it outright would make the check self-attested. The
+    # terminal ID that selects the record is still client-chosen (same
+    # CAO_TERMINAL_ID source as every other tool here, and the same shape as
+    # POST /outcomes) — this only stops the capability list itself from being
+    # agent-supplied, it does not bind the caller to an authenticated
+    # principal. Fail closed — without an ID there is no identity to authorize.
+    try:
+        terminal_id = _current_terminal_id()
+    except ValueError as e:
+        return {"success": False, "error": f"Could not resolve terminal context: {e}"}
+    if not terminal_id:
+        return {
+            "success": False,
+            "error": "Could not resolve terminal context (CAO_TERMINAL_ID unset or unknown)",
+        }
 
     try:
-        if not is_learning_enabled():
-            return {"success": False, "disabled": True, "error": LEARNING_DISABLED_MESSAGE}
-        target = (target_agent_profile or "").strip()
-        if not target:
-            return {"success": False, "error": "target_agent_profile is required"}
-
-        # Fail closed: a resolved caller identity is REQUIRED. Accepting a
-        # missing context would let a context-free caller write permanent
-        # feedback into any profile's scope.
-        terminal_context = _get_terminal_context_from_env()
-        if not terminal_context:
-            return {
-                "success": False,
-                "error": "Could not resolve terminal context (CAO_TERMINAL_ID unset or unknown)",
-            }
-        caller_profile = terminal_context.get("agent_profile")
-
-        # Cross-agent lesson writes are a privileged operation: permanent
-        # feedback memory injected into ANOTHER agent's future sessions.
-        # Authorize via the caller profile's declared capabilities —
-        # resolved server-side from the terminal's registered profile, so a
-        # worker cannot self-grant it through tool arguments.
-        if target != caller_profile:
-            if not _caller_has_store_lesson_capability(caller_profile):
-                return {
-                    "success": False,
-                    "error": (
-                        f"caller profile {caller_profile!r} is not authorized to store "
-                        f"lessons for {target!r}: cross-agent lesson writes require the "
-                        "'store_lesson' capability in the caller's profile frontmatter"
-                    ),
-                }
-
-        # Overriding agent_profile redirects resolve_scope_id's agent-scope
-        # resolution to the target worker. Provenance fields (provider,
-        # terminal_id) still identify the actual caller.
-        lesson_context = {**terminal_context, "agent_profile": target}
-
-        service = MemoryService()
-        memory = await service.store(
-            content=content,
-            scope="agent",
-            memory_type="feedback",
-            key=key,
-            tags=tags or "",
-            terminal_context=lesson_context,
+        payload = mcp_utils.post_body_json(
+            "/lessons",
+            {
+                "target_agent_profile": target,
+                "content": content,
+                "key": key,
+                "tags": tags or "",
+                "source_terminal_id": terminal_id,
+            },
+            timeout=_mcp_timeout(),
         )
         return {
             "success": True,
-            "key": memory.key,
-            "scope": memory.scope,
-            "scope_id": memory.scope_id,
-            "target_agent_profile": target,
+            "key": payload["key"],
+            "scope": payload["scope"],
+            "scope_id": payload["scope_id"],
+            "target_agent_profile": payload["target_agent_profile"],
         }
-    except MemoryPartialWriteError as e:
-        return {
-            "success": False,
-            "error_kind": e.error_kind,
-            "error": str(e),
-            "partial_write": {
-                "key": e.key,
-                "scope": e.scope,
-                "scope_id": e.scope_id,
-                "file_path": e.file_path,
-                "completed_phases": e.completed_phases,
-                "repair_command": e.repair_command,
-            },
-        }
-    except MemoryDisabledError as e:
-        return {"success": False, "disabled": True, "error": str(e)}
+    except requests.RequestException as e:
+        partial = _partial_write_payload(e)
+        if partial is not None:
+            return partial
+        return _outcome_tool_error(e, "Failed to store lesson")
     except Exception as e:
         return {"success": False, "error": str(e)}
 
