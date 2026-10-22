@@ -321,10 +321,16 @@ def test_marked_sites_reads_each_rules_marker_the_same_way() -> None:
     sites = cl.missing_kwarg_sites("poll_until_done", "min_generation", [mod])
     assert len(sites) == 3
     marked = cl.marked_sites(sites, "staleness-ok", [mod])
-    assert marked == {
-        ("pkg/mod.py", "poll_until_done", "min_generation"): "the broker names no generation"
-    }
+    key = ("pkg/mod.py", "poll_until_done", "min_generation")
+    assert marked == {(key, 4): "the broker names no generation"}, "per site: line 4 only"
     assert cl.marked_sites(sites, "nothing-ok", [mod]) == {}
+    # The unmarked siblings on lines 2 and 8 share the key and must still fail.
+    with pytest.raises(AssertionError) as exc:
+        cl.check_against_allowlist(
+            rule="staleness-gate", sites=sites, allowlist={}, marked=marked, remedy="x"
+        )
+    assert "pkg/mod.py:2" in str(exc.value) and "pkg/mod.py:8" in str(exc.value)
+    assert "pkg/mod.py:4" not in str(exc.value)
 
 
 def test_missing_kwarg_sites_flags_an_omission_and_a_splat_but_not_an_explicit_pass() -> None:
@@ -405,9 +411,25 @@ def test_check_against_allowlist_accepts_an_inline_marker_instead_of_a_row() -> 
         rule="r",
         sites=[_site("a")],
         allowlist={},
-        marked={("pkg/mod.py", "a"): "deliberate"},
+        marked={(("pkg/mod.py", "a"), 7): "deliberate"},
         remedy="do the thing",
     )
+
+
+def test_check_against_allowlist_marks_exempt_one_site_not_its_same_key_siblings() -> None:
+    """A marker on one call must not cover an identical unmarked call in the
+    same module (PR #999 re-review, P3-1): line-free keys collide on purpose for
+    allowlist rows, which carry a reviewed count, but a mark carries none."""
+    with pytest.raises(AssertionError) as exc:
+        cl.check_against_allowlist(
+            rule="r",
+            sites=[_site("a", line=7), _site("a", line=30)],
+            allowlist={},
+            marked={(("pkg/mod.py", "a"), 7): "deliberate"},
+            remedy="do the thing",
+        )
+    message = str(exc.value)
+    assert "pkg/mod.py:30" in message and "pkg/mod.py:7" not in message
 
 
 def test_check_against_allowlist_fails_on_a_stale_inline_marker() -> None:
@@ -416,7 +438,7 @@ def test_check_against_allowlist_fails_on_a_stale_inline_marker() -> None:
             rule="r",
             sites=[],
             allowlist={},
-            marked={("pkg/mod.py", "gone"): "deliberate"},
+            marked={(("pkg/mod.py", "gone"), 7): "deliberate"},
             remedy="do the thing",
         )
     assert "no longer sit on a flagged" in str(exc.value)

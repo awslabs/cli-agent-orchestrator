@@ -229,7 +229,7 @@ def test_enum_subset_literals_are_deliberate() -> None:
     sources = cl.parse_sources()
     sites = cl.enum_subset_sites(sources)
     marked = cl.marked_sites(sites, "subset-ok", sources)
-    unmarked = [site for site in sites if site.key not in marked]
+    unmarked = [site for site in sites if (site.key, site.line) not in marked]
 
     cl.check_against_allowlist(
         rule="enum-subset",
