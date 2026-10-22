@@ -710,10 +710,12 @@ class TmuxClient:
         :meth:`create_pane`: the session those run against may never have had
         the floor raised (created before this fix, or by a different process),
         and whether an existing pane picks up a raised global at all depends
-        on the tmux version (3.8 does, for output that arrives afterwards;
-        measured). Either way, lines a pane has already discarded at 2000 do
-        not come back, so the raise has to be in place before the pane
-        produces output -- that is, before it is created.
+        on the tmux version: from 3.7 it does, for output that arrives
+        afterwards ("When history-limit is changed, apply to existing panes",
+        tmux CHANGES, issue 4705; measured on 3.4 and 3.8); before 3.7 it keeps
+        the limit it was created with. Either way, lines a pane has already
+        discarded at 2000 do not come back, so the raise has to be in place
+        before the pane produces output -- that is, before it is created.
 
         Same ``start-server ; set-option`` single-invocation idiom as
         :meth:`_set_server_exit_empty_off`, and for the same reason: on a clean

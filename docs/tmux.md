@@ -93,9 +93,10 @@ out of scrollback entirely and the supervisor received a truncated reply or none
 
 What it touches: because the option is global, your own new windows and
 sessions on that server also get the raised value. Panes that already exist
-keep the scrollback they have; what tmux does with their limit afterwards
-depends on the tmux version (3.8 applies the raised value to output that arrives
-later). Memory is allocated lazily as output arrives and only by panes that
+keep the scrollback they have; whether their limit changes afterwards depends on
+the tmux version (from 3.7 the raised value applies to output that arrives later;
+before 3.7 an existing pane keeps the limit it was created with). Memory is
+allocated lazily as output arrives and only by panes that
 actually fill up: about 38 MB of tmux memory for a pane that holds 50000 lines
 of 100 characters, against about 1.8 MB at 2000.
 

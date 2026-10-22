@@ -5,6 +5,7 @@ which is deliberately NOT mocked — see its module docstring for why.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -1604,10 +1605,29 @@ class TestRealTmuxHistoryLimit:
     exists. Each path has to raise the floor itself, because the session it
     runs against may never have had it raised (made before this fix, or by
     another process), and lines a pane has already discarded at 2000 do not
-    come back when the option is raised later (tmux 3.8: an existing pane does
-    pick up a raised global for output that arrives afterwards, measured; the
-    output that arrived before is gone).
+    come back when the option is raised later.
+
+    tmux versions. Every assertion about a pane CAO creates holds on every
+    tmux this project supports (3.2+; CI runs Ubuntu 24.04's 3.4, developers
+    tend to run 3.8). What happens to a pane that ALREADY existed when CAO
+    raised the global changed in tmux 3.7 ("When history-limit is changed,
+    apply to existing panes, not just new ones", CHANGES, issue 4705): before
+    3.7 that pane reports the 2000 it was created with for the rest of its
+    life; from 3.7 it reports the raised value and keeps later output to it.
+    The one test that has a pre-existing pane in view branches on that, with
+    both arms asserted, so a future tmux that changes it again fails here
+    instead of passing by accident.
     """
+
+    # The release that made a raised history-limit apply to existing panes.
+    _EXISTING_PANES_FOLLOW_GLOBAL_SINCE = (3, 7)
+
+    @staticmethod
+    def _tmux_version() -> tuple[int, int]:
+        out = subprocess.run(["tmux", "-V"], capture_output=True, text=True, check=True).stdout
+        match = re.search(r"(\d+)\.(\d+)", out)
+        assert match, f"could not parse tmux version from {out!r}"
+        return int(match.group(1)), int(match.group(2))
 
     def _require_tmux(self) -> None:
         if not shutil.which("tmux"):
@@ -1624,9 +1644,18 @@ class TestRealTmuxHistoryLimit:
 
     def _pane_limits(self, socket_name: str, target: str) -> list[int]:
         """``history_limit`` of every pane in ``target``, as tmux reports it."""
-        result = self._tmux(socket_name, "list-panes", "-t", target, "-F", "#{history_limit}")
+        return sorted(self._pane_limits_by_id(socket_name, target).values())
+
+    def _pane_limits_by_id(self, socket_name: str, target: str) -> dict[str, int]:
+        """``history_limit`` of every pane in ``target``, keyed by pane id."""
+        result = self._tmux(
+            socket_name, "list-panes", "-t", target, "-F", "#{pane_id} #{history_limit}"
+        )
         assert result.returncode == 0, f"tmux list-panes failed: {result.stderr}"
-        return sorted(int(line) for line in result.stdout.split())
+        return {
+            pane_id: int(limit)
+            for pane_id, limit in (line.split() for line in result.stdout.split("\n") if line)
+        }
 
     def _global_limit(self, socket_name: str) -> int:
         result = self._tmux(socket_name, "show-options", "-gv", "history-limit")
@@ -1665,6 +1694,8 @@ class TestRealTmuxHistoryLimit:
         2000 — shallower than ``_ESCALATION_STEPS[-1]`` (5000), so the deepest
         extraction rung could not reach further than the middle rungs and a
         long reply was silently lost from scrollback (#728).
+
+        Holds on every supported tmux (3.2+): only a pane CAO created is in view.
         """
         self._require_tmux()
         socket_name = f"cao-test-history-limit-{uuid.uuid4().hex[:12]}"
@@ -1683,7 +1714,12 @@ class TestRealTmuxHistoryLimit:
     def test_a_window_added_to_a_pre_existing_session_gets_the_floor(self, tmp_path):
         """``create_window`` is how every assign/handoff worker terminal is made.
         On a session whose global is still 2000 (asserted first), the new
-        window must get the floor (#728)."""
+        window must get the floor (#728).
+
+        Holds on every supported tmux (3.2+): only the new window's pane is
+        asserted after the raise. The pre-existing window's pane is not, since
+        what it reports is version-dependent (class docstring).
+        """
         self._require_tmux()
         socket_name = f"cao-test-history-window-{uuid.uuid4().hex[:12]}"
         self._tmux(socket_name, "kill-server")
@@ -1703,29 +1739,58 @@ class TestRealTmuxHistoryLimit:
     def test_a_split_into_a_pre_existing_host_window_gets_the_floor(self, tmp_path):
         """Pane mode's ``_split_host_window`` path: the host window already
         exists (made at 2000 by someone else, asserted first), and the split
-        must not start life at that (#728)."""
+        must not start life at that (#728).
+
+        The NEW pane's assertion holds on every supported tmux. The host
+        window's ORIGINAL pane is the one place this class has a pre-existing
+        pane in view, and what it reports depends on the tmux version (see the
+        class docstring): 2000 before 3.7, the raised value from 3.7. Both arms
+        are asserted; CI's 3.4 and a developer's 3.8 take different ones.
+        """
         self._require_tmux()
         socket_name = f"cao-test-history-split-{uuid.uuid4().hex[:12]}"
         self._tmux(socket_name, "kill-server")
         try:
             self._pre_existing_session(socket_name, "pre", "cao-agents", str(tmp_path))
+            before = self._pane_limits_by_id(socket_name, "pre:cao-agents")
+            assert len(before) == 1
+            (original_id,) = before
             client = self._client(socket_name, pane_mode=True)
 
             client.create_pane("pre", "cao-agents", "coder-1", "term-hist-3", str(tmp_path))
 
-            limits = self._pane_limits(socket_name, "pre:cao-agents")
-            assert len(limits) == 2, f"expected the host pane plus one split, got {limits}"
-            assert limits == [TMUX_HISTORY_LIMIT, TMUX_HISTORY_LIMIT], (
+            after = self._pane_limits_by_id(socket_name, "pre:cao-agents")
+            new_ids = set(after) - {original_id}
+            assert (
+                len(new_ids) == 1
+            ), f"expected exactly one split pane, panes went {before} -> {after}"
+            (new_id,) = new_ids
+            assert after[new_id] == TMUX_HISTORY_LIMIT, (
                 "the split pane must get CAO's scrollback floor; the window was at "
-                f"2000 before create_pane ran and reports {limits} after"
+                f"2000 before create_pane ran and the new pane reports {after[new_id]}"
             )
+
+            if self._tmux_version() >= self._EXISTING_PANES_FOLLOW_GLOBAL_SINCE:
+                assert after[original_id] == TMUX_HISTORY_LIMIT, (
+                    "tmux >= 3.7 applies a raised history-limit to existing panes "
+                    f"(CHANGES, issue 4705); the original pane reports {after[original_id]}"
+                )
+            else:
+                assert after[original_id] == 2000, (
+                    "tmux < 3.7 leaves an existing pane at the limit it was created "
+                    f"with; the original pane reports {after[original_id]}"
+                )
         finally:
             self._tmux(socket_name, "kill-server")
 
     def test_the_host_window_opened_by_the_first_pane_mode_terminal_gets_the_floor(self, tmp_path):
         """Pane mode's ``_open_host_window`` path: no host window yet, so the
         first pane-mode terminal opens it and takes its first pane. That pane
-        is an agent terminal too (#728)."""
+        is an agent terminal too (#728).
+
+        Holds on every supported tmux (3.2+): only the new window's pane is
+        asserted.
+        """
         self._require_tmux()
         socket_name = f"cao-test-history-host-{uuid.uuid4().hex[:12]}"
         self._tmux(socket_name, "kill-server")
@@ -1747,6 +1812,9 @@ class TestRealTmuxHistoryLimit:
         limit, ``-S -5000`` and ``-S -`` both return ~2004 lines on a pane that
         printed 3000 (measured, tmux 3.2a) and the earliest ~1000 lines are
         gone. With CAO's limit in force the deepest rung sees all of them.
+
+        Holds on every supported tmux (3.2+): the pane is created by CAO after
+        the raise, so its limit does not depend on the 3.7 change.
         """
         self._require_tmux()
         socket_name = f"cao-test-history-depth-{uuid.uuid4().hex[:12]}"
