@@ -283,6 +283,12 @@ def test_banned_set_is_exactly_the_four_named_crates():
 # whole module. `which` is not a Windows builtin, which is precisely where this test is most
 # likely to be skipped. `shutil.which` is the stdlib equivalent, needs no subprocess, and honours
 # PATHEXT on Windows. (#321; reported by review on PR #547)
+# Deliberately NOT marked must_run: this skip is genuinely covered elsewhere.
+# ci.yml's `rust` job installs the toolchain with dtolnay/rust-toolchain and runs
+# `python scripts/assert_no_ffi.py --manifest-path tui/Cargo.toml` directly in its
+# "Assert no Python-FFI crate in the dependency graph (FR-5.2)" step, so the real
+# graph IS asserted on every PR; the pip-only Unit Tests job has no cargo and
+# should keep skipping.
 @pytest.mark.skipif(
     shutil.which("cargo") is None,
     reason="cargo not installed; the Rust CI job covers this path",

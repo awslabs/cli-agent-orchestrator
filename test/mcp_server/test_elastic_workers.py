@@ -1,6 +1,7 @@
 """Elastic worker provisioning and acknowledged completion tests."""
 
 import asyncio
+import threading
 import time
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -465,15 +466,28 @@ def test_assign_elastic_calls_overlap_instead_of_serialising(monkeypatch):
     """Fan-out is the whole point of an elastic fleet.
 
     Both blocking legs (the broker POST and the assignment itself) run off the
-    event loop, so N delegations cost roughly one placement rather than N. With
-    either leg back on the loop this takes ~3x as long, which is what a
-    supervisor delegating five tasks used to pay.
+    event loop via `asyncio.to_thread`. This test guards the longer leg: three
+    concurrent delegations must all be in flight inside `_assign_impl` at once.
+    A three-party barrier proves that directly: it only releases once all three
+    callers have arrived, so a hang
+    (caught by its timeout, below) means the calls serialised instead of
+    overlapping. This replaces an earlier wall-clock assertion
+    (`elapsed < 0.8`) that flaked four times in one day on unrelated PRs
+    (#1003 twice, #999, #1012) at 0.90-0.98s on shared CI runners and passed on
+    every retry -- a timer can't distinguish a slow runner from real
+    serialisation, but a barrier can.
     """
     monkeypatch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker:9890")
     monkeypatch.setenv("CAO_ELASTIC_BROKER_TOKEN", "broker-token")
 
+    barrier = threading.Barrier(3, timeout=5.0)
+    broken = []
+
     def slow_assign(*args, **kwargs):
-        time.sleep(0.3)
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            broken.append(True)
         return {"success": True}
 
     def slow_post(*args, **kwargs):
@@ -494,9 +508,9 @@ def test_assign_elastic_calls_overlap_instead_of_serialising(monkeypatch):
         patch.object(server.requests, "post", side_effect=slow_post),
         patch.object(server, "_assign_impl", side_effect=slow_assign),
     ):
-        started = time.monotonic()
         results = asyncio.run(three())
-        elapsed = time.monotonic() - started
 
     assert all(r["success"] for r in results)
-    assert elapsed < 0.8, f"three delegations took {elapsed:.2f}s; expected ~0.4s"
+    assert (
+        not broken
+    ), "the three delegations did not overlap: _assign_impl was never in flight for all three at once"

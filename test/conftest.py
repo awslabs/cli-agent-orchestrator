@@ -33,7 +33,12 @@ if str(_MOCK_CLI_BIN_DIR) not in os.environ.get("PATH", "").split(os.pathsep):
 # Expose the managed-subprocess fixtures (cao_server, cao_server_with_auth,
 # cao_terminal) and the shared infra fixtures (jwt_factory, jwks_server,
 # terminal_factory) to every test under test/ without per-conftest imports.
+#
+# ``test._must_run`` is the must_run assurance gate (see that module): it turns a
+# skipped or deselected assurance test into a session failure in the CI job that
+# owns the gate.
 pytest_plugins = (
+    "test._must_run",
     "test.fixtures.cao_server",
     "test.fixtures.jwt_factory",
     "test.fixtures.jwks_server",
