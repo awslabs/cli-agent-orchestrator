@@ -1819,6 +1819,8 @@ async def health_check():
     def _probe(binary: str) -> str:
         return "ok" if shutil.which(binary) else "unavailable"
 
+    from cli_agent_orchestrator.services.settings_service import get_server_settings
+
     backend = get_backend()
     backend_name = "herdr" if isinstance(backend, HerdrBackend) else "tmux"
 
@@ -1826,6 +1828,11 @@ async def health_check():
         "status": "ok",
         "service": "cli-agent-orchestrator",
         "terminal_backend": backend_name,
+        # The init budget THIS server applies (issue #710). Clients size their
+        # wait for a synchronous create from their own settings, so an operator
+        # can compare the two here when the client runs with a different
+        # environment or on another host.
+        "provider_init_timeout": int(get_server_settings()["provider_init_timeout"]),
         "components": {
             "cao": "ok",
             "herdr": _probe("herdr"),
@@ -3627,9 +3634,11 @@ async def create_session(
 
         if lookup_only and not idempotency_key:
             raise ValueError("lookup_only requires an idempotency_key")
-        # Passed only when set, so the ordinary create call stays
-        # byte-identical for every existing caller (review on PR #773).
-        lookup_kwargs: Dict[str, Any] = {"lookup_only": True} if lookup_only else {}
+        # Optional arguments are passed only when set, so the ordinary create
+        # call stays byte-identical for every existing caller (review on PR #773).
+        optional_kwargs: Dict[str, Any] = {"lookup_only": True} if lookup_only else {}
+        if body and "description" in body.model_fields_set:
+            optional_kwargs["description"] = body.description
         result = await session_service.create_session(
             provider=provider,
             agent_profile=agent_profile,
@@ -3644,15 +3653,10 @@ async def create_session(
             model=model,
             use_worktree=use_worktree,
             idempotency_key=idempotency_key,
-            **lookup_kwargs,
             resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
-            **(
-                {"description": body.description}
-                if body and "description" in body.model_fields_set
-                else {}
-            ),
+            **optional_kwargs,
         )
 
         if (
@@ -8103,6 +8107,13 @@ async def get_inbox_messages_endpoint(
     status_param: Optional[str] = Query(
         default=None, alias="status", description="Filter by message status"
     ),
+    order: str = Query(
+        default="asc",
+        description="Order by created_at: asc (oldest first) or desc (newest first)",
+    ),
+    sender_id: Optional[str] = Query(
+        default=None, description="Return only messages from this sender"
+    ),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[Dict]:
     """Get inbox messages for a terminal.
@@ -8111,6 +8122,8 @@ async def get_inbox_messages_endpoint(
         terminal_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10, max: 100)
         status_param: Optional filter by message status ('pending', 'delivered', 'failed')
+        order: Sort by created_at, 'asc' (default, oldest first) or 'desc' (newest first)
+        sender_id: Optional filter returning only messages from this sender
 
     Returns:
         List of inbox messages with sender_id, message, created_at, status
@@ -8127,8 +8140,21 @@ async def get_inbox_messages_endpoint(
                     detail=f"Invalid status: {status_param}. Valid values: pending, delivered, failed",
                 )
 
-        # Get messages using existing database function
-        messages = get_inbox_messages(terminal_id, limit=limit, status=status_filter)
+        if order not in ("asc", "desc"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid order: {order}. Valid values: asc, desc",
+            )
+
+        # Get messages using existing database function. ``limit`` applies after
+        # ordering, so ``order=desc`` with a small limit returns the newest rows.
+        messages = get_inbox_messages(
+            terminal_id,
+            limit=limit,
+            status=status_filter,
+            sender_id=sender_id,
+            newest_first=order == "desc",
+        )
 
         # Convert to response format
         result = []
@@ -8707,7 +8733,19 @@ async def internal_memory_recall(
         sort_by=body.sort_by,
         include_related=body.include_related,
     )
-    return {"memories": [memory.model_dump(mode="json") for memory in memories]}
+    return {
+        "memories": [
+            {
+                **memory.model_dump(mode="json"),
+                **(
+                    {"lifecycle_status": memory.lifecycle_status}
+                    if memory.lifecycle_status is not None
+                    else {}
+                ),
+            }
+            for memory in memories
+        ]
+    }
 
 
 @app.post("/internal/memory/forget")
@@ -8844,6 +8882,8 @@ async def list_memories_endpoint(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[MemorySummary]:
     """List stored memories across all projects (mirrors `cao memory list --all`)."""
+    from cli_agent_orchestrator.services.settings_service import is_non_accessing_inspection_enabled
+
     _require_memory_enabled()
     svc = _get_memory_service()
     try:
@@ -8856,6 +8896,7 @@ async def list_memories_endpoint(
             limit=1000,
             scan_all=True,
             search_mode="metadata",
+            record_access=not is_non_accessing_inspection_enabled(),
         )
         if scope_id is not None:
             memories = [m for m in memories if _memory_matches_scope_id(m, scope_id, svc.base_dir)]
@@ -9135,6 +9176,8 @@ async def get_memory_endpoint(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> MemoryDetail:
     """Show a memory by key (mirrors `cao memory show`; first match wins)."""
+    from cli_agent_orchestrator.services.settings_service import is_non_accessing_inspection_enabled
+
     _require_memory_enabled()
     svc = _get_memory_service()
     try:
@@ -9144,6 +9187,7 @@ async def get_memory_endpoint(
             limit=1000,
             scan_all=True,
             search_mode="metadata",
+            record_access=not is_non_accessing_inspection_enabled(),
         )
         for mem in memories:
             if mem.key != key:

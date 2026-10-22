@@ -78,6 +78,33 @@ ops-MCP tool and `POST /sessions` itself share one validator
 (`utils/forwarded_env.py`) so the paths cannot drift; a direct HTTP caller gets
 a 422 naming the key.
 
+## Scrollback depth (`history-limit`)
+
+CAO shares your default tmux server, and before it creates a pane it raises that
+server's **global** `history-limit` to 50000 lines if the current value is lower.
+It never lowers a value you already set higher, and if it cannot read the current
+value it leaves the option alone.
+
+Why: a worker's reply is read back out of the pane's scrollback. tmux keeps 2000
+lines by default, which is shallower than the deepest read CAO attempts (5000
+lines), so a long reply plus a TUI's end-of-turn redraw could push the response
+out of scrollback entirely and the supervisor received a truncated reply or none
+(#728). 50000 matches the repository's recommended `.tmux.conf`.
+
+What it touches: because the option is global, your own new windows and
+sessions on that server also get the raised value. Panes that already exist
+keep the scrollback they have; whether their limit changes afterwards depends on
+the tmux version (from 3.7 the raised value applies to output that arrives later;
+before 3.7 an existing pane keeps the limit it was created with). Memory is
+allocated lazily as output arrives and only by panes that
+actually fill up: about 38 MB of tmux memory for a pane that holds 50000 lines
+of 100 characters, against about 1.8 MB at 2000.
+
+To change the floor, set `CAO_TMUX_HISTORY_LIMIT` in cao-server's environment.
+`CAO_TMUX_HISTORY_LIMIT=0` disables the raise entirely; a value below 5000 means
+the deepest extraction reads cannot be served and CAO clips them to what the
+pane can hold.
+
 ## Notes
 
 - CAO session names are automatically prefixed with `cao-`. Use the prefixed name (e.g. `cao-my-task`) when referencing a session in `tmux attach`, `cao session send`, or `cao shutdown`. Teardown never leaves that namespace: `cao shutdown --session my-task` and `DELETE /sessions/my-task` act on `cao-my-task`, and CAO refuses to kill a tmux session whose name lacks the prefix, so a personal session that shares the operator's tmux server is out of reach.

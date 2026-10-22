@@ -18,7 +18,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.utils.orchestration import (
-    _HANDOFF_CREATE_TIMEOUT_S,
     HandoffContext,
     _handoff_impl,
     _shape_handoff_message,
@@ -546,7 +545,13 @@ class TestHandoffEarlyTerminalId:
         mock_create.return_value = ("dev-t1", "kiro_cli")
         seen = []
 
-        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+        with (
+            patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests,
+            patch(
+                "cli_agent_orchestrator.utils.orchestration.synchronous_create_timeout",
+                return_value=(5.0, 430.0),
+            ) as mock_budget,
+        ):
             mock_requests.post.return_value = _ok_run_step_response(terminal_id="dev-t1")
             mock_requests.Timeout = Exception
             result = asyncio.run(_handoff_impl("developer", "Do task", on_terminal_id=seen.append))
@@ -554,7 +559,57 @@ class TestHandoffEarlyTerminalId:
         assert seen == ["dev-t1"]
         assert result.success is True
         assert result.terminal_id == "dev-t1"
-        assert mock_create.call_args[1]["create_timeout"] == _HANDOFF_CREATE_TIMEOUT_S
+        # The create is synchronous (no defer_init), so its budget is the
+        # init-derived one, resolved for THIS profile (issue #710).
+        mock_budget.assert_called_once_with("developer")
+        assert mock_create.call_args[1]["create_timeout"] == (5.0, 430.0)
+
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_synchronous_create_budget_follows_provider_init_timeout(
+        self, mock_create, mock_provider, _nudge
+    ):
+        """Issue #710 (review on PR #1002, P2-1): the early-terminal-id path
+        creates the worker SYNCHRONOUSLY, so cao-server does not answer until
+        ``provider.initialize()`` returns. A flat 150s (#634) was below a
+        successful Claude init at 3T=180s. The budget must now be a
+        ``(connect, read)`` tuple whose read half moves with
+        ``provider_init_timeout`` -- the property that separates a derivation
+        from a second hard-coded constant."""
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.return_value = ("dev-t1", "kiro_cli")
+
+        reads = []
+        for init_timeout in (60, 240):
+            with (
+                patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests,
+                patch(
+                    "cli_agent_orchestrator.services.settings_service.get_server_settings",
+                    return_value={
+                        "provider_init_timeout": init_timeout,
+                        "mcp_request_timeout": 30,
+                    },
+                ),
+                patch(
+                    "cli_agent_orchestrator.utils.agent_profiles.load_launch_profile",
+                    side_effect=FileNotFoundError("no override on this box"),
+                ),
+            ):
+                mock_requests.post.return_value = _ok_run_step_response(terminal_id="dev-t1")
+                mock_requests.Timeout = Exception
+                result = asyncio.run(
+                    _handoff_impl("developer", "Do task", on_terminal_id=lambda _tid: None)
+                )
+            assert result.success is True
+            budget = mock_create.call_args[1]["create_timeout"]
+            assert isinstance(budget, tuple), f"expected (connect, read), got {budget!r}"
+            connect, read = budget
+            assert connect == 5.0
+            assert read > 150.0, "the #634 literal was below a successful 3T Claude init"
+            reads.append(read)
+
+        assert reads[1] > reads[0]
 
     @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
@@ -829,17 +884,10 @@ class TestHandoffEarlyTerminalId:
 
 
 class TestHandoffCreateTimeoutCoversProviderFloors:
-    """_HANDOFF_CREATE_TIMEOUT_S must exceed every provider's own unconditional
-    ready-timeout floor (antigravity_cli.py's max(180.0, init_timeout) is the
-    highest known one), so an ordinary slow start finishes inside a single
-    attempt. Starts slower than that are covered by the keyed retry and the
-    lookup in TestHandoffCreateTimeoutRecovery, not by this constant."""
-
-    def test_constant_exceeds_known_provider_floors(self):
-        """This is the test that actually pins the regression: 150.0 (the old
-        value) is LESS than antigravity's 180.0 floor; 240.0 is not. Fails
-        against the pre-fix constant, passes after."""
-        assert _HANDOFF_CREATE_TIMEOUT_S > 180.0
+    """A slow but successful create must surface its terminal_id. The single
+    attempt's budget comes from ``synchronous_create_timeout`` (issue #710);
+    starts slower than that are covered by the keyed retry and the lookup in
+    TestHandoffCreateTimeoutRecovery."""
 
     def test_slow_but_successful_create_is_not_killed_client_side(self, monkeypatch):
         """Companion end-to-end sanity check, independent of the constant's
@@ -890,7 +938,7 @@ class TestHandoffCreateTimeoutCoversProviderFloors:
         thread.start()
 
         monkeypatch.setattr(orchestration, "API_BASE_URL", f"http://127.0.0.1:{port}")
-        monkeypatch.setattr(orchestration, "_HANDOFF_CREATE_TIMEOUT_S", 3.0)
+        monkeypatch.setattr(orchestration, "synchronous_create_timeout", lambda *_a, **_k: 3.0)
         # Unset, so handoff takes the new-session POST /sessions branch, the only
         # one the stand-in server implements.
         monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)
@@ -991,7 +1039,7 @@ class TestHandoffCreateTimeoutRecovery:
         # The first attempt always times out (init takes 1.2s > 1.0s). The replay
         # starts at ~1.0s and is held only until init settles at ~1.2s, so it
         # uses ~0.2s of its own 1.0s budget: ample headroom on a loaded runner.
-        monkeypatch.setattr(orchestration, "_HANDOFF_CREATE_TIMEOUT_S", 1.0)
+        monkeypatch.setattr(orchestration, "synchronous_create_timeout", lambda *_a, **_k: 1.0)
         monkeypatch.delenv("CAO_TERMINAL_ID", raising=False)
         try:
             reported = []
@@ -1031,7 +1079,13 @@ class TestHandoffCreateTimeoutRecovery:
             requests.exceptions.ConnectTimeout("connect timed out"),
             ("dev-t1", "kiro_cli"),
         ]
-        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+        with (
+            patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests,
+            patch(
+                "cli_agent_orchestrator.utils.orchestration.synchronous_create_timeout",
+                return_value=(5.0, 430.0),
+            ),
+        ):
             mock_requests.exceptions = requests.exceptions
             mock_requests.post.return_value = _ok_run_step_response(terminal_id="dev-t1")
             mock_requests.Timeout = requests.Timeout
@@ -1043,7 +1097,7 @@ class TestHandoffCreateTimeoutRecovery:
         assert mock_create.call_count == 2
         timeouts = [c.kwargs["create_timeout"] for c in mock_create.call_args_list]
         keys = {c.kwargs["idempotency_key"] for c in mock_create.call_args_list}
-        assert timeouts == [_HANDOFF_CREATE_TIMEOUT_S, _HANDOFF_CREATE_TIMEOUT_S]
+        assert timeouts == [(5.0, 430.0), (5.0, 430.0)]
         assert len(keys) == 1 and None not in keys
 
     @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")

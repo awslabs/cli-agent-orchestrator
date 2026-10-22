@@ -28,7 +28,7 @@ import re
 import time
 import uuid
 from collections.abc import Mapping
-from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple, Union
 
 import requests
 
@@ -50,6 +50,7 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.description import normalize_description
+from cli_agent_orchestrator.utils.init_allowance import synchronous_create_timeout
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_session_name_for_key,
@@ -119,53 +120,105 @@ def _auth_headers_for(base_url: str) -> Dict[str, str]:
 # supervisor LLM remembering to hand-write its terminal ID into the message.
 ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "true").lower() == "true"
 
+# The two sender-ID suffixes. They are composed ONLY through
+# ``append_sender_suffix`` so the structured-prompt guard below applies to
+# every call site (test_sender_suffix_structured_prompt.py enforces this).
+ASSIGN_SUFFIX_TEMPLATE = (
+    "[Assigned by terminal {terminal_id}. "
+    "When done, send results back to terminal {terminal_id} using send_message]"
+)
+MESSAGE_SUFFIX_TEMPLATE = (
+    "[Message from terminal {terminal_id}. Use send_message MCP tool for any follow-up work.]"
+)
+
+# Providers whose CLI dispatches an input whose first character is ``@`` as a
+# structured prompt invocation rather than prose. This is a property of the
+# RECEIVING terminal's CLI, not of the text: Claude Code, Codex, Gemini,
+# Copilot CLI and OpenCode read a leading ``@path`` as a file mention inside
+# ordinary prose and need the callback suffix exactly as much as any other
+# task (review on PR #1028). Only kiro-cli has the no-terminator grammar
+# described in ``is_structured_prompt_invocation``.
+STRUCTURED_PROMPT_PROVIDERS = frozenset({ProviderType.KIRO_CLI.value})
+
+# A deferred provider lookup. The receiver's provider often costs an HTTP GET
+# (the worker row, the remote profile store); passing a resolver instead of a
+# string lets ``append_sender_suffix`` pay that only for ``@``-leading
+# messages, which is the only case where the answer changes anything.
+ProviderResolver = Callable[[], Optional[str]]
+
+
+def _leads_with_at(message: str) -> bool:
+    """True when the first non-blank character of ``message`` is ``@``."""
+    return message.lstrip().startswith("@")
+
+
+def is_structured_prompt_invocation(message: str, provider: Optional[str]) -> bool:
+    """True when ``provider``'s CLI will read ``message`` as ``@<prompt> [args]``.
+
+    kiro-cli dispatches any input whose first character is ``@`` as an MCP
+    prompt call (e.g. ``@agent-sop:code-analysis query="..."``): it strips the
+    ``@``, shlex-splits the ENTIRE remaining input (newlines included), takes
+    the first token as the prompt name and zips every further token
+    positionally onto the prompt's declared arguments. The grammar has no
+    terminator, so text appended anywhere after the invocation is read as
+    parameter values -- a trailing sender-ID suffix landed in the SOP's
+    optional ``thoroughness`` parameter as ``[Assigned`` (issue #70).
+
+    Two conditions, both required:
+
+    * ``provider`` is in ``STRUCTURED_PROMPT_PROVIDERS``. Every other provider
+      treats a leading ``@path`` as a file mention in prose, where the suffix
+      is both safe and needed. An unknown provider (``None``) is treated as
+      prose so the worker keeps its callback instruction, which is what every
+      provider received before issue #70 was fixed.
+    * the first non-blank character of ``message`` is ``@``. An ``@``-mention
+      inside prose (``Review @src/main.py``) is never an invocation.
+    """
+    return provider in STRUCTURED_PROMPT_PROVIDERS and _leads_with_at(message)
+
+
+def append_sender_suffix(
+    message: str,
+    template: str,
+    terminal_id: str,
+    *,
+    provider: Optional[Union[str, ProviderResolver]],
+) -> str:
+    """Append the sender-ID suffix as its own paragraph, unless the RECEIVING
+    provider would absorb it as a prompt parameter.
+
+    ``provider`` is the provider of the terminal that will read the message:
+    a string when the caller already knows it, or a zero-argument resolver
+    that is called only when ``message`` leads with ``@`` (ordinary prose
+    never pays for the lookup). ``None`` means unknown and keeps the suffix.
+    The argument is keyword-only and has no default so a new call site cannot
+    forget to say which provider it is sending to.
+
+    Suppressing the suffix loses only the in-message reminder: callback
+    routing is structural since issue #284 (``caller_id`` on the worker row,
+    ``send_message`` without ``receiver_id`` routes to the recorded caller).
+    """
+    if _leads_with_at(message):
+        resolved = provider() if callable(provider) else provider
+        if is_structured_prompt_invocation(message, resolved):
+            return message
+    return message + "\n\n" + template.format(terminal_id=terminal_id)
+
+
 # Terminal count threshold for cleanup nudge
 TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
 
-# Generous client-side timeout for a SYNCHRONOUS (non-deferred) terminal create
-# call, used by handoff's early-terminal-id path (review on PR #634, issue #616).
-# Provider init (shell warm-up + CLI startup + MCP registration + auth) can
-# legitimately take up to ~45s server-side -- well past _mcp_timeout()'s 30s
-# default. That default was never a problem before because nothing called
-# _create_terminal non-deferred in production (assign always uses
-# defer_init=True); this is the first caller of that path, so it gets its own
-# padded timeout rather than silently inheriting one sized for something else.
-#
-# The ~45s estimate above is not the real worst case, though: several
-# providers apply their own unconditional ready-timeout FLOOR on top of the
-# configurable provider_init_timeout (default 60s) -- antigravity_cli.py's
-# initialize() uses max(180.0, init_timeout), minimax_code.py and kimi_cli.py
-# use max(120.0, init_timeout). At the old 150.0s value, a legitimately-slow
-# (but successful) antigravity init past ~150s got killed client-side here,
-# leaving an orphaned worker terminal with no terminal_id surfaced to the
-# operator to clean it up. 240.0 clears the highest known SINGLE floor
-# (antigravity's 180.0) with real headroom.
-#
-# It does NOT clear every provider's real worst case, though (review on PR
-# #773): antigravity's initialize() runs three sequential waits --
-# wait_for_shell(10.0), then the startup-dialog handler and wait_until_status
-# EACH capped at max(180.0, init_timeout) -- so a successful default-settings
-# init can legitimately take up to ~370s; kimi's is similarly additive
-# (~300s). A per-provider-aware constant would have to grow every time a
-# provider's own sequential floor does, and a fixed number can never cover an
-# arbitrarily large `provider_init_timeout` profile override. So this value is
-# left as a headroomed TYPICAL-case budget, not an attempted worst-case
-# ceiling -- the real safety net is `_HANDOFF_CREATE_ATTEMPTS` below: a
-# client-side timeout on this call no longer loses the terminal_id (see its
-# use in `_handoff_impl`), so an init slower than even this padded value
-# degrades to "slightly slower response", not "orphaned worker".
-_HANDOFF_CREATE_TIMEOUT_S = 240.0
-
 # How many times handoff's synchronous create is sent, all under the SAME
-# idempotency key and each with the full `_HANDOFF_CREATE_TIMEOUT_S` budget
-# (review on PR #773). The client never guesses from the exception type
-# whether its timed-out attempt reached the server: if it did, the retry is an
-# idempotent replay, which cao-server holds until the original
-# provider.initialize() settles and then returns the READY terminal (or the
-# original failure); if it did not (e.g. a ConnectTimeout), the retry is a
-# fresh create that gets the same full budget as a first attempt. Three
-# attempts cover the slowest default-settings init above (~370s) even when
-# the first attempt never connected.
+# idempotency key and each with the full ``synchronous_create_timeout`` budget
+# (review on PR #773). That budget is the client's view of the server's init
+# allowance (issue #710); it can still be outrun, for example when the server
+# reads a larger ``provider_init_timeout`` than the client does. The client
+# never guesses from the exception type whether its timed-out attempt reached
+# the server: if it did, the retry is an idempotent replay, which cao-server
+# holds until the original provider.initialize() settles and then returns the
+# READY terminal (or the original failure); if it did not (e.g. a
+# ConnectTimeout), the retry is a fresh create that gets the same full budget
+# as a first attempt.
 _HANDOFF_CREATE_ATTEMPTS = 3
 _TERMINAL_ID_PATTERN = re.compile(r"^[a-f0-9]{8}$")
 
@@ -732,7 +785,7 @@ def _create_terminal(
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
     model: Optional[str] = None,
     use_worktree: bool = False,
-    create_timeout: Optional[float] = None,
+    create_timeout: Optional[Union[float, Tuple[float, float]]] = None,
     idempotency_key: Optional[str] = None,
     lookup_only: bool = False,
     claim: Optional[EphemeralClaim] = None,
@@ -764,14 +817,15 @@ def _create_terminal(
             ``None`` (default) keeps today's behavior (``_mcp_timeout()``,
             30s), which is fine for ``defer_init=True`` (assign's path:
             returns in <2s by design) but too short for a SYNCHRONOUS create
-            that waits out ``provider.initialize()`` -- some providers'
-            own unconditional ready-timeout floors put a successful init well
-            past 300s (see ``_HANDOFF_CREATE_TIMEOUT_S``'s comment) -- pass an
-            explicit, larger value for that case. A client-side timeout on
-            this call is not fatal to the caller either way: retrying with the
-            same ``idempotency_key`` either replays the original create (and
-            waits for its initialization) or performs it if it never arrived
-            (see ``_HANDOFF_CREATE_ATTEMPTS``'s use in ``_handoff_impl``).
+            that waits out ``provider.initialize()`` -- pass
+            ``synchronous_create_timeout(agent_profile)`` from
+            ``utils.init_allowance`` for that case (issue #710), as handoff
+            does. A ``(connect, read)`` tuple is accepted as ``requests`` takes
+            it, so only the read half is widened.
+            A client-side timeout on this call is not fatal to the caller:
+            retrying with the same ``idempotency_key`` either replays the
+            original create (and waits for its initialization) or performs it
+            if it never arrived (see ``_HANDOFF_CREATE_ATTEMPTS``).
         defer_init: If True, tell
             cao-server to skip the ``provider.initialize()`` wait and return
             as soon as the tmux window and DB record exist. Provider init
@@ -1176,6 +1230,45 @@ def _parse_run_step_error(
     return None, fallback, None, None
 
 
+def _receiver_provider(receiver_id: str) -> Optional[str]:
+    """Provider of the terminal a ``send_message`` payload is addressed to.
+
+    Reads the receiver's row from the node ``_send_to_inbox`` will post to:
+    the callback node when the receiver is the recorded cross-node supervisor,
+    otherwise this node, with the same one-shot retry against the callback
+    node for an ID this node does not know. Returns ``None`` when no row can
+    be read: the sender suffix is then kept, which is what every provider
+    received before issue #70 was fixed, and the inbox POST that follows
+    reports the real delivery error itself. The lookup is advisory and never
+    turns a deliverable message into a failure.
+    """
+    callback_url, callback_terminal_id = _callback_route()
+    if callback_url and receiver_id == callback_terminal_id:
+        bases = [callback_url]
+    elif callback_url:
+        bases = [API_BASE_URL, callback_url]
+    else:
+        bases = [API_BASE_URL]
+
+    for base in bases:
+        try:
+            response = requests.get(
+                f"{base}/terminals/{receiver_id}",
+                headers={**_auth_headers_for(base), **elastic_worker_gateway_headers()} or None,
+                timeout=_mcp_timeout(),
+            )
+            if response.status_code == 404:
+                continue
+            response.raise_for_status()
+            row = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            logger.debug("Receiver provider lookup for %s failed: %s", receiver_id, exc)
+            return None
+        provider = row.get("provider") if isinstance(row, dict) else None
+        return str(provider) if provider else None
+    return None
+
+
 def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
     """Send message to another terminal's inbox (queued delivery when IDLE).
 
@@ -1501,6 +1594,8 @@ class _HandoffCreateUnresolved(Exception):
 
 def _http_error_detail(exc: requests.exceptions.HTTPError) -> str:
     """Return the ``detail`` cao-server sent with an error response, if any."""
+    if exc.response is None:
+        return str(exc)
     try:
         detail = exc.response.json().get("detail")
     except (AttributeError, ValueError):
@@ -1522,7 +1617,7 @@ def _create_handoff_terminal(
     """Synchronously create handoff's worker, retrying a client timeout.
 
     Every attempt carries the SAME idempotency key and the full
-    ``_HANDOFF_CREATE_TIMEOUT_S`` budget (review on PR #773). Only a timeout is
+    ``synchronous_create_timeout`` budget (review on PR #773). Only a timeout is
     retried. Whether or not the timed-out attempt reached cao-server, the next
     one is safe: a replay is held server-side until the original
     provider.initialize() settles, and an attempt that never arrived is simply
@@ -1535,6 +1630,7 @@ def _create_handoff_terminal(
     retried either; it raises ``_HandoffCreateUnresolved`` so the caller can
     still look up a worker an earlier attempt may have committed.
     """
+    claim_kwargs: Dict[str, Any] = {"claim": claim} if claim is not None else {}
     saw_timeout = False
     for attempt in range(1, _HANDOFF_CREATE_ATTEMPTS + 1):
         try:
@@ -1544,21 +1640,20 @@ def _create_handoff_terminal(
                 engine=engine,
                 model=model,
                 use_worktree=use_worktree,
-                create_timeout=_HANDOFF_CREATE_TIMEOUT_S,
+                create_timeout=synchronous_create_timeout(agent_profile),
                 idempotency_key=idempotency_key,
                 description=description,
-                **({"claim": claim} if claim is not None else {}),
+                **claim_kwargs,
             )
         except requests.exceptions.Timeout as exc:
             saw_timeout = True
             if attempt == _HANDOFF_CREATE_ATTEMPTS:
                 raise _HandoffCreateUnresolved(str(exc)) from exc
             logger.warning(
-                "handoff: create attempt %d/%d timed out after %ss; retrying with "
-                "the same idempotency key",
+                "handoff: create attempt %d/%d timed out; retrying with the same "
+                "idempotency key",
                 attempt,
                 _HANDOFF_CREATE_ATTEMPTS,
-                _HANDOFF_CREATE_TIMEOUT_S,
             )
         except requests.exceptions.HTTPError as exc:
             status_code = exc.response.status_code if exc.response is not None else None
@@ -1603,6 +1698,7 @@ def _lookup_committed_handoff_terminal(
     is nothing to recover (or the lookup itself failed), and the caller
     reports the original timeout unchanged.
     """
+    claim_kwargs: Dict[str, Any] = {"claim": claim} if claim is not None else {}
     try:
         terminal_id, _provider = _create_terminal(
             agent_profile,
@@ -1610,10 +1706,14 @@ def _lookup_committed_handoff_terminal(
             engine=engine,
             model=model,
             use_worktree=use_worktree,
+            # A lookup answers without waiting for init, but it is still a
+            # create request to the server, so it carries the same derived
+            # budget as every other one (issue #710).
+            create_timeout=synchronous_create_timeout(agent_profile),
             idempotency_key=idempotency_key,
             lookup_only=True,
             description=description,
-            **({"claim": claim} if claim is not None else {}),
+            **claim_kwargs,
         )
     except Exception as exc:  # noqa: BLE001 -- best-effort recovery of an id
         logger.info("handoff: no committed terminal recovered after create timeout: %s", exc)
@@ -1891,6 +1991,12 @@ async def _handoff_impl(
         # GET); reassigning ``provider`` to its return value uses whatever it
         # actually persisted on the terminal as the source of truth for the
         # reuse call below, rather than assuming the two resolutions agree.
+        # This create is SYNCHRONOUS (no defer_init), so cao-server does not
+        # answer until ``provider.initialize()`` returns; the client budget has
+        # to be derived from the ``provider_init_timeout`` the server is itself
+        # waiting out, not written down a second time (issue #710). It used to
+        # be a flat 150s (#634), which was below a successful Claude init at
+        # 3T=180s, let alone Kimi's 300s or Antigravity's 370s.
         claim_kwargs: Dict[str, Any] = {"claim": claim} if claim is not None else {}
         # A key is synthesized here even when the caller passed none (true of
         # every caller today -- see this function's idempotency_key docstring
@@ -1939,6 +2045,8 @@ async def _handoff_impl(
                 ),
                 output=None,
                 terminal_id=terminal_id,
+                job_id=None,
+                pending=None,
             )
         _notify_terminal_id(on_terminal_id, terminal_id)
 
@@ -2046,6 +2154,7 @@ def _assign_remote(
     agent_profile: str,
     worker_message: str,
     current_terminal_id: str,
+    inject_sender_suffix: bool = False,
     target_host: str,
     working_directory: Optional[str],
     engine: Optional[str],
@@ -2063,6 +2172,13 @@ def _assign_remote(
     node) and the task is delivered once the remote provider initializes. The
     remote node resolves the provider from its OWN installed profile store
     (``provider`` is deliberately omitted from the request).
+
+    ``inject_sender_suffix``: append the callback-instructions suffix to
+    ``worker_message`` here rather than in the caller, because the receiving
+    provider that decides whether the suffix is safe (issue #70) lives in the
+    remote node's profile store and is read only after the ready wait below,
+    and only for an ``@``-leading task. ``False`` (the default) delivers
+    ``worker_message`` as given.
 
     Callback routing: assign is non-blocking, so results come back via the
     worker's ``send_message``. The worker's node has no DB row for this
@@ -2110,6 +2226,13 @@ def _assign_remote(
     base_url = _resolve_target_base_url(target_host)
     if ready_wait_seconds > 0:
         _wait_remote_ready(base_url, ready_wait_seconds)
+    if inject_sender_suffix:
+        worker_message = append_sender_suffix(
+            worker_message,
+            ASSIGN_SUFFIX_TEMPLATE,
+            current_terminal_id,
+            provider=lambda: _resolve_remote_provider(base_url, agent_profile),
+        )
     params: Dict[str, Any] = {"agent_profile": agent_profile}
     if remote_session_name:
         params["session_name"] = remote_session_name
@@ -2195,6 +2318,21 @@ def _assign_remote(
 
 
 # Implementation function for assign
+def _assign_worker_provider(agent_profile: str, claim: Optional[EphemeralClaim]) -> str:
+    """Provider the local assign worker will run, resolved BEFORE it exists.
+
+    The same resolution ``_create_terminal`` applies a moment later: an
+    ephemeral claim pins the provider; otherwise the profile's own provider,
+    falling back to the supervisor's (``_resolve_handoff_provider``, one GET on
+    the supervisor row). Only consulted to decide whether the sender suffix is
+    safe for the worker's CLI, so ``append_sender_suffix`` calls it only for
+    ``@``-leading tasks.
+    """
+    if claim is not None:
+        return claim.provider
+    return _resolve_handoff_provider(agent_profile).provider
+
+
 def _assign_impl(
     agent_profile: str,
     message: str,
@@ -2256,24 +2394,14 @@ def _assign_impl(
                 ),
             }
 
-        # Compose the message the worker will see once it is ready. We do
-        # this here (not on the server) because the callback-instructions
-        # suffix depends on ``CAO_TERMINAL_ID``, which lives in the calling
-        # process's env (the supervisor-owned MCP subprocess, or a ``cao
-        # agent assign`` shell), not on the cao-server side.
-        if ENABLE_SENDER_ID_INJECTION:
-            worker_message = (
-                message
-                + f"\n\n[Assigned by terminal {current_terminal_id}. "
-                + f"When done, send results back to terminal {current_terminal_id} using send_message]"
-            )
-        else:
-            worker_message = message
-
         if target_host:
+            # The remote node resolves the worker's provider from its own
+            # profile store, so the callback suffix is composed there, once
+            # the node is known to be up (see ``_assign_remote``).
             return _assign_remote(
                 agent_profile=agent_profile,
-                worker_message=worker_message,
+                worker_message=message,
+                inject_sender_suffix=ENABLE_SENDER_ID_INJECTION,
                 current_terminal_id=current_terminal_id,
                 target_host=target_host,
                 working_directory=working_directory,
@@ -2285,6 +2413,23 @@ def _assign_impl(
                 remote_session_name=remote_session_name,
                 description=description,
             )
+
+        # Compose the message the worker will see once it is ready. We do
+        # this here (not on the server) because the callback-instructions
+        # suffix depends on ``CAO_TERMINAL_ID``, which lives in the calling
+        # process's env (the supervisor-owned MCP subprocess, or a ``cao
+        # agent assign`` shell), not on the cao-server side. The helper leaves
+        # a kiro-cli ``@<prompt> [args]`` invocation untouched (issue #70) and
+        # looks the worker's provider up only when the task leads with ``@``.
+        if ENABLE_SENDER_ID_INJECTION:
+            worker_message = append_sender_suffix(
+                message,
+                ASSIGN_SUFFIX_TEMPLATE,
+                current_terminal_id,
+                provider=lambda: _assign_worker_provider(agent_profile, claim),
+            )
+        else:
+            worker_message = message
 
         # Create terminal in DEFERRED-INIT mode: cao-server returns as soon
         # as the tmux window is up and the DB row is written; the actual
@@ -2426,14 +2571,19 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
         # Auto-inject sender terminal ID suffix when enabled. Skipped when
         # CAO_TERMINAL_ID is unset — never inject 'unknown' as a routable
         # address (issue #284); _send_to_inbox raises a clear error for that
-        # case anyway.
+        # case anyway. The helper leaves a kiro-cli ``@<prompt> [args]``
+        # invocation untouched (issue #70) and reads the RECEIVER's provider
+        # only when the message leads with ``@``.
+        receiver: str = receiver_id
         if ENABLE_SENDER_ID_INJECTION and own_terminal_id:
-            message += (
-                f"\n\n[Message from terminal {own_terminal_id}. "
-                "Use send_message MCP tool for any follow-up work.]"
+            message = append_sender_suffix(
+                message,
+                MESSAGE_SUFFIX_TEMPLATE,
+                own_terminal_id,
+                provider=lambda: _receiver_provider(receiver),
             )
 
-        return _send_to_inbox(receiver_id, message)
+        return _send_to_inbox(receiver, message)
     except requests.HTTPError as exc:
         # e.g. the receiver terminal (a recorded caller included) was deleted
         # before this reply — surface the API detail instead of a raw
