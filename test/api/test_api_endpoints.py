@@ -57,6 +57,18 @@ class TestHealthCheck:
         data = response.json()
         assert data["terminal_backend"] == "tmux"
 
+    def test_health_reports_the_servers_provider_init_timeout(self, client):
+        """Issue #710 (review on PR #1002, P3-1): clients size their wait for a
+        synchronous create from THEIR settings, so the server publishes the value
+        it applies for an operator to compare against."""
+        with patch(
+            "cli_agent_orchestrator.services.settings_service.get_server_settings",
+            return_value={"provider_init_timeout": 180},
+        ):
+            response = client.get("/health")
+        assert response.status_code == 200
+        assert response.json()["provider_init_timeout"] == 180
+
     def test_health_reports_terminal_backend_herdr(self, client):
         """GET /health reports terminal_backend='herdr' when server uses HerdrBackend."""
         from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend

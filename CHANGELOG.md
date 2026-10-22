@@ -24,8 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Breaking / migration:** a fresh script run now executes a private copy of the approved source.
   Modules beside the spec are not importable and `__file__` names the copy; this matches resume.
-- **Breaking / migration:** while approval is enabled, fresh agent steps in script runs refuse reserved
-  ephemeral profile names until #827 binds their definitions.
+- **Breaking / migration:** reserved ephemeral names are refused as fresh script-run agent steps
+  while approval is enforced: they have no installed definition for the launch guard to digest.
 - **Breaking / migration:** non-Git roots now bind the directory's canonical path into `plan_id`.
   Moving or renaming such a directory requires a new approval; Git-repository plan identifiers are
   unchanged.
@@ -45,10 +45,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run-step transport does not yet receive that credential; subprocess credential delivery
   remains a separate security-boundary decision.
 
+- Opt-in non-accessing inspection for CLI memory list/show and HTTP GET
+  memory views. Agent recall still reinforces access counts; repeated
+  operator views cannot make lessons promotion-eligible. Part of #861.
+
+- Opt-in `memory.lifecycle.enabled` excludes active supersedes targets from
+  injection and adds transient recall labels/demotion. Defaults and canonical
+  Markdown remain unchanged; score/relevance demotion is always on. Ordering
+  and labels share one supersedes snapshot, including related targets. Part of #861.
+
+- Batch lifecycle eligibility seam for native, vault, related and curator
+  injection paths, with lazy checks before caps and per-source fail-open
+  diagnostics. The registry contains only the built-in supersedes source,
+  disabled by default; ordinary explicit recall remains unfiltered.
+  Part of #861. Refs #867.
+
+- On-demand `cao memory list --query Q --explain` compares default/relevance
+  ranks without recording access or exposing memory content, tags or paths.
+  Both pools share one supersedes snapshot for consistent ranks and labels;
+  source failures are visible and errors omit paths and keys. `lexical_degenerate`
+  reports all-zero lexical batches without changing ranking.
+  Table/JSON output is bounded; `memory.explain_enabled` defaults to true and
+  supports `CAO_MEMORY_EXPLAIN_ENABLED`. Part of #861.
+
+- Opt-in memory recall `sort_by="relevance"` over the widened candidate pool,
+  with all-term tiers and bounded age influence for native project rows.
+  Missing, empty and whitespace-only queries follow the exact recency path,
+  including source selection and access effects; defaults are unchanged. Part of #861.
+
 - `assign` and `handoff` now launch ephemeral agents (#801) from their creator terminal: Claude Code by default, Codex when an operator allows it.
 - Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `ephemeral.enabled` stays off by default.
 - Persistent agent descriptions with creation-time CLI/MCP labels and editable
   descriptions in Web UI Home and Agents (#942).
+- `cao agent assign`, `handoff` and `send-message` accept `--message-file PATH` (`-` for
+  stdin) in place of the positional MESSAGE, the file/stdin input #616 asked for: read as UTF-8,
+  one trailing newline dropped, mutually exclusive with MESSAGE, and refused when empty.
 
 - The publish workflow now refuses, in seconds, a release tag whose version
   `pyproject.toml`, `uv.lock` and the devcontainer feature do not carry, and a
@@ -171,6 +202,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Every client call that creates a session or terminal synchronously (`cao launch` without
+  `--headless`, `cao agent handoff`, the `launch_agent` app gesture and the `cao-ops`
+  `launch_session` tool without a message) now sizes its wait from `provider_init_timeout`
+  and the profile's override of it, through one shared derivation, instead of from
+  `mcp_request_timeout` or a per-site literal (30s, 150s, 300s). A successful but slow
+  provider init was being reported to the caller as a transport failure while cao-server went
+  on building the worker, so a retry collided with a session that already existed. Only the
+  read half of the request timeout widens; an unreachable server still reports in 5s. A guard
+  test enumerates every create call site and fails on one that neither defers init nor derives
+  its budget. `GET /health` now reports the server's `provider_init_timeout` so an operator can
+  check that a client on another host sees the same value (#710).
+- Vault scan now re-reads a note whose size, mtime or ctime changed across the read window up to
+  three times with a short backoff, as ADR-006 specifies, instead of skipping it on the first
+  torn read. A note saved by Obsidian during a reconcile is indexed from the clean re-read; a
+  note still changing after the bound is recorded as `unstable_skipped` with the attempt count in
+  the finding detail and its prior row is left intact (#644).
+- Vault configuration validation no longer queries the database. `VaultConfig` validators are
+  pure, so a `memory.vault` document with a project mapping validates on a fresh `CAO_HOME_DIR`
+  that has never run `init_db()`, and `cao config list` shows it without a database. Project
+  aliases are still canonicalised, and alias-equivalent mappings still refused, on the loading
+  path (`get_vault_config`) that owns a database; a guard test keeps every vault validator free
+  of `clients.database` (#644).
+- `cao-server` now refuses to start when another `cao-server` already owns the
+  same `CAO_HOME_DIR`, whatever port either uses. The server takes an exclusive
+  `flock` on `server.lock` in the data directory before the database, recovery
+  sweeps, terminal registry, status monitor or port bind, holds it for the
+  process lifetime, and the second instance exits non-zero naming the owning
+  PID, port and start time. Previously the port was the only guard, and a
+  second server on another port silently marked the first server's in-flight
+  launches as interrupted, double-delivered inbox messages on the herdr
+  backend, and could tear down the first server's tmux panes. Two servers on
+  one data directory are unsupported; use a separate `CAO_HOME_DIR` and
+  `--port` per server (#406, #709).
+- Concurrent blocking script starts with the same run id now return a conflict
+  for the loser without changing the winning run's journal or live record.
+- Script runs under approval enforcement now stop before spawning if their run row
+  cannot be recorded. A known script run with a missing row supplies no memory
+  and logs a warning, whether enforcement is on or off. Its launch guard also
+  refuses fresh agent launches while approval is enforced.
+- Kiro CLI agent specs installed by CAO now carry `includeMcpJson`, the name Kiro CLI documents, instead of the retired `useLegacyMcpJson` alias, which Kiro rejected as a duplicate field whenever another writer added the canonical key (#1026). The profile field keeps its `useLegacyMcpJson` spelling and is now actually forwarded into the spec; previously it was accepted and ignored.
 - Corrective workflow re-prompts now reuse the attempt's rendered prompt, so
   workflow inputs and earlier step outputs stay filled in when structured output
   is missing or invalid (#966).
@@ -214,6 +285,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-zero for a task the server goes on to deliver. A 4xx still fails at once,
   and a timeout after failed polls says the message may already have been
   delivered.
+- `cao session send`, the headless `cao launch` run, `cao worker send` and
+  `cao worker attach` no longer lose the agent's reply when one status poll
+  fails while they wait (#1016). The same rule as #882 applies: a connection
+  error, a read timeout, a 5xx or a reply that is not JSON is retried until the
+  send timeout, a 4xx fails at once, and a timeout after failed polls names the
+  last error. Broker errors from `FleetClient` now keep their HTTP status, so a
+  worker's 404 still fails at once.
 - Audit all tracked npm, Bun, uv, and Cargo dependency graphs in every CI run
   and weekly, including development dependencies and unfixed advisories. Block
   every HIGH/CRITICAL finding and scan error, and publish complete inventory and
@@ -724,8 +802,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   root outside Git is now an approvable plan instead of `plan_identity_unavailable`. Approvals granted
   for a plan fingerprinted against a different directory must be granted again.
 
-- A script run refuses to launch further agent steps (HTTP 409, `kind: plan_inputs_changed`) when an
-  agent profile or the memory-enabled setting changed after the run's approval check (#699).
+- While approval is enforced, a script run refuses to launch further agent steps (HTTP 409,
+  `kind: plan_inputs_changed`) when an agent profile or the memory-enabled setting changes after
+  the admission snapshot. That snapshot is captured before the approval check (#699).
 
 - `cao workflow get` / `update` / `delete` validate and percent-encode workflow names;
   `cao workflow validate --json` returns the `{ok: false, ...}` envelope on failure; `cao workflow
@@ -772,6 +851,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- A profile's `tools:` allowlist is now enforced for every CAO MCP tool, not
+  just the delegation tools (`assign`, `handoff`, `assign_elastic`,
+  `create_ephemeral_agent`, `workflow_run`/`resume`/`start`) that #769/#811
+  already checked. Provider-native tool restrictions can't name an MCP tool
+  (`get_disallowed_tools` skips every `@`-prefixed entry), so a bound terminal
+  whose allowlist omitted `@cao-mcp-server` could still reach `memory_store`,
+  `memory_forget`, `delete_terminal`, `workflow_cancel`, and the rest of the
+  surface. One `on_call_tool` middleware now gates every `cao-mcp-server` tool
+  on the caller's allowlist, deferring to the same policy function #769 added,
+  so a tool registered later is covered by default. The callback protocol
+  (`send_message`, `complete_assignment`, `workflow_return`,
+  `answer_user_prompt`) and the independently-granted `discovery` tools
+  (`list_siblings`, `update_metadata`) are carved out, matching documented
+  behavior. Denied calls now surface as an MCP `ToolError` rather than a
+  `{"success": false, "error": ...}` result for the previously-gated seven.
+  `cao-ops-mcp-server` is unaffected — it is a separate, operator-granted
+  control plane. (#671)
 - New `Actions Security` CI job runs zizmor 1.30.1 over `.github/` on every PR
   and push to `main`, failing on Medium-or-higher findings. Accepted findings
   are listed with reasons in `.github/zizmor.yml` (checkout credential

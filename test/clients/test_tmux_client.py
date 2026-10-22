@@ -5,12 +5,16 @@ which is deliberately NOT mocked — see its module docstring for why.
 """
 
 import os
+import re
 import shutil
 import subprocess
+import time
 import uuid
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+
+from cli_agent_orchestrator.constants import TMUX_HISTORY_LIMIT
 
 
 @pytest.fixture
@@ -173,13 +177,21 @@ class TestCreateSession:
         tmux.server.cmd.side_effect = [
             MagicMock(returncode=1, stdout=[], stderr=["server exited unexpectedly"]),
             MagicMock(returncode=0, stdout=[], stderr=[]),
+            # history-limit read: the fresh server's default (#728)
+            MagicMock(returncode=0, stdout=["history-limit 2000"], stderr=[]),
+            MagicMock(returncode=0, stdout=[], stderr=[]),  # history-limit set (#728)
         ]
 
         with patch("cli_agent_orchestrator.clients.tmux.time.sleep") as mock_sleep:
             tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
 
         exit_empty = call("start-server", ";", "set-option", "-s", "exit-empty", "off")
-        assert tmux.server.cmd.call_args_list == [exit_empty, exit_empty]
+        assert tmux.server.cmd.call_args_list == [
+            exit_empty,
+            exit_empty,
+            _READ_HISTORY_LIMIT,
+            _SET_HISTORY_LIMIT,
+        ]
         mock_sleep.assert_called_once_with(tmux._EXIT_EMPTY_RETRY_DELAY_S)
         assert "exit-empty" not in caplog.text
 
@@ -373,6 +385,133 @@ class TestCreateSessionEnvironmentFiltering:
         assert "MY_CUSTOM_THING" not in env
 
 
+# ── _set_server_history_limit (floor, #728) ──────────────────────────
+
+_READ_HISTORY_LIMIT = call("start-server", ";", "show-options", "-g", "history-limit")
+_SET_HISTORY_LIMIT = call(
+    "start-server", ";", "set-option", "-g", "history-limit", str(TMUX_HISTORY_LIMIT)
+)
+
+
+def _server_reporting(history_limit, *, then=None):
+    """A ``server.cmd`` side effect whose ``show-options`` answers ``history_limit``.
+
+    ``history_limit`` may be an int (a live value), ``None`` (the read fails),
+    or a list of raw stdout lines. ``then`` supplies results for the calls that
+    follow the read, in order; the default is success.
+    """
+    following = list(then or [])
+
+    def cmd(*args):
+        if "show-options" in args:
+            if history_limit is None:
+                return MagicMock(returncode=1, stdout=[], stderr=["error connecting"])
+            if isinstance(history_limit, list):
+                return MagicMock(returncode=0, stdout=history_limit, stderr=[])
+            return MagicMock(returncode=0, stdout=[f"history-limit {history_limit}"], stderr=[])
+        if following:
+            return following.pop(0)
+        return MagicMock(returncode=0, stdout=[], stderr=[])
+
+    return cmd
+
+
+class TestSetServerHistoryLimit:
+    """CAO shares the operator's tmux server. The scrollback raise is a FLOOR:
+    a global at or above CAO's value is left alone, a lower one is raised, and
+    a value that cannot be read is never overwritten."""
+
+    def test_the_read_starts_the_server_in_the_same_invocation(self, tmux):
+        """So a clean socket reads the fresh server's value (2000, or whatever
+        the operator's .tmux.conf says) instead of failing, and the
+        ``set-option`` that follows cannot overwrite a dotfile value the read
+        never saw."""
+        tmux.server.cmd.side_effect = _server_reporting(2000)
+
+        tmux._set_server_history_limit()
+
+        assert tmux.server.cmd.call_args_list[0] == _READ_HISTORY_LIMIT
+
+    def test_higher_existing_limit_is_left_alone(self, tmux):
+        """An operator-set 100000 must survive a CAO session launch untouched:
+        no ``set-option`` at all, not a set to the same value."""
+        tmux.server.cmd.side_effect = _server_reporting(100000)
+
+        tmux._set_server_history_limit()
+
+        assert tmux.server.cmd.call_args_list == [_READ_HISTORY_LIMIT]
+
+    def test_limit_already_at_the_floor_is_left_alone(self, tmux):
+        tmux.server.cmd.side_effect = _server_reporting(TMUX_HISTORY_LIMIT)
+
+        tmux._set_server_history_limit()
+
+        assert tmux.server.cmd.call_args_list == [_READ_HISTORY_LIMIT]
+
+    def test_default_limit_is_raised_to_cao_floor(self, tmux):
+        """tmux's own 2000 default is below CAO's floor and gets raised."""
+        tmux.server.cmd.side_effect = _server_reporting(2000)
+
+        tmux._set_server_history_limit()
+
+        assert tmux.server.cmd.call_args_list == [_READ_HISTORY_LIMIT, _SET_HISTORY_LIMIT]
+
+    def test_an_operators_lower_limit_is_raised_too(self, tmux):
+        """This is a floor, not a preservation of whatever is there: an
+        operator who set 1000 gets CAO's value on this server. The override
+        for that operator is ``CAO_TMUX_HISTORY_LIMIT`` (docs/tmux.md)."""
+        tmux.server.cmd.side_effect = _server_reporting(1000)
+
+        tmux._set_server_history_limit()
+
+        assert tmux.server.cmd.call_args_list == [_READ_HISTORY_LIMIT, _SET_HISTORY_LIMIT]
+
+    def test_failed_read_sets_nothing(self, tmux):
+        """A live server whose value could not be read keeps it: a failed read
+        is not a licence to overwrite 100000 with 50000."""
+        tmux.server.cmd.side_effect = _server_reporting(None)
+
+        tmux._set_server_history_limit()
+
+        assert tmux.server.cmd.call_args_list == [_READ_HISTORY_LIMIT]
+
+    def test_unparseable_read_sets_nothing(self, tmux):
+        tmux.server.cmd.side_effect = _server_reporting(["history-limit lots", "noise"])
+
+        tmux._set_server_history_limit()
+
+        assert tmux.server.cmd.call_args_list == [_READ_HISTORY_LIMIT]
+
+    def test_read_failure_as_exception_sets_nothing(self, tmux):
+        tmux.server.cmd.side_effect = OSError("tmux binary missing")
+
+        tmux._set_server_history_limit()  # best-effort: must not raise
+
+        assert tmux.server.cmd.call_count == 1
+
+    def test_set_is_retried_once_after_a_failed_set(self, tmux):
+        """Same single-retry contract as ``_set_server_exit_empty_off``, for the
+        same reason: a create right after an external ``kill-server`` can reach
+        the dying old server and get ``server exited unexpectedly``."""
+        tmux.server.cmd.side_effect = _server_reporting(
+            2000,
+            then=[
+                MagicMock(returncode=1, stdout=[], stderr=["server exited unexpectedly"]),
+                MagicMock(returncode=0, stdout=[], stderr=[]),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.tmux.time.sleep") as mock_sleep:
+            tmux._set_server_history_limit()
+
+        assert tmux.server.cmd.call_args_list == [
+            _READ_HISTORY_LIMIT,
+            _SET_HISTORY_LIMIT,
+            _SET_HISTORY_LIMIT,
+        ]
+        mock_sleep.assert_called_once_with(tmux._EXIT_EMPTY_RETRY_DELAY_S)
+
+
 # ── create_window ────────────────────────────────────────────────────
 
 
@@ -387,6 +526,21 @@ class TestCreateWindow:
         result = tmux.create_window("ses", "agent-window", "tid2", str(tmp_path))
 
         assert result == "agent-window"
+
+    def test_create_window_raises_the_shared_servers_history_limit(self, tmux, tmp_path):
+        """A window added to a session that predates this fix (or was created
+        by a different process) must still get the scrollback floor raised
+        before the window exists (#728)."""
+        mock_window = MagicMock()
+        mock_window.name = "agent-window"
+        mock_session = MagicMock()
+        mock_session.new_window.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+        tmux.server.cmd.side_effect = _server_reporting(2000)
+
+        tmux.create_window("ses", "agent-window", "tid2", str(tmp_path))
+
+        assert _SET_HISTORY_LIMIT in tmux.server.cmd.call_args_list
 
     def test_create_window_session_not_found(self, tmux, tmp_path):
         tmux.server.sessions.get.return_value = None
@@ -1426,6 +1580,292 @@ class TestRealTmuxExitEmpty:
         finally:
             subprocess.run(["tmux", "-S", socket_path, "kill-server"], capture_output=True)
             shutil.rmtree(socket_dir, ignore_errors=True)
+
+
+@pytest.mark.integration
+class TestRealTmuxHistoryLimit:
+    """A CAO pane must keep enough scrollback to hold a worker's whole reply (#728).
+
+    Real tmux, isolated socket, same tier and lifecycle discipline as
+    ``TestRealTmuxExitEmpty`` above — and for the same reason: the bug being
+    guarded is a tmux-behaviour bug (the default 2000-line scrollback is
+    shallower than the extraction ladder reaches), which no mock-call
+    assertion can observe.
+
+    Every server here starts from ``-f /dev/null``. Without that, tmux sources
+    the developer's own ``~/.tmux.conf`` into the "isolated" server, and a
+    dotfile that already says ``history-limit 50000`` (the repo's recommended
+    one does) makes every assertion below pass against the merge base. The
+    tests that model a pre-existing session also assert the 2000 precondition
+    outright, so a vacuous pass is a failure, not a green.
+
+    One test per pane-creating path in ``TmuxClient``: the first pane of a new
+    session, a window added to an existing session, a split into an existing
+    host window, and the host window a pane-mode terminal opens when none
+    exists. Each path has to raise the floor itself, because the session it
+    runs against may never have had it raised (made before this fix, or by
+    another process), and lines a pane has already discarded at 2000 do not
+    come back when the option is raised later.
+
+    tmux versions. Every assertion about a pane CAO creates holds on every
+    tmux this project supports (3.2+; CI runs Ubuntu 24.04's 3.4, developers
+    tend to run 3.8). What happens to a pane that ALREADY existed when CAO
+    raised the global changed in tmux 3.7 ("When history-limit is changed,
+    apply to existing panes, not just new ones", CHANGES, issue 4705): before
+    3.7 that pane reports the 2000 it was created with for the rest of its
+    life; from 3.7 it reports the raised value and keeps later output to it.
+    The one test that has a pre-existing pane in view branches on that, with
+    both arms asserted, so a future tmux that changes it again fails here
+    instead of passing by accident.
+    """
+
+    # The release that made a raised history-limit apply to existing panes.
+    _EXISTING_PANES_FOLLOW_GLOBAL_SINCE = (3, 7)
+
+    @staticmethod
+    def _tmux_version() -> tuple[int, int]:
+        out = subprocess.run(["tmux", "-V"], capture_output=True, text=True, check=True).stdout
+        match = re.search(r"(\d+)\.(\d+)", out)
+        assert match, f"could not parse tmux version from {out!r}"
+        return int(match.group(1)), int(match.group(2))
+
+    def _require_tmux(self) -> None:
+        if not shutil.which("tmux"):
+            pytest.skip("tmux not installed")
+
+    @staticmethod
+    def _tmux(socket_name: str, *args: str) -> subprocess.CompletedProcess:
+        """A bare tmux call against the isolated server, outside the code under test."""
+        return subprocess.run(
+            ["tmux", "-L", socket_name, "-f", "/dev/null", *args],
+            capture_output=True,
+            text=True,
+        )
+
+    def _pane_limits(self, socket_name: str, target: str) -> list[int]:
+        """``history_limit`` of every pane in ``target``, as tmux reports it."""
+        return sorted(self._pane_limits_by_id(socket_name, target).values())
+
+    def _pane_limits_by_id(self, socket_name: str, target: str) -> dict[str, int]:
+        """``history_limit`` of every pane in ``target``, keyed by pane id."""
+        result = self._tmux(
+            socket_name, "list-panes", "-t", target, "-F", "#{pane_id} #{history_limit}"
+        )
+        assert result.returncode == 0, f"tmux list-panes failed: {result.stderr}"
+        return {
+            pane_id: int(limit)
+            for pane_id, limit in (line.split() for line in result.stdout.split("\n") if line)
+        }
+
+    def _global_limit(self, socket_name: str) -> int:
+        result = self._tmux(socket_name, "show-options", "-gv", "history-limit")
+        assert result.returncode == 0, f"tmux show-options failed: {result.stderr}"
+        return int(result.stdout.strip())
+
+    def _client(self, socket_name: str, pane_mode: bool = False):
+        import libtmux
+
+        from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+        client = TmuxClient(pane_mode=pane_mode)
+        # ``config_file`` puts ``-f /dev/null`` on every libtmux invocation
+        # too, including the ``start-server`` the client itself issues.
+        client.server = libtmux.Server(socket_name=socket_name, config_file="/dev/null")
+        return client
+
+    def _pre_existing_session(self, socket_name: str, session: str, window: str, cwd: str) -> None:
+        """A session created by something other than this TmuxClient, at tmux's defaults.
+
+        Models a session that predates the fix or that another process made:
+        its global ``history-limit`` is still 2000, so whichever creation path
+        runs next must raise it, or its pane starts life at 2000.
+        """
+        made = self._tmux(socket_name, "new-session", "-d", "-s", session, "-n", window, "-c", cwd)
+        assert made.returncode == 0, f"could not create the probe session: {made.stderr}"
+        assert self._global_limit(socket_name) == 2000, (
+            "precondition: the isolated server must start at tmux's 2000 default, or "
+            "nothing below proves the raise happened"
+        )
+        assert self._pane_limits(socket_name, f"{session}:{window}") == [2000]
+
+    def test_first_pane_of_a_new_session_keeps_the_configured_scrollback(self, tmp_path):
+        """The session's FIRST window is an agent terminal, and a pane reads
+        history-limit only at creation time. Pre-fix this reads tmux's default
+        2000 — shallower than ``_ESCALATION_STEPS[-1]`` (5000), so the deepest
+        extraction rung could not reach further than the middle rungs and a
+        long reply was silently lost from scrollback (#728).
+
+        Holds on every supported tmux (3.2+): only a pane CAO created is in view.
+        """
+        self._require_tmux()
+        socket_name = f"cao-test-history-limit-{uuid.uuid4().hex[:12]}"
+        self._tmux(socket_name, "kill-server")
+        client = self._client(socket_name)
+        try:
+            client.create_session("history-probe", "win1", "term-hist-1", str(tmp_path))
+
+            assert self._pane_limits(socket_name, "history-probe:win1") == [TMUX_HISTORY_LIMIT], (
+                "the first pane of a CAO session must keep CAO's configured "
+                "scrollback, not tmux's 2000-line default"
+            )
+        finally:
+            self._tmux(socket_name, "kill-server")
+
+    def test_a_window_added_to_a_pre_existing_session_gets_the_floor(self, tmp_path):
+        """``create_window`` is how every assign/handoff worker terminal is made.
+        On a session whose global is still 2000 (asserted first), the new
+        window must get the floor (#728).
+
+        Holds on every supported tmux (3.2+): only the new window's pane is
+        asserted after the raise. The pre-existing window's pane is not, since
+        what it reports is version-dependent (class docstring).
+        """
+        self._require_tmux()
+        socket_name = f"cao-test-history-window-{uuid.uuid4().hex[:12]}"
+        self._tmux(socket_name, "kill-server")
+        try:
+            self._pre_existing_session(socket_name, "pre", "win1", str(tmp_path))
+            client = self._client(socket_name)
+
+            client.create_window("pre", "win2", "term-hist-2", str(tmp_path))
+
+            assert self._pane_limits(socket_name, "pre:win2") == [TMUX_HISTORY_LIMIT], (
+                "a worker window added to a pre-existing session must get CAO's "
+                "scrollback floor; it inherited the stale global instead"
+            )
+        finally:
+            self._tmux(socket_name, "kill-server")
+
+    def test_a_split_into_a_pre_existing_host_window_gets_the_floor(self, tmp_path):
+        """Pane mode's ``_split_host_window`` path: the host window already
+        exists (made at 2000 by someone else, asserted first), and the split
+        must not start life at that (#728).
+
+        The NEW pane's assertion holds on every supported tmux. The host
+        window's ORIGINAL pane is the one place this class has a pre-existing
+        pane in view, and what it reports depends on the tmux version (see the
+        class docstring): 2000 before 3.7, the raised value from 3.7. Both arms
+        are asserted; CI's 3.4 and a developer's 3.8 take different ones.
+        """
+        self._require_tmux()
+        socket_name = f"cao-test-history-split-{uuid.uuid4().hex[:12]}"
+        self._tmux(socket_name, "kill-server")
+        try:
+            self._pre_existing_session(socket_name, "pre", "cao-agents", str(tmp_path))
+            before = self._pane_limits_by_id(socket_name, "pre:cao-agents")
+            assert len(before) == 1
+            (original_id,) = before
+            client = self._client(socket_name, pane_mode=True)
+
+            client.create_pane("pre", "cao-agents", "coder-1", "term-hist-3", str(tmp_path))
+
+            after = self._pane_limits_by_id(socket_name, "pre:cao-agents")
+            new_ids = set(after) - {original_id}
+            assert (
+                len(new_ids) == 1
+            ), f"expected exactly one split pane, panes went {before} -> {after}"
+            (new_id,) = new_ids
+            assert after[new_id] == TMUX_HISTORY_LIMIT, (
+                "the split pane must get CAO's scrollback floor; the window was at "
+                f"2000 before create_pane ran and the new pane reports {after[new_id]}"
+            )
+
+            if self._tmux_version() >= self._EXISTING_PANES_FOLLOW_GLOBAL_SINCE:
+                assert after[original_id] == TMUX_HISTORY_LIMIT, (
+                    "tmux >= 3.7 applies a raised history-limit to existing panes "
+                    f"(CHANGES, issue 4705); the original pane reports {after[original_id]}"
+                )
+            else:
+                assert after[original_id] == 2000, (
+                    "tmux < 3.7 leaves an existing pane at the limit it was created "
+                    f"with; the original pane reports {after[original_id]}"
+                )
+        finally:
+            self._tmux(socket_name, "kill-server")
+
+    def test_the_host_window_opened_by_the_first_pane_mode_terminal_gets_the_floor(self, tmp_path):
+        """Pane mode's ``_open_host_window`` path: no host window yet, so the
+        first pane-mode terminal opens it and takes its first pane. That pane
+        is an agent terminal too (#728).
+
+        Holds on every supported tmux (3.2+): only the new window's pane is
+        asserted.
+        """
+        self._require_tmux()
+        socket_name = f"cao-test-history-host-{uuid.uuid4().hex[:12]}"
+        self._tmux(socket_name, "kill-server")
+        try:
+            self._pre_existing_session(socket_name, "pre", "win1", str(tmp_path))
+            client = self._client(socket_name, pane_mode=True)
+
+            client.create_pane("pre", "cao-agents", "coder-1", "term-hist-4", str(tmp_path))
+
+            assert self._pane_limits(socket_name, "pre:cao-agents") == [TMUX_HISTORY_LIMIT], (
+                "the host window a pane-mode terminal opens must get CAO's "
+                "scrollback floor; it inherited the stale global instead"
+            )
+        finally:
+            self._tmux(socket_name, "kill-server")
+
+    def test_deep_capture_rungs_actually_reach_deeper_than_shallow_ones(self, tmp_path):
+        """The ladder must be monotonic on real tmux: with the default 2000-line
+        limit, ``-S -5000`` and ``-S -`` both return ~2004 lines on a pane that
+        printed 3000 (measured, tmux 3.2a) and the earliest ~1000 lines are
+        gone. With CAO's limit in force the deepest rung sees all of them.
+
+        Holds on every supported tmux (3.2+): the pane is created by CAO after
+        the raise, so its limit does not depend on the 3.7 change.
+        """
+        self._require_tmux()
+        socket_name = f"cao-test-history-depth-{uuid.uuid4().hex[:12]}"
+        self._tmux(socket_name, "kill-server")
+        client = self._client(socket_name)
+        try:
+            client.create_session("depth-probe", "win1", "term-hist-5", str(tmp_path))
+            # Drive the pane through a bare ``tmux send-keys``, not through
+            # TmuxClient's paste-buffer path: this test is about capture depth,
+            # and the send path has its own version-dependent behaviour (3.2a
+            # rejects ``paste-buffer -p``) that would turn an unrelated
+            # incompatibility into a failure of this assertion.
+            fill = self._tmux(
+                socket_name,
+                "send-keys",
+                "-t",
+                "depth-probe:win1",
+                'for i in $(seq 1 3000); do echo "cao-line-$i"; done',
+                "Enter",
+            )
+            assert fill.returncode == 0, f"could not drive the probe pane: {fill.stderr}"
+
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                out = client.get_history(
+                    "depth-probe", "win1", strip_escapes=True, visible_only=True
+                )
+                if "cao-line-3000" in out:
+                    break
+                time.sleep(0.5)
+            else:
+                pytest.fail("the probe pane never finished printing 3000 lines")
+
+            deep = client.get_history("depth-probe", "win1", strip_escapes=True, full_history=True)
+            shallow = client.get_history("depth-probe", "win1", strip_escapes=True, tail_lines=1000)
+
+            assert deep.count("\n") > shallow.count("\n"), (
+                "the full_history rung must read deeper than a 1000-line tail, "
+                "not get clamped to the same scrollback cap (#728)"
+            )
+            # Exact line, not a substring: "cao-line-1" also matches
+            # "cao-line-1000" and would pass against a 2000-line buffer.
+            printed = deep.splitlines()
+            assert "cao-line-1" in printed, (
+                "the earliest line must still be in scrollback: with tmux's "
+                "2000-line default the first ~1000 lines have already been "
+                "discarded, which is how a long worker reply is lost (#728)"
+            )
+            assert "cao-line-3000" in printed
+        finally:
+            self._tmux(socket_name, "kill-server")
 
 
 class TestKillRefusesForeignSessions:

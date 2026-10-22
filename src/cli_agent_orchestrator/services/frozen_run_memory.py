@@ -87,8 +87,9 @@ def frozen_memory_for(
 
     ``None`` means the caller should pass nothing to ``send_input`` and let today's live path run —
     which is the correct answer for a non-workflow terminal, for a YAML run, or for a run with no
-    readable manifest. ``""`` means a manifest existed but its memory block could not be persisted;
-    the caller must supply that empty block to prevent the terminal's live-memory fallback.
+    readable manifest. ``""`` means a known script run has lost its row, or a manifest existed but
+    its memory block could not be persisted; the caller must supply that empty block to prevent
+    the terminal's live-memory fallback.
 
     TOTAL: never raises. A workflow step must not fail because a memory block could not be frozen;
     the worst outcome here is a run that proceeds without memory, which is visible in the manifest.
@@ -103,7 +104,17 @@ def frozen_memory_for(
         logger.warning("frozen memory: could not read run '%s' (resolving live): %s", run_id, e)
         return None
 
-    if row is None or row.manifest_json is None:
+    if row is None:
+        from cli_agent_orchestrator.services.workflow_service import run_registry
+
+        # None selects LIVE memory. A known script run whose durable admission
+        # state is missing must instead supply an explicit empty block.
+        if getattr(run_registry.get(run_id), "tier", None) == "script":
+            logger.warning("frozen memory: run '%s': run row missing; memory withheld", run_id)
+            return ""
+        return None
+
+    if row.manifest_json is None:
         # A YAML run never freezes a manifest, and a script run whose freeze failed has none either.
         # Both mean "there is nothing frozen to honour", which is not the same as "no memory".
         return None

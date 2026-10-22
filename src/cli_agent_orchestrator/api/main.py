@@ -10,6 +10,7 @@ import re
 import signal
 import struct
 import subprocess
+import sys
 import termios
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -185,6 +186,7 @@ from cli_agent_orchestrator.services.workflow_journal import (
 from cli_agent_orchestrator.services.workflow_journal import EventRow, GapMarker, StepRow
 from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
+from cli_agent_orchestrator.utils import server_lock
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.forwarded_env import ForwardedEnvError, validate_forwarded_env
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
@@ -1385,6 +1387,22 @@ async def lifespan(app: FastAPI):
     # only in ``main()`` — so the imported-app deployment path
     # (``uvicorn cli_agent_orchestrator.api.main:app``) is covered too. Idempotent.
     install_access_log_redaction()
+    # issues #406 / #709: exactly one cao-server per CAO_HOME_DIR. Taken before
+    # the database, the recovery sweeps, the terminal registry, the status
+    # monitor and uvicorn's port bind (uvicorn binds after lifespan startup), so
+    # a second server never touches shared state. The port is the only guard
+    # otherwise, and a different --port sidesteps it. Refusal is loud: the
+    # message names the owning process and the process exits non-zero. There is
+    # no escape hatch on purpose. ``main()`` stores the resolved port on
+    # ``app.state``; the imported-app path falls back to CAO_API_PORT.
+    try:
+        server_lock_handle = server_lock.acquire_server_lock(
+            port=getattr(app.state, "server_port", None) or SERVER_PORT
+        )
+    except server_lock.ServerLockHeldError as exc:
+        logger.error("refusing to start: %s", exc.message().splitlines()[0])
+        server_lock.refuse(exc)
+    logger.info("Holding server lock %s (pid %d)", server_lock_handle.path, os.getpid())
     # issue #583 Bolt 3 (``approval-enforcement-default``): report the approval gate's RESOLVED state
     # AND the mechanism that decided it. A malformed settings file fails closed, so the source tells
     # the operator why enforcement remains ON and how to recover. Logs only the boolean and a member
@@ -1621,6 +1639,9 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("Error shutting down OTel telemetry", exc_info=True)
     logger.info("Shutting down CLI Agent Orchestrator server...")
+    # Last: the kernel would drop it at exit anyway, but releasing explicitly
+    # lets an in-process restart (tests) re-acquire without a process boundary.
+    server_lock_handle.release()
 
 
 def get_plugin_registry(request: Request) -> PluginRegistry:
@@ -1846,6 +1867,8 @@ async def health_check():
     def _probe(binary: str) -> str:
         return "ok" if shutil.which(binary) else "unavailable"
 
+    from cli_agent_orchestrator.services.settings_service import get_server_settings
+
     backend = get_backend()
     backend_name = "herdr" if isinstance(backend, HerdrBackend) else "tmux"
 
@@ -1853,6 +1876,11 @@ async def health_check():
         "status": "ok",
         "service": "cli-agent-orchestrator",
         "terminal_backend": backend_name,
+        # The init budget THIS server applies (issue #710). Clients size their
+        # wait for a synchronous create from their own settings, so an operator
+        # can compare the two here when the client runs with a different
+        # environment or on another host.
+        "provider_init_timeout": int(get_server_settings()["provider_init_timeout"]),
         "components": {
             "cao": "ok",
             "herdr": _probe("herdr"),
@@ -6306,12 +6334,20 @@ async def submit_workflow_run_endpoint(
         )
         manifest_json = frozen.manifest_json
         try:
+            # Keep the admission snapshot even if the profile set changes during
+            # the gate. Preserve the gate's refusal precedence on capture failure.
+            capture_error = None
+            try:
+                guard = await asyncio.to_thread(launch_guard.capture)
+            except approval_gate.PlanIdentityUnavailableError as exc:
+                capture_error = exc
             approval_gate.ensure_plan_approved(
                 tier="script",
                 manifest_json=manifest_json,
                 unavailable_reason=frozen.unavailable_reason or "internal",
             )
-            guard = await asyncio.to_thread(launch_guard.capture)
+            if capture_error is not None:
+                raise capture_error
         except approval_gate.PlanIdentityUnavailableError as e:
             # 503, not 403: the freeze above returned None, so CAO could not complete its own work and
             # nothing about the caller was wrong. MUST precede the arm below, which is its base class
@@ -8260,6 +8296,13 @@ async def get_inbox_messages_endpoint(
     status_param: Optional[str] = Query(
         default=None, alias="status", description="Filter by message status"
     ),
+    order: str = Query(
+        default="asc",
+        description="Order by created_at: asc (oldest first) or desc (newest first)",
+    ),
+    sender_id: Optional[str] = Query(
+        default=None, description="Return only messages from this sender"
+    ),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[Dict]:
     """Get inbox messages for a terminal.
@@ -8268,6 +8311,8 @@ async def get_inbox_messages_endpoint(
         terminal_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10, max: 100)
         status_param: Optional filter by message status ('pending', 'delivered', 'failed')
+        order: Sort by created_at, 'asc' (default, oldest first) or 'desc' (newest first)
+        sender_id: Optional filter returning only messages from this sender
 
     Returns:
         List of inbox messages with sender_id, message, created_at, status
@@ -8284,8 +8329,21 @@ async def get_inbox_messages_endpoint(
                     detail=f"Invalid status: {status_param}. Valid values: pending, delivered, failed",
                 )
 
-        # Get messages using existing database function
-        messages = get_inbox_messages(terminal_id, limit=limit, status=status_filter)
+        if order not in ("asc", "desc"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid order: {order}. Valid values: asc, desc",
+            )
+
+        # Get messages using existing database function. ``limit`` applies after
+        # ordering, so ``order=desc`` with a small limit returns the newest rows.
+        messages = get_inbox_messages(
+            terminal_id,
+            limit=limit,
+            status=status_filter,
+            sender_id=sender_id,
+            newest_first=order == "desc",
+        )
 
         # Convert to response format
         result = []
@@ -8864,7 +8922,19 @@ async def internal_memory_recall(
         sort_by=body.sort_by,
         include_related=body.include_related,
     )
-    return {"memories": [memory.model_dump(mode="json") for memory in memories]}
+    return {
+        "memories": [
+            {
+                **memory.model_dump(mode="json"),
+                **(
+                    {"lifecycle_status": memory.lifecycle_status}
+                    if memory.lifecycle_status is not None
+                    else {}
+                ),
+            }
+            for memory in memories
+        ]
+    }
 
 
 @app.post("/internal/memory/forget")
@@ -9001,6 +9071,8 @@ async def list_memories_endpoint(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[MemorySummary]:
     """List stored memories across all projects (mirrors `cao memory list --all`)."""
+    from cli_agent_orchestrator.services.settings_service import is_non_accessing_inspection_enabled
+
     _require_memory_enabled()
     svc = _get_memory_service()
     try:
@@ -9013,6 +9085,7 @@ async def list_memories_endpoint(
             limit=1000,
             scan_all=True,
             search_mode="metadata",
+            record_access=not is_non_accessing_inspection_enabled(),
         )
         if scope_id is not None:
             memories = [m for m in memories if _memory_matches_scope_id(m, scope_id, svc.base_dir)]
@@ -9292,6 +9365,8 @@ async def get_memory_endpoint(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> MemoryDetail:
     """Show a memory by key (mirrors `cao memory show`; first match wins)."""
+    from cli_agent_orchestrator.services.settings_service import is_non_accessing_inspection_enabled
+
     _require_memory_enabled()
     svc = _get_memory_service()
     try:
@@ -9301,6 +9376,7 @@ async def get_memory_endpoint(
             limit=1000,
             scan_all=True,
             search_mode="metadata",
+            record_access=not is_non_accessing_inspection_enabled(),
         )
         for mem in memories:
             if mem.key != key:
@@ -9735,6 +9811,8 @@ def main():
 
     host = args.host or SERVER_HOST
     port = args.port or SERVER_PORT
+    # The lifespan records this port in the server lock's diagnostics (#406).
+    app.state.server_port = port
     # Extend the CORS allowlist so a custom --host/--port still permits
     # same-host browser access without requiring CAO_CORS_ORIGINS. The
     # already-installed CORSMiddleware reads the list by reference, so

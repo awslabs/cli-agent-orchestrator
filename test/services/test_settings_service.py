@@ -1049,3 +1049,36 @@ class TestWritesAreSerializedAndAtomic:
         data = json.loads(settings_file.read_text())
         assert data["session_labels"] == {"cao-a": "A", "cao-b": "B"}
         assert data["agent_dirs"] == {"kiro_cli": "/keep"}
+
+
+@pytest.mark.parametrize(
+    "saved,env,expected",
+    [
+        (None, None, True),
+        (False, None, False),
+        (True, "false", False),
+        (False, "true", True),
+        (False, "", False),
+    ],
+)
+def test_explain_enabled_precedence(settings_file, monkeypatch, saved, env, expected):
+    if saved is not None:
+        settings_file.write_text(json.dumps({"memory": {"explain_enabled": saved}}))
+    if env is None:
+        monkeypatch.delenv("CAO_MEMORY_EXPLAIN_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("CAO_MEMORY_EXPLAIN_ENABLED", env)
+    assert settings_service.is_memory_explain_enabled() is expected
+
+
+def test_explain_enabled_read_error_keeps_default(monkeypatch):
+    def broken():
+        raise OSError("unavailable")
+
+    monkeypatch.setattr(settings_service, "get_memory_settings", broken)
+    assert settings_service.is_memory_explain_enabled() is True
+
+
+def test_explain_setting_rejects_non_bool():
+    with pytest.raises(ValueError, match="must be a bool"):
+        settings_service.set_memory_setting("explain_enabled", "false")
