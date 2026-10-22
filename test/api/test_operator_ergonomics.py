@@ -160,6 +160,48 @@ class TestFsDirs:
         assert resp.status_code == 400
         assert "permission" in resp.json()["detail"].lower()
 
+    def test_only_the_sanitised_value_reaches_the_filesystem(self, client, tmp_path):
+        """The shape CodeQL py/path-injection is asking for, pinned directly.
+
+        ``resolve_listable_path`` is the single sanitizer on this path: it
+        canonicalizes with ``realpath`` and containment-checks the result, and
+        the endpoint must then use THAT value and nothing else -- not the
+        request string, not ``normalize_working_directory``'s lexical output.
+        Pinned by making the sanitizer return a directory the request never
+        named: if any of ``exists``/``is_dir``/``iterdir`` still consumed a
+        request-derived spelling, the listing would be of ``decoy`` (or a 400),
+        not of ``sanitised``.
+        """
+        decoy = tmp_path / "decoy"
+        (decoy / "decoy-child").mkdir(parents=True)
+        sanitised = tmp_path / "sanitised"
+        (sanitised / "sanitised-child").mkdir(parents=True)
+
+        with patch(
+            "cli_agent_orchestrator.api.main.resolve_listable_path",
+            return_value=str(sanitised),
+        ) as sanitizer:
+            resp = client.get("/fs/dirs", params={"path": str(decoy)})
+
+        assert resp.status_code == 200, resp.json()
+        body = resp.json()
+        assert body["dirs"] == ["sanitised-child"]
+        assert body["path"] == str(sanitised)
+        # ...and the sanitizer is handed the NORMALIZED spelling, so the
+        # Windows/``~``/quote translation still happens before the policy runs.
+        assert sanitizer.call_args.args[0] == str(decoy)
+
+    def test_a_refused_path_never_reaches_a_filesystem_call(self, client):
+        """The other half of the same property: the policy runs BEFORE any
+        probe, so a refused spelling is not stat'ed or listed at all. A shape
+        that probed first and judged afterwards would still 400, but would
+        have used the tainted value to do it."""
+        with patch("cli_agent_orchestrator.api.main.Path.iterdir") as iterdir:
+            resp = client.get("/fs/dirs", params={"path": "/etc/ssh"})
+        assert resp.status_code == 400, resp.json()
+        assert "not allowed" in resp.json()["detail"]
+        iterdir.assert_not_called()
+
 
 class TestSessionLabelEndpoint:
     def test_label_roundtrip_and_clear(self, client, settings_file, backend):
