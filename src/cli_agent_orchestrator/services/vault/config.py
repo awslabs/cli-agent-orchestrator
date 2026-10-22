@@ -2,6 +2,12 @@
 
 This validates configuration only. Filesystem consumers must re-assert
 realpath containment immediately beside each filesystem sink.
+
+Validation is pure: it depends on the document and on process constants, never
+on the database. Project aliases are canonicalised on the loading path
+(``settings_service.get_vault_config`` via ``binding.canonicalize_vault_config``),
+which is the code that owns a database. A ``test_config_pure_validation`` guard
+walks every validator in this package to keep it that way.
 """
 
 from __future__ import annotations
@@ -24,7 +30,6 @@ from pydantic import (
     model_validator,
 )
 
-from cli_agent_orchestrator.clients.database import get_project_id_by_alias
 from cli_agent_orchestrator.constants import (
     CAO_HOME_DIR,
     MEMORY_BASE_DIR,
@@ -116,15 +121,13 @@ def _paths_overlap(left: str, right: str) -> bool:
     return _is_path_contained_by(left, right) or _is_path_contained_by(right, left)
 
 
-def canonical_scope_id(scope: str, scope_id: Optional[str]) -> Optional[str]:
-    """Return the durable identity used by every vault-facing scope boundary."""
-    if scope != "project" or scope_id is None:
-        return scope_id
-    return get_project_id_by_alias(scope_id, fail_closed=True) or scope_id
+def mapping_identity(mapping: "FolderMapping") -> tuple[str, Optional[str]]:
+    """Return the comparison key for a mapping's configured ``(scope, scope_id)``.
 
-
-def _mapping_identity(mapping: "FolderMapping") -> tuple[str, Optional[str]]:
-    scope_id = canonical_scope_id(mapping.scope, mapping.scope_id)
+    Project ids compare case-insensitively. This looks only at the configured
+    value; alias canonicalisation happens on the loading path.
+    """
+    scope_id = mapping.scope_id
     return mapping.scope, (
         scope_id.casefold() if mapping.scope == "project" and scope_id else scope_id
     )
@@ -271,13 +274,7 @@ class VaultSpec(BaseModel):
         if len(writable) != 1:
             raise ValueError("only the managed_folder mapping may be writable")
 
-        self.mappings = [
-            mapping.model_copy(
-                update={"scope_id": canonical_scope_id(mapping.scope, mapping.scope_id)}
-            )
-            for mapping in self.mappings
-        ]
-        bindings = [_mapping_identity(mapping) for mapping in self.mappings]
+        bindings = [mapping_identity(mapping) for mapping in self.mappings]
         if len(bindings) != len(set(bindings)):
             raise ValueError("mappings must not resolve to the same (scope, scope_id)")
         return self

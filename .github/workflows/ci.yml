@@ -53,21 +53,37 @@ jobs:
           version: v0.70.0
 
       - name: Run unit tests with coverage
+        # CAO_MUST_RUN names the assurance gates this leg owns; a `must_run`
+        # test for a listed gate that skips or gets deselected fails the session
+        # instead of passing silently (see test/_must_run.py). Only the 3.12 leg
+        # installs Trivy, so only the 3.12 leg claims the "unit" gate.
+        env:
+          CAO_MUST_RUN: ${{ matrix.python-version == '3.12' && 'unit' || '' }}
         run: |
           if [ "${{ matrix.python-version }}" = "3.12" ]; then
             trivy --version
           fi
           # CI intentionally includes integration-marked tests except for the Kiro
           # provider test, which requires an authenticated external CLI.
-          uv run pytest test/ examples/workflow/tests/ \
+          uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ \
             --ignore=test/providers/test_kiro_cli_integration.py \
             --ignore=test/e2e \
             -m "not e2e" \
             --cov=src/cli_agent_orchestrator \
+            --cov-branch \
             --cov-report=xml \
             --cov-fail-under=80 \
             --cov-report=term-missing \
             -v
+        # --cov-branch (#1005) also makes --cov-fail-under read the BLENDED
+        # line+branch figure rather than line coverage. Whether that reads harder
+        # or softer than line-only depends on whether branch % is below or above
+        # line % that run (today: 89.28 branch vs 93.10 line, so blended is a
+        # harder bar at 80 -- not an invariant, just the current numbers). The
+        # authoritative, separately-floored line metric is the ratchet's
+        # (.coverage-baseline.json, python.floor_pct = 87.0) in the cao-mcp-apps
+        # job below. If the blend lands under 80 on a first run, lower THIS
+        # number -- do not drop the branch data, and do not touch the line floor.
 
       - name: Validate Markdown links
         run: uv run python scripts/validate_markdown_links.py
@@ -124,6 +140,75 @@ jobs:
         run: npm run build
         working-directory: web
 
+      # =================================================================================
+      # WHEEL-CONTENTS GATE (issues #610, #705) — this job is the ONLY place in CI where
+      # test/test_wheel_contents.py can execute at all.
+      #
+      # `Unit Tests` runs pytest but never builds the web UI, and this job built the web UI
+      # but ran no pytest. test_wheel_contents.py is gated on the built web UI existing, so
+      # dropped into `Unit Tests` it reports SKIPPED in all three legs and no job in the
+      # workflow runs it. Here it runs exactly once.
+      #
+      # WHY HERE and not in `Unit Tests`: the property under test is Python-version
+      # independent (does hatchling's `[tool.hatch.build] artifacts` glob cover the whole
+      # web_ui/ build output), so running it on 3.10/3.11/3.12 would assert the same thing
+      # three times and build the web UI three times to do it. It also keeps the repo's
+      # primary test gate free of an npm-registry dependency. Follows the `CAO MCP Apps`
+      # job's existing in-file pattern: a Node build plus setup-uv/uv sync plus targeted
+      # pytest files.
+      #
+      # SCOPE: the pytest step names its files EXPLICITLY, so it closes the gap for THOSE
+      # FILES and not for the class. Another web_ui-dependent test added elsewhere under
+      # test/ would still skip in `Unit Tests` and would not be collected here; wiring it
+      # in means naming it in this step too.
+      #
+      # test_hatch_artifacts_guard.py is listed alongside it, but is NOT dependent on this
+      # job: it never skips, so `Unit Tests` already runs it on 3.10/3.11/3.12. It is named
+      # here because this is the only job where `web_ui/` exists on disk, which is the only
+      # place its whole-directory wheel assertion can cover THAT root rather than skipping it.
+      # =================================================================================
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # `--all-extras --dev`, not plain `uv sync`: `agui` is an optional extra and every
+      # other install site in this file passes both flags. Plain `uv sync` omits it and
+      # yields ~58 spurious agui collection failures.
+      - name: Install Python deps (for the wheel-contents packaging test)
+        run: uv sync --locked --all-extras --dev
+
+      - name: "Wheel-contents regression test (issues #610, #705)"
+        # The skip-guard is the load-bearing half. test_wheel_contents.py SKIPS when the
+        # built web UI is absent, and a skip keeps this job GREEN — the same false
+        # assurance the test exists to remove. `npm run build` exiting 0 while writing an
+        # incomplete tree is a failure this step exists to catch, so assert the
+        # precondition instead of trusting it.
+        #
+        # The guard calls `web_ui_build_is_complete()` from the test module rather than
+        # re-testing paths in shell: one source of truth, and it checks index.html AND
+        # every asset index.html loads (#705), not just the entry point.
+        #
+        # That import resolves `test` from the CURRENT DIRECTORY, so this step must stay at
+        # the repo root. The sibling steps in this job set `working-directory: web`; adding
+        # it here would fail with `ModuleNotFoundError: No module named 'test'`.
+        #
+        # Only these two files: the full suite already runs in `Unit Tests`, and the
+        # wheel build here is ~2s, so duplicating the suite would be pure waste.
+        run: |
+          uv run python -c 'import test.test_wheel_contents as t; raise SystemExit(0 if t.web_ui_build_is_complete() else 1)' || {
+            echo "The built web UI under src/cli_agent_orchestrator/web_ui/ is absent or incomplete" >&2
+            echo "after 'npm run build' (index.html missing, or it references assets that were" >&2
+            echo "not written). test/test_wheel_contents.py would SKIP rather than run, leaving" >&2
+            echo "this job green with the packaging assertion unexecuted (issues #610, #705)." >&2
+            exit 1
+          }
+          uv run pytest test/test_wheel_contents.py test/test_hatch_artifacts_guard.py --no-cov -q
+
   aidlc-portfolio-example:
     name: AI-DLC Portfolio Example
     runs-on: ubuntu-latest
@@ -179,14 +264,16 @@ jobs:
         run: npm ci
         working-directory: cao_mcp_apps
 
+      # Was wrapped in `if ls src/**/*.ts src/**/*.tsx; then ... else echo "no
+      # TypeScript sources yet (Phase 0)"; fi`. Phase 0 is over: there are 29
+      # .ts/.tsx files under src/{agent,dashboard,event-stream,graph,shared,test},
+      # so the else branch is dead. It was also fragile in the direction this PR
+      # cares about -- bash does not expand `**` recursively without `globstar`,
+      # so `src/**/*.ts` only ever matched one level down, and moving the sources
+      # one directory deeper would have silently turned tsc into an echo.
       - name: Type check
         working-directory: cao_mcp_apps
-        run: |
-          if ls src/**/*.ts src/**/*.tsx >/dev/null 2>&1; then
-            npm run typecheck
-          else
-            echo "no TypeScript sources yet (Phase 0) — skipping tsc"
-          fi
+        run: npm run typecheck
 
       - name: Unit tests
         working-directory: cao_mcp_apps
@@ -209,13 +296,16 @@ jobs:
         run: uv run pytest test/test_http_only_boundary.py -q
 
       - name: Backend coverage (for the ratchet floor)
-        # Produces coverage.json (python floor) consumed by coverage:ratchet.
+        # Produces coverage.json (python line + branch floors) consumed by
+        # coverage:ratchet. --cov-branch adds num_branches/covered_branches to
+        # totals; the ratchet floors line and branch SEPARATELY (#1005).
         run: |
-          uv run pytest test/ examples/workflow/tests/ \
+          uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ \
             --ignore=test/providers/test_kiro_cli_integration.py \
             --ignore=test/e2e \
             -m "not e2e" \
             --cov=src/cli_agent_orchestrator \
+            --cov-branch \
             --cov-report=json \
             --cov-fail-under=80 \
             -q
@@ -277,10 +367,10 @@ jobs:
         run: uv sync --locked --all-extras --dev
 
       - name: Check code formatting with black
-        run: uv run black --check src/ test/ examples/robotics/cross-zone-transport/
+        run: uv run black --check src/ test/ examples/robotics/cross-zone-transport/ examples/skills/
 
       - name: Check import sorting with isort
-        run: uv run isort --check-only src/ test/ examples/robotics/cross-zone-transport/
+        run: uv run isort --check-only src/ test/ examples/robotics/cross-zone-transport/ examples/skills/
 
       - name: Run type checker with mypy (ratchet)
         # Issue #1005. This step used to be `uv run mypy src/` with

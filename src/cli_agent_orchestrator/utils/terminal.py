@@ -6,11 +6,14 @@ import logging
 import re
 import time
 import uuid
-from typing import Callable, Optional, Union
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 from cli_agent_orchestrator.constants import API_BASE_URL, SESSION_PREFIX
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.utils import api_http
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.utils.fleet import BrokerRequestError
 
 logger = logging.getLogger(__name__)
 
@@ -239,6 +242,27 @@ def sync_backend_from_server() -> None:
         logger.debug(f"sync_backend_from_server: could not reach server: {e}")
 
 
+def _is_transient_poll_error(
+    exc: Union[api_http.exceptions.RequestException, "BrokerRequestError"],
+) -> bool:
+    """Whether a failed status poll is worth retrying before the caller's timeout.
+
+    A 4xx will not change on retry (a deleted terminal, a missing credential), so
+    it is final. A 5xx, a connection error, a read timeout or a reply that is not
+    JSON can clear while the server or broker catches up (#882, #1016). Every loop
+    that waits on a terminal's status classifies its failures here, so a local
+    terminal and a ``cao worker`` behind the fleet broker get the same policy.
+    """
+    from cli_agent_orchestrator.utils.fleet import BrokerRequestError
+
+    if isinstance(exc, BrokerRequestError):
+        status_code = exc.status_code
+    else:
+        response = getattr(exc, "response", None)
+        status_code = response.status_code if response is not None else None
+    return status_code is None or not 400 <= status_code < 500
+
+
 def poll_until_done(
     terminal_id: str,
     timeout: float,
@@ -273,9 +297,17 @@ def poll_until_done(
     IDLE-versus-COMPLETED reasoning above is provider behaviour, not transport
     behaviour, so it must not be duplicated per transport.
 
-    Raises click.ClickException on error, timeout, or request failure.
+    A failed poll is retried until ``timeout`` unless it is a 4xx (see
+    ``_is_transient_poll_error``); the agent keeps working while the server or
+    broker is briefly unavailable, and giving up on one 503 made ``cao session
+    send`` drop a reply that was on its way (#1016).
+
+    Raises click.ClickException on ERROR status, on a 4xx, or on timeout, which
+    names the last failed poll if the final ones failed.
     """
     import click
+
+    from cli_agent_orchestrator.utils.fleet import BrokerRequestError
 
     if idle_stable_polls < 1:
         raise click.ClickException(f"idle_stable_polls must be >= 1, got {idle_stable_polls}")
@@ -283,12 +315,14 @@ def poll_until_done(
     start = time.time()
     consecutive_idle = 0
     observed_working = False
+    last_error: Optional[str] = None
     while True:
         elapsed = time.time() - start
         if elapsed > timeout:
-            raise click.ClickException(
-                f"Timed out after {int(elapsed)}s waiting for terminal {terminal_id}"
-            )
+            message = f"Timed out after {int(elapsed)}s waiting for terminal {terminal_id}"
+            if last_error is not None:
+                message += f"; the last poll failed: {last_error}"
+            raise click.ClickException(message)
         try:
             if read_status is not None:
                 status = read_status(terminal_id)
@@ -298,38 +332,44 @@ def poll_until_done(
                 resp = api_http.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
                 resp.raise_for_status()
                 status = resp.json().get("status")
-            if status == TerminalStatus.COMPLETED.value:
-                return
-            if status == TerminalStatus.ERROR.value:
-                raise click.ClickException("Terminal reached ERROR status")
-            if status == TerminalStatus.IDLE.value:
-                # Only count IDLE as progress toward "done" once we've seen the
-                # agent actually start working — otherwise the idle-before-
-                # processing window right after a send would return early with
-                # empty output.
-                if observed_working:
-                    consecutive_idle += 1
-                    if consecutive_idle >= idle_stable_polls:
-                        return
-            elif status in (
-                TerminalStatus.PROCESSING.value,
-                TerminalStatus.WAITING_USER_ANSWER.value,
-            ):
-                # The agent is actively working (or blocked on a prompt after
-                # starting). Mark that it started and reset the idle streak so a
-                # mid-turn idle flap can't accumulate. UNKNOWN is deliberately
-                # NOT treated as "started": a terminal can report UNKNOWN before
-                # it begins (no output yet / provider not registered / deferred
-                # init), and counting it would let a subsequent stable idle
-                # satisfy the gate and return early with empty output.
-                observed_working = True
-                consecutive_idle = 0
-            else:
-                # UNKNOWN or any other non-ready status: not evidence of work.
-                # Reset the idle streak but do not flip observed_working.
-                consecutive_idle = 0
-        except api_http.exceptions.RequestException as e:
-            raise click.ClickException(f"Failed to poll terminal status: {e}")
+        except (api_http.exceptions.RequestException, BrokerRequestError) as e:
+            if not _is_transient_poll_error(e):
+                raise click.ClickException(f"Failed to poll terminal status: {e}")
+            last_error = str(e)
+            logger.debug(f"poll_until_done [{terminal_id}]: poll failed, retrying: {e}")
+            time.sleep(polling_interval)
+            continue
+        last_error = None
+        if status == TerminalStatus.COMPLETED.value:
+            return
+        if status == TerminalStatus.ERROR.value:
+            raise click.ClickException("Terminal reached ERROR status")
+        if status == TerminalStatus.IDLE.value:
+            # Only count IDLE as progress toward "done" once we've seen the
+            # agent actually start working — otherwise the idle-before-
+            # processing window right after a send would return early with
+            # empty output.
+            if observed_working:
+                consecutive_idle += 1
+                if consecutive_idle >= idle_stable_polls:
+                    return
+        elif status in (
+            TerminalStatus.PROCESSING.value,
+            TerminalStatus.WAITING_USER_ANSWER.value,
+        ):
+            # The agent is actively working (or blocked on a prompt after
+            # starting). Mark that it started and reset the idle streak so a
+            # mid-turn idle flap can't accumulate. UNKNOWN is deliberately
+            # NOT treated as "started": a terminal can report UNKNOWN before
+            # it begins (no output yet / provider not registered / deferred
+            # init), and counting it would let a subsequent stable idle
+            # satisfy the gate and return early with empty output.
+            observed_working = True
+            consecutive_idle = 0
+        else:
+            # UNKNOWN or any other non-ready status: not evidence of work.
+            # Reset the idle streak but do not flip observed_working.
+            consecutive_idle = 0
         time.sleep(polling_interval)
 
 
@@ -384,8 +424,7 @@ def wait_for_initial_delivery(
             resp.raise_for_status()
             payload = resp.json()
         except api_http.exceptions.RequestException as e:
-            response = getattr(e, "response", None)
-            if response is not None and 400 <= response.status_code < 500:
+            if not _is_transient_poll_error(e):
                 raise click.ClickException(f"Failed to poll terminal delivery state: {e}")
             last_error = str(e)
             logger.debug(f"wait_for_initial_delivery [{terminal_id}]: poll failed, retrying: {e}")

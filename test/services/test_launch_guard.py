@@ -323,3 +323,45 @@ def test_check_refuses_none_profile_digest(monkeypatch, agent, recorded):
     monkeypatch.setattr(launch_guard.settings_service, "is_memory_enabled", lambda: False)
     with pytest.raises(launch_guard.PlanInputsChangedError, match="not recorded.*cannot be read"):
         launch_guard.check("run-1", agent)
+
+
+@pytest.mark.asyncio
+async def test_missing_row_refuses_known_script_agent_launch(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from cli_agent_orchestrator.services import agent_step, workflow_service
+
+    monkeypatch.setattr(
+        launch_guard.settings_service, "resolve_workflow_approval_posture", lambda: _posture(True)
+    )
+    monkeypatch.setattr(launch_guard.workflow_journal, "get_run", lambda run_id: None)
+    monkeypatch.setattr(
+        workflow_service, "run_registry", {"missing-script": SimpleNamespace(tier="script")}
+    )
+    create = AsyncMock(side_effect=ValueError("terminal creation reached"))
+    monkeypatch.setattr(agent_step.terminal_service, "create_terminal", create)
+    with pytest.raises(
+        launch_guard.PlanInputsChangedError, match="recorded launch state is unreadable"
+    ):
+        await agent_step.run_agent_step(
+            "kiro_cli", "worker", "work", env_vars={"CAO_WORKFLOW_RUN_ID": "missing-script"}
+        )
+    create.assert_not_called()
+
+
+@pytest.mark.parametrize("run_id", [None, "unknown", "missing-yaml", "yaml-row"])
+def test_missing_row_guard_leaves_non_script_launches_unchanged(monkeypatch, run_id):
+    from cli_agent_orchestrator.services import workflow_service
+
+    monkeypatch.setattr(
+        launch_guard.settings_service, "resolve_workflow_approval_posture", lambda: _posture(True)
+    )
+    monkeypatch.setattr(
+        launch_guard.workflow_journal,
+        "get_run",
+        lambda key: SimpleNamespace(tier="yaml") if key == "yaml-row" else None,
+    )
+    monkeypatch.setattr(
+        workflow_service, "run_registry", {"missing-yaml": SimpleNamespace(tier="yaml")}
+    )
+    launch_guard.check(run_id, "worker")
