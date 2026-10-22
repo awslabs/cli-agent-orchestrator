@@ -221,7 +221,7 @@ def test_every_ast_parse_site_is_allowlisted_with_a_length_bound() -> None:
 # off the live database.
 _CRASH_PROBE = """
 import sys
-from cli_agent_orchestrator.constants import WORKFLOW_MAX_SPEC_BYTES
+from cli_agent_orchestrator.constants import SCRIPT_LINT_MAX_SOURCE_CHARS, WORKFLOW_MAX_SPEC_BYTES
 from cli_agent_orchestrator.services.script_lint import lint_script
 from cli_agent_orchestrator.services import workflow_spec_service as wss
 
@@ -252,12 +252,26 @@ except ValueError:
     pass
 else:
     sys.exit("_extract_inputs parsed a source over SCRIPT_LINT_MAX_SOURCE_CHARS")
+
+# 4. The deepest source the cap ADMITS, through both parser entry points. This is the
+#    margin check that used to run in the pytest process (#970 review P3-4): raise
+#    SCRIPT_LINT_MAX_SOURCE_CHARS past the host's cliff and this child segfaults (rc -11)
+#    and the test goes red, instead of the pytest process dumping core. On CPython 3.10
+#    65,535 levels parse; 3.11+ raise RecursionError, which both callers convert.
+at_cap = "a" + ".b" * ((SCRIPT_LINT_MAX_SOURCE_CHARS - 2) // 2) + "\\n"
+assert len(at_cap) <= SCRIPT_LINT_MAX_SOURCE_CHARS
+assert lint_script(at_cap, "at_cap.py").status in ("pass", "fail")
+try:
+    wss._extract_inputs(at_cap)
+except ValueError as e:
+    assert "too deeply nested" in str(e) or "too complex" in str(e), e
 print("SURVIVED")
 """
 
 
 def test_pathological_nesting_crashes_no_child_interpreter(tmp_path: Path) -> None:
-    """The exact #969 input, through BOTH parser entry points, must return control."""
+    """The #969 input and the deepest in-cap source, through BOTH parser entry points,
+    must return control."""
 
     env = {**os.environ, "CAO_HOME_DIR": str(tmp_path), "PYTHONFAULTHANDLER": "1"}
     proc = subprocess.run(
@@ -391,14 +405,21 @@ def test_oversize_rejection_keeps_the_rule_id_extract_inputs_skips_on() -> None:
     assert result.status == "fail"
 
 
-def test_lint_cap_stays_below_the_measured_segfault_cliff() -> None:
-    """Make the two measurements recorded at the constant executable rather than prose."""
+def test_lint_cap_is_pinned_and_clears_the_largest_shipped_script() -> None:
+    """Pin the constant's value and its floor. The margin itself is measured by probe step 4.
 
-    # Measured cliff: 150_000-200_000 nesting levels. A dense all-nesting source spends
-    # ~2 chars per level, so 128 KiB admits 65_536 levels -- ~2.6x of margin.
-    assert SCRIPT_LINT_MAX_SOURCE_CHARS <= 128 * 1024, (
-        "raising this cap narrows the margin to the ast.parse segfault cliff; re-measure "
-        "the cliff on the target runner first (#969)"
+    This test measures nothing (#970 review P3-4 on its predecessor's name): it is a
+    tripwire so that raising SCRIPT_LINT_MAX_SOURCE_CHARS is a deliberate act that
+    re-reads the measurements recorded at the constant, and a floor so the crash guard
+    never rejects a workflow script this repo ships.
+    """
+
+    # 128 KiB admits 65,535 levels of a.b.b...; the measured CPython 3.10 cliff is about
+    # 130,700 levels on both hosts measured (see the constant), about 2.0x of margin.
+    assert SCRIPT_LINT_MAX_SOURCE_CHARS == 128 * 1024, (
+        "SCRIPT_LINT_MAX_SOURCE_CHARS changed; re-measure the ast.parse cliff on CPython "
+        "3.10 (the child probe's step 4 does so on every run) and update the numbers "
+        "recorded at the constant (#969)"
     )
     largest = _REPO_ROOT / "examples" / "workflows" / "pr-health" / "pr_health.py"
     assert largest.is_file(), largest

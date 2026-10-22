@@ -129,10 +129,11 @@ class TestOversizeSourceGuard:
     that crash class; the first one took the interpreter down before the cap
     existed.
 
-    The actual 200_000-level input that used to segfault pytest is NOT replayed
-    here in-process — that is the exact anti-pattern this class guards against,
-    since a cap regression would take this test process down with no test
-    identity reported. It runs instead in a child interpreter, in
+    Nothing deep is parsed here in-process — not the 200_000-level input that
+    used to segfault pytest, and not the deepest source the cap admits either
+    (#970 review P3-4: at a cap of 262,002 characters or more that parse
+    segfaults the pytest process on CPython 3.10, so the margin check must run
+    in a child). Both run in a child interpreter, in
     ``test/services/test_ast_parse_depth_guard.py``'s crash probe. Here, only
     the length branch (shared by the deep case, since depth is irrelevant once
     the length cap rejects first) is asserted in-process.
@@ -153,18 +154,6 @@ class TestOversizeSourceGuard:
         assert str(SCRIPT_LINT_MAX_SOURCE_CHARS) in result.findings[0].message
         # ERRORs are mirrored into the legacy list (Q5=A), warnings never are.
         assert len(result.errors) == 1
-
-    def test_source_at_the_cap_parses_without_crashing(self):
-        # Pins the safety MARGIN, so raising SCRIPT_LINT_MAX_SOURCE_CHARS
-        # without re-measuring the segfault cliff turns this red instead of
-        # turning the suite into a core dump. A source that is nothing but
-        # nesting is the deepest AST the cap can admit (depth <= len(source)).
-        depth = (SCRIPT_LINT_MAX_SOURCE_CHARS - 2) // 2
-        source = "a" + ".b" * depth + "\n"
-        assert len(source) <= SCRIPT_LINT_MAX_SOURCE_CHARS
-        result = lint_script(source, "at_cap.py")
-        assert isinstance(result, ScriptValidationResult)
-        assert result.status in ("pass", "fail")
 
     def test_source_just_under_the_cap_still_reaches_the_rules(self):
         # The cap must not swallow a large-but-legitimate script: the repo's

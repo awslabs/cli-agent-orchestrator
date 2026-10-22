@@ -1025,8 +1025,9 @@ SCRIPT_LINT_NONDETERMINISM_MODULES = frozenset({"random", "secrets", "uuid", "ti
 #   - Largest workflow script shipped in this repo is
 #     ``examples/workflows/pr-health/pr_health.py`` at ~58 KiB, so this leaves
 #     ~2.3x headroom for a legitimately large hand-written script.
-# ``test_source_at_the_cap_parses_without_crashing`` pins the first number by
-# actually parsing a worst-case source at the cap.
+# Step 4 of ``test_ast_parse_depth_guard.py``'s child-process crash probe parses
+# a worst-case source at exactly this cap on every run, so a cap past the host's
+# cliff is a red test rather than a core dump of the pytest process.
 #
 # Deliberately BELOW ``WORKFLOW_MAX_SPEC_BYTES`` (256 KiB, above) rather than
 # matching it: that cap is sized for a legitimate spec's byte budget, not for
