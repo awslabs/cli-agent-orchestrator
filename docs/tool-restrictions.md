@@ -111,11 +111,15 @@ No `role` is needed — `allowedTools` is the full specification of what tools t
 | `fs_*` | All filesystem ops | All of the above | All of the above |
 | `web_fetch` | Fetch URLs / search the web | `WebFetch`, `WebSearch` | (not mapped) |
 | `@builtin` | Selector naming the provider's own built-in tool set; **grants nothing by itself** on any provider. Kept in the role defaults for readability; list `fs_*`/`execute_bash` explicitly for the access you want | (no-op) | (no-op) |
-| `@cao-mcp-server` | CAO orchestration tools | `handoff`, `assign`, `send_message`, plus Hermes prompt answers via `answer_user_prompt` | Same |
+| `@cao-mcp-server` | Every CAO MCP tool: `handoff`, `assign`, `send_message`, Hermes prompt answers via `answer_user_prompt`, memory (`memory_store`/`memory_recall`/`memory_forget`), workflows, `delete_terminal`, and the rest of the `cao-mcp-server` surface | Same | Same |
 | `discovery` | Sibling discovery/metadata (`list_siblings`, `update_metadata`) | Same | Same |
 | `*` | Everything (unrestricted) | All tools | All tools |
 
 CAO translates these to each provider's native tool names automatically. You write one vocabulary; it works across supported providers.
+
+#### `@cao-mcp-server` gates the whole CAO MCP tool surface, not just delegation
+
+Every tool `cao-mcp-server` registers is denied to a bound terminal whose effective allowlist omits `@cao-mcp-server` and `*` (#671) — not only the delegation tools (`assign`, `handoff`, `assign_elastic`, the `workflow_run` family, `create_ephemeral_agent`) that carried their own check before this. A single `on_call_tool` middleware enforces this once, ahead of every tool, so a tool registered later is covered by default. Four tools stay reachable regardless of the grant because they are the callback protocol an assigned worker depends on to report back and cannot be mistaken for a capability: `send_message`, `complete_assignment`, `workflow_return`, `answer_user_prompt`. The two `discovery`-gated tools (`list_siblings`, `update_metadata`) pass this gate on `discovery` alone, per the carve-out below — they do not need `@cao-mcp-server` too. This gate covers `cao-mcp-server` only; `cao-ops-mcp-server` (the inbound control-plane server for external agents — see [Control Planes](control-planes.md)) is operator-granted and out of its scope.
 
 #### `discovery` is a separate opt-in, not part of `@cao-mcp-server`
 
