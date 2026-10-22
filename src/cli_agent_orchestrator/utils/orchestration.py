@@ -475,7 +475,11 @@ def _wait_remote_ready(base_url: str, timeout: float) -> None:
     while True:
         attempt += 1
         try:
-            response = requests.get(f"{base_url}/health", timeout=(2.0, 5.0))
+            response = requests.get(
+                f"{base_url}/health",
+                headers=_auth_headers_for(base_url) or None,
+                timeout=(2.0, 5.0),
+            )
             if response.status_code < 400:
                 if attempt > 1:
                     logger.info("Remote node %s answered /health on attempt %d", base_url, attempt)
@@ -520,6 +524,7 @@ def _resolve_remote_provider(base_url: str, agent_profile: str) -> str:
     try:
         response = requests.get(
             f"{base_url}/agents/profiles/{agent_profile}",
+            headers=_auth_headers_for(base_url) or None,
             timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
         )
     except requests.RequestException as exc:
@@ -554,6 +559,7 @@ def _cleanup_remote_terminal(base_url: str, terminal_id: str) -> bool:
     try:
         response = requests.delete(
             f"{base_url}/terminals/{terminal_id}",
+            headers=_auth_headers_for(base_url) or None,
             timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
         )
         if response.status_code == 404:
@@ -2120,6 +2126,7 @@ def _assign_remote(
                 CALLBACK_TERMINAL_ID_ENV: current_terminal_id,
             },
         },
+        headers=_auth_headers_for(base_url) or None,
         timeout=(REMOTE_CONNECT_TIMEOUT, _mcp_timeout()),
     )
     if response.status_code >= 400:

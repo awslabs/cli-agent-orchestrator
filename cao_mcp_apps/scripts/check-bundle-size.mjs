@@ -5,7 +5,7 @@
 //   dashboard.html     <= 250 KB gz
 //   agent.html         <= 250 KB gz
 //   event-stream.html  <= 150 KB gz
-//   graph.html         <= 120 KB gz (measured ~86.3 KB gz with sigma+graphology+graphology-layout; ~28% headroom)
+//   graph.html         <= 200 KB gz (measured ~177.2 KB gz with sigma 4+graphology+graphology-layout; ~11% headroom)
 //
 // Each artifact is a single inlined HTML file (vite-plugin-singlefile). Exits
 // non-zero if any built bundle exceeds its budget.
@@ -24,7 +24,7 @@ const BUDGETS = [
   { file: "dashboard.html", limitKb: 250 },
   { file: "agent.html", limitKb: 250 },
   { file: "event-stream.html", limitKb: 150 },
-  { file: "graph.html", limitKb: 120 },
+  { file: "graph.html", limitKb: 200 },
 ];
 
 let failed = 0;
