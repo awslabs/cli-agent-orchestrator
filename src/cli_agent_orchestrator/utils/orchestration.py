@@ -697,9 +697,12 @@ class EphemeralClaim(NamedTuple):
 class _ClaimRefused(ValueError):
     """Carry only the policy relay's public rule and message to the handler."""
 
-    def __init__(self, rule: str, message: str):
+    def __init__(self, rule: str, message: str, status_code: Optional[int] = None):
         super().__init__(message)
         self.rule = rule
+        # The HTTP status behind a generic refusal, so handoff can tell a failed
+        # original (424) from an unknown outcome (review on PR #773).
+        self.status_code = status_code
 
 
 def _local_claim_refusal(rule: str, detail: str = "") -> _ClaimRefused:
@@ -965,7 +968,9 @@ def _create_terminal(
             if kind == "ephemeral_policy":
                 raise _ClaimRefused(rule or "unexpected_failure", message)
             raise _ClaimRefused(
-                "unexpected_failure", f"ephemeral launch failed ({response.status_code})"
+                "unexpected_failure",
+                f"ephemeral launch failed ({response.status_code})",
+                status_code=response.status_code,
             )
         response.raise_for_status()
         terminal = response.json()
@@ -1665,10 +1670,12 @@ def _create_handoff_terminal(
         except _ClaimRefused as exc:
             # With a claim, _create_terminal reports every 4xx/5xx as a refusal,
             # so the 424 and other-error branches above never see it (review on
-            # PR #773). After a timeout, an earlier attempt may have committed
-            # the worker: let the caller look it up. With nothing committed the
-            # caller re-raises this refusal, so its rule and message stay.
-            if saw_timeout:
+            # PR #773). A 424 is the failed original, as without a claim: raise
+            # it and do not look anything up. After a timeout, any other refusal
+            # may hide a worker an earlier attempt committed: let the caller
+            # look it up. With nothing committed the caller re-raises this
+            # refusal, so its rule and message stay.
+            if saw_timeout and exc.status_code != 424:
                 raise _HandoffCreateUnresolved(str(exc)) from exc
             raise
     raise AssertionError("unreachable")  # the loop always returns or raises

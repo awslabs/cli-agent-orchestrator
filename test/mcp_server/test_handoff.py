@@ -1248,8 +1248,8 @@ class TestHandoffCreateTimeoutRecovery:
 
     @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
     def test_claim_refusal_after_a_timeout_is_unresolved(self, mock_create):
-        """With a claim, _create_terminal reports a 424 or 500 as _ClaimRefused.
-        After a timeout that must still lead to the lookup, not a lost id."""
+        """With a claim, _create_terminal reports a 500 as _ClaimRefused. After a
+        timeout that must still lead to the lookup, not a lost id."""
         import requests
 
         from cli_agent_orchestrator.utils.orchestration import (
@@ -1259,7 +1259,9 @@ class TestHandoffCreateTimeoutRecovery:
             _HandoffCreateUnresolved,
         )
 
-        refusal = _ClaimRefused("unexpected_failure", "ephemeral launch failed (424)")
+        refusal = _ClaimRefused(
+            "unexpected_failure", "ephemeral launch failed (500)", status_code=500
+        )
         mock_create.side_effect = [requests.exceptions.ReadTimeout("read timed out"), refusal]
         claim = EphemeralClaim("claude_code", [], "claim-1")
 
@@ -1277,6 +1279,38 @@ class TestHandoffCreateTimeoutRecovery:
         assert exc_info.value.__cause__ is refusal
         assert mock_create.call_count == 2
         assert all(c.kwargs["claim"] is claim for c in mock_create.call_args_list)
+
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_claim_424_after_a_timeout_is_the_failed_original(self, mock_create):
+        """A 424 means the original failed, with or without a claim: it is
+        raised as is, so handoff does not look up and report that worker."""
+        import requests
+
+        from cli_agent_orchestrator.utils.orchestration import (
+            EphemeralClaim,
+            _ClaimRefused,
+            _create_handoff_terminal,
+        )
+
+        refusal = _ClaimRefused(
+            "unexpected_failure", "ephemeral launch failed (424)", status_code=424
+        )
+        mock_create.side_effect = [requests.exceptions.ReadTimeout("read timed out"), refusal]
+
+        with pytest.raises(_ClaimRefused) as exc_info:
+            _create_handoff_terminal(
+                "dev",
+                None,
+                engine=None,
+                model=None,
+                use_worktree=False,
+                idempotency_key="k",
+                claim=EphemeralClaim("claude_code", [], "claim-1"),
+            )
+
+        assert exc_info.value is refusal
+        assert mock_create.call_count == 2
+        assert not any(c.kwargs.get("lookup_only") for c in mock_create.call_args_list)
 
     @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
     def test_claim_refusal_on_the_first_attempt_is_raised(self, mock_create):
