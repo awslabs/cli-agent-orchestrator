@@ -407,9 +407,8 @@ line_length = 100
 # ruff — the dead-code gate black, isort and mypy all miss (#1005).
 #
 # WHY: issue #752's root cause was a computed status value that nothing ever read. black
-# and isort only reformat; mypy is `continue-on-error: true` in the Code Quality job and
-# does not report unread locals under any setting. So an assignment whose result is
-# dropped had NO gate in this repo at all.
+# and isort only reformat, and mypy does not report unread locals under any setting. So
+# an assignment whose result is dropped had NO gate in this repo at all.
 #
 # SELECTION IS DELIBERATELY NARROW. Measured on this tree at ruff 0.17.1 over
 # src/ test/ examples/:
@@ -490,9 +489,10 @@ python_functions = "test_*"
 # they drift with every test added.)
 #
 # The integration tests that need a real external CLI carry their own
-# `pytest.mark.skipif` on an env gate as well as the marker (see
-# test/providers/test_kiro_cli_integration.py:41), so selecting them locally
-# collects-and-skips rather than trying to drive an unauthenticated binary.
+# `pytest.mark.skipif` on an env gate as well as the marker (the module-level
+# `pytestmark` block in test/providers/test_kiro_cli_integration.py), so
+# selecting them locally collects-and-skips rather than trying to drive an
+# unauthenticated binary.
 addopts = "--cov=src --cov-report=term-missing -m 'not e2e'"
 
 # NFR-3's 80% line floor is enforced in CI, NOT here (issue #583 Bolt 3, build-and-test).
