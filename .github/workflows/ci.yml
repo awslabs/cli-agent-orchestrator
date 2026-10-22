@@ -53,21 +53,37 @@ jobs:
           version: v0.70.0
 
       - name: Run unit tests with coverage
+        # CAO_MUST_RUN names the assurance gates this leg owns; a `must_run`
+        # test for a listed gate that skips or gets deselected fails the session
+        # instead of passing silently (see test/_must_run.py). Only the 3.12 leg
+        # installs Trivy, so only the 3.12 leg claims the "unit" gate.
+        env:
+          CAO_MUST_RUN: ${{ matrix.python-version == '3.12' && 'unit' || '' }}
         run: |
           if [ "${{ matrix.python-version }}" = "3.12" ]; then
             trivy --version
           fi
           # CI intentionally includes integration-marked tests except for the Kiro
           # provider test, which requires an authenticated external CLI.
-          uv run pytest test/ examples/workflow/tests/ \
+          uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ \
             --ignore=test/providers/test_kiro_cli_integration.py \
             --ignore=test/e2e \
             -m "not e2e" \
             --cov=src/cli_agent_orchestrator \
+            --cov-branch \
             --cov-report=xml \
             --cov-fail-under=80 \
             --cov-report=term-missing \
             -v
+        # --cov-branch (#1005) also makes --cov-fail-under read the BLENDED
+        # line+branch figure rather than line coverage. Whether that reads harder
+        # or softer than line-only depends on whether branch % is below or above
+        # line % that run (today: 89.28 branch vs 93.10 line, so blended is a
+        # harder bar at 80 -- not an invariant, just the current numbers). The
+        # authoritative, separately-floored line metric is the ratchet's
+        # (.coverage-baseline.json, python.floor_pct = 87.0) in the cao-mcp-apps
+        # job below. If the blend lands under 80 on a first run, lower THIS
+        # number -- do not drop the branch data, and do not touch the line floor.
 
       - name: Validate Markdown links
         run: uv run python scripts/validate_markdown_links.py
@@ -248,14 +264,16 @@ jobs:
         run: npm ci
         working-directory: cao_mcp_apps
 
+      # Was wrapped in `if ls src/**/*.ts src/**/*.tsx; then ... else echo "no
+      # TypeScript sources yet (Phase 0)"; fi`. Phase 0 is over: there are 29
+      # .ts/.tsx files under src/{agent,dashboard,event-stream,graph,shared,test},
+      # so the else branch is dead. It was also fragile in the direction this PR
+      # cares about -- bash does not expand `**` recursively without `globstar`,
+      # so `src/**/*.ts` only ever matched one level down, and moving the sources
+      # one directory deeper would have silently turned tsc into an echo.
       - name: Type check
         working-directory: cao_mcp_apps
-        run: |
-          if ls src/**/*.ts src/**/*.tsx >/dev/null 2>&1; then
-            npm run typecheck
-          else
-            echo "no TypeScript sources yet (Phase 0) — skipping tsc"
-          fi
+        run: npm run typecheck
 
       - name: Unit tests
         working-directory: cao_mcp_apps
@@ -278,13 +296,16 @@ jobs:
         run: uv run pytest test/test_http_only_boundary.py -q
 
       - name: Backend coverage (for the ratchet floor)
-        # Produces coverage.json (python floor) consumed by coverage:ratchet.
+        # Produces coverage.json (python line + branch floors) consumed by
+        # coverage:ratchet. --cov-branch adds num_branches/covered_branches to
+        # totals; the ratchet floors line and branch SEPARATELY (#1005).
         run: |
-          uv run pytest test/ examples/workflow/tests/ \
+          uv run pytest test/ examples/workflow/tests/ examples/skills/tests/ \
             --ignore=test/providers/test_kiro_cli_integration.py \
             --ignore=test/e2e \
             -m "not e2e" \
             --cov=src/cli_agent_orchestrator \
+            --cov-branch \
             --cov-report=json \
             --cov-fail-under=80 \
             -q
@@ -346,10 +367,10 @@ jobs:
         run: uv sync --locked --all-extras --dev
 
       - name: Check code formatting with black
-        run: uv run black --check src/ test/ examples/robotics/cross-zone-transport/
+        run: uv run black --check src/ test/ examples/robotics/cross-zone-transport/ examples/skills/
 
       - name: Check import sorting with isort
-        run: uv run isort --check-only src/ test/ examples/robotics/cross-zone-transport/
+        run: uv run isort --check-only src/ test/ examples/robotics/cross-zone-transport/ examples/skills/
 
       - name: Run type checker with mypy (ratchet)
         # Issue #1005. This step used to be `uv run mypy src/` with

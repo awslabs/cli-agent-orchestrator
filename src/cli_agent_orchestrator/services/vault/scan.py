@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,12 @@ MAX_TOTAL_SCAN_BYTES = 64 * 1024 * 1024
 
 SCAN_BYTE_BUDGET_EXCEEDED = FindingCode.BYTE_BUDGET_EXCEEDED
 SCAN_NOTE_LIMIT_EXCEEDED = FindingCode.NOTE_LIMIT_EXCEEDED
+
+# ADR-006 stability check: a note whose identity changes across one read window
+# is re-read up to this many times, with a short linear backoff, before it is
+# recorded as ``unstable_skipped`` and left for the next reconcile.
+MAX_UNSTABLE_REREADS = 3
+UNSTABLE_REREAD_DELAY_SECONDS = 0.02
 
 
 @dataclass(frozen=True)
@@ -132,14 +139,17 @@ def scan_vault(
             break
 
         remaining_bytes = max_total_bytes - total_bytes
-        read, after, refusal = _read_stable_utf8(
+        read, after, refusal, reads = _read_stable_utf8_with_rereads(
             candidate,
             root,
             vault.max_note_bytes,
             max_read_bytes=min(vault.max_note_bytes, remaining_bytes),
         )
         if refusal is not None:
-            notes.append(_refused(candidate, refusal, _refusal_detail(refusal), after))
+            detail = _refusal_detail(refusal)
+            if refusal == FindingCode.UNSTABLE_SKIPPED and reads > 1:
+                detail = f"{detail}; still changing after {reads} reads"
+            notes.append(_refused(candidate, refusal, detail, after))
             continue
         assert read is not None and after is not None
         raw_bytes = read
@@ -505,6 +515,33 @@ def _read_stable_utf8(
     if _stat_identity(before) != _stat_identity(after):
         return None, after, FindingCode.UNSTABLE_SKIPPED
     return content, after, None
+
+
+def _read_stable_utf8_with_rereads(
+    candidate: _Candidate,
+    root: str,
+    max_note_bytes: int,
+    *,
+    max_read_bytes: Optional[int] = None,
+    max_rereads: int = MAX_UNSTABLE_REREADS,
+) -> tuple[Optional[bytes], Optional[os.stat_result], Optional[FindingCode], int]:
+    """Re-read a note whose identity changed across the read window, within a bound.
+
+    Only ``UNSTABLE_SKIPPED`` is retried; every other refusal is final. Returns
+    the last read outcome plus the number of reads performed so the caller can
+    report how long the note kept changing. The backoff is linear and short: an
+    Obsidian autosave completes in milliseconds, and the bound keeps a note that
+    is being written continuously from stalling the scan.
+    """
+    reads = 0
+    while True:
+        reads += 1
+        content, after, refusal = _read_stable_utf8(
+            candidate, root, max_note_bytes, max_read_bytes=max_read_bytes
+        )
+        if refusal != FindingCode.UNSTABLE_SKIPPED or reads > max_rereads:
+            return content, after, refusal, reads
+        time.sleep(UNSTABLE_REREAD_DELAY_SECONDS * reads)
 
 
 def _refusal_detail(code: FindingCode) -> str:

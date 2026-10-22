@@ -663,8 +663,15 @@ def get_memory_settings() -> Dict[str, Any]:
     return result
 
 
-def get_vault_config():
-    """Load the validated ``memory.vault`` object with a disable-only env gate."""
+def get_vault_config(*, canonicalize: bool = True):
+    """Load the validated ``memory.vault`` object with a disable-only env gate.
+
+    Schema validation is pure. With ``canonicalize`` (the default for every
+    runtime consumer) project mapping ids are then resolved through the
+    persisted alias table, which fails closed when the database is unavailable.
+    Introspection surfaces such as ``cao config list`` pass ``canonicalize=False``
+    so they can show the configured document on a home that has no database yet.
+    """
     from cli_agent_orchestrator.services.vault.config import VaultConfig
 
     settings = _load()
@@ -673,6 +680,10 @@ def get_vault_config():
     if not isinstance(raw_vault, dict):
         raise ValueError("memory.vault must be an object")
     config = VaultConfig.model_validate(raw_vault)
+    if canonicalize:
+        from cli_agent_orchestrator.services.vault.binding import canonicalize_vault_config
+
+        config = canonicalize_vault_config(config)
 
     # This operational override may only reduce exposure. In particular, an
     # env value of true never enables a file-disabled or absent configuration.
