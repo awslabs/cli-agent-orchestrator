@@ -28,6 +28,7 @@ import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+from cli_agent_orchestrator.utils import api_http
 from cli_agent_orchestrator.utils.terminal import poll_until_done
 
 TERMINAL_ID = "term-735"
@@ -424,6 +425,41 @@ def test_with_no_output_since_the_send_the_refusal_has_no_bound(chunk_driven, ca
             )
     assert len(reads) > 1
     assert capsys.readouterr().err == ""
+
+
+def test_a_transient_poll_failure_during_the_gated_wait_neither_aborts_nor_opens_the_gate(
+    chunk_driven, capsys
+):
+    """#1037's retry and the #735 gate together: a 503 while the previous turn's
+    COMPLETED is still latched is retried (not fatal) and is not a reading, so it
+    neither counts as a stamp nor starts the grace; the wait then ends on this
+    turn's own stamped completion with no warning."""
+    sm = chunk_driven
+    _finish_a_first_turn(sm)
+    boundary = _dispatch(sm)
+
+    def script(n):
+        if n in (1, 3):
+            raise api_http.exceptions.HTTPError(
+                "503 Service Unavailable", response=MagicMock(status_code=503)
+            )
+        if n == 5:
+            sm._process_chunk(TERMINAL_ID, "task two <SPIN>")
+        elif n == 7:
+            sm._process_chunk(TERMINAL_ID, " answer two <DONE>")
+
+    reads, get = _http_reader(sm, boundary, script)
+    with patch("cli_agent_orchestrator.utils.terminal.api_http.get", side_effect=get):
+        poll_until_done(
+            TERMINAL_ID,
+            timeout=10.0,
+            polling_interval=0.01,
+            min_generation=boundary,
+            stamp_grace=0.01,  # would open the gate at once if a 503 started it
+        )
+
+    assert len(reads) >= 7, "a failed poll or the stale COMPLETED ended the wait early"
+    assert capsys.readouterr().err == "", "a transient failure must not degrade the gate"
 
 
 def test_a_server_restart_degrades_at_once_with_a_warning(capsys):
