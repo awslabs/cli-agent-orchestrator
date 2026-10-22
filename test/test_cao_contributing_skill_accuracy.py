@@ -168,10 +168,9 @@ def _job_is_blocking(job: dict) -> bool:
     pins it directly instead of trusting that it works.
 
     STEP-level ``continue-on-error`` is deliberately not consulted. It tolerates
-    one step, not the job, and ``ci.yml`` carries four of them -- the mypy step
-    plus three artifact uploads -- while all four of those jobs remain hard
-    gates. Folding steps in here would mis-report three blocking jobs as
-    tolerated.
+    one step, not the job, and ``ci.yml`` carries three of them -- artifact uploads
+    in three jobs -- while all three of those jobs remain hard gates. Folding steps
+    in here would mis-report three blocking jobs as tolerated.
     """
     return not _truthy_continue_on_error(job.get("continue-on-error"))
 
@@ -476,19 +475,14 @@ class TestTheBlockingDerivationItself:
             for step in (job.get("steps") or [])
             if _truthy_continue_on_error(step.get("continue-on-error"))
         ]
-        assert len(tolerated) >= 4, (
-            "Expected ci.yml to carry at least the four step-level "
-            "continue-on-error steps verified here -- mypy in Code Quality plus "
-            "three artifact uploads (AG-UI demo, AG-UI construct demos, Agent "
-            f"Plugins dog-food) -- but found {len(tolerated)}: {tolerated}. A "
-            "DECREASE is the direction that matters: it means the case "
+        assert len(tolerated) >= 3, (
+            "Expected ci.yml to carry at least the three step-level "
+            "continue-on-error steps verified here -- the AG-UI demo, AG-UI "
+            f"construct demos, and Agent Plugins dog-food artifact uploads -- but "
+            f"found {len(tolerated)}: {tolerated}. A DECREASE is the direction that "
+            "matters: it means the case "
             "test_step_level_tolerance_does_not_make_the_job_tolerated models may "
             "no longer exist in this repo. An increase is fine; raise this floor."
-        )
-        assert any("mypy" in str(step_name) for _job, step_name in tolerated), (
-            "mypy's step-level tolerance is the specific case the modelling above "
-            f"describes and the skill documents; it is not among {tolerated}. A "
-            "count alone would pass on three unrelated artifact uploads."
         )
         assert all(
             _job_is_blocking(_ci_jobs_by_name()[job_name]) for job_name, _ in tolerated
@@ -853,15 +847,15 @@ class TestReferencedPathsExist:
 
 
 class TestMypyToleranceClaim:
-    def test_mypy_is_still_non_blocking(self):
-        """The skill tells contributors not to 'fix' red mypy. Verify that holds."""
+    def test_mypy_is_blocking_via_the_ratchet(self):
+        """The skill tells contributors mypy is blocking via a ratchet. Verify that holds."""
         spec = _ci_spec()
         steps = spec["jobs"]["lint"]["steps"]
         mypy_steps = [s for s in steps if "mypy" in str(s.get("run", ""))]
         assert mypy_steps, "The lint job no longer runs mypy; update the skill."
-        assert all(_truthy_continue_on_error(s.get("continue-on-error")) for s in mypy_steps), (
-            "mypy is now BLOCKING in CI. The skill's guidance to ignore pre-existing "
-            "mypy errors is actively harmful until it is rewritten."
+        assert not any(_truthy_continue_on_error(s.get("continue-on-error")) for s in mypy_steps), (
+            "mypy is no longer BLOCKING in CI (continue-on-error reappeared). The "
+            "skill's guidance that mypy is a blocking ratchet is now wrong."
         )
 
 
