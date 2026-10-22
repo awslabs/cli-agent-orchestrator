@@ -379,10 +379,11 @@ class BaseProvider(ABC):
         unchanged just after submission opt in so callers cannot observe the
         previous turn's cached COMPLETED state as the new turn's result.
 
-        The published PROCESSING is an optimistic latch, NOT provider evidence:
-        it does not authorize stale-pane recovery for the new generation, and it
-        does not suppress the mid-burst processing probe, which is what earns
-        that evidence for a TUI whose screen never goes quiet (#814).
+        The published PROCESSING is an optimistic latch, NOT provider evidence.
+        It carries no observation stamp, so it is not "this turn has been seen
+        working": the mid-burst processing probe keeps running until the work is
+        actually seen on screen (#814), and the stale-PROCESSING capture gate,
+        for providers that opt into that recovery, does not accept it either.
         """
         return False
 

@@ -1780,9 +1780,11 @@ class TestMidBurstProcessingProbe:
         behind the turn's ``_capture_generation``. Keyed on the status field
         alone, the mid-burst probe then saw "already PROCESSING" and returned
         for the whole window it exists to cover — the busy turn whose TUI never
-        goes quiet. The probe is what re-earns the evidence that authorizes the
-        stale-PROCESSING capture recovery for this generation, so skipping it
-        also leaves the turn unable to self-heal.
+        goes quiet. The spinner the probe sees is this turn's observation, and
+        that stamp is what lets the probe and the raw-path debounce stop looking
+        (``_processing_observed_this_turn_locked``). It feeds nothing else today:
+        the stale-PROCESSING capture gate reads the same stamp, but only for
+        providers that opt into that recovery, and none of those is probed.
         """
         sm = self._bursting_monitor()
         provider = self._probing_provider([True])
