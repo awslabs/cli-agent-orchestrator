@@ -80,6 +80,21 @@ def _patched_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_SCRATCH_DIR", tmp_path / "scratch")
+    # issue #583 Bolt 3 (``approval-enforcement-default``): the approval gate now defaults ON, and
+    # every test in this module drives a script run whose plan is not approved. These are tests of the
+    # RUNNER -- spawn, reap, sentinel scanning, resume admission, TOCTOU -- not of approval, so the
+    # gate is turned off here through the real setting. Doing it in the fixture rather than per test
+    # keeps the runner's own behaviour the only variable, and using the setting rather than patching
+    # ``ensure_plan_approved`` out means the gate's disabled path stays genuinely exercised.
+    import json as _json
+
+    from cli_agent_orchestrator.services import settings_service as _settings
+
+    _gate_off = tmp_path / "settings.json"
+    _gate_off.write_text(_json.dumps({"workflow": {"require_approval": False}}))
+    monkeypatch.setattr(_settings, "SETTINGS_FILE", _gate_off)
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
     # Isolate the process-local registry between tests.
     from cli_agent_orchestrator.services import workflow_service
 
@@ -252,6 +267,7 @@ def _install_fake_spawn(monkeypatch: pytest.MonkeyPatch, process: object) -> dic
     async def _fake_exec(*args, **kwargs):
         captured["args"] = args
         captured["env"] = kwargs.get("env")
+        captured["cwd"] = kwargs.get("cwd")
         return process
 
     monkeypatch.setattr(
@@ -362,11 +378,26 @@ async def test_lint_fail_raises_before_any_spawn(monkeypatch: pytest.MonkeyPatch
 
 
 @pytest.mark.asyncio
-async def test_happy_completed_result_shape_and_sentinel(monkeypatch: pytest.MonkeyPatch):
+async def test_happy_completed_result_shape_and_sentinel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
     """M1 + A6: exit 0 -> COMPLETED, tier-neutral shape, sentinel output parsed."""
     proc = _FakeProcess(exit_rc=0, stdout=b'log line\nCAO_WORKFLOW_OUTPUT:{"answer": 42}\n')
     captured = _install_fake_spawn(monkeypatch, proc)
-    result = await run_script_workflow(_FakeScriptSpec(), {}, "run-ok")
+    manifest_cwds = []
+    monkeypatch.setattr(
+        script_runner.manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: script_runner.manifest_freeze.FrozenManifest(
+            (lambda **kwargs: manifest_cwds.append(kwargs["cwd"]) or None)(**kwargs)
+        ),
+    )
+    result = await run_script_workflow(
+        _FakeScriptSpec(),
+        {},
+        "run-ok",
+        working_directory=str(tmp_path),
+    )
 
     assert isinstance(result, WorkflowRunResult)
     assert result.state == RunState.COMPLETED
@@ -382,6 +413,10 @@ async def test_happy_completed_result_shape_and_sentinel(monkeypatch: pytest.Mon
     # F3: the journaled started_at is the SAME timestamp as the record's, not a
     # second independent _now() call.
     assert row.started_at == result.started_at
+    assert script_runner.run_registry["run-ok"].working_directory == os.path.realpath(tmp_path)
+    assert captured["cwd"] == os.path.realpath(tmp_path)
+    assert manifest_cwds == [os.path.realpath(tmp_path)]
+    assert json.loads(row.spec_snapshot)["working_directory"] == os.path.realpath(tmp_path)
     # Constructed env is the exact 6-key allowlist (INV-2 + BR-A5), no resume flag.
     env = captured["env"]
     assert set(env) == {
@@ -397,6 +432,43 @@ async def test_happy_completed_result_shape_and_sentinel(monkeypatch: pytest.Mon
 
 
 @pytest.mark.asyncio
+async def test_blocking_run_persists_launch_guard(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        script_runner.launch_guard.settings_service,
+        "is_workflow_approval_required",
+        lambda: True,
+    )
+    monkeypatch.setattr(script_runner.approval_gate, "ensure_plan_approved", lambda **kwargs: None)
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles,
+        "list_agent_profiles",
+        lambda: [{"name": "developer"}],
+    )
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles,
+        "_read_agent_profile_source",
+        lambda name: "profile source",
+    )
+    monkeypatch.setattr(
+        script_runner.launch_guard.settings_service,
+        "is_memory_enabled",
+        lambda: True,
+    )
+    _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+
+    await run_script_workflow(
+        _FakeScriptSpec(),
+        {},
+        "run-guard-persisted",
+        working_directory=str(tmp_path),
+    )
+
+    snapshot = json.loads(workflow_journal.get_run("run-guard-persisted").spec_snapshot)
+    assert snapshot["launch_guard"]["memory_enabled"] is True
+    assert set(snapshot["launch_guard"]["profiles"]) == {"developer"}
+
+
+@pytest.mark.asyncio
 async def test_crash_nonzero_exit_failed_kind_error(monkeypatch: pytest.MonkeyPatch):
     """Nonzero exit -> FAILED with a redacted durable diagnostic and a swept worker."""
     swept = {"run": None}
@@ -407,7 +479,7 @@ async def test_crash_nonzero_exit_failed_kind_error(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(script_runner, "_reconcile_orphans", _fake_sweep)
     proc = _FakeProcess(exit_rc=1, stderr=f"Traceback: boom with {aws_key}\n".encode())
-    _install_fake_spawn(monkeypatch, proc)
+    captured = _install_fake_spawn(monkeypatch, proc)
 
     result = await run_script_workflow(_FakeScriptSpec(), {}, "run-crash")
     assert result.state == RunState.FAILED
@@ -855,6 +927,15 @@ async def test_resume_live_run_raises_not_allowed(monkeypatch: pytest.MonkeyPatc
     from cli_agent_orchestrator.services import workflow_service
 
     monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    # Admission freezing is covered separately; avoid timing this liveness proof
+    # against filesystem/profile discovery before the drive starts.
+    monkeypatch.setattr(
+        script_runner.manifest_freeze,
+        "freeze_manifest",
+        lambda **kwargs: script_runner.manifest_freeze.FrozenManifest(
+            (lambda **kw: None)(**kwargs)
+        ),
+    )
     proc = _FakeProcess(exit_rc=0, hang=True)
     _install_fake_spawn(monkeypatch, proc)
 
@@ -997,7 +1078,9 @@ async def test_resume_happy_materializes_and_deletes_temp(monkeypatch: pytest.Mo
     workflow_journal.insert_run(
         run_id="run-resume",
         workflow_name="wf",
-        spec_snapshot=json.dumps({"source": source, "path": "/tmp/wf.py"}),
+        spec_snapshot=json.dumps(
+            {"source": source, "path": "/tmp/wf.py", "working_directory": "/recorded/root"}
+        ),
         inputs_json="{}",
         state="failed",
         started_at="2026-07-08T00:00:00Z",
@@ -1016,6 +1099,8 @@ async def test_resume_happy_materializes_and_deletes_temp(monkeypatch: pytest.Mo
     env = captured["env"]
     assert env["CAO_WORKFLOW_RESUME"] == "1"
     assert env["CAO_WORKFLOW_GENERATION"] == "4"
+    assert captured["cwd"] == "/recorded/root"
+    assert script_runner.run_registry["run-resume"].working_directory == "/recorded/root"
     # The exec'd path is the engine-owned materialized temp file, NOT the on-disk
     # author file — and it is deleted in the finally after reap (BR-30).
     exec_path = captured["args"][1]
@@ -1580,16 +1665,19 @@ async def test_run_script_workflow_prepared_drives_without_reinsert(
     monkeypatch.setattr(workflow_journal, "insert_run", _fail_insert)
 
     proc = _FakeProcess(exit_rc=0, stdout=b'CAO_WORKFLOW_OUTPUT:{"ok": true}\n')
-    _install_fake_spawn(monkeypatch, proc)
+    captured = _install_fake_spawn(monkeypatch, proc)
 
     record = _make_record("run-prep-script", process=None, generation="1")
     workflow_service.run_registry["run-prep-script"] = record
 
     env = build_env("run-prep-script", "1", {})
-    result = await run_script_workflow_prepared(record, "/tmp/wf.py", env)
+    result = await run_script_workflow_prepared(
+        record, source="print('x')\n", env=env, working_directory="/prepared/root"
+    )
 
     assert result.state == RunState.COMPLETED
     assert result.output == {"ok": True}
+    assert captured["cwd"] == "/prepared/root"
     # DR-2: liveness mark cleared on exit.
     assert "run-prep-script" not in workflow_service._active_drives
 
@@ -1604,7 +1692,7 @@ async def test_run_script_workflow_prepared_marks_then_clears_active_drive(
 
     observed = {"live": None}
 
-    async def _fake_drive(record, script_path, env):
+    async def _fake_drive(record, script_path, env, *, working_directory=None):
         observed["live"] = record.run_id in workflow_service._active_drives
         return WorkflowRunResult(
             run_id=record.run_id,
@@ -1615,6 +1703,467 @@ async def test_run_script_workflow_prepared_marks_then_clears_active_drive(
 
     monkeypatch.setattr(script_runner, "_drive_process", _fake_drive)
     record = _make_record("run-prep-live", process=None, generation="1")
-    await run_script_workflow_prepared(record, "/tmp/wf.py", build_env("run-prep-live", "1", {}))
+    await run_script_workflow_prepared(
+        record, source="print('x')\n", env=build_env("run-prep-live", "1", {})
+    )
     assert observed["live"] is True
     assert "run-prep-live" not in workflow_service._active_drives
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_fresh_run_executes_approved_bytes_after_mid_start_update(monkeypatch, tmp_path):
+    """Admission, the journal and the interpreter must all use the approved source."""
+    import hashlib
+
+    from cli_agent_orchestrator.clients.database import _migrate_workflow_index
+    from cli_agent_orchestrator.services import (
+        approval_gate,
+        approval_store,
+        launch_guard,
+        settings_service,
+        workflow_spec_service,
+    )
+
+    _migrate_workflow_index()
+    settings_service.SETTINGS_FILE.write_text('{"workflow": {"require_approval": true}}')
+    monkeypatch.setattr(approval_store, "DATABASE_FILE", tmp_path / "wf.db")
+    monkeypatch.setattr(launch_guard.agent_profiles, "list_agent_profiles", lambda: [])
+    monkeypatch.setattr(launch_guard.settings_service, "is_memory_enabled", lambda: False)
+    spec_dir = tmp_path / "specs"
+    spec_dir.mkdir()
+    source_a = 'print(\'CAO_WORKFLOW_OUTPUT:{"ran": "A-approved-é"}\')\r\n'
+    source_b = 'print(\'CAO_WORKFLOW_OUTPUT:{"ran": "B-never-approved"}\')\n'
+    spec = workflow_spec_service.create_workflow("fresh", source_a, scan_dir=str(spec_dir))
+    with pytest.raises(approval_gate.PlanApprovalRequiredError) as refusal:
+        await run_script_workflow(spec, {}, "fresh-refused", working_directory=str(tmp_path))
+    approval_store.grant(refusal.value.plan_id, "test-operator")
+
+    capture = launch_guard.capture
+
+    def update_in_window():
+        workflow_spec_service.update_workflow(
+            spec.name, source_b, spec.content_hash, scan_dir=str(spec_dir)
+        )
+        return capture()
+
+    monkeypatch.setattr(launch_guard, "capture", update_in_window)
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_SCRATCH_DIR", scratch)
+    materialize = script_runner._materialize_snapshot
+    staged = {}
+
+    def observe_snapshot(*args, **kwargs):
+        path = materialize(*args, **kwargs)
+        staged["path"] = path
+        staged["hash"] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        return path
+
+    monkeypatch.setattr(script_runner, "_materialize_snapshot", observe_snapshot)
+    result = await run_script_workflow(spec, {}, "fresh-approved", working_directory=str(tmp_path))
+    assert result.state == RunState.COMPLETED
+    assert result.output == {"ran": "A-approved-é"}
+    row = workflow_journal.get_run("fresh-approved")
+    snapshot = json.loads(row.spec_snapshot)
+    manifest = json.loads(row.manifest_json)
+    assert (
+        staged["hash"] == manifest["source_hash"] == snapshot["content_hash"] == spec.content_hash
+    )
+    assert manifest["plan_id"] == refusal.value.plan_id
+    assert Path(spec.path).read_text() == source_b
+    assert not Path(staged["path"]).exists()
+
+
+def test_prepared_source_is_keyword_only():
+    import inspect
+
+    signature = inspect.signature(run_script_workflow_prepared)
+    assert "spec_path" not in signature.parameters
+    assert signature.parameters["source"].kind == inspect.Parameter.KEYWORD_ONLY
+    with pytest.raises(TypeError):
+        run_script_workflow_prepared(
+            _make_record("old-caller", process=None, generation="1"), "/tmp/wf.py", {}
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prepared", [False, True], ids=["blocking", "prepared"])
+@pytest.mark.parametrize(
+    "outcome", ["success", "failure", "timeout", "cancel", "spawn-failure", "exception"]
+)
+async def test_fresh_snapshot_lifecycle(monkeypatch, tmp_path, outcome, prepared):
+    """Private source exists during the drive and is removed on every exit path."""
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_SCRATCH_DIR", scratch)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TIMEOUT", 0.01)
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_TERM_GRACE", 0.01)
+    spec = _FakeScriptSpec(source="print('approved')\n", path=str(tmp_path / "author.py"))
+    Path(spec.path).write_text(spec.source)
+    run_id = "snapshot-lifecycle"
+    seen = []
+
+    def observe(path):
+        staged = Path(path)
+        assert staged != Path(spec.path)
+        assert staged.read_text() == spec.source
+        assert staged.stat().st_mode & 0o777 == 0o600
+        assert scratch.stat().st_mode & 0o777 == 0o700
+        assert not staged.stem.isidentifier()
+        assert staged.name == f"start-{run_id}.py"
+        seen.append(staged)
+
+    proc = _FakeProcess(exit_rc=1 if outcome == "failure" else 0, hang=outcome == "timeout")
+
+    async def spawn(*args, **kwargs):
+        observe(args[1])
+        if outcome == "spawn-failure":
+            raise OSError("spawn refused")
+        if outcome == "cancel":
+            script_runner.run_registry[run_id].cancelled = True
+        return proc
+
+    async def raising_drive(record, path, env, *, working_directory=None):
+        observe(path)
+        raise RuntimeError("drive exception")
+
+    monkeypatch.setattr(script_runner.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    if outcome == "exception":
+        monkeypatch.setattr(script_runner, "_drive_process", raising_drive)
+
+    async def start():
+        if not prepared:
+            return await run_script_workflow(spec, {}, run_id)
+        _seed_script_run(run_id)
+        record = _make_record(run_id, process=None, generation="1")
+        script_runner.run_registry[run_id] = record
+        return await run_script_workflow_prepared(record, source=spec.source, env={})
+
+    if outcome == "exception":
+        with pytest.raises(RuntimeError, match="drive exception"):
+            await start()
+    else:
+        result = await start()
+        state = {"success": RunState.COMPLETED, "cancel": RunState.CANCELLED}.get(
+            outcome, RunState.FAILED
+        )
+        kind = {"success": None, "cancel": "cancelled", "timeout": "timeout"}.get(outcome, "error")
+        assert result.state == state
+        assert result.kind == kind
+        assert workflow_journal.get_run(run_id).state == state.value
+    assert seen and not seen[0].exists()
+    assert run_id not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prepared", [False, True], ids=["blocking", "prepared"])
+async def test_fresh_materialize_oserror_settles_failed(monkeypatch, tmp_path, prepared):
+    def cannot_stage(*args, **kwargs):
+        raise OSError(28, "No space left on device", "/private/engine/source.py")
+
+    async def must_not_drive(*args, **kwargs):
+        pytest.fail("materialization failure must not spawn")
+
+    monkeypatch.setattr(script_runner, "_materialize_snapshot", cannot_stage)
+    monkeypatch.setattr(script_runner, "_drive_process", must_not_drive)
+    run_id = "stage-failure"
+    if prepared:
+        _seed_script_run(run_id)
+        record = _make_record(run_id, process=None, generation="1")
+        result = await run_script_workflow_prepared(record, source="print('approved')", env={})
+    else:
+        result = await run_script_workflow(_FakeScriptSpec(), {}, run_id)
+    assert result.state == RunState.FAILED
+    assert result.kind == "error"
+    assert result.warnings == [
+        "could not stage the approved script source: No space left on device"
+    ]
+    assert workflow_journal.get_run(run_id).state == "failed"
+    assert run_id not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["fdopen", "write"])
+async def test_partial_start_snapshot_deleted_on_materialize_error(monkeypatch, tmp_path, failure):
+    scratch = tmp_path / "scratch"
+    monkeypatch.setattr(script_runner, "WORKFLOW_SCRIPT_SCRATCH_DIR", scratch)
+    fdopen = script_runner.os.fdopen
+
+    class FailingWriter:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.stream.close()
+
+        def write(self, source):
+            self.stream.write(source[:5])
+            raise OSError(28, "No space left on device")
+
+    def fail_materialize(fd, *args, **kwargs):
+        if failure == "fdopen":
+            raise OSError(24, "Too many open files")
+        return FailingWriter(fdopen(fd, *args, **kwargs))
+
+    monkeypatch.setattr(script_runner.os, "fdopen", fail_materialize)
+    result = await run_script_workflow(_FakeScriptSpec(), {}, "partial-stage-failure")
+    assert result.state == RunState.FAILED
+    assert not (scratch / "start-partial-stage-failure.py").exists()
+    assert "partial-stage-failure" not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforced", [True, False], ids=["enforced", "opt-out"])
+async def test_insert_failure_stops_enforced_script_before_spawn(
+    monkeypatch, tmp_path, enforced, caplog
+):
+    from cli_agent_orchestrator.services import approval_store, settings_service
+
+    settings_service.SETTINGS_FILE.write_text(
+        json.dumps({"workflow": {"require_approval": enforced}})
+    )
+    monkeypatch.setattr(approval_store, "approval_state", lambda plan: approval_store.APPROVED)
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles, "list_agent_profiles", lambda: []
+    )
+    monkeypatch.setattr(settings_service, "is_memory_enabled", lambda: False)
+    private_path = str(tmp_path / "private-journal-location")
+
+    def insert_failure(*args, **kwargs):
+        raise RuntimeError(private_path)
+
+    monkeypatch.setattr(workflow_journal, "insert_run", insert_failure)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    result = await run_script_workflow(
+        _FakeScriptSpec(), {}, "insert-failed", working_directory=str(tmp_path)
+    )
+    warnings = [
+        entry
+        for entry in caplog.records
+        if entry.name == script_runner.logger.name and "insert_run" in entry.getMessage()
+    ]
+    assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
+    assert "RuntimeError" in warnings[0].getMessage()
+    assert private_path not in caplog.text
+    if enforced:
+        assert spawned == {}, "an approved run without its journal row must never spawn"
+        assert result.state == RunState.FAILED
+        assert result.kind == "error"
+        assert result.warnings == [
+            "Could not durably record this script run; no script was started. "
+            "Repair the run journal and start a new run."
+        ]
+        assert private_path not in result.model_dump_json()
+        record = script_runner.run_registry["insert-failed"]
+        assert record.state == RunState.FAILED and record.finished_at is not None
+        assert "insert-failed" not in script_runner._active_drives
+    else:
+        assert spawned
+        assert result.state == RunState.COMPLETED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforced", [True, False], ids=["enforced", "opt-out"])
+async def test_duplicate_insert_preserves_winning_live_run(monkeypatch, tmp_path, enforced):
+    """A loser at the INSERT boundary must not settle or replace the winner."""
+    from cli_agent_orchestrator.services import approval_store, settings_service
+
+    settings_service.SETTINGS_FILE.write_text(
+        json.dumps({"workflow": {"require_approval": enforced}})
+    )
+    monkeypatch.setattr(approval_store, "approval_state", lambda plan: approval_store.APPROVED)
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles, "list_agent_profiles", lambda: []
+    )
+    monkeypatch.setattr(settings_service, "is_memory_enabled", lambda: False)
+    run_id = "duplicate-insert"
+    winner = _make_record(run_id, process=None, generation="7")
+    workflow_journal.insert_run(
+        run_id,
+        "winning-workflow",
+        '{"source":"winner"}',
+        '{"owner":"winner"}',
+        RunState.RUNNING.value,
+        winner.started_at,
+        "script",
+        "7",
+    )
+    before = workflow_journal.get_run(run_id)
+    script_runner.run_registry[run_id] = winner
+    script_runner._active_drives.add(run_id)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    conflict = None
+    try:
+        # The HTTP availability check can already have passed before the winner
+        # inserts. Exercise the real duplicate constraint at the engine boundary.
+        await run_script_workflow(_FakeScriptSpec(), {}, run_id, working_directory=str(tmp_path))
+    except KeyError as exc:
+        conflict = exc
+
+    assert workflow_journal.get_run(run_id) == before, "the winning row must remain untouched"
+    assert script_runner.run_registry[run_id] is winner
+    assert winner.state == RunState.RUNNING and winner.finished_at is None
+    assert run_id in script_runner._active_drives
+    assert spawned == {}
+    assert conflict is not None and "already exists" in str(conflict)
+
+
+@pytest.mark.asyncio
+async def test_insert_failure_refuses_when_enforcement_turns_on_after_capture(
+    monkeypatch, tmp_path
+):
+    from cli_agent_orchestrator.services import settings_service
+
+    settings_service.SETTINGS_FILE.write_text('{"workflow":{"require_approval":false}}')
+    real_capture = script_runner.launch_guard.capture
+    captured = []
+
+    def capture():
+        guard = real_capture()
+        captured.append(guard)
+        return guard
+
+    def insert_failure(*args, **kwargs):
+        assert json.loads(args[2])["launch_guard"] == {"approval_required": False}
+        settings_service.SETTINGS_FILE.write_text('{"workflow":{"require_approval":true}}')
+        raise RuntimeError(str(tmp_path / "private-journal-location"))
+
+    monkeypatch.setattr(script_runner.launch_guard, "capture", capture)
+    monkeypatch.setattr(workflow_journal, "insert_run", insert_failure)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    result = await run_script_workflow(
+        _FakeScriptSpec(), {}, "posture-flipped", working_directory=str(tmp_path)
+    )
+    assert captured == [{"approval_required": False}]
+    assert spawned == {}, "the current posture must be re-read before any spawn"
+    assert result.state == RunState.FAILED and result.kind == "error"
+    assert script_runner.run_registry["posture-flipped"].finished_at is not None
+    assert "posture-flipped" not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timing", ["before-commit", "after-commit"])
+@pytest.mark.parametrize("enforced", [False, True], ids=["opt-out", "enforced"])
+async def test_cancel_during_insert_is_honoured_before_spawn(
+    monkeypatch, tmp_path, timing, enforced
+):
+    """Cancel on the real loop while INSERT's worker has not returned to it."""
+    from fastapi import HTTPException
+
+    from cli_agent_orchestrator.api import main as api_main
+    from cli_agent_orchestrator.services import approval_store, settings_service
+
+    settings_service.SETTINGS_FILE.write_text(
+        json.dumps({"workflow": {"require_approval": enforced}})
+    )
+    monkeypatch.setattr(approval_store, "approval_state", lambda plan: approval_store.APPROVED)
+    monkeypatch.setattr(
+        script_runner.launch_guard.agent_profiles, "list_agent_profiles", lambda: []
+    )
+    monkeypatch.setattr(settings_service, "is_memory_enabled", lambda: False)
+    loop = asyncio.get_running_loop()
+    insert_run = workflow_journal.insert_run
+    run_id = "cancel-during-insert"
+    replies = []
+    errors = []
+    writes = []
+    update_run_state = workflow_journal.update_run_state
+
+    def track_state(run_id, state, *args, **kwargs):
+        writes.append(state)
+        return update_run_state(run_id, state, *args, **kwargs)
+
+    monkeypatch.setattr(workflow_journal, "update_run_state", track_state)
+
+    def cancel():
+        future = asyncio.run_coroutine_threadsafe(
+            api_main.cancel_workflow_run_endpoint(run_id, []), loop
+        )
+        try:
+            replies.append(future.result(timeout=5))
+        except HTTPException as exc:
+            errors.append(exc.status_code)
+
+    def insert_then_cancel(*args, **kwargs):
+        if timing == "before-commit":
+            cancel()
+        insert_run(*args, **kwargs)
+        if timing == "after-commit":
+            cancel()
+
+    monkeypatch.setattr(workflow_journal, "insert_run", insert_then_cancel)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    result = await run_script_workflow(
+        _FakeScriptSpec(), {}, run_id, working_directory=str(tmp_path)
+    )
+    assert errors == [], "an admission cancel must not return 404"
+    assert replies == [{"success": True, "run_id": run_id}]
+    assert result.state == RunState.CANCELLED and result.kind == "cancelled"
+    assert spawned == {}, "an acknowledged admission cancel must prevent spawning"
+    row = workflow_journal.get_run(run_id)
+    assert row.state == RunState.CANCELLED.value and row.generation == "2"
+    assert RunState.COMPLETED.value not in writes
+    record = script_runner.run_registry[run_id]
+    assert record.cancelled and record.state == RunState.CANCELLED
+    assert record.process is None and record.generation == "2"
+    assert run_id not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", [False, True], ids=["own-entry", "winner-entry"])
+async def test_duplicate_insert_removes_only_its_own_publication(
+    monkeypatch, tmp_path, replacement
+):
+    run_id = "duplicate-publication"
+    winner = _make_record(run_id, process=None, generation="7")
+    insert_run = workflow_journal.insert_run
+    insert_run(
+        run_id,
+        "winner",
+        '{"source":"winner"}',
+        "{}",
+        RunState.RUNNING.value,
+        winner.started_at,
+        "script",
+        "7",
+    )
+    before = workflow_journal.get_run(run_id)
+    publications = []
+
+    def duplicate(*args, **kwargs):
+        publications.append(script_runner.run_registry.get(run_id))
+        if replacement:
+            script_runner.run_registry[run_id] = winner
+            script_runner._active_drives.add(run_id)
+        return insert_run(*args, **kwargs)  # the real duplicate constraint
+
+    monkeypatch.setattr(workflow_journal, "insert_run", duplicate)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    with pytest.raises(KeyError, match="already exists"):
+        await run_script_workflow(_FakeScriptSpec(), {}, run_id, working_directory=str(tmp_path))
+    assert len(publications) == 1 and isinstance(publications[0], ScriptRunRecord)
+    assert publications[0] is not winner
+    assert workflow_journal.get_run(run_id) == before
+    assert spawned == {}
+    if replacement:
+        assert script_runner.run_registry[run_id] is winner
+        assert run_id in script_runner._active_drives
+    else:
+        assert run_id not in script_runner.run_registry
+        assert run_id not in script_runner._active_drives
+
+
+@pytest.mark.asyncio
+async def test_active_drive_without_registry_rejects_new_admission(monkeypatch):
+    run_id = "active-without-record"
+    script_runner._active_drives.add(run_id)
+    spawned = _install_fake_spawn(monkeypatch, _FakeProcess(exit_rc=0))
+    with pytest.raises(KeyError, match="already exists"):
+        await run_script_workflow(_FakeScriptSpec(), {}, run_id)
+    assert run_id not in script_runner.run_registry
+    assert workflow_journal.get_run(run_id) is None
+    assert run_id in script_runner._active_drives
+    assert spawned == {}

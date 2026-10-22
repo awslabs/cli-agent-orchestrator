@@ -33,6 +33,7 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -54,6 +55,7 @@ from cli_agent_orchestrator.models.workflow_runtime import (
 )
 from cli_agent_orchestrator.services import (
     approval_gate,
+    launch_guard,
     manifest_freeze,
     terminal_service,
     workflow_journal,
@@ -134,6 +136,32 @@ class ScriptRunRecord:
     started_at: str
     finished_at: Optional[str]
     tier: str = "script"
+    working_directory: Optional[str] = None
+
+
+def run_root_for(env: Optional[Dict[str, str]]) -> Optional[str]:
+    """Return the recorded root for the script run named by a step environment."""
+    run_id = (env or {}).get("CAO_WORKFLOW_RUN_ID")
+    record = run_registry.get(run_id) if isinstance(run_id, str) else None
+    return record.working_directory if isinstance(record, ScriptRunRecord) else None
+
+
+def build_script_snapshot(
+    spec: Any,
+    *,
+    working_directory: str,
+    launch_guard: Optional[Dict[str, Any]],
+) -> str:
+    """Serialize the durable source snapshot and its launch-time drift guard."""
+    return json.dumps(
+        {
+            "source": spec.source,
+            "path": spec.path,
+            "content_hash": getattr(spec, "content_hash", None),
+            "working_directory": working_directory,
+            "launch_guard": launch_guard,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -932,7 +960,7 @@ def record_step_completion(
 # ---------------------------------------------------------------------------
 # _materialize_snapshot (BR-30) — engine-owned temp file, 0o600 under 0o700 root
 # ---------------------------------------------------------------------------
-def _materialize_snapshot(run_id: str, source: str) -> str:
+def _materialize_snapshot(run_id: str, source: str, *, prefix: str = "resume") -> str:
     """Write the frozen ``spec_snapshot.source`` to an engine-owned temp file (BR-30).
 
     Resume re-drives the FROZEN snapshot, not the author's on-disk file (INV-7),
@@ -951,7 +979,7 @@ def _materialize_snapshot(run_id: str, source: str) -> str:
     except OSError as exc:
         # Non-fatal: the dir exists; log if we could not tighten its mode.
         logger.warning("script scratch dir '%s' chmod 0o700 failed: %s", scratch, exc)
-    path = scratch / f"resume-{run_id}.py"
+    path = scratch / f"{prefix}-{run_id}.py"
     # Open with O_CREAT|O_EXCL-free write but an explicit restrictive mode: create
     # owner-only, truncating any stale file from a prior aborted resume.
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
@@ -961,9 +989,14 @@ def _materialize_snapshot(run_id: str, source: str) -> str:
         # os.fdopen failed to wrap the fd, so it never took ownership — close the
         # raw fd ourselves to avoid a descriptor leak, then re-raise.
         os.close(fd)
+        _delete_temp_file(str(path))
         raise
-    with fh:
-        fh.write(source)
+    try:
+        with fh:
+            fh.write(source)
+    except OSError:
+        _delete_temp_file(str(path))
+        raise
     # Re-assert 0o600 in case an inherited umask widened O_CREAT's mode.
     try:
         os.chmod(path, 0o600)
@@ -1097,19 +1130,24 @@ def _close_pipes(process: asyncio.subprocess.Process) -> bool:
 # Shared drive: spawn -> concurrent drain -> reap -> bounded drain -> exit interp -> finalize
 # ---------------------------------------------------------------------------
 async def _drive_process(
-    record: ScriptRunRecord, script_path: str, env: Dict[str, str]
+    record: ScriptRunRecord,
+    script_path: str,
+    env: Dict[str, str],
+    *,
+    working_directory: Optional[str] = None,
 ) -> WorkflowRunResult:
     """Spawn, drain both pipes concurrently, reap under the bound, interpret exit.
 
     THE single execution path for both a fresh run (A1) and a resume (A2) — the
-    only difference is the env (``CAO_WORKFLOW_RESUME``) and the script path
-    (author file vs materialized snapshot). Never ``shell=True`` (C-2).
+    only difference is the env (``CAO_WORKFLOW_RESUME``). Both execute an
+    engine-owned source snapshot. Never ``shell=True`` (C-2).
     """
     try:
         record.process = await asyncio.create_subprocess_exec(
             sys.executable,
             script_path,
             env=env,
+            cwd=working_directory,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -1204,23 +1242,43 @@ async def _drive_process(
     )
 
 
-async def _persist_generation_best_effort(record: ScriptRunRecord) -> None:
-    """Persist a bumped generation on the timeout arm (best-effort, INV-4/INV-6).
+async def _drive_frozen(
+    record: ScriptRunRecord,
+    source: str,
+    env: Dict[str, str],
+    *,
+    working_directory: Optional[str],
+) -> WorkflowRunResult:
+    """Execute the admitted source from a private copy, even after a queued start."""
+    try:
+        path = _materialize_snapshot(record.run_id, source, prefix="start")
+    except OSError as exc:
+        return await _finalize(
+            record,
+            state=RunState.FAILED,
+            kind="error",
+            error=f"could not stage the approved script source: {exc.strerror or 'unknown OS error'}",
+        )
+    try:
+        return await _drive_process(record, path, env, working_directory=working_directory)
+    finally:
+        _delete_temp_file(path)
 
-    Unlike the load-bearing pre-spawn/cancel bumps (which surface a persist
-    failure to the caller), the timeout-arm bump happens while finalizing a run
-    that already failed — a persist failure here only degrades the straggler
-    fence for an already-dead run, so it is logged + swallowed rather than raised.
+
+async def _persist_generation_best_effort(record: ScriptRunRecord) -> None:
+    """Persist a bumped generation while settling a run (best-effort, INV-4/INV-6).
+
+    Used by timeout and admission-cancel finalization. A persist failure degrades
+    the generation fence, so it is logged and swallowed rather than preventing
+    the run from settling.
     """
     from cli_agent_orchestrator.services.workflow_service import update_run_generation
 
     try:
         await asyncio.to_thread(update_run_generation, record.run_id, record.generation)
-    except (
-        Exception
-    ) as e:  # noqa: BLE001 — timeout-arm gen persist is best-effort; run already FAILED (INV-4)
+    except Exception as e:  # noqa: BLE001 — generation persist is best-effort (INV-4)
         logger.warning(
-            "journal: timeout-arm generation bump persist for run '%s' failed: %s",
+            "journal: generation bump persist for run '%s' failed: %s",
             record.run_id,
             e,
         )
@@ -1229,23 +1287,27 @@ async def _persist_generation_best_effort(record: ScriptRunRecord) -> None:
 # ---------------------------------------------------------------------------
 # A1 — run_script_workflow (S1 flow, M1 + M2 run-path gate)
 # ---------------------------------------------------------------------------
-async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) -> WorkflowRunResult:
+async def run_script_workflow(
+    spec: Any,
+    inputs: Dict[str, Any],
+    run_id: str,
+    *,
+    working_directory: Optional[str] = None,
+) -> WorkflowRunResult:
     """Run a script workflow to completion, awaited inline (A1, S1, US-B1/B4/B5).
 
     ``spec`` is the resolved ``ScriptSpec`` (U5/C4) — duck-typed here (U5 owns the
     concrete model): it exposes ``.source`` (script text), ``.path`` (display path
-    for lint messages + exec), ``.name``, and optionally ``.content_hash``.
+    for lint messages), ``.name``, and optionally ``.content_hash``.
 
     Steps: (0) lint gate — a ``fail`` raises ``ScriptLintError`` before any journal
     row or subprocess (BR-1); (1) journal the run row (tier=script, gen=1) +
     register the live record; (2) spawn with the constructed env (INV-2); (3) drain
     both pipes concurrently while awaiting exit under the wall-clock bound, then
     give the drain ``WORKFLOW_SCRIPT_TERM_GRACE`` after the exit and close pipes a
-    background process still holds; (4) interpret the exit + sentinel scan. Only
-    the lint gate raises, and it raises exactly one type — ``ScriptLintError`` —
-    while a run failure/timeout returns a FAILED result instead. Naming the type
-    matters: it is the only exception a caller of this function must handle, so an
-    ``except Exception`` here would be both too broad and a silent way to swallow it.
+    background process still holds; (4) interpret the exit + sentinel scan.
+    Lint, approval and duplicate-id admission refusals raise before spawning;
+    a run failure/timeout returns a FAILED result instead.
     """
     # --- Step -1: validate the run_id key BEFORE any journal/registry/path use
     # (shared validator, mirrors base start_run at workflow_service.py:713). A
@@ -1261,23 +1323,37 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
     # --- Step 0b: approval gate (issue #583 Bolt 2, ``approval-gate``) ---
     # Built ONCE here and handed to the INSERT below unchanged, so the manifest that is CHECKED is
     # byte-identical to the one STORED — and ADR-583-4's one-write discipline is preserved.
-    manifest_json = await asyncio.to_thread(
-        manifest_freeze.build_manifest_json,
+    root = os.path.realpath(working_directory if working_directory is not None else os.getcwd())
+    frozen = await asyncio.to_thread(
+        manifest_freeze.freeze_manifest,
         source_hash=spec.content_hash,
         inputs=inputs,
+        cwd=root,
     )
     # Placed here, and not lower, for two reasons that are both about leaving nothing behind:
     #   * BEFORE the registry write and the journal INSERT, so a refused start leaves no live record
     #     and no ``workflow_run`` row. Every first run of a new plan is refused by design, so
     #     recording them would durably record runs that never happened.
-    #   * OUTSIDE the ``try`` around ``insert_run`` below, which swallows EVERY exception by design
-    #     ("journal insert is best-effort; live floor still serves"). A refusal raised inside it would
-    #     be logged and the run would continue — the gate would appear to work and would authorise
-    #     nothing.
-    # No-ops entirely when enforcement is disabled, which is the default.
-    approval_gate.ensure_plan_approved(tier="script", manifest_json=manifest_json)
+    #   * OUTSIDE the ``try`` around ``insert_run`` below, so an approval refusal
+    #     cannot be handled as a journal fault (best-effort when enforcement is off).
+    # No-ops entirely when enforcement is disabled through the explicit opt-out.
+    # Bind the launch state at admission, before the gate can yield to an edit.
+    # Defer a capture refusal until after the gate to preserve its 403/503 precedence.
+    capture_error = None
+    try:
+        guard = await asyncio.to_thread(launch_guard.capture)
+    except approval_gate.PlanIdentityUnavailableError as exc:
+        capture_error = exc
+    manifest_json = frozen.manifest_json
+    approval_gate.ensure_plan_approved(
+        tier="script",
+        manifest_json=manifest_json,
+        unavailable_reason=frozen.unavailable_reason or "internal",
+    )
+    if capture_error is not None:
+        raise capture_error
 
-    # --- Step 1: register the live record + journal the durable run row ---
+    # --- Step 1: publish the live record + journal the durable run row ---
     record = ScriptRunRecord(
         run_id=run_id,
         workflow_name=spec.name,
@@ -1290,20 +1366,23 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
         started_at=_now(),
         finished_at=None,
         tier="script",
+        working_directory=root,
     )
     # M3 (traceability): a registered record lives for the process lifetime — it is
     # NOT evicted on finalize, mirroring the base YAML registry, so a bounded
     # post-run status window keeps serving. Registry eviction/TTL is deferred to
     # U5/base scope (no per-tier eviction here).
+    # Check and publish without yielding: cancellation must find this record
+    # even while the durable INSERT is pending, and a live winner must survive.
+    if run_id in run_registry or run_id in _active_drives:
+        raise KeyError(f"run_id '{run_id}' already exists")
     run_registry[run_id] = record
 
     # The durable spec_snapshot carries the frozen source (resume reads it back).
-    spec_snapshot = json.dumps(
-        {
-            "source": spec.source,
-            "path": spec.path,
-            "content_hash": getattr(spec, "content_hash", None),
-        }
+    spec_snapshot = build_script_snapshot(
+        spec,
+        working_directory=root,
+        launch_guard=guard,
     )
     try:
         await asyncio.to_thread(
@@ -1326,10 +1405,37 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
             # it; reusing it rather than rebuilding is what makes checked-equals-stored true.
             manifest_json,
         )
-    except (
-        Exception
-    ) as e:  # noqa: BLE001 — journal insert is best-effort; live floor still serves (INV-4)
-        logger.warning("journal: script insert_run for '%s' failed (run continues): %s", run_id, e)
+    except sqlite3.IntegrityError:
+        # Remove only our publication; a replacement belongs to the winner.
+        # Never finalize or write through the winning run's journal row.
+        if run_registry.get(run_id) is record:
+            del run_registry[run_id]
+        raise KeyError(f"run_id '{run_id}' already exists") from None
+    except Exception as e:  # noqa: BLE001 — a failed admission must settle before spawn
+        if guard.get("approval_required", True) or approval_gate.is_workflow_approval_required():
+            # An enforced run needs the durable guard and frozen-memory state.
+            # Never expose the journal exception (which can include local paths).
+            logger.warning(
+                "journal: script insert_run failed; refusing script spawn (%s)", type(e).__name__
+            )
+            return await _finalize(
+                record,
+                state=RunState.FAILED,
+                kind="error",
+                error="Could not durably record this script run; no script was started. "
+                "Repair the run journal and start a new run.",
+            )
+        logger.warning(
+            "journal: script insert_run for '%s' failed (run continues): %s",
+            run_id,
+            type(e).__name__,
+        )
+
+    if record.cancelled:
+        # A cancel before the INSERT could not persist its generation yet. Honour
+        # it before spawning and fence callers against the now-durable row.
+        await _persist_generation_best_effort(record)
+        return await _finalize(record, state=RunState.CANCELLED, kind="cancelled")
 
     # --- Step 2: spawn (constructed env) + Step 3/4: drive, reap, interpret ---
     # Mark the drive live for the whole spawn->reap window so Gate-2 of a
@@ -1341,19 +1447,23 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
     env = build_env(run_id, "1", inputs, resume=False)
     _active_drives.add(run_id)
     try:
-        return await _drive_process(record, spec.path, env)
+        return await _drive_frozen(record, spec.source, env, working_directory=root)
     finally:
         _active_drives.discard(run_id)
 
 
 async def run_script_workflow_prepared(
-    record: ScriptRunRecord, spec_path: str, env: Dict[str, str]
+    record: ScriptRunRecord,
+    *,
+    source: str,
+    env: Dict[str, str],
+    working_directory: Optional[str] = None,
 ) -> WorkflowRunResult:
     """Drive an already-linted, already-journaled, already-registered script run (U2, ADR-3).
 
     The DEDICATED prepared entry the async submission path's background task
     (``_run_in_background``) invokes for the script tier. It is the EXACT tail of
-    :func:`run_script_workflow` (the ``_active_drives.add`` -> ``_drive_process``
+    :func:`run_script_workflow` (the ``_active_drives.add`` -> ``_drive_frozen``
     -> ``finally discard`` block) with the pre-drive key-validate, lint gate,
     record build, registration, and durable insert REMOVED — the async handler
     (C1) has already done all of those BEFORE acking with 202.
@@ -1369,7 +1479,7 @@ async def run_script_workflow_prepared(
     """
     _active_drives.add(record.run_id)
     try:
-        return await _drive_process(record, spec_path, env)
+        return await _drive_frozen(record, source, env, working_directory=working_directory)
     finally:
         _active_drives.discard(record.run_id)
 
@@ -1468,6 +1578,9 @@ async def resume_script_run(
             source = snapshot["source"]
             if not isinstance(source, str):
                 raise ValueError("spec_snapshot.source is not a string")
+            working_directory = snapshot.get("working_directory")
+            if working_directory is not None and not isinstance(working_directory, str):
+                raise ValueError("spec_snapshot.working_directory is not a string")
         except (ValueError, TypeError, KeyError) as e:
             raise ResumeCorruptError(f"run '{run_id}' snapshot is corrupt: {e}") from e
 
@@ -1506,7 +1619,11 @@ async def resume_script_run(
         # ``plan_id`` comes from the manifest ALREADY on the row and is never recomputed: recomputing
         # would re-read the script from disk, so an edit between start and resume would refuse a run
         # whose approval is perfectly valid for what it actually froze.
-        approval_gate.ensure_plan_approved(tier=row.tier, manifest_json=row.manifest_json)
+        approval_gate.ensure_plan_approved(
+            tier=row.tier,
+            manifest_json=row.manifest_json,
+            unavailable_reason="no_recorded_identity",
+        )
 
         # --- The human's recovery decisions (issue #583, FR-7). NOT a gate: admission
         # is over, this resume holds the drive claim, and nothing has been spawned yet.
@@ -1553,6 +1670,7 @@ async def resume_script_run(
             started_at=row.started_at,
             finished_at=None,
             tier="script",
+            working_directory=working_directory,
         )
 
         # --- Execution: bump + PERSIST generation BEFORE spawn (INV-6, load-bearing) ---
@@ -1574,7 +1692,15 @@ async def resume_script_run(
 
         env = _build_env(run_id, record.generation, journaled_inputs, resume=True)
         snapshot_path = _materialize_snapshot(run_id, source)
-        result = await _drive_process(record, snapshot_path, env)
+        if working_directory is None:
+            result = await _drive_process(record, snapshot_path, env)
+        else:
+            result = await _drive_process(
+                record,
+                snapshot_path,
+                env,
+                working_directory=working_directory,
+            )
     finally:
         _active_drives.discard(run_id)
         _delete_temp_file(snapshot_path)  # ALWAYS deleted after reap (BR-30)

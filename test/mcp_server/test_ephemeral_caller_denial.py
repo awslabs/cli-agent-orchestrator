@@ -164,41 +164,14 @@ async def test_workflow_tools_enforce_gate(registry, monkeypatch, tool):
     post.assert_not_called()
 
 
-@pytest.mark.parametrize("path", ["assign", "handoff", "handoff_nowait"])
-@pytest.mark.asyncio
-async def test_target_without_claim_refuses_before_tool_inheritance(stores, monkeypatch, path):
-    (stores[1] / f"{NAME}.md").write_text(DOCUMENT)
-    monkeypatch.setenv("CAO_TERMINAL_ID", "abcd1234")
-    get = Mock(
-        return_value=Mock(
-            status_code=200,
-            json=lambda: {
-                "provider": "claude_code",
-                "session_name": "session",
-                "allowed_tools": ["*"],
-            },
-        )
-    )
-    monkeypatch.setattr(orchestration.requests, "get", get)
-    inheritance = Mock(side_effect=AssertionError("must not inherit"))
-    monkeypatch.setattr(orchestration, "_resolve_child_allowed_tools", inheritance)
+@pytest.mark.parametrize(
+    "helper", [orchestration._create_terminal, orchestration._resolve_handoff_provider]
+)
+def test_target_without_claim_refuses_before_tool_inheritance(stores, monkeypatch, helper):
     post = Mock(side_effect=AssertionError("must not launch"))
     monkeypatch.setattr(orchestration.requests, "post", post)
-    if path == "assign":
-        result = orchestration._assign_impl(NAME, "task", working_directory="/workspace")
-        assert result["success"] is False
-        assert result["message"].endswith(
-            "Ephemeral targets cannot be launched through assign or handoff in this version."
-        )
-    else:
-        result = await orchestration._handoff_impl(
-            NAME, "task", working_directory="/workspace", wait=path != "handoff_nowait"
-        )
-        assert result.success is False
-        assert result.message.endswith(
-            "Ephemeral targets cannot be launched through assign or handoff in this version."
-        )
-    inheritance.assert_not_called()
+    with pytest.raises(ValueError, match=r"Ephemeral targets cannot be launched without a claim\."):
+        helper(NAME)
     post.assert_not_called()
 
 

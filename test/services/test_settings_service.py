@@ -1,6 +1,7 @@
 """Tests for settings_service module."""
 
 import json
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,6 +19,7 @@ from cli_agent_orchestrator.services.settings_service import (
     set_extra_agent_dirs,
     set_extra_skill_dirs,
 )
+from cli_agent_orchestrator.utils import atomic_file
 
 
 @pytest.fixture
@@ -75,6 +77,54 @@ class TestLoad:
         assert result == data
 
 
+class TestWorkflowApprovalPosture:
+    """Approval enforcement defaults on and malformed configuration cannot weaken it."""
+
+    @pytest.mark.parametrize(
+        ("contents", "source"),
+        [
+            ("{not valid json", settings_service.GATE_SOURCE_READ_FAILURE),
+            (json.dumps([]), "invalid-settings-fallback"),
+            (
+                json.dumps({"workflow": "not an object"}),
+                "invalid-settings-fallback",
+            ),
+            (
+                json.dumps({"workflow": {"require_approval": None}}),
+                "invalid-settings-fallback",
+            ),
+            (
+                json.dumps({"workflow": {"require_approval": "false"}}),
+                "invalid-settings-fallback",
+            ),
+            (
+                json.dumps({"workflow": {"require_approval": 0}}),
+                "invalid-settings-fallback",
+            ),
+        ],
+    )
+    def test_malformed_configuration_fails_closed(
+        self, settings_file, monkeypatch, contents, source
+    ):
+        monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
+        settings_file.write_text(contents)
+
+        posture = settings_service.resolve_workflow_approval_posture()
+
+        assert posture.required is True
+        assert posture.source == source
+
+    def test_explicit_boolean_false_is_the_only_file_opt_out(self, settings_file, monkeypatch):
+        monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
+        settings_file.write_text(json.dumps({"workflow": {"require_approval": False}}))
+
+        posture = settings_service.resolve_workflow_approval_posture()
+
+        assert posture == settings_service.WorkflowApprovalPosture(
+            False, settings_service.GATE_SOURCE_FILE
+        )
+
+
 def test_get_memory_settings_drops_unvalidated_vault_data(settings_file):
     settings_file.write_text(
         json.dumps({"memory": {"vault": {"root": "/etc/shadow", "mappings": []}}})
@@ -116,6 +166,88 @@ class TestSave:
         _save({"old": True})
         _save({"new": True})
         assert json.loads(settings_file.read_text()) == {"new": True}
+
+    def test_save_atomically_replaces_and_enforces_private_mode(self, settings_file, monkeypatch):
+        settings_file.write_text('{"old": true}')
+        settings_file.chmod(0o640)
+        monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
+        real_replace = atomic_file.os.replace
+        replacements = []
+
+        def _record_replace(source, target):
+            replacements.append((Path(source), Path(target)))
+            real_replace(source, target)
+
+        monkeypatch.setattr(atomic_file.os, "replace", _record_replace)
+
+        _save({"new": True})
+
+        assert len(replacements) == 1
+        assert replacements[0][1] == settings_file
+        assert json.loads(settings_file.read_text()) == {"new": True}
+        assert settings_file.stat().st_mode & 0o777 == 0o600
+
+    def test_save_replaces_settings_symlink_and_preserves_target(self, settings_file, monkeypatch):
+        target = settings_file.with_name("dotfiles-settings.json")
+        target.write_text('{"old": true}')
+        target.chmod(0o640)
+        settings_file.symlink_to(target)
+        monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
+
+        _save({"new": True})
+
+        assert not settings_file.is_symlink()
+        assert json.loads(target.read_text()) == {"old": True}
+        assert json.loads(settings_file.read_text()) == {"new": True}
+        assert target.stat().st_mode & 0o777 == 0o640
+
+    def test_save_replaces_dangling_settings_symlink(self, settings_file, monkeypatch):
+        target = settings_file.with_name("dotfiles-settings.json")
+        settings_file.symlink_to(target)
+        monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
+
+        _save({"new": True})
+
+        assert not settings_file.is_symlink()
+        assert not target.exists()
+        assert json.loads(settings_file.read_text()) == {"new": True}
+
+    def test_concurrent_writes_and_reads_surface_writer_errors(self, settings_file, monkeypatch):
+        """Exercise concurrent access; replace and mode assertions pin atomicity."""
+        monkeypatch.setattr(atomic_file, "LOCK_DIR", settings_file.parent / "locks")
+        _save({"iteration": -1, "payload": "x" * 4096})
+        finished = threading.Event()
+        failures = []
+
+        def _writer():
+            try:
+                for iteration in range(150):
+                    _save({"iteration": iteration, "payload": str(iteration) * 4096})
+            except Exception as exc:  # noqa: BLE001 - captured for the test thread
+                failures.append(exc)
+            finally:
+                finished.set()
+
+        def _reader():
+            while not finished.is_set():
+                try:
+                    value = json.loads(settings_file.read_text())
+                    assert isinstance(value["iteration"], int)
+                    assert isinstance(value["payload"], str)
+                except Exception as exc:  # noqa: BLE001 - captured for the test thread
+                    failures.append(exc)
+                    return
+
+        writer = threading.Thread(target=_writer)
+        reader = threading.Thread(target=_reader)
+        reader.start()
+        writer.start()
+        writer.join(timeout=10)
+        reader.join(timeout=10)
+
+        assert not writer.is_alive()
+        assert not reader.is_alive()
+        assert failures == []
 
 
 class TestGetAgentDirs:
@@ -636,3 +768,137 @@ class TestSavePrivateAndSymlinkSafe:
         assert victim.read_text() == "do not touch"
         assert not settings.is_symlink()
         assert json.loads(settings.read_text()) == {"k": "v"}
+
+
+# Every public writer, called with an argument that would persist something.
+_WRITERS = [
+    pytest.param(lambda: settings_service.set_agent_dirs({"kiro_cli": "/x"}), id="agent_dirs"),
+    pytest.param(lambda: settings_service.set_disabled_agent_dirs([]), id="disabled_agent_dirs"),
+    pytest.param(lambda: settings_service.set_extra_agent_dirs(["/x"]), id="extra_agent_dirs"),
+    pytest.param(lambda: settings_service.set_extra_skill_dirs(["/x"]), id="extra_skill_dirs"),
+    pytest.param(lambda: settings_service.set_memory_setting("enabled", True), id="memory"),
+    pytest.param(
+        lambda: settings_service.set_skill_projection_mode("copy"), id="skill_projection_mode"
+    ),
+]
+
+
+class TestWritersFailClosed:
+    """GH #737: a write over a settings.json that exists but cannot be read or
+    parsed used to persist ``_load()``'s ``{}`` fallback as the new truth,
+    deleting every other setting while reporting success. Every writer now
+    refuses and leaves the file byte-identical.
+    """
+
+    @pytest.mark.parametrize("write", _WRITERS)
+    def test_unparseable_file_is_refused_and_preserved(self, settings_file, write):
+        settings_file.write_text('{"agent_dirs": {"kiro_cli": "/keep"},}')  # trailing comma
+        before = settings_file.read_bytes()
+        with pytest.raises(settings_service.SettingsUnreadableError):
+            write()
+        assert settings_file.read_bytes() == before
+
+    @pytest.mark.parametrize("write", _WRITERS)
+    def test_undecodable_file_is_refused_and_preserved(self, settings_file, write):
+        settings_file.write_bytes(b"\xff\xfe{}")
+        before = settings_file.read_bytes()
+        with pytest.raises(settings_service.SettingsUnreadableError):
+            write()
+        assert settings_file.read_bytes() == before
+
+    @pytest.mark.parametrize("write", _WRITERS)
+    def test_an_oserror_shaped_target_is_refused_cleanly(self, settings_file, write):
+        """OSError-shaped unreadability (e.g. the path being a directory, or
+        a permission fault) must translate to SettingsUnreadableError like
+        UnicodeDecodeError does, not escape as a bare OSError traceback.
+        ``locked_atomic_rewrite`` pre-reads the target before ``_mutate``'s
+        own strict load ever runs."""
+        settings_file.mkdir()
+        with pytest.raises(settings_service.SettingsUnreadableError):
+            write()
+        assert settings_file.is_dir()
+
+    @pytest.mark.parametrize("write", _WRITERS)
+    def test_an_absent_file_is_still_created(self, settings_file, write):
+        """ "Absent" stays distinct from "unreadable": defaults are the right
+        answer for a file nobody has written yet, so first-run writes work."""
+        assert not settings_file.exists()
+        write()
+        assert isinstance(json.loads(settings_file.read_text()), dict)
+
+    @pytest.mark.parametrize("write", _WRITERS)
+    def test_a_readable_file_keeps_its_other_sections(self, settings_file, write):
+        """The guard must not cost the happy path, and the write must still be
+        a read-modify-write rather than a replace."""
+        settings_file.write_text(json.dumps({"terminal": {"backend": "tmux"}}))
+        write()
+        assert json.loads(settings_file.read_text())["terminal"] == {"backend": "tmux"}
+
+    def test_a_json_scalar_is_refused_too(self, settings_file):
+        """Valid JSON that is not an object parsed fine and was then ignored,
+        so the write replaced it. Unknown content is unknown content."""
+        settings_file.write_text("[1, 2, 3]")
+        with pytest.raises(settings_service.SettingsUnreadableError):
+            settings_service.set_memory_setting("enabled", True)
+        assert settings_file.read_text() == "[1, 2, 3]"
+
+    def test_the_reporters_file_loses_nothing(self, settings_file):
+        """The exact file from the issue: 216 bytes in, 42 bytes out."""
+        settings_file.write_text(
+            "{\n"
+            '  "terminal": {"backend": "tmux", "herdr_session": "cao"},\n'
+            '  "logging": {"level": "DEBUG"},\n'
+            '  "agents": {"extra_dirs": ["/important-agent-store"]},\n'
+            '  "memory": {"enabled": true, "flush_threshold": 0.5,}\n'
+            "}\n"
+        )
+        before = settings_file.read_bytes()
+        with pytest.raises(settings_service.SettingsUnreadableError):
+            settings_service.set_memory_setting("enabled", True)
+        assert settings_file.read_bytes() == before
+
+    def test_an_invalid_value_is_rejected_without_touching_the_file(self, settings_file):
+        """Validation runs before the lock is taken, so a rejected value never
+        creates settings.json nor waits on another writer."""
+        settings_file.write_text(json.dumps({"memory": {"enabled": True}}))
+        before = settings_file.stat().st_ino
+        with pytest.raises(ValueError):
+            settings_service.set_memory_setting("flush_threshold", 5.0)
+        assert settings_file.stat().st_ino == before
+        assert json.loads(settings_file.read_text()) == {"memory": {"enabled": True}}
+
+    def test_a_write_keeps_the_file_private(self, settings_file):
+        """The locked rewrite publishes at 0600 like ``_save`` does (#913):
+        a new settings.json must not land at the umask default."""
+        settings_service.set_memory_setting("enabled", True)
+        assert oct(settings_file.stat().st_mode & 0o777) == oct(0o600)
+
+    def test_concurrent_writers_do_not_lose_each_others_sections(self, settings_file):
+        """Load and save used to be two separate lock acquisitions, so two
+        writers that both read before either saved each published their own
+        view and the later one won whole."""
+        settings_file.write_text(json.dumps({}))
+        errors = []
+
+        def writer(fn):
+            try:
+                fn()
+            except BaseException as e:  # pragma: no cover - surfaced by the assert
+                errors.append(e)
+
+        threads = [
+            threading.Thread(
+                target=writer, args=(lambda: settings_service.set_extra_agent_dirs(["/a"]),)
+            ),
+            threading.Thread(
+                target=writer, args=(lambda: settings_service.set_extra_skill_dirs(["/b"]),)
+            ),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert errors == []
+        data = json.loads(settings_file.read_text())
+        assert data["extra_agent_dirs"] == ["/a"]
+        assert data["extra_skill_dirs"] == ["/b"]
