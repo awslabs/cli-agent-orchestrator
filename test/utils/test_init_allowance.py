@@ -43,6 +43,23 @@ def test_resolve_init_timeout_prefers_the_profile_override():
         assert resolve_init_timeout("slow-agent", _SETTINGS) == 300
 
 
+def test_resolve_init_timeout_does_not_let_a_lower_override_shorten_the_wait():
+    """Review on PR #1002, P3-1 (setup 2). ``BaseProvider.get_init_timeout``
+    prefers the override, but six providers (``copilot_cli``, ``cursor_cli``,
+    ``hermes``, ``kiro_cli``, ``omp``, ``opencode_cli``) read the global value
+    directly and never see it. A client that trusted an override of 30 against
+    a global 300 would give up at 430s on a Kiro init the server still allowed
+    600s for. The larger of the two covers both kinds of provider."""
+    from cli_agent_orchestrator.utils.agent_profiles import ProfileSource
+
+    profile = SimpleNamespace(provider_init_timeout=30)
+    with patch(
+        "cli_agent_orchestrator.utils.agent_profiles.load_launch_profile",
+        return_value=(profile, ProfileSource.INSTALLED),
+    ):
+        assert resolve_init_timeout("fast-agent", dict(_SETTINGS, provider_init_timeout=300)) == 300
+
+
 def test_resolve_init_timeout_falls_back_when_the_profile_cannot_be_loaded():
     """Sizing a wait must never be the thing that fails the call.
 

@@ -2,7 +2,7 @@
 
 Issue #710. A handful of client call sites POST a create and then wait for
 cao-server to finish ``provider.initialize()`` before it answers. The budget
-such a call needs is a function of the SAME value the server will use --
+such a call needs is a function of the value the server waits out --
 ``server.provider_init_timeout``, or the profile's own override of it
 (``BaseProvider.get_init_timeout`` prefers the profile) -- not of
 ``server.mcp_request_timeout``, which sizes ordinary reads and sends. Pairing
@@ -13,6 +13,15 @@ worker, so the caller retried against a worker that already existed.
 Every client-side allowance for server-side init resolves through here, so
 raising ``provider_init_timeout`` (or a profile's override) moves all of them
 at once instead of leaving each site's literal behind.
+
+Which process's value? This module runs in the CLIENT (``cao launch``, the MCP
+server, ``cao-ops``) and reads the client's own ``settings.json`` and
+``CAO_PROVIDER_INIT_TIMEOUT``. It matches the server exactly when both see the
+same configuration, which is the case for the local single-host install. An
+operator who sets ``CAO_PROVIDER_INIT_TIMEOUT`` only in cao-server's
+environment, or points a client at another host through ``CAO_API_HOST``, has
+to set the same value where the client runs; ``GET /health`` reports the
+server's value so the two can be compared. See ``docs/configuration.md``.
 """
 
 from __future__ import annotations
@@ -47,16 +56,28 @@ def resolve_init_timeout(
     agent_profile: Optional[str] = None,
     settings: Optional[Dict[str, Any]] = None,
 ) -> int:
-    """Return the ``provider_init_timeout`` (seconds) the SERVER will apply.
+    """Return the ``provider_init_timeout`` (seconds) to size a client wait from.
 
-    Mirrors ``BaseProvider.get_init_timeout``: the profile's own
-    ``provider_init_timeout`` override wins over the server setting. Resolved
+    The global value comes from this process's server settings (``settings``
+    when given, else ``get_server_settings()``). A profile override is resolved
     through ``load_launch_profile``, the same loader the server uses
     (``terminal_service.py``, ``claude_code.py``, ``codex.py``) -- a reserved
     ephemeral name is served exclusively from the server-owned live store, and
     ``load_agent_profile`` alone cannot see it. A profile that cannot be loaded
-    here falls back to the server default rather than failing the caller -- the
+    here falls back to the global value rather than failing the caller -- the
     server resolves the real profile itself; this only sizes a wait.
+
+    The result is ``max(global, override)``, not the override alone.
+    ``BaseProvider.get_init_timeout`` prefers the override, but six providers
+    (``copilot_cli``, ``cursor_cli``, ``hermes``, ``kiro_cli``, ``omp``,
+    ``opencode_cli``) read the global value directly and never see it. A
+    client that trusted an override BELOW the global value would therefore
+    give up on a successful init those providers were still allowed. Taking
+    the larger value covers both kinds of provider; the only cost is that a
+    hung create under a lowered override reports at the global budget.
+
+    This is the client's view of the value. It equals the server's only when
+    both processes read the same configuration; see the module docstring.
     """
 
     from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -75,7 +96,7 @@ def resolve_init_timeout(
     except Exception:  # noqa: BLE001 -- sizing a wait must never fail the call
         return base
     override = getattr(profile, "provider_init_timeout", None)
-    return int(override) if override is not None else base
+    return max(base, int(override)) if override is not None else base
 
 
 def _antigravity_successful_init_s(timeout: int) -> float:
