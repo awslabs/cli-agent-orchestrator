@@ -128,6 +128,13 @@ _NON_PUBLISHABLE_KINDS = frozenset(
 # clobber content another thread already read).
 _KIMI_CONFIG_WRITE_LOCK = threading.Lock()
 
+# Floor of the readiness wait in ``initialize`` (the startup-dialog handler and
+# ``wait_until_status`` both run to ``max(READY_TIMEOUT_FLOOR_S,
+# provider_init_timeout)``). A CLIENT prices its wait for a synchronous create
+# from this (``utils.init_allowance``, issue #710), so it is a module constant
+# here rather than a copy there that a change here would silently leave short.
+READY_TIMEOUT_FLOOR_S = 120.0
+
 
 # Custom exception for provider errors
 class ProviderError(Exception):
@@ -2131,7 +2138,7 @@ class KimiCliProvider(BaseProvider):
         # capped at the (shorter) server default while wait_until_status used
         # a hardcoded 120s, so a dialog appearing after 60s but before 120s
         # was never dismissed.
-        ready_timeout = max(120.0, init_timeout)
+        ready_timeout = max(READY_TIMEOUT_FLOOR_S, init_timeout)
 
         # Wait for shell prompt to appear in the tmux window
         if not await wait_for_shell(self.terminal_id, timeout=init_timeout):

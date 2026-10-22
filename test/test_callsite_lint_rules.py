@@ -326,10 +326,9 @@ BARE_TIMEOUT_ALLOWLIST = {
         "post(timeout=5)",
     ): "elastic-broker release notify; best-effort and already in try/except",
     # ---- provider launch readiness ----
-    (
-        "cli_agent_orchestrator/providers/antigravity_cli.py",
-        "wait_for_shell(timeout=10)",
-    ): "shell-prompt wait before the launch command is typed",
+    # antigravity_cli's wait_for_shell(timeout=10) row was deleted when #710
+    # made that literal the module constant SHELL_WAIT_TIMEOUT_S, which
+    # utils.init_allowance reads to size the client wait.
     (
         "cli_agent_orchestrator/providers/mock_cli.py",
         "wait_for_shell(timeout=10)",
