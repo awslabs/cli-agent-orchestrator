@@ -19,6 +19,7 @@ import ast
 import http.server
 import json
 import pathlib
+import textwrap
 import threading
 import time
 from unittest.mock import patch
@@ -181,26 +182,58 @@ def test_every_poll_failing_times_out_naming_the_last_error(sender):
 
 # -- every loop that waits on a terminal's status uses the shared policy -------
 
-# The loops allowed to read a terminal's status, and why. A new wait loop must
-# either call one of the first two or be added here with its reason.
+# The loops allowed to read a terminal's status, and why, keyed by module and
+# function. A new wait loop must either call one of the first two or be added
+# here with its reason.
 _STATUS_LOOPS = {
-    "poll_until_done": "classifies failures with _is_transient_poll_error",
-    "wait_for_initial_delivery": "classifies failures with _is_transient_poll_error",
-    "wait_until_terminal_status": (
+    ("utils/terminal.py", "poll_until_done"): "classifies failures with _is_transient_poll_error",
+    ("utils/terminal.py", "wait_for_initial_delivery"): (
+        "classifies failures with _is_transient_poll_error"
+    ),
+    ("utils/terminal.py", "wait_until_terminal_status"): (
         "returns False on any failure and never raises, so a failed poll cannot "
         "skip a caller's output fetch; `cao launch` attaches either way"
     ),
 }
 
 
-def _reads_terminal_status(call: ast.Call) -> bool:
-    func = ast.unparse(call.func)
-    if func.split(".")[-1] in {"terminal_status", "read_status"}:
+def _assignments(function):
+    """Each local name in ``function`` mapped to the source of what it is assigned."""
+    assigned = {}
+    for node in ast.walk(function):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                assigned.setdefault(target.id, []).append(ast.unparse(value))
+    return assigned
+
+
+def _reads_terminal_status(call: ast.Call, assigned) -> bool:
+    func = ast.unparse(call.func).split(".")[-1]
+    if func in {"terminal_status", "read_status"}:
         return True
-    if func.split(".")[-1] == "get" and call.args:
-        url = ast.unparse(call.args[0])
-        return "/terminals/" in url and not url.rstrip("'\"").endswith("/output")
-    return False
+    if func != "get":
+        return False
+    url = (
+        call.args[0]
+        if call.args
+        else next((kw.value for kw in call.keywords if kw.arg == "url"), None)
+    )
+    if url is None:
+        return False
+    if isinstance(url, ast.Name):
+        sources = assigned.get(url.id, [])
+    else:
+        sources = [ast.unparse(url)]
+    return any(
+        "/terminals/" in source and not source.rstrip("'\"").endswith("/output")
+        for source in sources
+    )
 
 
 def _calls_outside_lambdas(node):
@@ -218,26 +251,77 @@ def _calls_outside_lambdas(node):
         yield from _calls_outside_lambdas(child)
 
 
+def _status_wait_loops(tree):
+    """Names of the functions in ``tree`` with a loop that reads a terminal's status."""
+    for function in ast.walk(tree):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        assigned = _assignments(function)
+        for loop in ast.walk(function):
+            if isinstance(loop, (ast.While, ast.For)) and any(
+                _reads_terminal_status(call, assigned) for call in _calls_outside_lambdas(loop)
+            ):
+                yield function
+                break
+
+
+_GUARD_CASES = {
+    "inline-url": """
+        def f(t):
+            while True:
+                api_http.get(f"{BASE}/terminals/{t}")
+    """,
+    "url-in-a-variable": """
+        def f(t):
+            url = f"{BASE}/terminals/{t}"
+            while True:
+                api_http.get(url)
+    """,
+    "url-keyword": """
+        def f(t):
+            while True:
+                requests.get(url=f"{BASE}/terminals/{t}")
+    """,
+    "fleet-client": """
+        def f(c, t):
+            for _ in range(3):
+                c.terminal_status("w", t)
+    """,
+}
+
+
+@pytest.mark.parametrize("case", _GUARD_CASES)
+def test_the_guard_sees_a_status_read_in_each_form(case):
+    tree = ast.parse(textwrap.dedent(_GUARD_CASES[case]))
+    assert [f.name for f in _status_wait_loops(tree)] == ["f"]
+
+
+def test_the_guard_ignores_output_reads():
+    source = """
+        def f(t):
+            while True:
+                api_http.get(f"{BASE}/terminals/{t}/output")
+    """
+    assert list(_status_wait_loops(ast.parse(textwrap.dedent(source)))) == []
+
+
 def test_every_status_wait_loop_goes_through_the_shared_failure_policy():
     package = pathlib.Path(cli_agent_orchestrator.__file__).parent
     found = {}
     for path in sorted((package / "cli").rglob("*.py")) + sorted((package / "utils").rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for function in ast.walk(tree):
-            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for loop in ast.walk(function):
-                if isinstance(loop, (ast.While, ast.For)) and any(
-                    _reads_terminal_status(call) for call in _calls_outside_lambdas(loop)
-                ):
-                    found[function.name] = function
+        module = path.relative_to(package).as_posix()
+        for function in _status_wait_loops(ast.parse(path.read_text(encoding="utf-8"))):
+            found[(module, function.name)] = function
 
     assert set(found) == set(_STATUS_LOOPS), (
         "a loop reads terminal status outside the known wait helpers; route it "
         "through poll_until_done or classify its failures with _is_transient_poll_error"
     )
-    for name in ("poll_until_done", "wait_for_initial_delivery"):
+    for key in (
+        ("utils/terminal.py", "poll_until_done"),
+        ("utils/terminal.py", "wait_for_initial_delivery"),
+    ):
         calls = {
-            ast.unparse(node.func) for node in ast.walk(found[name]) if isinstance(node, ast.Call)
+            ast.unparse(node.func) for node in ast.walk(found[key]) if isinstance(node, ast.Call)
         }
-        assert "_is_transient_poll_error" in calls, name
+        assert "_is_transient_poll_error" in calls, key
