@@ -147,6 +147,7 @@ def scope_write_allowed(caller: str, target: str) -> bool:
     return bool(SCOPE_RANK[caller] > SCOPE_RANK[target])
 
 
+# Defaults proposed in #861, not yet measured; validate before any default change.
 RELEVANCE_RECENCY_FLOOR = 0.85
 RELEVANCE_RECENCY_SCALE_DAYS = 30.0
 
