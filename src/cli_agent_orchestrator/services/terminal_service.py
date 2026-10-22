@@ -1463,6 +1463,19 @@ async def _create_terminal_unguarded(
             try:
                 row = get_terminal(existing_terminal_id)
             except ValueError:
+                # A failed original deletes its row during rollback before it
+                # removes its waiter (review on PR #773). A replay that lands in
+                # that window must report the original's failure, keeping the
+                # mapping, rather than read the missing row as stale and start a
+                # second worker for the key.
+                waiter = _pending_sync_inits.get(existing_terminal_id)
+                if waiter is not None and not lookup_only:
+                    await waiter.settled.wait()
+                    if waiter.error is not None:
+                        raise IdempotentCreateFailed(
+                            f"terminal {existing_terminal_id!r} for idempotency_key "
+                            f"{idempotency_key!r} failed to initialize: {waiter.error}"
+                        ) from waiter.error
                 # The key's mapping outlived the terminal it pointed to (e.g.
                 # a completed-and-torn-down handoff, retried long after the
                 # fact) -- there is nothing left to recover, so fall through

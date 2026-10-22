@@ -1736,6 +1736,28 @@ class TestIdempotentReplayWaitsForInitialization:
             await create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
 
     @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_idempotency_key")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
+    async def test_replay_during_the_rollback_of_a_failed_original_reports_the_failure(
+        self, mock_lookup, mock_get_terminal, mock_delete_key
+    ):
+        """The rollback of a failed original deletes its row before the waiter
+        goes away. A replay in that window must not read the row as stale,
+        drop the mapping and start a second worker."""
+        mock_lookup.return_value = _record(terminal_id="prior-terminal")
+        mock_get_terminal.side_effect = ValueError("Terminal 'prior-terminal' not found")
+        waiter = terminal_service._SyncInitWaiter()
+        waiter.settle(TimeoutError("Antigravity CLI initialization timed out after 180.0 seconds"))
+        terminal_service._pending_sync_inits["prior-terminal"] = waiter
+
+        with pytest.raises(terminal_service.IdempotentCreateFailed, match="timed out after 180"):
+            await create_terminal("kiro_cli", "developer", new_session=True, idempotency_key="k")
+
+        # The fall-through to a fresh create starts by dropping the mapping.
+        mock_delete_key.assert_not_called()
+
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.get_idempotency_record")
     async def test_lookup_only_returns_the_committed_terminal_without_waiting(

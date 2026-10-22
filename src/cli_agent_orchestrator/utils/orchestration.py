@@ -1567,6 +1567,15 @@ def _create_handoff_terminal(
             if saw_timeout:
                 raise _HandoffCreateUnresolved(str(exc)) from exc
             raise
+        except _ClaimRefused as exc:
+            # With a claim, _create_terminal reports every 4xx/5xx as a refusal,
+            # so the 424 and other-error branches above never see it (review on
+            # PR #773). After a timeout, an earlier attempt may have committed
+            # the worker: let the caller look it up. With nothing committed the
+            # caller re-raises this refusal, so its rule and message stay.
+            if saw_timeout:
+                raise _HandoffCreateUnresolved(str(exc)) from exc
+            raise
     raise AssertionError("unreachable")  # the loop always returns or raises
 
 
