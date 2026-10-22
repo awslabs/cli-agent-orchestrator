@@ -27,6 +27,7 @@ from cli_agent_orchestrator.clients.database import (
     delete_idempotency_key,
     delete_terminal,
     delete_terminals_by_session,
+    fail_orphaned_pending_messages,
     get_flow,
     get_idempotency_record,
     get_inbox_messages,
@@ -348,6 +349,96 @@ class TestTerminalOperations:
             result = list_pending_receiver_ids_older_than(30)
 
         assert result == ["term-old"]
+
+    def test_fail_orphaned_pending_messages(self, test_db):
+        """A PENDING message whose receiver row is gone is failed, not left
+        claiming PENDING forever (#708).
+
+        The reconcile join deliberately drops these so the sweep does not retry
+        deliveries to deleted agents; this is the counterpart that stops them
+        reporting a state they can never leave.
+        """
+        old = datetime.now(timezone.utc) - timedelta(seconds=120)
+        fresh = datetime.now(timezone.utc)
+
+        with test_db() as seed:
+            seed.add_all(
+                [
+                    TerminalModel(
+                        id="term-alive",
+                        tmux_session="cao-s",
+                        tmux_window="w",
+                        provider="kiro_cli",
+                    ),
+                    # Receiver alive — still the sweep's to deliver.
+                    InboxModel(
+                        sender_id="a",
+                        receiver_id="term-alive",
+                        message="alive",
+                        status=MessageStatus.PENDING.value,
+                        created_at=old,
+                    ),
+                    # Receiver row gone and past the grace window — undeliverable.
+                    InboxModel(
+                        sender_id="a",
+                        receiver_id="term-ghost",
+                        message="ghost",
+                        status=MessageStatus.PENDING.value,
+                        created_at=old,
+                    ),
+                    # Receiver row gone but inside the grace window — left alone.
+                    InboxModel(
+                        sender_id="a",
+                        receiver_id="term-ghost",
+                        message="ghost-fresh",
+                        status=MessageStatus.PENDING.value,
+                        created_at=fresh,
+                    ),
+                    # Already delivered to a gone receiver — not touched.
+                    InboxModel(
+                        sender_id="a",
+                        receiver_id="term-ghost",
+                        message="done",
+                        status=MessageStatus.DELIVERED.value,
+                        created_at=old,
+                    ),
+                ]
+            )
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            failed_ids = fail_orphaned_pending_messages(30)
+
+        with test_db() as check:
+            by_message = {m.message: m.status for m in check.query(InboxModel).all()}
+
+        assert len(failed_ids) == 1
+        assert by_message["ghost"] == MessageStatus.FAILED.value
+        assert by_message["alive"] == MessageStatus.PENDING.value
+        assert by_message["ghost-fresh"] == MessageStatus.PENDING.value
+        assert by_message["done"] == MessageStatus.DELIVERED.value
+
+    def test_fail_orphaned_pending_messages_is_a_noop_without_orphans(self, test_db):
+        """No orphans, no writes — the sweep runs every 30s."""
+        with test_db() as seed:
+            seed.add(
+                TerminalModel(
+                    id="term-alive", tmux_session="cao-s", tmux_window="w", provider="kiro_cli"
+                )
+            )
+            seed.add(
+                InboxModel(
+                    sender_id="a",
+                    receiver_id="term-alive",
+                    message="m",
+                    status=MessageStatus.PENDING.value,
+                    created_at=datetime.now(timezone.utc) - timedelta(seconds=120),
+                )
+            )
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            assert fail_orphaned_pending_messages(30) == []
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_delete_terminals_by_session(self, mock_session_class):

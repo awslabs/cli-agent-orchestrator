@@ -200,6 +200,13 @@ STARTUP_PROMPT_BOTTOM_LINES = 15
 # write, and small next to provider_init_timeout.
 POST_READINESS_TRANSITIONAL_REREADS = 6
 STARTUP_ACTIVITY_PATTERN = r"^\s*•[^\S\n]+\S"
+# A turn's own structure, as opposed to a bare `•` bullet: the tree
+# continuation under a tool row, the dim secondary row, and the error cell that
+# ends a failed turn. Codex never draws any of these outside a turn, so unlike
+# the bare bullet above they are unambiguous activity. Kept separate from
+# TURN_ACTIVITY_PATTERN, which deliberately includes `•` because its callers
+# are judging a frame that already has a submitted user message above it.
+STARTUP_TURN_STRUCTURE_PATTERN = r"^[^\S\n]*[◦└■]"
 # Codex's runtime approval prompt as actually rendered by codex-cli 0.147.0,
 # verified against a live tmux capture (test/providers/fixtures/
 # codex_approval_modal_raw.txt):
@@ -403,6 +410,57 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
             break
 
     return len("\n".join(all_lines[:footer_start_idx]))
+
+
+def _is_pre_turn_startup_frame(clean_output: str) -> bool:
+    """Return True when the frame shows a Codex that has never run a turn.
+
+    Codex prints account and product notices into its startup chrome as
+    ordinary bullets -- codex-cli 0.153 draws
+
+        • You have 1 usage limit reset available. Run /usage to use one.
+
+    between the welcome banner and the idle composer. Glyph-wise that is
+    indistinguishable from a tool row or from the model's own reply, and both of
+    the places that read a bullet got it wrong (#739): the startup readiness
+    veto refused a pane sitting at its idle composer, so the startup handler
+    could only end at its outer cap; and ``get_status`` took the "reply whose
+    user marker was evicted" branch and answered COMPLETED for a worker that
+    had never been given a task -- the dangerous direction, it tells the
+    conductor the agent is free.
+
+    The discriminator is the one the surrounding code already uses ("Only a
+    terminal that has not had a turn shows the startup banner instead", in
+    ``_status_of_frame``), and it is structural rather than a list of the notice
+    copy somebody has happened to see: a turn cannot exist without a submitted
+    user message, so a frame that still shows the welcome banner AND has no
+    user cell above the TUI footer cutoff has had no turn, and every bullet on
+    it is startup chrome. The cutoff is computed exactly as
+    ``_status_of_frame`` computes it, so the composer's own placeholder row
+    ("› Ask Codex to do anything", a USER_PREFIX_PATTERN match) is excluded by
+    both and the two cannot disagree about whether a turn has started.
+
+    Fails toward today's behaviour: a shell prompt glyph that USER_PREFIX_PATTERN
+    happens to match, or a banner scrolled out of the buffer, returns False and
+    leaves the old conservative readings in place.
+
+    Anchored on BANNER_VERSION_PATTERN rather than the bare "OpenAI Codex"
+    substring: a reply that merely quotes the product name (e.g. "I'm OpenAI
+    Codex, here is...") would otherwise also read as pre-turn (#739 review).
+    The versioned banner line ("OpenAI Codex (v0.153.2)") is startup chrome
+    the model does not render into a reply.
+    """
+    if not re.search(BANNER_VERSION_PATTERN, clean_output):
+        return False
+    all_lines = clean_output.splitlines()
+    if any(re.search(TUI_FOOTER_PATTERN, line) for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]):
+        cutoff = _compute_tui_footer_cutoff(all_lines)
+    else:
+        cutoff = len(clean_output)
+    return not any(
+        match.start() < cutoff
+        for match in re.finditer(USER_PREFIX_PATTERN, clean_output, re.IGNORECASE | re.MULTILINE)
+    )
 
 
 def _banner_version(text: str) -> tuple[int, int, int]:
@@ -1019,7 +1077,18 @@ def _has_startup_idle_composer(clean_output: str) -> bool:
     tail_lines = all_lines[-STARTUP_PROMPT_BOTTOM_LINES:]
     tail_output = "\n".join(tail_lines)
 
-    if re.search(STARTUP_ACTIVITY_PATTERN, tail_output, re.MULTILINE):
+    # The activity veto. A live spinner and a turn's tree/error rows are
+    # unambiguous and always veto. A bare `•` bullet is not: on a frame that has
+    # had no turn it is the account notice Codex prints into its startup chrome,
+    # and vetoing on it meant the startup handler could never return "settled"
+    # for such an account (#739). See _is_pre_turn_startup_frame.
+    if re.search(TUI_PROGRESS_PATTERN, tail_output, re.MULTILINE):
+        return False
+    if re.search(STARTUP_TURN_STRUCTURE_PATTERN, tail_output, re.MULTILINE):
+        return False
+    if re.search(STARTUP_ACTIVITY_PATTERN, tail_output, re.MULTILINE) and not (
+        _is_pre_turn_startup_frame(clean_output)
+    ):
         return False
     if re.search(WAITING_PROMPT_PATTERN, tail_output, re.IGNORECASE | re.MULTILINE):
         return False
@@ -2364,7 +2433,19 @@ class CodexProvider(BaseProvider):
             #   e2e tests would time out.
             # Search above the TUI footer cutoff so the › suggestion-hint and
             # status-bar lines aren't confused with a model reply.
-            if _find_assistant_marker(clean_output[:cutoff_pos]) is not None:
+            #
+            # A frame that still shows the welcome banner with no user cell on
+            # it has had no turn at all, so its bullets are the account notices
+            # Codex prints into its startup chrome, not a reply whose marker
+            # scrolled away (#739): a notice bullet here answered COMPLETED for
+            # a worker that was never given a task. IDLE is the honest verdict
+            # and still satisfies initialize()'s {IDLE, COMPLETED} wait. The
+            # eviction case this branch exists for cannot look like this -- a
+            # transcript long enough to evict its user marker has pushed the
+            # banner out of the buffer too.
+            if _find_assistant_marker(
+                clean_output[:cutoff_pos]
+            ) is not None and not _is_pre_turn_startup_frame(clean_output):
                 return TerminalStatus.COMPLETED
             return TerminalStatus.IDLE
 

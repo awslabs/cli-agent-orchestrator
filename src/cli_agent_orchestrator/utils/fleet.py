@@ -46,6 +46,20 @@ _CONNECT_TIMEOUT = 5.0
 _READ_TIMEOUT = 60.0
 
 
+class BrokerRequestError(click.ClickException):
+    """A broker request that failed, keeping the HTTP status for callers that retry.
+
+    ``status_code`` is ``None`` when the broker could not be reached at all. The
+    message is still the sentence ``FleetClient._check`` builds, so nothing a user
+    sees changes; a poll loop can now tell a 404 that will not change on retry
+    from a 503 that might.
+    """
+
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class FleetClient:
     """One fleet, addressed through its broker."""
 
@@ -214,7 +228,7 @@ class FleetClient:
                 timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
             )
         except requests.RequestException as exc:
-            raise click.ClickException(
+            raise BrokerRequestError(
                 f"Failed to reach the fleet broker at {self.url}: {exc}"
             ) from exc
         if raise_for_status:
@@ -242,4 +256,6 @@ class FleetClient:
             detail = (response.text or "").strip()
         if response.status_code == 401:
             detail = detail or f"broker rejected the token in {ELASTIC_BROKER_TOKEN_ENV}"
-        raise click.ClickException(detail or f"broker returned HTTP {response.status_code}")
+        raise BrokerRequestError(
+            detail or f"broker returned HTTP {response.status_code}", response.status_code
+        )

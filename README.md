@@ -132,6 +132,8 @@ provider override while keeping the same sequence.
   multi-step pipelines.
 - [Launch decisions](docs/decisions.md): local routing settings and content-free records.
 - [Skills](docs/skills.md): install, scope, and author reusable agent guidance.
+- [Skills lifecycle example](examples/skills/README.md): install, discover,
+  load, apply, update, and remove a reusable skill in an isolated home.
 - [Memory](docs/memory.md) and [self-learning](docs/self-learning.md):
   persistent cross-session memory, and the opt-in loop that turns workflow
   outcomes into lessons and promoted instructions.
