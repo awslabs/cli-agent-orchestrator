@@ -40,6 +40,16 @@ Each agent has its own credential. The cell's MCP server checks the scopes and
 the robot claim of the credential, so a tool argument or a prompt cannot widen
 them. The human operator holds the only credential for `stop_cell`.
 
+> [!WARNING]
+> The credential files sit in the run directory, readable by your OS user, and
+> every agent runs as that user. The isolation holds only when the provider
+> enforces each profile's tool allowlist, so no agent has a shell or can read
+> files. For the enforcement of each provider, see
+> [Tool restrictions](../../../docs/tool-restrictions.md). With a provider that
+> only asks in the prompt, an agent could read another agent's credential, move
+> another robot, or stop the cell. `prepare` warns for these providers: use
+> them only for a trusted local simulation.
+
 `walk_to` and `pick_and_place` return `accepted` at once. The agent then calls
 `observe` until the command is `succeeded` or `failed`, the same contract as
 `start_task` / `get_task_status` in Strands Robots. A command succeeds only when

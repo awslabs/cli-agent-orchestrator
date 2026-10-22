@@ -77,6 +77,15 @@ orchestration layer does not care which one a robot uses.
 
 ## 4. Proposed scenario: a two-robot pick-and-deliver cell
 
+> Superseded for v1 by the sorting job in section 10. Handing a part from the
+> arm to a carrier needs both robots in **one** simulated world: in
+> `strands-robots==0.5.3` each sim `Robot(...)`, and the default twin factory,
+> builds its own world, so a part cannot move between them. A transfer
+> scenario needs one shared simulation with credential-scoped per-robot
+> adapters, as in upstream `examples/fleet/01_skill_dispatch_multi_vendor.py`,
+> plus a standing policy that keeps the G1 balanced while other robots step
+> that world (see section 10, decision 4).
+
 One MuJoCo world, two robots, one job:
 
 1. **Fetch.** A mobile robot (G1 humanoid on the WBC policy, or the Yahboom M3
@@ -139,6 +148,14 @@ flowchart TD
 - Every rollout has a time budget, and an exhausted budget is a failure, not
   a success.
 - A grasp assist in sim (`attach_bodies`) is reported as such in the evidence.
+- Credential checks hold only while an agent cannot read another agent's
+  credential file. Every agent runs as the same OS user, so this depends on the
+  provider enforcing the profile's tool allowlist (no shell, no file reads).
+  Providers with prompt-only enforcement (Codex, Kimi CLI, MiniMax Code,
+  Antigravity CLI, OMP; see `docs/tool-restrictions.md`) are for trusted
+  simulation runs only. **Hardware prerequisite:** a hard-enforcing provider
+  *and* OS-level isolation of the credentials (a separate OS user or container
+  per agent), or the hardware run does not start.
 
 ## 7. Delivery phases
 
@@ -148,7 +165,7 @@ flowchart TD
 | 1. Cell MCP server | `cell_mcp.py` over Strands `Robot`, scoped credentials, the tool set above, `mock` policy for tests | Unit tests pass with the `mock` policy and no model download |
 | 2. Agents and runner | Profiles (`cell_supervisor.md`, `mobile_operator.md`, `arm_operator.md`, `cell_checker.md`), `demo.py prepare / serve / connect`, same shape as the first example | A scripted run (no LLM) completes fetch &#8594; pick &#8594; deliver in sim |
 | 3. End-to-end with CAO | Real provider CLIs (Claude Code, Kiro CLI, Codex), recording, failure-injection scenarios (policy timeout, dropped part) | Three recorded live runs, including one recovered failure |
-| 4. Twin and hardware path | Driver path on a twin (`transport="twin"`), then an optional real robot (SO-101 on a Feetech bus, or a Yahboom M3 Pro) | The same agent prompts move the twin; hardware run filmed if a robot is available |
+| 4. Twin and hardware path | Driver path on a twin (`transport="twin"`), then an optional real robot (SO-101 on a Feetech bus, or a Yahboom M3 Pro). Before hardware: per-agent credential isolation (section 6) | The same agent prompts move the twin; hardware run filmed if a robot is available |
 | 5. Docs and enablement | README, images and GIF, tests in CI, a blog post, a bonus module for the OPN310 workshop | PR ready for review |
 
 ## 8. Open questions
