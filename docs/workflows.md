@@ -465,8 +465,11 @@ and discarded; it is never written to the manifest as its own value.
 > time, so editing a profile changes how an approved plan executes. Script-tier steps are discovered by
 > executing the Python, so at approval time there is no list of which profiles a run will name — the
 > digest therefore covers **every installed profile**, not just the ones a script happens to use. The
-> practical consequence: `cao agent install <anything>`, or editing any profile in your agent store,
-> invalidates every existing approval and the next run of each plan is refused until re-approved.
+> practical consequence: `cao install <anything>`, or editing any profile in your agent store or any
+> file `cao install` wrote for a profile (the Kiro agent JSON, the Copilot or OpenCode agent file, the
+> installed context copy), invalidates every existing approval and the next run of each plan is
+> refused until re-approved. The packaged built-in profiles are in the set too, so a CAO upgrade that
+> changes a bundled profile also moves every `plan_id`.
 
 > **Migration: new runs move to `plan-v2`; approved `plan-v1` resumes still pass.** A `plan_id` computed after
 > upgrading always uses the new `plan-v2:` scheme, so the first NEW run of every plan is refused until
@@ -537,8 +540,8 @@ The missing-approval and missing-identity refusal bodies carry the identifier as
 {
   "detail": {
     "kind": "approval_required",
-    "plan_id": "plan-v1:9f3c…",
-    "message": "Plan 'plan-v1:9f3c…' has not been approved. …"
+    "plan_id": "plan-v2:9f3c…",
+    "message": "Plan 'plan-v2:9f3c…' has not been approved. …"
   }
 }
 ```
@@ -619,18 +622,19 @@ rather than what survived the redaction rules of the day.
 
 ### What an approval does not cover
 
-An approval binds three things: the script source, its resolved inputs, and the state of the run's
-working directory when the run is admitted. For a Git repository that state is the commit and the
-worktree changes, not the path, so two checkouts in the same state share one approval. For a directory
-outside any Git repository it is only the directory's canonical path.
+An approval binds four things: the script source, its resolved inputs, the state of the run's
+working directory when the run is admitted, and the installed agent profile set (every profile's
+source text plus the files `cao install` wrote for it). For a Git repository the directory state is
+the commit and the worktree changes, not the path, so two checkouts in the same state share one
+approval. For a directory outside any Git repository it is only the directory's canonical path.
 
 Everything else is read when a step runs, so a new run of an approved plan can do something different
 from what was reviewed and still match the same `plan_id`:
 
-- **Agent profiles.** A step's system prompt, tools and model come from the profile it names, read
-  when the step launches. If that profile is edited after approval, the next run uses the edited
-  profile under the original `plan_id`. Within one run, CAO refuses further agent launches once a
-  profile changes (`plan_inputs_changed`); a new run is not refused. Tracked in #827.
+- **Agent profile edits within one run.** A profile edit after a run is admitted is caught at the
+  next agent launch in that run (`plan_inputs_changed`); the next NEW run gets a new `plan_id` and is
+  refused until re-approved. What a profile edit cannot change is a run that already launched its
+  steps.
 - **Memory content.** CAO memory is resolved at a run's first agent terminal and is not part of the
   `plan_id`. Memory added or edited after approval, including through the `memory_store` tool, reaches
   the next run's steps under the original `plan_id`. Only the memory-enabled setting is checked, and
