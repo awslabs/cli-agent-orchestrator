@@ -57,6 +57,22 @@ class TerminalInputBlockedError(Exception):
     """
 
 
+class ProviderExitedInputBlockedError(TerminalInputBlockedError):
+    """Input was refused because the provider process is gone, not because it asked a question.
+
+    Raised by ``services/terminal_service.py``'s delivery guards when the
+    terminal's status is ERROR or its pane's foreground process is the shell that
+    was running before the CLI launched (#1018). Still a
+    ``TerminalInputBlockedError`` so every existing handler keeps its answer --
+    409 at ``/terminals/{id}/input``, 504 at ``run_step``, FAILED in the inbox --
+    but the deferred-init path catches this subclass FIRST and tears the worker
+    down: there is no prompt to answer, ``answer_user_prompt`` refuses because
+    the status is not WAITING_USER_ANSWER, and a re-send is refused again, so
+    "leave it alive for the operator" would keep a dead worker registered and
+    tell the supervisor to wait on a prompt that does not exist.
+    """
+
+
 class TerminalLimitError(Exception):
     """Raised when creating a terminal would exceed this node's tracked-terminal cap.
 

@@ -16,13 +16,18 @@ baseline, whatever its own ``get_status`` says, and it does not depend on the
 provider having finished initializing.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from cli_agent_orchestrator.models.provider import ProviderType
-from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError, TerminalStatus
+from cli_agent_orchestrator.models.terminal import (
+    ProviderExitedInputBlockedError,
+    TerminalInputBlockedError,
+    TerminalStatus,
+)
 from cli_agent_orchestrator.providers.manager import ProviderManager
+from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.terminal_service import dispatch_input, send_input
 
 METADATA = {
@@ -90,6 +95,20 @@ class TestDispatchRefusesBareShell:
         harness.provider.mark_input_received.assert_not_called()
         harness.provider.record_dispatched_message.assert_not_called()
         harness.update_last_active.assert_not_called()
+
+    def test_refusals_are_the_provider_exited_subclass(self, harness):
+        """Both guards raise the subclass, so handlers that catch the base class are unchanged
+        and the deferred-init path can tell a dead worker from a parked one."""
+        harness.backend.get_pane_current_command.return_value = "bash"
+        with pytest.raises(ProviderExitedInputBlockedError):
+            dispatch_input("1e293d67", TASK)
+
+        harness.backend.get_pane_current_command.return_value = "codex"
+        harness.status_monitor.get_status.return_value = TerminalStatus.ERROR
+        with pytest.raises(ProviderExitedInputBlockedError):
+            dispatch_input("1e293d67", TASK)
+
+        assert issubclass(ProviderExitedInputBlockedError, TerminalInputBlockedError)
 
     def test_refuses_when_status_flips_to_error_before_typing(self, harness):
         """The reporter's 150 ms: IDLE at the first read, ERROR by the time we would type."""
@@ -207,3 +226,118 @@ class TestEveryProviderIsRefusedIntoABareShell:
             dispatch_input("1e293d67", TASK)
 
         harness.backend.send_keys.assert_called_once()
+
+
+class TestDeferredInitTearsDownAnExitedProvider:
+    """Review of #1018 (P2-2): assign must not report a bare shell as "waiting on a prompt".
+
+    ``_schedule_deferred_init`` catches ``TerminalInputBlockedError`` to leave a
+    worker that is parked on a real prompt alive for ``answer_user_prompt``. The
+    delivery guards raise for a different reason -- the provider process is gone
+    -- and on that path the same handling kept a dead worker registered, recorded
+    the outcome as ``waiting_user_answer`` and told the supervisor to answer a
+    prompt that does not exist. The guards now raise
+    ``ProviderExitedInputBlockedError`` and the deferred path tears the worker
+    down like any other startup failure.
+    """
+
+    METADATA = dict(METADATA, provider="kiro_cli", caller_id="supervisor1")
+
+    @pytest.fixture
+    def deferred(self):
+        provider = MagicMock()
+        provider.initialize = AsyncMock(return_value=True)
+        provider.shell_baseline = "bash"
+        provider.runtime_variant = None
+        provider.paste_enter_count = 1
+        provider.blocks_orchestrated_input_while_waiting_user_answer = False
+
+        persist = MagicMock()
+        notify = MagicMock()
+        surface = AsyncMock()
+        with (
+            patch.object(terminal_service, "MemoryService") as memory_service,
+            patch.object(terminal_service, "status_monitor") as status_monitor,
+            patch.object(terminal_service, "provider_manager") as provider_manager,
+            patch("cli_agent_orchestrator.backends.registry._backend") as backend,
+            patch.object(
+                terminal_service, "get_terminal_metadata", return_value=dict(self.METADATA)
+            ),
+            patch.object(terminal_service, "update_terminal_shell_command"),
+            patch.object(terminal_service, "update_last_active"),
+            patch.object(terminal_service, "_clear_deferred_init_external_owner", AsyncMock()),
+            patch.object(terminal_service, "_persist_initial_delivery", persist),
+            patch.object(terminal_service, "_notify_caller_of_deferred_failure", notify),
+            patch.object(terminal_service, "_surface_deferred_init_failure", surface),
+        ):
+            memory_service.return_value.get_curated_memory_context.return_value = ""
+            status_monitor.get_status.return_value = TerminalStatus.IDLE
+            provider_manager.get_provider.return_value = provider
+            backend.supports_event_inbox.return_value = False
+            backend.get_history.return_value = ""
+            yield MagicMock(
+                provider=provider,
+                backend=backend,
+                status_monitor=status_monitor,
+                persist=persist,
+                notify=notify,
+                surface=surface,
+            )
+
+    @pytest.mark.asyncio
+    async def test_pane_back_at_shell_after_init_is_torn_down(self, deferred):
+        """initialize() succeeded; by delivery time the pane's foreground process is bash again."""
+        deferred.backend.get_pane_current_command.return_value = "bash"
+
+        task = terminal_service._schedule_deferred_init(
+            deferred.provider, "1e293d67", TASK, None, None
+        )
+        await task
+
+        deferred.backend.send_keys.assert_not_called()
+        deferred.surface.assert_awaited_once()
+        kwargs = deferred.surface.await_args.kwargs
+        assert kwargs["kind"] == "provider_exited"
+        assert kwargs["exception_type"] == "ProviderExitedInputBlockedError"
+        assert "exited" in kwargs["message"]
+        # The "parked on a prompt" branch did not run.
+        assert not any(
+            call.kwargs.get("kind") == "waiting_user_answer"
+            for call in deferred.persist.call_args_list
+        )
+        assert not any(
+            call.kwargs.get("delete_worker") is False for call in deferred.notify.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_error_status_at_delivery_is_torn_down(self, deferred):
+        """The pre-existing ERROR guard takes the same path: the provider is gone, not asking."""
+        deferred.backend.get_pane_current_command.return_value = "kiro-cli"
+        deferred.status_monitor.get_status.return_value = TerminalStatus.ERROR
+
+        await terminal_service._schedule_deferred_init(
+            deferred.provider, "1e293d67", TASK, None, None
+        )
+
+        deferred.backend.send_keys.assert_not_called()
+        deferred.surface.assert_awaited_once()
+        assert deferred.surface.await_args.kwargs["kind"] == "provider_exited"
+
+    @pytest.mark.asyncio
+    async def test_a_real_prompt_is_still_left_alive(self, deferred):
+        """The WAITING_USER_ANSWER branch is untouched: a parked worker is kept for the operator."""
+        deferred.provider.blocks_orchestrated_input_while_waiting_user_answer = True
+        deferred.backend.get_pane_current_command.return_value = "kiro-cli"
+        deferred.status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+
+        await terminal_service._schedule_deferred_init(
+            deferred.provider, "1e293d67", TASK, None, None
+        )
+
+        deferred.backend.send_keys.assert_not_called()
+        deferred.surface.assert_not_awaited()
+        assert any(
+            call.kwargs.get("kind") == "waiting_user_answer"
+            for call in deferred.persist.call_args_list
+        )
+        assert deferred.notify.call_args.kwargs.get("delete_worker") is False

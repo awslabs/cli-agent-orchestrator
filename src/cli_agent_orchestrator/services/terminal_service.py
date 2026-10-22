@@ -82,6 +82,7 @@ from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
+    ProviderExitedInputBlockedError,
     Terminal,
     TerminalInputBlockedError,
     TerminalLimitError,
@@ -3519,6 +3520,33 @@ def _schedule_deferred_init(
                 # delivered never sees an unmasked status first (#566).
                 await asyncio.to_thread(_persist_initial_delivery, terminal_id, "delivered")
             await _clear_deferred_init_external_owner(terminal_id)
+        except ProviderExitedInputBlockedError as e:
+            # Caught BEFORE the TerminalInputBlockedError branch below, whose
+            # "alive, parked on a prompt, keep it" handling is wrong for this
+            # case (#1018 review, P2-2): the delivery guard refused because the
+            # provider process is gone -- status ERROR, or the pane's foreground
+            # process is the pre-launch shell again. There is no prompt to
+            # answer (answer_user_prompt refuses, the status is not
+            # WAITING_USER_ANSWER), a re-send is refused the same way, and the
+            # pane is a bare shell. Treat it as the startup failure it is: tear
+            # the worker down and tell the caller the provider exited.
+            logger.error(
+                "Deferred init for terminal %s: provider process exited before the task "
+                "could be delivered: %r.",
+                terminal_id,
+                e,
+            )
+            await _surface_deferred_init_failure(
+                terminal_id,
+                kind="provider_exited",
+                message=(
+                    f"Worker {terminal_id} provider process exited before the task could be "
+                    f"delivered; nothing was typed into the pane. {e}"
+                ),
+                exception_type=type(e).__name__,
+                registry=registry,
+                delete_on_failure=delete_on_failure,
+            )
         except TerminalInputBlockedError as e:
             # The worker initialized but is parked on an interactive prompt
             # (WAITING_USER_ANSWER). It is alive and can be driven via
@@ -3932,7 +3960,7 @@ def _refuse_if_provider_gone(terminal_id: str, provider: Any, metadata: Dict[str
        made of the pane.
     """
     if status_monitor.get_status(terminal_id) == TerminalStatus.ERROR:
-        raise TerminalInputBlockedError(
+        raise ProviderExitedInputBlockedError(
             f"Terminal {terminal_id} provider is in ERROR state "
             "(provider process may have exited). Refusing to deliver input."
         )
@@ -3944,7 +3972,7 @@ def _refuse_if_provider_gone(terminal_id: str, provider: Any, metadata: Dict[str
             terminal_id,
             shell,
         )
-        raise TerminalInputBlockedError(
+        raise ProviderExitedInputBlockedError(
             f"Terminal {terminal_id} is a bare shell ({shell}): the provider process has "
             "exited and typed input would be executed as commands. Refusing to deliver input."
         )
@@ -4013,9 +4041,11 @@ def dispatch_input(
 
             # Guard: refuse to type into a terminal whose provider process has
             # exited. Without this check, queued messages would be pasted into
-            # a bare shell and executed as arbitrary commands.
+            # a bare shell and executed as arbitrary commands. The subclass
+            # tells the deferred-init path this is a dead worker to tear down,
+            # not a prompt to leave for the operator (#1018 review).
             if current_status == TerminalStatus.ERROR:
-                raise TerminalInputBlockedError(
+                raise ProviderExitedInputBlockedError(
                     f"Terminal {terminal_id} provider is in ERROR state "
                     "(provider process may have exited). Refusing to deliver input."
                 )
