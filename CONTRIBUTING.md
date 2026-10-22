@@ -40,6 +40,49 @@ GitHub provides additional document on [forking a repository](https://help.githu
 [creating a pull request](https://help.github.com/articles/creating-a-pull-request/).
 
 
+## Type checking: the mypy ratchet
+
+CI's **Code Quality** job runs `uv run python scripts/mypy_ratchet.py` instead of a bare
+`uv run mypy src/`, and that step is **blocking**.
+
+The repo carries a backlog of pre-existing type errors, recorded per file and per error code
+in [`mypy-baseline.json`](mypy-baseline.json). The ratchet compares a fresh `mypy src/` run
+against that baseline:
+
+- **New errors fail the job.** A new error code in a baselined file, more of an existing one,
+  or any error in a file absent from the baseline. Swapping a new error in one file for a
+  deleted one in another does *not* net out — the comparison is per file per code, not a
+  repo-wide total.
+- **Pre-existing errors pass.** You are not asked to fix someone else's module to land your
+  change.
+- **Fewer errors pass**, and the step prints the command to bank the improvement.
+
+Run it locally before pushing:
+
+```bash
+uv run python scripts/mypy_ratchet.py        # same check CI runs
+uv run mypy src/                             # the raw output, if you want to read it
+```
+
+**Lowering the baseline** (good, do this freely): fix the errors, then
+
+```bash
+uv run python scripts/mypy_ratchet.py --update
+```
+
+and commit `mypy-baseline.json` alongside the fix.
+
+**Raising the baseline** needs a reviewer's explicit OK. `--update` will happily write a
+higher number, so the file itself cannot stop you — the review does. If your PR raises any
+count, say in the description which file and error code went up and why the error cannot
+reasonably be fixed or narrowly suppressed instead. A `# type: ignore[code]` with a comment
+on the offending line is almost always the better trade than a raised baseline, because it
+is visible at the site of the problem rather than in a JSON file nobody reads.
+
+> Note: `mypy.ini` at the repo root is the config mypy actually loads; the `[tool.mypy]`
+> section in `pyproject.toml` is shadowed by it and has no effect. Edit `mypy.ini`.
+
+
 ## Developing in GitHub Codespaces
 
 The project runs end-to-end inside a Codespace. See [docs/codespaces.md](docs/codespaces.md)

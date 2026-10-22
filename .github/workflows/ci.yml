@@ -35,7 +35,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -53,6 +53,12 @@ jobs:
           version: v0.70.0
 
       - name: Run unit tests with coverage
+        # CAO_MUST_RUN names the assurance gates this leg owns; a `must_run`
+        # test for a listed gate that skips or gets deselected fails the session
+        # instead of passing silently (see test/_must_run.py). Only the 3.12 leg
+        # installs Trivy, so only the 3.12 leg claims the "unit" gate.
+        env:
+          CAO_MUST_RUN: ${{ matrix.python-version == '3.12' && 'unit' || '' }}
         run: |
           if [ "${{ matrix.python-version }}" = "3.12" ]; then
             trivy --version
@@ -64,10 +70,20 @@ jobs:
             --ignore=test/e2e \
             -m "not e2e" \
             --cov=src/cli_agent_orchestrator \
+            --cov-branch \
             --cov-report=xml \
             --cov-fail-under=80 \
             --cov-report=term-missing \
             -v
+        # --cov-branch (#1005) also makes --cov-fail-under read the BLENDED
+        # line+branch figure rather than line coverage. Whether that reads harder
+        # or softer than line-only depends on whether branch % is below or above
+        # line % that run (today: 89.28 branch vs 93.10 line, so blended is a
+        # harder bar at 80 -- not an invariant, just the current numbers). The
+        # authoritative, separately-floored line metric is the ratchet's
+        # (.coverage-baseline.json, python.floor_pct = 87.0) in the cao-mcp-apps
+        # job below. If the blend lands under 80 on a first run, lower THIS
+        # number -- do not drop the branch data, and do not touch the line floor.
 
       - name: Validate Markdown links
         run: uv run python scripts/validate_markdown_links.py
@@ -102,7 +118,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
           cache: "npm"
@@ -123,6 +139,75 @@ jobs:
       - name: Build
         run: npm run build
         working-directory: web
+
+      # =================================================================================
+      # WHEEL-CONTENTS GATE (issues #610, #705) — this job is the ONLY place in CI where
+      # test/test_wheel_contents.py can execute at all.
+      #
+      # `Unit Tests` runs pytest but never builds the web UI, and this job built the web UI
+      # but ran no pytest. test_wheel_contents.py is gated on the built web UI existing, so
+      # dropped into `Unit Tests` it reports SKIPPED in all three legs and no job in the
+      # workflow runs it. Here it runs exactly once.
+      #
+      # WHY HERE and not in `Unit Tests`: the property under test is Python-version
+      # independent (does hatchling's `[tool.hatch.build] artifacts` glob cover the whole
+      # web_ui/ build output), so running it on 3.10/3.11/3.12 would assert the same thing
+      # three times and build the web UI three times to do it. It also keeps the repo's
+      # primary test gate free of an npm-registry dependency. Follows the `CAO MCP Apps`
+      # job's existing in-file pattern: a Node build plus setup-uv/uv sync plus targeted
+      # pytest files.
+      #
+      # SCOPE: the pytest step names its files EXPLICITLY, so it closes the gap for THOSE
+      # FILES and not for the class. Another web_ui-dependent test added elsewhere under
+      # test/ would still skip in `Unit Tests` and would not be collected here; wiring it
+      # in means naming it in this step too.
+      #
+      # test_hatch_artifacts_guard.py is listed alongside it, but is NOT dependent on this
+      # job: it never skips, so `Unit Tests` already runs it on 3.10/3.11/3.12. It is named
+      # here because this is the only job where `web_ui/` exists on disk, which is the only
+      # place its whole-directory wheel assertion can cover THAT root rather than skipping it.
+      # =================================================================================
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # `--all-extras --dev`, not plain `uv sync`: `agui` is an optional extra and every
+      # other install site in this file passes both flags. Plain `uv sync` omits it and
+      # yields ~58 spurious agui collection failures.
+      - name: Install Python deps (for the wheel-contents packaging test)
+        run: uv sync --locked --all-extras --dev
+
+      - name: "Wheel-contents regression test (issues #610, #705)"
+        # The skip-guard is the load-bearing half. test_wheel_contents.py SKIPS when the
+        # built web UI is absent, and a skip keeps this job GREEN — the same false
+        # assurance the test exists to remove. `npm run build` exiting 0 while writing an
+        # incomplete tree is a failure this step exists to catch, so assert the
+        # precondition instead of trusting it.
+        #
+        # The guard calls `web_ui_build_is_complete()` from the test module rather than
+        # re-testing paths in shell: one source of truth, and it checks index.html AND
+        # every asset index.html loads (#705), not just the entry point.
+        #
+        # That import resolves `test` from the CURRENT DIRECTORY, so this step must stay at
+        # the repo root. The sibling steps in this job set `working-directory: web`; adding
+        # it here would fail with `ModuleNotFoundError: No module named 'test'`.
+        #
+        # Only these two files: the full suite already runs in `Unit Tests`, and the
+        # wheel build here is ~2s, so duplicating the suite would be pure waste.
+        run: |
+          uv run python -c 'import test.test_wheel_contents as t; raise SystemExit(0 if t.web_ui_build_is_complete() else 1)' || {
+            echo "The built web UI under src/cli_agent_orchestrator/web_ui/ is absent or incomplete" >&2
+            echo "after 'npm run build' (index.html missing, or it references assets that were" >&2
+            echo "not written). test/test_wheel_contents.py would SKIP rather than run, leaving" >&2
+            echo "this job green with the packaging assertion unexecuted (issues #610, #705)." >&2
+            exit 1
+          }
+          uv run pytest test/test_wheel_contents.py test/test_hatch_artifacts_guard.py --no-cov -q
 
   aidlc-portfolio-example:
     name: AI-DLC Portfolio Example
@@ -162,12 +247,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Set up Python
         run: uv python install 3.12
@@ -179,14 +264,16 @@ jobs:
         run: npm ci
         working-directory: cao_mcp_apps
 
+      # Was wrapped in `if ls src/**/*.ts src/**/*.tsx; then ... else echo "no
+      # TypeScript sources yet (Phase 0)"; fi`. Phase 0 is over: there are 29
+      # .ts/.tsx files under src/{agent,dashboard,event-stream,graph,shared,test},
+      # so the else branch is dead. It was also fragile in the direction this PR
+      # cares about -- bash does not expand `**` recursively without `globstar`,
+      # so `src/**/*.ts` only ever matched one level down, and moving the sources
+      # one directory deeper would have silently turned tsc into an echo.
       - name: Type check
         working-directory: cao_mcp_apps
-        run: |
-          if ls src/**/*.ts src/**/*.tsx >/dev/null 2>&1; then
-            npm run typecheck
-          else
-            echo "no TypeScript sources yet (Phase 0) — skipping tsc"
-          fi
+        run: npm run typecheck
 
       - name: Unit tests
         working-directory: cao_mcp_apps
@@ -209,13 +296,16 @@ jobs:
         run: uv run pytest test/test_http_only_boundary.py -q
 
       - name: Backend coverage (for the ratchet floor)
-        # Produces coverage.json (python floor) consumed by coverage:ratchet.
+        # Produces coverage.json (python line + branch floors) consumed by
+        # coverage:ratchet. --cov-branch adds num_branches/covered_branches to
+        # totals; the ratchet floors line and branch SEPARATELY (#1005).
         run: |
           uv run pytest test/ examples/workflow/tests/ \
             --ignore=test/providers/test_kiro_cli_integration.py \
             --ignore=test/e2e \
             -m "not e2e" \
             --cov=src/cli_agent_orchestrator \
+            --cov-branch \
             --cov-report=json \
             --cov-fail-under=80 \
             -q
@@ -238,7 +328,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
 
@@ -265,7 +355,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -282,13 +372,21 @@ jobs:
       - name: Check import sorting with isort
         run: uv run isort --check-only src/ test/ examples/robotics/cross-zone-transport/
 
-      - name: Run type checker with mypy
-        run: uv run mypy src/
-        # Pre-existing repo-wide mypy errors (agent_scaffold/profile/
-        # memory_service — unrelated to AG-UI) are tolerated as non-blocking on
-        # main; this PR introduces none. Mirror main's policy so Code Quality
-        # stays green rather than silently making mypy a hard gate here.
-        continue-on-error: true
+      - name: Run type checker with mypy (ratchet)
+        # Issue #1005. This step used to be `uv run mypy src/` with
+        # `continue-on-error: true`, so a red type check blocked nothing and the
+        # repo's 177 pre-existing errors were indistinguishable from 178.
+        #
+        # The ratchet blocks on NEW errors only, measured per file per error code
+        # against the committed `mypy-baseline.json`. Pre-existing errors pass,
+        # counts that fall pass (and the step tells you to bank them with
+        # `--update`), counts that rise fail. The full `mypy src/` output is
+        # echoed to this log before the verdict.
+        #
+        # Deliberately NO `continue-on-error` here: that key is the entire
+        # difference between a gate and a decoration, and
+        # test/scripts/test_mypy_ratchet.py asserts it stays absent.
+        run: uv run python scripts/mypy_ratchet.py
 
   ag-ui-demo:
     name: AG-UI demo (shift-left recording)
@@ -298,7 +396,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -310,7 +408,7 @@ jobs:
         run: uv sync --locked --all-extras --dev
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
 
@@ -335,7 +433,7 @@ jobs:
 
       - name: Upload demo GIF artifact
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ag-ui-eventsource-viewer-demo
           path: docs/media/ag-ui-eventsource-viewer-demo.gif
@@ -350,7 +448,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -362,7 +460,7 @@ jobs:
         run: uv sync --locked --all-extras --dev
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
 
@@ -386,7 +484,7 @@ jobs:
 
       - name: Upload construct demo GIFs artifact
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ag-ui-construct-demos
           path: docs/media/ag-ui-*-demo.gif
@@ -401,7 +499,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -413,7 +511,7 @@ jobs:
         run: uv sync --locked --all-extras --dev
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
 
@@ -440,7 +538,7 @@ jobs:
 
       - name: Upload dog-food demo GIF artifact
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: agent-plugins-dogfood
           path: docs/media/agent-plugins-dogfood-demo.gif
@@ -455,7 +553,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -467,7 +565,7 @@ jobs:
         run: uv sync --locked --all-extras --dev
 
       - name: Set up Node.js (for the @ag-ui/client stock SDK)
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
 
@@ -616,7 +714,7 @@ jobs:
       # without it, so `uv sync` would fail with `uv: command not found`. Caught by comparing every
       # job's setup-uv presence against its uv usage rather than assuming the toolchain was there.
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -726,7 +824,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
       - name: Generate requirements.txt for scanning
         run: |
@@ -778,7 +876,7 @@ jobs:
           exit-code: '0'
 
       - name: Upload Trivy scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v3
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v3
         # `always()` is load-bearing now that Trivy can fail: without it, a CRITICAL finding
         # would fail the scan step and SKIP the upload, hiding the very finding that failed
         # the build from the Security tab.
