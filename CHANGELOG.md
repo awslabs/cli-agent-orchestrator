@@ -791,6 +791,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- A profile's `tools:` allowlist is now enforced for every CAO MCP tool, not
+  just the delegation tools (`assign`, `handoff`, `assign_elastic`,
+  `create_ephemeral_agent`, `workflow_run`/`resume`/`start`) that #769/#811
+  already checked. Provider-native tool restrictions can't name an MCP tool
+  (`get_disallowed_tools` skips every `@`-prefixed entry), so a bound terminal
+  whose allowlist omitted `@cao-mcp-server` could still reach `memory_store`,
+  `memory_forget`, `delete_terminal`, `workflow_cancel`, and the rest of the
+  surface. One `on_call_tool` middleware now gates every `cao-mcp-server` tool
+  on the caller's allowlist, deferring to the same policy function #769 added,
+  so a tool registered later is covered by default. The callback protocol
+  (`send_message`, `complete_assignment`, `workflow_return`,
+  `answer_user_prompt`) and the independently-granted `discovery` tools
+  (`list_siblings`, `update_metadata`) are carved out, matching documented
+  behavior. Denied calls now surface as an MCP `ToolError` rather than a
+  `{"success": false, "error": ...}` result for the previously-gated seven.
+  `cao-ops-mcp-server` is unaffected — it is a separate, operator-granted
+  control plane. (#671)
 - New `Actions Security` CI job runs zizmor 1.30.1 over `.github/` on every PR
   and push to `main`, failing on Medium-or-higher findings. Accepted findings
   are listed with reasons in `.github/zizmor.yml` (checkout credential
