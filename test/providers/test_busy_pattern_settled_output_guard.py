@@ -12,11 +12,14 @@ nor IDLE and burns its whole budget as a timeout, and InboxService (IDLE or
 COMPLETED only) starves. That is #908 -> #956 -> #974.
 
 This file enumerates the busy patterns instead of the lines: every module-level
-live-status pattern in every provider module is discovered by name and must
-reject a shared corpus of settled output. A new provider, or a new busy pattern
-in an existing one, is covered the moment it is defined -- no test has to
-remember to add it. A pattern that is deliberately loose because it is only ever
-applied inside a narrower context has to say so in ``KNOWN_LOOSE``.
+pattern in every provider module whose NAME says it is a live-status pattern
+(see ``_BUSY_NAME`` / ``_IS_PATTERN_NAME``) is discovered and must reject a
+shared corpus of settled output. The scope is the naming convention, nothing
+more: a busy pattern named outside it, or a regex inlined at its call site, is
+not covered, which is why ``test_discovery_finds_the_known_busy_patterns`` pins
+the names this file is known to depend on. A pattern that is deliberately loose
+because it is only ever applied inside a narrower context has to say so in
+``KNOWN_LOOSE``.
 """
 
 import importlib
@@ -32,8 +35,17 @@ from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 # A module-level regex is a live-status pattern if its name says so. Restricted
 # to names that end in PATTERN/_RE so shared sub-expressions (_SPINNER_VERB, a
 # verb character class) are not treated as line patterns in their own right.
-_BUSY_NAME = re.compile(r"SPINNER|PROCESSING|WORKING|BUSY")
+# PROGRESS is codex's word for it (TUI_PROGRESS_PATTERN); BACKGROUND_WAIT is
+# claude_code's still-running-task line, a PROCESSING signal on both of its
+# paths. Plain WAIT would also pull in the WAITING_* user-prompt patterns,
+# which are not busy signals.
+_BUSY_NAME = re.compile(r"SPINNER|PROCESSING|WORKING|BUSY|PROGRESS|BACKGROUND_WAIT")
 _IS_PATTERN_NAME = re.compile(r"(?:PATTERN|_RE)$")
+# A string pattern's flags are the call site's choice (cursor_cli and codex
+# search several of theirs with IGNORECASE), so string patterns are compiled
+# with the superset. For a "must not match" check more flags can only make the
+# guard stricter, never let a hit through.
+_STRING_PATTERN_FLAGS = re.MULTILINE | re.IGNORECASE
 
 # Settled output: finished responses, tool-call lines and static chrome. None of
 # these is a live spinner, in any provider's TUI, and no busy pattern may match
@@ -112,6 +124,11 @@ KNOWN_LOOSE = {
         "applied between separators. NEW_TUI_BOX_SPINNER_PATTERN is the tight "
         "line-level form used next to the input box."
     ),
+    "claude_code.SEPARATOR_WALK_SPINNER_PATTERN": (
+        "Any glyph + ellipsis, applied by get_status() only to the lines between "
+        "the last two separators, where the newest TUI draws nothing but the "
+        "live turn. It matches the version footer and a '·' bullet on its own."
+    ),
     "codex.PROCESSING_PATTERN": (
         "Legacy keyword list (thinking|working|running|...) that no status path "
         "applies any more: codex's own comment notes it matches 'running' in "
@@ -122,10 +139,12 @@ KNOWN_LOOSE = {
     ),
     "cursor_cli.PROCESSING_PATTERN": (
         "KNOWN LIVE GAP, sibling of GH #974: the glyph class includes '·' with "
-        "no first-word gerund anchor, so a settled '·' bullet or the version "
-        "footer directly above the last separator reads PROCESSING on "
-        "cursor_cli's backwards walk (cursor_cli.py:728). Tracked for its own "
-        "issue; listed here so this guard stays green on it without hiding it."
+        "no first-word anchor, so a settled '·' bullet or the version footer "
+        "directly above the last separator reads PROCESSING in "
+        "cursor_cli.get_status(), which inlines this regex in its walk back "
+        "from the last separator and uses the name for its last-marker "
+        "fallback. Tracked for its own issue; listed here so this guard stays "
+        "green on it without hiding it."
     ),
 }
 
@@ -144,7 +163,7 @@ def _discover():
                 compiled = value
             elif isinstance(value, str):
                 try:
-                    compiled = re.compile(value, re.MULTILINE)
+                    compiled = re.compile(value, _STRING_PATTERN_FLAGS)
                 except re.error:  # a fragment that is not valid on its own
                     continue
             else:
@@ -157,16 +176,26 @@ DISCOVERED = _discover()
 
 
 def test_discovery_finds_the_known_busy_patterns():
-    """Renaming a pattern out of the naming convention must not drop coverage."""
+    """Renaming a pattern out of the naming convention must not drop coverage.
+
+    This list is the guard's declared scope: every busy pattern this file is
+    known to cover, by name, one per naming token in ``_BUSY_NAME``. A pattern
+    that is not here and not named to the convention is not covered.
+    """
     names = {qualname for qualname, _ in DISCOVERED}
     for expected in (
         "claude_code.REDUCED_MOTION_SPINNER_PATTERN",
         "claude_code.NEW_TUI_BOX_SPINNER_PATTERN",
+        "claude_code.AFTER_SUMMARY_SPINNER_PATTERN",
+        "claude_code.SEPARATOR_WALK_SPINNER_PATTERN",
+        "claude_code.BACKGROUND_WAIT_PATTERN",
+        "codex.TUI_PROGRESS_PATTERN",
         "cursor_cli.PROCESSING_PATTERN",
         "minimax_code._PROCESSING_HEAD_PATTERN",
+        "omp._WORKING_PATTERN",
+        "copilot_cli.COPILOT_BUSY_ROW_PATTERN",
     ):
         assert expected in names, f"{expected} no longer discovered; fix _BUSY_NAME"
-    assert len(names) >= 15
 
 
 @pytest.mark.parametrize("qualname,pattern", [pytest.param(q, p, id=q) for q, p in DISCOVERED])
@@ -176,11 +205,11 @@ def test_busy_pattern_rejects_settled_output(qualname, pattern):
     hits = [line for line in ALL_SETTLED_LINES if pattern.search(line)]
     assert not hits, (
         f"{qualname} reads settled output as a live spinner: {hits}. A busy "
-        f"pattern that matches finished output pins PROCESSING on the unscoped "
-        f"screen scan (GH #974). Anchor the match -- e.g. require the first "
-        f"word after the glyph to be a gerund, as claude_code._SPINNER_VERB "
-        f"does -- or add {qualname} to KNOWN_LOOSE with the scoping that makes "
-        f"it safe."
+        f"pattern that matches finished output pins PROCESSING wherever it is "
+        f"applied to rows that have settled (GH #974). Anchor the match on "
+        f"something only the spinner prints, or scope the call site to the row "
+        f"the spinner can occupy (the newest row above the input box) and add "
+        f"{qualname} to KNOWN_LOOSE naming that scope."
     )
 
 

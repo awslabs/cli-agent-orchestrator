@@ -301,6 +301,11 @@ NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+" + 
 # ("✢ Dilly-dallying…") are a live spinner here too; a plain "\w*ing\b" let
 # them read COMPLETED after "✻ Pondered for 8s" (PR #975 review, P3-4).
 AFTER_SUMMARY_SPINNER_PATTERN = re.compile(r"[✶✢✽✻✳·*][ \t]+" + _SPINNER_VERB + r"[^\n]*…")
+# Any glyph + ellipsis, for get_status()'s walk back from the last separator:
+# deliberately loose (no verb, "·" included, "*" excluded) because it is applied
+# only to the lines between the last two separators, where the newest TUI
+# draws nothing but the live turn. Named so the busy-pattern guard sees it.
+SEPARATOR_WALK_SPINNER_PATTERN = re.compile(r"[✶✢✽✻✳·][^\n]*\u2026")
 # Live spinner under Claude Code's prefersReducedMotion setting (GH #908): the
 # animated glyph is replaced by a static "●", e.g. "● Leavening… (running
 # UserPromptSubmit hook)" or "● Sublimating… (12s · ↓ 300 tokens)". "●" is also
@@ -1127,8 +1132,8 @@ class ClaudeCodeProvider(BaseProvider):
         if _sep_positions and not _boxless_completion_tail:
             pre_sep_lines = output[: _sep_positions[-1]].rstrip("\n").split("\n")
             for line in reversed(pre_sep_lines):
-                if re.search(
-                    r"[✶✢✽✻✳·][^\n]*\u2026", line
+                if SEPARATOR_WALK_SPINNER_PATTERN.search(
+                    line
                 ) or REDUCED_MOTION_SPINNER_PATTERN.search(line):
                     return TerminalStatus.PROCESSING  # spinner before another separator
                 if _sep_re.search(line):
