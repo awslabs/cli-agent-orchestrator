@@ -74,6 +74,12 @@ class TestNormalizeWorkingDirectory:
         with pytest.raises(WorkingDirectoryError, match="leaves drive C:"):
             normalize_working_directory(r"C:\..\..\Windows", mnt_root=mnt)
 
+    def test_unmounted_root_means_no_drives_not_an_error(self, tmp_path):
+        """No ``/mnt`` at all (macOS, plain Linux): a Windows spelling is a
+        clear 400, and nothing request-derived is ever stat'ed to find out."""
+        with pytest.raises(WorkingDirectoryError, match="drive C: is not mounted"):
+            normalize_working_directory(r"C:\proj", mnt_root=tmp_path / "absent")
+
     def test_missing_directory_is_not_created(self, mnt):
         """Pure: the spelling is cleaned, nothing is stat'ed or made. Creation
         is ``ensure_working_directory``'s job, at the point of use."""
@@ -110,9 +116,9 @@ class TestNormalizeWorkingDirectory:
             normalize_working_directory(str(target), mnt_root=mnt)
 
     def test_unknown_user_tilde_is_a_clear_error(self, mnt):
-        """``expanduser`` raises RuntimeError for ``~nobody``; that has to
-        become the same error family every other unusable spelling produces,
-        or the endpoints answer 500."""
+        """``os.path.expanduser`` hands ``~nobody/...`` back untouched; that has
+        to become the same error family every other unusable spelling
+        produces, not a relative-path complaint and not a 500."""
         with pytest.raises(WorkingDirectoryError, match="Cannot expand"):
             normalize_working_directory("~definitely-not-a-user-here/proj", mnt_root=mnt)
 

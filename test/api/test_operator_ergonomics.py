@@ -514,7 +514,7 @@ class TestWorkingDirectoryNormalizationAtTheBoundary:
         mnt = tmp_path / "mnt"
         (mnt / "c").mkdir(parents=True)
         with (
-            patch("cli_agent_orchestrator.utils.paths.Path.is_dir", return_value=True),
+            patch("cli_agent_orchestrator.utils.paths._mounted_drives", return_value={"c"}),
             patch("cli_agent_orchestrator.api.main.terminal_service") as ts,
             patch("cli_agent_orchestrator.api.main.session_service") as svc,
         ):

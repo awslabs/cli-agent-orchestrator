@@ -55,6 +55,24 @@ def normalized_path(path: "str | Path") -> str:
     return os.path.realpath(os.path.expanduser(str(path)))
 
 
+def _mounted_drives(mnt_root: Path) -> set[str]:
+    """Drive letters present under the WSL interop mount, lower-cased.
+
+    Lists the (constant) mount root rather than stat'ing a path assembled from
+    the request, so no request-derived string reaches a filesystem call inside
+    the normalizer (CodeQL py/path-injection). ``/mnt`` holds a handful of
+    entries; a missing or unreadable root simply means no drives.
+    """
+    try:
+        return {
+            entry.name.lower()
+            for entry in mnt_root.iterdir()
+            if len(entry.name) == 1 and entry.name.isalpha() and entry.is_dir()
+        }
+    except OSError:
+        return set()
+
+
 def normalize_working_directory(
     working_directory: Optional[str],
     mnt_root: Path = Path("/mnt"),
@@ -67,9 +85,9 @@ def normalize_working_directory(
     inside WSL where those paths only exist under the ``/mnt/<drive>/`` interop
     mount, so every such launch used to fail as an opaque 500 deep in tmux.
 
-    PURE: this function never stats, creates or otherwise touches the target
-    (the one filesystem probe is whether the drive mount itself exists). It
-    does exactly four things:
+    PURE: this function never stats, creates or otherwise touches the target;
+    its one filesystem read is a listing of the constant mount root, to learn
+    which drives exist. It does exactly four things:
 
     - Strips surrounding quotes and whitespace.
     - Expands ``~``.
@@ -105,7 +123,7 @@ def normalize_working_directory(
     if match:
         drive, rest = match.group(1).lower(), match.group(2).replace("\\", "/")
         drive_mount = Path(os.path.normpath(mnt_root / drive))
-        if not drive_mount.is_dir():
+        if drive not in _mounted_drives(mnt_root):
             raise WorkingDirectoryError(
                 f"{working_directory!r} is a Windows path, but drive {drive.upper()}: "
                 f"is not mounted at {drive_mount}. Use the Linux path instead."
@@ -118,18 +136,21 @@ def normalize_working_directory(
         logger.info("Translated Windows path %r -> %s", working_directory, translated)
         cleaned = str(translated)
 
-    try:
-        path = Path(cleaned).expanduser()
-    except RuntimeError as e:
-        # ``~nobody/proj`` for a user that does not exist: no home to expand
-        # into. Same contract as every other unusable spelling, a clear 400.
-        raise WorkingDirectoryError(f"Cannot expand {cleaned!r}: {e}")
+    # ``os.path.expanduser`` (string-level, the same call the path policy
+    # itself uses) rather than ``Path.expanduser()``: the latter raises for an
+    # unknown ``~user`` and is treated as a path sink by the analyser, the
+    # former hands the spelling back untouched, which the check below turns
+    # into the same clear 400 every other unusable spelling gets.
+    expanded = os.path.expanduser(cleaned)
+    if expanded.startswith("~"):
+        # ``~nobody/proj`` for a user that does not exist: no home to expand into.
+        raise WorkingDirectoryError(f"Cannot expand {cleaned!r}: no home directory for that user")
     # Lexical normalization: ``a/../b`` cancels ``a`` on paper, but a later
     # ``mkdir(parents=True)`` walks the literal components and would
     # materialize ``a`` on its way to ``b``. Deliberately not ``resolve()``:
     # symlinks are the policy check's canonicalization concern, and following
     # them needs the path to exist.
-    path = Path(os.path.normpath(path))
+    path = Path(os.path.normpath(expanded))
     if len(str(path)) > WORKING_DIRECTORY_MAX_LEN:
         raise WorkingDirectoryError(
             f"Working directory path is too long "
@@ -174,26 +195,32 @@ def validate_working_directory(working_directory: str) -> str:
         WorkingDirectoryError: relative, blocked, beneath a blocked subtree,
             an existing non-directory, or no existing ancestor at all.
     """
-    # Checked first so the message says what is wrong. Not just files: a FIFO,
-    # socket or device node would otherwise fail later inside tmux with
-    # exactly the opaque error the normalization exists to prevent. The
-    # ``os.path`` predicates swallow OSError (ENAMETOOLONG, EACCES on a parent)
-    # and answer False, which is fine here: a target the OS cannot even stat is
-    # refused by the mkdir in ensure_working_directory instead.
-    expanded = os.path.expanduser(working_directory)
-    if os.path.exists(expanded) and not os.path.isdir(expanded):
-        raise WorkingDirectoryError(f"{expanded!r} is not a folder")
+    # The policy helper runs FIRST and is the only thing that sees the raw
+    # value: it canonicalizes (realpath), containment-checks and applies the
+    # blocked-directory rules, so everything below operates on its sanitised
+    # output and no request-derived string reaches a filesystem call here
+    # (CodeQL py/path-injection). ``allow_file=True`` only so an existing
+    # non-directory comes back to us instead of being reported as "does not
+    # exist"; the blocked-subtree rules still apply to it.
     try:
-        return resolve_and_validate_path(
+        real = resolve_and_validate_path(
             working_directory,
             allow_create=True,
-            allow_file=False,
+            allow_file=True,
             description="Working directory",
         )
     except ValueError as e:
         raise WorkingDirectoryError(str(e)) from e
     except OSError as e:  # defensive: the policy helper swallows these today
         raise WorkingDirectoryError(f"Working directory {working_directory!r} cannot be used: {e}")
+    # Not just files: a FIFO, socket or device node would otherwise fail later
+    # inside tmux with exactly the opaque error the normalization exists to
+    # prevent. The ``os.path`` predicates swallow OSError (ENAMETOOLONG, EACCES
+    # on a parent) and answer False, which is fine: a target the OS cannot even
+    # stat is refused by the mkdir in ensure_working_directory instead.
+    if os.path.exists(real) and not os.path.isdir(real):
+        raise WorkingDirectoryError(f"{real!r} is not a folder")
+    return real
 
 
 def ensure_working_directory(working_directory: str) -> str:
