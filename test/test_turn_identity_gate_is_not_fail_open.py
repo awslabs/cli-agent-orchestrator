@@ -244,6 +244,13 @@ def test_the_status_a_client_reads_still_carries_which_turn_earned_it(_finished_
         body = Terminal(**terminal_service.get_terminal("term735")).model_dump()
 
     assert body["status"] == TerminalStatus.COMPLETED.value, "fixture no longer reads COMPLETED"
+    # The pair must come from ONE lock read. Two separate reads (get_status(),
+    # then a generation accessor) let a detector apply this turn's PROCESSING in
+    # between and pair the previous turn's COMPLETED with the new turn's stamp,
+    # which is a reading the gate below would wrongly accept (review P3-2; the
+    # separate accessor was removed so no caller can pair them again).
+    _finished_turn.status_observation.assert_called_once()
+    _finished_turn.get_status.assert_not_called()
 
     reads = []
 

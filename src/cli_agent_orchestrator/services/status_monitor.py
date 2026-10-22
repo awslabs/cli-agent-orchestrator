@@ -940,27 +940,6 @@ class StatusMonitor:
             applied = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
             return StatusObservation(applied, self._status_generation.get(terminal_id, 0))
 
-    def status_generation(self, terminal_id: str) -> Optional[int]:
-        """Return the output generation ``_last_status`` was last EARNED at.
-
-        The read-only half of :meth:`status_observation`. ``get_terminal`` does
-        not call this: it reads the (status, generation) pair atomically via
-        ``status_observation`` instead, because two separate lock acquisitions
-        would let a detector apply a fresh verdict in between and pair the
-        previous turn's COMPLETED with the new turn's generation (#735). This
-        method remains for a caller that genuinely only needs the generation on
-        its own, with no corresponding status read to keep in sync with it.
-
-        Returns None for event-inbox backends (herdr), which derive status on demand
-        and never advance the generation, matching ``status_observation``.
-        """
-        from cli_agent_orchestrator.backends.registry import get_backend
-
-        if get_backend().supports_event_inbox():
-            return None
-        with self._lock:
-            return self._status_generation.get(terminal_id, 0)
-
     def notify_input_sent(self, terminal_id: str, *, assume_processing: bool = False) -> None:
         """Arm the next PROCESSING transition.
 
