@@ -945,32 +945,180 @@ class TestCodexProfileDocumentedForm:
         ), "the log still tells operators to write a [profiles.<name>] block"
 
 
-# Codex's own rejection, verbatim from codex-cli 0.162.1, as the pane wraps it
-# after codex prints it and exits back to the shell.
-CONFIG_REJECTION_PANE = """\
-$ codex --profile cao_reviewer --no-alt-screen --disable shell_snapshot
-Error: --profile `cao_reviewer` cannot be used while
-/home/op/.codex/config.toml contains legacy `profile = "cao_reviewer"` or
-`[profiles.cao_reviewer]` config; move those settings into
-/home/op/.codex/cao_reviewer.config.toml and remove the legacy profile
-selector/table. See https://developers.openai.com/codex/config-advanced#profiles
-for more information.
-$ """
+# Real captures of codex's config rejection. tmux 3.8, `new-session -x <W> -y 50`,
+# `capture-pane -e -p -S -200` (CAO's own path, clients/tmux.py get_history) with
+# and without `-J`, escape-stripped, blank rows dropped. bash with
+# PS1='op@devbox:~/repo$ ' (CAO does not forward PS1, so a pane shows the
+# operator's own, prefixed, prompt) and a `codex` on PATH that prints
+# codex-cli 0.163.0's one-line rejection verbatim to stderr and exits 1. The
+# real binary, pointed at a CODEX_HOME holding a `[profiles.cao_reviewer]`
+# table, printed the identical line and wrapped identically at 220 columns.
+CONFIG_REJECTION_LAUNCH_ROW = (
+    "op@devbox:~/repo$ codex --profile cao_reviewer --no-alt-screen --disable shell_snapshot"
+)
+CONFIG_REJECTION_LINE = (
+    "Error: --profile `cao_reviewer` cannot be used while /home/op/.codex/config.toml "
+    'contains legacy `profile = "cao_reviewer"` or `[profiles.cao_reviewer]` config; '
+    "move those settings into /home/op/.codex/cao_reviewer.config.toml and remove the "
+    "legacy profile selector/table. See "
+    "https://developers.openai.com/codex/config-advanced#profiles for more information."
+)
+CONFIG_REJECTION_EXIT_PROMPT = "op@devbox:~/repo$ "
+# `capture-pane -J`, which _find_startup_config_error asks for: tmux rejoins its
+# own soft wraps, so each logical line is ONE row at any pane width. Identical
+# at 220 and at 80 columns.
+CONFIG_REJECTION_PANE = "\n".join(
+    [CONFIG_REJECTION_LAUNCH_ROW, CONFIG_REJECTION_LINE, CONFIG_REJECTION_EXIT_PROMPT]
+)
+# The same pane WITHOUT -J, as tmux renders it: hard-wrapped at the exact column
+# (inside a word when that is where the column falls), trailing spaces trimmed,
+# leading spaces kept. 220 is CAO's default pane width (clients/tmux.py); an
+# operator attaching from a smaller terminal shrinks the window to theirs.
+CONFIG_REJECTION_PANE_WRAPPED = {
+    220: (
+        "op@devbox:~/repo$ codex --profile cao_reviewer --no-alt-screen --disable shell_snapshot\n"
+        "Error: --profile `cao_reviewer` cannot be used while /home/op/.codex/config.toml "
+        'contains legacy `profile = "cao_reviewer"` or `[profiles.cao_reviewer]` config; '
+        "move those settings into /home/op/.codex/cao_reviewer.confi\n"
+        "g.toml and remove the legacy profile selector/table. See "
+        "https://developers.openai.com/codex/config-advanced#profiles for more information.\n"
+        "op@devbox:~/repo$"
+    ),
+    120: (
+        "op@devbox:~/repo$ codex --profile cao_reviewer --no-alt-screen --disable shell_snapshot\n"
+        "Error: --profile `cao_reviewer` cannot be used while /home/op/.codex/config.toml "
+        'contains legacy `profile = "cao_reviewe\n'
+        'r"` or `[profiles.cao_reviewer]` config; move those settings into '
+        "/home/op/.codex/cao_reviewer.config.toml and remove th\n"
+        "e legacy profile selector/table. See "
+        "https://developers.openai.com/codex/config-advanced#profiles for more information.\n"
+        "op@devbox:~/repo$"
+    ),
+    80: (
+        "op@devbox:~/repo$ codex --profile cao_reviewer --no-alt-screen --disable shell_s\n"
+        "napshot\n"
+        "Error: --profile `cao_reviewer` cannot be used while /home/op/.codex/config.toml\n"
+        ' contains legacy `profile = "cao_reviewer"` or `[profiles.cao_reviewer]` config;\n'
+        " move those settings into /home/op/.codex/cao_reviewer.config.toml and remove th\n"
+        "e legacy profile selector/table. See https://developers.openai.com/codex/config-\n"
+        "advanced#profiles for more information.\n"
+        "op@devbox:~/repo$"
+    ),
+}
+# Two more real unjoined captures: a macOS-style home split at the dot, and a
+# short home at 80 columns where the wrap lands INSIDE the distinguishing
+# phrase ("co" / "ntains legacy") -- the shape the first detector missed.
+CONFIG_REJECTION_PANE_WRAPPED_MAC_HOME_220 = (
+    "op@devbox:~/repo$ codex --profile cao_reviewer --no-alt-screen --disable shell_snapshot\n"
+    "Error: --profile `cao_reviewer` cannot be used while "
+    "/Users/firstname.lastname/.codex/config.toml contains legacy "
+    '`profile = "cao_reviewer"` or `[profiles.cao_reviewer]` config; move those settings '
+    "into /Users/firstname.\n"
+    "lastname/.codex/cao_reviewer.config.toml and remove the legacy profile selector/table. "
+    "See https://developers.openai.com/codex/config-advanced#profiles for more information.\n"
+    "op@devbox:~/repo$"
+)
+CONFIG_REJECTION_PANE_WRAPPED_ROOT_HOME_80 = (
+    "op@devbox:~/repo$ codex --profile cao_reviewer --no-alt-screen --disable shell_s\n"
+    "napshot\n"
+    "Error: --profile `cao_reviewer` cannot be used while /root/.codex/config.toml co\n"
+    'ntains legacy `profile = "cao_reviewer"` or `[profiles.cao_reviewer]` config; mo\n'
+    "ve those settings into /root/.codex/cao_reviewer.config.toml and remove the lega\n"
+    "cy profile selector/table. See https://developers.openai.com/codex/config-advanc\n"
+    "ed#profiles for more information.\n"
+    "op@devbox:~/repo$"
+)
+
+
+def _tmux_hard_wrap(logical_line: str, width: int) -> list[str]:
+    """The rows tmux's default capture returns for one logical line at ``width``.
+
+    Split at the exact column, trailing spaces trimmed, leading spaces kept.
+    ``test_wrap_model_reproduces_the_real_captures`` pins this to the real
+    tmux output above, so the width sweep below is grounded, not assumed.
+    """
+    return [logical_line[i : i + width].rstrip() for i in range(0, len(logical_line), width)]
+
+
+def _render_wrapped_pane(logical_lines: list[str], width: int) -> str:
+    return "\n".join(row for line in logical_lines for row in _tmux_hard_wrap(line, width))
+
+
+def _rejection_pane_for(home: str, name: str) -> list[str]:
+    """Codex's rejection as logical lines for another CODEX_HOME and profile name."""
+    return [
+        CONFIG_REJECTION_LAUNCH_ROW.replace("cao_reviewer", name),
+        CONFIG_REJECTION_LINE.replace("/home/op", home).replace("cao_reviewer", name),
+        CONFIG_REJECTION_EXIT_PROMPT,
+    ]
 
 
 class TestCodexConfigRejectionDiagnostic:
     """#967: a rejected config must not surface as a generic init timeout."""
 
-    def test_rejection_is_found_and_reassembled_across_wrapped_rows(self):
+    def test_joined_capture_yields_the_whole_line_and_not_the_prompt(self):
+        """The production capture (-J): the message is codex's line, exactly."""
         message = _find_config_rejection(CONFIG_REJECTION_PANE)
 
-        assert message is not None, "codex's config rejection was not detected in the pane"
-        # The actionable half is at the far end of the wrapped line; a detector
-        # that returned only the matching row would drop it.
-        assert "cao_reviewer.config.toml" in message, "the file to create is not in the message"
-        assert "cannot be used while" in message
-        # Must not swallow the shell prompt codex exits back to.
-        assert not message.rstrip().endswith("$")
+        assert message == CONFIG_REJECTION_LINE
+        # The actionable half is at the far end of the line; a detector that
+        # returned only a wrapped row would drop or split it.
+        assert "/home/op/.codex/cao_reviewer.config.toml" in message
+        # Must not swallow the (prefixed) shell prompt codex exits back to.
+        assert "op@devbox" not in message
+
+    @pytest.mark.parametrize("width", sorted(CONFIG_REJECTION_PANE_WRAPPED))
+    def test_wrapped_capture_is_detected_without_the_prompt_at_every_width(self, width):
+        """A capture that kept tmux's soft wraps still detects, and still stops
+        at the prefixed prompt. The path in it is context only (it is split at
+        220 columns); the operator-facing text names the file from CAO's data."""
+        message = _find_config_rejection(CONFIG_REJECTION_PANE_WRAPPED[width])
+
+        assert message is not None, f"not detected at {width} columns"
+        assert message.startswith("Error:")
+        assert "op@devbox" not in message, f"prompt absorbed at {width} columns: {message!r}"
+        assert "for more information." in message, "the message was cut short"
+
+    @pytest.mark.parametrize(
+        "pane",
+        [CONFIG_REJECTION_PANE_WRAPPED_MAC_HOME_220, CONFIG_REJECTION_PANE_WRAPPED_ROOT_HOME_80],
+        ids=["mac-home-220", "root-home-80-wrap-inside-phrase"],
+    )
+    def test_wrap_inside_the_phrase_or_the_home_path_still_detects(self, pane):
+        message = _find_config_rejection(pane)
+
+        assert message is not None
+        assert "op@devbox" not in message
+
+    @pytest.mark.parametrize("width", sorted(CONFIG_REJECTION_PANE_WRAPPED))
+    def test_wrap_model_reproduces_the_real_captures(self, width):
+        """Grounds the sweep below: the simulated wrap IS what tmux 3.8 returned."""
+        rendered = _render_wrapped_pane(
+            [CONFIG_REJECTION_LAUNCH_ROW, CONFIG_REJECTION_LINE, CONFIG_REJECTION_EXIT_PROMPT],
+            width,
+        )
+        assert rendered == CONFIG_REJECTION_PANE_WRAPPED[width]
+
+    @pytest.mark.parametrize("width", range(40, 241))
+    def test_detection_and_prompt_exclusion_hold_at_every_pane_width(self, width):
+        """The class, not the instance: at ANY width an attached terminal can
+        impose, for several CODEX_HOME shapes and profile names, the unjoined
+        capture is detected and never absorbs the prompt. A wrap can land
+        anywhere -- inside the phrase, the path or the prompt glyph's word."""
+        for home in (
+            "/home/op",
+            "/root",
+            "/Users/firstname.lastname",
+            "/data/projects/team-alpha/agents/.config/codex-home",
+        ):
+            for name in ("cao_reviewer", "r", "a-very-long-profile-name_for_the_sweep"):
+                pane = _render_wrapped_pane(_rejection_pane_for(home, name), width)
+                message = _find_config_rejection(pane)
+                assert message is not None, f"not detected: width={width} home={home} name={name}"
+                assert message.startswith("Error:"), (width, home, name, message)
+                assert (
+                    "op@devbox" not in message
+                ), f"prompt absorbed: width={width} home={home} name={name}: {message!r}"
 
     def test_clean_startup_pane_is_not_flagged(self):
         assert _find_config_rejection(SETTLED) is None
@@ -1100,6 +1248,68 @@ class TestCodexConfigRejectionDiagnostic:
                 await provider.initialize()
 
         assert "cao_reviewer.config.toml" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_startup_check_asks_the_backend_for_joined_rows(self, mock_tmux):
+        """tmux wraps codex's one-line rejection at the exact pane column, often
+        inside the path the operator needs; only tmux itself can rejoin it."""
+        mock_tmux.return_value.get_history.return_value = CONFIG_REJECTION_PANE
+        provider = CodexProvider("tid", "sess", "win", None)
+
+        await provider._find_startup_config_error()
+
+        mock_tmux.return_value.get_history.assert_called_once_with("sess", "win", join_wrapped=True)
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex.agent_profiles.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_message_names_the_file_from_codex_profile_not_from_the_pane(
+        self, mock_tmux, mock_load, mock_wait_shell, mock_wait_status, mock_sleep
+    ):
+        """A backend that hands back unjoined rows splits the path mid-word
+        (``cao_reviewer.confi`` / ``g.toml`` at 220 columns). The instruction
+        must still name the right file, from the codexProfile CAO launched
+        with; the pane text is quoted as context after it."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_tmux.return_value.get_history.return_value = CONFIG_REJECTION_PANE_WRAPPED[220]
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = "cao_reviewer"
+        mock_profile.provider_init_timeout = None
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "reviewer")
+
+        with patch.object(
+            provider, "_handle_trust_prompt", new=AsyncMock(return_value="unresolved")
+        ):
+            with pytest.raises(ProviderError) as excinfo:
+                await provider.initialize()
+
+        message = str(excinfo.value)
+        instruction, _, context = message.partition("Codex said:")
+        assert "$CODEX_HOME/cao_reviewer.config.toml" in instruction, message
+        assert "--profile cao_reviewer" in instruction
+        assert "op@devbox" not in message, "the shell prompt leaked into the operator message"
+        assert context.lstrip().startswith("Error:"), "codex's own text is not quoted"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_message_without_a_launched_profile_names_the_placeholder(self, mock_tmux):
+        mock_tmux.return_value.get_history.return_value = CONFIG_REJECTION_PANE
+        provider = CodexProvider("tid", "sess", "win", None)
+
+        detail = await provider._find_startup_config_error()
+
+        assert detail is not None
+        assert "$CODEX_HOME/<name>.config.toml" in detail
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)

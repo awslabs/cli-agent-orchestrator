@@ -160,15 +160,26 @@ TURN_ACTIVITY_PATTERN = r"^[^\S\n]*[•◦└■]"
 # CAO's own (previously wrong) docs got a message pointing at host slowness
 # rather than at the config line they needed to move (#967). Matched on the
 # distinguishing phrase rather than the whole sentence because codex
-# interpolates absolute CODEX_HOME paths into it and the pane wraps them.
-# Verified against codex-cli 0.162.1.
+# interpolates absolute CODEX_HOME paths into it. Verified against codex-cli
+# 0.162.1 and 0.163.0.
 CONFIG_PROFILE_ERROR_PATTERN = r"cannot be used while.*contains legacy"
-# How many pane rows the wrapped rejection message may span. Observed at 6 rows
-# on an 80-column pane with a short CODEX_HOME; the cap keeps the reassembled
-# string from absorbing the shell prompt codex exits back to.
+# The same phrase with every space removed, matched against text that has had
+# ALL its whitespace removed. tmux wraps codex's one-line message at the exact
+# pane column, inside words when that is where the column falls ("co" /
+# "ntains legacy" on an 80-column pane with a short CODEX_HOME), and a joiner
+# cannot know whether a wrap fell inside a word or on a space tmux then
+# trimmed. Comparing with no whitespace on either side makes detection
+# independent of the pane width.
+_CONFIG_PROFILE_ERROR_COMPACT = re.compile(CONFIG_PROFILE_ERROR_PATTERN.replace(" ", ""))
+# How many pane rows a rejection that still carries the pane's soft wraps may
+# span. Observed at 5 rows on an 80-column pane with a short CODEX_HOME. A
+# capture taken with get_history(join_wrapped=True) holds the message as ONE
+# row, so this bounds only the fallback for captures that were not joined.
 CONFIG_ERROR_MESSAGE_ROWS = 8
-# A row that is nothing but the shell prompt codex exits back to. Marks the end
-# of the wrapped rejection message.
+# A row that is nothing but a bare shell prompt glyph. Ends the wrapped
+# rejection message when the launch row (and so the real prompt prefix) is not
+# in the capture; a usual prompt is prefixed (`operator@host:/repo$`) and is
+# recognised from the launch row instead, see _find_config_rejection().
 SHELL_PROMPT_ONLY_PATTERN = r"^[$%#>❯›»]\s*$"
 # The shell prompt plus the `codex` invocation CAO itself typed to start this
 # terminal. Anchors _find_config_rejection() on the most recent launch attempt:
@@ -179,8 +190,9 @@ SHELL_PROMPT_ONLY_PATTERN = r"^[$%#>❯›»]\s*$"
 # `❯`), so the glyph is matched anywhere on the row, not only at column 0. The failure
 # direction of the wider match is a false negative (a rejection row that happens to
 # contain `$ codex` is taken as a launch line and the generic timeout stands), which is
-# the safe one.
-LAUNCH_COMMAND_PATTERN = r".*[$%#>❯›»]\s*codex\b"
+# the safe one. The `prompt` group is everything before `codex`: the operator's prompt
+# as this pane renders it, which is also what codex exits back to.
+LAUNCH_COMMAND_PATTERN = r"(?P<prompt>.*[$%#>❯›»])\s*codex\b"
 
 # Workspace trust/approval prompt shown when Codex opens a new directory.
 # Two known variants:
@@ -510,15 +522,31 @@ def _banner_version(text: str) -> tuple[int, int, int]:
     return (major, minor, patch)
 
 
+def _without_whitespace(text: str) -> str:
+    """``text`` with every whitespace character removed."""
+    return "".join(text.split())
+
+
 def _find_config_rejection(clean_output: str) -> Optional[str]:
     """Return codex's config-rejection message from a pane capture, or None.
 
     Codex prints this and exits before any banner, so the pane text is the ONLY
     evidence of the failure that reaches CAO -- there is no exit status to read
-    back through tmux. Reassembled across rows because the message is one long
-    logical line that the pane hard-wraps, and the part an operator actually
-    needs (the ``<name>.config.toml`` path to move settings into) is at the far
-    end of it.
+    back through tmux.
+
+    Codex prints the rejection as ONE logical line. Captured with
+    ``get_history(join_wrapped=True)`` (``capture-pane -J``) it arrives as one
+    row whatever the pane width, and that row is the message. A capture that
+    still carries the pane's soft wraps (a backend without the flag, or a
+    caller that did not ask for joined rows) is reassembled across the rows
+    after the anchor instead. Such a reassembly is CONTEXT ONLY: tmux wraps at
+    the exact pane column, so a word can be split (``cao_reviewer.confi`` /
+    ``g.toml`` at CAO's default 220 columns), and the joiner cannot tell a
+    split word from a space tmux trimmed at the row end. The operator-facing
+    text therefore names the file from CAO's own data, not from this string
+    (see CodexProvider._find_startup_config_error). Detection compares with all
+    whitespace removed, so a wrap that lands inside the distinguishing phrase
+    cannot hide the rejection either.
 
     Scans only the most recent launch attempt, not the whole scrollback: tmux
     retains history across restarts, so an old rejection from a previous
@@ -528,29 +556,45 @@ def _find_config_rejection(clean_output: str) -> Optional[str]:
     LAUNCH_COMMAND_PATTERN (the `$ codex ...` CAO itself typed); a pane
     fragment with no visible launch line (e.g. captured mid-attempt) falls
     back to scanning everything, keeping the LAST match as before.
+
+    The launch row also shows what this pane's shell prompt looks like: all of
+    it before ``codex``. The prompt codex exits back to is normally prefixed
+    (``op@devbox:~/repo$``), which a bare-glyph test does not recognise, so the
+    message would otherwise absorb it (and anything typed after it). A row
+    that starts with the launch row's prompt ends the message.
     """
     rows = [line.strip() for line in clean_output.splitlines() if line.strip()]
+    prompt_prefix = ""
     for index in range(len(rows) - 1, -1, -1):
-        if re.match(LAUNCH_COMMAND_PATTERN, rows[index]):
+        launch = re.match(LAUNCH_COMMAND_PATTERN, rows[index])
+        if launch:
             rows = rows[index:]
+            prompt_prefix = launch.group("prompt").strip()
             break
+
+    def ends_message(row: str) -> bool:
+        if prompt_prefix and row.startswith(prompt_prefix):
+            return True
+        return re.match(SHELL_PROMPT_ONLY_PATTERN, row) is not None
+
     rejection = None
     for index, row in enumerate(rows):
         # Anchor on the row that OPENS the message, not on the row carrying the
-        # distinguishing phrase: the pane wraps "cannot be used while" and
-        # "contains legacy" onto different rows, so the phrase only exists once
-        # the rows are rejoined.
+        # distinguishing phrase: an unjoined pane wraps "cannot be used while"
+        # and "contains legacy" onto different rows, so the phrase only exists
+        # once the rows are rejoined.
         if not re.match(ERROR_PATTERN, row):
             continue
         message_rows = [row]
         for continuation in rows[index + 1 : index + CONFIG_ERROR_MESSAGE_ROWS]:
             # Stop at the prompt codex exits back to, so the operator-facing
-            # string cannot absorb it or anything typed after it.
-            if re.match(SHELL_PROMPT_ONLY_PATTERN, continuation):
+            # string cannot absorb it or anything typed after it. On a joined
+            # capture this stops at once: the whole message is the anchor row.
+            if ends_message(continuation):
                 break
             message_rows.append(continuation)
         joined = " ".join(message_rows)
-        if re.search(CONFIG_PROFILE_ERROR_PATTERN, joined):
+        if _CONFIG_PROFILE_ERROR_COMPACT.search(_without_whitespace(joined)):
             rejection = joined
     return rejection
 
@@ -1321,6 +1365,12 @@ class CodexProvider(BaseProvider):
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        # The codex `--profile <name>` the last _build_codex_command() launched
+        # with, or None for a --yolo launch. Read by _find_startup_config_error()
+        # so the operator is told which $CODEX_HOME/<name>.config.toml to create
+        # from CAO's own data rather than from pane text the terminal may have
+        # wrapped mid-path (#967).
+        self._launched_codex_profile: Optional[str] = None
         # Explicit per-call override for profile.model, see _build_codex_command.
         self._model = model
         # The release in the startup banner, and whether it ends each turn with
@@ -1537,7 +1587,9 @@ class CodexProvider(BaseProvider):
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
+        self._launched_codex_profile = None
         if profile and profile.codexProfile and not yolo:
+            self._launched_codex_profile = profile.codexProfile
             command_parts = ["codex", "--profile", profile.codexProfile]
         else:
             if profile and profile.codexProfile:
@@ -2011,8 +2063,15 @@ class CodexProvider(BaseProvider):
         its existing failure. Called only from paths that are already failing.
         """
         try:
+            # Joined rows: codex prints the rejection as one long line and tmux
+            # wraps it at the exact pane column, often inside the very path the
+            # operator needs (#967). Asking tmux to rejoin its own wraps is the
+            # one way to get that line back intact at any pane width.
             output = await asyncio.to_thread(
-                get_backend().get_history, self.session_name, self.window_name
+                get_backend().get_history,
+                self.session_name,
+                self.window_name,
+                join_wrapped=True,
             )
         except Exception:
             # A transient capture failure must not replace the startup failure
@@ -2029,10 +2088,19 @@ class CodexProvider(BaseProvider):
         rejection = _find_config_rejection(clean_output)
         if not rejection:
             return None
+        # The file to create is named from CAO's own data (the codexProfile it
+        # launched with), never parsed back out of the pane: a backend that
+        # does not join wrapped rows can hand back the path split mid-word, and
+        # the quoted codex text below is context, not the instruction.
+        name = self._launched_codex_profile or "<name>"
+        config_file = "$CODEX_HOME/<name>.config.toml".replace("<name>", name)
         detail = (
-            f"Codex refused to start and exited: {rejection}"
-            " -- CAO launched `codex --profile` because the agent profile sets"
-            " codexProfile; see 'Custom Codex Profile' in docs/codex-cli.md."
+            f"Codex refused to start and exited: it rejects `--profile {name}`."
+            f" Move that profile's settings into {config_file} (under ~/.codex/ when"
+            " CODEX_HOME is unset) and remove the legacy profile table or selector"
+            " from config.toml; see 'Custom Codex Profile' in docs/codex-cli.md."
+            " CAO passed --profile because the agent profile sets codexProfile."
+            f" Codex said: {rejection}"
         )
         # Logged as well as raised: the raised text reaches the caller that
         # requested this terminal, but an operator debugging a failed fleet

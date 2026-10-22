@@ -1831,6 +1831,7 @@ class TmuxClient:
         strip_escapes: bool = False,
         full_history: bool = False,
         visible_only: bool = False,
+        join_wrapped: bool = False,
     ) -> str:
         """Get window history.
 
@@ -1845,6 +1846,13 @@ class TmuxClient:
             full_history: If True, capture entire scrollback buffer (overrides tail_lines)
             visible_only: If True, capture exactly the currently rendered viewport
                 (``-S 0``) and nothing from scrollback (overrides tail_lines/full_history)
+            join_wrapped: If True, rows that tmux soft-wrapped at the pane width
+                come back rejoined into the logical line the program wrote
+                (``capture-pane -J``). A one-line message a CLI printed is one
+                row whatever the pane width, instead of N rows split at the
+                exact column -- often inside a word, as with codex's config
+                rejection at CAO's default 220 columns (#967). ``-J`` also keeps
+                trailing spaces, which the default capture trims.
 
         Raises:
             ValueError: The session or window is genuinely gone.
@@ -1875,6 +1883,8 @@ class TmuxClient:
             else:
                 lines = tail_lines if tail_lines is not None else TMUX_HISTORY_LINES
                 flags = ["-p", "-S", f"-{lines}"]
+            if join_wrapped:
+                flags = ["-J"] + flags
             if not strip_escapes:
                 flags = ["-e"] + flags
             result = pane.cmd("capture-pane", *flags)
