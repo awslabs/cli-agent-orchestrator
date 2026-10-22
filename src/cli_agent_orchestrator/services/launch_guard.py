@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from cli_agent_orchestrator.services import approval_gate, settings_service, workflow_journal
 from cli_agent_orchestrator.utils import agent_profiles
@@ -40,13 +40,26 @@ _SETTINGS_FAILURE_MESSAGE = (
 )
 
 
-def capture() -> Dict[str, Any]:
+def capture(
+    profile_set: Optional[Mapping[str, agent_profiles.ProfileEntry]] = None,
+) -> Dict[str, Any]:
+    """Record the launch state a run is admitted under: one digest per installed profile, plus memory.
+
+    ``profile_set`` is the snapshot ``manifest_freeze.freeze_manifest`` already read for the ``plan_id``
+    (``FrozenManifest.profile_set``). Both start paths MUST pass it: the approval gate ran against that
+    snapshot, and a second read here would record whatever is on disk after the gate — so a profile
+    edited in that window was recorded as the approved state and ``check`` accepted it for the rest of
+    the run (PR #1000, P3-3). ``test_callsite_lint_rules`` fails any production call that omits it.
+    ``None`` reads the set now, for callers with no freeze (tests, and a freeze that never reached the
+    profile set).
+    """
     if not settings_service.is_workflow_approval_required():
         return {"approval_required": False}
     try:
-        names = sorted({profile["name"] for profile in agent_profiles.list_agent_profiles()})
+        if profile_set is None:
+            profile_set = agent_profiles.read_profile_set()
         return {
-            "profiles": {name: _profile_digest(name) for name in names},
+            "profiles": {name: _entry_digest(profile_set[name]) for name in sorted(profile_set)},
             "memory_enabled": settings_service.is_memory_enabled(),
         }
     except Exception as exc:

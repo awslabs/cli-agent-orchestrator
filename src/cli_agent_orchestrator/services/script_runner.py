@@ -1337,11 +1337,17 @@ async def run_script_workflow(
     #   * OUTSIDE the ``try`` around ``insert_run`` below, so an approval refusal
     #     cannot be handled as a journal fault (best-effort when enforcement is off).
     # No-ops entirely when enforcement is disabled through the explicit opt-out.
-    # Bind the launch state at admission, before the gate can yield to an edit.
+    # Bind the launch state at admission, before the gate can yield to an edit. The guard is built from
+    # the SAME profile-set read the plan_id was computed from, so a profile edited between the freeze
+    # and this line cannot be recorded as the approved state (PR #1000, P3-3).
     # Defer a capture refusal until after the gate to preserve its 403/503 precedence.
     capture_error = None
     try:
-        guard = await asyncio.to_thread(launch_guard.capture)
+        # Called inside the lambda, not passed to to_thread as a value, so the call-site lint
+        # (test_callsite_lint_rules rule 4) can see the keyword.
+        guard = await asyncio.to_thread(
+            lambda: launch_guard.capture(profile_set=frozen.profile_set)
+        )
     except approval_gate.PlanIdentityUnavailableError as exc:
         capture_error = exc
     manifest_json = frozen.manifest_json

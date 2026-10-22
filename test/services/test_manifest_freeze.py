@@ -409,3 +409,40 @@ def test_a_profile_that_vanishes_mid_scan_still_freezes_to_an_identity_matching_
     monkeypatch.setattr(agent_profiles, "_read_agent_profile_source", _vanished)
     raced = _frozen()["plan_id"]
     assert raced not in {present, absent}
+
+
+def test_the_freeze_returns_the_profile_set_read_its_plan_id_was_computed_from(
+    tmp_path, monkeypatch
+):
+    """P3-3: one read, shared. ``profile_set`` digests to the value folded into this plan_id, so the
+    launch guard built from it describes the admitted state and not a later one."""
+    _store(tmp_path, monkeypatch, reviewer="---\nname: reviewer\n---\nA.")
+    frozen = manifest_freeze.freeze_manifest(source_hash="h", inputs={}, cwd=str(tmp_path))
+    assert frozen.profile_set is not None
+    assert "reviewer" in frozen.profile_set
+    assert frozen.profile_set["reviewer"].source == "---\nname: reviewer\n---\nA."
+    plan_from_snapshot = manifest_freeze.freeze_manifest(
+        source_hash="h", inputs={}, cwd=str(tmp_path)
+    )
+    assert (
+        json.loads(plan_from_snapshot.manifest_json)["plan_id"]
+        == json.loads(frozen.manifest_json)["plan_id"]
+    )
+    # The snapshot is what the digest hashed: it reproduces the live digest while nothing changed, and
+    # keeps reproducing the FROZEN one after an edit the live store no longer matches.
+    live_before = agent_profiles.profile_set_digest()
+    assert agent_profiles.profile_set_digest(frozen.profile_set) == live_before
+    (tmp_path / "agent-store" / "reviewer.md").write_text("---\nname: reviewer\n---\nB.")
+    assert agent_profiles.profile_set_digest() != live_before
+    assert agent_profiles.profile_set_digest(frozen.profile_set) == live_before
+
+
+def test_a_freeze_that_fails_before_the_profile_set_carries_no_snapshot(monkeypatch):
+    monkeypatch.setattr(
+        manifest_freeze,
+        "derive_baseline",
+        lambda root: {"available": False, "reason": "git_timeout"},
+    )
+    frozen = manifest_freeze.freeze_manifest(source_hash="h", inputs={})
+    assert frozen.manifest_json is None
+    assert frozen.profile_set is None

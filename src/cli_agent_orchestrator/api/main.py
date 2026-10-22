@@ -6101,10 +6101,16 @@ async def submit_workflow_run_endpoint(
         manifest_json = frozen.manifest_json
         try:
             # Keep the admission snapshot even if the profile set changes during
-            # the gate. Preserve the gate's refusal precedence on capture failure.
+            # the gate: the guard is built from the SAME profile-set read the plan_id
+            # was computed from (PR #1000, P3-3). Preserve the gate's refusal
+            # precedence on capture failure.
             capture_error = None
             try:
-                guard = await asyncio.to_thread(launch_guard.capture)
+                # Called inside the lambda, not passed to to_thread as a value, so the
+                # call-site lint (test_callsite_lint_rules rule 4) can see the keyword.
+                guard = await asyncio.to_thread(
+                    lambda: launch_guard.capture(profile_set=frozen.profile_set)
+                )
             except approval_gate.PlanIdentityUnavailableError as exc:
                 capture_error = exc
             approval_gate.ensure_plan_approved(
