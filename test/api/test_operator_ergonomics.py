@@ -127,6 +127,32 @@ class TestFsDirs:
         assert resp.status_code == 200
         assert resp.json()["parent"] is None
 
+    @pytest.mark.parametrize("blocked", ["/etc", "/etc/ssh", "/proc", "/root", "/dev"])
+    def test_blocked_system_subtrees_are_not_listable(self, client, blocked):
+        """Nothing under these can ever be a working directory, so listing
+        them is pure disclosure: refused at any depth with the policy's own
+        wording. (CodeQL round 2 on #1036: this is also what makes the
+        canonical path, not the request string, the value that reaches
+        ``exists``/``is_dir``/``iterdir``.)"""
+        resp = client.get("/fs/dirs", params={"path": blocked})
+        assert resp.status_code == 400, resp.json()
+        assert "not allowed" in resp.json()["detail"]
+
+    @pytest.mark.parametrize("root", ["/", "/tmp", "/var"])
+    def test_exact_match_roots_stay_listable_so_a_picker_can_descend(self, client, root):
+        """``/``, ``/tmp`` and ``/var`` are refused AS working directories but
+        projects live beneath them; a folder picker has to pass through."""
+        resp = client.get("/fs/dirs", params={"path": root})
+        assert resp.status_code == 200, resp.json()
+        assert isinstance(resp.json()["dirs"], list)
+
+    def test_symlink_into_a_blocked_subtree_is_refused_after_resolution(self, client, tmp_path):
+        link = tmp_path / "escape"
+        link.symlink_to("/etc")
+        resp = client.get("/fs/dirs", params={"path": str(link)})
+        assert resp.status_code == 400
+        assert "not allowed" in resp.json()["detail"]
+
     def test_unreadable_folder_is_a_400_not_a_500(self, client, tmp_path):
         # Simulate EACCES on iterdir without depending on running as non-root.
         with patch("cli_agent_orchestrator.api.main.Path.iterdir", side_effect=PermissionError):

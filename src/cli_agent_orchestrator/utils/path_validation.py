@@ -82,9 +82,14 @@ BLOCKED_SYSTEM_SUBTREES = frozenset(
 _BLOCKED_SUBTREE_EXCEPTIONS = ("/dev/shm",)
 
 
-def _blocked_reason(real_path: str) -> str:
-    """Return why ``real_path`` is refused, or an empty string if it is allowed."""
-    if real_path in BLOCKED_SYSTEM_DIRECTORIES:
+def _blocked_reason(real_path: str, *, include_exact: bool = True) -> str:
+    """Return why ``real_path`` is refused, or an empty string if it is allowed.
+
+    ``include_exact=False`` applies only the subtree half of the policy, for
+    callers that LIST rather than use a directory (see
+    :func:`resolve_listable_path`).
+    """
+    if include_exact and real_path in BLOCKED_SYSTEM_DIRECTORIES:
         return f"blocked system path {real_path}"
     for allowed in _BLOCKED_SUBTREE_EXCEPTIONS:
         if real_path == allowed or real_path.startswith(allowed + "/"):
@@ -178,6 +183,40 @@ def resolve_and_validate_path(
         )
     if not os.path.isdir(ancestor_real):
         raise ValueError(f"{description} has no existing ancestor directory: {path}")
+    return real_path
+
+
+def resolve_listable_path(path: str, description: str = "Path") -> str:
+    """Canonicalize a directory an operator wants to LIST, not use.
+
+    For the ``GET /fs/dirs`` folder picker (#724). Same canonicalization and
+    containment guard as :func:`resolve_and_validate_path`, and the SUBTREE
+    half of its policy: nothing beneath ``/etc``, ``/proc``, ``/sys``,
+    ``/dev`` (bar ``/dev/shm``), ``/root``, the system binary and library
+    trees or the cron spool is listable at any depth, because no working
+    directory can ever live there and a listing of them is pure disclosure.
+    The EXACT-match roots (``/``, ``/tmp``, ``/var`` and their macOS
+    ``/private`` twins) stay listable, unlike for a working directory:
+    projects live beneath them and a picker has to pass through them to get
+    there. Existence and directory-ness are the caller's concern, so it can
+    report them with its own wording.
+
+    Returns:
+        Canonicalized absolute path.
+
+    Raises:
+        ValueError: If the path is relative after canonicalization or lies
+            inside a blocked system subtree.
+    """
+    path = os.path.expanduser(path)
+    real_path = os.path.realpath(os.path.abspath(path))
+    # Containment guard, as in resolve_and_validate_path: always true after
+    # realpath(), kept explicit for the analyser's two-state taint model.
+    if not real_path.startswith("/"):
+        raise ValueError(f"{description} must be an absolute path: {path}")
+    reason = _blocked_reason(real_path, include_exact=False)
+    if reason:
+        raise ValueError(f"{description} not allowed: {path} (resolves to {reason})")
     return real_path
 
 

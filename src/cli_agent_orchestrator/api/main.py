@@ -188,7 +188,10 @@ from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.forwarded_env import ForwardedEnvError, validate_forwarded_env
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
-from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
+from cli_agent_orchestrator.utils.path_validation import (
+    resolve_and_validate_path,
+    resolve_listable_path,
+)
 from cli_agent_orchestrator.utils.paths import WorkingDirectoryError, normalize_working_directory
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
@@ -3178,21 +3181,31 @@ async def list_directories(
 
     Read-scope gated when auth is enabled, like ``GET /settings/agent-dirs``.
     Be clear about what that gate protects: this endpoint ENUMERATES child
-    directory names for any path the server user can read, with no root
-    confinement, which is a materially stronger disclosure than the
-    existence-and-creatability oracle a caller already has through
-    ``working_directory``. Under the default localhost-only posture that is
-    the operator reading their own filesystem; once auth is enabled it means a
-    read-scope token can walk the tree. Confining it to a configurable root is
-    the obvious hardening if that ever becomes the deployment shape.
+    directory names for any path the server user can read, which is a
+    materially stronger disclosure than the existence-and-creatability oracle
+    a caller already has through ``working_directory``. The one confinement
+    is the path policy's blocked SUBTREES (``/etc``, ``/proc``, ``/sys``,
+    ``/dev``, ``/root``, the system binary and library trees): nothing there
+    can ever be a working directory, so nothing there is listed, at any depth.
+    ``/`` and ``/tmp`` themselves stay listable so a picker can descend
+    through them. Under the default localhost-only posture the rest is the
+    operator reading their own filesystem; once auth is enabled it means a
+    read-scope token can walk the allowed tree. Confining it to a configurable
+    root is the obvious further hardening if that ever becomes the deployment
+    shape.
     """
     try:
         # ``normalize_working_directory`` returns None for a blank or
         # quotes-only value, which must fall back to the documented home
         # default -- ``Path("")`` would silently resolve to the server's CWD.
+        # Only the policy helper's canonical output reaches a filesystem call
+        # below (realpath + containment + blocked-subtree check; CodeQL
+        # py/path-injection): the normalized request string never does.
         normalized = normalize_working_directory(path) if path else None
-        resolved = Path(normalized) if normalized else Path.home()
-        resolved = resolved.resolve()
+        if normalized is None:
+            resolved = Path.home().resolve()
+        else:
+            resolved = Path(resolve_listable_path(normalized, description="Folder"))
         # Both probes sit inside the try: a component over NAME_MAX makes
         # exists()/is_dir() raise OSError, which the arm below turns into a 400.
         if not resolved.exists():

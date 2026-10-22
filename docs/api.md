@@ -175,11 +175,14 @@ See [Agent Profiles](agent-profile.md) and
   It accepts the same operator-typed spellings `working_directory` accepts
   (see Sessions and terminals) but never creates anything, and it is
   read-scope gated like `GET /settings/agent-dirs`. Note what it discloses:
-  child directory names for any path the server user can read, with no root
-  confinement. That is stronger than the existence check `working_directory`
-  already gives a caller, so under an auth-enabled deployment a read-scope
-  token can enumerate the filesystem; confine it to a root if that is your
-  deployment shape.
+  child directory names for any path the server user can read, confined
+  only by the path policy's blocked subtrees (`/etc`, `/proc`, `/sys`,
+  `/dev`, `/root`, the system binary and library trees are refused at any
+  depth; `/` and `/tmp` themselves stay listable so a picker can descend
+  through them). That is still stronger than the existence check
+  `working_directory` already gives a caller, so under an auth-enabled
+  deployment a read-scope token can enumerate the allowed tree; confine it
+  to a root if that is your deployment shape.
 
 ### Skills
 

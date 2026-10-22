@@ -360,3 +360,44 @@ class TestBlockedSubtrees:
         look = tmp_path / "etc_like"
         look.mkdir()
         assert resolve_and_validate_path(str(look)) == os.path.realpath(str(look))
+
+
+class TestResolveListablePath:
+    """The listing variant for ``GET /fs/dirs``: subtree policy only."""
+
+    def _fn(self):
+        from cli_agent_orchestrator.utils.path_validation import resolve_listable_path
+
+        return resolve_listable_path
+
+    @pytest.mark.parametrize("root", ["/", "/tmp", "/var"])
+    def test_exact_match_roots_are_listable(self, root):
+        assert self._fn()(root) == os.path.realpath(root)
+
+    @pytest.mark.parametrize("blocked", ["/etc", "/etc/ssh", "/proc/1", "/root", "/dev", "/sys"])
+    def test_blocked_subtrees_are_refused_at_any_depth(self, blocked):
+        with pytest.raises(ValueError, match="not allowed"):
+            self._fn()(blocked)
+
+    def test_dev_shm_carve_out_still_applies(self):
+        assert self._fn()("/dev/shm") == os.path.realpath("/dev/shm")
+
+    def test_canonicalizes_and_follows_symlinks_before_judging(self, tmp_path):
+        real = tmp_path / "real"
+        real.mkdir()
+        (tmp_path / "link").symlink_to(real)
+        assert self._fn()(str(tmp_path / "link" / ".." / "real")) == os.path.realpath(real)
+        escape = tmp_path / "escape"
+        escape.symlink_to("/etc")
+        with pytest.raises(ValueError, match="not allowed"):
+            self._fn()(str(escape))
+
+    def test_missing_target_is_not_its_concern(self, tmp_path):
+        """Existence is reported by the caller with its own wording."""
+        target = tmp_path / "nope"
+        assert self._fn()(str(target)) == os.path.realpath(target)
+        assert not target.exists()
+
+    def test_description_lands_in_the_message(self):
+        with pytest.raises(ValueError, match="Folder not allowed"):
+            self._fn()("/etc", description="Folder")
