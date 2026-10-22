@@ -176,7 +176,8 @@ class TestCreateSession:
         tmux.server.cmd.side_effect = [
             MagicMock(returncode=1, stdout=[], stderr=["server exited unexpectedly"]),
             MagicMock(returncode=0, stdout=[], stderr=[]),
-            MagicMock(returncode=0, stdout=[], stderr=[]),  # history-limit read (#728)
+            # history-limit read: the fresh server's default (#728)
+            MagicMock(returncode=0, stdout=["history-limit 2000"], stderr=[]),
             MagicMock(returncode=0, stdout=[], stderr=[]),  # history-limit set (#728)
         ]
 
@@ -184,15 +185,11 @@ class TestCreateSession:
             tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
 
         exit_empty = call("start-server", ";", "set-option", "-s", "exit-empty", "off")
-        history_limit_read = call("show-options", "-g", "history-limit")
-        history_limit_set = call(
-            "start-server", ";", "set-option", "-g", "history-limit", str(TMUX_HISTORY_LIMIT)
-        )
         assert tmux.server.cmd.call_args_list == [
             exit_empty,
             exit_empty,
-            history_limit_read,
-            history_limit_set,
+            _READ_HISTORY_LIMIT,
+            _SET_HISTORY_LIMIT,
         ]
         mock_sleep.assert_called_once_with(tmux._EXIT_EMPTY_RETRY_DELAY_S)
         assert "exit-empty" not in caplog.text
@@ -387,69 +384,130 @@ class TestCreateSessionEnvironmentFiltering:
         assert "MY_CUSTOM_THING" not in env
 
 
-# ── _set_server_history_limit (raise-only, #728) ─────────────────────
+# ── _set_server_history_limit (floor, #728) ──────────────────────────
+
+_READ_HISTORY_LIMIT = call("start-server", ";", "show-options", "-g", "history-limit")
+_SET_HISTORY_LIMIT = call(
+    "start-server", ";", "set-option", "-g", "history-limit", str(TMUX_HISTORY_LIMIT)
+)
+
+
+def _server_reporting(history_limit, *, then=None):
+    """A ``server.cmd`` side effect whose ``show-options`` answers ``history_limit``.
+
+    ``history_limit`` may be an int (a live value), ``None`` (the read fails),
+    or a list of raw stdout lines. ``then`` supplies results for the calls that
+    follow the read, in order; the default is success.
+    """
+    following = list(then or [])
+
+    def cmd(*args):
+        if "show-options" in args:
+            if history_limit is None:
+                return MagicMock(returncode=1, stdout=[], stderr=["error connecting"])
+            if isinstance(history_limit, list):
+                return MagicMock(returncode=0, stdout=history_limit, stderr=[])
+            return MagicMock(returncode=0, stdout=[f"history-limit {history_limit}"], stderr=[])
+        if following:
+            return following.pop(0)
+        return MagicMock(returncode=0, stdout=[], stderr=[])
+
+    return cmd
 
 
 class TestSetServerHistoryLimit:
-    """CAO shares the operator's tmux server, so raising its scrollback must
-    never lower a value the operator already configured (synthesis.md #1)."""
+    """CAO shares the operator's tmux server. The scrollback raise is a FLOOR:
+    a global at or above CAO's value is left alone, a lower one is raised, and
+    a value that cannot be read is never overwritten."""
 
-    def test_lower_existing_limit_is_preserved(self, tmux):
-        """An operator-set 100000 must survive a CAO session launch unchanged."""
-        tmux.server.cmd.side_effect = [
-            MagicMock(returncode=0, stdout=["history-limit 100000"], stderr=[]),
-            MagicMock(returncode=0, stdout=[], stderr=[]),
-        ]
+    def test_the_read_starts_the_server_in_the_same_invocation(self, tmux):
+        """So a clean socket reads the fresh server's value (2000, or whatever
+        the operator's .tmux.conf says) instead of failing, and the
+        ``set-option`` that follows cannot overwrite a dotfile value the read
+        never saw."""
+        tmux.server.cmd.side_effect = _server_reporting(2000)
 
         tmux._set_server_history_limit()
 
-        tmux.server.cmd.assert_any_call(
-            "start-server", ";", "set-option", "-g", "history-limit", "100000"
-        )
+        assert tmux.server.cmd.call_args_list[0] == _READ_HISTORY_LIMIT
+
+    def test_higher_existing_limit_is_left_alone(self, tmux):
+        """An operator-set 100000 must survive a CAO session launch untouched:
+        no ``set-option`` at all, not a set to the same value."""
+        tmux.server.cmd.side_effect = _server_reporting(100000)
+
+        tmux._set_server_history_limit()
+
+        assert tmux.server.cmd.call_args_list == [_READ_HISTORY_LIMIT]
+
+    def test_limit_already_at_the_floor_is_left_alone(self, tmux):
+        tmux.server.cmd.side_effect = _server_reporting(TMUX_HISTORY_LIMIT)
+
+        tmux._set_server_history_limit()
+
+        assert tmux.server.cmd.call_args_list == [_READ_HISTORY_LIMIT]
 
     def test_default_limit_is_raised_to_cao_floor(self, tmux):
         """tmux's own 2000 default is below CAO's floor and gets raised."""
-        tmux.server.cmd.side_effect = [
-            MagicMock(returncode=0, stdout=["history-limit 2000"], stderr=[]),
-            MagicMock(returncode=0, stdout=[], stderr=[]),
-        ]
+        tmux.server.cmd.side_effect = _server_reporting(2000)
 
         tmux._set_server_history_limit()
 
-        tmux.server.cmd.assert_any_call(
-            "start-server", ";", "set-option", "-g", "history-limit", str(TMUX_HISTORY_LIMIT)
-        )
+        assert tmux.server.cmd.call_args_list == [_READ_HISTORY_LIMIT, _SET_HISTORY_LIMIT]
 
-    def test_clean_socket_falls_back_to_cao_default(self, tmux):
-        """No server up yet to read from -- nothing to preserve, use CAO's default."""
-        tmux.server.cmd.side_effect = [
-            MagicMock(returncode=1, stdout=[], stderr=["error connecting"]),
-            MagicMock(returncode=0, stdout=[], stderr=[]),
-        ]
+    def test_an_operators_lower_limit_is_raised_too(self, tmux):
+        """This is a floor, not a preservation of whatever is there: an
+        operator who set 1000 gets CAO's value on this server. The override
+        for that operator is ``CAO_TMUX_HISTORY_LIMIT`` (docs/tmux.md)."""
+        tmux.server.cmd.side_effect = _server_reporting(1000)
 
         tmux._set_server_history_limit()
 
-        tmux.server.cmd.assert_any_call(
-            "start-server", ";", "set-option", "-g", "history-limit", str(TMUX_HISTORY_LIMIT)
-        )
+        assert tmux.server.cmd.call_args_list == [_READ_HISTORY_LIMIT, _SET_HISTORY_LIMIT]
+
+    def test_failed_read_sets_nothing(self, tmux):
+        """A live server whose value could not be read keeps it: a failed read
+        is not a licence to overwrite 100000 with 50000."""
+        tmux.server.cmd.side_effect = _server_reporting(None)
+
+        tmux._set_server_history_limit()
+
+        assert tmux.server.cmd.call_args_list == [_READ_HISTORY_LIMIT]
+
+    def test_unparseable_read_sets_nothing(self, tmux):
+        tmux.server.cmd.side_effect = _server_reporting(["history-limit lots", "noise"])
+
+        tmux._set_server_history_limit()
+
+        assert tmux.server.cmd.call_args_list == [_READ_HISTORY_LIMIT]
+
+    def test_read_failure_as_exception_sets_nothing(self, tmux):
+        tmux.server.cmd.side_effect = OSError("tmux binary missing")
+
+        tmux._set_server_history_limit()  # best-effort: must not raise
+
+        assert tmux.server.cmd.call_count == 1
 
     def test_set_is_retried_once_after_a_failed_set(self, tmux):
         """Same single-retry contract as ``_set_server_exit_empty_off``, for the
         same reason: a create right after an external ``kill-server`` can reach
         the dying old server and get ``server exited unexpectedly``."""
-        tmux.server.cmd.side_effect = [
-            MagicMock(returncode=1, stdout=[], stderr=["error connecting"]),  # read
-            MagicMock(returncode=1, stdout=[], stderr=["server exited unexpectedly"]),
-            MagicMock(returncode=0, stdout=[], stderr=[]),
-        ]
+        tmux.server.cmd.side_effect = _server_reporting(
+            2000,
+            then=[
+                MagicMock(returncode=1, stdout=[], stderr=["server exited unexpectedly"]),
+                MagicMock(returncode=0, stdout=[], stderr=[]),
+            ],
+        )
 
         with patch("cli_agent_orchestrator.clients.tmux.time.sleep") as mock_sleep:
             tmux._set_server_history_limit()
 
-        history_limit_set = call(
-            "start-server", ";", "set-option", "-g", "history-limit", str(TMUX_HISTORY_LIMIT)
-        )
-        assert tmux.server.cmd.call_args_list[1:] == [history_limit_set, history_limit_set]
+        assert tmux.server.cmd.call_args_list == [
+            _READ_HISTORY_LIMIT,
+            _SET_HISTORY_LIMIT,
+            _SET_HISTORY_LIMIT,
+        ]
         mock_sleep.assert_called_once_with(tmux._EXIT_EMPTY_RETRY_DELAY_S)
 
 
@@ -470,19 +528,18 @@ class TestCreateWindow:
 
     def test_create_window_raises_the_shared_servers_history_limit(self, tmux, tmp_path):
         """A window added to a session that predates this fix (or was created
-        by a different process) must still get the scrollback floor raised --
-        a pane reads ``history-limit`` only once, at creation (#728)."""
+        by a different process) must still get the scrollback floor raised
+        before the window exists (#728)."""
         mock_window = MagicMock()
         mock_window.name = "agent-window"
         mock_session = MagicMock()
         mock_session.new_window.return_value = mock_window
         tmux.server.sessions.get.return_value = mock_session
+        tmux.server.cmd.side_effect = _server_reporting(2000)
 
         tmux.create_window("ses", "agent-window", "tid2", str(tmp_path))
 
-        tmux.server.cmd.assert_any_call(
-            "start-server", ";", "set-option", "-g", "history-limit", str(TMUX_HISTORY_LIMIT)
-        )
+        assert _SET_HISTORY_LIMIT in tmux.server.cmd.call_args_list
 
     def test_create_window_session_not_found(self, tmux, tmp_path):
         tmux.server.sessions.get.return_value = None

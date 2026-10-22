@@ -205,11 +205,18 @@ class TestCreatePane:
         ]
 
     def test_raises_the_shared_servers_history_limit(self, tmux, tmp_path):
-        """A split pane reads ``history-limit`` at creation too, so a session
-        that predates this fix must still get the floor raised here (#728)."""
+        """A session that predates this fix must still get the scrollback floor
+        raised before the split pane exists (#728)."""
         from cli_agent_orchestrator.constants import TMUX_HISTORY_LIMIT
 
         self._session(tmux)
+
+        def cmd(*args):
+            if "show-options" in args:
+                return MagicMock(returncode=0, stdout=["history-limit 2000"], stderr=[])
+            return MagicMock(returncode=0, stdout=[], stderr=[])
+
+        tmux.server.cmd.side_effect = cmd
 
         tmux.create_pane("ses", "cao-agents", "coder-3", "tid", str(tmp_path))
 
