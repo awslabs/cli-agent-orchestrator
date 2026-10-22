@@ -18,6 +18,7 @@ from cli_agent_orchestrator.providers.codex import (
     LOGIN_MENU_FOOTER,
     LOGIN_MENU_PATTERN,
     POST_READINESS_TRANSITIONAL_REREADS,
+    STARTUP_ACTIVITY_PATTERN,
     STARTUP_PROMPT_BOTTOM_LINES,
     TRUST_PROMPT_PATTERN,
     TRUST_PROMPT_PATTERN_V2,
@@ -27,6 +28,7 @@ from cli_agent_orchestrator.providers.codex import (
     _has_approval_modal_in_bottom,
     _has_approval_prompt_in_bottom,
     _has_startup_idle_composer,
+    _is_pre_turn_startup_frame,
     _live_startup_block,
     _toml_override,
     _toml_scalar,
@@ -6157,3 +6159,162 @@ class TestTransitionalIsAStartupOnlyState:
         assert (
             mock_tmux.return_value.get_history.call_count == 1 + POST_READINESS_TRANSITIONAL_REREADS
         )
+
+
+class TestCodexAccountNoticeAtStartup:
+    """#739: a `•` account notice in the startup chrome blocked every launch.
+
+    Codex prints account/product notices as ordinary bullets between the
+    welcome banner and the idle composer:
+
+        • You have 1 usage limit reset available. Run /usage to use one.
+
+    Reported against a live codex-cli 0.153.2 and reproduced on 0.153.4. Two
+    independent failures on one glyph:
+
+    1. ``_has_startup_idle_composer``'s activity veto refused readiness on a
+       pane sitting at its idle composer, so ``_handle_trust_prompt`` could
+       only ever end at its ``provider_init_timeout`` outer cap and log "no
+       prompt or welcome banner detected" about a fully started Codex.
+    2. ``get_status`` took the "reply whose › user marker was evicted" branch
+       off the same bullet and answered COMPLETED for a worker that had never
+       been given a task -- the direction the code's own comment calls "the
+       dangerous case -- it tells the conductor the agent is free".
+
+    Both now go through ``_is_pre_turn_startup_frame``: a frame still showing
+    the welcome banner with no submitted user cell above the footer cutoff has
+    run no turn, so its bullets are chrome. Nothing about the notice copy is
+    matched, so the next notice Codex invents is covered too.
+    """
+
+    # The reporter's capture (issue body), 0.153.2.
+    _NOTICE_PANE = (
+        "╭──────────────────────────────────────────────────────────╮\n"
+        "│ >_ OpenAI Codex (v0.153.2)                               │\n"
+        "│ model:       gpt-5.6-sol   /model to change              │\n"
+        "│ directory:   /tmp/cao/work                               │\n"
+        "│ permissions: YOLO mode                                   │\n"
+        "╰──────────────────────────────────────────────────────────╯\n"
+        "\n"
+        "  Tip: Use /copy or press Ctrl+O to copy the latest agent response as Markdown.\n"
+        "\n"
+        "• You have 1 usage limit reset available. Run /usage to use one.\n"
+        "\n"
+        "› Ask Codex to do anything\n"
+        "\n"
+        "  gpt-5.6-sol default · /tmp/cao/work\n"
+    )
+    # @mastash3ff's capture, 0.153.4: the 0.149+ `»` composer glyph, a
+    # different Tip line, the plural notice, and a `model · path` footer.
+    _NOTICE_PANE_V2 = (
+        "╭───────────────────────────────────────────────────╮\n"
+        "│ >_ OpenAI Codex (v0.153.4)                        │\n"
+        "╰───────────────────────────────────────────────────╯\n"
+        "  Tip: [tui.keymap] in ~/.codex/config.toml lets you rebind supported shortcuts.\n"
+        "• You have 3 usage limit resets available. Run /usage to use one.\n"
+        "» Ask Codex to do anything\n"
+        "  gpt-6-astra ultra · ~/pa\n"
+    )
+
+    @pytest.mark.parametrize("pane", [_NOTICE_PANE, _NOTICE_PANE_V2])
+    def test_notice_bullet_does_not_veto_startup_readiness(self, pane):
+        # The precondition the bug rested on: the bullet IS still an
+        # STARTUP_ACTIVITY_PATTERN match in the bottom window, so this asserts
+        # the new classification and not a changed capture.
+        tail = "\n".join(pane.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+        assert re.search(STARTUP_ACTIVITY_PATTERN, tail, re.MULTILINE) is not None
+        assert _is_pre_turn_startup_frame(pane) is True
+        assert _has_startup_idle_composer(pane) is True
+
+    @pytest.mark.parametrize("pane", [_NOTICE_PANE, _NOTICE_PANE_V2])
+    def test_notice_bullet_is_not_a_model_reply(self, pane):
+        """IDLE, not COMPLETED: the worker is ready and has nothing to report."""
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(pane) == TerminalStatus.IDLE
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.codex.asyncio.sleep", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
+    async def test_startup_handler_settles_on_a_notice_pane(self, mock_tmux, mock_sleep):
+        """End to end through the handler: "settled", not the outer cap.
+
+        On the unfixed head this loop ran the full ``outer_timeout`` and
+        returned "unresolved".
+        """
+        mock_tmux.return_value.get_history.side_effect = frames(self._NOTICE_PANE)
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        outcome = await provider._handle_trust_prompt(idle_gap=30.0, outer_timeout=30.0)
+
+        assert outcome == "settled"
+        backend = mock_tmux.return_value
+        assert [
+            call[0] for call in backend.mock_calls if call[0] in ("send_keys", "send_special_key")
+        ] == []
+
+    # ---- the veto still vetoes everything it was introduced for ----
+
+    def test_a_live_spinner_still_vetoes(self):
+        pane = self._NOTICE_PANE.replace(
+            "› Ask Codex to do anything",
+            "• Working (3s • esc to interrupt)\n\n› Ask Codex to do anything",
+        )
+        assert _has_startup_idle_composer(pane) is False
+
+    def test_a_turn_tree_row_still_vetoes(self):
+        pane = self._NOTICE_PANE.replace(
+            "› Ask Codex to do anything",
+            "• Ran ls -la\n  └ src test\n\n› Ask Codex to do anything",
+        )
+        assert _has_startup_idle_composer(pane) is False
+
+    def test_an_error_cell_still_vetoes(self):
+        pane = self._NOTICE_PANE.replace(
+            "› Ask Codex to do anything",
+            "■ stream error: request failed\n\n› Ask Codex to do anything",
+        )
+        assert _has_startup_idle_composer(pane) is False
+
+    def test_a_bullet_under_a_submitted_user_cell_still_vetoes(self):
+        """A dispatched turn is not a pre-turn frame, banner in view or not."""
+        pane = self._NOTICE_PANE.replace(
+            "› Ask Codex to do anything",
+            "› summarize the repo\n• Here is the summary you asked for.\n\n"
+            "› Ask Codex to do anything",
+        )
+        assert _is_pre_turn_startup_frame(pane) is False
+        assert _has_startup_idle_composer(pane) is False
+
+    def test_a_reply_whose_user_marker_was_evicted_is_still_completed(self):
+        """The COMPLETED branch #739 touches keeps its reason for existing.
+
+        A transcript long enough to evict its › user marker has pushed the
+        welcome banner out of the rolling buffer too, so the gate does not fire.
+        """
+        pane = (
+            "• I finished the refactor and all the tests pass.\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol default · /tmp/cao/work\n"
+        )
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(pane) == TerminalStatus.COMPLETED
+
+    def test_a_reply_that_merely_names_the_product_is_still_completed(self):
+        """A reply mentioning "OpenAI Codex" must not read as the startup banner.
+
+        ``_is_pre_turn_startup_frame`` anchors on BANNER_VERSION_PATTERN, not
+        the bare "OpenAI Codex" substring: the versioned banner line is
+        startup chrome the model does not render into a reply, so a reply
+        that merely names the product does not flip this COMPLETED to IDLE.
+        """
+        pane = (
+            "• Sure, I'm OpenAI Codex and I finished the refactor.\n"
+            "\n"
+            "› Ask Codex to do anything\n"
+            "\n"
+            "  gpt-5.6-sol default · /tmp/cao/work\n"
+        )
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        assert provider.get_status(pane) == TerminalStatus.COMPLETED

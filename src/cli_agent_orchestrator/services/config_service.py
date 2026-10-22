@@ -26,13 +26,13 @@ under the *nested* schema described in issue #357.
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.services.vault.config import VaultConfig
-from cli_agent_orchestrator.utils.atomic_file import locked_atomic_write
+from cli_agent_orchestrator.utils.atomic_file import locked_atomic_rewrite, locked_atomic_write
 
 logger = logging.getLogger(__name__)
 
@@ -255,7 +255,7 @@ def _settings_file() -> Path:
     return settings_service.SETTINGS_FILE
 
 
-def _load_raw() -> Dict[str, Any]:
+def _load_raw(*, strict: bool = False) -> Dict[str, Any]:
     """Load the unified settings file, migrating legacy config.json in place.
 
     On first run after upgrading, if a legacy ``config.json`` exists and the
@@ -268,20 +268,57 @@ def _load_raw() -> Dict[str, Any]:
     ``settings_service._save``. The read and write are still separate
     operations, so a concurrent ``set()`` from a second process during
     migration could be lost.
+
+    With ``strict`` the loader raises ``SettingsUnreadableError`` when
+    settings.json is PRESENT but cannot be read or parsed, instead of
+    answering ``{}``. Writers must pass it (GH #737): the lenient answer is
+    indistinguishable from "no settings yet", so a caller that mutates it and
+    saves publishes an empty file over the user's real one. ``strict`` still
+    merges the legacy migration into the returned dict (so a strict writer's
+    own publish carries it forward under the same lock), but does not persist
+    it itself — persisting a partial ``terminal`` object independently of a
+    strict writer's own update would permanently block the migration (GH
+    #737 follow-up).
     """
     global _migration_logged
 
+    from cli_agent_orchestrator.services import settings_service
+
     settings_file = _settings_file()
     data: Dict[str, Any] = {}
-    if settings_file.exists():
+    unreadable = False
+    try:
+        raw = settings_file.read_text()
+    except FileNotFoundError:
+        raw = None
+    except (OSError, UnicodeDecodeError) as e:
+        if strict:
+            raise settings_service.SettingsUnreadableError(settings_file, e) from e
+        logger.warning(f"Failed to read {settings_file}: {e}")
+        raw, unreadable = None, True
+    if raw is not None:
         try:
-            loaded = json.loads(settings_file.read_text())
-            if isinstance(loaded, dict):
-                data = loaded
-        except Exception as e:
+            loaded = json.loads(raw)
+        except ValueError as e:
+            if strict:
+                raise settings_service.SettingsUnreadableError(settings_file, e) from e
             logger.warning(f"Failed to read {settings_file}: {e}")
+            loaded, unreadable = None, True
+        if isinstance(loaded, dict):
+            data = loaded
+        else:
+            e2 = TypeError(f"expected a JSON object, got {type(loaded).__name__}")
+            if strict:
+                raise settings_service.SettingsUnreadableError(settings_file, e2)
+            logger.warning(f"Failed to read {settings_file}: {e2}")
+            unreadable = True
 
-    if "terminal" not in data and LEGACY_CONFIG_FILE.exists():
+    # Never migrate on top of a file we could not read: the migration writes
+    # (in non-strict mode) or merges into data a strict writer is about to
+    # publish, and either way unknown content must not be silently discarded.
+    # Reached only when the loader did not already raise above, so `data` is
+    # a real parse result (or {}) and `unreadable` is False here.
+    if not unreadable and "terminal" not in data and LEGACY_CONFIG_FILE.exists():
         try:
             legacy = json.loads(LEGACY_CONFIG_FILE.read_text())
         except Exception as e:
@@ -295,7 +332,12 @@ def _load_raw() -> Dict[str, Any]:
                 terminal_section["herdr_session"] = legacy["herdr_session"]
             if terminal_section:
                 data["terminal"] = terminal_section
-                _save_raw(data)
+                # In strict mode (called from _mutate_raw's compute), the
+                # merged data is persisted by the enclosing writer's own
+                # publish under the same lock — persisting it here too would
+                # be a second, independent write to the same file.
+                if not strict:
+                    _save_raw(data)
                 if not _migration_logged:
                     logger.info(
                         f"Migrated legacy {LEGACY_CONFIG_FILE} into {settings_file} "
@@ -319,6 +361,43 @@ def _save_raw(data: Dict[str, Any]) -> None:
     settings_file = _settings_file()
     settings_file.parent.mkdir(parents=True, exist_ok=True)
     locked_atomic_write(settings_file, json.dumps(data, indent=2), mode=0o600)
+
+
+def _mutate_raw(update: Callable[[Dict[str, Any]], None]) -> None:
+    """Fail-closed, locked read-modify-write of the unified settings file.
+
+    The ``_load_raw`` / mutate / ``_save_raw`` pair this replaces destroyed
+    data (GH #737): a settings.json with a single trailing comma loaded as
+    ``{}``, ``cao config set logging.level INFO`` added its one key to that,
+    and ``_save_raw`` published a four-line file over the user's. The load and
+    the save also took the lock separately, so two concurrent setters each
+    published their own view and the later one won whole.
+
+    ``update`` mutates the parsed settings in place while the lock is held.
+    An absent file still starts from ``{}``; a present-but-unreadable one
+    raises ``settings_service.SettingsUnreadableError`` before ``update``
+    runs, leaving the file byte-identical.
+    """
+    from cli_agent_orchestrator.services import settings_service
+
+    settings_file = _settings_file()
+
+    def compute(_existing: str) -> str:
+        # Re-read strictly rather than parsing ``_existing``: the helper hands
+        # us "" for both absent and unreadable, which is the distinction that
+        # has to fail closed here.
+        data = _load_raw(strict=True)
+        update(data)
+        return json.dumps(data, indent=2)
+
+    try:
+        locked_atomic_rewrite(settings_file, compute, mode=0o600)
+    except (OSError, UnicodeDecodeError) as e:
+        # locked_atomic_rewrite reads the file before calling compute, so
+        # undecodable bytes or OS-level read failures (permission denied,
+        # the path being a directory, ...) surface from there, ahead of our
+        # strict read.
+        raise settings_service.SettingsUnreadableError(settings_file, e) from e
 
 
 def _get_from_file(path: str) -> Any:
@@ -388,7 +467,7 @@ def _get_value(path: str, default: Any = None, override: Optional[Any] = None) -
         from cli_agent_orchestrator.services import settings_service
 
         try:
-            vault = settings_service.get_vault_config()
+            vault = settings_service.get_vault_config(canonicalize=False)
         except ValueError as exc:
             logger.warning("Invalid vault configuration disabled for config lookup: %s", exc)
             vault = VaultConfig()
@@ -442,33 +521,35 @@ def _set_value(path: str, value: Any) -> Any:
         return settings_service.set_agent_dirs({provider: value})
     if path == "agents.roles" or path.startswith("agents.roles."):
         # Write both nested and flat for backward compat
-        data = _load_raw()
-        if path == "agents.roles":
-            roles = value
-        else:
-            role_name = path.split(".", 2)[2]
-            roles = data.get("roles", {})
-            if not isinstance(roles, dict):
-                roles = {}
-            roles[role_name] = value
-        # Nested format
-        agents_section = data.get("agents", {})
-        if not isinstance(agents_section, dict):
-            agents_section = {}
-        agents_section["roles"] = roles
-        data["agents"] = agents_section
-        # Flat format
-        data["roles"] = roles
-        _save_raw(data)
+        roles: Any = {}
+
+        def update_roles(data: Dict[str, Any]) -> None:
+            nonlocal roles
+            if path == "agents.roles":
+                roles = value
+            else:
+                role_name = path.split(".", 2)[2]
+                roles = data.get("roles", {})
+                if not isinstance(roles, dict):
+                    roles = {}
+                roles[role_name] = value
+            # Nested format
+            agents_section = data.get("agents", {})
+            if not isinstance(agents_section, dict):
+                agents_section = {}
+            agents_section["roles"] = roles
+            data["agents"] = agents_section
+            # Flat format
+            data["roles"] = roles
+
+        _mutate_raw(update_roles)
         return roles
     if path.startswith("memory."):
         key = path.split(".", 1)[1]
         return settings_service.set_memory_setting(key, value)
 
     keys = _LEGACY_KEY_MAP.get(path, tuple(path.split(".")))
-    data = _load_raw()
-    _set_nested(data, keys, value)
-    _save_raw(data)
+    _mutate_raw(lambda data: _set_nested(data, keys, value))
     return value
 
 

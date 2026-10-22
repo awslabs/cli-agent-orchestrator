@@ -4,6 +4,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     IdempotencyKeyModel,
     InboxModel,
@@ -24,6 +26,58 @@ from cli_agent_orchestrator.services.memory_format import parse_index_entry
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
 logger = logging.getLogger(__name__)
+
+
+def stale_terminal_runtime_is_live(terminal: TerminalModel) -> bool:
+    """Is the agent behind this aged-out registry row still running? (#708)
+
+    Retention selects rows on ``last_active``, which is written ONLY on input
+    delivery (``send_input`` / ``send_special_key``), so a perfectly healthy
+    agent that nobody has messaged for ``RETENTION_DAYS`` is indistinguishable
+    by that column from an abandoned one. Deleting its row does not stop it --
+    ``delete_terminal_row`` drops the registry record without killing the tmux
+    window or the provider process -- but it does make it permanently
+    UNADDRESSABLE: ``create_inbox_message`` rejects a receiver with no row, and
+    ``list_pending_receiver_ids_older_than`` inner-joins ``terminals``, so every
+    message already PENDING for that receiver silently leaves the
+    reconciliation sweep forever while still reporting PENDING.
+
+    Fails CLOSED. ``cleanup_terminal_exact(..., close=False)`` proves identity
+    from the terminal's own ``@cao_terminal_id`` option rather than its
+    (reusable) session/window name, and only ``ABSENT`` -- positive proof no
+    live object carries this id -- is read as "gone". Both ``STILL_PRESENT``
+    and ``UNKNOWN`` (an unreadable listing, an ambiguous identity, or any
+    other unanswerable lookup) are treated as live and retained, because a
+    wrong "gone" is irreversible and silent whereas a wrong "live" only
+    defers the row's deletion to the next sweep.
+    """
+    backend = get_backend()
+    terminal_id = str(terminal.id)
+    session_name = str(terminal.tmux_session)
+    window_name = str(terminal.tmux_window)
+    try:
+        result = backend.cleanup_terminal_exact(terminal_id, session_name, window_name, close=False)
+    except Exception as exc:  # noqa: BLE001 — unanswerable liveness fails closed
+        logger.warning(
+            "Could not establish liveness for stale terminal %s (%s:%s); retaining it: %s",
+            terminal_id,
+            session_name,
+            window_name,
+            exc,
+        )
+        return True
+
+    if result.outcome == TerminalCleanupOutcome.ABSENT:
+        return False
+    if result.outcome == TerminalCleanupOutcome.UNKNOWN:
+        logger.warning(
+            "Could not establish liveness for stale terminal %s (%s:%s); retaining it: %s",
+            terminal_id,
+            session_name,
+            window_name,
+            result.detail,
+        )
+    return True
 
 
 def cleanup_old_data():
@@ -64,6 +118,14 @@ def cleanup_old_data():
                     "retaining it: %s",
                     terminal_id,
                     exc,
+                )
+                continue
+
+            # Age is not death (#708). A live agent's row is the only thing
+            # that makes it addressable, so never age one out.
+            if stale_terminal_runtime_is_live(terminal):
+                logger.info(
+                    "Retaining aged-out terminal %s: its runtime is still live", terminal_id
                 )
                 continue
 

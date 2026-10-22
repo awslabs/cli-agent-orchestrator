@@ -14,6 +14,7 @@ import pytest
 from cli_agent_orchestrator.services import config_service as cs
 from cli_agent_orchestrator.services import settings_service
 from cli_agent_orchestrator.services.config_service import ConfigService
+from cli_agent_orchestrator.services.settings_service import SettingsUnreadableError
 from cli_agent_orchestrator.utils import atomic_file
 
 
@@ -370,11 +371,180 @@ class TestSavePrivateAndSymlinkSafe:
 
     def test_set_does_not_follow_a_symlink(self, _isolated_settings, tmp_path):
         settings = _isolated_settings["settings"]
-        victim = tmp_path / "victim.txt"
-        victim.write_text("do not touch")
+        victim = tmp_path / "victim.json"
+        # Parseable content: since GH #737 a write over a settings.json whose
+        # content cannot be read is refused outright, so an unparseable victim
+        # would pass this test for the wrong reason (nothing written at all).
+        # The unparseable case is pinned separately below.
+        victim.write_text(json.dumps({"terminal": {"backend": "herdr"}}))
+        before = victim.read_bytes()
         settings.symlink_to(victim)
         ConfigService.set("terminal.backend", "tmux")
-        assert victim.read_text() == "do not touch"
+        assert victim.read_bytes() == before
         assert not settings.is_symlink()
         assert oct(settings.stat().st_mode & 0o777) == oct(0o600)
         assert json.loads(settings.read_text())["terminal"]["backend"] == "tmux"
+
+    def test_a_symlink_to_unparseable_content_is_left_alone(self, _isolated_settings, tmp_path):
+        """Refusing (GH #737) must not reintroduce following the link: neither
+        the victim nor the symlink itself is touched."""
+        settings = _isolated_settings["settings"]
+        victim = tmp_path / "victim.txt"
+        victim.write_text("do not touch")
+        settings.symlink_to(victim)
+        with pytest.raises(SettingsUnreadableError):
+            ConfigService.set("terminal.backend", "tmux")
+        assert victim.read_text() == "do not touch"
+        assert settings.is_symlink()
+
+
+# Every ConfigService.set path that persists: the generic nested writer, the
+# agents.roles dual-format writer, and the three that delegate to
+# settings_service setters.
+_SET_PATHS = [
+    pytest.param("logging.level", "INFO", id="generic-nested"),
+    pytest.param("terminal.backend", "tmux", id="legacy-key-map"),
+    pytest.param("agents.roles.reviewer", "x", id="agents-roles"),
+    pytest.param("agents.extra_dirs", ["/x"], id="delegated-extra-dirs"),
+    pytest.param("memory.enabled", True, id="delegated-memory"),
+    pytest.param("skills.extra_dirs", ["/x"], id="delegated-skill-dirs"),
+]
+
+
+class TestSetFailsClosedOverAnUnreadableFile:
+    """GH #737: ``cao config set`` over a settings.json that exists but cannot
+    be read loaded it as ``{}``, added its own key, and published the result —
+    deleting every other section while exiting 0. Every setter now refuses and
+    leaves the file byte-identical.
+    """
+
+    @pytest.mark.parametrize(
+        "path,value",
+        [(p.values[0], p.values[1]) for p in _SET_PATHS],
+        ids=[p.id for p in _SET_PATHS],
+    )
+    def test_unparseable_file_is_refused_and_preserved(self, _isolated_settings, path, value):
+        settings = _isolated_settings["settings"]
+        # The reporter's file: valid settings plus one trailing comma.
+        settings.write_text(
+            "{\n"
+            '  "terminal": {"backend": "tmux", "herdr_session": "cao"},\n'
+            '  "logging": {"level": "DEBUG"},\n'
+            '  "agents": {"extra_dirs": ["/important-agent-store"]},\n'
+            '  "memory": {"enabled": true, "flush_threshold": 0.5,}\n'
+            "}\n"
+        )
+        before = settings.read_bytes()
+        with pytest.raises(SettingsUnreadableError):
+            ConfigService.set(path, value)
+        assert settings.read_bytes() == before
+
+    @pytest.mark.parametrize(
+        "path,value",
+        [(p.values[0], p.values[1]) for p in _SET_PATHS],
+        ids=[p.id for p in _SET_PATHS],
+    )
+    def test_undecodable_file_is_refused_and_preserved(self, _isolated_settings, path, value):
+        """Not just bad JSON — bytes that are not even text. The read fails
+        inside the atomic-rewrite helper, ahead of the strict parse, so this
+        pins that the helper's own failure is translated rather than escaping
+        as a bare UnicodeDecodeError.
+        """
+        settings = _isolated_settings["settings"]
+        settings.write_bytes(b"\xff\xfe{}")
+        before = settings.read_bytes()
+        with pytest.raises(SettingsUnreadableError):
+            ConfigService.set(path, value)
+        assert settings.read_bytes() == before
+
+    @pytest.mark.parametrize("content", ['"just a string"', "null", "42", "[1, 2, 3]"])
+    def test_a_json_scalar_is_refused_too(self, _isolated_settings, content):
+        """A file holding a valid JSON non-object parsed fine and was ignored,
+        so the write replaced it with an object. Unknown content is unknown
+        content: refuse. Includes JSON ``null``, which used to slip through
+        because ``elif loaded is not None`` treated it as "nothing parsed"
+        rather than "not a dict"."""
+        settings = _isolated_settings["settings"]
+        settings.write_text(content)
+        with pytest.raises(SettingsUnreadableError):
+            ConfigService.set("logging.level", "INFO")
+        assert settings.read_text() == content
+
+    def test_settings_path_as_a_directory_is_refused_cleanly(self, _isolated_settings):
+        """OSError-shaped unreadability (e.g. the path being a directory, or
+        a permission fault) must translate to SettingsUnreadableError, not
+        escape as a bare OSError traceback. ``locked_atomic_rewrite``
+        pre-reads the target before ``_mutate_raw``'s own strict load runs."""
+        settings = _isolated_settings["settings"]
+        settings.mkdir()
+        with pytest.raises(SettingsUnreadableError):
+            ConfigService.set("logging.level", "INFO")
+        assert settings.is_dir()
+
+    def test_the_cli_reports_it_and_exits_non_zero(self, _isolated_settings):
+        """The pre-fix command echoed the new value and exited 0; the only
+        trace was a logger.warning invisible at the default level."""
+        from click.testing import CliRunner
+
+        from cli_agent_orchestrator.cli.commands.config import config as config_group
+
+        settings = _isolated_settings["settings"]
+        settings.write_text('{"logging": {"level": "DEBUG"},}')
+        before = settings.read_bytes()
+        result = CliRunner().invoke(config_group, ["set", "logging.level", "INFO"])
+        assert result.exit_code != 0
+        assert "could not be read" in result.output
+        assert "Nothing was written" in result.output
+        assert settings.read_bytes() == before
+
+    def test_a_readable_file_still_writes_and_keeps_its_siblings(self, _isolated_settings):
+        """The guard must not cost the happy path: a well-formed file is still
+        updated in place with every other section intact."""
+        settings = _isolated_settings["settings"]
+        settings.write_text(
+            json.dumps({"terminal": {"backend": "tmux"}, "logging": {"level": "DEBUG"}})
+        )
+        ConfigService.set("logging.level", "INFO")
+        data = json.loads(settings.read_text())
+        assert data["logging"]["level"] == "INFO"
+        assert data["terminal"] == {"backend": "tmux"}
+
+    def test_an_absent_file_is_still_created(self, _isolated_settings):
+        """ "Absent" is not "unreadable": first-run writes must keep working."""
+        settings = _isolated_settings["settings"]
+        assert not settings.exists()
+        ConfigService.set("logging.level", "INFO")
+        assert json.loads(settings.read_text())["logging"]["level"] == "INFO"
+
+    def test_migration_survives_a_strict_write(self, _isolated_settings):
+        """GH #737 follow-up: a strict write (``ConfigService.set``, which
+        calls ``_load_raw(strict=True)``) must not suppress the legacy
+        migration outright. A write that touches only ``terminal.spawn_mode``
+        used to persist a partial ``{"terminal": {"spawn_mode": ...}}``
+        section whose mere presence then permanently blocked the migration,
+        silently resetting backend/herdr_session to defaults forever after.
+        """
+        _isolated_settings["legacy"].write_text(
+            json.dumps({"terminal_backend": "herdr", "herdr_session": "my-sess"})
+        )
+        ConfigService.set("terminal.spawn_mode", "pane")
+
+        on_disk = json.loads(_isolated_settings["settings"].read_text())
+        assert on_disk["terminal"] == {
+            "backend": "herdr",
+            "herdr_session": "my-sess",
+            "spawn_mode": "pane",
+        }
+        assert ConfigService.get("terminal.backend") == "herdr"
+        assert ConfigService.get("terminal.herdr_session") == "my-sess"
+
+    def test_legacy_migration_does_not_run_over_an_unreadable_file(self, _isolated_settings):
+        """``_load_raw``'s config.json migration is itself a write. Over an
+        unreadable settings.json the lenient load saw no ``terminal`` key and
+        would have published ``{"terminal": ...}`` over it."""
+        settings = _isolated_settings["settings"]
+        _isolated_settings["legacy"].write_text(json.dumps({"terminal_backend": "herdr"}))
+        settings.write_text('{"logging": {"level": "DEBUG"},}')
+        before = settings.read_bytes()
+        ConfigService.get("logging.level")  # lenient read path, must not write
+        assert settings.read_bytes() == before
