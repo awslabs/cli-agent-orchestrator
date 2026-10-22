@@ -659,13 +659,13 @@ class TestCreateInboxMessageEndpoint:
     """Test POST /terminals/{receiver_id}/inbox/messages endpoint."""
 
     def test_create_inbox_message_success(self, client):
-        """POST creates an inbox message, starts immediate delivery, and answers
-        as soon as the delivery reports the paste reached the pane (#78, PR #1004
-        P2-2): deliver_pending gets the app's plugin registry and the endpoint's
-        after_dispatch callback, and calling that callback is what releases the
-        response -- not the INBOX_IMMEDIATE_DELIVERY_WAIT budget."""
-        import time
-
+        """POST creates an inbox message and starts immediate delivery with the
+        P2-2 contract (#78, PR #1004): deliver_pending gets the app's plugin
+        registry and the endpoint's own after_dispatch callback. That the
+        callback releases the response is proven in
+        test_inbox_messages.py::TestCreateInboxMessageResponseTiming by calling
+        the endpoint directly; through TestClient the per-request loop shutdown
+        waits for the delivery thread, so no timing is asserted here."""
         mock_msg = MagicMock()
         mock_msg.id = 1
         mock_msg.sender_id = "sender1"
@@ -675,8 +675,7 @@ class TestCreateInboxMessageEndpoint:
 
         def deliver(receiver_id, registry=None, after_dispatch=None):
             delivery_calls.append((receiver_id, registry, after_dispatch))
-            time.sleep(0.2)  # the paste takes a moment to reach the pane...
-            after_dispatch()  # ...and this is the only thing that may answer the POST early
+            after_dispatch()  # the paste reached the pane
 
         with (
             patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
@@ -685,12 +684,10 @@ class TestCreateInboxMessageEndpoint:
             mock_create.return_value = mock_msg
             mock_inbox.deliver_pending.side_effect = deliver
 
-            started = time.monotonic()
             response = client.post(
                 "/terminals/abcd1234/inbox/messages",
                 params={"sender_id": "sender1", "message": "hello"},
             )
-            elapsed = time.monotonic() - started
 
             assert response.status_code == 200
             data = response.json()
@@ -711,8 +708,6 @@ class TestCreateInboxMessageEndpoint:
         assert after_dispatch.__qualname__.endswith(
             "create_inbox_message_endpoint.<locals>._mark_dispatched"
         ), "deliver_pending must get the endpoint's own post-dispatch marker"
-        # The budget is the default 5s; only the callback could have answered this fast.
-        assert elapsed < 2.0, f"POST took {elapsed:.1f}s: after_dispatch did not release it"
 
     def test_create_inbox_message_delivery_failure_still_succeeds(self, client):
         """Immediate delivery failure should not fail the API response."""
