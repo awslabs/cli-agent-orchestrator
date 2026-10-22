@@ -201,10 +201,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so `handoff` and workflow steps tore the worker down about 2s after sending the
   task. A `●` line whose ellipsis is followed by the spinner's status in
   parentheses (a running hook, the elapsed time, the token count or `thinking`)
-  is now treated as a live spinner, whatever the message before it (#908). That
-  match additionally requires the first word after the `●` to be a gerund, so a
+  is now treated as a live spinner, whatever the message before it (#908). A
   finished response that reports its own timing — `● Done. The fix is in place…
-  (3m 12s)` — is no longer held at processing until the step times out (#974).
+  (3m 12s)` with the end-of-turn summary under it — is the same text, so the
+  rendered-screen detector now looks for a spinner only on the newest row above
+  the input box, as the raw-buffer detector already did, instead of holding the
+  worker at processing until the step timed out (#974). The same scope stops a
+  response bullet in the bottom rows from reading as a spinner.
 
 - `store_lesson` no longer decides the learning gate, authorizes itself, or opens
   SQLite inside the agent's process. It writes through a new `POST /lessons`

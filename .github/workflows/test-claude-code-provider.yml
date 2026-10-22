@@ -59,7 +59,7 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
-          # The busy-pattern guard (GH #9011) runs here too: this gate fires on a
+          # The busy-pattern guard (GH #974) runs here too: this gate fires on a
           # claude_code.py-only change, which is exactly when a spinner pattern
           # can be widened back onto settled output.
           uv run pytest test/providers/test_claude_code_unit.py \

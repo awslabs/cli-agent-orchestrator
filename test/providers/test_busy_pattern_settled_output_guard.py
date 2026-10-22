@@ -5,11 +5,12 @@ against pane text. Those patterns are each spelled out independently, and the
 tests around them only ever assert the positive direction — "this spinner line
 reads PROCESSING". Nothing asserted the inverse, so when a new busy pattern's
 match surface overlaps the glyph the same TUI uses for *finished* output, an
-ordinary settled line reads PROCESSING. On ``get_status_from_screen`` that scan
-is an unscoped ``any()`` over the bottom rows, so the settled line pins
-PROCESSING until it scrolls off: ``_wait_for_completion`` sees neither COMPLETED
-nor IDLE and burns its whole budget as a timeout, and InboxService (IDLE or
-COMPLETED only) starves. That is #908 -> #956 -> #974.
+ordinary settled line reads PROCESSING. ``get_status_from_screen`` used to take
+ANY match in the bottom rows, so the settled line pinned PROCESSING until it
+scrolled off: ``_wait_for_completion`` saw neither COMPLETED nor IDLE and
+burned its whole budget as a timeout, and InboxService (IDLE or COMPLETED only)
+starved. That is #908 -> #956 -> #974. The scan is now scoped to the newest
+conversation row above the input box; this file guards the patterns themselves.
 
 This file enumerates the busy patterns instead of the lines: every module-level
 pattern in every provider module whose NAME says it is a live-status pattern

@@ -319,18 +319,22 @@ SEPARATOR_WALK_SPINNER_PATTERN = re.compile(r"[✶✢✽✻✳·][^\n]*\u2026")
 # "● Analyzing… the diff is fine" and the tool-call line
 # "● Calling cao-mcp-server… (ctrl+o to expand)" do not match.
 #
-# GH #974: the status anchor alone is NOT enough, because a finished response
-# can carry a duration or token parenthetical of its own — "● Done. The fix is
-# in place… (3m 12s)", "● Approved the plan… (↓ 1.2k tokens)" — and "●" is the
-# response marker. That read PROCESSING on both status paths, and on the
-# get_status_from_screen() path (which scans the bottom 25 rows for ANY match,
-# with no separator scoping and no "newer output below" escape) the settled
-# line pinned PROCESSING for good: _wait_for_completion then saw neither
-# COMPLETED nor IDLE and burned its whole budget as a timeout. So ALSO require
-# the gerund as the first word, exactly as NEW_TUI_BOX_SPINNER_PATTERN does for
-# the animated glyphs and for the same reason. The task row ("Running the test
-# suite") and the "-"/"'" verbs that made #956 give up on a first-word anchor
-# all pass _SPINNER_VERB; "Done.", "Approved", "Ran" and "Fixed" do not.
+# GH #974: a finished response can carry a duration or token parenthetical of
+# its own — "● Done. The fix is in place… (3m 12s)", "● Approved the plan…
+# (↓ 1.2k tokens)" — and "●" is the response marker, so this pattern matches
+# that row too. It cannot be tightened: the message is not a property of the
+# spinner row (a custom spinnerVerbs entry, the verb a hook interrupted, a task
+# row in another language), and a first-word rule reopened #908 for all of
+# those (PR #975 review). What separates the two is POSITION. The live spinner
+# is always the newest conversation row above the input box; a finished
+# response has the end-of-turn summary under it. So both call sites apply this
+# pattern only to that row: get_status()'s input-box walk always did, and
+# get_status_from_screen() now scopes its scan the same way instead of taking
+# ANY match in the bottom 25 rows (which let the settled line pin PROCESSING
+# for good, so _wait_for_completion burned its budget as a timeout). The one
+# frame position cannot separate is a settled "●" status row directly above
+# the box with no summary painted; it reads PROCESSING, the #908 direction,
+# until a live capture of such a turn says otherwise.
 _REDUCED_MOTION_STATUS = (
     r"(?:running[ \t][^)\n]*\bhooks?\b"
     r"|\d+(?:\.\d+)?[smhd]\b"
