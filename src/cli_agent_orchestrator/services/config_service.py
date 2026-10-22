@@ -467,7 +467,7 @@ def _get_value(path: str, default: Any = None, override: Optional[Any] = None) -
         from cli_agent_orchestrator.services import settings_service
 
         try:
-            vault = settings_service.get_vault_config()
+            vault = settings_service.get_vault_config(canonicalize=False)
         except ValueError as exc:
             logger.warning("Invalid vault configuration disabled for config lookup: %s", exc)
             vault = VaultConfig()

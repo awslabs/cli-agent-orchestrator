@@ -33,6 +33,7 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1265,22 +1266,19 @@ async def _drive_frozen(
 
 
 async def _persist_generation_best_effort(record: ScriptRunRecord) -> None:
-    """Persist a bumped generation on the timeout arm (best-effort, INV-4/INV-6).
+    """Persist a bumped generation while settling a run (best-effort, INV-4/INV-6).
 
-    Unlike the load-bearing pre-spawn/cancel bumps (which surface a persist
-    failure to the caller), the timeout-arm bump happens while finalizing a run
-    that already failed — a persist failure here only degrades the straggler
-    fence for an already-dead run, so it is logged + swallowed rather than raised.
+    Used by timeout and admission-cancel finalization. A persist failure degrades
+    the generation fence, so it is logged and swallowed rather than preventing
+    the run from settling.
     """
     from cli_agent_orchestrator.services.workflow_service import update_run_generation
 
     try:
         await asyncio.to_thread(update_run_generation, record.run_id, record.generation)
-    except (
-        Exception
-    ) as e:  # noqa: BLE001 — timeout-arm gen persist is best-effort; run already FAILED (INV-4)
+    except Exception as e:  # noqa: BLE001 — generation persist is best-effort (INV-4)
         logger.warning(
-            "journal: timeout-arm generation bump persist for run '%s' failed: %s",
+            "journal: generation bump persist for run '%s' failed: %s",
             record.run_id,
             e,
         )
@@ -1307,11 +1305,9 @@ async def run_script_workflow(
     register the live record; (2) spawn with the constructed env (INV-2); (3) drain
     both pipes concurrently while awaiting exit under the wall-clock bound, then
     give the drain ``WORKFLOW_SCRIPT_TERM_GRACE`` after the exit and close pipes a
-    background process still holds; (4) interpret the exit + sentinel scan. Only
-    the lint gate raises, and it raises exactly one type — ``ScriptLintError`` —
-    while a run failure/timeout returns a FAILED result instead. Naming the type
-    matters: it is the only exception a caller of this function must handle, so an
-    ``except Exception`` here would be both too broad and a silent way to swallow it.
+    background process still holds; (4) interpret the exit + sentinel scan.
+    Lint, approval and duplicate-id admission refusals raise before spawning;
+    a run failure/timeout returns a FAILED result instead.
     """
     # --- Step -1: validate the run_id key BEFORE any journal/registry/path use
     # (shared validator, mirrors base start_run at workflow_service.py:713). A
@@ -1338,20 +1334,26 @@ async def run_script_workflow(
     #   * BEFORE the registry write and the journal INSERT, so a refused start leaves no live record
     #     and no ``workflow_run`` row. Every first run of a new plan is refused by design, so
     #     recording them would durably record runs that never happened.
-    #   * OUTSIDE the ``try`` around ``insert_run`` below, which swallows EVERY exception by design
-    #     ("journal insert is best-effort; live floor still serves"). A refusal raised inside it would
-    #     be logged and the run would continue — the gate would appear to work and would authorise
-    #     nothing.
-    # No-ops entirely when enforcement is disabled, which is the default.
+    #   * OUTSIDE the ``try`` around ``insert_run`` below, so an approval refusal
+    #     cannot be handled as a journal fault (best-effort when enforcement is off).
+    # No-ops entirely when enforcement is disabled through the explicit opt-out.
+    # Bind the launch state at admission, before the gate can yield to an edit.
+    # Defer a capture refusal until after the gate to preserve its 403/503 precedence.
+    capture_error = None
+    try:
+        guard = await asyncio.to_thread(launch_guard.capture)
+    except approval_gate.PlanIdentityUnavailableError as exc:
+        capture_error = exc
     manifest_json = frozen.manifest_json
     approval_gate.ensure_plan_approved(
         tier="script",
         manifest_json=manifest_json,
         unavailable_reason=frozen.unavailable_reason or "internal",
     )
-    guard = await asyncio.to_thread(launch_guard.capture)
+    if capture_error is not None:
+        raise capture_error
 
-    # --- Step 1: register the live record + journal the durable run row ---
+    # --- Step 1: publish the live record + journal the durable run row ---
     record = ScriptRunRecord(
         run_id=run_id,
         workflow_name=spec.name,
@@ -1370,6 +1372,10 @@ async def run_script_workflow(
     # NOT evicted on finalize, mirroring the base YAML registry, so a bounded
     # post-run status window keeps serving. Registry eviction/TTL is deferred to
     # U5/base scope (no per-tier eviction here).
+    # Check and publish without yielding: cancellation must find this record
+    # even while the durable INSERT is pending, and a live winner must survive.
+    if run_id in run_registry or run_id in _active_drives:
+        raise KeyError(f"run_id '{run_id}' already exists")
     run_registry[run_id] = record
 
     # The durable spec_snapshot carries the frozen source (resume reads it back).
@@ -1399,10 +1405,37 @@ async def run_script_workflow(
             # it; reusing it rather than rebuilding is what makes checked-equals-stored true.
             manifest_json,
         )
-    except (
-        Exception
-    ) as e:  # noqa: BLE001 — journal insert is best-effort; live floor still serves (INV-4)
-        logger.warning("journal: script insert_run for '%s' failed (run continues): %s", run_id, e)
+    except sqlite3.IntegrityError:
+        # Remove only our publication; a replacement belongs to the winner.
+        # Never finalize or write through the winning run's journal row.
+        if run_registry.get(run_id) is record:
+            del run_registry[run_id]
+        raise KeyError(f"run_id '{run_id}' already exists") from None
+    except Exception as e:  # noqa: BLE001 — a failed admission must settle before spawn
+        if guard.get("approval_required", True) or approval_gate.is_workflow_approval_required():
+            # An enforced run needs the durable guard and frozen-memory state.
+            # Never expose the journal exception (which can include local paths).
+            logger.warning(
+                "journal: script insert_run failed; refusing script spawn (%s)", type(e).__name__
+            )
+            return await _finalize(
+                record,
+                state=RunState.FAILED,
+                kind="error",
+                error="Could not durably record this script run; no script was started. "
+                "Repair the run journal and start a new run.",
+            )
+        logger.warning(
+            "journal: script insert_run for '%s' failed (run continues): %s",
+            run_id,
+            type(e).__name__,
+        )
+
+    if record.cancelled:
+        # A cancel before the INSERT could not persist its generation yet. Honour
+        # it before spawning and fence callers against the now-durable row.
+        await _persist_generation_best_effort(record)
+        return await _finalize(record, state=RunState.CANCELLED, kind="cancelled")
 
     # --- Step 2: spawn (constructed env) + Step 3/4: drive, reap, interpret ---
     # Mark the drive live for the whole spawn->reap window so Gate-2 of a

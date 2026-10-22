@@ -178,6 +178,7 @@ from cli_agent_orchestrator.services.workflow_journal import (
 from cli_agent_orchestrator.services.workflow_journal import EventRow, GapMarker, StepRow
 from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
+from cli_agent_orchestrator.utils import server_lock
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.forwarded_env import ForwardedEnvError, validate_forwarded_env
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
@@ -1374,6 +1375,22 @@ async def lifespan(app: FastAPI):
     # only in ``main()`` — so the imported-app deployment path
     # (``uvicorn cli_agent_orchestrator.api.main:app``) is covered too. Idempotent.
     install_access_log_redaction()
+    # issues #406 / #709: exactly one cao-server per CAO_HOME_DIR. Taken before
+    # the database, the recovery sweeps, the terminal registry, the status
+    # monitor and uvicorn's port bind (uvicorn binds after lifespan startup), so
+    # a second server never touches shared state. The port is the only guard
+    # otherwise, and a different --port sidesteps it. Refusal is loud: the
+    # message names the owning process and the process exits non-zero. There is
+    # no escape hatch on purpose. ``main()`` stores the resolved port on
+    # ``app.state``; the imported-app path falls back to CAO_API_PORT.
+    try:
+        server_lock_handle = server_lock.acquire_server_lock(
+            port=getattr(app.state, "server_port", None) or SERVER_PORT
+        )
+    except server_lock.ServerLockHeldError as exc:
+        logger.error("refusing to start: %s", exc.message().splitlines()[0])
+        server_lock.refuse(exc)
+    logger.info("Holding server lock %s (pid %d)", server_lock_handle.path, os.getpid())
     # issue #583 Bolt 3 (``approval-enforcement-default``): report the approval gate's RESOLVED state
     # AND the mechanism that decided it. A malformed settings file fails closed, so the source tells
     # the operator why enforcement remains ON and how to recover. Logs only the boolean and a member
@@ -1610,6 +1627,9 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("Error shutting down OTel telemetry", exc_info=True)
     logger.info("Shutting down CLI Agent Orchestrator server...")
+    # Last: the kernel would drop it at exit anyway, but releasing explicitly
+    # lets an in-process restart (tests) re-acquire without a process boundary.
+    server_lock_handle.release()
 
 
 def get_plugin_registry(request: Request) -> PluginRegistry:
@@ -6076,12 +6096,20 @@ async def submit_workflow_run_endpoint(
         )
         manifest_json = frozen.manifest_json
         try:
+            # Keep the admission snapshot even if the profile set changes during
+            # the gate. Preserve the gate's refusal precedence on capture failure.
+            capture_error = None
+            try:
+                guard = await asyncio.to_thread(launch_guard.capture)
+            except approval_gate.PlanIdentityUnavailableError as exc:
+                capture_error = exc
             approval_gate.ensure_plan_approved(
                 tier="script",
                 manifest_json=manifest_json,
                 unavailable_reason=frozen.unavailable_reason or "internal",
             )
-            guard = await asyncio.to_thread(launch_guard.capture)
+            if capture_error is not None:
+                raise capture_error
         except approval_gate.PlanIdentityUnavailableError as e:
             # 503, not 403: the freeze above returned None, so CAO could not complete its own work and
             # nothing about the caller was wrong. MUST precede the arm below, which is its base class
@@ -9505,6 +9533,8 @@ def main():
 
     host = args.host or SERVER_HOST
     port = args.port or SERVER_PORT
+    # The lifespan records this port in the server lock's diagnostics (#406).
+    app.state.server_port = port
     # Extend the CORS allowlist so a custom --host/--port still permits
     # same-host browser access without requiring CAO_CORS_ORIGINS. The
     # already-installed CORSMiddleware reads the list by reference, so

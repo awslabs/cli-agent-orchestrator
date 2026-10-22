@@ -21,7 +21,8 @@ on:
     paths:
       - 'src/cli_agent_orchestrator/providers/codex.py'
       # Globbed, not a per-file list: a single hardcoded filename meant every
-      # Codex test outside test_codex_provider_unit.py was invisible to this
+      # Codex test outside test_codex_provider_unit.py (the completion-footer
+      # suite, the #739 startup-chrome invariant) was invisible to this
       # workflow, and so was any file a future fix adds. The run step below
       # expands the same glob.
       - 'test/providers/test_codex_*.py'
@@ -33,7 +34,8 @@ on:
     paths:
       - 'src/cli_agent_orchestrator/providers/codex.py'
       # Globbed, not a per-file list: a single hardcoded filename meant every
-      # Codex test outside test_codex_provider_unit.py was invisible to this
+      # Codex test outside test_codex_provider_unit.py (the completion-footer
+      # suite, the #739 startup-chrome invariant) was invisible to this
       # workflow, and so was any file a future fix adds. The run step below
       # expands the same glob.
       - 'test/providers/test_codex_*.py'
