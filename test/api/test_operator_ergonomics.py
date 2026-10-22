@@ -457,30 +457,38 @@ class TestWorkingDirectoryNormalizationAtTheBoundary:
         assert svc.create_session.call_args.kwargs["working_directory"] == str(target)
         assert svc.create_session.call_args.kwargs["create_working_directory"] is True
 
-    @pytest.mark.parametrize("endpoint", ["session", "terminal"])
-    def test_blocked_system_path_is_a_400_and_never_created(self, client, endpoint):
-        """``/tmp`` is in the repository's blocked set. The old helper created
-        ``/tmp/<new>`` at the boundary and the backend's ``allow_create=False``
-        check then accepted the now-existing path: an unconfined mkdir for any
-        write-scope token. The policy check now runs first, side-effect free
-        (plauzy, #724 review, blocking item 1)."""
-        target = Path("/tmp") / f"cao-724-{uuid.uuid4().hex}"
-        try:
-            with (
-                patch("cli_agent_orchestrator.api.main.terminal_service") as ts,
-                patch("cli_agent_orchestrator.api.main.session_service") as svc,
-            ):
-                ts.create_terminal = AsyncMock()
-                svc.create_session = AsyncMock()
-                resp = self._create(client, endpoint, str(target))
-            assert resp.status_code == 400, resp.json()
-            assert "not allowed" in resp.json()["detail"]
-            assert not target.exists(), "a blocked path was created"
-            ts.create_terminal.assert_not_called()
-            svc.create_session.assert_not_called()
-        finally:
-            if target.exists():  # pragma: no cover - only on a failed assertion
-                target.rmdir()
+    def test_a_fictional_path_reaches_a_mocked_service_untouched(self, client):
+        """The boundary is lexical only. Whether ``/workspace`` is allowed or
+        exists is the service's call (made at the point of use, see
+        ``test_working_directory_point_of_use.py``), so a caller that mocks the
+        service -- every MCP handler test does, with exactly this path -- sees
+        the mock's answer, not a policy 400 from the endpoint."""
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as ts,
+            patch("cli_agent_orchestrator.api.main.session_service") as svc,
+        ):
+            ts.create_terminal = AsyncMock(return_value=self._terminal())
+            svc.create_session = AsyncMock(return_value=self._terminal())
+            assert self._create(client, "terminal", "/workspace").status_code == 201
+            assert self._create(client, "session", "/workspace").status_code == 201
+        assert ts.create_terminal.call_args.kwargs["working_directory"] == "/workspace"
+        assert svc.create_session.call_args.kwargs["working_directory"] == "/workspace"
+
+    def test_create_session_maps_a_refused_directory_to_400(self, client, tmp_path):
+        """The policy refusal (``/tmp/<new>``, ``/etc/<new>``) is raised by the
+        service as WorkingDirectoryError; ``POST /sessions`` must answer 400
+        with the policy's own wording, and the mocked service proves nothing
+        was created on the way."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as svc:
+            svc.create_session = AsyncMock(
+                side_effect=WorkingDirectoryError(
+                    "Working directory not allowed: /tmp/x (nearest existing ancestor "
+                    "resolves to blocked system path /private/tmp)"
+                )
+            )
+            resp = self._create(client, "session", str(tmp_path / "x"))
+        assert resp.status_code == 400
+        assert "not allowed" in resp.json()["detail"]
 
     @pytest.mark.parametrize("endpoint", ["session", "terminal"])
     def test_component_over_name_max_is_a_400_not_a_500(self, client, endpoint, tmp_path):

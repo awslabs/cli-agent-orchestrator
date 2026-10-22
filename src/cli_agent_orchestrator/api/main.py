@@ -189,11 +189,7 @@ from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, reso
 from cli_agent_orchestrator.utils.forwarded_env import ForwardedEnvError, validate_forwarded_env
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
-from cli_agent_orchestrator.utils.paths import (
-    WorkingDirectoryError,
-    normalize_working_directory,
-    validate_working_directory,
-)
+from cli_agent_orchestrator.utils.paths import WorkingDirectoryError, normalize_working_directory
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
     load_skill_content,
@@ -3713,16 +3709,16 @@ async def create_session(
                 )
         # Accept the spellings an operator actually types into a browser field
         # (``~``, Explorer-quoted, Windows drive paths on WSL) and reject an
-        # unusable one as a clear 400 here, instead of a 500 deep in tmux.
-        # Both calls are side-effect free: the normalization is lexical and
-        # the policy check (blocked system directories, judged on the nearest
-        # existing ancestor for a missing target -- #345 D5) only reads. The
-        # directory itself is created by terminal_service at the point of use,
-        # after the duplicate-session and terminal-cap checks, so a request
+        # unusable one as a clear 400 here, instead of a 500 deep in tmux. The
+        # normalization is purely lexical: whether the directory is ALLOWED
+        # (blocked system directories, judged on the nearest existing ancestor
+        # for a missing target -- #345 D5) and whether it EXISTS are decided by
+        # terminal_service at the point of use, after the duplicate-session and
+        # terminal-cap checks, where the directory is also created, so a request
         # rejected anywhere along the way leaves nothing behind (plauzy, #724).
+        # No policy call here: callers that mock the service (the MCP handler
+        # tests pass a fictional /workspace) must see the service's answer.
         working_directory = normalize_working_directory(working_directory)
-        if working_directory is not None:
-            validate_working_directory(working_directory)
 
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
@@ -4114,14 +4110,12 @@ async def create_terminal_in_session(
                     ),
                 )
 
-        # Same operator-typed spellings POST /sessions accepts (see there), and
-        # the same side-effect-free policy check. Creation happens inside
+        # Same operator-typed spellings POST /sessions accepts (see there);
+        # lexical only. The path policy and the creation both happen inside
         # terminal_service once the session-not-found and terminal-cap checks
         # have passed, so a rejected request never leaves a tree behind.
         try:
             working_directory = normalize_working_directory(working_directory)
-            if working_directory is not None:
-                validate_working_directory(working_directory)
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 

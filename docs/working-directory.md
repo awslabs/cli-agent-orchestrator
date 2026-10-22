@@ -44,8 +44,9 @@ can refuse the request (name validation, duplicate session, session not found,
 the terminal cap): a rejected request leaves nothing behind. Creation is
 bounded by a depth cap, and a directory the OS cannot create (a parent that is
 a file or not traversable, a read-only filesystem) is a `400`, not a `500`. The
-MCP `handoff`/`assign` `working_directory` parameter is unchanged: it never
-creates anything.
+MCP `handoff`/`assign` tools reach these same two endpoints, so a missing
+directory under an allowed parent is created for them too; their own parameter
+validation is unchanged.
 
 ## Usage Example
 
