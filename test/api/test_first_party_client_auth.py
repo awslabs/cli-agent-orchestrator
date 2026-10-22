@@ -3,58 +3,73 @@
 The ROUTE side of the scope gate is centrally tested — ``test/security/test_authz_matrix.py``
 and ``test/api/test_auth_read_gating.py`` walk the route table, so adding a gated route is
 safe by construction. The CALLER side is per-module convention: each client module has its
-own ``_auth_headers()`` (``mcp_server/utils.py:21``, ``mcp_server/app_tools.py:105``,
-``ops_mcp_server/server.py:74``, ``utils/orchestration.py:65``) and every ``requests`` call
-is supposed to pass ``headers=_auth_headers() or None``. A convention does not stop the next
-call site from omitting it, and ten of them already have, in ``mcp_server/server.py``. Only
-one of those ten (the script-tier shim's call site) has a fix in flight: the filed #829
-ticket's unmerged ``agent/gh-829`` branch adds a run-scoped token for exactly that case. The
-other nine -- five of which this module exercises -- are untouched by that branch; they are
-the same shape of bug but have no fix in flight.
+own ``_auth_headers()`` (``mcp_server/utils.py``, ``mcp_server/app_tools.py``,
+``ops_mcp_server/server.py``, ``utils/orchestration.py``) and every ``requests`` call is
+supposed to pass ``headers=_auth_headers() or None``. A convention does not stop the next
+call site from omitting it. #990 found fourteen ``mcp_server/server.py`` sites that had, and
+#991 attached the helper at all fourteen; the five ``mcp_server`` cases below are the
+end-to-end regression tests for that fix, driving the real tool through the real route.
+One surface is still broken: the script-tier shim (``cao_workflow``) is stdlib-only and has
+no credential to attach. #829 tracks it; its unmerged ``agent/gh-829`` branch adds a
+run-scoped token (``security/run_tokens.py``).
 
 The two guards that exist test the wrong axis. ``test/test_bearer_scope_boundary.py`` (#822)
 checks a bearer is never paired with a REMOTE url — it says nothing about a local url paired
 with NO helper. ``test/api/test_workflow_authoring_client_auth.py`` (#699) drives real
 clients against the real routes, but only the four workflow-authoring tools and the ``cao
-workflow`` verbs.
+workflow`` verbs. ``test/test_bearer_call_site_census.py`` scans source text for
+``requests.<verb>(`` calls, so it cannot see a client that goes through ``api_http`` or
+``urllib``.
 
-So this module is the generic version: one parametrised case per first-party client surface
+So this module is the generic version: a parametrised case per first-party client surface
 that drives the REAL client entry point against the REAL route table with auth enabled, and
 asserts no request the client made was refused at the auth boundary (401/403). It does not
 assert the call SUCCEEDS — an admitted request may still 404 or 500 because no tmux session,
-no skill and no terminal row exist in a unit test. The only claim is that the client got
+no skill and no live terminal exist in a unit test. The only claim is that the client got
 past the gate, which is the one thing nothing else checks.
 
-Auth mode: local-token (#706, ``security/auth.py:109-131``). ``CAO_AUTH_LOCAL_TOKEN`` alone
-switches ``is_auth_enabled()`` on for the server AND is what ``get_local_bearer()`` hands the
-client, and a match grants the full scope set. That isolates the single variable this module
-is about — is a credential attached at all — with no JWKS stub, no subprocess and no
-per-route scope bookkeeping, so the whole module runs in about a second. Scope CORRECTNESS
-per route is the authz matrix's job, not this one's.
+Auth mode: local-token (#706, ``security/auth.py``). ``CAO_AUTH_LOCAL_TOKEN`` alone switches
+``is_auth_enabled()`` on for the server AND is what ``get_local_bearer()`` hands the client,
+and a match grants the full scope set. That isolates the single variable this module is
+about — is a credential attached at all — with no JWKS stub, no subprocess and no per-route
+scope bookkeeping, so the whole module runs in about a second. Scope CORRECTNESS per route
+is the authz matrix's job, not this one's.
+
+Known-broken surfaces are marked with ``_broken_until(<probe>)``, never a bare
+``xfail``. A bare ``xfail(strict=True)`` encodes a BELIEF ("this is broken") that only a
+human can retire, so when the fix lands on another branch the marker goes stale and the
+strict XPASS lands as a red on whichever PR merges second (that is exactly what happened
+to the five ``mcp_server`` markers this file first shipped with, 28 minutes after #991 was
+opened). ``_broken_until`` ties the marker to a PROBE for the fix's footprint instead: the
+case asserts the fixed behaviour from day one, is expected to fail only while the probe
+says the fix is absent, and lifts itself the moment the fix lands. If the probe is wrong
+in either direction the strict marker still goes red, so a stale probe cannot rot into a
+permanent exemption either. ``test_known_broken_markers_lift_themselves`` enumerates the
+class: no surface may carry an xfail that was not built this way.
 
 Surfaces deliberately NOT covered, with reasons:
 
-* ``services/agui/base.py:111`` / ``services/agui/stream_reader.py:116`` carry their own
+* ``services/agui/base.py`` / ``services/agui/stream_reader.py`` carry their own
   ``self._token`` — an AG-UI client credential supplied by the caller, not this node's
   ``CAO_AUTH_LOCAL_TOKEN``.
-* ``utils/fleet.py:123,209``, ``services/terminal_service.py:2098,2123`` and the
-  ``utils/orchestration.py`` remote arms (``:442,485,519,1890``) address ANOTHER node or the
-  elastic-worker gateway, which hold their own credentials. Withholding ours there is the
-  #822 rule, already enforced statically.
-* The terminal WebSocket (``api/main.py:8111``) needs a real listener (the
-  ``cao_server_with_auth`` fixture), not ``TestClient``; covering it here would cost a
+* ``utils/fleet.py``, ``services/terminal_service.py`` and the ``utils/orchestration.py``
+  remote arms address ANOTHER node or the elastic-worker gateway, which hold their own
+  credentials. Withholding ours there is the #822 rule, already enforced statically.
+* The terminal WebSocket (``api/main.py``, ``/terminals/{id}/ws``) needs a real listener
+  (the ``cao_server_with_auth`` fixture), not ``TestClient``; covering it here would cost a
   subprocess per case and break the "keep each test fast" budget.
-* ``services/install_service.py:250`` fetches from outside CAO.
+* ``services/install_service.py`` fetches from outside CAO.
 """
 
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import io
 import json
 import os
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
@@ -101,7 +116,7 @@ class _ApiBoundary:
     """Routes a client's outbound HTTP into the real FastAPI app and records each hop."""
 
     client: TestClient
-    hops: List[_Hop] = field(default_factory=list)
+    hops: List[_Hop]
 
     @staticmethod
     def _path(url: str) -> str:
@@ -188,6 +203,10 @@ class _FakeUrlopenResult:
         return self._status
 
 
+def _new_boundary() -> _ApiBoundary:
+    return _ApiBoundary(TestClient(app, base_url="http://localhost"), [])
+
+
 @pytest.fixture
 def boundary(monkeypatch):
     """Auth on (local-token mode), and every client's HTTP wired to the real app.
@@ -205,10 +224,10 @@ def boundary(monkeypatch):
     assert auth_module.is_local_token_mode() is True
     assert auth_module.get_local_bearer() == LOCAL_TOKEN
 
-    # The two tools that act on "my own terminal" need an identity to act as.
+    # The tools that act on "my own terminal" need an identity to act as.
     monkeypatch.setenv("CAO_TERMINAL_ID", TERMINAL_ID)
 
-    adapter = _ApiBoundary(TestClient(app, base_url="http://localhost"))
+    adapter = _new_boundary()
     for verb in ("get", "post", "put", "patch", "delete", "request"):
         monkeypatch.setattr(requests, verb, getattr(adapter, verb))
     monkeypatch.setattr(shim_transport, "urlopen", adapter.urlopen)
@@ -264,94 +283,155 @@ def _shim_run_step() -> Any:
 
 
 # ---------------------------------------------------------------------------
-# The surfaces. ``xfail(strict=True)`` marks the ones that are broken TODAY --
-# every one of them is a client that attaches no credential against a route that
-# requires one. Only ``script_tier.run_step`` has a fix in flight: the filed #829
-# ticket's unmerged ``agent/gh-829`` branch adds a run-scoped token for exactly that
-# shim. The five ``mcp_server`` surfaces below are the same #829-shaped class of bug
-# but #829's branch never touches ``mcp_server/`` -- they have no fix in flight and
-# need their own. strict=True means each marker must be REMOVED when its own surface
-# is actually fixed, so none of these can rot into a permanent exemption.
+# What credential each surface is expected to put on the wire.
 # ---------------------------------------------------------------------------
 
-_BROKEN_MCP_SERVER = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the #829-shaped class, NOT covered by #829 itself: mcp_server/server.py attaches "
-        "no Authorization header to a scope-gated local route, and the unmerged agent/gh-829 "
-        "branch never touches mcp_server/, so no fix is in flight for this surface"
-    ),
-)
 
-_BROKEN_SCRIPT_TIER = pytest.mark.xfail(
-    strict=True,
+def _this_nodes_bearer(bearer: Optional[str]) -> bool:
+    """The default: the operator-provisioned local token, verbatim."""
+    return bearer == f"Bearer {LOCAL_TOKEN}"
+
+
+def _some_credential(bearer: Optional[str]) -> bool:
+    """A surface whose credential is NOT this node's bearer by design.
+
+    The script tier runs inside a workflow step and must not hold the node's
+    operator token; #829 gives it a run-scoped token instead. Until that lands
+    the shim sends nothing, so "any Authorization header at all" is the weakest
+    assertion that is true after the fix and false before it. Tighten this to
+    the run-token shape once #829 is on main.
+    """
+    return bool(bearer)
+
+
+# ---------------------------------------------------------------------------
+# Known-broken markers that lift themselves.
+# ---------------------------------------------------------------------------
+
+_SELF_LIFTING_MARKS: List[Any] = []
+
+
+def _broken_until(fixed: Callable[[], bool], *, reason: str) -> Any:
+    """Mark a surface as known-broken until ``fixed()`` reports the fix has landed.
+
+    The case keeps asserting the FIXED behaviour. While the probe is false the
+    case is a strict xfail; once the probe is true the marker is inert and the
+    case is a plain assertion. Both mismatches stay loud: a fix that lands
+    without flipping the probe is a strict XPASS, and a probe that flips before
+    the behaviour is fixed is a plain failure. Neither needs a human to notice
+    anything -- only to correct the probe, and only when the probe is wrong.
+    """
+    mark = pytest.mark.xfail(
+        condition=not fixed(),
+        strict=True,
+        reason=f"{reason} [lifts itself when {fixed.__name__}() is true]",
+    )
+    _SELF_LIFTING_MARKS.append(mark.mark)
+    return mark
+
+
+def _run_scoped_tokens_landed() -> bool:
+    """#829's footprint: the server-side run-token module its branch adds.
+
+    Named in the #829 branch as ``security/run_tokens.py``. If the fix lands
+    under another name the script-tier case XPASSes strictly and this probe
+    gets corrected -- the same cost as a bare xfail, but only in that case.
+    """
+    return importlib.util.find_spec("cli_agent_orchestrator.security.run_tokens") is not None
+
+
+_BROKEN_SCRIPT_TIER = _broken_until(
+    _run_scoped_tokens_landed,
     reason=(
         "#829: the script-tier shim has no credential to attach; the filed #829 ticket's "
         "unmerged agent/gh-829 branch (security/run_tokens.py) implements the fix in flight"
     ),
 )
 
-SURFACES = [
-    # --- mcp_server tools: the #829-shaped class, but not covered by #829 ------
-    pytest.param(
-        lambda: _call(_tool(mcp_server, "load_skill"), name="cao-memory"),
+
+# ---------------------------------------------------------------------------
+# The surfaces.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Surface:
+    """One first-party client entry point and what it is expected to do on the wire."""
+
+    id: str
+    drive: Callable[[], Any]
+    credential: Callable[[Optional[str]], bool] = _this_nodes_bearer
+    marks: Tuple[Any, ...] = ()
+
+    def param(self) -> Any:
+        return pytest.param(self, id=self.id, marks=self.marks)
+
+
+SURFACES: List[_Surface] = [
+    # --- mcp_server tools: the #990 class, fixed by #991 ---------------------
+    _Surface(
         id="mcp.load_skill",
-        marks=_BROKEN_MCP_SERVER,
+        drive=lambda: _call(_tool(mcp_server, "load_skill"), name="cao-memory"),
     ),
-    pytest.param(
-        lambda: _call(_tool(mcp_server, "emit_ui"), component="progress", props={"pct": 1}),
+    _Surface(
         id="mcp.emit_ui",
-        marks=_BROKEN_MCP_SERVER,
+        drive=lambda: _call(_tool(mcp_server, "emit_ui"), component="progress", props={"pct": 1}),
     ),
-    pytest.param(
-        lambda: _call(_tool(mcp_server, "answer_user_prompt"), terminal_id=TERMINAL_ID, answer="1"),
+    _Surface(
         id="mcp.answer_user_prompt",
-        marks=_BROKEN_MCP_SERVER,
+        drive=lambda: _call(
+            _tool(mcp_server, "answer_user_prompt"), terminal_id=TERMINAL_ID, answer="1"
+        ),
     ),
-    pytest.param(
-        lambda: _call(_tool(mcp_server, "list_siblings"), depth=None, cross_session=False),
+    _Surface(
         id="mcp.list_siblings",
-        marks=_BROKEN_MCP_SERVER,
+        drive=lambda: _call(_tool(mcp_server, "list_siblings"), depth=None, cross_session=False),
     ),
-    pytest.param(
-        lambda: _call(_tool(mcp_server, "update_metadata"), metadata={"doing": "gate"}),
+    _Surface(
         id="mcp.update_metadata",
-        marks=_BROKEN_MCP_SERVER,
+        drive=lambda: _call(_tool(mcp_server, "update_metadata"), metadata={"doing": "gate"}),
     ),
-    # --- script tier: the shim cannot see a credential at all -----------------
-    pytest.param(_shim_run_step, id="script_tier.run_step", marks=_BROKEN_SCRIPT_TIER),
-    # --- surfaces that already attach the bearer ------------------------------
-    pytest.param(
-        lambda: _call(_tool(mcp_server, "workflow_list")),
+    _Surface(
         id="mcp.workflow_list",
+        drive=lambda: _call(_tool(mcp_server, "workflow_list")),
     ),
-    pytest.param(
-        lambda: _call(_tool(mcp_server, "workflow_status"), run_id="run-9007"),
+    _Surface(
         id="mcp.workflow_status",
+        drive=lambda: _call(_tool(mcp_server, "workflow_status"), run_id="run-9007"),
     ),
-    pytest.param(
-        lambda: _call(_tool(ops_server, "list_profiles")),
+    # --- script tier: the shim cannot see a credential at all (#829) ---------
+    _Surface(
+        id="script_tier.run_step",
+        drive=_shim_run_step,
+        credential=_some_credential,
+        marks=(_BROKEN_SCRIPT_TIER,),
+    ),
+    # --- the other client modules ---------------------------------------------
+    _Surface(
         id="ops_mcp.list_profiles",
+        drive=lambda: _call(_tool(ops_server, "list_profiles")),
     ),
-    pytest.param(
-        lambda: _call(_tool(ops_server, "list_sessions")),
+    _Surface(
         id="ops_mcp.list_sessions",
+        drive=lambda: _call(_tool(ops_server, "list_sessions")),
     ),
-    pytest.param(
-        lambda: app_tools._render_dashboard_impl(),
+    _Surface(
         id="mcp_apps.render_dashboard",
+        drive=lambda: app_tools._render_dashboard_impl(),
     ),
-    pytest.param(
-        lambda: _cli(cli_session.session, ["list"]),
+    _Surface(
         id="cli.session_list",
+        drive=lambda: _cli(cli_session.session, ["list"]),
     ),
 ]
 
+PARAMS = [surface.param() for surface in SURFACES]
 
-@pytest.mark.parametrize("drive", SURFACES)
-def test_first_party_client_is_not_refused_at_the_auth_boundary(boundary, drive):
+
+@pytest.mark.parametrize("surface", PARAMS)
+def test_first_party_client_is_not_refused_at_the_auth_boundary(boundary, surface):
     """The real client reaches the real route with auth on and is not 401/403'd."""
-    _drive(drive)
+    _drive(surface.drive)
 
     assert boundary.hops, (
         "the client made no HTTP call, so this case proves nothing -- the entry point "
@@ -361,18 +441,40 @@ def test_first_party_client_is_not_refused_at_the_auth_boundary(boundary, drive)
     assert not refused, "refused at the auth boundary: " + "; ".join(str(h) for h in refused)
 
 
-@pytest.mark.parametrize("drive", SURFACES)
-def test_first_party_client_sends_this_nodes_bearer(boundary, drive):
-    """Stronger form: the credential on the wire is this node's local bearer.
+@pytest.mark.parametrize("surface", PARAMS)
+def test_first_party_client_sends_its_credential_on_every_hop(boundary, surface):
+    """Stronger form: every hop carries the credential this surface is meant to send.
 
     Separate from the status assertion so a surface that is admitted for the WRONG
     reason -- a route that quietly stopped being gated -- still fails here.
     """
-    _drive(drive)
+    _drive(surface.drive)
 
     assert boundary.hops
-    bare = [hop for hop in boundary.hops if hop.bearer != f"Bearer {LOCAL_TOKEN}"]
+    bare = [hop for hop in boundary.hops if not surface.credential(hop.bearer)]
     assert not bare, "sent no / wrong credential: " + "; ".join(str(h) for h in bare)
+
+
+def test_known_broken_markers_lift_themselves():
+    """The class guard: no surface may carry a bare ``xfail``.
+
+    Every xfail on a surface must have been built by ``_broken_until`` -- strict, and
+    conditioned on a probe for the fix -- so a marker can never again encode a belief
+    that only a human can retire.
+    """
+    for surface in SURFACES:
+        for mark in surface.marks:
+            mark = getattr(mark, "mark", mark)
+            if mark.name != "xfail":
+                continue
+            assert mark in _SELF_LIFTING_MARKS, (
+                f"{surface.id}: xfail not built by _broken_until(); a known-broken marker "
+                "must name the probe that lifts it"
+            )
+            assert mark.kwargs.get("strict") is True, f"{surface.id}: xfail must be strict"
+            assert isinstance(
+                mark.kwargs.get("condition"), bool
+            ), f"{surface.id}: xfail must carry the probe's verdict as its condition"
 
 
 def test_the_gate_catches_a_removed_bearer_attachment():
@@ -383,7 +485,7 @@ def test_the_gate_catches_a_removed_bearer_attachment():
     exists to catch, so the parametrised assertion above must fail when it is gone.
     """
     with patch.object(ops_server, "_auth_headers", return_value={}):
-        adapter = _ApiBoundary(TestClient(app, base_url="http://localhost"))
+        adapter = _new_boundary()
         with patch.dict(os.environ, {"CAO_AUTH_LOCAL_TOKEN": LOCAL_TOKEN}, clear=False):
             for var in ("AUTH0_DOMAIN", "CAO_AUTH_JWKS_URI"):
                 os.environ.pop(var, None)
