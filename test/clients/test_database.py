@@ -1807,6 +1807,103 @@ class TestFlowOperations:
             create_inbox_message("sender-123", "dead-terminal", "Hello")
 
 
+class TestGetInboxMessagesOrdering:
+    """Ordering and sender filtering for get_inbox_messages."""
+
+    def _seed(self, test_db):
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        rows = [
+            InboxModel(
+                sender_id="worker-a",
+                receiver_id="supervisor",
+                message="oldest",
+                status=MessageStatus.PENDING.value,
+                created_at=base,
+            ),
+            InboxModel(
+                sender_id="worker-b",
+                receiver_id="supervisor",
+                message="middle",
+                status=MessageStatus.DELIVERED.value,
+                created_at=base + timedelta(minutes=1),
+            ),
+            InboxModel(
+                sender_id="worker-a",
+                receiver_id="supervisor",
+                message="newest-a",
+                status=MessageStatus.PENDING.value,
+                created_at=base + timedelta(minutes=2),
+            ),
+            InboxModel(
+                sender_id="worker-a",
+                receiver_id="other",
+                message="other-inbox",
+                status=MessageStatus.PENDING.value,
+                created_at=base + timedelta(minutes=3),
+            ),
+        ]
+        with test_db() as session:
+            session.add_all(rows)
+            session.commit()
+
+    def test_default_order_is_oldest_first(self, test_db):
+        """The default stays oldest-first and does not cross receivers."""
+        self._seed(test_db)
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            messages = get_inbox_messages("supervisor")
+
+        assert [message.message for message in messages] == ["oldest", "middle", "newest-a"]
+
+    def test_newest_first_applies_limit_after_ordering(self, test_db):
+        """newest_first returns the latest row when limit is 1."""
+        self._seed(test_db)
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            messages = get_inbox_messages("supervisor", limit=1, newest_first=True)
+
+        assert [message.message for message in messages] == ["newest-a"]
+
+    def test_explicit_oldest_first_still_limits_from_the_start(self, test_db):
+        """newest_first=False keeps limit applied to the oldest rows."""
+        self._seed(test_db)
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            messages = get_inbox_messages("supervisor", limit=1, newest_first=False)
+
+        assert [message.message for message in messages] == ["oldest"]
+
+    def test_sender_filter_excludes_other_senders(self, test_db):
+        """sender_id returns only that sender's messages for the receiver."""
+        self._seed(test_db)
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            messages = get_inbox_messages("supervisor", sender_id="worker-b")
+
+        assert [message.message for message in messages] == ["middle"]
+        assert messages[0].sender_id == "worker-b"
+
+    def test_sender_filter_combines_with_status_order_and_limit(self, test_db):
+        """sender_id, status, newest_first, and limit apply together."""
+        self._seed(test_db)
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            messages = get_inbox_messages(
+                "supervisor",
+                limit=1,
+                status=MessageStatus.PENDING,
+                sender_id="worker-a",
+                newest_first=True,
+            )
+
+        assert [message.message for message in messages] == ["newest-a"]
+        assert messages[0].status == MessageStatus.PENDING
+
+    def test_pending_messages_stay_oldest_first(self, test_db):
+        """get_pending_messages keeps delivering the oldest pending message."""
+        self._seed(test_db)
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            messages = get_pending_messages("supervisor", limit=1)
+
+        assert [message.message for message in messages] == ["oldest"]
+        assert messages[0].status == MessageStatus.PENDING
+
+
 class TestInitDb:
     """Tests for init_db function."""
 

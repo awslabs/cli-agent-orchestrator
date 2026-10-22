@@ -69,6 +69,40 @@ DEFAULT_PROVIDER = ProviderType.KIRO_CLI.value
 # Higher values provide more context but increase memory usage
 TMUX_HISTORY_LINES = 200
 
+# Scrollback floor CAO raises the operator's shared tmux server's global
+# ``history-limit`` to before it creates a pane.
+#
+# CAO does not run its own tmux server -- it shares the operator's default one
+# (see ``TmuxClient.__init__``) -- so this is a FLOOR: a global already at or
+# above it is left alone; a lower one (tmux's 2000 default, or an operator's own
+# lower setting) is raised (see ``TmuxClient._set_server_history_limit``). The
+# option is global, so the operator's own new windows on that server get it
+# too. ``CAO_TMUX_HISTORY_LIMIT`` overrides the value; 0 disables the raise
+# (``docs/tmux.md`` documents the memory cost).
+#
+# tmux's default is 2000 lines, which is SHALLOWER than the deepest rung of
+# ``get_output``'s extraction escalation (5000 lines, see
+# ``terminal_service._ESCALATION_STEPS``). On a default server the top rungs are
+# dead weight -- ``capture-pane -S -5000`` and ``-S -`` both return the same
+# ~2000 lines -- and a long worker reply plus the redraw burst a TUI emits at the
+# end of a turn can push the response marker out of scrollback entirely. The
+# supervisor then receives a truncated reply, or none (#728).
+#
+# 50000 matches the repo's own recommended ``.tmux.conf`` and leaves the whole
+# ladder, including the overflow threshold, reachable. ``TmuxBackend`` reports
+# it as the read ceiling ``get_output`` clips its ladder to. Cost is bounded:
+# tmux allocates scrollback lazily, per pane, as output arrives.
+TMUX_HISTORY_LIMIT = _env_int("CAO_TMUX_HISTORY_LIMIT", 50000)
+
+# The most lines herdr returns from one ``pane read``, whatever ``--lines`` asks
+# for: herdr clamps the request server-side (``lines.min(1000)``, herdr v0.9.5
+# ``src/app/api_helpers.rs:117``; the flagless default is 80 at ``:118``).
+# ``HerdrBackend.max_history_lines`` reports this so ``get_output`` clips its
+# escalation ladder and overflow threshold to a depth the backend can actually
+# serve; a rung above it returns the same 1000 lines as the rung below (#728).
+# Not operator-tunable: it is herdr's number, not CAO's.
+HERDR_PANE_READ_MAX_LINES = 1000
+
 # Foreground commands to treat as bracketed-paste INCOMPATIBLE.
 # (\x1b[200~...\x1b[201~). send_keys(force_bracketed_paste=True) checks the
 # pane's live #{pane_current_command} against this set before wrapping, so a
