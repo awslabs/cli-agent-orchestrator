@@ -35,9 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking / migration:** plan approval binds the script source, its resolved inputs, the working
   directory's state (the Git commit and worktree, or the canonical path of a non-Git directory) and,
   since `plan-v2`, the installed agent profile set. It does not bind memory content (#828), the
-  managed `.env` values a profile references, installed skills, plugin MCP servers, or a same-name
-  profile shadowed in a lower-priority directory: a later run of an approved plan uses their current
-  content.
+  managed `.env` values a profile references, installed skills, agent-plugin MCP servers for the
+  providers that receive them at launch (`with_plugin_mcp`; for Kiro and OpenCode `cao install`
+  writes them into files that are bound, so an agent-plugin change moves `plan_id` there), the Kiro
+  `resources` files and global `mcp.json`, or a same-name profile shadowed in a lower-priority
+  directory: a later run of an approved plan uses their current content.
 - **Breaking / migration:** script-run plan identifiers move from `plan-v1:` to `plan-v2:` and now
   bind the installed agent profile set — every installed profile's source text plus the files
   `cao install` wrote for it (the Kiro agent JSON, the Copilot and OpenCode agent files, the shared

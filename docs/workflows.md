@@ -652,9 +652,16 @@ from what was reviewed and still match the same `plan_id`:
   value is not, because that file is where credentials live and a digest of the substituted text would
   carry a hash of each credential into an identifier that is logged and displayed. Changing a referenced
   value with `cao env set` does not change the `plan_id`.
-- **MCP servers from installed agent plugins.** Agent-plugin MCP servers are delivered to the agent at
-  launch (`with_plugin_mcp`), not read from the profile, so adding or removing an agent plugin does not
-  change the `plan_id`.
+- **MCP servers from installed agent plugins, for providers that receive them at launch.** Where
+  `cao install` materialises agent-plugin MCP servers into a file the provider reads (the Kiro agent
+  JSON, the shared OpenCode `opencode.json`), they ARE bound: an agent-plugin install or uninstall
+  rewrites those files for every installed profile, so it moves every `plan_id`. For the providers that
+  receive agent-plugin MCP servers at launch instead (`with_plugin_mcp`: Claude Code, Codex, Copilot,
+  Kimi, Cursor, Grok, OMP, Antigravity, MiniMax), nothing on disk changes for the profile, so adding or
+  removing an agent plugin does not change the `plan_id` there.
+- **Kiro launch inputs `cao install` does not write.** The files a Kiro agent's `resources` point at,
+  other than the installed context copy, and the global Kiro `mcp.json` when a profile opts in with
+  `useLegacyMcpJson` (`includeMcpJson`), are read by Kiro at launch and are not part of the `plan_id`.
 - **Installed skills.** The skill catalog under the CAO skills directory is injected into a launching
   agent's context and is not part of the `plan_id`.
 - **A same-name profile shadowed in a lower-priority directory.** Only the profile that wins
@@ -665,7 +672,8 @@ from what was reviewed and still match the same `plan_id`:
 
 Each of these is a launch input the next run reads live. Binding any of them is a separate change from
 #827; the `.env` case needs a design that does not leak values, and the others need a product ruling on
-whether an operator's agent-plugin or skill change should invalidate every approval.
+whether an operator's agent-plugin or skill change should invalidate every approval on every provider
+(today it does so only where `cao install` writes the servers to disk).
 - **Repository changes after admission.** The repository state is read once, when the run is
   admitted. Changes made after that, including while a submitted run waits for a free slot, are not
   detected.
