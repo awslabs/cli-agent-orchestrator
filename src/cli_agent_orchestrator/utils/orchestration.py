@@ -660,7 +660,14 @@ def _require_remote_delegation_ceiling(base_url: str, target_host: str) -> None:
         ValueError: the node is unreachable, or does not advertise the feature.
     """
     try:
-        response = requests.get(f"{base_url}/health", timeout=(REMOTE_CONNECT_TIMEOUT, 5.0))
+        # Same form as the remote-health wait above: ``_auth_headers_for`` is
+        # empty for any host but this one, so no bearer reaches the remote node,
+        # and the bearer census (#991) can see the call is routed through it.
+        response = requests.get(
+            f"{base_url}/health",
+            headers=_auth_headers_for(base_url) or None,
+            timeout=(REMOTE_CONNECT_TIMEOUT, 5.0),
+        )
         features = response.json().get("features") if response.status_code == 200 else None
     except (requests.RequestException, ValueError) as exc:
         raise ValueError(

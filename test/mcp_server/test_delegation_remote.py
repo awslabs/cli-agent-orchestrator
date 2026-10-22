@@ -52,6 +52,26 @@ class TestRequireRemoteDelegationCeiling:
         with pytest.raises(ValueError, match="cannot verify"):
             _require_remote_delegation_ceiling("http://cao-worker-0:9889", "cao-worker-0")
 
+    # The probe is a ``requests`` call built on ``base_url``, so the bearer census
+    # (#991, ``test/test_bearer_call_site_census.py``) requires its ``headers=``
+    # to come from a bearer helper. ``_auth_headers_for`` is the right one: it
+    # is empty for any host but this node, so the probe never discloses the
+    # local token to the remote node it is vetting. @haofeif re-review at
+    # 95e580fd, P2.
+    @patch(f"{_SRV}.get_local_bearer", return_value="tok")
+    @patch(f"{_SRV}.requests.get")
+    def test_probe_sends_no_local_bearer_to_a_remote_node(self, mock_get, _bearer):
+        mock_get.return_value = _response(200, {"status": "ok", "features": ["delegation_ceiling"]})
+        _require_remote_delegation_ceiling("http://cao-worker-0:9889", "cao-worker-0")
+        assert mock_get.call_args.kwargs["headers"] is None
+
+    @patch(f"{_SRV}.get_local_bearer", return_value="tok")
+    @patch(f"{_SRV}.requests.get")
+    def test_probe_carries_the_local_bearer_when_the_node_is_this_one(self, mock_get, _bearer):
+        mock_get.return_value = _response(200, {"status": "ok", "features": ["delegation_ceiling"]})
+        _require_remote_delegation_ceiling(API_BASE_URL, "localhost")
+        assert mock_get.call_args.kwargs["headers"] == {"Authorization": "Bearer tok"}
+
 
 class TestOwnDelegationCeiling:
     @patch(f"{_SRV}.requests")
