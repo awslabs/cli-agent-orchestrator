@@ -240,7 +240,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before declaring ready, a ready verdict from a pane that is back at the shell is ERROR
   whether or not initialization has finished, and the shared delivery path re-checks the
   status and the pane's foreground process immediately before typing, for every provider
-  that records a shell baseline (#1018).
+  that records a shell baseline. `assign` and `handoff` now tear down a worker whose
+  provider is in ERROR or has exited to the shell by delivery time and report
+  `provider_exited` (or `provider_exited_after_dispatch` when a resubmit was refused after
+  the task had been typed once); previously the dead worker was kept and reported as
+  waiting on a prompt (#1018).
 - Corrective workflow re-prompts now reuse the attempt's rendered prompt, so
   workflow inputs and earlier step outputs stay filled in when structured output
   is missing or invalid (#966).

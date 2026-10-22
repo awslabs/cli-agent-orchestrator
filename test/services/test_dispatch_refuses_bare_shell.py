@@ -349,3 +349,102 @@ class TestDeferredInitTearsDownAnExitedProvider:
             for call in deferred.persist.call_args_list
         )
         assert deferred.notify.call_args.kwargs.get("delete_worker") is False
+
+
+class TestDeferredInitRefusedResubmitAfterATaskWasTyped:
+    """Review round 2 of #1018 (P3): a refused RESUBMIT must not claim nothing was typed.
+
+    The confirm loop re-sends when no PROCESSING follows the first paste. If the
+    provider has stopped by then, the resubmit is refused by the same guards and
+    lands in the same ``except`` as a refused first send -- but the task went into
+    the pane once already, into the provider or into the shell. Saying "nothing
+    was typed" there invites the supervisor to assign it again as if it never ran.
+    """
+
+    METADATA = dict(METADATA, provider="kiro_cli", caller_id="supervisor1")
+
+    @pytest.fixture
+    def deferred(self):
+        provider = MagicMock()
+        provider.initialize = AsyncMock(return_value=True)
+        provider.shell_baseline = "bash"
+        provider.runtime_variant = None
+        provider.paste_enter_count = 1
+        provider.paste_submit_delay = 0.0
+        provider.blocks_orchestrated_input_while_waiting_user_answer = False
+        provider.requires_execution_evidence = False
+
+        surface = AsyncMock()
+        with (
+            patch.object(terminal_service, "MemoryService") as memory_service,
+            patch.object(terminal_service, "status_monitor") as status_monitor,
+            patch.object(terminal_service, "provider_manager") as provider_manager,
+            patch("cli_agent_orchestrator.backends.registry._backend") as backend,
+            patch.object(
+                terminal_service, "get_terminal_metadata", return_value=dict(self.METADATA)
+            ),
+            patch.object(terminal_service, "update_terminal_shell_command"),
+            patch.object(terminal_service, "update_last_active"),
+            patch.object(terminal_service, "_clear_deferred_init_external_owner", AsyncMock()),
+            patch.object(terminal_service, "_persist_initial_delivery", MagicMock()),
+            patch.object(terminal_service, "_notify_caller_of_deferred_failure", MagicMock()),
+            patch.object(terminal_service, "_surface_deferred_init_failure", surface),
+            # No PROCESSING ever follows the paste, so the confirm loop resubmits at once.
+            patch.object(
+                terminal_service, "_wait_for_post_dispatch_start", AsyncMock(return_value=False)
+            ),
+        ):
+            memory_service.return_value.get_curated_memory_context.return_value = ""
+            status_monitor.get_status.return_value = TerminalStatus.IDLE
+            provider_manager.get_provider.return_value = provider
+            backend.supports_event_inbox.return_value = False
+            backend.get_history.return_value = ""
+            yield MagicMock(
+                provider=provider, backend=backend, status_monitor=status_monitor, surface=surface
+            )
+
+    @pytest.mark.asyncio
+    async def test_pane_back_at_shell_at_resubmit_reports_the_task_was_typed_once(self, deferred):
+        # kiro-cli in the foreground for the first paste; the shell by the time of the resubmit.
+        pane = iter(["kiro-cli"])
+        deferred.backend.get_pane_current_command.side_effect = lambda *_a, **_k: next(pane, "bash")
+
+        await terminal_service._schedule_deferred_init(
+            deferred.provider, "1e293d67", TASK, None, None
+        )
+
+        assert deferred.backend.send_keys.call_count == 1
+        deferred.surface.assert_awaited_once()
+        kwargs = deferred.surface.await_args.kwargs
+        assert kwargs["kind"] == "provider_exited_after_dispatch"
+        assert "typed once" in kwargs["message"]
+        assert "nothing was typed" not in kwargs["message"]
+        assert "effect is unknown" in kwargs["message"]
+
+    @pytest.mark.asyncio
+    async def test_error_status_at_resubmit_reports_the_task_was_typed_once(self, deferred):
+        deferred.backend.get_pane_current_command.return_value = "kiro-cli"
+        statuses = iter([TerminalStatus.IDLE, TerminalStatus.IDLE])
+        deferred.status_monitor.get_status.side_effect = lambda *_a, **_k: next(
+            statuses, TerminalStatus.ERROR
+        )
+
+        await terminal_service._schedule_deferred_init(
+            deferred.provider, "1e293d67", TASK, None, None
+        )
+
+        assert deferred.backend.send_keys.call_count == 1
+        assert deferred.surface.await_args.kwargs["kind"] == "provider_exited_after_dispatch"
+
+    @pytest.mark.asyncio
+    async def test_refused_first_send_still_says_nothing_was_typed(self, deferred):
+        deferred.backend.get_pane_current_command.return_value = "bash"
+
+        await terminal_service._schedule_deferred_init(
+            deferred.provider, "1e293d67", TASK, None, None
+        )
+
+        deferred.backend.send_keys.assert_not_called()
+        kwargs = deferred.surface.await_args.kwargs
+        assert kwargs["kind"] == "provider_exited"
+        assert "nothing was typed" in kwargs["message"]

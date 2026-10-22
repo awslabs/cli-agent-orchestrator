@@ -903,3 +903,70 @@ class TestWaitUntilStatusOnPoll:
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
 
         assert await wait_until_status("test-terminal", TerminalStatus.IDLE, timeout=1.0) is True
+
+
+class TestOnPollIsNotATransientPollFailure:
+    """Merge of #1018 with #1037: the two policies in this module must stay apart.
+
+    #1037 retries transient poll failures in the synchronous ``poll_until_done``
+    and ``wait_for_initial_delivery`` through ``_is_transient_poll_error``. #1018
+    adds ``on_poll`` to the asynchronous ``wait_until_status``, whose hook aborts
+    by raising. Nothing in ``wait_until_status`` may classify or retry what the
+    hook raises: an exit-to-shell found by the hook has to end the wait on that
+    very poll, however the retry classifier would have read the exception.
+    """
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_hook_exception_ends_the_wait_even_though_the_classifier_calls_it_transient(
+        self, mock_monitor
+    ):
+        from cli_agent_orchestrator.providers.base import ProviderExitedError
+        from cli_agent_orchestrator.utils.terminal import _is_transient_poll_error
+
+        mock_monitor.get_status.return_value = TerminalStatus.PROCESSING
+        exited = ProviderExitedError("pane is back at the shell")
+
+        async def on_poll():
+            raise exited
+
+        # The retry classifier has no status code to read, so it would say "retry".
+        assert _is_transient_poll_error(exited) is True  # type: ignore[arg-type]
+
+        with pytest.raises(ProviderExitedError):
+            await wait_until_status(
+                "test-terminal",
+                TerminalStatus.IDLE,
+                timeout=5.0,
+                polling_interval=0.01,
+                on_poll=on_poll,
+            )
+
+        # One poll, one hook call, no retry, no second read.
+        assert mock_monitor.get_status.call_count == 1
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_hook_runs_on_a_poll_whose_status_is_ready_before_the_wait_returns(
+        self, mock_monitor
+    ):
+        """The hook sees the ready poll too: a ready verdict from a bare shell is still vetoed."""
+        from cli_agent_orchestrator.providers.base import ProviderExitedError
+
+        mock_monitor.get_status.side_effect = [TerminalStatus.PROCESSING, TerminalStatus.IDLE]
+        pane_is_shell = iter([False, True])
+
+        async def on_poll():
+            if next(pane_is_shell):
+                raise ProviderExitedError("pane is back at the shell")
+
+        with pytest.raises(ProviderExitedError):
+            await wait_until_status(
+                "test-terminal",
+                TerminalStatus.IDLE,
+                timeout=5.0,
+                polling_interval=0.01,
+                on_poll=on_poll,
+            )
+
+        assert mock_monitor.get_status.call_count == 2

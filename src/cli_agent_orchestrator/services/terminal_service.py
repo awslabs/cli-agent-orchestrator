@@ -3332,6 +3332,12 @@ def _schedule_deferred_init(
 
     async def _run() -> None:
         caller_id: Optional[str] = initial_caller_id
+        # Whether the first dispatch_input() returned, i.e. the task was pasted
+        # at least once. A provider-exited refusal before that point means
+        # nothing was typed; one after it (a refused resubmit) means the task
+        # went into the pane once already and its effect is unknown (#1018
+        # review round 2, P3).
+        task_dispatched = False
         try:
             await provider_instance.initialize()
             shell_command = provider_instance.shell_baseline
@@ -3386,6 +3392,7 @@ def _schedule_deferred_init(
                     sender_id=caller_id,
                     orchestration_type=effective_orchestration_type,
                 )
+                task_dispatched = True
                 # The pending mark is deliberately NOT released here.
                 #
                 # Round-4 review (haofeif), P1. An earlier revision cleared it at
@@ -3530,19 +3537,33 @@ def _schedule_deferred_init(
             # WAITING_USER_ANSWER), a re-send is refused the same way, and the
             # pane is a bare shell. Treat it as the startup failure it is: tear
             # the worker down and tell the caller the provider exited.
-            logger.error(
-                "Deferred init for terminal %s: provider process exited before the task "
-                "could be delivered: %r.",
-                terminal_id,
-                e,
-            )
-            await _surface_deferred_init_failure(
-                terminal_id,
-                kind="provider_exited",
-                message=(
+            #
+            # Two refusals land here and they must not be described the same
+            # way (#1018 review round 2, P3). Before the first dispatch_input()
+            # returned, nothing was typed. After it -- the confirm loop's
+            # resubmit was refused -- the task was pasted once already, into the
+            # provider or, if it stopped inside the check-then-send window, into
+            # the shell, and the message must not invite the supervisor to
+            # assign it again as if it never ran. The guard's own text says
+            # "may have exited" for the ERROR case; neither message claims more.
+            if task_dispatched:
+                kind = "provider_exited_after_dispatch"
+                detail = (
+                    f"Worker {terminal_id} provider process stopped after the task had been "
+                    f"typed once; a re-delivery was refused. The task's effect is unknown: "
+                    f"inspect the worker's output before assigning it again. {e}"
+                )
+            else:
+                kind = "provider_exited"
+                detail = (
                     f"Worker {terminal_id} provider process exited before the task could be "
                     f"delivered; nothing was typed into the pane. {e}"
-                ),
+                )
+            logger.error("Deferred init for terminal %s: %s", terminal_id, detail)
+            await _surface_deferred_init_failure(
+                terminal_id,
+                kind=kind,
+                message=detail,
                 exception_type=type(e).__name__,
                 registry=registry,
                 delete_on_failure=delete_on_failure,
