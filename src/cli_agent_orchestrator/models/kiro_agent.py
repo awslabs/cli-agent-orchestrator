@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 
 class KiroAgentConfig(BaseModel):
@@ -12,7 +12,25 @@ class KiroAgentConfig(BaseModel):
     description: str
     tools: List[str] = Field(default_factory=lambda: ["*"])
     allowedTools: List[str] = Field(default_factory=list)
-    useLegacyMcpJson: bool = False
+    # Serialized under the name Kiro CLI documents today. ``useLegacyMcpJson``
+    # is the spelling Kiro CLI retired in favour of ``includeMcpJson``; it still
+    # accepts the old one as an alias of the same field, so a spec that carries
+    # BOTH is rejected with ``duplicate field includeMcpJson`` (#1026). This
+    # field is non-Optional with a ``False`` default, so the writer's
+    # ``model_dump_json(exclude_none=True)`` cannot drop it: every spec CAO
+    # installs carries the key, and emitting the retired spelling made those
+    # specs unloadable the moment any other writer added the canonical one.
+    #
+    # ``validation_alias`` keeps INPUT compatible both ways: a profile, fixture
+    # or raw spec that says ``useLegacyMcpJson`` still loads, and so does the
+    # canonical name. Only the OUTPUT spelling changes. The alias is
+    # validation-only on purpose -- a ``serialization_alias`` would re-emit the
+    # retired name, which is the defect itself. test/models/test_kiro_agent.py
+    # pins both halves and keeps the retired spelling out of the field set.
+    includeMcpJson: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("includeMcpJson", "useLegacyMcpJson"),
+    )
     resources: List[str] = Field(default_factory=list)
 
     # Optional pass-through fields
