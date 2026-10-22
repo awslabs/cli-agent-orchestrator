@@ -92,7 +92,9 @@ class TestGetInboxMessagesEndpoint:
             assert response.status_code == 200
             data = response.json()
             assert len(data) == 2
-            mock_get.assert_called_once_with("abcdef12", limit=2, status=None)
+            mock_get.assert_called_once_with(
+                "abcdef12", limit=2, status=None, sender_id=None, newest_first=False
+            )
 
     def test_get_messages_with_status_and_limit(self, client, sample_inbox_messages):
         """Test getting messages with both status and limit parameters."""
@@ -104,7 +106,102 @@ class TestGetInboxMessagesEndpoint:
             assert response.status_code == 200
             data = response.json()
             assert len(data) == 1
-            mock_get.assert_called_once_with("abcdef12", limit=5, status=MessageStatus.PENDING)
+            mock_get.assert_called_once_with(
+                "abcdef12",
+                limit=5,
+                status=MessageStatus.PENDING,
+                sender_id=None,
+                newest_first=False,
+            )
+
+    def test_default_order_is_oldest_first(self, client, sample_inbox_messages):
+        """Omitting order keeps the historical oldest-first query."""
+        with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
+            mock_get.return_value = sample_inbox_messages
+
+            response = client.get("/terminals/abcdef12/inbox/messages")
+
+            assert response.status_code == 200
+            mock_get.assert_called_once_with(
+                "abcdef12", limit=10, status=None, sender_id=None, newest_first=False
+            )
+
+    def test_order_desc_requests_newest_first(self, client, sample_inbox_messages):
+        """order=desc asks the database for newest-first, then applies limit."""
+        with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
+            mock_get.return_value = list(reversed(sample_inbox_messages))[:1]
+
+            response = client.get("/terminals/abcdef12/inbox/messages?order=desc&limit=1")
+
+            assert response.status_code == 200
+            data = response.json()
+            assert len(data) == 1
+            assert data[0]["id"] == 3
+            mock_get.assert_called_once_with(
+                "abcdef12", limit=1, status=None, sender_id=None, newest_first=True
+            )
+
+    def test_order_asc_is_explicit_oldest_first(self, client, sample_inbox_messages):
+        """order=asc is the same oldest-first query as omitting order."""
+        with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
+            mock_get.return_value = sample_inbox_messages
+
+            response = client.get("/terminals/abcdef12/inbox/messages?order=asc")
+
+            assert response.status_code == 200
+            mock_get.assert_called_once_with(
+                "abcdef12", limit=10, status=None, sender_id=None, newest_first=False
+            )
+
+    def test_sender_id_filter_is_forwarded(self, client, sample_inbox_messages):
+        """sender_id is passed through and only that sender's messages are returned."""
+        matching = [msg for msg in sample_inbox_messages if msg.sender_id == "sender1"]
+
+        with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
+            mock_get.return_value = matching
+
+            response = client.get("/terminals/abcdef12/inbox/messages?sender_id=sender1")
+
+            assert response.status_code == 200
+            data = response.json()
+            assert len(data) == 1
+            assert data[0]["sender_id"] == "sender1"
+            mock_get.assert_called_once_with(
+                "abcdef12", limit=10, status=None, sender_id="sender1", newest_first=False
+            )
+
+    def test_sender_id_combines_with_status_order_and_limit(self, client, sample_inbox_messages):
+        """sender_id combines with status, order, and limit."""
+        with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
+            mock_get.return_value = sample_inbox_messages[:1]
+
+            response = client.get(
+                "/terminals/abcdef12/inbox/messages"
+                "?status=pending&order=desc&limit=1&sender_id=sender1"
+            )
+
+            assert response.status_code == 200
+            data = response.json()
+            assert len(data) == 1
+            mock_get.assert_called_once_with(
+                "abcdef12",
+                limit=1,
+                status=MessageStatus.PENDING,
+                sender_id="sender1",
+                newest_first=True,
+            )
+
+    def test_invalid_order_parameter(self, client):
+        """An invalid order value returns 400, the same way an invalid status does."""
+        with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
+            response = client.get("/terminals/abcdef12/inbox/messages?order=newest")
+
+            assert response.status_code == 400
+            data = response.json()
+            assert "detail" in data
+            assert "Invalid order" in data["detail"]
+            assert "asc, desc" in data["detail"]
+            mock_get.assert_not_called()
 
     def test_invalid_status_parameter(self, client):
         """Test error handling for invalid status parameter."""
