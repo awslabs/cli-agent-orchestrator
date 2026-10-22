@@ -2271,7 +2271,6 @@ class MemoryService:
             for rk in targets:
                 if rk in visited:
                     continue
-                visited.add(rk)
                 if (
                     eligibility is not None
                     and memory_eligibility.MemoryIdentity(
@@ -2280,6 +2279,7 @@ class MemoryService:
                     in related_reasons
                 ):
                     continue
+                visited.add(rk)
                 if getattr(primary, "source_kind", "native") == "vault":
                     related_mem = self._load_related_vault_memory(
                         rk,
@@ -4613,13 +4613,13 @@ class MemoryService:
                         break
                     if rk in visited:
                         continue
-                    visited.add(rk)
                     if (
                         check is not None
                         and memory_eligibility.MemoryIdentity(rk, scope_val, scope_id, source_kind)
                         in related_reasons
                     ):
                         continue
+                    visited.add(rk)
                     if getattr(primary, "source_kind", "native") == "vault":
                         related_mem = self._load_related_vault_memory(
                             rk,

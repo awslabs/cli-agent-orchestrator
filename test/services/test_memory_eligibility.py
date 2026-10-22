@@ -474,3 +474,82 @@ def test_known_exclusion_precedes_unknown_supersedes_group(seeded, registry, mon
     assert by_key["blocked"]["exclusion_reasons"] == ["promoted"]
     assert by_key["survivor"]["injection"] == "unknown"
     assert result["eligibility_errors"] == ["lifecycle.supersedes"]
+
+
+@pytest.fixture
+def same_key_related_targets(svc, db_engine, monkeypatch, registry):
+    """Project exclusion must not shadow the eligible global related target."""
+    factory = sessionmaker(bind=db_engine)
+    monkeypatch.setattr(database, "SessionLocal", factory)
+    monkeypatch.setattr(memory_relationship_service, "SessionLocal", factory)
+    ctx = _ctx(caller_scope="global")
+    primaries = [
+        ("primary-project", "project"),
+        ("primary-global-a", "global"),
+        ("primary-global-b", "global"),
+    ]
+    now = datetime.now(timezone.utc)
+    for days, (key, scope) in enumerate(primaries):
+        _run(svc.store(key=key, content="primary-body", scope=scope, terminal_context=ctx))
+        _stamp_updated_at(db_engine, key, scope, now - timedelta(days=days))
+    for scope, content in [("project", "EXCLUDED TARGET"), ("global", "ELIGIBLE TARGET")]:
+        _run(svc.store(key="shared-related", content=content, scope=scope, terminal_context=ctx))
+        # Keep related targets out of the primary pool, as in the existing
+        # fan-out fixture. The real wiki and metadata rows remain available.
+        index = svc.get_index_path(scope, svc.resolve_scope_id(scope, ctx))
+        index.write_text(
+            "\n".join(
+                line for line in index.read_text().splitlines() if "[shared-related]" not in line
+            )
+            + "\n"
+        )
+    with factory() as db:
+        for key, scope in primaries:
+            db.query(MemoryMetadataModel).filter_by(key=key, scope=scope).update(
+                {"related_keys": "shared-related"}
+            )
+        db.commit()
+
+    class ProjectExclusion(FixtureSource):
+        def excluded(self, request, candidates):
+            return {
+                identity: self.reason
+                for identity in candidates
+                if identity.key == "shared-related" and identity.scope == "project"
+            }
+
+    registry.register_source(ProjectExclusion())
+    return svc, ctx
+
+
+def test_excluded_related_target_does_not_shadow_other_scope_in_curator_recall(
+    same_key_related_targets,
+):
+    service, ctx = same_key_related_targets
+    rows = _run(
+        service.recall(
+            query="primary-body",
+            search_mode="metadata",
+            terminal_context=dict(ctx, agent_profile="memory_manager"),
+            include_related=True,
+            limit=3,
+        )
+    )
+    assert [(m.key, m.scope) for m in rows if not m.is_related] == [
+        ("primary-project", "project"),
+        ("primary-global-a", "global"),
+        ("primary-global-b", "global"),
+    ]
+    related = [(m.key, m.scope, m.content) for m in rows if m.is_related]
+    # The two eligible global primaries still inject their same-key target once.
+    assert related == [("shared-related", "global", "ELIGIBLE TARGET")]
+
+
+def test_excluded_related_target_does_not_shadow_other_scope_in_injection(
+    same_key_related_targets,
+):
+    service, ctx = same_key_related_targets
+    block = service.get_memory_context(ctx)
+    assert "EXCLUDED TARGET" not in block
+    assert "shared-related [related]: ELIGIBLE TARGET" in block
+    assert block.count("shared-related [related]") == 1
