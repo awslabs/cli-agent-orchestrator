@@ -3376,9 +3376,43 @@ class TestClaudeCodeReducedMotionFinishedResponse:
 
     def test_hyphen_and_contraction_verbs_match_on_the_animated_glyph_too(self):
         """The widened verb class fixes NEW_TUI_BOX_SPINNER_PATTERN, which had the
-        "\\w*ing" gap for the default verbs carrying "-"/"'"."""
-        for line in ("✢ Dilly-dallying… (12s)", "✻ Beboppin'… (12s)"):
+        "\\w*ing" gap for the default verbs carrying "-"/"'". "·" and "*" are
+        spinner frames as well as bullets, so they count too."""
+        for line in (
+            "✢ Dilly-dallying… (12s)",
+            "✻ Beboppin'… (12s)",
+            "· Dilly-dallying… (12s · ↓ 300 tokens)",
+            "* Beboppin’… (thinking)",
+            "✢ Compacting conversation…",
+        ):
             assert NEW_TUI_BOX_SPINNER_PATTERN.search(line), line
         # Still rejects a response bullet / the version footer above the box.
         for line in ("* Remember to deploy…", "· latest: 2.1.0 — run /update…"):
             assert not NEW_TUI_BOX_SPINNER_PATTERN.search(line), line
+
+    # PR #975 review, P3-1: a hyphenated -ing compound is ordinary prose, and a
+    # settled bullet that opens with one and ends in an ellipsis must not read
+    # as a spinner. The default verbs run straight into the ellipsis; prose
+    # does not.
+    HYPHENATED_PROSE_BULLETS = [
+        "* Long-running jobs now stop after 30 minutes…",
+        "* Self-hosting is supported, see the docs…",
+        "· Re-running the failed tests is the next step…",
+        "* Rockin' the new layout is optional…",
+    ]
+
+    @pytest.mark.parametrize("line", HYPHENATED_PROSE_BULLETS)
+    def test_hyphenated_prose_bullet_is_not_a_spinner(self, line):
+        assert not NEW_TUI_BOX_SPINNER_PATTERN.search(line), line
+
+    @pytest.mark.parametrize("line", HYPHENATED_PROSE_BULLETS)
+    def test_hyphenated_prose_bullet_reads_completed_on_both_paths(self, line):
+        """Directly above the box (no summary painted) and in the finished-turn
+        frame; the first is where only the pattern can reject it."""
+        for screen in (
+            self._screen("● Notes:", line),
+            self._screen("● Summary:", line, "  and the rest of the answer.", "", self.SUMMARY),
+        ):
+            for _ in range(3):
+                assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+                assert self._p().get_status("\n".join(screen)) == TerminalStatus.COMPLETED

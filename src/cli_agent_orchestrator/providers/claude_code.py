@@ -283,11 +283,17 @@ NEW_TUI_SPINNER_PATTERN = r"[✶✢✽✻✳·*][^\n]*ing…"
 # carries: a hyphen inside the word ("Dilly-dallying") and the dropped-g
 # contraction ("Beboppin'", with either ASCII ' or the typographic ’). A plain
 # "\w*ing\b" rejects both — \w spans no "-" and no "'" — which is why #956
-# dropped the first-word anchor entirely rather than widening it, and that is
-# what left the reduced-motion pattern matching finished responses (GH #974).
+# dropped the first-word anchor from the reduced-motion pattern rather than
+# widening it. Those verbs run straight into the ellipsis ("Dilly-dallying…"),
+# whereas a hyphenated -ing compound in response prose is followed by more
+# words ("* Long-running jobs now stop after 30 minutes…", "* Self-hosting is
+# supported, see the docs…") — and "*" / "·" are markdown bullets as well as
+# spinner frames. So the "-" / "'" forms are accepted only when the ellipsis
+# follows at once (PR #975 review, P3-1); the plain form still carries the
+# multi-word spinner ("✢ Compacting conversation…", "✻ Running the test suite…").
 # No "\b" after the contraction: the next character is the "…", so there is no
 # word boundary to assert there.
-_SPINNER_VERB = r"[\w'’-]*(?:ing\b|in['’])"
+_SPINNER_VERB = r"(?:\w*ing\b|[\w'’-]*(?:ing|in['’])(?=…))"
 NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+" + _SPINNER_VERB + r".*…")
 # Live spinner under Claude Code's prefersReducedMotion setting (GH #908): the
 # animated glyph is replaced by a static "●", e.g. "● Leavening… (running

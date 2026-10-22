@@ -43,6 +43,12 @@ SETTLED_LINES = [
     "● Calling cao-mcp-server… (ctrl+o to expand)",
     # The completed-response marker, same shape.
     "⏺ Ran the suite… (12s)",
+    # Settled bullets that open with a hyphenated or contracted -ing compound
+    # and end in an ellipsis (PR #975 review, P3-1). "*" and "·" are spinner
+    # frames as well as markdown bullets.
+    "* Long-running jobs now stop after 30 minutes…",
+    "* Self-hosting is supported, see the docs…",
+    "· Re-running the failed tests is the next step…",
     # Static chrome.
     "● high · /effort",
     "* Remember to deploy…",
@@ -79,6 +85,11 @@ LIVE_SPINNER_LINES = [
     "● Dilly-dallying… (12s · ↓ 300 tokens)",
     "● Beboppin'… (thinking)",
     "✢ Compacting conversation…",
+    # The default verbs carrying "-" / "'", on the animated glyphs and on the
+    # "·" / "*" spinner frames.
+    "✢ Dilly-dallying… (12s · ↓ 300 tokens)",
+    "· Dilly-dallying… (12s · ↓ 300 tokens)",
+    "* Beboppin’… (thinking)",
 ]
 
 # Patterns that match settled output on purpose, because the call site supplies
@@ -100,6 +111,14 @@ KNOWN_LOOSE = {
         "Legacy pre-TUI fragment, composed into larger expressions and only "
         "applied between separators. NEW_TUI_BOX_SPINNER_PATTERN is the tight "
         "line-level form used next to the input box."
+    ),
+    "codex.PROCESSING_PATTERN": (
+        "Legacy keyword list (thinking|working|running|...) that no status path "
+        "applies any more: codex's own comment notes it matches 'running' in "
+        "'You are running Codex in...', and it matches 'Re-running' in a "
+        "settled bullet here. Codex reads PROCESSING from TUI_PROGRESS_PATTERN. "
+        "Listed so the guard stays green on it without hiding that a bare word "
+        "list is not a busy signal."
     ),
     "cursor_cli.PROCESSING_PATTERN": (
         "KNOWN LIVE GAP, sibling of GH #974: the glyph class includes '·' with "
