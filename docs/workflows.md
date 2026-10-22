@@ -642,6 +642,25 @@ from what was reviewed and still match the same `plan_id`:
 - **Files in a non-Git working directory.** The `plan_id` records the directory's path, not its
   contents. Files added, changed or removed there after approval are used by the next run under the
   original `plan_id`.
+- **Managed `.env` values a profile references.** A profile's `${VAR}` placeholders are resolved from
+  the CAO-managed `.env` file (`cao env set`) when the step launches. The placeholder text is bound; the
+  value is not, because that file is where credentials live and a digest of the substituted text would
+  carry a hash of each credential into an identifier that is logged and displayed. Changing a referenced
+  value with `cao env set` does not change the `plan_id`.
+- **MCP servers from installed plugins.** Plugin MCP servers are delivered to the agent at launch
+  (`with_plugin_mcp`), not read from the profile, so adding or removing a plugin does not change the
+  `plan_id`.
+- **Installed skills.** The skill catalog under the CAO skills directory is injected into a launching
+  agent's context and is not part of the `plan_id`.
+- **A same-name profile shadowed in a lower-priority directory.** Only the profile that wins
+  resolution, plus the files `cao install` wrote for that name, is bound; a same-named file in a
+  directory that loses resolution is not.
+- **The reserved ephemeral namespace.** Ephemeral profiles are created by the run after admission and
+  are bound on their own path, so they are outside the installed-set digest by design.
+
+Each of these is a launch input the next run reads live. Binding any of them is a separate change from
+#827; the `.env` case needs a design that does not leak values, and the others need a product ruling on
+whether an operator's plugin or skill change should invalidate every approval.
 - **Repository changes after admission.** The repository state is read once, when the run is
   admitted. Changes made after that, including while a submitted run waits for a free slot, are not
   detected.
