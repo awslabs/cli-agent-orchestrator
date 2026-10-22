@@ -36,14 +36,9 @@ _BUSY_NAME = re.compile(r"SPINNER|PROCESSING|WORKING|BUSY")
 _IS_PATTERN_NAME = re.compile(r"(?:PATTERN|_RE)$")
 
 # Settled output: finished responses, tool-call lines and static chrome. None of
-# these is a live spinner, in any provider's TUI.
+# these is a live spinner, in any provider's TUI, and no busy pattern may match
+# any of them on its own.
 SETTLED_LINES = [
-    # GH #974: a finished response that reports its own timing. "●" is also
-    # Claude Code's response marker and its reduced-motion spinner glyph.
-    "● Done. The fix is in place… (3m 12s)",
-    "● Approved the plan… (↓ 1.2k tokens)",
-    "● Ran the suite… (12s)",
-    "● Thought about it… (esc to interrupt)",
     # The MCP tool-call line: parentheses, but no spinner status.
     "● Calling cao-mcp-server… (ctrl+o to expand)",
     # The completed-response marker, same shape.
@@ -55,6 +50,26 @@ SETTLED_LINES = [
     "└ Completed in 12s",
     "● Ready",
 ]
+
+# GH #974: a finished response that reports its own timing. "●" is Claude
+# Code's response marker AND its reduced-motion spinner glyph, and the
+# parenthetical is the spinner's own status shape, so these rows are
+# byte-for-byte a live spinner with a non-gerund message (#908, #956). No
+# regex can reject them without also rejecting that spinner; what makes them
+# settled is their POSITION: the end-of-turn summary is the newest row above
+# the input box, not the response. They are therefore guarded through the
+# public status paths in the finished-turn frame (TestSettledFrameNeverPins
+# Processing), not against each pattern in isolation.
+SETTLED_STATUS_ROWS = [
+    "● Done. The fix is in place… (3m 12s)",
+    "● Approved the plan… (↓ 1.2k tokens)",
+    "● Ran the suite… (12s)",
+    "● Thought about it… (esc to interrupt)",
+    "● Refactoring complete… (3m 12s)",
+]
+ALL_SETTLED_LINES = SETTLED_LINES + SETTLED_STATUS_ROWS
+# The newest row above the box once a turn has finished (GH #865).
+END_OF_TURN_SUMMARY = "✻ Worked for 3m 12s"
 
 # Live spinner lines, for the opposite direction: narrowing a busy pattern must
 # not go so far that nothing matches a real spinner any more.
@@ -71,6 +86,16 @@ LIVE_SPINNER_LINES = [
 # being loose, or names a pattern that no longer exists, fails below -- the
 # allowlist cannot rot into a silent exemption.
 KNOWN_LOOSE = {
+    "claude_code.REDUCED_MOTION_SPINNER_PATTERN": (
+        "GH #908/#956/#974: matches any '● <message>… (<spinner status>)' row, "
+        "so it also matches a finished response that reports its own timing "
+        "(SETTLED_STATUS_ROWS). The message is not a property of the spinner "
+        "row (custom spinnerVerbs, hook verbs, task text in any language), so "
+        "the pattern cannot be tightened; both call sites supply position "
+        "instead: get_status()'s input-box walk and get_status_from_screen() "
+        "match it only on the newest conversation row above the input box, "
+        "where a finished turn has its end-of-turn summary."
+    ),
     "claude_code.PROCESSING_PATTERN": (
         "Legacy pre-TUI fragment, composed into larger expressions and only "
         "applied between separators. NEW_TUI_BOX_SPINNER_PATTERN is the tight "
@@ -129,7 +154,7 @@ def test_discovery_finds_the_known_busy_patterns():
 def test_busy_pattern_rejects_settled_output(qualname, pattern):
     if qualname in KNOWN_LOOSE:
         pytest.skip(f"deliberately loose: {KNOWN_LOOSE[qualname]}")
-    hits = [line for line in SETTLED_LINES if pattern.search(line)]
+    hits = [line for line in ALL_SETTLED_LINES if pattern.search(line)]
     assert not hits, (
         f"{qualname} reads settled output as a live spinner: {hits}. A busy "
         f"pattern that matches finished output pins PROCESSING on the unscoped "
@@ -145,38 +170,66 @@ def test_known_loose_entries_are_still_real_and_still_loose(qualname):
     by_name = dict(DISCOVERED)
     assert qualname in by_name, f"{qualname} is gone; drop it from KNOWN_LOOSE"
     assert any(
-        by_name[qualname].search(line) for line in SETTLED_LINES
+        by_name[qualname].search(line) for line in ALL_SETTLED_LINES
     ), f"{qualname} is tight now; drop it from KNOWN_LOOSE so it is guarded"
 
 
+# The two patterns claude_code applies to the newest row above the input box,
+# in get_status()'s input-box walk and in get_status_from_screen(). A live
+# spinner that neither matches reads COMPLETED there, the #908 failure.
+BOX_ROW_PATTERNS = (
+    "claude_code.NEW_TUI_BOX_SPINNER_PATTERN",
+    "claude_code.REDUCED_MOTION_SPINNER_PATTERN",
+)
+
+
 @pytest.mark.parametrize("line", LIVE_SPINNER_LINES)
-def test_a_real_spinner_still_matches_some_claude_code_busy_pattern(line):
+def test_a_real_spinner_still_matches_a_box_row_pattern(line):
     """The narrowing direction has a floor: do not anchor the spinner away."""
+    by_name = dict(DISCOVERED)
     assert any(
-        pattern.search(line)
-        for qualname, pattern in DISCOVERED
-        if qualname.startswith("claude_code.") and qualname not in KNOWN_LOOSE
-    ), f"no claude_code busy pattern matches the live spinner {line!r}"
+        by_name[qualname].search(line) for qualname in BOX_ROW_PATTERNS
+    ), f"no box-row busy pattern matches the live spinner {line!r}"
 
 
 class TestSettledFrameNeverPinsProcessing:
     """The same invariant through the public status paths, including the latch.
 
     The regex guard above is the cheap enumeration; this is the behaviour it
-    stands in for. ``get_status_from_screen`` has no separator scoping and no
-    "newer output below" escape, so a settled frame that reads PROCESSING once
-    reads PROCESSING on every later poll too.
+    stands in for. A frame that has settled must not read PROCESSING on any
+    poll: ``get_status_from_screen`` used to scan every bottom row for a busy
+    match, so a settled row that matched once matched on every later poll too
+    (GH #974). Polled three times so a latch, not just a first read, is caught.
     """
 
     BOX = "─" * 60
 
-    def _screen(self, line):
-        return ["❯ review the diff", line, self.BOX, "❯ ", self.BOX, "  ? for shortcuts"]
+    def _screen(self, *lines):
+        return ["❯ review the diff", *lines, self.BOX, "❯ ", self.BOX, "  ? for shortcuts"]
 
-    @pytest.mark.parametrize("line", SETTLED_LINES)
-    def test_settled_line_is_not_processing_on_either_path(self, line):
+    def _assert_never_processing(self, screen):
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        screen = self._screen(line)
         for _ in range(3):
             assert provider.get_status_from_screen(screen) != TerminalStatus.PROCESSING
             assert provider.get_status("\n".join(screen)) != TerminalStatus.PROCESSING
+
+    @pytest.mark.parametrize("line", SETTLED_LINES)
+    def test_settled_line_alone_above_the_box_is_not_processing(self, line):
+        """Directly above the box, with nothing under it: the one position a
+        live spinner occupies, so only the pattern itself rejects the line."""
+        self._assert_never_processing(self._screen(line))
+
+    @pytest.mark.parametrize("line", ALL_SETTLED_LINES)
+    def test_settled_line_in_a_finished_turn_is_not_processing(self, line):
+        """The finished-turn frame: the line, response body, the end-of-turn
+        summary as the newest row. This is where the #974 latch lived, and the
+        only frame in which SETTLED_STATUS_ROWS can be told from a spinner."""
+        screen = self._screen(line, "  and the rest of the answer.", "", END_OF_TURN_SUMMARY)
+        self._assert_never_processing(screen)
+
+    @pytest.mark.parametrize("line", ALL_SETTLED_LINES)
+    def test_settled_line_with_chrome_below_the_summary_is_not_processing(self, line):
+        """Box chrome ("⎿ Tip: …") renders between the summary and the box; it
+        must be skipped on the way up, not mistaken for the newest row."""
+        screen = self._screen(line, "", END_OF_TURN_SUMMARY, "⎿ Tip: press ctrl+o to expand")
+        self._assert_never_processing(screen)

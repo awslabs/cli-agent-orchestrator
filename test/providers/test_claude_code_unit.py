@@ -3192,15 +3192,21 @@ class TestClaudeCodeReducedMotionSpinner:
 
 
 class TestClaudeCodeReducedMotionFinishedResponse:
-    """GH #974 (follow-up to #908 / #956): the reduced-motion pattern anchored
-    only on the parenthesised status, so a FINISHED response whose first line
-    ends in a duration or token parenthetical read PROCESSING on both status
-    paths. ``get_status_from_screen`` scans the bottom 25 rows for any match with
-    no separator scoping, so that settled line pinned PROCESSING for good and
+    """GH #974 (follow-up to #908 / #956): a FINISHED response whose first line
+    ends in a duration or token parenthetical is the same text as a live
+    reduced-motion spinner row, so REDUCED_MOTION_SPINNER_PATTERN matches it on
+    purpose (#956: any message, anchored on the status in the parentheses, so a
+    custom ``spinnerVerbs`` entry or a task row in another language stays
+    PROCESSING). What tells the two apart is POSITION: the spinner is always the
+    newest conversation row above the input box, while a finished response has
+    the end-of-turn summary under it. The raw path's input-box walk already
+    looked only there; ``get_status_from_screen`` scanned the bottom 25 rows for
+    ANY match, so the settled row pinned PROCESSING for good and
     ``_wait_for_completion`` saw neither COMPLETED nor IDLE until its timeout.
     """
 
     BOX = "─" * 60
+    SUMMARY = "✻ Worked for 3m 12s"
 
     def _p(self):
         return ClaudeCodeProvider("test123", "test-session", "window-0")
@@ -3215,23 +3221,44 @@ class TestClaudeCodeReducedMotionFinishedResponse:
             "  ? for shortcuts",
         ]
 
-    @pytest.mark.parametrize(
-        "line",
-        [
-            # A finished response that happens to report its own elapsed time.
-            "● Done. The fix is in place… (3m 12s)",
-            "● Approved the plan… (↓ 1.2k tokens)",
-            "● Ran the suite… (12s)",
-            "● Rebased onto main… (2 files, 1.2k tokens)",
-            "● Handed the work back… (thinking it through below)",
-            # Past tense, not a gerund, with the exact spinner status shape.
-            "● Thought about it… (esc to interrupt)",
-        ],
-    )
-    def test_finished_response_with_status_parenthetical_is_completed(self, line):
-        screen = self._screen(line)
+    FINISHED_RESPONSE_LINES = [
+        # A finished response that happens to report its own elapsed time.
+        "● Done. The fix is in place… (3m 12s)",
+        "● Approved the plan… (↓ 1.2k tokens)",
+        "● Ran the suite… (12s)",
+        "● Rebased onto main… (2 files, 1.2k tokens)",
+        "● Handed the work back… (thinking it through below)",
+        # Past tense with the exact spinner status shape.
+        "● Thought about it… (esc to interrupt)",
+        # Opens with a gerund, so no word rule could reject it either.
+        "● Refactoring complete… (3m 12s)",
+    ]
+
+    @pytest.mark.parametrize("line", FINISHED_RESPONSE_LINES)
+    def test_finished_response_with_summary_below_is_completed(self, line):
+        """The finished turn's end-of-turn summary is the newest row above the
+        box, so the response row above it is history on both paths."""
+        screen = self._screen(line, "  The patch is in src/app.py.", "", self.SUMMARY)
         assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
         assert self._p().get_status("\n".join(screen)) == TerminalStatus.COMPLETED
+
+    @pytest.mark.parametrize("line", FINISHED_RESPONSE_LINES)
+    def test_finished_response_does_not_pin_the_screen_path_processing(self, line):
+        """The screen path used to scan every bottom row, so the settled response
+        row stayed matched for the rest of the session: a permanent PROCESSING,
+        not a one-poll blip. Chrome between the summary and the box is skipped."""
+        screen = self._screen(line, "", self.SUMMARY, "⎿ Tip: press ctrl+o to expand")
+        for _ in range(3):
+            assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
+    def test_finished_response_with_only_chrome_below_is_still_a_spinner_row(self):
+        """Chrome is not conversation: a "●" row with nothing but "⎿ Tip" under it
+        is still the newest conversation row, so it keeps the #908 reading."""
+        screen = self._screen(
+            "● Sublimating… (12s · ↓ 300 tokens)", "⎿ Tip: press ctrl+o to expand"
+        )
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+        assert self._p().get_status("\n".join(screen)) == TerminalStatus.PROCESSING
 
     @pytest.mark.parametrize(
         "line",
@@ -3250,31 +3277,52 @@ class TestClaudeCodeReducedMotionFinishedResponse:
             "● Leavening… (esc to interrupt reviewer)",
         ],
     )
-    def test_gerund_anchor_keeps_every_908_spinner_shape_processing(self, line):
+    def test_every_908_spinner_shape_stays_processing(self, line):
         screen = self._screen(line)
         assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
         assert self._p().get_status("\n".join(screen)) == TerminalStatus.PROCESSING
 
-    def test_hyphen_and_contraction_verbs_match_on_the_animated_glyph_too(self):
-        """The same widened verb class fixes NEW_TUI_BOX_SPINNER_PATTERN, which
-        had the identical "\\w*ing" gap for the default verbs carrying "-"/"'"."""
-        for line in ("✢ Dilly-dallying… (12s)", "✻ Beboppin'… (12s)"):
-            assert NEW_TUI_BOX_SPINNER_PATTERN.search(line), line
-        # Still rejects a response bullet / the version footer above the box.
-        for line in ("* Remember to deploy…", "· latest: 2.1.0 — run /update…"):
-            assert not NEW_TUI_BOX_SPINNER_PATTERN.search(line), line
+    # #956's case, which a first-word rule reopened (PR #975 review, P2-1): the
+    # message before the ellipsis is NOT a property of the spinner row. The
+    # ``spinnerVerbs`` setting accepts any string, the hook spinner shows the
+    # verb the hook was interrupted on, and a task row is in whatever language
+    # the task is in. None of these ends in "ing".
+    NON_GERUND_SPINNER_LINES = [
+        "● Hmm… (running PreToolUse hook)",
+        "● Work in progress… (12s · ↓ 300 tokens)",
+        "● Fix the login bug… (12s · ↓ 300 tokens)",
+        "● Ejecutando las pruebas… (12s · ↓ 300 tokens)",
+        "● 2/3 tests fixed… (12s · ↓ 300 tokens)",
+    ]
 
-    def test_finished_response_does_not_pin_the_screen_path_processing(self):
-        """The screen path has no separator scoping: the settled response line
-        sits in the bottom rows for the rest of the session, so a match there is
-        a permanent PROCESSING, not a one-poll blip."""
-        screen = self._screen(
-            "● Done. The fix is in place… (3m 12s)",
-            "",
-            "⎿ Tip: press ctrl+o to expand",
-        )
-        for _ in range(3):
-            assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+    @pytest.mark.parametrize("line", NON_GERUND_SPINNER_LINES)
+    def test_non_gerund_spinner_message_is_processing(self, line):
+        screen = self._screen(line)
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+        assert self._p().get_status("\n".join(screen)) == TerminalStatus.PROCESSING
+
+    @pytest.mark.parametrize("line", NON_GERUND_SPINNER_LINES)
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_non_gerund_spinner_message_outlasts_turn_end_grace(self, mock_backend, line):
+        """Same setup as test_static_reduced_motion_spinner_outlasts_turn_end_grace:
+        a static "●" row does not repaint, so once the grace runs out only this
+        pattern keeps the frame at PROCESSING. With a first-word rule the custom
+        verb fell through and read COMPLETED, and handoff tore the worker down."""
+        from cli_agent_orchestrator.providers.claude_code import TURN_END_GRACE_S
+
+        mock_backend.get_native_status.return_value = None
+        mock_backend.supports_event_inbox.return_value = False
+        mock_backend.get_history.return_value = ""
+        provider = self._p()
+        provider.mark_input_received()
+        clock = {"now": 1000.0}
+        provider._turn_gate_clock = lambda: clock["now"]
+        screen = self._screen(line)
+
+        for _ in range(2):
+            assert provider.get_status_from_screen(screen) == TerminalStatus.PROCESSING
+            assert provider.get_status("\n".join(screen)) == TerminalStatus.PROCESSING
+            clock["now"] += TURN_END_GRACE_S + 1
 
     def test_live_spinner_below_a_finished_response_still_wins(self):
         """A new turn started under the old response: PROCESSING, not COMPLETED."""
@@ -3285,29 +3333,52 @@ class TestClaudeCodeReducedMotionFinishedResponse:
         assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
         assert self._p().get_status("\n".join(screen)) == TerminalStatus.PROCESSING
 
+    def test_animated_spinner_above_a_settled_row_is_history_on_the_screen_path(self):
+        """The scope applies to the animated glyphs too: a spinner row that the
+        composite still holds above newer output is not the live spinner."""
+        screen = self._screen(
+            "✢ Sublimating… (4s · ↓ 12 tokens)",
+            "● Done. The fix is in place.",
+            "",
+            self.SUMMARY,
+        )
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
+    def test_spinner_without_a_box_is_still_processing_on_the_screen_path(self):
+        """No box on screen (launch, a full-screen dialog): nothing has settled,
+        so the whole bottom region is scanned as before."""
+        screen = ["● Sublimating… (4s · ↓ 12 tokens)", "", "  some other row"]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "● Done. The fix is in place… (3m 12s)",
+            "● Approved the plan… (↓ 1.2k tokens)",
+            "● Refactoring complete… (3m 12s)",
+            "● Nothing left to do… (12s)",
+        ],
+    )
     @pytest.mark.xfail(
-        reason="Known limitation (GH #974 follow-up): the gerund anchor narrows "
-        "the match surface but cannot distinguish spinner prose from response "
-        "prose on a single line. A finished response that happens to open with "
-        "a gerund still reads PROCESSING. Needs a 'newer output below this line' "
-        "escape on get_status_from_screen's bottom-25-row scan.",
+        reason="Known limitation (GH #974 residual): a single settled '●' row with "
+        "a status-shaped parenthetical DIRECTLY above the box, with no end-of-turn "
+        "summary under it, is byte-for-byte a live reduced-motion spinner with a "
+        "non-gerund message (#908). Position cannot separate them and a word rule "
+        "must not (PR #975 review, P2-1), so this frame reads PROCESSING, the "
+        "direction #908 chose. There is no live capture of a finished turn that "
+        "paints no summary; one is needed before a rule is chosen for this case.",
         strict=True,
     )
-    def test_gerund_leading_finished_response_still_misreads_processing(self):
-        screen = self._screen("● Refactoring complete… (3m 12s)")
+    def test_settled_status_row_alone_above_the_box_is_indistinguishable(self, line):
+        screen = self._screen(line)
         assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
         assert self._p().get_status("\n".join(screen)) == TerminalStatus.COMPLETED
 
-    @pytest.mark.xfail(
-        reason="Known limitation (GH #974 follow-up): the gerund anchor requires "
-        "a present-participle first word, so a custom non-gerund spinnerVerbs "
-        "entry (e.g. 'Work in progress') falls through and misreads as COMPLETED "
-        "instead of PROCESSING -- the same shape this fix was meant to close. "
-        "Needs a 'newer output below this line' escape on "
-        "get_status_from_screen's bottom-25-row scan, not another regex anchor.",
-        strict=True,
-    )
-    def test_non_gerund_custom_spinner_verb_still_misreads_completed(self):
-        screen = self._screen("● Work in progress… (12s · ↓ 300 tokens)")
-        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
-        assert self._p().get_status("\n".join(screen)) == TerminalStatus.PROCESSING
+    def test_hyphen_and_contraction_verbs_match_on_the_animated_glyph_too(self):
+        """The widened verb class fixes NEW_TUI_BOX_SPINNER_PATTERN, which had the
+        "\\w*ing" gap for the default verbs carrying "-"/"'"."""
+        for line in ("✢ Dilly-dallying… (12s)", "✻ Beboppin'… (12s)"):
+            assert NEW_TUI_BOX_SPINNER_PATTERN.search(line), line
+        # Still rejects a response bullet / the version footer above the box.
+        for line in ("* Remember to deploy…", "· latest: 2.1.0 — run /update…"):
+            assert not NEW_TUI_BOX_SPINNER_PATTERN.search(line), line

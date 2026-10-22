@@ -322,8 +322,7 @@ _REDUCED_MOTION_STATUS = (
     r"|esc[ \t]+to[ \t]+interrupt\b)"
 )
 REDUCED_MOTION_SPINNER_PATTERN = re.compile(
-    r"^[ \t]*●[ \t]+" + _SPINNER_VERB + r"[^\n]*…[ \t]+\(" + _REDUCED_MOTION_STATUS,
-    re.MULTILINE,
+    r"^[ \t]*●[ \t]+[^\n]*…[ \t]+\(" + _REDUCED_MOTION_STATUS, re.MULTILINE
 )
 
 
@@ -1318,9 +1317,11 @@ class ClaudeCodeProvider(BaseProvider):
         return TerminalStatus.UNKNOWN
 
     @staticmethod
-    def _turn_ended_above_box(above_lines: List[str]) -> bool:
-        """True when the newest conversation line above the input box is the
-        end-of-turn summary. Blank rows and box chrome are skipped on the way up.
+    def _newest_conversation_row(above_lines: List[str]) -> Optional[str]:
+        """The newest conversation row above the input box, or None when nothing
+        but blank rows and box chrome ("⎿ Tip: …", the effort footer, the tmux
+        notices) sits above it. This is the only row the TUI draws the live
+        spinner on, and the row the end-of-turn summary lands on.
         """
         for line in reversed(above_lines):
             if (
@@ -1329,8 +1330,16 @@ class ClaudeCodeProvider(BaseProvider):
                 or EFFORT_FOOTER_LINE_PATTERN.match(line)
             ):
                 continue
-            return NEW_TUI_BOX_SUMMARY_PATTERN.match(line) is not None
-        return False
+            return line
+        return None
+
+    @classmethod
+    def _turn_ended_above_box(cls, above_lines: List[str]) -> bool:
+        """True when the newest conversation line above the input box is the
+        end-of-turn summary. Blank rows and box chrome are skipped on the way up.
+        """
+        newest = cls._newest_conversation_row(above_lines)
+        return newest is not None and NEW_TUI_BOX_SUMMARY_PATTERN.match(newest) is not None
 
     def _turn_still_in_flight(self, path: str, above_lines: List[str]) -> bool:
         """After a dispatch, a box without the summary as its newest line above is
@@ -1407,6 +1416,30 @@ class ClaudeCodeProvider(BaseProvider):
         joined = "\n".join(rows)
         bottom = rows[-25:]
 
+        # Real input box: a prompt line with a "────" rail BOTH within 2 rows
+        # above AND within 2 rows below — the "──── / ❯ / ────" box Claude pins
+        # to the bottom of the viewport. Located first because the spinner scan
+        # below is scoped to it.
+        sep_idx = [i for i, ln in enumerate(rows) if re.search(r"─{8,}", ln)]
+        # Prompt line: ❯/> followed by whitespace OR alone at end-of-line. The
+        # bare-glyph case matters because rows are rstrip()ed: an EMPTY prompt
+        # box renders as "❯" + pyte's space padding, which rstrip reduces to a
+        # bare "❯" that IDLE_PROMPT_PATTERN (glyph + whitespace) cannot match.
+        # We deliberately do NOT require the prompt line to be empty — a ready
+        # box carries placeholder text (❯ Try "fix typecheck errors").
+        prompt_idx = [i for i, ln in enumerate(rows) if re.search(r"[>❯](?:[\s\xa0]|$)", ln)]
+        # Require BOTH rails, not just one nearby separator: during launch the
+        # echoed "> " system-prompt quote can land within 2 rows of a single
+        # early-painted ──── rule, which a one-sided adjacency misread as a ready
+        # prompt (premature IDLE on init — the first task then hits a not-ready
+        # agent). The real box always has a rail above AND below the prompt.
+        boxed_rows = [
+            pi
+            for pi in prompt_idx
+            if any(0 < pi - si <= 2 for si in sep_idx) and any(0 < si - pi <= 2 for si in sep_idx)
+        ]
+        box_top = max(si for si in sep_idx if 0 < boxed_rows[-1] - si <= 2) if boxed_rows else None
+
         # Live spinner: "✻ <gerund>… (…)" — the boxed-prompt spinner or a bare
         # spinner line. Visible in a composited frame ⇒ genuinely working.
         #
@@ -1419,9 +1452,26 @@ class ClaudeCodeProvider(BaseProvider):
         # then latches and starves InboxService (delivers only on IDLE/COMPLETED).
         # The raw get_status() path already switched to the tight pattern for the
         # same reason; the screen path must match.
+        #
+        # GH #974: with the box on screen, only the NEWEST conversation row above
+        # it can be the live spinner — the TUI draws the spinner directly above
+        # the box, under everything the turn has printed so far. A row higher up
+        # is history, whatever it looks like: a finished response's own duration
+        # parenthetical ("● Done. The fix is in place… (3m 12s)") is the same
+        # text as a reduced-motion spinner row, and only its position tells them
+        # apart. Scanning every bottom row for ANY match let that settled row pin
+        # PROCESSING until it scrolled off, so _wait_for_completion burned its
+        # whole budget as a timeout. This mirrors the raw path's input-box walk
+        # in get_status(). Without a box (launch, a full-screen dialog) nothing
+        # has settled yet, so the whole bottom region is scanned as before.
+        if box_top is not None:
+            newest = self._newest_conversation_row(rows[:box_top])
+            spinner_rows = [newest] if newest is not None else []
+        else:
+            spinner_rows = bottom
         if any(
             NEW_TUI_BOX_SPINNER_PATTERN.search(ln) or REDUCED_MOTION_SPINNER_PATTERN.search(ln)
-            for ln in bottom
+            for ln in spinner_rows
         ):
             return TerminalStatus.PROCESSING
 
@@ -1447,30 +1497,8 @@ class ClaudeCodeProvider(BaseProvider):
         if any(BACKGROUND_WAIT_PATTERN.search(ln) for ln in bottom):
             return TerminalStatus.PROCESSING
 
-        # Real input box: a prompt line with a "────" rail BOTH within 2 rows
-        # above AND within 2 rows below — the "──── / ❯ / ────" box Claude pins
-        # to the bottom of the viewport.
-        sep_idx = [i for i, ln in enumerate(rows) if re.search(r"─{8,}", ln)]
-        # Prompt line: ❯/> followed by whitespace OR alone at end-of-line. The
-        # bare-glyph case matters because rows are rstrip()ed: an EMPTY prompt
-        # box renders as "❯" + pyte's space padding, which rstrip reduces to a
-        # bare "❯" that IDLE_PROMPT_PATTERN (glyph + whitespace) cannot match.
-        # We deliberately do NOT require the prompt line to be empty — a ready
-        # box carries placeholder text (❯ Try "fix typecheck errors").
-        prompt_idx = [i for i, ln in enumerate(rows) if re.search(r"[>❯](?:[\s\xa0]|$)", ln)]
-        # Require BOTH rails, not just one nearby separator: during launch the
-        # echoed "> " system-prompt quote can land within 2 rows of a single
-        # early-painted ──── rule, which a one-sided adjacency misread as a ready
-        # prompt (premature IDLE on init — the first task then hits a not-ready
-        # agent). The real box always has a rail above AND below the prompt.
-        boxed_rows = [
-            pi
-            for pi in prompt_idx
-            if any(0 < pi - si <= 2 for si in sep_idx) and any(0 < si - pi <= 2 for si in sep_idx)
-        ]
-        if boxed_rows:
+        if box_top is not None:
             # No spinner is drawn while text streams; see NEW_TUI_BOX_SUMMARY_PATTERN.
-            box_top = max(si for si in sep_idx if 0 < boxed_rows[-1] - si <= 2)
             if self._turn_still_in_flight("screen", rows[:box_top]):
                 return TerminalStatus.PROCESSING
             if re.search(
