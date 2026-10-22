@@ -21,7 +21,7 @@ import os
 import re
 import signal
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple, Union
 
 import websockets
 from websockets.asyncio.client import ClientConnection, connect
@@ -53,6 +53,9 @@ STABLE_CONNECTION = 10.0
 #: Seconds to wait for the server's hello after the upgrade. A peer or proxy that
 #: accepts the upgrade and then stays silent is given up on and retried.
 HELLO_TIMEOUT = 30.0
+#: Seconds between reads of a terminal last pushed as processing (see
+#: Bridge.recheck_processing): the status monitor's own pace for that recovery.
+STALE_PROCESSING_RECHECK = 3.0
 _STATUS_TOPIC = re.compile(r"^terminal\.([^.]+)\.status$")
 
 
@@ -104,13 +107,17 @@ class Bridge:
         # Results that could not be sent (no channel at the time), delivered
         # after the next hello: the server acts on results it no longer awaits.
         self._unsent: List[Result] = []
+        # The status last pushed for each terminal, on any connection.
+        self._pushed: Dict[str, TerminalStatus] = {}
+        # Launches that have counted the local terminals and not yet settled.
+        self._launching = 0
         # Strong references: the event loop holds only weak ones to tasks.
         self._tasks: Set["asyncio.Task[None]"] = set()
         self._stop = asyncio.Event()
 
     # --- outbound ---
 
-    async def _send(self, frame) -> None:
+    async def _send(self, frame: Union[Result, Status]) -> None:
         # The socket is read under the lock, so a send queued behind a stalled
         # one uses whichever socket is current, not the one it saw first.
         async with self._send_lock:
@@ -151,10 +158,13 @@ class Bridge:
 
         return status_monitor.get_status(terminal_id)
 
-    async def _push_status(self, terminal_id: str, skip_unknown: bool = False) -> None:
+    async def _push_status(
+        self, terminal_id: str, skip_unknown: bool = False, only_if_changed: bool = False
+    ) -> None:
         """Send the terminal's current status. It is read under the send lock, so
         the last frame the server gets for a terminal carries its newest status.
-        With ``skip_unknown``, nothing is sent while the status is not known."""
+        With ``skip_unknown``, nothing is sent while the status is not known;
+        with ``only_if_changed``, nothing while it is the one last pushed."""
         if self._ws is None:
             return
         async with self._send_lock:
@@ -162,6 +172,8 @@ class Bridge:
             # so status frames cannot be reordered.
             status = await asyncio.to_thread(self._status_of, terminal_id)
             if skip_unknown and status == TerminalStatus.UNKNOWN:
+                return
+            if only_if_changed and self._pushed.get(terminal_id) == status:
                 return
             frame = Status(terminal_id=terminal_id, status=status)
             # The socket current now, as in _send: a push queued behind a
@@ -171,6 +183,7 @@ class Bridge:
                 return
             try:
                 await ws.send(encode(frame))
+                self._pushed[terminal_id] = status
             except websockets.exceptions.ConnectionClosed:
                 # Not queued: a connection's hello is followed by every
                 # terminal's status as it is then.
@@ -196,6 +209,27 @@ class Bridge:
                         )
         finally:
             bus.unsubscribe("terminal.*.status", queue)
+
+    async def recheck_processing(self, interval: float = STALE_PROCESSING_RECHECK) -> None:
+        """Read again, every ``interval``, the status of each terminal last pushed
+        as processing, and push it once it has changed.
+
+        The status monitor's recovery of a turn that ended without the output it
+        recognises (#558) runs only when the status is read. Locally the
+        server's polls read it; here nothing else would, and such a terminal
+        would read processing on the server until it printed again.
+        """
+        while True:
+            await asyncio.sleep(interval)
+            for terminal_id, pushed in list(self._pushed.items()):
+                if pushed != TerminalStatus.PROCESSING:
+                    continue
+                try:
+                    await self._push_status(terminal_id, only_if_changed=True)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - retried on the next round
+                    logger.debug("could not recheck terminal %s", terminal_id, exc_info=True)
 
     # --- commands ---
 
@@ -229,17 +263,22 @@ class Bridge:
                     launching[0].set()
                     self._launches.pop(command.op_id, None)
             else:
-                if command.type == CommandType.DELETE:
-                    # The terminal may be one a launch still in progress is
-                    # starting (its row exists before its result is sent): let
-                    # any launch that could have made it settle first, so a
-                    # delete sent after a reconnect never tears a pane down
-                    # under its initialization. Older terminals do not wait.
-                    for settled, existed in list(self._launches.values()):
-                        if command.terminal_id not in existed:
-                            await settled.wait()
+                # The turn first, so this terminal's commands run in arrival
+                # order even while a delete below waits for launches.
                 async with self._terminal_turn(command.terminal_id):
+                    if command.type == CommandType.DELETE:
+                        # The terminal may be one a launch still in progress is
+                        # starting (its row exists before its result is sent):
+                        # let any launch that could have made it settle first,
+                        # so a delete sent after a reconnect never tears a pane
+                        # down under its initialization. Older terminals do not
+                        # wait. Launches take no terminal's turn: no deadlock.
+                        for settled, existed in list(self._launches.values()):
+                            if command.terminal_id not in existed:
+                                await settled.wait()
                     payload = await self.execute(command)
+                    if command.type == CommandType.DELETE:
+                        self._pushed.pop(command.terminal_id, None)
             result = Result(op_id=command.op_id, ok=True, payload=payload)
         except Exception as exc:  # noqa: BLE001 - reported to the server as a failed result
             logger.warning("command %s (%s) failed: %s", command.op_id, command.type.value, exc)
@@ -261,7 +300,6 @@ class Bridge:
         from cli_agent_orchestrator.clients.database import get_terminal_metadata
         from cli_agent_orchestrator.models.inbox import OrchestrationType
         from cli_agent_orchestrator.services import terminal_service
-        from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 
         payload = command.payload
         if command.type == CommandType.LAUNCH:
@@ -269,44 +307,21 @@ class Bridge:
 
             # The server bounds launches too; this also covers terminals it
             # does not know of yet. One more would leave this runtime unable
-            # ever to hello again.
-            running = len(await asyncio.to_thread(list_all_terminals))
-            if running >= MAX_HELLO_TERMINALS:
-                raise RuntimeError(
-                    f"this runtime already runs {running} terminals: at most "
-                    f"{MAX_HELLO_TERMINALS}"
-                )
-            profile = payload["agent_profile"]
-            provider = payload.get("provider") or resolve_provider(profile, DEFAULT_PROVIDER)
-            terminal = await terminal_service.create_terminal(
-                provider=provider,
-                agent_profile=profile,
-                new_session=True,
-                working_directory=payload.get("working_directory"),
-            )
+            # ever to hello again. Counted, as on the server, from before the
+            # rows are read until the launch settles, so concurrent launches
+            # cannot pass the bound (at worst one is refused early).
+            self._launching += 1
             try:
-                local = await asyncio.to_thread(terminal_service.get_terminal, terminal.id)
-                reported = _jsonable(local)
-                # Where it launched, as this runtime resolved it (its own cwd
-                # for an omitted directory): the central row records this.
-                reported["working_directory"] = await asyncio.to_thread(
-                    _launched_working_directory, terminal.id
-                )
-                return {"terminal": reported}
-            except Exception as exc:
-                # The agent runs but the server would never learn of it: stop it.
-                stopped = False
-                try:
-                    stopped = bool(
-                        await asyncio.to_thread(terminal_service.delete_terminal, terminal.id)
+                running = len(await asyncio.to_thread(list_all_terminals))
+                if running + self._launching > MAX_HELLO_TERMINALS:
+                    raise RuntimeError(
+                        f"this runtime already runs {running} terminals, and "
+                        f"{self._launching - 1} more are launching: at most "
+                        f"{MAX_HELLO_TERMINALS}"
                     )
-                except Exception:  # noqa: BLE001 - reported in the error below
-                    logger.exception("could not stop unreported terminal %s", terminal.id)
-                detail = f"launched terminal {terminal.id} but could not report it ({exc})"
-                if not stopped:
-                    # Named, so the server deletes it as an unrecorded terminal.
-                    raise UnreportedLaunch(detail + "; it may still be running", terminal.id)
-                raise RuntimeError(detail) from exc
+                return await self._launch(payload)
+            finally:
+                self._launching -= 1
 
         terminal_id = command.terminal_id
         if not terminal_id:
@@ -360,6 +375,43 @@ class Bridge:
             return {"deleted": bool(deleted)}
         raise ValueError(f"unsupported command: {command.type.value}")
 
+    async def _launch(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Start the agent; report it, or stop it if it cannot be reported."""
+        from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
+
+        profile = payload["agent_profile"]
+        provider = payload.get("provider") or resolve_provider(profile, DEFAULT_PROVIDER)
+        terminal = await terminal_service.create_terminal(
+            provider=provider,
+            agent_profile=profile,
+            new_session=True,
+            working_directory=payload.get("working_directory"),
+        )
+        try:
+            local = await asyncio.to_thread(terminal_service.get_terminal, terminal.id)
+            reported = _jsonable(local)
+            # Where it launched, as this runtime resolved it (its own cwd
+            # for an omitted directory): the central row records this.
+            reported["working_directory"] = await asyncio.to_thread(
+                _launched_working_directory, terminal.id
+            )
+            return {"terminal": reported}
+        except Exception as exc:
+            # The agent runs but the server would never learn of it: stop it.
+            stopped = False
+            try:
+                stopped = bool(
+                    await asyncio.to_thread(terminal_service.delete_terminal, terminal.id)
+                )
+            except Exception:  # noqa: BLE001 - reported in the error below
+                logger.exception("could not stop unreported terminal %s", terminal.id)
+            detail = f"launched terminal {terminal.id} but could not report it ({exc})"
+            if not stopped:
+                # Named, so the server deletes it as an unrecorded terminal.
+                raise UnreportedLaunch(detail + "; it may still be running", terminal.id)
+            raise RuntimeError(detail) from exc
+
     # --- connection ---
 
     def _current_statuses(self) -> Dict[str, TerminalStatus]:
@@ -376,10 +428,8 @@ class Bridge:
         try:
             statuses = await asyncio.to_thread(self._current_statuses)
             if len(statuses) > MAX_HELLO_TERMINALS:
-                raise TooManyTerminals(
-                    f"this runtime runs {len(statuses)} terminals, more than a hello "
-                    f"may list ({MAX_HELLO_TERMINALS}); stop some here to reconnect"
-                )
+                # Rechecked: launched meanwhile, past the check before dialling.
+                raise TooManyTerminals(_too_many(len(statuses)))
             await ws.send(
                 encode(
                     Hello(
@@ -432,6 +482,11 @@ class Bridge:
         while not self._stop.is_set():
             self._helloed_at = None
             try:
+                # Before dialling: a hello that could not list them all would
+                # only open and drop a socket on every retry.
+                listed = len(await asyncio.to_thread(self._current_statuses))
+                if listed > MAX_HELLO_TERMINALS:
+                    raise TooManyTerminals(_too_many(listed))
                 async with connect(
                     self.server_url,
                     additional_headers={TOKEN_HEADER: self._token},
@@ -497,6 +552,13 @@ class Bridge:
                 f"readiness file {str(self._ready_file)!r} cannot be removed ({exc}); "
                 "stopping, since it would report this runtime ready while disconnected"
             ) from exc
+
+
+def _too_many(listed: int) -> str:
+    return (
+        f"this runtime runs {listed} terminals, more than a hello may list "
+        f"({MAX_HELLO_TERMINALS}); stop some here to reconnect"
+    )
 
 
 def _launched_working_directory(terminal_id: str) -> Optional[str]:
@@ -617,6 +679,7 @@ async def _amain() -> None:
         asyncio.create_task(status_monitor.run()),
         asyncio.create_task(log_writer.run()),
         asyncio.create_task(bridge.forward_status()),
+        asyncio.create_task(bridge.recheck_processing()),
     ]
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, bridge.stop)

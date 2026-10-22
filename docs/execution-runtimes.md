@@ -14,7 +14,7 @@ exactly as before.
 | HTTP API, authentication | yes | no; it serves nothing |
 | Central SQLite state | yes, one row per terminal, naming its runtime | pane bookkeeping only |
 | tmux, provider CLIs, agents | no, for remote terminals; none at all with `CAO_LOCAL_EXECUTION=0` | yes |
-| Status detection | receives it | derives it beside the pane and pushes it |
+| Status detection | receives it | derives it beside the pane and pushes it; rereads a terminal still `processing` every 3 s, as the server's polls do locally |
 | Agent profiles, provider files | no, for remote terminals | yes: resolved from the runtime's own profile store, written by its `create_terminal` |
 | Workspace | no, for remote terminals | yes: a launch's `working_directory` is a path in the runtime; the central row records the directory the runtime resolved |
 | Provider credentials | no, for remote terminals | yes: the runtime's own (in the EKS example, its service account's IAM role) |

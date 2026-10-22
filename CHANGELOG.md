@@ -77,7 +77,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   processes agents leave. `cao-bridge` logs at INFO to stderr, so
   `kubectl logs` shows its connects and reconnects, and the warnings every
   launch and delete used to log (a status for a terminal placed nowhere yet,
-  a row expected to be missing) are gone. The image checks the kiro-cli
+  a row expected to be missing) are gone. `cao-bridge` reads again, every
+  3 s, the status of a terminal it last reported as processing, so a turn
+  that ends without the output the status monitor recognises (#558)
+  recovers on a runtime too, where nothing else polls it. The image checks the kiro-cli
   archive's published sha256 before running its installer.
   `CAO_LOCAL_EXECUTION=0` stops the server starting agents
   itself, and `CAO_RUNTIME_LAUNCH_TIMEOUT` bounds a launch. An EKS example is

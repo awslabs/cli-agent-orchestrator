@@ -180,6 +180,35 @@ class TestHandshake:
         frame = decode(_hello(statuses=statuses))
         assert isinstance(frame, Hello) and len(frame.statuses) == MAX_HELLO_TERMINALS
 
+    def test_a_runtime_gone_before_its_hello_is_not_an_error(self, server):
+        # The server closed the socket again, which raised: uvicorn logged a
+        # traceback, for a runtime over the terminal bound on every retry (#834).
+        import logging
+
+        from websockets.sync.client import connect
+
+        errors = []
+
+        class Collect(logging.Handler):
+            def emit(self, record):
+                errors.append(record.getMessage())
+
+        # uvicorn's own logger, which need not propagate to the root.
+        handler = Collect(level=logging.ERROR)
+        logging.getLogger("uvicorn.error").addHandler(handler)
+        try:
+            url = f"ws://{server}/runtime/channel"
+            headers = {"x-cao-runtime-token": TOKEN}  # as cao-bridge sends it
+            with connect(url, additional_headers=headers):
+                pass  # gone without a hello
+            with connect(url, additional_headers=headers) as ws:
+                ws.send(_hello())  # and the server still serves the next one
+                assert isinstance(decode(ws.recv(timeout=DEADLINE)), Hello)
+            time.sleep(0.2)  # the first connection's handler has finished by now
+        finally:
+            logging.getLogger("uvicorn.error").removeHandler(handler)
+        assert errors == []
+
     def test_a_hello_at_the_limit_is_handled(self, client, monkeypatch):
         # Every listed terminal is processed: none is recorded here, so each
         # gets one cleanup, and the server answers the hello.
@@ -342,6 +371,9 @@ def start_runtime(server, tmp_path):
 
     def start(runtime_id="rt-1", script=lambda command: {}, statuses=None):
         ready = tmp_path / f"{runtime_id}.ready"
+        # A runtime started before under this id may not have removed it yet:
+        # waiting on its file would return before this one's hello.
+        ready.unlink(missing_ok=True)
         if statuses is None:
             # By default the runtime runs the terminals recorded on it, so its
             # hello lists them, status not yet known; the server drops a record
@@ -2489,6 +2521,7 @@ class TestLaunchMetadata:
             "/work/\x00x",
             "/work/repo\r\nINJECTED",
             "/work/\x1b[31mred",
+            "/work/\x9b31mred",
             "/" + "a" * 4096,
         ],
     )

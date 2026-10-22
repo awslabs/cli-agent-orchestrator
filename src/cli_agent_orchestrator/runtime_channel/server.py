@@ -306,7 +306,10 @@ async def runtime_channel(ws: WebSocket) -> None:
 
     try:
         hello = decode(await ws.receive_text())
-    except (ValidationError, WebSocketDisconnect):
+    except WebSocketDisconnect:
+        # Gone before its hello: nothing to close (closing again would raise).
+        return
+    except ValidationError:
         await ws.close(code=status.WS_1002_PROTOCOL_ERROR)
         return
     server_hello = encode(Hello(protocol_version=PROTOCOL_VERSION, runtime_id="server"))
@@ -480,13 +483,13 @@ class _Launched(BaseModel):
     @classmethod
     def _plausible_directory(cls, value: Optional[str]) -> Optional[str]:
         # Runtime-asserted and only recorded, never used as a path here. One
-        # that is not absolute, is longer than a path may be, or holds a
-        # control character (NUL, CR/LF, a terminal escape) is not recorded:
-        # the request's is.
+        # that is not absolute, is longer than a path may be, or holds a C0 or
+        # C1 control character (NUL, CR/LF, a terminal escape, U+009B CSI) is
+        # not recorded: the request's is.
         if value and (
             not value.startswith("/")
             or len(value) > MAX_WORKING_DIRECTORY
-            or any(ord(c) < 0x20 or ord(c) == 0x7F for c in value)
+            or any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in value)
         ):
             return None
         return value

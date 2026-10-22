@@ -21,7 +21,9 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 #: meaning and does not bump it: a bump would refuse every older peer. That
 #: holds only where ignoring the field is safe: one that grants, authenticates
 #: or restricts anything must be required, with a bump, since an older peer
-#: would silently ignore it.
+#: would silently ignore it. The rule runs from the first release: until then
+#: version 1 is still being defined (``Command.session_name``, which restricts,
+#: joined it before any cao-bridge shipped).
 PROTOCOL_VERSION = 1
 
 

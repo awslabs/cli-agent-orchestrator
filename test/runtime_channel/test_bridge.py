@@ -971,27 +971,22 @@ class TestConnection:
         with pytest.raises(TooManyTerminals, match="more than a hello may list"):
             await bridge.serve(NothingSent())
 
-        attempts = []
-
-        class Connected:
-            async def __aenter__(self):
-                attempts.append(1)
-                return NothingSent()
-
-            async def __aexit__(self, *exc):
-                return False
-
-        monkeypatch.setattr(bridge_mod, "connect", lambda *args, **kwargs: Connected())
+        # Nor does it dial: each retry would open a socket only to drop it
+        # before its hello, which the server logged as an error (#834).
+        dials = []
+        monkeypatch.setattr(bridge_mod, "connect", lambda *args, **kwargs: dials.append(1))
         monkeypatch.setattr(bridge_mod, "BACKOFF_INITIAL", 0.01)
         running = asyncio.ensure_future(bridge.run())
         await asyncio.sleep(0.2)
         bridge.stop()
         await asyncio.wait_for(running, 5)
-        assert len(attempts) >= 2, "it keeps retrying, in case terminals are stopped"
-        assert any(
-            r.levelname == "ERROR" and "more than a hello may list" in r.getMessage()
+        assert dials == [], "it never dialled"
+        errors = [
+            r
             for r in caplog.records
-        )
+            if r.levelname == "ERROR" and "more than a hello may list" in r.getMessage()
+        ]
+        assert len(errors) >= 2, "it keeps retrying, in case terminals are stopped"
 
     @pytest.mark.asyncio
     async def test_a_server_speaking_another_version_is_fatal(self, tmp_path):
@@ -1087,3 +1082,121 @@ class TestStatusForwarding:
             forwarding.cancel()
             await asyncio.gather(forwarding, return_exceptions=True)
             bus.set_loop(previous)
+
+
+class TestRecheckProcessing:
+    """#558's recovery runs only when the status is read: on a runtime nothing
+    else reads it, so cao-bridge does, for a terminal it last pushed as
+    processing (reported on #834)."""
+
+    class _Socket:
+        def __init__(self):
+            self.frames = []
+
+        async def send(self, text):
+            self.frames.append(decode(text))
+
+    @pytest.mark.asyncio
+    async def test_a_turn_that_ended_quietly_is_pushed_once(self):
+        bridge = _bridge()
+        bridge._ws = ws = self._Socket()
+        reads = iter([TerminalStatus.PROCESSING, TerminalStatus.COMPLETED])
+        bridge._status_of = lambda tid: next(reads, TerminalStatus.COMPLETED)
+        await bridge._push_status("abcd1234")  # pushed as processing
+        task = asyncio.ensure_future(bridge.recheck_processing(interval=0.01))
+        try:
+            for _ in range(200):
+                if len(ws.frames) >= 2:
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)  # more rounds: nothing more to send
+        finally:
+            task.cancel()
+        assert [(f.terminal_id, f.status) for f in ws.frames] == [
+            ("abcd1234", TerminalStatus.PROCESSING),
+            ("abcd1234", TerminalStatus.COMPLETED),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_terminal_still_processing_sends_nothing_more(self):
+        bridge = _bridge()
+        bridge._ws = ws = self._Socket()
+        bridge._status_of = lambda tid: TerminalStatus.PROCESSING
+        await bridge._push_status("abcd1234")
+        task = asyncio.ensure_future(bridge.recheck_processing(interval=0.01))
+        await asyncio.sleep(0.1)
+        task.cancel()
+        assert len(ws.frames) == 1
+
+    @pytest.mark.asyncio
+    async def test_only_terminals_last_pushed_as_processing_are_read(self):
+        bridge = _bridge()
+        bridge._ws = self._Socket()
+        bridge._pushed = {"idle0001": TerminalStatus.IDLE, "busy0001": TerminalStatus.PROCESSING}
+        read = []
+        bridge._status_of = lambda tid: read.append(tid) or TerminalStatus.PROCESSING
+        task = asyncio.ensure_future(bridge.recheck_processing(interval=0.01))
+        await asyncio.sleep(0.1)
+        task.cancel()
+        assert read and set(read) == {"busy0001"}
+
+
+class TestCommandOrder:
+    @pytest.mark.asyncio
+    async def test_a_command_after_a_delete_runs_after_it(self, monkeypatch):
+        # A delete waits for launches in flight; a command for the same
+        # terminal that arrived after it must not run first (#834).
+        bridge = _bridge()
+        sent, ran = [], []
+
+        async def send(frame):
+            sent.append(frame)
+
+        async def execute(command):
+            ran.append(command.type)
+            return {}
+
+        monkeypatch.setattr(bridge, "_send", send)
+        monkeypatch.setattr(bridge, "execute", execute)
+        launch_settled = asyncio.Event()
+        bridge._launches["op-launch"] = (launch_settled, set())  # abcd1234 not among them
+        delete = asyncio.ensure_future(bridge.handle(_command(CommandType.DELETE)))
+        await asyncio.sleep(0.02)
+        key = asyncio.ensure_future(bridge.handle(_command(CommandType.KEY, key="Enter")))
+        await asyncio.sleep(0.02)
+        assert ran == [], "both wait: the delete for the launch, the key for the delete"
+        launch_settled.set()
+        await asyncio.gather(delete, key)
+        assert ran == [CommandType.DELETE, CommandType.KEY]
+
+
+class TestLaunchBound:
+    @pytest.mark.asyncio
+    async def test_concurrent_launches_cannot_pass_the_bound(self, monkeypatch):
+        import cli_agent_orchestrator.clients.database as database
+        from cli_agent_orchestrator.runtime_channel.protocol import MAX_HELLO_TERMINALS
+
+        rows = [{"id": f"{n:08x}"} for n in range(MAX_HELLO_TERMINALS - 1)]
+        monkeypatch.setattr(database, "list_all_terminals", lambda: rows)
+        started, release = [], asyncio.Event()
+
+        async def launch(payload):
+            started.append(payload)
+            await release.wait()
+            return {"terminal": {}}
+
+        bridge = _bridge()
+        monkeypatch.setattr(bridge, "_launch", launch)
+        first = asyncio.ensure_future(
+            bridge.execute(_command(CommandType.LAUNCH, None, agent_profile="developer"))
+        )
+        for _ in range(100):
+            if started:
+                break
+            await asyncio.sleep(0.01)
+        # One slot left, and the first launch holds it while it starts.
+        with pytest.raises(RuntimeError, match="1 more are launching"):
+            await bridge.execute(_command(CommandType.LAUNCH, None, agent_profile="developer"))
+        release.set()
+        await first
+        assert len(started) == 1 and bridge._launching == 0
