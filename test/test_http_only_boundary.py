@@ -116,8 +116,8 @@ DUAL_MODE_ALLOWLIST: Dict[Tuple[str, str, str], str] = {
         MODULE_SCOPE,
         "cli_agent_orchestrator.services.outcome_service",
     ): (
-        "constants only (LEARNING_DISABLED_CODE, LEARNING_DISABLED_MESSAGE); the "
-        "report_outcome write path is HTTP (POST /outcomes)"
+        "one constant only (LEARNING_DISABLED_CODE); the report_outcome and "
+        "store_lesson write paths are HTTP (POST /outcomes, POST /lessons)"
     ),
     (
         "mcp_server/server.py",
@@ -159,21 +159,18 @@ DUAL_MODE_ALLOWLIST: Dict[Tuple[str, str, str], str] = {
     ): "log_refusal only: a logger.warning with no state access (ephemeral_service.py:152)",
 }
 
-# NOT legitimate: these reach the in-process service with no HTTP path at all,
-# so against a remote Backplane they write to the wrong database. Pinned here
-# only so the gate can ship green while the product fix lands separately.
-# Removing an entry is the definition of done for its tracking issue.
-KNOWN_GAP_ALLOWLIST: Dict[Tuple[str, str, str], str] = {
-    (
-        "mcp_server/server.py",
-        "store_lesson",
-        "cli_agent_orchestrator.services.memory_service",
-    ): (
-        "issue #744: store_lesson calls MemoryService() unconditionally with no "
-        "memory_gateway / remote_memory_url() branch, unlike memory_store. Needs a "
-        "route (or the gateway) before this entry can be deleted."
-    ),
-}
+# NOT legitimate: entries here reach the in-process service with no HTTP path
+# at all, so against a remote Backplane they write to the wrong database. Pin
+# here only so the gate can ship green while the product fix lands separately,
+# and name the tracking issue in the reason.
+#
+# Deleting an entry is necessary for its issue to close, not sufficient: this
+# scan sees imports, not every in-process path. The #744 pin (store_lesson
+# importing MemoryService) was removed when #996 moved store_lesson to
+# ``POST /lessons``; the in-process ``is_learning_enabled()`` gate that #996
+# also removed was never visible to this scan, because ``settings_service``
+# does not import a state client.
+KNOWN_GAP_ALLOWLIST: Dict[Tuple[str, str, str], str] = {}
 
 ALLOWLIST: Dict[Tuple[str, str, str], str] = {**DUAL_MODE_ALLOWLIST, **KNOWN_GAP_ALLOWLIST}
 
@@ -441,4 +438,6 @@ def test_forbidden_state_services_cover_services_not_imported_by_mcp_server() ->
     )
     missing = [name for name in bypass_candidates if name not in FORBIDDEN_STATE_SERVICES]
     assert not missing, f"derived FORBIDDEN_STATE_SERVICES is missing: {missing}"
-    assert len(FORBIDDEN_STATE_SERVICES) == 25
+    # 24 after #1031 made services/vault/config.py client-free. (P3-1 removes
+    # this count in the next commit: it is a snapshot, not a contract.)
+    assert len(FORBIDDEN_STATE_SERVICES) == 24
