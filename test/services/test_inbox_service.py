@@ -1308,3 +1308,230 @@ class TestRun:
                 pass
 
         mock_to_thread.assert_awaited_once_with(svc.deliver_pending, "abc123", registry=None)
+
+
+class TestDeliveryIsolation:
+    """PR #1004 review, P2-2: one unconfirmed delivery must not stall the rest.
+
+    The submit confirmation (#78) can hold a terminal's delivery lock for a
+    full confirmation cycle. That wait belongs to the one terminal that swallowed
+    its Enter; the status-event consumer, the sweeps and the inbox POST must not
+    sit behind it.
+    """
+
+    @staticmethod
+    def _idle_event(terminal_id):
+        return {"topic": f"terminal.{terminal_id}.status", "data": {"status": "idle"}}
+
+    @pytest.mark.asyncio
+    async def test_one_stalled_delivery_does_not_delay_another_terminal(self):
+        """term-A's delivery blocks (unconfirmed submit); term-B is still delivered."""
+        import threading
+        import time
+
+        release_a = threading.Event()
+        delivered = {}
+
+        def deliver(terminal_id, registry=None):
+            delivered[terminal_id] = time.monotonic()
+            if terminal_id == "term-A":
+                release_a.wait(5)
+
+        svc = InboxService()
+        svc.deliver_pending = MagicMock(side_effect=deliver)
+        queue = asyncio.Queue()
+        await queue.put(self._idle_event("term-A"))
+        await queue.put(self._idle_event("term-B"))
+
+        with patch("cli_agent_orchestrator.services.inbox_service.bus") as mock_bus:
+            mock_bus.subscribe.return_value = queue
+            task = asyncio.create_task(svc.run())
+            try:
+                deadline = time.monotonic() + 2.0
+                while "term-B" not in delivered and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                # B was dispatched while A was still blocked inside its delivery.
+                assert "term-B" in delivered
+                assert not release_a.is_set()
+            finally:
+                release_a.set()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                await asyncio.sleep(0.05)
+
+    @pytest.mark.asyncio
+    async def test_events_for_an_in_flight_terminal_coalesce_into_one_recheck(self):
+        """Three IDLE events while term-A's delivery is in flight: one re-check,
+        run after the first finishes (same ordering the serial loop gave), not a
+        thread per event queued behind the lock."""
+        import threading
+        import time
+
+        release = threading.Event()
+        calls = []
+        started = threading.Event()
+
+        def deliver(terminal_id, registry=None):
+            calls.append(time.monotonic())
+            if len(calls) == 1:
+                started.set()
+                release.wait(5)
+
+        svc = InboxService()
+        svc.deliver_pending = MagicMock(side_effect=deliver)
+        queue = asyncio.Queue()
+        await queue.put(self._idle_event("term-A"))
+
+        with patch("cli_agent_orchestrator.services.inbox_service.bus") as mock_bus:
+            mock_bus.subscribe.return_value = queue
+            task = asyncio.create_task(svc.run())
+            try:
+                await asyncio.to_thread(started.wait, 2)
+                for _ in range(3):
+                    await queue.put(self._idle_event("term-A"))
+                await asyncio.sleep(0.1)
+                assert len(calls) == 1, "a re-check ran while the first delivery held the lock"
+                release.set()
+                deadline = time.monotonic() + 2.0
+                while len(calls) < 2 and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                await asyncio.sleep(0.1)
+                assert len(calls) == 2
+            finally:
+                release.set()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_delivery_error_is_logged_and_the_loop_keeps_consuming(self):
+        svc = InboxService()
+        svc.deliver_pending = MagicMock(side_effect=[RuntimeError("boom"), None])
+        queue = asyncio.Queue()
+        await queue.put(self._idle_event("term-A"))
+        await queue.put(self._idle_event("term-B"))
+
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.bus") as mock_bus,
+            patch("cli_agent_orchestrator.services.inbox_service.logger") as mock_logger,
+        ):
+            mock_bus.subscribe.return_value = queue
+            task = asyncio.create_task(svc.run())
+            await asyncio.sleep(0.2)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert svc.deliver_pending.call_count == 2
+        assert any("boom" in str(c) for c in mock_logger.error.call_args_list)
+
+    def test_after_dispatch_fires_after_the_paste_and_before_confirmation(self):
+        order = []
+        sm = MagicMock()
+        sm.get_status.return_value = TerminalStatus.IDLE
+
+        svc = InboxService()
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", sm),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+                return_value=[_make_message()],
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.update_message_status"),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.terminal_service.dispatch_input",
+                side_effect=lambda *a, **k: order.append("paste") or 7,
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.get_backend") as backend,
+            patch.object(
+                svc, "_confirm_submitted", side_effect=lambda *a, **k: order.append("confirm")
+            ),
+        ):
+            backend.return_value.supports_event_inbox.return_value = False
+            svc.deliver_pending("term-1", after_dispatch=lambda: order.append("after_dispatch"))
+
+        assert order == ["paste", "after_dispatch", "confirm"]
+
+    def test_after_dispatch_fires_once_even_when_nothing_is_pending(self):
+        fired = []
+        with patch(
+            "cli_agent_orchestrator.services.inbox_service.get_pending_messages", return_value=[]
+        ):
+            InboxService().deliver_pending("term-1", after_dispatch=lambda: fired.append(1))
+        assert fired == [1]
+
+    def test_after_dispatch_fires_once_when_delivery_raises(self):
+        fired = []
+        with patch(
+            "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+            side_effect=RuntimeError("db down"),
+        ):
+            with pytest.raises(RuntimeError):
+                InboxService().deliver_pending("term-1", after_dispatch=lambda: fired.append(1))
+        assert fired == [1]
+
+    @pytest.mark.parametrize(
+        "sweep, lister",
+        [
+            (
+                "reconcile_orphaned_messages",
+                "cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_older_than",
+            ),
+            (
+                "poll_opencode_pending_messages",
+                "cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_by_provider",
+            ),
+        ],
+    )
+    def test_sweep_does_not_wait_on_a_stalled_receiver_before_the_next(self, sweep, lister):
+        """The sweep fans out: term-B is delivered while term-A is still blocked."""
+        import threading
+        import time
+
+        release_a = threading.Event()
+        delivered = {}
+
+        def deliver(terminal_id, registry=None):
+            delivered[terminal_id] = time.monotonic()
+            if terminal_id == "term-A":
+                release_a.wait(5)
+
+        svc = InboxService()
+        svc.deliver_pending = MagicMock(side_effect=deliver)
+
+        def run_sweep():
+            with (
+                patch(lister, return_value=["term-A", "term-B"]),
+                patch(
+                    "cli_agent_orchestrator.services.inbox_service.fail_orphaned_pending_messages",
+                    return_value=[],
+                ),
+            ):
+                getattr(svc, sweep)()
+
+        worker = threading.Thread(target=run_sweep)
+        worker.start()
+        try:
+            deadline = time.monotonic() + 2.0
+            while "term-B" not in delivered and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert "term-B" in delivered
+            assert not release_a.is_set()
+        finally:
+            release_a.set()
+            worker.join(5)
+        assert svc.deliver_pending.call_count == 2
+
+    def test_sweep_survives_one_receiver_failing_in_the_pool(self):
+        svc = InboxService()
+        svc.deliver_pending = MagicMock(side_effect=[RuntimeError("boom"), None])
+        with (
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_older_than",
+                return_value=["term-A", "term-B"],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.fail_orphaned_pending_messages",
+                return_value=[],
+            ),
+        ):
+            svc.reconcile_orphaned_messages()
+        assert svc.deliver_pending.call_count == 2

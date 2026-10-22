@@ -317,10 +317,16 @@ INBOX_RECONCILE_GRACE_SECONDS = 30
 # ({MSG1}{MSG2} in the issue). Confirm the receiver actually began processing
 # THIS delivery, and re-submit if it did not.
 #
-# The confirmation is synchronous inside the delivery (holding the per-terminal
-# delivery lock on purpose: that is what stops a second paste landing on top of
-# an unsubmitted first). It costs one or two status reads on a healthy delivery
-# and up to INBOX_SUBMIT_CONFIRM_TIMEOUT on a dropped one.
+# The confirmation runs synchronously inside the delivery, holding that
+# terminal's delivery lock. The lock DELAYS a second paste to the same terminal
+# until the first is confirmed or given up on; it does not prevent the pile-up
+# by itself -- only a successful recovery does (see the inbox docstring for which
+# providers can recover). Cost: one or two status reads on a healthy delivery;
+# on a dropped one, up to INBOX_SUBMIT_CONFIRM_TIMEOUT for the first wait plus
+# the same again per recovery attempt that is actually sent (so at most
+# INBOX_SUBMIT_CONFIRM_TIMEOUT * (1 + INBOX_SUBMIT_MAX_RESUBMITS)), all of it
+# inside that one terminal's lock. Each terminal's delivery runs on its own
+# worker thread, so the wait never holds up delivery to other terminals.
 INBOX_SUBMIT_CONFIRMATION = (
     os.environ.get("CAO_INBOX_SUBMIT_CONFIRMATION", "true").lower() == "true"
 )
@@ -332,6 +338,22 @@ INBOX_SUBMIT_CONFIRM_TIMEOUT = 8.0
 # deferred-init path's 3: inbox messages are not a session's only work, and the
 # reconcile sweep is not a second chance here (the message is already DELIVERED).
 INBOX_SUBMIT_MAX_RESUBMITS = 2
+
+# How long POST /terminals/{id}/inbox/messages waits for its immediate delivery
+# attempt to reach the pane before answering. The message is already stored
+# when the wait starts and the attempt keeps running in the background, so
+# this bounds API latency only -- it never decides whether a message is
+# delivered. It has to stay well inside the sender's HTTP timeout (30s default,
+# settings_service.py): a POST that lands while the receiver's lock is held by
+# an unconfirmed delivery could otherwise wait out that whole confirmation,
+# time out at the sender, and tempt it to send the message a second time.
+INBOX_IMMEDIATE_DELIVERY_WAIT = 5.0
+
+# Worker threads the OpenCode poller and the reconcile sweep fan out over.
+# Each receiver's delivery can hold its thread for a full confirmation cycle,
+# so the sweeps run receivers in parallel instead of one after another; the
+# cap bounds the thread count under a backlog.
+INBOX_SWEEP_FANOUT = 8
 
 # =============================================================================
 # Cleanup Service Configuration

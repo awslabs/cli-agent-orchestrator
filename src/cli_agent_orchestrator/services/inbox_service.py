@@ -4,11 +4,13 @@ Consumer: terminal.{id}.status
 """
 
 import asyncio
+import functools
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import groupby
-from typing import Dict
+from typing import Callable, Dict, Iterable, Optional, Set
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -25,6 +27,7 @@ from cli_agent_orchestrator.constants import (
     INBOX_SUBMIT_CONFIRM_TIMEOUT,
     INBOX_SUBMIT_CONFIRMATION,
     INBOX_SUBMIT_MAX_RESUBMITS,
+    INBOX_SWEEP_FANOUT,
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
@@ -78,31 +81,81 @@ class InboxService:
             return lock
 
     async def run(self, registry: PluginRegistry | None = None) -> None:
+        """Consume status events and deliver to each ready terminal on its own task.
+
+        One task per terminal, never one shared await: a delivery now includes
+        the submit confirmation (#78), which can hold that terminal's lock for
+        INBOX_SUBMIT_CONFIRM_TIMEOUT * (1 + INBOX_SUBMIT_MAX_RESUBMITS) seconds
+        when the receiver swallowed the Enter. Awaiting it inline here (as this
+        loop did before) stalled delivery to EVERY other terminal for that long
+        (PR #1004 review, P2-2). Spawning instead keeps the consumer reading;
+        the per-terminal delivery lock still keeps deliveries to one terminal
+        in order.
+
+        Events for a terminal whose delivery is still in flight are coalesced
+        into a single re-check that runs when that delivery finishes, so a
+        burst of status transitions cannot queue a thread per event behind the
+        lock -- and the re-check preserves the old semantics, where the later
+        event's delivery ran after the earlier one and saw the pending rows it
+        left behind.
+        """
         queue = bus.subscribe("terminal.*.status")
         logger.info("InboxService started")
 
-        while True:
-            try:
-                event = await queue.get()
-                status_value = event["data"]["status"]
-                if status_value in (TerminalStatus.IDLE.value, TerminalStatus.COMPLETED.value):
-                    terminal_id = terminal_id_from_topic(event["topic"])
-                    # deliver_pending does blocking DB + tmux I/O. Offload it to a
-                    # worker thread so this consumer keeps yielding to the event loop
-                    # (StatusMonitor/LogWriter must not be starved — see the threading
-                    # note in docs/event-driven-architecture.md). The registry is
-                    # threaded through so status-driven deliveries fire
-                    # PostSendMessageEvent hooks with the same attribution as the
-                    # immediate and OpenCode-poller paths.
-                    await asyncio.to_thread(self.deliver_pending, terminal_id, registry=registry)
-            except Exception as e:
-                logger.error(f"Error in InboxService: {e}")
+        in_flight: Dict[str, asyncio.Task] = {}
+        recheck: Set[str] = set()
+
+        def _finished(terminal_id: str, task: "asyncio.Task[None]") -> None:
+            in_flight.pop(terminal_id, None)
+            if not task.cancelled() and task.exception() is not None:
+                logger.error(f"Error in InboxService: {task.exception()}")
+            if terminal_id in recheck:
+                recheck.discard(terminal_id)
+                _spawn(terminal_id)
+
+        def _spawn(terminal_id: str) -> None:
+            # deliver_pending does blocking DB + tmux I/O (and now the
+            # confirmation wait). Offload it to a worker thread so this consumer
+            # keeps yielding to the event loop (StatusMonitor/LogWriter must not
+            # be starved — see the threading note in
+            # docs/event-driven-architecture.md). The registry is threaded
+            # through so status-driven deliveries fire PostSendMessageEvent
+            # hooks with the same attribution as the immediate and
+            # OpenCode-poller paths.
+            task = asyncio.create_task(
+                asyncio.to_thread(self.deliver_pending, terminal_id, registry=registry)
+            )
+            in_flight[terminal_id] = task
+            task.add_done_callback(functools.partial(_finished, terminal_id))
+
+        try:
+            while True:
+                try:
+                    event = await queue.get()
+                    status_value = event["data"]["status"]
+                    if status_value in (
+                        TerminalStatus.IDLE.value,
+                        TerminalStatus.COMPLETED.value,
+                    ):
+                        terminal_id = terminal_id_from_topic(event["topic"])
+                        if terminal_id in in_flight:
+                            recheck.add(terminal_id)
+                        else:
+                            _spawn(terminal_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"Error in InboxService: {e}")
+        finally:
+            for task in in_flight.values():
+                task.cancel()
 
     def deliver_pending(
         self,
         terminal_id: str,
         num_messages: int = 1,
         registry: PluginRegistry | None = None,
+        after_dispatch: Optional[Callable[[], None]] = None,
     ) -> None:
         """Deliver pending message(s) to a ready terminal. Use num_messages=0 for all.
 
@@ -114,17 +167,38 @@ class InboxService:
         ``send_message`` orchestration type are threaded to ``terminal_service``
         so ``PostSendMessageEvent`` hooks fire with correct attribution.
 
+        ``after_dispatch`` is called exactly once, as soon as the immediate
+        dispatch decision is over: right after the paste reached the pane (BEFORE
+        the submit confirmation, which can take a long time), or on return when
+        nothing was delivered. It lets a caller that only needs to know the
+        attempt was made -- the inbox POST -- answer without waiting out a
+        confirmation. It is never an acknowledgement that the receiver accepted
+        the message.
+
         Safe to call from any thread: the whole read→mark→send sequence is
         serialized per terminal (see __init__ for why that is load-bearing).
         """
-        with self._delivery_lock(terminal_id):
-            self._deliver_pending_locked(terminal_id, num_messages, registry)
+        notified = False
+
+        def notify() -> None:
+            nonlocal notified
+            if notified or after_dispatch is None:
+                return
+            notified = True
+            after_dispatch()
+
+        try:
+            with self._delivery_lock(terminal_id):
+                self._deliver_pending_locked(terminal_id, num_messages, registry, notify)
+        finally:
+            notify()
 
     def _deliver_pending_locked(
         self,
         terminal_id: str,
         num_messages: int,
         registry: PluginRegistry | None,
+        after_dispatch: Callable[[], None] = lambda: None,
     ) -> None:
         limit = num_messages if num_messages > 0 else 100
         messages = get_pending_messages(terminal_id, limit=limit)
@@ -188,6 +262,9 @@ class InboxService:
                         orchestration_type=OrchestrationType.SEND_MESSAGE,
                     )
                 logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
+                # The paste is in the pane: the immediate-delivery caller may
+                # answer now. Everything below is confirmation and recovery.
+                after_dispatch()
                 if INBOX_SUBMIT_CONFIRMATION and not eager:
                     if get_backend().supports_event_inbox():
                         # Event-inbox backends (herdr) push delivery synchronously
@@ -357,6 +434,34 @@ class InboxService:
         )
         return False
 
+    def _deliver_to_each(
+        self,
+        terminal_ids: Iterable[str],
+        registry: PluginRegistry | None,
+        failure_label: str,
+    ) -> None:
+        """Run ``deliver_pending`` for every receiver, in parallel, failures isolated.
+
+        The sweeps used to walk receivers one after another. With the submit
+        confirmation inside each delivery, one receiver that swallowed its Enter
+        held the whole sweep for up to a full confirmation cycle per such
+        receiver (PR #1004 review, P2-2). Fan out instead; the per-terminal lock
+        keeps this from racing the status-event and POST paths.
+        """
+        ids = list(terminal_ids)
+        if not ids:
+            return
+        with ThreadPoolExecutor(max_workers=min(len(ids), INBOX_SWEEP_FANOUT)) as pool:
+            futures = {
+                pool.submit(self.deliver_pending, terminal_id, registry=registry): terminal_id
+                for terminal_id in ids
+            }
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.debug(f"{failure_label} failed for {futures[future]}: {e}")
+
     def poll_opencode_pending_messages(self, registry: PluginRegistry | None = None) -> None:
         """Poll OpenCode terminals for pending inbox messages.
 
@@ -364,11 +469,11 @@ class InboxService:
         change after the TUI settles, so the FIFO-driven StatusMonitor may not
         emit an IDLE/COMPLETED transition to trigger delivery on its own.
         """
-        for terminal_id in list_pending_receiver_ids_by_provider(ProviderType.OPENCODE_CLI.value):
-            try:
-                self.deliver_pending(terminal_id, registry=registry)
-            except Exception as e:
-                logger.debug(f"OpenCode inbox poll failed for {terminal_id}: {e}")
+        self._deliver_to_each(
+            list_pending_receiver_ids_by_provider(ProviderType.OPENCODE_CLI.value),
+            registry,
+            "OpenCode inbox poll",
+        )
 
     def reconcile_orphaned_messages(self, registry: PluginRegistry | None = None) -> None:
         """Re-attempt delivery for messages stuck in PENDING past the grace window.
@@ -401,11 +506,11 @@ class InboxService:
         except Exception as e:
             logger.error(f"Failed to sweep orphaned inbox messages: {e}")
 
-        for terminal_id in list_pending_receiver_ids_older_than(INBOX_RECONCILE_GRACE_SECONDS):
-            try:
-                self.deliver_pending(terminal_id, registry=registry)
-            except Exception as e:
-                logger.debug(f"Inbox reconciliation failed for {terminal_id}: {e}")
+        self._deliver_to_each(
+            list_pending_receiver_ids_older_than(INBOX_RECONCILE_GRACE_SECONDS),
+            registry,
+            "Inbox reconciliation",
+        )
 
 
 inbox_service = InboxService()
