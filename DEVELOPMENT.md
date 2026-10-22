@@ -121,7 +121,7 @@ uv run pytest test/providers/ -m "not e2e and not integration" -v
 ```
 
 The default pytest configuration is the contributor unit-suite entry point, and its marker
-selection now matches CI's: `-m 'not e2e'` excludes only the 15 e2e-marked tests outside
+selection now matches CI's: `-m 'not e2e'` excludes only the e2e-marked tests outside
 `test/e2e/`. `test/test_suite_selection.py` pins this — it asserts that a plain contributor
 run DOES collect an `integration`-marked test. A command-line `-m` replaces the configured
 marker rather than composing with it, so append `and not integration` explicitly (as above)
