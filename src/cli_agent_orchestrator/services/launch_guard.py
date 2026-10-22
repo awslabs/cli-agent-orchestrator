@@ -56,7 +56,15 @@ def check(run_id: Optional[str], agent: str) -> None:
     if not run_id:
         return
     row = workflow_journal.get_run(run_id)
-    if row is None or row.tier != "script":
+    if row is None:
+        # A live script record still requires its durable admission state.
+        # Import lazily: script_runner and workflow_service share the registry.
+        from cli_agent_orchestrator.services.workflow_service import run_registry
+
+        if getattr(run_registry.get(run_id), "tier", None) == "script":
+            raise PlanInputsChangedError(_UNREADABLE_MESSAGE)
+        return
+    if row.tier != "script":
         return
     if posture.source in (
         settings_service.GATE_SOURCE_READ_FAILURE,
