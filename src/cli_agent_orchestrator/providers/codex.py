@@ -2045,7 +2045,10 @@ class CodexProvider(BaseProvider):
         )
         # The last word before readiness is declared belongs to the pane's
         # foreground process, not to the frame: the re-reads above took up to
-        # a few seconds, and the reporter's codex died 150 ms after readiness.
+        # a few seconds. In the reporter's log codex had already exited when
+        # the readiness wait read IDLE on its first poll; the ERROR that
+        # followed 154 ms after this method returned was the old,
+        # ``_initialized``-gated check finally being allowed to look.
         await self._raise_if_exited_during_startup()
         self._initialized = True
         return True

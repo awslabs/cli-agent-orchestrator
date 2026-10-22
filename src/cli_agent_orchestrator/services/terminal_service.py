@@ -4075,15 +4075,26 @@ def dispatch_input(
 
         # THE LAST CHECK BEFORE TYPING (#1018). The status read above is now
         # one memory-service call old, and it was only ever the monitor's
-        # cached verdict: the reporter's log shows the terminal flipping to
-        # ERROR 150 ms after readiness and the task being typed 700 ms later
-        # regardless. Re-read the status, and -- independently of any status
-        # and of whether the provider finished initializing -- compare the
-        # pane's foreground process with the shell that was running before the
-        # CLI launched. A pane whose foreground process is that shell again is
-        # a bare shell, and bash executes every line pasted into it. Everything
-        # between here and send_keys is in-memory bookkeeping, so a refusal
-        # here leaves no half-recorded dispatch behind.
+        # cached verdict: in the reporter's log the monitor flipped the
+        # terminal to ERROR 154 ms after initialize() finished and the task was
+        # typed 700 ms after that regardless. Re-read the status, and --
+        # independently of any status and of whether the provider finished
+        # initializing -- compare the pane's foreground process with the shell
+        # that was running before the CLI launched. A pane whose foreground
+        # process is that shell again is a bare shell, and bash executes every
+        # line pasted into it.
+        #
+        # What remains between here and send_keys: the monitor arm, the buffer
+        # clear, the provider's dispatch bookkeeping -- which for codex
+        # includes one pane capture in record_dispatched_message() -- and then
+        # the paste itself. That is a check-then-act window of one tmux
+        # round trip, far shorter than before but not zero; a CLI that exits
+        # after the paste and before Enter can still hand the pasted bytes to
+        # its shell, and a design that types input cannot close that. Placed
+        # after inject_memory_context() deliberately, because the memory
+        # lookup is the slow step; the cost is that a refused send has
+        # consumed the terminal's one-time memory block (#1018 review, P3-3).
+        # A refusal here raises before any of that bookkeeping runs.
         _refuse_if_provider_gone(terminal_id, provider, metadata)
 
         # Check how many Enter keys the provider needs after paste

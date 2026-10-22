@@ -192,13 +192,21 @@ def _construct(provider_cls):
 
 
 class TestEveryProviderIsRefusedIntoABareShell:
-    """Structural guard: the refusal is provider-agnostic.
+    """Structural guard: the refusal does not depend on the provider class.
 
     Each real provider class, whatever its own ``get_status`` would say about the
     pane and whether or not it has finished initializing, is refused delivery
-    when its pane's foreground process is the shell it recorded as the baseline.
-    Adding a provider cannot opt out of this by accident: the check lives in the
-    shared delivery path and keys only on ``shell_baseline``.
+    when its pane's foreground process is the shell recorded as its
+    ``shell_baseline``. The check lives in the shared delivery path and keys only
+    on that attribute, so no provider type can be special-cased out of it.
+
+    What this does NOT test (#1018 review, P3-1): that every provider records a
+    baseline. Each case sets ``shell_baseline`` itself. In production only codex,
+    kiro_cli and omp capture one in ``initialize()``; the other providers reach
+    ``dispatch_input`` with ``shell_baseline`` None and get the status-only
+    guard, as the CHANGELOG states. Capturing the baseline for every provider in
+    ``terminal_service`` before ``provider.initialize()`` is the follow-up that
+    would make this guard mean what its first wording claimed.
     """
 
     @pytest.mark.parametrize("provider_cls", _every_provider_class())
