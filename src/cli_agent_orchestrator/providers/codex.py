@@ -71,11 +71,12 @@ IDLE_PROMPT_STRICT_PATTERN = r"^\s*(?:❯|›|»|codex>)\s*$"
 
 PROCESSING_PATTERN = r"\b(thinking|working|running|executing|processing|analyzing)\b"
 WAITING_PROMPT_PATTERN = r"^(?:Approve|Allow)\b.*\b(?:y/n|yes/no|yes|no)\b"
-# "Error loading config.toml:" is the prefix codex 0.162.1 prints for the same
-# config-rejection failure when its stdout is not a tty (e.g. piped/redirected,
-# never the case for CAO's tmux-launched panes, which always see "Error:").
-# Kept as a second anchor so this still fires if codex is ever invoked outside
-# a pty.
+# Codex prints the same config rejection behind one of two prefixes: "Error:"
+# (observed from codex-cli 0.163.0 in a tmux pane, the CAO case) and "Error
+# loading config.toml:" (the text #967 reported from a run under CAO; the TUI
+# start path in the 0.162 source writes it with no tty check). Which prefix a
+# given release writes to a pty is not pinned down, so both are anchors and
+# detection does not depend on the answer.
 ERROR_PATTERN = (
     r"^(?:Error:|ERROR:|Error loading config\.toml:|Traceback \(most recent call last\):|panic:)"
 )
