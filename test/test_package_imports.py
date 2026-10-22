@@ -8,19 +8,27 @@ import, 132 test modules failed collection, and ``ruff check`` was green, becaus
 gate selected only F401 (unused import) and F841 (unused local). F401's autofix REMOVES
 names; nothing in the gate checked that a removed name was not still READ.
 
-Two checks lock the class:
+Two checks lock the class, and each covers a stated scope (haofeif, #1006 re-review
+P3-2: an earlier wording claimed F821 "proves nothing still uses the removed name";
+ruff is per-file and cannot):
 
 1. ``test_ruff_gate_reports_an_undefined_name`` -- the repo's own ruff configuration
    (``pyproject.toml``, not ``--isolated``) must report F821 for a module that uses a
-   name it never imported. This pins the rule in ``[tool.ruff.lint] select``; dropping
-   it fails here before it fails in CI's lint step.
+   name it never imported, and F822 for a module that lists one in ``__all__``. Scope:
+   uses of the removed name IN THE SAME FILE, including quoted and
+   ``from __future__ import annotations`` annotations. This pins both rules in
+   ``[tool.ruff.lint] select``; dropping one fails here before CI's lint step.
 2. ``test_every_module_under_src_imports_in_a_fresh_interpreter`` -- every ``.py`` file
    under ``src/`` imports as a module, in a subprocess with a scratch ``HOME`` and
-   ``CAO_HOME_DIR``. This is the runtime half: it also catches the shapes a static
-   name check cannot see, such as ``from a import X`` where ``X`` was removed from ``a``
-   as an "unused" re-export, and an import-time error in a module no test happens to
-   import. The subprocess is deliberate: in-process, a module ``conftest.py`` already
-   imported would pass without being exercised here.
+   ``CAO_HOME_DIR``. Scope: anything that runs at import time, so a MODULE-LEVEL
+   ``from a import X`` where ``X`` was removed from ``a``, and any import-time error in
+   a module no test happens to import. The subprocess is deliberate: in-process, a
+   module ``conftest.py`` already imported would pass without being exercised here.
+
+Outside both: a function-scope ``from a import X``, an attribute use ``a.X``, and a
+``mock.patch("pkg.a.X")`` target string. Those fail only when a unit test executes
+them (ImportError / AttributeError), so a green lint step plus a green import guard is
+not proof that no use of a removed name remains anywhere.
 
    The module list comes from the FILES, not from ``pkgutil.walk_packages``. The walk
    only descends into directories that have an ``__init__.py``, and ``services/`` and
@@ -41,6 +49,8 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = REPO_ROOT / "pyproject.toml"
@@ -106,15 +116,27 @@ print(json.dumps({"attempted": attempted, "failures": failures}))
 """
 
 
-def test_ruff_gate_reports_an_undefined_name(tmp_path: Path) -> None:
-    """The repo's ruff config must report F821. This is the static half of the guard:
-    F401's autofix removes an import, F821 is what says a removed name is still used."""
+@pytest.mark.parametrize(
+    ("rule", "source"),
+    [
+        pytest.param(
+            "F821",
+            "def profile_declares_capability(profile_name: Optional[str]) -> bool:\n"
+            "    return profile_name is not None\n",
+            id="F821-undefined-name",
+        ),
+        pytest.param(
+            "F822",
+            '__all__ = ["Optional"]\n',
+            id="F822-undefined-name-in-__all__",
+        ),
+    ],
+)
+def test_ruff_gate_reports_an_undefined_name(tmp_path: Path, rule: str, source: str) -> None:
+    """The repo's ruff config must report F821 and F822. Static half of the guard:
+    F401's autofix removes an import; these report a same-file use of the removed name."""
     broken = tmp_path / "uses_a_name_it_never_imported.py"
-    broken.write_text(
-        "def profile_declares_capability(profile_name: Optional[str]) -> bool:\n"
-        "    return profile_name is not None\n",
-        encoding="utf-8",
-    )
+    broken.write_text(source, encoding="utf-8")
     result = subprocess.run(
         [
             sys.executable,
@@ -134,10 +156,10 @@ def test_ruff_gate_reports_an_undefined_name(tmp_path: Path) -> None:
         text=True,
     )
     assert result.returncode != 0, (
-        "ruff passed a module that reads a name it never imported; "
-        "F821 has left [tool.ruff.lint] select\n" + result.stdout + result.stderr
+        "ruff passed a module that uses a name it never imported; "
+        f"{rule} has left [tool.ruff.lint] select\n" + result.stdout + result.stderr
     )
-    assert "F821" in result.stdout and "Optional" in result.stdout, result.stdout + result.stderr
+    assert rule in result.stdout and "Optional" in result.stdout, result.stdout + result.stderr
 
 
 def test_every_module_under_src_imports_in_a_fresh_interpreter(tmp_path: Path) -> None:
