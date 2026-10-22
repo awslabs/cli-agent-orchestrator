@@ -177,6 +177,16 @@ SEPARATOR_PATTERN = (
 # case-insensitive: a few builds render "plan" lower-case depending
 # on the locale.
 TUI_PLACEHOLDER_PATTERN = r"(?:Plan, search, build anything|Add a follow-up)"
+
+# Status-bar fragments, used only as a FALLBACK "the TUI has finished
+# rendering" guard when the input-box placeholder is not in the tail.
+# The bar renders the active model name, so it is plan- and
+# model-dependent and must never be the only readiness signal: a Cursor
+# Free plan cannot select a named model ("Free plans can only use Auto")
+# and renders "Auto" here, matching neither alternative. Gating
+# readiness on this pattern alone made every Free-plan launch time out
+# (issue #752). ``TUI_PLACEHOLDER_PATTERN`` is the model-independent
+# primary signal; see ``tui_rendered`` in get_status().
 TUI_STATUS_BAR_PATTERN = r"Run Everything|Composer \d"
 
 
@@ -691,10 +701,57 @@ class CursorCliProvider(BaseProvider):
         # present in the tail whenever the agent is working.
         TUI_TAIL_WINDOW = 1024
         tail = clean[-TUI_TAIL_WINDOW:]
-        processing_indicator_in_tail = (
-            re.search(TUI_PROCESSING_INDICATOR_PATTERN, tail, re.IGNORECASE) is not None
-        )
         placeholder_in_tail = re.search(TUI_PLACEHOLDER_PATTERN, tail, re.IGNORECASE) is not None
+
+        # The indicator is rendered ON the input-box line, next to the
+        # placeholder. Anchor the check to the tail starting at the LAST
+        # input-box line rather than searching the whole window: the
+        # pipe-pane buffer is an append-only stream of every TUI
+        # redraw, so a working frame's "ctrl+c to stop" is still
+        # sitting in the window after the agent finishes. A finished
+        # Cursor frame is only a few hundred bytes (input box, status
+        # bar, progress percentage), well inside TUI_TAIL_WINDOW, so a
+        # whole-window search keeps the terminal pinned at PROCESSING
+        # for the rest of the session (issue #752).
+        #
+        # The input-box line is matched STRUCTURALLY on Cursor's input
+        # arrow (``→``) immediately before the placeholder, not just on
+        # the placeholder phrase appearing anywhere in a line: ordinary
+        # response prose can contain "Add a follow-up" or "Plan,
+        # search, build anything" without the arrow, and matching that
+        # as the "last input-box line" would let response text
+        # impersonate the input box and report a still-working agent
+        # as COMPLETED.
+        #
+        # We search from the START of that last structural match to the
+        # END of the tail (not just that one line) because the
+        # indicator can wrap onto the line immediately after the
+        # placeholder in a narrow pane; the stale frame's indicator
+        # always sits BEFORE the final input-box line, never after it,
+        # since the finished frame is appended last.
+        #
+        # Builds that never render a placeholder (older text-mode
+        # Cursor) have no input-box line to anchor to; fall back to the
+        # whole-window search there so their behaviour is unchanged.
+        _input_box_line_re = re.compile(r"→\s*" + TUI_PLACEHOLDER_PATTERN, re.IGNORECASE)
+        _input_box_matches = list(_input_box_line_re.finditer(tail))
+        indicator_haystack = tail[_input_box_matches[-1].start() :] if _input_box_matches else tail
+        processing_indicator_in_tail = (
+            re.search(TUI_PROCESSING_INDICATOR_PATTERN, indicator_haystack, re.IGNORECASE)
+            is not None
+        )
+
+        # "The TUI has finished rendering" guard for the PROCESSING and
+        # IDLE/COMPLETED branches below. The status bar renders the
+        # ACTIVE MODEL NAME, so it cannot be the only readiness signal:
+        # on a Cursor Free plan a named model is rejected ("Free plans
+        # can only use Auto") and the bar reads "Auto", matching
+        # neither alternative in TUI_STATUS_BAR_PATTERN. That left
+        # get_status() at UNKNOWN forever and every launch timed out
+        # (issue #752). The placeholder is model-independent and is
+        # emitted by every v2026 TUI regardless of plan, so accept
+        # either marker.
+        tui_rendered = placeholder_in_tail or re.search(TUI_STATUS_BAR_PATTERN, clean) is not None
 
         if processing_indicator_in_tail:
             # Primary v2026+ PROCESSING signal: the "ctrl+c to stop"
@@ -768,10 +825,10 @@ class CursorCliProvider(BaseProvider):
             return TerminalStatus.WAITING_USER_ANSWER
 
         # v2026+ TUI: "ctrl+c to stop" is on the input-box line.
-        # This is the primary PROCESSING signal. We also require
-        # the status bar to be present so a half-initialised TUI
-        # does not false-positive.
-        if tui_processing and re.search(TUI_STATUS_BAR_PATTERN, clean):
+        # This is the primary PROCESSING signal. We also require the
+        # TUI to have finished rendering (``tui_rendered``) so a
+        # half-initialised TUI does not false-positive.
+        if tui_processing and tui_rendered:
             return TerminalStatus.PROCESSING
 
         # IDLE / COMPLETED: an idle prompt at the bottom of the
@@ -788,16 +845,15 @@ class CursorCliProvider(BaseProvider):
         if last_idle:
             return TerminalStatus.COMPLETED if self._turns > 0 else TerminalStatus.IDLE
 
-        # v2026+ TUI IDLE: no "ctrl+c to stop" indicator on the
-        # input-box line AND the status bar is visible. The
+        # v2026+ TUI IDLE: no "ctrl+c to stop" indicator on the last
+        # input-box line AND the TUI has finished rendering. The
         # placeholder is always present in v2026 regardless of
         # state, so it is the *absence* of the processing
         # indicator that distinguishes idle / completed from
-        # processing. We require the status bar to be present
-        # too so we don't false-positive on a half-initialised
-        # TUI. Same IDLE-vs-COMPLETED split via the turn counter
-        # as above.
-        if not processing_indicator_in_tail and re.search(TUI_STATUS_BAR_PATTERN, clean):
+        # processing. We require ``tui_rendered`` too so we don't
+        # false-positive on a half-initialised TUI. Same
+        # IDLE-vs-COMPLETED split via the turn counter as above.
+        if not processing_indicator_in_tail and tui_rendered:
             return TerminalStatus.COMPLETED if self._turns > 0 else TerminalStatus.IDLE
 
         return TerminalStatus.UNKNOWN

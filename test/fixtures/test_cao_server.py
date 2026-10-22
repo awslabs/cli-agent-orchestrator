@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import json
 import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 from test.conftest import mint_test_token
@@ -26,6 +29,7 @@ from test.fixtures.cao_server import (
     _seed_omp_e2e_state,
     _session_rsa_keys,
     _start_cao_server,
+    _subprocess_env,
 )
 
 import pytest
@@ -231,6 +235,48 @@ def test_parallel_ports_distinct(tmp_path_factory: pytest.TempPathFactory) -> No
         for srv in servers:
             with contextlib.suppress(Exception):
                 srv.stop()
+
+
+def test_second_server_on_same_home_is_refused(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """A second cao-server on the same CAO_HOME_DIR exits non-zero before serving (#406, #709).
+
+    Different port on purpose: the port used to be the only guard.
+    """
+    home = tmp_path_factory.mktemp("cao_one_per_home")
+    first = _start_cao_server(home, _pick_free_port())
+    try:
+        cao_home = home / ".aws" / "cli-agent-orchestrator"
+        diagnostics = json.loads((cao_home / "server.lock").read_text())
+        assert diagnostics["port"] == first.port
+
+        second_port = _pick_free_port()
+        second = subprocess.run(
+            [sys.executable, "-m", "cli_agent_orchestrator.api.main", "--port", str(second_port)],
+            env=_subprocess_env(home, second_port),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert second.returncode != 0, second.stdout + second.stderr
+        lines = second.stderr.splitlines()
+        first_line = next(line for line in lines if line.startswith("cao: another server"))
+        assert first_line.startswith(
+            f"cao: another server (PID {diagnostics['pid']}, port {first.port}, started "
+        )
+        assert first_line.endswith("Z) already owns")
+        assert f"     {cao_home}" in lines
+        assert (
+            "     Stop it, or run this instance with a different CAO_HOME_DIR and --port." in lines
+        )
+        # The second server never bound its port and the first still serves.
+        with pytest.raises(requests.ConnectionError):
+            requests.get(f"http://127.0.0.1:{second_port}/health", timeout=1.0)
+        assert requests.get(f"{first.url}/health", timeout=2.0).status_code == 200
+        assert json.loads((cao_home / "server.lock").read_text()) == diagnostics
+    finally:
+        first.stop()
 
 
 def test_startup_failure_raises_with_log_tail(

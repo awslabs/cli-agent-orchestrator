@@ -1,7 +1,12 @@
 {
-  "_comment": "Coverage ratchet floors. The ratchet (cao_mcp_apps/scripts/coverage-ratchet.mjs) fails CI if measured line coverage drops below these floors. Phase 0 seeded null placeholders (record-only); Phase V task 12.5 raised the floors to the measured values to lock in the gains. Floors sit a small margin below the measured values (python 87.21%, frontend 90.92%) to absorb cross-Python-version jitter while still blocking real regressions.",
+  "_comment": "Coverage ratchet floors. The ratchet (cao_mcp_apps/scripts/coverage-ratchet.mjs) fails CI if measured coverage drops below these floors. Phase 0 seeded null placeholders (record-only); Phase V task 12.5 raised the floors to the measured values to lock in the gains. Floors sit a small margin below the measured values (python 87.21%, frontend 90.92%) to absorb cross-Python-version jitter while still blocking real regressions.",
+  "_comment_branch": "python_branch is a SECOND, separately-floored metric (#1005), measured from the same coverage.json now that CI passes --cov-branch. It is deliberately record-only (null floor) on introduction: the full-suite branch figure is unknown until CI measures it, and the python line floor must not move. Raise floor_pct to a small margin below the first reported value, in its own PR. NOTE: the line floor is computed as covered_lines/num_statements, NOT read from totals.percent_covered, which --cov-branch redefines as a blended line+branch figure.",
   "python": {
     "floor_pct": 87.0,
+    "coverage_json": "coverage.json"
+  },
+  "python_branch": {
+    "floor_pct": null,
     "coverage_json": "coverage.json"
   },
   "frontend": {

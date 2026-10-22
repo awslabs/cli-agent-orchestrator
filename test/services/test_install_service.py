@@ -236,6 +236,52 @@ class TestInstallAgent:
         assert kiro_config["name"] == "developer"
         assert kiro_config["mcpServers"]["service"]["env"]["API_TOKEN"] == "secret-token"
 
+    @pytest.mark.parametrize(
+        ("frontmatter_line", "expected"),
+        [
+            pytest.param("", False, id="unset-means-false-as-before"),
+            pytest.param("useLegacyMcpJson: true\n", True, id="profile-true-reaches-the-spec"),
+            pytest.param("useLegacyMcpJson: false\n", False, id="profile-false-reaches-the-spec"),
+        ],
+    )
+    def test_install_writes_kiro_mcp_json_flag_under_its_current_name(
+        self,
+        install_paths: dict[str, Path],
+        tmp_path: Path,
+        frontmatter_line: str,
+        expected: bool,
+    ) -> None:
+        """The installed spec carries ``includeMcpJson`` only, with the profile's value (#1026).
+
+        Kiro CLI retired ``useLegacyMcpJson`` and rejects a spec that carries both
+        spellings, so the retired one must never be written. The profile keeps the
+        historical spelling; before this test its value never reached the spec at
+        all, so the ``true`` case is the one that would have failed either way.
+        """
+        built_in_dir = tmp_path / "builtin-agent-store"
+        built_in_dir.mkdir()
+        (built_in_dir / "mcp-json-agent.md").write_text(
+            "---\n"
+            "name: mcp-json-agent\n"
+            "description: Test agent\n"
+            "role: developer\n"
+            f"{frontmatter_line}"
+            "---\n"
+            "Body.\n",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "cli_agent_orchestrator.utils.agent_profiles.resources.files",
+            return_value=built_in_dir,
+        ):
+            result = install_agent("mcp-json-agent", "kiro_cli")
+
+        assert result.success is True, result.message
+        kiro_config = json.loads((install_paths["kiro_dir"] / "mcp-json-agent.json").read_text())
+        assert kiro_config["includeMcpJson"] is expected
+        assert "useLegacyMcpJson" not in kiro_config
+
     def test_install_kiro_resolves_bundled_mcp_command_persisted(
         self, install_paths: dict[str, Path]
     ) -> None:

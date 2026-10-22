@@ -253,9 +253,12 @@ ever run.
 
 What is **not** guaranteed is the adjacent case the criterion does not name: Obsidian open
 and actively writing. A note saved during a reconcile is caught by the two-stat stability
-check, skipped with `unstable_skipped` (warn), and its prior row left intact. Correct
-behavior — never index a torn file — but it means a reconcile concurrent with active editing
-can legitimately skip notes, and the operator sees a warn count rather than a clean run.
+check and, per ADR-006, re-read up to three times with a short backoff; a save that completes
+within that window is indexed from the clean re-read (`test_scan_unstable_reread.py`). A note
+still changing after the bound is skipped with `unstable_skipped` (warn), its finding detail
+records how many reads were attempted, and its prior row is left intact. Correct behavior —
+never index a torn file — but it means a reconcile concurrent with continuous editing can
+still legitimately skip notes, and the operator sees a warn count rather than a clean run.
 
 Recorded so the gap is stated rather than surprising, and so nobody reads AC11 as
 "concurrent with Obsidian" when it says "while Obsidian is closed".
