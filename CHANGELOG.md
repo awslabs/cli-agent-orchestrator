@@ -799,8 +799,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SHA-256 of the matched span (`cao.secret_ok: [{pattern, sha256}]`); a boolean or pattern-only entry
   quarantines the note. `cao memory vault scan --fingerprints` prints the values an acceptance needs;
   `cao memory vault status` reports honoured acceptances (`secret_acceptances`, `secret_accepted`) and
-  inert ones (`secret_acceptance_unmatched`). The config-load warning for `warn` with `inject: true`
-  is retired because the pairing no longer carries exposure. `reject` is unchanged.
+  inert ones (`secret_acceptance_unmatched`). Fingerprints come from one acceptance-free pass, so
+  they never change with what is accepted; a credential two patterns match, such as
+  `NAME_TOKEN=value`, prints two fingerprints and needs both accepted before the value is served
+  raw. The config-load warning for `warn` with `inject: true` is retired because the pairing no
+  longer carries exposure. `reject` is unchanged.
   **Migration:** operators who relied on `warn` passing raw bytes to agents must add a per-finding
   acceptance to each note for each span they want served raw; until then those spans are redacted.
 

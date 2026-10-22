@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import itertools
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from test.services.vault.test_vault_injection_renderer import (
@@ -29,6 +31,7 @@ from click.testing import CliRunner
 from cli_agent_orchestrator.clients.database import VaultFindingModel, VaultNoteModel
 from cli_agent_orchestrator.services import settings_service
 from cli_agent_orchestrator.services.secret_gate import (
+    fingerprint_secrets,
     pattern_names,
     redact_secrets,
     redact_secrets_with_acceptances,
@@ -94,6 +97,40 @@ _SAMPLES: dict[str, tuple[str, str]] = {
 _SECRET_BODY = "password: hunter2sixteen"
 _SECRET_VALUE = "hunter2sixteen"
 
+# Credentials that two or three patterns match, innermost first: the vendor
+# pattern on the value, then ``bearer_token`` or ``secret_assignment`` on the
+# assignment around it. (note body, the innermost value that must never leak,
+# the chain of pattern names in cascade order.)
+_NESTED: dict[str, tuple[str, str, tuple[str, ...]]] = {
+    "github_token_env": (
+        "GITHUB_TOKEN=ghp_" + "a" * 36,
+        "ghp_" + "a" * 36,
+        ("github_pat", "bearer_token"),
+    ),
+    "anthropic_key_env": (
+        "ANTHROPIC_API_KEY=sk-ant-api03-" + "Qz7" * 30,
+        "sk-ant-api03-" + "Qz7" * 30,
+        ("anthropic_api_key", "bearer_token"),
+    ),
+    "gitlab_key_env": (
+        "API_KEY=glpat-" + "x" * 20,
+        "glpat-" + "x" * 20,
+        ("gitlab_pat", "bearer_token"),
+    ),
+    "bearer_github_header": (
+        "Authorization: Bearer ghp_" + "c" * 36,
+        "ghp_" + "c" * 36,
+        ("github_pat", "bearer_token"),
+    ),
+    "three_levels": (
+        "secret: token=ghp_" + "b" * 36,
+        "ghp_" + "b" * 36,
+        ("github_pat", "bearer_token", "secret_assignment"),
+    ),
+}
+_ENV_TOKEN_BODY, _ENV_TOKEN_VALUE, _ENV_TOKEN_CHAIN = _NESTED["github_token_env"]
+_FINGERPRINT_LINE = re.compile(r"pattern=(\S+) sha256=([0-9a-f]{64})(?: inside=(\S+))?")
+
 
 def _warn_renderer(tmp_path, monkeypatch):
     """The injectable renderer fixture with the project mapping switched to warn."""
@@ -119,7 +156,27 @@ def _write_note(vault_root, body: str, *, cao_extra: str = "") -> Path:
 
 
 def _acceptance_yaml(pattern: str, sha256: str) -> str:
-    return f"  secret_ok:\n    - pattern: {pattern}\n      sha256: {sha256}\n"
+    return _acceptances_yaml([(pattern, sha256)])
+
+
+def _acceptances_yaml(pairs) -> str:
+    return "  secret_ok:\n" + "".join(
+        f"    - pattern: {pattern}\n      sha256: {sha256}\n" for pattern, sha256 in pairs
+    )
+
+
+def _printed_fingerprints(
+    memory_cli, monkeypatch, warn_config, vault
+) -> list[tuple[str, str, str]]:
+    """``(pattern, sha256, inside)`` for every line ``vault scan --fingerprints`` prints."""
+    monkeypatch.setattr(memory_cli, "_configured_vault", lambda: (warn_config, vault))
+    result = CliRunner().invoke(memory_cli.vault_scan, ["--fingerprints"])
+    assert result.exit_code == 0, result.output
+    return [
+        (m.group(1), m.group(2), m.group(3) or "")
+        for m in map(_FINGERPRINT_LINE.search, result.output.splitlines())
+        if m is not None
+    ]
 
 
 def _reconcile(vault, run_id: str) -> None:
@@ -230,6 +287,78 @@ def test_recall_through_memory_service_is_redacted(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Nested matches: fingerprints are independent of the acceptance set
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", sorted(_NESTED))
+def test_nested_fingerprints_are_independent_of_the_acceptance_set(name):
+    """The pairs ``--fingerprints`` prints are the pairs checked under every allowlist.
+
+    Enumerates every subset of the printed pairs. The innermost value reaches
+    the output exactly when every pair is accepted, and the fingerprints the
+    cascade reports never change with the allowlist. Reverting the P2-2 fix
+    (re-matching later patterns over partly unredacted text) fails the
+    full-subset case: the outer hash drifts and the value stays redacted.
+    """
+    body, value, chain = _NESTED[name]
+    text, matches = redact_secrets_with_acceptances(body, ())
+    assert text == redact_secrets(body)[0]
+    assert tuple(m.pattern for m in matches) == chain
+    assert [m.enclosed_by for m in matches] == [*chain[1:], None]
+    printed = [(m.pattern, m.sha256) for m in matches]
+    assert fingerprint_secrets(body).fingerprints == tuple(printed)
+
+    for size in range(len(printed) + 1):
+        for subset in itertools.combinations(printed, size):
+            rendered, again = redact_secrets_with_acceptances(body, subset)
+            assert [(m.pattern, m.sha256) for m in again] == printed, subset
+            assert [m.accepted for m in again] == [pair in subset for pair in printed]
+            if size == len(printed):
+                assert rendered == body
+                assert all(m.passed for m in again)
+            else:
+                assert value not in rendered, subset
+                assert not again[0].passed
+
+
+def test_inner_acceptance_alone_is_blocked_and_names_the_outer_match():
+    body, value, (inner, outer) = _NESTED["github_token_env"]
+    printed = fingerprint_secrets(body).fingerprints
+
+    text, matches = redact_secrets_with_acceptances(body, [printed[0]])
+
+    assert text == f"GITHUB_[REDACTED:{outer}]"
+    assert value not in text
+    assert (matches[0].pattern, matches[0].accepted, matches[0].passed) == (inner, True, False)
+    assert matches[0].blocked_by == outer
+    assert (matches[1].accepted, matches[1].passed, matches[1].blocked_by) == (False, False, None)
+
+
+def test_outer_acceptance_alone_serves_the_outer_span_as_fingerprinted():
+    body, value, (inner, outer) = _NESTED["github_token_env"]
+    printed = fingerprint_secrets(body).fingerprints
+
+    text, matches = redact_secrets_with_acceptances(body, [printed[1]])
+
+    assert text == f"GITHUB_TOKEN=[REDACTED:{inner}]"
+    assert value not in text
+    assert (matches[0].accepted, matches[0].passed) == (False, False)
+    assert (matches[1].accepted, matches[1].passed) == (True, True)
+
+
+def test_three_level_nesting_blames_the_nearest_unaccepted_match():
+    body, _value, chain = _NESTED["three_levels"]
+    printed = fingerprint_secrets(body).fingerprints
+
+    _text, matches = redact_secrets_with_acceptances(body, printed[:2])
+
+    assert [m.passed for m in matches] == [False, False, False]
+    assert matches[0].blocked_by == chain[2]
+    assert matches[1].blocked_by == chain[2]
+
+
+# ---------------------------------------------------------------------------
 # Per-finding acceptance
 # ---------------------------------------------------------------------------
 
@@ -287,6 +416,69 @@ def test_acceptance_with_right_hash_but_wrong_pattern_is_not_honoured(tmp_path, 
 
     assert recalled is not None
     assert _SECRET_VALUE not in recalled.content
+
+
+def test_nested_credential_passes_raw_when_every_printed_fingerprint_is_accepted(
+    tmp_path, monkeypatch
+):
+    """The P2-2 scenario end to end: accept exactly what ``--fingerprints`` printed."""
+    from cli_agent_orchestrator.cli.commands import memory as memory_cli
+
+    service, session_factory, vault_root, warn_config, vault = _warn_renderer(tmp_path, monkeypatch)
+    _write_note(vault_root, _ENV_TOKEN_BODY)
+    printed = _printed_fingerprints(memory_cli, monkeypatch, warn_config, vault)
+    assert [(p, inside) for p, _h, inside in printed] == [
+        ("github_pat", "bearer_token"),
+        ("bearer_token", ""),
+    ]
+    _write_note(
+        vault_root, _ENV_TOKEN_BODY, cao_extra=_acceptances_yaml([(p, h) for p, h, _i in printed])
+    )
+    _reconcile(vault, "warn-nested-accept-all")
+
+    recalled = _recall(warn_config)
+    block = service.get_memory_context_for_terminal("worker")
+
+    assert recalled is not None
+    assert _ENV_TOKEN_BODY in recalled.content
+    assert "[REDACTED" not in recalled.content
+    assert recalled.redacted_patterns == []
+    assert _ENV_TOKEN_BODY in block
+    findings = _findings(session_factory)
+    # Reconcile folds same-code findings into one sorted, comma-joined detail.
+    assert len(findings["secret_accepted"]) == 2
+    assert set(findings["secret_accepted"]) == {"bearer_token,github_pat"}
+    assert "secret_acceptance_unmatched" not in findings
+    counters = _counter_values(session_factory)
+    assert counters["secret_acceptance.spans_passed"] == 4  # two spans, recall + injection
+    assert "secret_redaction.memories_redacted" not in counters
+
+
+def test_nested_credential_with_only_the_inner_acceptance_is_redacted_and_reported(
+    tmp_path, monkeypatch
+):
+    """An accepted span inside an unaccepted match is redacted, and status does not call it served."""
+    service, session_factory, vault_root, warn_config, vault = _warn_renderer(tmp_path, monkeypatch)
+    inner_pair = fingerprint_secrets(_ENV_TOKEN_BODY).fingerprints[0]
+    _write_note(vault_root, _ENV_TOKEN_BODY, cao_extra=_acceptances_yaml([inner_pair]))
+    _reconcile(vault, "warn-nested-inner-only")
+
+    recalled = _recall(warn_config)
+    block = service.get_memory_context_for_terminal("worker")
+
+    assert recalled is not None
+    assert _ENV_TOKEN_VALUE not in recalled.content
+    assert "GITHUB_[REDACTED:bearer_token]" in recalled.content
+    assert recalled.redacted_patterns == ["github_pat", "bearer_token"]
+    assert _ENV_TOKEN_VALUE not in block
+    findings = _findings(session_factory)
+    assert "secret_accepted" not in findings
+    assert findings["secret_acceptance_unmatched"] == [
+        "github_pat: span is inside an unaccepted bearer_token match; accept that fingerprint too"
+    ]
+    counters = _counter_values(session_factory)
+    assert "secret_acceptance.spans_passed" not in counters
+    assert counters["secret_redaction.memories_redacted"] == 2
 
 
 @pytest.mark.parametrize(
@@ -463,8 +655,9 @@ def test_vault_note_text_reaches_agents_only_through_the_redaction_chokepoint():
     Three properties, each checked structurally so a new surface fails loudly:
 
     1. ``load_candidate`` binds ``body`` through ``_redact_for_model`` before the
-       ``Memory`` constructor, and ``_redact_for_model`` calls the acceptance-aware
-       cascade. Deleting either line fails this test.
+       ``Memory`` constructor, and ``_redact_for_model`` runs the cascade
+       (``fingerprint_secrets``) and renders it against the note's acceptances
+       (``render``). Deleting either line fails this test.
     2. A vault-backed ``Memory`` is constructed in exactly two places: the
        chokepoint, and ``_store_vault_memory``, which echoes the caller's own
        input back to the writer and reads no vault bytes.
@@ -498,10 +691,8 @@ def test_vault_note_text_reaches_agents_only_through_the_redaction_chokepoint():
     assert isinstance(keywords["content"], ast.Name) and keywords["content"].id == "body"
     assert "redacted_patterns" in keywords
     redactor = _function(reader_tree, "_redact_for_model")
-    assert any(
-        isinstance(node, ast.Call) and _call_name(node) == "redact_secrets_with_acceptances"
-        for node in ast.walk(redactor)
-    )
+    redactor_calls = {_call_name(node) for node in ast.walk(redactor) if isinstance(node, ast.Call)}
+    assert {"fingerprint_secrets", "render"} <= redactor_calls
 
     vault_memory_constructors: set[tuple[str, str | None]] = set()
     load_consumers: set[tuple[str, str | None]] = set()

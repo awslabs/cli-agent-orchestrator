@@ -205,6 +205,17 @@ mapping, is reported as `secret_acceptance_unmatched`. Recall counters
 `secret_redaction.*` and `secret_acceptance.spans_passed` count redacted loads
 and raw spans served.
 
+A credential written as an assignment, such as `GITHUB_TOKEN=ghp_…` or
+`Authorization: Bearer ghp_…`, matches twice: the vendor pattern on the value
+and `bearer_token` (or `secret_assignment`) on the assignment around it.
+`--fingerprints` prints both lines, the inner one marked `inside=bearer_token`,
+and both must be accepted before the value is served raw. Fingerprints do not
+change with what you accept: they come from one acceptance-free pass over the
+note, and acceptances are applied to that result. Accepting only the inner pair
+leaves the outer match redacted and reports `secret_acceptance_unmatched`
+naming the fingerprint still needed. `secret_accepted` and `spans_passed` count
+only spans the agent actually received.
+
 For managed writes, the gate checks the authored body and CAO-generated
 `cao` metadata before publishing. Preserved user frontmatter is not scanned or
 rewritten by this gate; review and change that frontmatter directly when it

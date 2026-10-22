@@ -21,7 +21,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.models.memory import Memory
 from cli_agent_orchestrator.services.memory_format import normalize_memory_tags
-from cli_agent_orchestrator.services.secret_gate import redact_secrets_with_acceptances
+from cli_agent_orchestrator.services.secret_gate import fingerprint_secrets
 from cli_agent_orchestrator.services.vault.binding import VaultBinding
 from cli_agent_orchestrator.services.vault.boundary import (
     is_excluded_relpath,
@@ -436,11 +436,19 @@ def _redact_for_model(
     """Redact credential-shaped spans before note text leaves the read boundary.
 
     Returns the redacted body and the deduplicated, pattern-order names of the
-    patterns that were redacted. Acceptances are read from the note's current
-    frontmatter, never from the index, so an acceptance is honoured only while
-    it is still written in the note; they are honoured only on a ``warn``
-    mapping. Counters are content-free.
+    patterns whose spans did not reach the output raw. The cascade is run once
+    with no allowlist, so the fingerprints it checks are the ones
+    ``vault scan --fingerprints`` printed; acceptances are then applied to that
+    recorded result. They are read from the note's current frontmatter, never
+    from the index, so an acceptance is honoured only while it is still written
+    in the note, and only on a ``warn`` mapping. A span passes raw only when its
+    own pair and every enclosing match's pair are accepted. The frontmatter is
+    parsed only when the body has a match, so a clean note costs one cascade.
+    Counters are content-free and count spans actually served raw.
     """
+    cascade = fingerprint_secrets(body)
+    if not cascade:
+        return body, ()
     accepted: tuple[tuple[str, str], ...] = ()
     if candidate.binding.mapping.secret_gate == "warn":
         parsed = parse_note(
@@ -449,18 +457,16 @@ def _redact_for_model(
             secret_gate=candidate.binding.mapping.secret_gate,
         )
         accepted = secret_acceptances(parsed.cao) if parsed.finding_code is None else ()
-    redacted, matches = redact_secrets_with_acceptances(body, accepted)
-    if not matches:
-        return redacted, ()
-    redacted_names = tuple(dict.fromkeys(m.pattern for m in matches if not m.accepted))
-    passed = sum(1 for m in matches if m.accepted)
+    redacted, matches = cascade.render(accepted)
+    redacted_names = tuple(dict.fromkeys(m.pattern for m in matches if not m.passed))
+    passed = sum(1 for m in matches if m.passed)
     vault_id = candidate.binding.vault_id
     if redacted_names:
         increment_counter(vault_id, "secret_redaction.memories_redacted", 1)
         increment_counter(
             vault_id,
             "secret_redaction.pattern_matches",
-            sum(1 for m in matches if not m.accepted),
+            sum(1 for m in matches if not m.passed),
         )
     if passed:
         increment_counter(vault_id, "secret_acceptance.spans_passed", passed)

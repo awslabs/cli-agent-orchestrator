@@ -619,26 +619,41 @@ def _acceptance_findings(
     matches: tuple[SecretMatch, ...] = ()
     if has_secret:
         _text, matches = redact_secrets_with_acceptances(parsed.region.body, accepted)
-    honoured = {(m.pattern, m.sha256) for m in matches if m.accepted}
-    for match in matches:
-        if match.accepted:
-            findings.append(
-                ScanFinding(
-                    FindingCode.SECRET_ACCEPTED,
-                    match.pattern,
-                    finding_severity(FindingCode.SECRET_ACCEPTED, secret_gate="reject"),
-                )
-            )
+    # ``secret_accepted`` is reported only for a span the agent receives as
+    # fingerprinted. An accepted span inside an unaccepted match (the vendor
+    # value inside ``NAME_TOKEN=value``) is still redacted, so it is reported
+    # as unmatched with the second fingerprint the operator has to accept.
+    hits = {pair: [m for m in matches if (m.pattern, m.sha256) == pair] for pair in set(accepted)}
     for pattern, digest in accepted:
-        if (pattern, digest) not in honoured:
-            findings.append(
-                ScanFinding(
-                    FindingCode.SECRET_ACCEPTANCE_UNMATCHED,
-                    f"{pattern}: no current span matches",
-                    finding_severity(FindingCode.SECRET_ACCEPTANCE_UNMATCHED, secret_gate="reject"),
+        spans = hits[(pattern, digest)]
+        if not spans:
+            findings.append(_unmatched(f"{pattern}: no current span matches"))
+            continue
+        for match in spans:
+            if match.passed:
+                findings.append(
+                    ScanFinding(
+                        FindingCode.SECRET_ACCEPTED,
+                        match.pattern,
+                        finding_severity(FindingCode.SECRET_ACCEPTED, secret_gate="reject"),
+                    )
                 )
-            )
+            else:
+                findings.append(
+                    _unmatched(
+                        f"{pattern}: span is inside an unaccepted {match.blocked_by} match; "
+                        "accept that fingerprint too"
+                    )
+                )
     return tuple(findings)
+
+
+def _unmatched(detail: str) -> ScanFinding:
+    return ScanFinding(
+        FindingCode.SECRET_ACCEPTANCE_UNMATCHED,
+        detail,
+        finding_severity(FindingCode.SECRET_ACCEPTANCE_UNMATCHED, secret_gate="reject"),
+    )
 
 
 def _parse_findings(parsed: ParseResult) -> tuple[ScanFinding, ...]:

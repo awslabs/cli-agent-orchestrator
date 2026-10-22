@@ -262,8 +262,10 @@ def vault_scan(fingerprints, dry_run):
     Scans the configured vault notes without changing files or derived rows.
     With --fingerprints, each credential-shaped span is listed as its pattern
     name and SHA-256, the two values a per-finding cao.secret_ok acceptance in
-    that note's frontmatter needs. Fingerprints are shown only here, never
-    stored.
+    that note's frontmatter needs. A span marked inside=<pattern> sits within
+    another match, as the value does in NAME_TOKEN=value; both fingerprints
+    must be accepted for it to be served raw. Fingerprints are shown only here,
+    never stored.
     """
     from cli_agent_orchestrator.services.secret_gate import redact_secrets_with_acceptances
     from cli_agent_orchestrator.services.vault.scan import scan_vault
@@ -276,9 +278,12 @@ def vault_scan(fingerprints, dry_run):
                 continue
             _text, matches = redact_secrets_with_acceptances(note.parsed.region.body, ())
             for match in matches:
+                # A span inside another match (the value inside NAME_TOKEN=value)
+                # passes raw only when both fingerprints are accepted.
+                inside = f" inside={match.enclosed_by}" if match.enclosed_by else ""
                 click.echo(
                     f"fingerprint: {note.vault_relpath} pattern={match.pattern} "
-                    f"sha256={match.sha256}"
+                    f"sha256={match.sha256}{inside}"
                 )
     click.echo(
         f"Scanned {len(report.notes)} note(s); {report.total_bytes_scanned} bytes "
