@@ -4255,7 +4255,7 @@ async def send_terminal_input(
         #
         # Called instead of the ``send_input`` bool wrapper purely to keep the
         # boundary it computes; the behaviour is identical.
-        boundary = await asyncio.to_thread(
+        boundary: Optional[int] = await asyncio.to_thread(
             terminal_service.dispatch_input,
             terminal_id,
             message,

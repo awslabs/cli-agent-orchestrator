@@ -3706,7 +3706,7 @@ def get_terminal(terminal_id: str) -> Dict:
             # the new turn's generation, defeating the #735 gate it feeds.
             observation = status_monitor.status_observation(terminal_id)
             observed_status = observation.status
-            status_generation: Optional[int] = observation.output_generation
+            status_generation = observation.output_generation
             # External deferred initialization has a short two-phase window:
             # the provider can render ERROR before the background init task has
             # durably written ``deferred_init_failure``. Publishing that

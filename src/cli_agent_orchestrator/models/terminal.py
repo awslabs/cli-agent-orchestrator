@@ -93,7 +93,7 @@ class Terminal(BaseModel):
         None, description="Terminal that created this one via handoff/assign (callback target)"
     )
     callback_terminal_id: Optional[str] = Field(
-        None,
+        default=None,
         description=(
             "For a worker created from ANOTHER node (assign/handoff with target_host): "
             "the creating supervisor's terminal id, read back from the "
@@ -131,7 +131,7 @@ class Terminal(BaseModel):
         ),
     )
     initial_delivery: Optional[Dict[str, Any]] = Field(
-        None,
+        default=None,
         description=(
             "Durable outcome of the initial message this terminal was created with "
             "(deferred init): state pending/delivered/failed plus kind and message. "
@@ -149,7 +149,7 @@ class Terminal(BaseModel):
         None, description="Current terminal status (live only)"
     )
     status_generation: Optional[int] = Field(
-        None,
+        default=None,
         description=(
             "Output generation that ``status`` was EARNED at, from "
             "StatusMonitor.status_observation(). A status counts as evidence for a "
