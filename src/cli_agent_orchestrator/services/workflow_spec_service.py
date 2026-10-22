@@ -1106,10 +1106,10 @@ def _validated_script_spec(name: str, source: str, target_path: str) -> ScriptSp
     The ``WORKFLOW_MAX_SPEC_BYTES`` check runs BEFORE ``lint_script``, not after: both
     caps reject oversize input, but they are different budgets with different public
     messages (#969/#970), and ``SCRIPT_LINT_MAX_SOURCE_CHARS`` (128 KiB) is smaller than
-    ``WORKFLOW_MAX_SPEC_BYTES`` (256 KiB). Linting first would mean every spec over 128
-    KiB — including ones between 128 and 256 KiB that the byte budget alone would still
-    reject — surfaces the lint cap's generic "syntax" finding instead of the stable,
-    actionable "spec exceeds N bytes" error callers already depend on.
+    ``WORKFLOW_MAX_SPEC_BYTES`` (256 KiB). Linting first would mean a spec over 256 KiB
+    surfaces the lint cap's "syntax" finding instead of the stable "spec exceeds N bytes"
+    error callers already depend on. A spec between 128 and 256 KiB passes the byte
+    budget and is refused by the lint cap, whose finding names the size and the limit.
 
     Raises:
         ValueError: over the byte cap, a lint ERROR, or a malformed ``INPUTS`` literal.

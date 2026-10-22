@@ -3,15 +3,15 @@ name, stays behind a length bound (#969).
 
 The defect class, not the instance. A function contracted to be total ("never raises
 on input content") reaches an UNGATED NATIVE-RECURSION primitive -- CPython's C parser
-via ``ast.parse`` -- on unbounded caller-supplied text. Pre-3.12 CPython's AST build
-recurses in C with no ``_Py_EnterRecursiveCall`` gate, so deep nesting CAN exhaust the C
-stack and segfault with no exception to catch -- but where that cliff sits is host- and
-version-dependent, not a fixed line: this repo's DevSpace (CPython 3.10) segfaults around
-150,000-200,000 nesting levels, while the GitHub Actions runner (CPython 3.11) instead
-raises a clean ``RecursionError`` well before reaching a segfault on the same input.
-Neither direction is universal, so a fix must handle both outcomes: an exception to
-convert, and -- on a host whose cliff sits closer in -- no exception to see at all.
-``sys.setrecursionlimit`` does not reach that native-recursion code either way.
+via ``ast.parse`` -- on unbounded caller-supplied text. CPython 3.10's AST build recurses
+in C with no recursion gate, so deep nesting exhausts the C stack and segfaults with no
+exception to catch; CPython 3.11 added the gate, so 3.11+ raise a clean ``RecursionError``
+from about 3,500 levels instead. Where 3.10's cliff sits depends on the host's stack: the
+two hosts measured (x86_64 Linux and macOS arm64, 8 MiB stack) both segfault between
+130,500 and 131,000 levels of ``a.b.b...`` -- see ``SCRIPT_LINT_MAX_SOURCE_CHARS`` for the
+table. A fix must therefore handle both outcomes: an exception to convert on 3.11+, and on
+3.10 no exception to see at all. ``sys.setrecursionlimit`` does not reach that
+native-recursion code either way.
 
 The tooling half of the class is why a reader found this and a test did not. The original
 ``test_deeply_nested_expression_is_total`` asserted the right property in the wrong

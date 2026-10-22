@@ -15,8 +15,9 @@ Rule catalogue — eight rules:
 - ``syntax`` (ERROR) — ``ast.parse`` failed; anchored at ``e.lineno`` or 1.
   Also carries the pre-parse oversize verdict: a source over
   ``SCRIPT_LINT_MAX_SOURCE_CHARS`` is refused WITHOUT being parsed, because on
-  CPython <=3.11 a deeply nested source segfaults ``ast.parse`` outright rather
-  than raising anything the arms below could catch.
+  CPython 3.10 a deeply nested source segfaults ``ast.parse`` outright rather
+  than raising anything the arms below could catch (3.11+ raise
+  ``RecursionError`` instead, which the arm below converts).
 - ``disallowed-import`` (ERROR) — static or literal-string dynamic import
   whose first dotted segment is in ``SCRIPT_LINT_DISALLOWED_IMPORT_PREFIXES``
   (scripts reach CAO over HTTP only; the ``cao_workflow`` shim is the
@@ -105,7 +106,7 @@ def lint_script(source: str, display_path: str) -> ScriptValidationResult:
     wrapped once with four narrow arms (no broad except — totality by
     construction, proven by the hypothesis property test).
 
-    Totality needs ONE thing the except arms cannot provide. On CPython <=3.11
+    Totality needs ONE thing the except arms cannot provide. On CPython 3.10
     ``ast.parse`` segfaults on deeply nested input instead of raising — the C
     recursion is ungated, so there is no exception to narrow. The oversize
     pre-check below is what keeps the never-raises contract true on the 3.10
@@ -178,11 +179,13 @@ def lint_script(source: str, display_path: str) -> ScriptValidationResult:
         )
         return _build_result(findings)
     except MemoryError:
-        # The length cap above bounds AST *depth* (one node per character) but
-        # not the parser's separate allocation behavior: a denser grammar
-        # construct (e.g. a long chain of unary operators) can exhaust memory
-        # well under the cap without ever hitting the C-stack limit the cap
-        # exists for. Same fail-closed shape as the three arms above.
+        # Not an out-of-memory condition: CPython's PEG parser has a FIXED
+        # stack depth, and a right-recursive construct (a chain of about 6,000
+        # unary operators, ``**``, ``not``, ``if``/``else`` or ``lambda``)
+        # overflows it and the parser raises ``MemoryError`` ("Parser stack
+        # overflowed - Python source too complex to parse" on 3.12+, bare on
+        # 3.10), far under the length cap and long before the C stack is at
+        # risk. Same fail-closed shape as the three arms above.
         logger.warning("out of memory parsing %s", display_path)
         findings.append(
             LintFinding(

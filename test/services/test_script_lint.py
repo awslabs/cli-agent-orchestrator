@@ -121,7 +121,7 @@ class TestSyntaxRule:
 class TestOversizeSourceGuard:
     """The pre-parse length cap — a crash guard, not a style limit.
 
-    On CPython <=3.11 the AST build inside ``ast.parse`` recurses in C once per
+    On CPython 3.10 the AST build inside ``ast.parse`` recurses in C once per
     nesting level with no recursion gate, so a deeply nested source overflows
     the C stack and SEGFAULTS: no exception is raised, so none of
     ``lint_script``'s except arms can convert it into a finding and the
@@ -167,11 +167,13 @@ class TestOversizeSourceGuard:
 
     def test_dense_unary_chain_under_the_cap_is_fail_closed_not_memoryerror(self):
         # The length cap bounds AST depth for a 2-bytes-per-level attribute
-        # chain, but a denser construct hits a DIFFERENT crash mode well under
-        # the cap: a long chain of unary minus allocates one AST node per
-        # character and raises MemoryError from inside ast.parse, not a
-        # SyntaxError/ValueError/RecursionError. 10_000 levels (~10 KB, two
-        # orders of magnitude under the 128 KiB cap) is enough to reproduce it.
+        # chain, but a right-recursive construct hits a DIFFERENT failure well
+        # under the cap: the PEG parser's stack has a fixed depth, and a chain
+        # of about 6,000 unary minus signs overflows it, so ast.parse raises
+        # MemoryError (the parser's "source too complex" signal, not a real
+        # out-of-memory), not a SyntaxError/ValueError/RecursionError. The same
+        # depth does it on 3.10, 3.12 and 3.13; 10_000 (~10 KB, far under the
+        # 128 KiB cap) reproduces it with margin.
         source = "-" * 10_000 + "1"
         result = lint_script(source, "unary.py")
         assert isinstance(result, ScriptValidationResult)
