@@ -351,3 +351,46 @@ def test_the_block_content_is_never_logged(journalled_run, resolves, caplog):
         frozen_run_memory.frozen_memory_for(journalled_run, "term-1", "task")
 
     assert "LIVE BLOCK" not in caplog.text, "memory text must not reach a second sink"
+
+
+@pytest.mark.parametrize(
+    "run_id, expected",
+    [("missing-script", ""), ("missing-yaml", None), ("unknown", None), (None, None)],
+)
+def test_missing_row_never_selects_live_memory_for_known_script(
+    monkeypatch, resolves, run_id, expected, tmp_path, caplog
+):
+    import logging
+    from types import SimpleNamespace
+
+    from cli_agent_orchestrator.services import settings_service, workflow_service
+
+    monkeypatch.setattr(workflow_journal, "get_run", lambda key: None)
+    monkeypatch.setattr(
+        workflow_service,
+        "run_registry",
+        {
+            "missing-script": SimpleNamespace(tier="script"),
+            "missing-yaml": SimpleNamespace(tier="yaml"),
+        },
+    )
+    settings = tmp_path / "settings.json"
+    monkeypatch.setattr(settings_service, "SETTINGS_FILE", settings)
+    monkeypatch.delenv("CAO_WORKFLOW_REQUIRE_APPROVAL", raising=False)
+    for enforced in (False, True):
+        settings.write_text(json.dumps({"workflow": {"require_approval": enforced}}))
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=frozen_run_memory.logger.name):
+            assert frozen_run_memory.frozen_memory_for(run_id, "term", "work") == expected
+        if run_id == "missing-script":
+            assert caplog.record_tuples == [
+                (
+                    frozen_run_memory.logger.name,
+                    logging.WARNING,
+                    "frozen memory: run 'missing-script': run row missing; memory withheld",
+                )
+            ]
+            assert str(tmp_path) not in caplog.text
+        else:
+            assert caplog.records == []
+    assert resolves == []

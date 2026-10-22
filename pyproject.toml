@@ -57,7 +57,7 @@ dependencies = [
     # "session not found" — this bound is the belt to that suspenders, keeping
     # the broken releases from arriving silently on another machine. Raise it
     # once upstream zips non-strict or pads short rows.
-    "libtmux>=0.51.0,<0.53.1",
+    "libtmux>=0.51.0,<0.62.1",
     "click>=8.2.0",
     "python-dotenv>=1.2.2",
     "python-frontmatter>=1.1.0",
@@ -421,9 +421,18 @@ testpaths = ["test"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
-addopts = "--cov=src --cov-report=term-missing -m 'not e2e and not integration'"
+addopts = "--cov=src --cov-branch --cov-report=term-missing -m 'not e2e and not integration'"
 
-# NFR-3's 80% line floor is enforced in CI, NOT here (issue #583 Bolt 3, build-and-test).
+# `--cov-branch` is COLLECTION ONLY, never a gate here (issue #1005). It makes
+# partially-taken branches visible in `term-missing` as `123->exit` / `123->130`,
+# which is what a reachability bug looks like locally: the line runs, one side of
+# the condition never does. Measured cost on a 369-test subset: 49-57s without,
+# 54-57s with -- inside run-to-run noise, so no local-loop tax.
+#
+# NFR-3's 80% floor is enforced in CI, NOT here (issue #583 Bolt 3, build-and-test).
+# With `--cov-branch` on, that CI invocation enforces the BLENDED line+branch
+# figure against 80, not a line-only floor -- the line-only floor is the
+# ratchet's separate `python.floor_pct = 87.0` (see CAUTION below, #1005).
 #
 # `fail_under` deliberately does NOT live in this file. `--cov` is in `addopts`
 # above, so it applies to EVERY pytest invocation -- and a single test file
@@ -436,8 +445,15 @@ addopts = "--cov=src --cov-report=term-missing -m 'not e2e and not integration'"
 # not measure the same test population, so a pyproject floor would enforce the
 # CI threshold against a different suite even on a full default local run.
 #
-# The floor is enforced instead by `--cov-fail-under=80` on that explicit CI
-# invocation in `.github/workflows/ci.yml`.
+# The blended floor is enforced instead by `--cov-fail-under=80` on that
+# explicit CI invocation in `.github/workflows/ci.yml`; the line-only floor is
+# the ratchet's `python.floor_pct` in `.coverage-baseline.json`, not this flag.
 #
 # NOTE for anyone reading ci.yml: the separate "Coverage ratchet" step there
 # belongs to cao_mcp_apps (the TypeScript subproject), not to this suite.
+#
+# CAUTION (#1005): with `--cov-branch` on, coverage.py's `totals.percent_covered`
+# becomes a BLENDED line+branch figure -- (covered_lines + covered_branches) /
+# (num_statements + num_branches) -- not line coverage. Anything reading that
+# field as "line coverage" must compute `covered_lines / num_statements` itself;
+# `.coverage-baseline.json`'s floors are enforced by a ratchet that now does.
