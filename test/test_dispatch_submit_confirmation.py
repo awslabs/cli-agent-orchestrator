@@ -14,6 +14,24 @@ This test enumerates every call site of a dispatch primitive and requires each
 one to either reach a confirmation helper or carry an explicit allowlist entry
 stating why an unconfirmed send is acceptable there. Adding a new fire-and-
 forget dispatch fails this test until its author makes that choice on purpose.
+
+What this guard is, and is not (PR #1004 review, P3-1). It is a static NAME
+check over the AST: a path "reaches confirmation" when its enclosing function,
+or a function it calls in the same module, mentions a confirmation symbol
+outside a branch that can never run (``if False``, ``while 0``, a boolean
+``and`` with a constant-false operand). It does NOT prove the confirmation
+executes on every path, and it is blind to:
+
+- aliases (``confirm = _confirm_submitted; confirm(...)`` is seen only because
+  the name is mentioned, not because it is called);
+- a mention that is dead for a reason the AST cannot see (a flag that is
+  always False at runtime, an early ``return`` above it);
+- confirmation delegated across modules (one level of intra-module call
+  resolution only).
+
+So the guard catches the class -- a new dispatch call site nobody wired -- and
+the behavioral tests (``TestInboxSubmitConfirmation`` for the inbox path, the
+deferred-init tests for its path) are what prove the wiring actually runs.
 """
 
 from __future__ import annotations
@@ -48,12 +66,17 @@ ALLOWED_UNCONFIRMED: Dict[Tuple[str, str], str] = {
         "Teardown. A swallowed Enter costs nothing: the caller kills the pane next."
     ),
     ("api/main.py", "send_terminal_input"): (
-        "POST /terminals/{id}/input is request/response -- the HTTP caller observes "
-        "the pane and retries. Confirming here would block the API worker."
+        "KNOWN GAP, tracked separately: POST /terminals/{id}/input returns success "
+        "when the paste was sent, with no proof the Enter landed. Nothing in CAO "
+        "retries it; a caller that does not watch the pane loses the message (#78 "
+        "shape). Confirming inline would block the API worker, so the fix is the "
+        "inbox path's shape: answer after the paste, confirm in the background."
     ),
     ("services/agui/handoff_approval.py", "send_input"): (
-        "AnswerDelivery adapter, not a dispatch path: the approval flow owns the "
-        "retry (the interrupt stays UNRESOLVED and a later resume re-attempts)."
+        "KNOWN GAP, tracked separately: the AnswerDelivery adapter sends the "
+        "approval answer fire-and-forget. If the Enter is swallowed the interrupt is "
+        "marked delivered and nothing re-attempts it; the answer sits unsubmitted in "
+        "the agent's prompt (#78 shape)."
     ),
     ("services/memory_service.py", "get_curated_memory_context"): (
         "Bounded wait with a safe fallback: the caller polls the curator for ~15s "
@@ -95,13 +118,40 @@ def _enclosing_chain(functions: List[ast.AST], line: int) -> List[ast.AST]:
     return sorted(spanning, key=lambda f: -f.lineno)
 
 
+def _statically_false(test: ast.AST) -> bool:
+    """True for a condition the AST alone proves can never hold.
+
+    ``if False:``, ``if 0:``, ``if None:``, and an ``and`` chain with any
+    constant-false operand (``if False and FLAG:``). A disabled confirmation
+    hidden behind one of these is dead code, and a dead mention must not
+    satisfy the guard (PR #1004 review, P3-1).
+    """
+    if isinstance(test, ast.Constant):
+        return not test.value
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        return any(_statically_false(value) for value in test.values)
+    return False
+
+
 def _names_in(node: ast.AST) -> Set[str]:
+    """Names and attributes mentioned in ``node``, skipping statically dead branches."""
     out: Set[str] = set()
-    for sub in ast.walk(node):
+
+    def visit(sub: ast.AST) -> None:
+        if isinstance(sub, (ast.If, ast.While)) and _statically_false(sub.test):
+            # The body can never run; only the test and the else branch are live.
+            visit(sub.test)
+            for child in sub.orelse:
+                visit(child)
+            return
         if isinstance(sub, ast.Name):
             out.add(sub.id)
         elif isinstance(sub, ast.Attribute):
             out.add(sub.attr)
+        for child in ast.iter_child_nodes(sub):
+            visit(child)
+
+    visit(node)
     return out
 
 
@@ -164,3 +214,70 @@ def test_every_pane_dispatch_confirms_the_submit_or_is_allowlisted() -> None:
     # matches a real call site must be deleted so the table stays re-auditable.
     stale = sorted(set(ALLOWED_UNCONFIRMED) - seen)
     assert not stale, f"ALLOWED_UNCONFIRMED has entries with no matching call site: {stale}"
+
+
+def _reaches(source: str, func: str = "deliver") -> bool:
+    tree = ast.parse(source)
+    functions = _functions(tree)
+    by_name = {f.name: f for f in functions}  # type: ignore[attr-defined]
+    return _reaches_confirmation([by_name[func]], by_name)
+
+
+def test_guard_counts_a_live_confirmation_mention() -> None:
+    assert _reaches(
+        "def deliver(t):\n"
+        "    dispatch_input(t, 'm')\n"
+        "    if INBOX_SUBMIT_CONFIRMATION:\n"
+        "        _confirm_submitted(t)\n"
+    )
+
+
+def test_guard_does_not_count_a_confirmation_behind_a_constant_false_branch() -> None:
+    """PR #1004 review, P3-1: ``if False and FLAG: confirm()`` used to pass the guard."""
+    assert not _reaches(
+        "def deliver(t):\n"
+        "    dispatch_input(t, 'm')\n"
+        "    if False and INBOX_SUBMIT_CONFIRMATION:\n"
+        "        _confirm_submitted(t)\n"
+    )
+    assert not _reaches(
+        "def deliver(t):\n"
+        "    dispatch_input(t, 'm')\n"
+        "    if 0:\n"
+        "        _confirm_submitted(t)\n"
+    )
+    assert not _reaches(
+        "def deliver(t):\n"
+        "    dispatch_input(t, 'm')\n"
+        "    while False:\n"
+        "        _confirm_submitted(t)\n"
+    )
+
+
+def test_guard_counts_the_else_branch_of_a_dead_if() -> None:
+    assert _reaches(
+        "def deliver(t):\n"
+        "    dispatch_input(t, 'm')\n"
+        "    if False:\n"
+        "        pass\n"
+        "    else:\n"
+        "        _confirm_submitted(t)\n"
+    )
+
+
+def test_guard_resolves_one_level_of_intra_module_calls() -> None:
+    assert _reaches(
+        "def deliver(t):\n"
+        "    dispatch_input(t, 'm')\n"
+        "    _wait(t)\n"
+        "def _wait(t):\n"
+        "    redeliver_dropped_message_with_boundary(t, 'm', 1)\n"
+    )
+    assert not _reaches(
+        "def deliver(t):\n"
+        "    dispatch_input(t, 'm')\n"
+        "    _wait(t)\n"
+        "def _wait(t):\n"
+        "    if False:\n"
+        "        redeliver_dropped_message_with_boundary(t, 'm', 1)\n"
+    )
