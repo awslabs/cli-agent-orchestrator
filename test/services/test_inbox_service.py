@@ -3,6 +3,7 @@
 import asyncio
 import textwrap
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS, INBOX_RECONCILE_INTERVAL
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.event_bus import EventBus
 from cli_agent_orchestrator.services.inbox_service import InboxService
@@ -293,7 +295,7 @@ class TestInboxSubmitConfirmation:
             ),
             # Exercise the real decision helper, stubbing only its two sinks: the
             # pane render it reads and the key it sends.
-            patch.object(terminal_service, "_message_visible_in_box", return_value=True),
+            patch.object(terminal_service, "_message_in_composer", return_value=True),
             patch.object(
                 terminal_service,
                 "send_special_key",
@@ -1535,3 +1537,168 @@ class TestDeliveryIsolation:
         ):
             svc.reconcile_orphaned_messages()
         assert svc.deliver_pending.call_count == 2
+
+
+class TestInboxRecoveryNeverDuplicates:
+    """PR #1004 review, P2-3: the inbox recovery must never deliver a message twice.
+
+    These drive the REAL ``deliver_pending`` -> ``dispatch_input`` -> recovery
+    helper with real provider classes. Only the DB, the pane and the status
+    monitor are fakes. The pane models #78: the first Enter is swallowed and the
+    pasted text stays in the composer, so a full re-send would join two copies
+    and the next Enter would submit both.
+    """
+
+    FIXTURES = Path(__file__).resolve().parents[1] / "providers" / "fixtures"
+    MESSAGE = "Run the migration once."
+
+    class _Pane:
+        def __init__(self, screen):
+            self.screen = screen
+            self.composer, self.submitted, self.enters = "", [], 0
+
+        def send_keys(self, session, window, text, enter_count=1, **kw):
+            self.composer += text
+            self.press_enter()
+
+        def press_enter(self):
+            self.enters += 1
+            if self.enters == 1:
+                return  # Enter swallowed: the text stays in the composer (#78)
+            self.submitted.append(self.composer)
+            self.composer = ""
+
+        def get_history(self, *a, **k):
+            return self.screen
+
+        def supports_event_inbox(self):
+            return False
+
+    @staticmethod
+    def _make_provider(cls):
+        import inspect
+
+        params = list(inspect.signature(cls.__init__).parameters.values())[1:]
+        args = ["term-1", "s", "w"]
+        for extra in params[3:]:
+            if extra.default is inspect.Parameter.empty and extra.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.POSITIONAL_ONLY,
+            ):
+                args.append("developer")
+        return cls(*args)
+
+    def _deliver(self, provider, provider_type, screen, caplog=None):
+        import sys
+
+        from cli_agent_orchestrator.services import terminal_service as ts
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+        pane = self._Pane(screen)
+        message = _make_message(message=self.MESSAGE)
+        sm = MagicMock()
+        sm.get_status.return_value = TerminalStatus.IDLE
+        sm.output_generation.return_value = 7
+        sm.probe_execution_evidence.return_value = False
+        # A submit that reaches the agent earns a post-boundary PROCESSING stamp;
+        # until then the receiver reads IDLE at the dispatch generation.
+        sm.status_observation.side_effect = lambda tid: (
+            StatusObservation(TerminalStatus.PROCESSING, 100)
+            if pane.submitted
+            else StatusObservation(TerminalStatus.IDLE, 7)
+        )
+        events = []
+        provider_module = sys.modules[type(provider).__module__]
+        with (
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRM_TIMEOUT", 0.0
+            ),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+                return_value=[message],
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.update_message_status"),
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", sm),
+            patch("cli_agent_orchestrator.services.inbox_service.get_backend", return_value=pane),
+            patch.object(ts, "status_monitor", sm),
+            patch.object(ts, "get_backend", return_value=pane),
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "s", "tmux_window": "w", "provider": provider_type},
+            ),
+            patch.object(ts.provider_manager, "get_provider", return_value=provider),
+            patch.object(ts, "inject_memory_context", side_effect=lambda m, *a: m),
+            patch.object(ts, "update_last_active"),
+            patch.object(ts, "send_special_key", side_effect=lambda tid, key: pane.press_enter()),
+            patch.object(
+                ts,
+                "dispatch_plugin_event",
+                side_effect=lambda reg, name, ev: events.append(name),
+            ),
+            patch.object(provider_module, "get_backend", return_value=pane, create=True),
+        ):
+            InboxService().deliver_pending("term-1", registry=MagicMock())
+        return pane, events
+
+    @pytest.mark.parametrize(
+        "provider_type, fixture",
+        [
+            ("opencode_cli", "opencode_cli_idle_splash.txt"),
+            ("mcode", "minimax_code_idle.txt"),
+        ],
+    )
+    def test_probe_capable_provider_without_a_composer_reader_gets_no_second_paste(
+        self, provider_type, fixture, caplog
+    ):
+        """OpenCode and MiniMax: a probe, no extract_current_composer. The
+        helper used to treat "not started" as "paste dropped" and re-pasted the
+        whole message on top of the first copy."""
+        import logging
+
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+
+        provider = self._make_provider(ProviderManager.provider_class(provider_type))
+        screen = (self.FIXTURES / fixture).read_text()
+        with caplog.at_level(logging.WARNING):
+            pane, events = self._deliver(provider, provider_type, screen)
+
+        assert pane.submitted == [], "nothing may be submitted twice or on top of the first paste"
+        assert pane.composer == self.MESSAGE, "the single paste stays where it was"
+        assert events.count("post_send_message") == 1
+        assert "composer cannot be read" in caplog.text
+
+    @pytest.mark.parametrize("provider_type", [t.value for t in ProviderType])
+    def test_no_provider_receives_an_inbox_message_twice_in_one_prompt(self, provider_type):
+        """The class, enumerated: for every registered provider, a swallowed
+        Enter followed by the recovery never yields two copies of the message
+        in one submission and never fires post_send_message twice."""
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+
+        provider = self._make_provider(ProviderManager.provider_class(provider_type))
+        pane, events = self._deliver(provider, provider_type, "")
+
+        for submitted in pane.submitted:
+            assert submitted.count(self.MESSAGE) <= 1, f"{provider_type} got the message twice"
+        assert pane.composer.count(self.MESSAGE) <= 1, f"{provider_type} composer holds two copies"
+        assert events.count("post_send_message") == 1, f"{provider_type} fired two plugin events"
+
+    def test_opencode_retained_completion_marker_is_not_pickup_evidence(self, caplog):
+        """The previous turn's ``▣ … · Ns`` marker is still on screen. The
+        probe reads COMPLETED, but that completion is not this delivery's."""
+        import logging
+
+        from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
+
+        provider = OpenCodeCliProvider("term-1", "s", "w")
+        screen = (self.FIXTURES / "opencode_cli_completed.txt").read_text()
+        assert provider.get_status(screen) == TerminalStatus.COMPLETED, "fixture precondition"
+        with caplog.at_level(logging.WARNING):
+            pane, events = self._deliver(provider, "opencode_cli", screen)
+
+        assert pane.submitted == []
+        assert pane.composer == self.MESSAGE
+        # Before the fix the probe's COMPLETED ended the recovery as "confirmed"
+        # with no log at all. Now the helper gets past the probe and records
+        # that it could not recover.
+        assert "composer cannot be read" in caplog.text, "a silent false confirmation is the bug"

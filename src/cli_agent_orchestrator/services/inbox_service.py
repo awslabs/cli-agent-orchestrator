@@ -361,15 +361,23 @@ class InboxService:
         step (#562) paths use -- so the three delivery paths share one notion of
         what a dropped send looks like and how to recover from it. The recovery
         is bare Enter when the text is still visible in the receiver's composer
-        (only the Enter was swallowed), a full re-send when it vanished and the
-        provider is probe-capable, and nothing at all otherwise.
+        (only the Enter was swallowed), a full re-send when the provider read
+        its composer and the text is NOT there and the provider is
+        probe-capable, and nothing at all otherwise.
 
-        ``full_resend_requires_probe=True`` on purpose: without a direct status
-        probe there is no way to tell "paste dropped" from "the agent already
-        read it and the prompt scrolled away", and re-pasting an inbox message
-        into a working agent delivers the same instruction twice. For those
-        providers the bare-Enter branch, which cannot duplicate anything, is the
-        only recovery -- see Open questions in the report: for kiro_cli and
+        Both gates are on on purpose. ``full_resend_requires_probe``: without a
+        direct status probe there is no way to tell "paste dropped" from "the
+        agent already read it and the prompt scrolled away", and re-pasting an
+        inbox message into a working agent delivers the same instruction twice.
+        ``full_resend_requires_composer_evidence``: a full re-send pastes into
+        the composer without clearing it, so unless the provider can show the
+        composer does not still hold the first paste, the re-send would join the
+        two copies and submit both (PR #1004 review, P2-3). A provider with
+        neither ``extract_current_composer`` nor a probe therefore gets no
+        recovery at all, only the log line. ``screen_may_show_previous_turn``:
+        an inbox receiver usually still shows its last turn's completion
+        marker, so a probe that cannot tell turns apart must not read that as
+        pickup -- see Open questions in the report: for kiro_cli and
         claude_code even that branch is currently inert because neither
         implements ``extract_current_composer``.
 
@@ -396,6 +404,8 @@ class InboxService:
                         message,
                         attempt,
                         full_resend_requires_probe=True,
+                        full_resend_requires_composer_evidence=True,
+                        screen_may_show_previous_turn=True,
                         registry=registry,
                         sender_id=sender_id,
                         orchestration_type=OrchestrationType.SEND_MESSAGE,

@@ -2908,7 +2908,9 @@ _DEFERRED_STARTED_STATUSES = {
 }
 
 
-def _worker_is_started_direct(terminal_id: str, provider) -> bool:
+def _worker_is_started_direct(
+    terminal_id: str, provider, *, accept_retained_completed: bool = True
+) -> bool:
     """Direct visible-screen status check bypassing the event-driven status cache.
 
     The deferred-init retry loop polls ``status_monitor.get_status()`` which
@@ -2916,6 +2918,15 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
     (pyte screener at rising-edge/quiescence edges). When that lags behind
     reality the cached status stays IDLE even though the worker already
     transitioned to PROCESSING.
+
+    ``accept_retained_completed=False`` is for callers whose receiver may still
+    show an EARLIER turn's completion marker (the inbox path: every receiver
+    has history). A probe that cannot tell which turn completed then counts
+    only live verdicts -- PROCESSING and WAITING_USER_ANSWER -- as started; a
+    provider whose detector binds COMPLETED to the dispatched turn
+    (``direct_status_probe_has_turn_identity``) keeps COMPLETED as evidence.
+    The deferred-init caller keeps the default: a fresh worker has no earlier
+    turn on screen, so its COMPLETED can only be this turn's.
 
     Kimi requires evidence from the rolling byte buffer cleared by send_input
     before dispatch. Capture-pane history can retain a previous completed turn,
@@ -2960,6 +2971,14 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
             exc_info=True,
         )
         return False
+    if (
+        status == TerminalStatus.COMPLETED
+        and not accept_retained_completed
+        and getattr(provider, "direct_status_probe_has_turn_identity", False) is not True
+    ):
+        # The marker on screen may belong to the previous turn; this probe
+        # cannot tell, so it is not evidence that THIS delivery was accepted.
+        return False
     return status in _DEFERRED_STARTED_STATUSES
 
 
@@ -2988,23 +3007,45 @@ def _normalized_box_text(text: str) -> str:
     return "".join(character.casefold() for character in text if character.isalnum())
 
 
-def _message_visible_in_box(terminal_id: str, message: str) -> bool:
-    """True when the current editable composer contains the message text.
+def _message_in_composer(terminal_id: str, message: str) -> Optional[bool]:
+    """Whether the current editable composer contains the message text, if knowable.
 
-    A bare Enter is safe only when the provider extracts the bounded trailing
-    message probe from its current composer. The pane can retain historical
-    deliveries, so cursor-adjacent or transcript text is not an input boundary.
-    A miss takes the safer full-redelivery path.
+    Three answers, and the difference between the last two is load-bearing:
+
+    - ``True``: the provider extracted its live composer and the bounded
+      trailing probe of the message is in it. Only the Enter was swallowed; a
+      bare Enter submits exactly what is there.
+    - ``False``: the composer was extracted and the message is NOT in it. The
+      paste itself was dropped, so a full re-send cannot double anything.
+    - ``None``: the composer cannot be read -- the provider has no
+      ``extract_current_composer``, the capture failed, or the message is too
+      short to probe for. Nothing is known about what a full re-send would land
+      on top of. A caller that must not duplicate (the inbox path) sends nothing
+      in this case; the deferred-init path's ``_message_visible_in_box`` keeps
+      treating it like ``False`` (its worker is fresh, see
+      ``redeliver_dropped_message_with_boundary``).
+
+    The pane can retain historical deliveries, so cursor-adjacent or transcript
+    text is never an input boundary; only the provider's own composer is.
     """
     normalized_message = _normalized_box_text(message)
     probe = normalized_message[-_CURRENT_COMPOSER_PROBE_MAX_CHARS:]
     if len(probe) < 8:
-        return False
+        return None
 
     composer = _capture_current_composer_region(terminal_id)
     if composer is None:
-        return False
+        return None
     return probe in _normalized_box_text(composer)
+
+
+def _message_visible_in_box(terminal_id: str, message: str) -> bool:
+    """True when the current editable composer is known to contain the message.
+
+    Bool view of :func:`_message_in_composer` for callers that only choose
+    between a bare Enter and a full re-send; "unknown" takes the re-send path.
+    """
+    return _message_in_composer(terminal_id, message) is True
 
 
 def redeliver_dropped_message(
@@ -3045,6 +3086,8 @@ def redeliver_dropped_message_with_boundary(
     provider=None,
     *,
     full_resend_requires_probe: bool = False,
+    full_resend_requires_composer_evidence: bool = False,
+    screen_may_show_previous_turn: bool = False,
     registry: "PluginRegistry | None" = None,
     sender_id: Optional[str] = None,
     orchestration_type: Optional[OrchestrationType] = None,
@@ -3082,6 +3125,24 @@ def redeliver_dropped_message_with_boundary(
     reaching here, and that pre-existing behavior is unchanged by this helper's
     extraction.
 
+    ``full_resend_requires_composer_evidence`` closes the other duplicate (PR
+    #1004 review, P2-3): a full re-send pastes INTO the composer without
+    clearing it, so if the first paste is still sitting there (Enter swallowed,
+    not paste dropped) the two copies join and the next Enter submits both --
+    the agent gets the instruction twice in one prompt and plugins see two
+    ``post_send_message`` events for one message. The probe cannot rule that
+    out: it says whether the agent is working, not whether the composer is
+    empty. With this gate on, the full re-send runs only when
+    ``_message_in_composer`` returned ``False`` -- the provider read its own
+    composer and the message is not in it. When the composer cannot be read
+    (``None``: no ``extract_current_composer``) nothing is sent and the drop is
+    logged, exactly as for providers without a probe.
+
+    ``screen_may_show_previous_turn`` tells the direct probe that a COMPLETED on
+    screen may be the receiver's EARLIER turn; see
+    ``_worker_is_started_direct``. The inbox path sets both; the deferred-init
+    path keeps both off (fresh worker, pre-existing behavior unchanged).
+
     The full re-send goes through ``dispatch_input`` with ``redelivery=True``: it
     repeats the dispatch CAO is already waiting on, so the provider must treat
     it as another delivery attempt of the same logical turn rather than as a
@@ -3109,9 +3170,14 @@ def redeliver_dropped_message_with_boundary(
         provider, "supports_direct_status_probe", False
     )
     if probe_capable:
-        if _worker_is_started_direct(terminal_id, provider):
+        if _worker_is_started_direct(
+            terminal_id,
+            provider,
+            accept_retained_completed=not screen_may_show_previous_turn,
+        ):
             return True, None
-    if _message_visible_in_box(terminal_id, message):
+    in_composer = _message_in_composer(terminal_id, message)
+    if in_composer is True:
         logger.warning(
             "Delivery to %s unsubmitted (Enter swallowed); " "re-submitting via Enter (attempt %d)",
             terminal_id,
@@ -3120,6 +3186,17 @@ def redeliver_dropped_message_with_boundary(
         boundary = status_monitor.output_generation(terminal_id)
         send_special_key(terminal_id, "Enter")
         return False, boundary
+    if full_resend_requires_composer_evidence and in_composer is None:
+        # The composer cannot be read, so a full re-send might land on top of
+        # the first paste and submit the instruction twice. Send nothing; the
+        # caller's own deadline classifies the outcome.
+        logger.warning(
+            "Delivery to %s not accepted and its composer cannot be read; "
+            "skipping full re-send to avoid a duplicate task (attempt %d)",
+            terminal_id,
+            attempt,
+        )
+        return False, None
     if getattr(provider, "execution_evidence_ambiguous", False) is True:
         logger.warning(
             "Delivery to %s is unconfirmed after execution context was evicted; "
