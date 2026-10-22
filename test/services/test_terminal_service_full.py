@@ -6081,3 +6081,83 @@ class TestInitialDeliveryIsDurable:
         payload = upd.call_args.args[1]
         assert payload == {"state": "failed", "kind": "k", "message": "m"}
         assert upd.call_args.kwargs == {"only_if_pending": True}
+
+
+class TestDispatchLatchDeclaredOnAProvider:
+    """``assume_processing_on_dispatch`` declared on a provider, end to end.
+
+    No shipped provider sets the flag, so the ``is True`` branch in
+    ``dispatch_input`` was reachable only by calling the monitor directly, and
+    that call is what every earlier test did (review of PR #998). Here a
+    provider class declares it, ``dispatch_input`` reads it and arms the REAL
+    monitor, and the turn's chunks then go through ``_process_chunk``: the
+    optimistic latch is PROCESSING without a stamp, the mid-burst probe still
+    runs (#814), and once it has seen the spinner it stops.
+    """
+
+    class _LatchingCodex(CodexProvider):
+        assume_processing_on_dispatch = True
+
+    @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_declared_flag_reaches_the_monitor_and_the_probe_still_runs(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        mock_update,
+        mock_memory_service,
+        mock_sm_pm,
+        mock_settings,
+    ):
+        from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+        from cli_agent_orchestrator.services.terminal_service import dispatch_input
+
+        mock_memory_service.return_value.get_curated_memory_context.return_value = ""
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_tmux.supports_event_inbox.return_value = False
+        mock_tmux.get_native_status.return_value = None  # tmux: no native status
+        mock_settings.return_value = {"state_buffer_max": 32768}
+        provider = self._LatchingCodex(
+            terminal_id="t1", session_name="cao-session", window_name="developer-abcd"
+        )
+        assert provider.assume_processing_on_dispatch is True
+        provider.probe_processing_from_screen = MagicMock(
+            wraps=provider.probe_processing_from_screen
+        )
+        mock_pm.get_provider.return_value = provider
+        mock_sm_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        sm._loop = MagicMock()  # edge-debounced path, as in production
+        sm._arm_quiesce_timer = lambda *a, **k: None
+        sm._cancel_quiesce_handle = lambda *a, **k: None
+        sm._detect_screen = lambda tid, prov: TerminalStatus.UNKNOWN  # torn rising edge
+        sm._last_status["t1"] = TerminalStatus.COMPLETED  # the previous turn
+
+        with patch("cli_agent_orchestrator.services.terminal_service.status_monitor", sm):
+            dispatch_input("t1", "next task")
+
+        # The declared flag took the ``is True`` branch: PROCESSING is published
+        # at the send, as an optimistic latch with no evidence stamp.
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+        assert "t1" not in sm._processing_generation
+        assert sm._dispatch_generation["t1"] == sm._capture_generation["t1"]
+
+        sm._process_chunk("t1", "\x1b[H(torn frame)")  # rising edge: no evidence
+        assert provider.probe_processing_from_screen.call_count == 0
+        sm._process_chunk("t1", "\x1b[2J\x1b[H› next task\r\n• Working (1s • esc to interrupt)")
+        assert provider.probe_processing_from_screen.call_count == 1  # #814: probed
+        assert sm._processing_generation["t1"] > sm._dispatch_generation["t1"]
+        sm._midburst_probe_at.pop("t1")  # > PYTE_MIDBURST_PROBE_S later
+        sm._process_chunk("t1", "\x1b[H• Working (2s • esc to interrupt)")
+        assert provider.probe_processing_from_screen.call_count == 1  # observed: skip
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
