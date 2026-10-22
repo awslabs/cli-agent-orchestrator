@@ -221,7 +221,7 @@ memory_recall(
   memory_type=None,        # optional, filter by type
   limit=10,                # optional, default 10, max 100
   search_mode="hybrid",    # optional: "hybrid" (default), "bm25", "metadata"
-  sort_by="recency",       # optional: "recency" (default), "score", "usage"
+  sort_by="recency",       # optional: "recency" (default), "score", "usage", "relevance"
   include_related=False    # optional, expand cross-referenced memories
 )
 ```
@@ -229,6 +229,33 @@ memory_recall(
 `sort_by` controls ranking: `recency` (newest first), `score` (composite 3-factor —
 BM25 relevance + recency + usage), or `usage` (most accessed). When no `scope` is
 given, results follow scope precedence: `session` > `project` > `global`.
+
+`relevance` is opt-in and needs a query; omitted, empty and whitespace-only
+queries follow the exact `recency` path. Other sort modes keep their existing
+query handling. Hybrid relevance uses the existing widened pool; metadata and
+BM25 relevance widen their single source too. Each source considers
+`max(limit, min(200, max(50, 3 * limit)))` rows. Partial BM25 matches fill only
+slots left by all-term matches, and all-term matches rank first.
+
+Within each tier, rank is normalized BM25 times an age factor. Only native
+project memories get `0.85 + 0.15 / (1 + days_old / 30)`; every vault row and
+all other scopes are time-neutral. Future dates clamp to age zero; naive dates
+mean UTC. An exact match aged 365 days has factor about 0.861, so a fresh match
+with lexical strength 0.862 can beat it. These constants need rollout validation.
+Ties use lexical strength and full identity, with no timestamp tie-break.
+When a nonempty batch normalizes to all zeros (including batches with only
+nonpositive raw BM25 scores), relevance falls back to full identity order
+within each tier. Scope precedence and supersedes demotion still apply; an
+age factor multiplied by zero has no effect. Explain reports this condition
+as `lexical_degenerate`; ranking is unchanged.
+Scope precedence still dominates when no scope is specified. Only returned
+primary rows increment access; related expansion remains unchanged.
+
+Active supersedes targets are always demoted in `score` and `relevance`, using
+the existing same-scope relationship predicate. `memory.lifecycle.enabled`
+does not undo this lexical-mode demotion. Explicit recall does not
+exclude superseded memories. Default recall and injection are unchanged.
+An older remote memory owner may reject the new sort value; upgrade both nodes.
 
 ### `memory_forget`
 
@@ -246,6 +273,161 @@ memory_forget(
 )
 ```
 
+### Injection eligibility sources
+
+The in-tree `services.memory_eligibility` registry provides batch lifecycle
+verdicts keyed by `(key, scope, scope_id, source_kind)`. Each enabled source is
+queried once per new candidate batch; identities are memoized only within the
+current injection build or curator recall. There is no cross-call cache or
+automatic discovery of external sources. The built-in `lifecycle.supersedes` source is disabled by default.
+
+Native entries, vault candidates and related targets are checked before their
+caps; vault exclusions happen before body loading. The same check also covers
+curator metadata, BM25, widened pools and related expansion. Candidate verdicts
+are evaluated lazily in chunks, so no exclusions means one primary chunk of
+10 per populated injection scope. Empty scopes require no verdict batch.
+Related targets use a separate bounded batch when needed. The BM25 corpus
+remains unfiltered so exclusions cannot change IDF.
+
+Explicit operator/agent recall never excludes through this seam. Curator
+recall is an injection path: it is recognized by the resolved policy or the
+`memory_manager` requester profile (including distributed calls). Its requester
+is the curator, not the worker it serves. Sources requiring worker identity
+must fail open on `curated_recall` rather than trust task text as identity.
+
+A source exception or invalid reason token fails open only that source's
+batch. Other sources still apply. Warnings report source, purpose and count;
+injection exclusion summaries report scope, count and source names, without
+keys or content. **Eligibility is lifecycle, not confidentiality:** vault
+binding policy and provider redaction retain their separate fail-closed gates.
+
+### Supersedes lifecycle (opt-in)
+
+Enable with `cao config set memory.lifecycle.enabled true` or
+`CAO_MEMORY_LIFECYCLE_ENABLED=true` (environment > nested file value > default
+false). Invalid nested lifecycle objects or non-boolean file values warn and
+leave it disabled; read errors also leave it disabled. The built-in source
+excludes targets of active same-scope `supersedes` edges from all four injection
+paths. Proposals, rejected and deleted edges do not exclude. Store failures
+fail open and appear in the source warnings and explain diagnostics. There is
+no cross-call cache: edge changes apply on the next call.
+
+Once lifecycle is enabled, any active `supersedes` edge removes its same-scope
+target from every agent's injection, including curator recall. Such an edge
+can be created through write/admin-scoped `POST /memory/relationships`, by
+`cao memory relationships promote`, or in a vault note's `cao.links` (reconcile
+marks links active by default when status is omitted). API authentication is
+off by default. These writers therefore also control injection suppression;
+the lifecycle flag adds no new authorization boundary.
+
+Lifecycle changes do not retract provider memory blocks already persisted
+in `<cwd>/.claude/CLAUDE.md`, `<cwd>/AGENTS.md` or Kiro's
+`<cwd>/.kiro/steering/cao-memory.md`. Claude Code, Codex and Kiro memory
+handlers refresh only their own provider's file when a terminal of that
+provider is created in that cwd: `claude_code` writes `.claude/CLAUDE.md`,
+`codex` writes `AGENTS.md`, and `kiro_cli` writes `.kiro/steering/cao-memory.md`.
+Retrieval must return a nonempty block and the write must succeed. Empty
+retrieval, fetch failures or write failures leave the previous block in place.
+Kiro owns its steering file and replaces the whole file; Claude Code and Codex
+replace only their delimited blocks. Kiro also validates the cwd and target
+before writing; missing cwd or failed validation leaves its old file intact.
+Frozen workflow replays continue using the recorded memory block without
+rechecking lifecycle; another terminal creation does not invalidate that
+snapshot. A fresh workflow run resolves current memory.
+
+Explicit recall retains superseded memories. With lifecycle enabled, recency
+moves them last without changing membership; usage demotes them before the
+stable scope pass and slice. Score/relevance keep their existing always-on
+demotion; the flag adds annotation only in those modes. A transient
+`lifecycle_status="superseded"` is excluded from `model_dump` and every canonical
+writer. MCP and the internal recall route include it only when set, preserving
+gateway round trips. CLI show displays a status line and list appends a marker
+only when labelled. Related extras are annotated but remain in expansion order.
+
+Disabling this flag restores default injection and recency/usage behavior;
+it does **not** undo score/relevance demotion. Supersedes cycles exclude both
+ends, and a persistent curator can still restate guidance recalled earlier.
+The diagnostic includes `lifecycle_enabled` to identify the active flag state.
+
+### Non-accessing operator inspection (opt-in)
+
+`cao config set memory.non_accessing_inspection true` or
+`CAO_MEMORY_NON_ACCESSING_INSPECTION=true` makes CLI list/show and HTTP
+`GET /memory`, `GET /memory/{key}` pass `record_access=False`. Environment
+beats file; the default and read-error fallback are false. Results and related
+expansion are unchanged, but these operator views no longer increase
+`access_count` or `last_accessed_at`. Agent feedback lessons therefore cannot
+become promotion-eligible merely from repeated operator inspection.
+
+MCP `memory_recall` and `/internal/memory/recall` retain the default
+`record_access=True` regardless of this switch. CLI clear and HTTP DELETE are
+outside its scope. Disabling it restores existing operator access counting.
+The service's keyword-only `record_access` parameter defaults to true; explain
+continues to avoid access bookkeeping independently of this flag.
+
+### On-demand relevance explain
+
+`cao memory list --query Q --explain` compares default recency recall with
+relevance recall through their shared pool and ordering functions. It never
+increments access counts or expands related memories. Nothing is scored
+passively on ordinary recall calls. `--scope`, `--type` and `--all` retain their
+usual scope meaning. Explain's `--limit` defaults to 10 and accepts 1–100;
+`--format` is `table` (default) or `json`. Ordinary list output is unchanged.
+A bare `--query` or bare `--explain` is a usage error (exit 2). Explicit
+`--limit` or `--format` without `--explain` is also a usage error, including
+values equal to their defaults. Service errors report only the exception
+type and an actionable hint. Set `CAO_LOG_LEVEL=DEBUG` and re-run explain to
+print the exception detail on stderr; normal stdout/stderr omit that detail.
+This opt-in diagnostic does not install a global CLI logging handler.
+
+JSON schema `cao.memory.explain/1` reports pool and all-term/partial counts,
+the fixed recency constants, overlap at the limit, and at most twice the limit
+in candidates: the union of the relevance and default top sets. Candidate
+fields are `key`, `scope`, `scope_id`, `source_kind`, `tier`, `lexical`,
+`recency_factor`, `relevance`, `relevance_rank`, `recency_rank`, `recovered`,
+and `superseded`, plus `injection` (`eligible`/`excluded`/`unknown`) and
+`exclusion_reasons` (ordered reason tokens). Top-level `eligibility_errors`
+lists sources that failed open. Top-level `lexical_degenerate` is true when
+a nonempty relevance pool has only zero normalized lexical values; an empty
+pool reports false. The table includes the same boolean in its footer.
+Injection verdicts describe this lifecycle seam only; confidentiality and
+budget gates still apply. Ranks are 1-based; relevance rank covers the entire
+pool, default rank covers only the default top set. A missing rank is JSON null.
+`recovered` means relevance selected a row the default top set omitted.
+Scores use the exact ordering values, rounded to four decimal places.
+Explain resolves supersedes state once over both pools and uses that same
+snapshot for ordering, labels and the built-in injection verdict. A failed
+group read adds `lifecycle.supersedes` to the errors and emits the same
+content-free failed-open warning as injection. The healthy partial snapshot
+is used for ordering, labels and injection verdicts without another read.
+With lifecycle enabled, only rows in failed scope groups report injection
+`unknown` unless another source already excludes them. Known exclusions take
+precedence; healthy groups keep their actual eligible/excluded verdicts.
+With lifecycle off, the failure warning uses purpose `relevance_demotion`;
+injection does not consult the disabled built-in source.
+A late curator ordering-snapshot failure reaches its check errors and warning
+without disabling the independent related-target batch, which can read again.
+Lifecycle recall similarly shares one ordering/label snapshot, including potential
+related targets discovered before ordering; their bodies still load only
+after the primary slice. These snapshots never survive the call.
+Relevance clamps negative normalized BM25 values to zero; the existing
+normalizer and frozen `score` behavior remain unchanged.
+A default-only row outside the relevance pool has no relevance rank and has
+zero lexical/relevance values. Overlap is intersection size divided by the
+larger top-set size; it is null when both sets are empty.
+
+Content, tags, paths, absolute timestamps, access counts and raw BM25 scores
+are omitted. The operator's query is echoed. Vault reads can still produce
+resolution warnings and increment the operational `recall_body_truncated`
+counter. This diagnostic leaves stored access state unchanged but does not
+promise zero vault observability effects.
+
+Disable it with `cao config set memory.explain_enabled false` or
+`CAO_MEMORY_EXPLAIN_ENABLED=false` (environment > file > default true).
+Disabled explain exits 1 and names `memory.explain_enabled`; a disabled memory
+subsystem exits 1 and names `memory.enabled`. An empty pool remains a successful
+diagnostic. This switch does not gate opt-in `sort_by="relevance"`.
+
 ## CLI Commands
 
 ```bash
@@ -254,6 +436,10 @@ cao memory list
 cao memory list --all              # all projects
 cao memory list --scope global
 cao memory list --type feedback
+
+# Compare default/relevance top results without recording access
+cao memory list --query "kafka streams" --explain
+cao memory list --query "kafka streams" --explain --limit 10 --format json
 
 # Show full content of a memory
 cao memory show <key>

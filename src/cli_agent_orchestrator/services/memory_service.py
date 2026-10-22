@@ -12,8 +12,20 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Sequence, Set, TypeVar, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterable,
+    Literal,
+    Optional,
+    Sequence,
+    Set,
+    TypeVar,
+    cast,
+)
 
 from cli_agent_orchestrator.constants import (
     MEMORY_BASE_DIR,
@@ -21,6 +33,7 @@ from cli_agent_orchestrator.constants import (
     MEMORY_SCOPE_BUDGET_CHARS,
 )
 from cli_agent_orchestrator.models.memory import Memory, MemoryScope, MemoryType
+from cli_agent_orchestrator.services import memory_eligibility
 from cli_agent_orchestrator.services.memory_archive.base import ExportReport, ImportReport
 from cli_agent_orchestrator.services.memory_format import (
     normalize_memory_tags,
@@ -57,6 +70,25 @@ VALID_SEARCH_MODES = ("metadata", "bm25", "hybrid")
 HYBRID_CANDIDATE_MIN = 50
 HYBRID_CANDIDATE_MULTIPLIER = 3
 HYBRID_CANDIDATE_MAX = 200
+
+
+@dataclass
+class RecallPool:
+    """Selected rows and the all-term tier from the same search snapshot."""
+
+    rows: list[Memory]
+    all_term_identities: set[tuple]
+    effective_sort: str
+
+
+@dataclass(frozen=True)
+class RelevanceScore:
+    """Content-free, per-call values used by ordering and explain."""
+
+    tier: int
+    lexical: float
+    recency_factor: float
+    relevance: float
 
 
 def _matches_all_terms(query: str, content: str) -> bool:
@@ -2080,6 +2112,36 @@ class MemoryService:
                 out.add((g_scope, g_scope_id, k))
         return out
 
+    def _superseded_keys_with_status(
+        self, memories: list[Memory]
+    ) -> tuple[set, set[tuple[str, Optional[str]]]]:
+        """Return the healthy snapshot and failed groups; the frozen reader is unchanged."""
+        groups: dict[tuple[str, Optional[str]], list[str]] = {}
+        for memory in memories:
+            groups.setdefault((memory.scope, self._effective_scope_id(memory)), []).append(
+                memory.key
+            )
+        if not groups:
+            return set(), set()
+        try:
+            from cli_agent_orchestrator.services.memory_relationship_service import (
+                MemoryRelationshipService,
+            )
+
+            service = MemoryRelationshipService()
+        except Exception:
+            return set(), set(groups)
+        snapshot: set = set()
+        failed: set[tuple[str, Optional[str]]] = set()
+        for (scope, scope_id), keys in groups.items():
+            try:
+                targets = service.superseded_targets(scope, scope_id, keys)
+            except Exception:
+                failed.add((scope, scope_id))
+                continue
+            snapshot.update((scope, scope_id, key) for key in targets)
+        return snapshot, failed
+
     def _is_superseded(self, m, superseded: set) -> bool:
         """The demotion predicate recall's sort key applies to ONE memory.
 
@@ -2094,24 +2156,8 @@ class MemoryService:
         """
         return (m.scope, self._effective_scope_id(m), m.key) in superseded
 
-    def _expand_related(
-        self,
-        primaries: list,
-        *,
-        terminal_id: Optional[str] = None,
-        policy: Optional[VaultInjectionPolicy] = None,
-    ) -> list:
-        """One-level cross-reference traversal for ``recall(include_related=True)``.
-
-        Appended AFTER the limit slice — the caller asked for related, we
-        deliver in addition. ``visited`` is seeded with primary keys for
-        cycle/dedup prevention. Depth = 1; no recursion. NOT subject to
-        ``RELATED_FANOUT_CAP`` (the per-primary parse cap of 3 suffices).
-        """
-        if not primaries:
-            return primaries
-        visited: set = {m.key for m in primaries}
-        extras: list = []
+    def _related_target_plan(self, primaries: list) -> list[tuple[Memory, list[str]]]:
+        """Resolve typed/legacy targets in batches, without loading their bodies."""
         # One-level expansion follows ACTIVE relates_to edges from the
         # relationship STORE (issue #511, FR-4.2 — the store is authoritative for
         # typed edges: only active relates_to is traversed; proposal/rejected/
@@ -2164,7 +2210,7 @@ class MemoryService:
                 logger.debug(f"active_targets_for failed for {g_scope}: {e}")
                 store_lookups[(g_scope, g_scope_id)] = {}
 
-        for primary in primaries:
+        def targets_for(primary):
             primary_scope_id = self._effective_scope_id(primary)
             # Absent from the map == the store has no active edges for this
             # primary, which is exactly the condition the legacy fallback below
@@ -2177,8 +2223,61 @@ class MemoryService:
             if not targets:
                 raw = legacy_lookups.get((primary.scope, primary_scope_id), {}).get(primary.key)
                 targets = self._parse_related_keys(raw, scope=primary.scope)
+            return targets
+
+        return [(primary, targets_for(primary)) for primary in primaries]
+
+    def _expand_related(
+        self,
+        primaries: list,
+        *,
+        terminal_id: Optional[str] = None,
+        policy: Optional[VaultInjectionPolicy] = None,
+        eligibility: Optional[memory_eligibility.EligibilityCheck] = None,
+        target_plan: Optional[list[tuple[Memory, list[str]]]] = None,
+    ) -> list:
+        """One-level cross-reference traversal for ``recall(include_related=True)``.
+
+        Appended AFTER the limit slice — the caller asked for related, we
+        deliver in addition. ``visited`` is seeded with primary keys for
+        cycle/dedup prevention. Depth = 1; no recursion. NOT subject to
+        ``RELATED_FANOUT_CAP`` (the per-primary parse cap of 3 suffices).
+        """
+        if not primaries:
+            return primaries
+        visited: set = {m.key for m in primaries}
+        extras: list = []
+        if target_plan is None:
+            target_plan = self._related_target_plan(primaries)
+        targets_by_identity = {self._identity(primary): targets for primary, targets in target_plan}
+
+        def targets_for(primary):
+            return targets_by_identity.get(self._identity(primary), [])
+
+        related_reasons = {}
+        if eligibility is not None:
+            identities = [
+                memory_eligibility.MemoryIdentity(
+                    rk, primary.scope, self._effective_scope_id(primary), primary.source_kind
+                )
+                for primary in primaries
+                for rk in targets_for(primary)
+            ]
+            if identities:
+                related_reasons = eligibility.reasons(identities)
+        for primary in primaries:
+            primary_scope_id = self._effective_scope_id(primary)
+            targets = targets_for(primary)
             for rk in targets:
                 if rk in visited:
+                    continue
+                if (
+                    eligibility is not None
+                    and memory_eligibility.MemoryIdentity(
+                        rk, primary.scope, primary_scope_id, primary.source_kind
+                    )
+                    in related_reasons
+                ):
                     continue
                 visited.add(rk)
                 if getattr(primary, "source_kind", "native") == "vault":
@@ -2378,6 +2477,8 @@ class MemoryService:
         search_mode: str = "hybrid",
         sort_by: str = "recency",
         include_related: bool = False,
+        *,
+        record_access: bool = True,
     ) -> list[Memory]:
         """Recall memories matching query and filters.
 
@@ -2393,6 +2494,10 @@ class MemoryService:
             DEFAULT — byte-identical to the pre-scoring behaviour.
           - ``score``: composite 3-factor (BM25 + recency + usage).
           - ``usage``: most-accessed first.
+          - ``relevance``: all-term tier, lexical relevance, bounded project-native age.
+            With no query, behaves exactly as recency.
+
+        ``record_access``: False skips reinforcement bookkeeping (operator inspection).
 
         ``include_related``: when True, each result's
         ``related_keys`` cross-references are loaded (one level, same scope)
@@ -2415,6 +2520,8 @@ class MemoryService:
         from cli_agent_orchestrator.services.memory_scoring import validate_sort_by
 
         validate_sort_by(sort_by)
+        if sort_by == "relevance" and (not query or not query.strip()):
+            sort_by = "recency"
         terminal_id = (terminal_context or {}).get("terminal_id")
         recall_policy = _resolve_injection_policy(
             False,
@@ -2422,145 +2529,95 @@ class MemoryService:
             terminal_id=terminal_id,
         )
 
-        if search_mode == "bm25":
-            if not query:
-                return []
-            scope_id = self._bm25_scope_id(scope, terminal_context)
-            bm25_only = self._bm25_search(
-                query=query,
-                scope=scope,
-                scope_id=scope_id,
-                memory_type=memory_type,
-                limit=limit,
-                exclude_keys=set(),
-                terminal_context=terminal_context,
-                scan_all=scan_all,
-                policy=recall_policy,
-            )
-            return self._apply_sort_and_increment(
-                bm25_only,
-                scope,
-                sort_by,
-                limit,
-                include_related=include_related,
-                query=query,
-                terminal_context=terminal_context,
-                scan_all=scan_all,
-                policy=recall_policy,
-            )
+        from cli_agent_orchestrator.services.settings_service import is_memory_lifecycle_enabled
 
-        widen_candidates = search_mode == "hybrid" and bool(query) and sort_by in {"score", "usage"}
-        candidate_limit = (
-            max(
-                limit,
-                min(
-                    HYBRID_CANDIDATE_MAX,
-                    max(HYBRID_CANDIDATE_MIN, HYBRID_CANDIDATE_MULTIPLIER * limit),
-                ),
-            )
-            if widen_candidates
-            else limit
-        )
-
-        metadata_results = await self._metadata_recall(
-            query=query,
-            scope=scope,
-            memory_type=memory_type,
-            limit=candidate_limit,
-            terminal_context=terminal_context,
-            scan_all=scan_all,
-            policy=recall_policy,
-        )
-
-        if search_mode == "metadata" or not query:
-            return self._apply_sort_and_increment(
-                metadata_results,
-                scope,
-                sort_by,
-                limit,
-                include_related=include_related,
-                query=query,
-                terminal_context=terminal_context,
-                scan_all=scan_all,
-                policy=recall_policy,
-            )
-
-        if widen_candidates:
-            by_identity: dict[tuple, Memory] = {}
-            for memory in metadata_results:
-                by_identity.setdefault(self._identity(memory), memory)
-            # An untruncated metadata scan is a census of index-listed rows.
-            # Check possible truncation or a shortfall after identity deduplication.
-            if len(metadata_results) == candidate_limit or len(by_identity) < limit:
-                all_term_identities: set[tuple] = set()
-                bm25_results = self._bm25_search(
-                    query=query,
-                    scope=scope,
-                    scope_id=self._bm25_scope_id(scope, terminal_context),
-                    memory_type=memory_type,
-                    limit=candidate_limit,
-                    exclude_keys=set(),
-                    terminal_context=terminal_context,
-                    scan_all=scan_all,
-                    policy=recall_policy,
-                    all_terms_first=True,
-                    all_term_identities=all_term_identities,
+        lifecycle_on = is_memory_lifecycle_enabled()
+        check = None
+        if (
+            recall_policy.is_curator
+            or (terminal_context or {}).get("agent_profile") == MEMORY_MANAGER_PROFILE
+        ):
+            check = memory_eligibility.begin_check(
+                memory_eligibility.EligibilityRequest.from_context(
+                    "curated_recall", terminal_context
                 )
-                partial_results = []
-                for memory in bm25_results:
-                    if self._identity(memory) in all_term_identities:
-                        by_identity.setdefault(self._identity(memory), memory)
-                    else:
-                        partial_results.append(memory)
-                if len(by_identity) < limit:
-                    for memory in partial_results:
-                        by_identity.setdefault(self._identity(memory), memory)
-                        if len(by_identity) >= limit:
-                            break
-            return self._apply_sort_and_increment(
-                list(by_identity.values()),
-                scope,
-                sort_by,
-                limit,
-                include_related=include_related,
-                query=query,
-                terminal_context=terminal_context,
-                scan_all=scan_all,
-                policy=recall_policy,
             )
+        eligibility_kwargs: dict[str, Any] = {"eligibility": check} if check is not None else {}
 
-        # hybrid: top up with BM25 hits not already in metadata results
-        exclude_keys = {m.key for m in metadata_results}
-        remaining = max(0, limit - len(metadata_results))
-        if remaining == 0:
-            return self._apply_sort_and_increment(
-                metadata_results,
-                scope,
-                sort_by,
-                limit,
-                include_related=include_related,
-                query=query,
-                terminal_context=terminal_context,
-                scan_all=scan_all,
-                policy=recall_policy,
-            )
+        if search_mode == "bm25" and not query:
+            return []
 
-        scope_id = self._bm25_scope_id(scope, terminal_context)
-        bm25_results = self._bm25_search(
-            query=query,
-            scope=scope,
-            scope_id=scope_id,
-            memory_type=memory_type,
-            limit=remaining,
-            exclude_keys=exclude_keys,
-            terminal_context=terminal_context,
-            scan_all=scan_all,
-            policy=recall_policy,
-        )
-        return self._apply_sort_and_increment(
-            metadata_results + bm25_results,
+        pool = await self._recall_pool(
+            query,
             scope,
+            memory_type,
+            limit,
+            terminal_context,
+            scan_all,
+            search_mode,
             sort_by,
+            recall_policy,
+            **eligibility_kwargs,
+        )
+        superseded_snapshot = None
+        target_plan = None
+        if (
+            lifecycle_on
+            or pool.effective_sort == "relevance"
+            or (pool.effective_sort == "score" and (check is not None or not record_access))
+        ):
+            snapshot_rows = list(pool.rows)
+            if lifecycle_on and include_related:
+                target_plan = self._related_target_plan(pool.rows)
+                snapshot_rows.extend(
+                    primary.model_copy(
+                        update={"key": key, "scope_id": self._effective_scope_id(primary)}
+                    )
+                    for primary, targets in target_plan
+                    for key in targets
+                )
+            if check is not None:
+                superseded_snapshot, failed = self._superseded_keys_with_status(snapshot_rows)
+                if failed:
+                    check.report_source_failure("lifecycle.supersedes", len(snapshot_rows))
+            else:
+                superseded_snapshot = self._superseded_keys(snapshot_rows)
+        if (
+            pool.effective_sort == "relevance"
+            or check is not None
+            or lifecycle_on
+            or not record_access
+        ):
+            ordered = self._order_candidates(
+                pool.rows,
+                scope,
+                pool.effective_sort,
+                query=query,
+                terminal_context=terminal_context,
+                scan_all=scan_all,
+                policy=recall_policy,
+                all_term_identities=pool.all_term_identities,
+                now=datetime.now(timezone.utc),
+                lifecycle_on=lifecycle_on,
+                superseded_snapshot=superseded_snapshot,
+            )
+            return self._finish_recall(
+                ordered,
+                scope,
+                limit,
+                include_related=include_related,
+                terminal_context=terminal_context,
+                policy=recall_policy,
+                **eligibility_kwargs,
+                lifecycle_on=lifecycle_on,
+                record_access=record_access,
+                superseded_snapshot=superseded_snapshot,
+                target_plan=target_plan,
+            )
+        return self._apply_sort_and_increment(
+            pool.rows,
+            scope,
+            pool.effective_sort,
             limit,
             include_related=include_related,
             query=query,
@@ -2568,6 +2625,356 @@ class MemoryService:
             scan_all=scan_all,
             policy=recall_policy,
         )
+
+    async def recall_explain(
+        self,
+        query: str,
+        scope: Optional[str] = None,
+        memory_type: Optional[str] = None,
+        limit: int = 10,
+        terminal_context: Optional[dict] = None,
+        scan_all: bool = False,
+    ) -> Optional[dict]:
+        """Compare default/relevance recall on demand, without access or expansion.
+
+        Vault loading can still emit resolution warnings and truncation counters.
+        Only the union of the two top-limit sets is reported, without memory text.
+        """
+        from cli_agent_orchestrator.services.memory_scoring import (
+            RELEVANCE_RECENCY_FLOOR,
+            RELEVANCE_RECENCY_SCALE_DAYS,
+            relevance_recency_factor,
+        )
+        from cli_agent_orchestrator.services.settings_service import is_memory_explain_enabled
+
+        if not _is_memory_enabled() or not is_memory_explain_enabled():
+            return None
+        if not query or not query.strip():
+            raise ValueError("recall_explain requires a nonempty query")
+        if not 1 <= limit <= 100:
+            raise ValueError("recall_explain limit must be between 1 and 100")
+        policy = _resolve_injection_policy(
+            False,
+            consumer="explicit_recall",
+            terminal_id=(terminal_context or {}).get("terminal_id"),
+        )
+        from cli_agent_orchestrator.services.settings_service import is_memory_lifecycle_enabled
+
+        lifecycle_on = is_memory_lifecycle_enabled()
+        now = datetime.now(timezone.utc)
+        default_pool = await self._recall_pool(
+            query,
+            scope,
+            memory_type,
+            limit,
+            terminal_context,
+            scan_all,
+            "hybrid",
+            "recency",
+            policy,
+        )
+        relevance_pool = await self._recall_pool(
+            query,
+            scope,
+            memory_type,
+            limit,
+            terminal_context,
+            scan_all,
+            "hybrid",
+            "relevance",
+            policy,
+        )
+        snapshot_rows = {self._identity(memory): memory for memory in relevance_pool.rows}
+        for memory in default_pool.rows:
+            snapshot_rows.setdefault(self._identity(memory), memory)
+        superseded, superseded_failed = self._superseded_keys_with_status(
+            list(snapshot_rows.values())
+        )
+        default_rows = self._order_candidates(
+            default_pool.rows,
+            scope,
+            "recency",
+            query=query,
+            terminal_context=terminal_context,
+            scan_all=scan_all,
+            policy=policy,
+            now=now,
+            lifecycle_on=lifecycle_on,
+            superseded_snapshot=superseded,
+        )[:limit]
+        scores: dict[tuple, RelevanceScore] = {}
+        relevance_rows = self._order_candidates(
+            relevance_pool.rows,
+            scope,
+            "relevance",
+            query=query,
+            terminal_context=terminal_context,
+            scan_all=scan_all,
+            policy=policy,
+            now=now,
+            lifecycle_on=lifecycle_on,
+            all_term_identities=relevance_pool.all_term_identities,
+            relevance_scores=scores,
+            superseded_snapshot=superseded,
+        )
+        relevance_ranks = {self._identity(m): i for i, m in enumerate(relevance_rows, 1)}
+        default_ranks = {self._identity(m): i for i, m in enumerate(default_rows, 1)}
+        top_relevance = {self._identity(m) for m in relevance_rows[:limit]}
+        union = {self._identity(m): m for m in relevance_rows[:limit]}
+        for memory in default_rows:
+            union.setdefault(self._identity(memory), memory)
+        request = memory_eligibility.EligibilityRequest.from_context(
+            "injected_context", terminal_context
+        )
+        check = memory_eligibility.begin_check(request)
+        if superseded_failed:
+            if check is None:
+                check = memory_eligibility.EligibilityCheck(request, [])
+            check.report_source_failure(
+                "lifecycle.supersedes",
+                len(snapshot_rows),
+                purpose=None if lifecycle_on else "relevance_demotion",
+            )
+        verdicts: dict[tuple, tuple[str, ...]] = {}
+        if check is not None:
+            check.use_superseded_snapshot(superseded, failed_groups=superseded_failed)
+            verdicts = {
+                tuple(identity): reasons
+                for identity, reasons in check.reasons(
+                    [memory_eligibility.MemoryIdentity(*identity) for identity in union]
+                ).items()
+            }
+        candidates = []
+        for identity, memory in union.items():
+            score = scores.get(identity)
+            if score is None:
+                # A default-only row has no lexical value in the relevance pool.
+                factor = (
+                    relevance_recency_factor(memory.updated_at, now=now)
+                    if memory.scope == "project" and memory.source_kind == "native"
+                    else 1.0
+                )
+                score = RelevanceScore(1, 0.0, factor, 0.0)
+            rank = relevance_ranks.get(identity)
+            default_rank = default_ranks.get(identity)
+            candidates.append(
+                {
+                    "key": memory.key,
+                    "scope": memory.scope,
+                    "scope_id": identity[2],
+                    "source_kind": memory.source_kind,
+                    "tier": "all_terms" if score.tier == 0 else "partial",
+                    "lexical": round(score.lexical, 4),
+                    "recency_factor": round(score.recency_factor, 4),
+                    "relevance": round(score.relevance, 4),
+                    "relevance_rank": rank,
+                    "recency_rank": default_rank,
+                    "recovered": rank is not None and rank <= limit and default_rank is None,
+                    "superseded": self._is_superseded(memory, superseded),
+                    "injection": (
+                        "excluded"
+                        if identity in verdicts
+                        else (
+                            "unknown"
+                            if lifecycle_on and (identity[1], identity[2]) in superseded_failed
+                            else "eligible"
+                        )
+                    ),
+                    "exclusion_reasons": list(verdicts.get(identity, ())),
+                }
+            )
+        candidates.sort(
+            key=lambda c: (
+                c["relevance_rank"] if c["relevance_rank"] is not None else float("inf"),
+                c["recency_rank"] if c["recency_rank"] is not None else float("inf"),
+            )
+        )
+        denominator = max(len(top_relevance), len(default_ranks))
+        all_term_count = sum(
+            self._identity(m) in relevance_pool.all_term_identities for m in relevance_rows
+        )
+        return {
+            "schema": "cao.memory.explain/1",
+            "query": query,
+            "search_mode": "hybrid",
+            "limit": limit,
+            "candidate_limit": self._candidate_limit(limit),
+            "pool_size": len(relevance_rows),
+            "lexical_degenerate": bool(scores)
+            and all(score.lexical == 0.0 for score in scores.values()),
+            "all_term_count": all_term_count,
+            "partial_fill_count": len(relevance_rows) - all_term_count,
+            "recency_floor": RELEVANCE_RECENCY_FLOOR,
+            "recency_scale_days": RELEVANCE_RECENCY_SCALE_DAYS,
+            "overlap_at_limit": (
+                len(top_relevance & set(default_ranks)) / denominator if denominator else None
+            ),
+            "candidates": candidates,
+            "lifecycle_enabled": lifecycle_on,
+            "eligibility_errors": list(check.errors) if check is not None else [],
+        }
+
+    async def _recall_pool(
+        self,
+        query: Optional[str],
+        scope: Optional[str],
+        memory_type: Optional[str],
+        limit: int,
+        terminal_context: Optional[dict],
+        scan_all: bool,
+        search_mode: str,
+        sort_by: str,
+        policy: Optional[VaultInjectionPolicy],
+        *,
+        eligibility: Optional[memory_eligibility.EligibilityCheck] = None,
+    ) -> RecallPool:
+        """Select candidates without ordering, access increments or expansion."""
+        eligibility_kwargs: dict[str, Any] = (
+            {"eligibility": eligibility} if eligibility is not None else {}
+        )
+        relevance = sort_by == "relevance" and bool(query)
+        candidate_limit = self._candidate_limit(limit) if relevance else limit
+        if search_mode == "bm25":
+            if not query:
+                return RecallPool([], set(), sort_by)
+            all_terms: set[tuple] = set()
+            tier_kwargs: dict[str, Any] = (
+                {"all_terms_first": True, "all_term_identities": all_terms} if relevance else {}
+            )
+            rows = self._bm25_search(
+                query=query,
+                scope=scope,
+                scope_id=self._bm25_scope_id(scope, terminal_context),
+                memory_type=memory_type,
+                limit=candidate_limit,
+                exclude_keys=set(),
+                terminal_context=terminal_context,
+                scan_all=scan_all,
+                policy=policy,
+                **tier_kwargs,
+                **eligibility_kwargs,
+            )
+            if relevance:
+                all_rows = [m for m in rows if self._identity(m) in all_terms]
+                partials = [m for m in rows if self._identity(m) not in all_terms]
+                rows = all_rows + partials[: max(0, limit - len(all_rows))]
+            return RecallPool(rows, all_terms, sort_by)
+
+        widen_candidates = (
+            search_mode == "hybrid" and bool(query) and sort_by in {"score", "usage", "relevance"}
+        )
+        candidate_limit = self._candidate_limit(limit) if widen_candidates or relevance else limit
+        metadata_results = await self._metadata_recall(
+            query=query,
+            scope=scope,
+            memory_type=memory_type,
+            limit=candidate_limit,
+            terminal_context=terminal_context,
+            scan_all=scan_all,
+            policy=policy,
+            **eligibility_kwargs,
+        )
+        if search_mode == "metadata" or not query:
+            return RecallPool(
+                metadata_results,
+                {self._identity(m) for m in metadata_results} if relevance else set(),
+                sort_by,
+            )
+        if widen_candidates:
+            rows, all_terms = self._widened_hybrid_pool(
+                metadata_results,
+                query,
+                scope,
+                memory_type,
+                limit,
+                candidate_limit,
+                terminal_context,
+                scan_all,
+                policy,
+                **eligibility_kwargs,
+            )
+            return RecallPool(rows, all_terms, sort_by)
+
+        # Legacy hybrid: metadata first, BM25 only fills remaining slots.
+        exclude_keys = {m.key for m in metadata_results}
+        remaining = max(0, limit - len(metadata_results))
+        if remaining == 0:
+            return RecallPool(metadata_results, set(), sort_by)
+        bm25_results = self._bm25_search(
+            query=query,
+            scope=scope,
+            scope_id=self._bm25_scope_id(scope, terminal_context),
+            memory_type=memory_type,
+            limit=remaining,
+            exclude_keys=exclude_keys,
+            terminal_context=terminal_context,
+            scan_all=scan_all,
+            policy=policy,
+            **eligibility_kwargs,
+        )
+        return RecallPool(metadata_results + bm25_results, set(), sort_by)
+
+    @staticmethod
+    def _candidate_limit(limit: int) -> int:
+        return max(
+            limit,
+            min(
+                HYBRID_CANDIDATE_MAX, max(HYBRID_CANDIDATE_MIN, HYBRID_CANDIDATE_MULTIPLIER * limit)
+            ),
+        )
+
+    def _widened_hybrid_pool(
+        self,
+        metadata_results: list[Memory],
+        query: str,
+        scope: Optional[str],
+        memory_type: Optional[str],
+        limit: int,
+        candidate_limit: int,
+        terminal_context: Optional[dict],
+        scan_all: bool,
+        policy: Optional[VaultInjectionPolicy],
+        *,
+        eligibility: Optional[memory_eligibility.EligibilityCheck] = None,
+    ) -> tuple[list[Memory], set[tuple]]:
+        """#961's identity merge and partial-fill contract, before final ranking."""
+        eligibility_kwargs: dict[str, Any] = (
+            {"eligibility": eligibility} if eligibility is not None else {}
+        )
+        by_identity: dict[tuple, Memory] = {}
+        for memory in metadata_results:
+            by_identity.setdefault(self._identity(memory), memory)
+        metadata_identities = set(by_identity)
+        all_term_identities: set[tuple] = set()
+        # An untruncated metadata scan is a census of index-listed rows.
+        # Check possible truncation or a shortfall after identity deduplication.
+        if len(metadata_results) == candidate_limit or len(by_identity) < limit:
+            bm25_results = self._bm25_search(
+                query=query,
+                scope=scope,
+                scope_id=self._bm25_scope_id(scope, terminal_context),
+                memory_type=memory_type,
+                limit=candidate_limit,
+                exclude_keys=set(),
+                terminal_context=terminal_context,
+                scan_all=scan_all,
+                policy=policy,
+                all_terms_first=True,
+                all_term_identities=all_term_identities,
+                **eligibility_kwargs,
+            )
+            partial_results = []
+            for memory in bm25_results:
+                if self._identity(memory) in all_term_identities:
+                    by_identity.setdefault(self._identity(memory), memory)
+                else:
+                    partial_results.append(memory)
+            if len(by_identity) < limit:
+                for memory in partial_results:
+                    by_identity.setdefault(self._identity(memory), memory)
+                    if len(by_identity) >= limit:
+                        break
+        return list(by_identity.values()), metadata_identities | all_term_identities
 
     def _apply_sort_and_increment(
         self,
@@ -2584,25 +2991,57 @@ class MemoryService:
         max_body_chars: int = 4096,
         policy: Optional[VaultInjectionPolicy] = None,
     ) -> list:
-        """Apply sort mode, slice, then best-effort access bump.
+        """Compatibility wrapper: order, then slice and perform side effects."""
+        ordered = self._order_candidates(
+            results,
+            scope,
+            sort_by,
+            query=query,
+            terminal_context=terminal_context,
+            scan_all=scan_all,
+            vault_candidates=vault_candidates,
+            max_body_chars=max_body_chars,
+            policy=policy,
+        )
+        return self._finish_recall(
+            ordered,
+            scope,
+            limit,
+            include_related=include_related,
+            terminal_context=terminal_context,
+            policy=policy,
+        )
 
-        ``recency`` is the byte-identical Phase 1/2 path: the per-source
-        sorts in ``_metadata_recall``/``_bm25_search`` already produced that
-        order, so we leave ``results`` untouched and only slice. ``score``/
-        ``usage`` enrich ``access_count`` from SQLite (recall builds Memory
-        objects from wiki files, which carry no usage data), compute the
-        composite, then apply a stable scope-precedence pass so scope
-        dominance holds in every mode.
-        """
+    def _order_candidates(
+        self,
+        results: list,
+        scope: Optional[str],
+        sort_by: str,
+        query: Optional[str] = None,
+        terminal_context: Optional[dict] = None,
+        scan_all: bool = False,
+        *,
+        vault_candidates: Optional[Sequence[VaultCandidate]] = None,
+        max_body_chars: int = 4096,
+        policy: Optional[VaultInjectionPolicy] = None,
+        all_term_identities: Optional[set[tuple]] = None,
+        now: Optional[datetime] = None,
+        relevance_scores: Optional[dict[tuple, RelevanceScore]] = None,
+        lifecycle_on: bool = False,
+        superseded_snapshot: Optional[set] = None,
+    ) -> list:
+        """Order candidates only; never increment access or expand related rows."""
         from cli_agent_orchestrator.services.memory_scoring import (
             SCOPE_PRECEDENCE,
             normalise_bm25_scores,
             score_memory,
         )
 
+        superseded: set = set()
         if sort_by != "recency":
-            self._enrich_access_counts(results)
-            now_utc = datetime.now(timezone.utc)
+            if sort_by != "relevance":
+                self._enrich_access_counts(results)
+            now_utc = now if now is not None else datetime.now(timezone.utc)
             if sort_by == "usage":
                 results.sort(
                     key=lambda m: (
@@ -2611,6 +3050,21 @@ class MemoryService:
                         m.key,
                     )
                 )
+            elif sort_by == "relevance":
+                scores = self._rank_relevance(
+                    results,
+                    query,
+                    terminal_context,
+                    scope,
+                    scan_all,
+                    all_term_identities=all_term_identities or set(),
+                    now=now_utc,
+                    vault_candidates=vault_candidates,
+                    max_body_chars=max_body_chars,
+                    policy=policy,
+                )
+                if relevance_scores is not None:
+                    relevance_scores.update(scores)
             else:  # "score"
                 # Genuine 3-factor: score the WHOLE candidate set against the
                 # query in one corpus, normalise per-batch, and feed that into
@@ -2646,6 +3100,7 @@ class MemoryService:
                         m.key,
                     )
                 )
+            if sort_by in {"score", "relevance"} or lifecycle_on:
                 # FR-4.6: a memory that is the TARGET of an active supersedes edge
                 # must not outrank active guidance merely by textual similarity.
                 # Apply a stable demotion — superseded memories sink below
@@ -2654,7 +3109,11 @@ class MemoryService:
                 # unchanged. NULL confidence is NOT used here (never treated as
                 # zero — NFR-2.3); this demotion is purely lifecycle-based.
                 try:
-                    superseded = self._superseded_keys(results)
+                    superseded = (
+                        superseded_snapshot
+                        if superseded_snapshot is not None
+                        else self._superseded_keys(results)
+                    )
                     if superseded:
                         # Full (scope, scope_id, key) identity — see
                         # _superseded_keys. A (scope, key) comparison would
@@ -2667,18 +3126,113 @@ class MemoryService:
                 # within-scope ordering while enforcing scope dominance.
                 results.sort(key=lambda m: SCOPE_PRECEDENCE.get(m.scope, 99))
 
+        if lifecycle_on:
+            if sort_by == "recency":
+                superseded = (
+                    superseded_snapshot
+                    if superseded_snapshot is not None
+                    else self._superseded_keys(results)
+                )
+                results.sort(key=lambda m: 1 if self._is_superseded(m, superseded) else 0)
+            for memory in results:
+                memory.lifecycle_status = (
+                    "superseded" if self._is_superseded(memory, superseded) else None
+                )
+        return results
+
+    def _rank_relevance(
+        self,
+        results: list[Memory],
+        query: Optional[str],
+        terminal_context: Optional[dict],
+        scope: Optional[str],
+        scan_all: bool,
+        *,
+        all_term_identities: set[tuple],
+        now: datetime,
+        vault_candidates: Optional[Sequence[VaultCandidate]] = None,
+        max_body_chars: int = 4096,
+        policy: Optional[VaultInjectionPolicy] = None,
+    ) -> dict[tuple, RelevanceScore]:
+        """Rank the pool and return the exact unrounded values used in that rank."""
+        from cli_agent_orchestrator.services.memory_scoring import (
+            normalise_bm25_scores,
+            relevance_recency_factor,
+        )
+
+        lexical = normalise_bm25_scores(
+            self._bm25_relevance(
+                query,
+                results,
+                terminal_context,
+                scope,
+                scan_all,
+                vault_candidates=vault_candidates,
+                max_body_chars=max_body_chars,
+                policy=policy,
+            )
+        )
+        values = {}
+        for memory in results:
+            identity = self._identity(memory)
+            factor = (
+                relevance_recency_factor(memory.updated_at, now=now)
+                if memory.scope == "project" and memory.source_kind == "native"
+                else 1.0
+            )
+            # The shared normalizer can retain negative scores in mixed-sign corpora.
+            # Keep relevance bounded without changing the frozen score path.
+            lex = max(0.0, min(1.0, lexical.get(identity, 0.0)))
+            values[identity] = RelevanceScore(
+                0 if identity in all_term_identities else 1, lex, factor, lex * factor
+            )
+        results.sort(
+            key=lambda m: (
+                values[self._identity(m)].tier,
+                -values[self._identity(m)].relevance,
+                -values[self._identity(m)].lexical,
+                m.key,
+                m.scope,
+                self._effective_scope_id(m) or "",
+                m.source_kind,
+            )
+        )
+        return values
+
+    def _finish_recall(
+        self,
+        results: list,
+        scope: Optional[str],
+        limit: int,
+        include_related: bool = False,
+        terminal_context: Optional[dict] = None,
+        *,
+        policy: Optional[VaultInjectionPolicy] = None,
+        eligibility: Optional[memory_eligibility.EligibilityCheck] = None,
+        lifecycle_on: bool = False,
+        record_access: bool = True,
+        superseded_snapshot: Optional[set] = None,
+        target_plan: Optional[list[tuple[Memory, list[str]]]] = None,
+    ) -> list:
+        """Slice, bump only returned primaries, and optionally append related rows."""
+        eligibility_kwargs: dict[str, Any] = (
+            {"eligibility": eligibility} if eligibility is not None else {}
+        )
+        if target_plan is not None:
+            eligibility_kwargs["target_plan"] = target_plan
         sliced = results[:limit]
 
-        # Best-effort access_count increment (non-blocking).
-        try:
-            self._increment_access_count(sliced)
-        except Exception as e:  # noqa: BLE001 — non-blocking promise
-            logger.warning(
-                "memory_increment_failed attempted=%d scope=%s",
-                len(sliced),
-                scope or "<all>",
-            )
-            logger.debug(f"recall increment failure detail: {e}")
+        if record_access:
+            # Best-effort access_count increment (non-blocking).
+            try:
+                self._increment_access_count(sliced)
+            except Exception as e:  # noqa: BLE001 — non-blocking promise
+                logger.warning(
+                    "memory_increment_failed attempted=%d scope=%s",
+                    len(sliced),
+                    scope or "<all>",
+                )
+                logger.debug(f"recall increment failure detail: {e}")
 
         # Opt-in cross-reference expansion, appended AFTER the
         # limit slice (the caller asked for related; we deliver in addition).
@@ -2688,10 +3242,32 @@ class MemoryService:
                     sliced,
                     terminal_id=(terminal_context or {}).get("terminal_id"),
                     policy=policy,
+                    **eligibility_kwargs,
                 )
             except Exception as e:  # noqa: BLE001 — non-blocking promise
                 logger.warning(f"related expansion failed, returning primaries: {e}")
 
+        if lifecycle_on:
+            extras = [memory for memory in sliced if memory.is_related]
+            if extras:
+                superseded = superseded_snapshot if superseded_snapshot is not None else set()
+                for memory in extras:
+                    memory.lifecycle_status = (
+                        "superseded" if self._is_superseded(memory, superseded) else None
+                    )
+        if eligibility is not None:
+            for scope_value in MemoryScope:
+                excluded_count, source_names = eligibility.exclusion_summary_for_scope(
+                    scope_value.value
+                )
+                if excluded_count:
+                    logger.info(
+                        "memory_injection_excluded purpose=%s scope=%s count=%d sources=%s",
+                        eligibility.request.purpose,
+                        scope_value.value,
+                        excluded_count,
+                        ",".join(source_names),
+                    )
         return sliced
 
     def _identity(self, m) -> tuple:
@@ -2803,6 +3379,8 @@ class MemoryService:
         terminal_context: Optional[dict] = None,
         scan_all: bool = False,
         policy: Optional[VaultInjectionPolicy] = None,
+        *,
+        eligibility: Optional[memory_eligibility.EligibilityCheck] = None,
     ) -> list[Memory]:
         """Substring-match recall via index.md walk (Phase 1 path)."""
         results: list[Memory] = []
@@ -2913,7 +3491,18 @@ class MemoryService:
             }
             results.sort(key=lambda m: (precedence.get(m.scope, 99), -m.updated_at.timestamp()))
 
-        return results[:limit]
+        if eligibility is None:
+            return results[:limit]
+        return list(
+            islice(
+                eligibility.eligible_in_order(
+                    results,
+                    lambda m: memory_eligibility.MemoryIdentity(*self._identity(m)),
+                    max(1, limit),
+                ),
+                max(0, limit),
+            )
+        )
 
     def _resolve_sources(
         self,
@@ -3183,6 +3772,7 @@ class MemoryService:
         policy: Optional[VaultInjectionPolicy] = None,
         all_terms_first: bool = False,
         all_term_identities: Optional[set[tuple]] = None,
+        eligibility: Optional[memory_eligibility.EligibilityCheck] = None,
     ) -> list[Memory]:
         """Rank wiki bodies by BM25 against ``query``.
 
@@ -3346,7 +3936,25 @@ class MemoryService:
                 idx for _score, idx in ranked if _matches_all_terms(query, contents[idx])
             }
             ranked.sort(key=lambda item: item[1] not in all_term_indexes)
-        ranked = ranked[:limit]
+        if eligibility is None:
+            ranked = ranked[:limit]
+        else:
+
+            def ranked_identity(item):
+                idx = item[1]
+                if idx in vault_memories:
+                    return memory_eligibility.MemoryIdentity(*self._identity(vault_memories[idx]))
+                entry = candidates[idx][1]
+                return memory_eligibility.MemoryIdentity(
+                    entry["key"], entry["scope"], entry.get("scope_id"), "native"
+                )
+
+            ranked = list(
+                islice(
+                    eligibility.eligible_in_order(ranked, ranked_identity, max(1, limit)),
+                    max(0, limit),
+                )
+            )
 
         results: list[Memory] = []
         for _score, idx in ranked:
@@ -3859,6 +4467,10 @@ class MemoryService:
             terminal_id=requester_terminal_id,
         )
 
+        check = memory_eligibility.begin_check(
+            memory_eligibility.EligibilityRequest.from_context("injected_context", terminal_context)
+        )
+
         for scope_val in scopes_in_order:
             scope_id = self.resolve_scope_id(scope_val, terminal_context)
             project_dir = self._get_project_dir(scope_val, scope_id)
@@ -3887,7 +4499,18 @@ class MemoryService:
             scope_entries.sort(key=lambda e: e.get("updated_at", ""), reverse=True)
 
             scope_memories: list[Memory] = []
-            for entry in scope_entries:
+            native_entries = (
+                scope_entries
+                if check is None
+                else check.eligible_in_order(
+                    scope_entries,
+                    lambda e: memory_eligibility.MemoryIdentity(
+                        e["key"], scope_val, scope_id, "native"
+                    ),
+                    MEMORY_MAX_PER_SCOPE,
+                )
+            )
+            for entry in native_entries:
                 if len(scope_memories) >= MEMORY_MAX_PER_SCOPE:
                     break
                 wiki_file = wiki_dir / entry["relative_path"]
@@ -3907,14 +4530,32 @@ class MemoryService:
                 memory = self._parse_wiki_file(resolved_wiki, file_content, entry)
                 if memory:
                     scope_memories.append(memory)
+                    if check is not None and len(scope_memories) >= MEMORY_MAX_PER_SCOPE:
+                        break
 
-            for candidate in self._vault_candidates(
+            vault_entries: Iterable[VaultCandidate] = self._vault_candidates(
                 vault_bindings,
                 require_injectable=True,
                 terminal_id=requester_terminal_id,
                 consumer="injected_context",
                 policy=injection_policy,
-            ):
+            )
+            if check is not None:
+                vault_entries = (
+                    ()
+                    if len(scope_memories) >= MEMORY_MAX_PER_SCOPE
+                    else check.eligible_in_order(
+                        vault_entries,
+                        lambda c: memory_eligibility.MemoryIdentity(
+                            cast(str, c.metadata.key),
+                            cast(str, c.metadata.scope),
+                            cast(Optional[str], c.metadata.scope_id),
+                            "vault",
+                        ),
+                        MEMORY_MAX_PER_SCOPE,
+                    )
+                )
+            for candidate in vault_entries:
                 if len(scope_memories) >= MEMORY_MAX_PER_SCOPE:
                     break
                 memory = load_candidate(
@@ -3924,6 +4565,8 @@ class MemoryService:
                 )
                 if memory:
                     scope_memories.append(memory)
+                    if check is not None and len(scope_memories) >= MEMORY_MAX_PER_SCOPE:
+                        break
 
             # One-level cross-reference expansion. Looks up ``related_keys``
             # for primary entries via SQLite (source of truth, not the
@@ -3947,6 +4590,18 @@ class MemoryService:
 
             visited: set = {m.key for m in scope_memories}
             primary_snapshot = list(scope_memories)
+            related_reasons = {}
+            if check is not None:
+                identities = [
+                    memory_eligibility.MemoryIdentity(rk, scope_val, scope_id, primary.source_kind)
+                    for primary in primary_snapshot
+                    for rk in self._parse_related_keys(
+                        related_lookups.get(primary.source_kind, {}).get(primary.key),
+                        scope=scope_val,
+                    )
+                ]
+                if identities:
+                    related_reasons = check.reasons(identities)
             for primary in primary_snapshot:
                 if related_added_total >= self.RELATED_FANOUT_CAP:
                     logger.info("related_fanout_cap_reached added=%d", related_added_total)
@@ -3957,6 +4612,12 @@ class MemoryService:
                     if related_added_total >= self.RELATED_FANOUT_CAP:
                         break
                     if rk in visited:
+                        continue
+                    if (
+                        check is not None
+                        and memory_eligibility.MemoryIdentity(rk, scope_val, scope_id, source_kind)
+                        in related_reasons
+                    ):
                         continue
                     visited.add(rk)
                     if getattr(primary, "source_kind", "native") == "vault":
@@ -3977,6 +4638,16 @@ class MemoryService:
                     scope_memories.append(related_mem)
                     related_added_total += 1
 
+            if check is not None:
+                excluded_count, source_names = check.exclusion_summary(scope_val, scope_id)
+                if excluded_count:
+                    logger.info(
+                        "memory_injection_excluded purpose=%s scope=%s count=%d sources=%s",
+                        check.request.purpose,
+                        scope_val,
+                        excluded_count,
+                        ",".join(source_names),
+                    )
             scope_used_chars = 0
             for position, mem in enumerate(scope_memories):
                 tag = " [related]" if getattr(mem, "is_related", False) else ""

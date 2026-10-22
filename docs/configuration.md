@@ -60,6 +60,9 @@ Every derived path resolves from this value, so one override moves everything â€
     "enabled": true,
     "compile_mode": "llm",
     "flush_threshold": 0.85,
+    "explain_enabled": true,
+    "non_accessing_inspection": false,
+    "lifecycle": {"enabled": false},
     "compile_timeout_s": 120.0
   },
   "terminal": {
@@ -167,6 +170,9 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 |---------|---------|--------------|
 | `enabled` | `true` | Master switch for the memory subsystem. |
 | `compile_mode` | `"llm"` | `llm` or `append`. `append` skips the LLM wiki-compiler entirely. |
+| `lifecycle.enabled` | `false` | Opt-in active supersedes exclusion for injection plus recall demotion/labels. Nested under `memory.lifecycle`; env override `CAO_MEMORY_LIFECYCLE_ENABLED`. Read/validation errors leave it off. |
+| `non_accessing_inspection` | `false` | CLI list/show and HTTP GET memory views skip access counters when on. MCP/internal recall still counts. Env override: `CAO_MEMORY_NON_ACCESSING_INSPECTION`; read errors leave it off. |
+| `explain_enabled` | `true` | On-demand `cao memory list --query Q --explain` diagnostic. Env override: `CAO_MEMORY_EXPLAIN_ENABLED` (env > file > default). Does not alter recall defaults or gate `sort_by="relevance"`. |
 | `flush_threshold` | `0.85` | Context-usage fraction that triggers a memory flush. |
 | `compile_timeout_s` | `120.0` | Wall-clock timeout for the wiki compile call. |
 | `vault` | `{}` | Validated Obsidian vault source configuration. `CAO_MEMORY_VAULT_ENABLED=false` can disable it but cannot enable an absent or file-disabled configuration. |
@@ -422,6 +428,9 @@ Every `CAO_*` variable below maps 1:1 to a `settings.json` key and is resolved t
 | `CAO_MCP_APPS_STATIC_DIR` | `apps.static_dir` | str |
 | `CAO_LOG_LEVEL` | `logging.level` | str |
 | `CAO_MEMORY_ENABLED` | `memory.enabled` | bool |
+| `CAO_MEMORY_LIFECYCLE_ENABLED` | `memory.lifecycle.enabled` | bool |
+| `CAO_MEMORY_NON_ACCESSING_INSPECTION` | `memory.non_accessing_inspection` | bool |
+| `CAO_MEMORY_EXPLAIN_ENABLED` | `memory.explain_enabled` | bool |
 | `CAO_MEMORY_COMPILE_MODE` | `memory.compile_mode` | str (`llm`/`append`) |
 | `CAO_MEMORY_FLUSH_THRESHOLD` | `memory.flush_threshold` | float |
 | `CAO_MEMORY_VAULT_ENABLED` | `memory.vault.enabled` | bool (disable-only) |
