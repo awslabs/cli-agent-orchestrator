@@ -89,7 +89,14 @@ CONTRACTS: Tuple[Contract, ...] = (
         knob="codexProfile",
         rejected=re.compile(
             r"\[profiles\.|(?<![\w./-])profiles\.[\w<>-]+\."
-            r"|(?<![\w.])profile\s*=\s*[\"']"  # top-level legacy selector, also rejected by codex-cli 0.162+
+            # The top-level legacy selector, also rejected by codex-cli 0.162+:
+            # a whole TOML key/value line, `profile = "<name>"` (optionally
+            # indented, optionally with a trailing comment) and nothing else.
+            # Matching the bare `profile="..."` token anywhere on a line flagged
+            # CAO's own Python keyword argument (`set_table(..., profile="worker")`)
+            # as the codex layout; a kwarg is never alone on its line without a
+            # trailing `,` or `)`, and a copyable TOML line never has one.
+            r"|^\s*profile\s*=\s*[\"'][\w<>.-]*[\"']\s*(?:#.*)?$"
         ),
         accepted=re.compile(
             r"(?:\$CODEX_HOME|~/\.codex|\$\{?CODEX_HOME\}?)/[\w<>.*-]+\.config\.toml"
@@ -157,3 +164,39 @@ def test_every_surface_defining_the_knob_names_the_file_it_reads(contract: Contr
         f"{contract.knob}: these surfaces say what the knob points at without naming "
         f"{contract.accepted.pattern} -- {contract.why}:\n  " + "\n  ".join(offenders)
     )
+
+
+# Lines a scanned surface may legitimately contain. The ``rejected`` oracle must
+# be exactly the external CLI's grammar: a guard that also matches CAO's own
+# API spelled with the same word flags a correct example and tells its author
+# the line "copies the rejected codex layout", which is false.
+_NOT_THE_REJECTED_LAYOUT = (
+    'set_table("model.route", "small", profile="worker")',
+    '    profile="worker",',  # a kwarg on its own line inside a multi-line call
+    "    profile='worker')",
+    'Example: `set_table("model.route", "small", profile="worker")`',
+    'launch(profile = "worker")',
+    '    const launch = { profile: "worker" };',
+    "the `profile` field selects which agent profile runs",
+    'codex --profile cao_reviewer  # not `profile = "..."` inside config.toml',
+)
+_THE_REJECTED_LAYOUT = (
+    'profile = "cao_reviewer"',
+    "profile = 'cao_reviewer'",
+    '  profile = "cao_reviewer"',
+    'profile="cao_reviewer"',
+    'profile = "<name>"',
+    'profile = "cao_reviewer"  # legacy selector',
+    "[profiles.cao_reviewer]",
+    'profiles.cao_reviewer.model = "gpt-5"',
+)
+
+
+@pytest.mark.parametrize("line", _NOT_THE_REJECTED_LAYOUT)
+def test_codex_rejected_layout_oracle_ignores_caos_own_profile_keyword(line: str) -> None:
+    assert not CONTRACTS[0].rejected.search(line), line
+
+
+@pytest.mark.parametrize("line", _THE_REJECTED_LAYOUT)
+def test_codex_rejected_layout_oracle_matches_the_toml_forms(line: str) -> None:
+    assert CONTRACTS[0].rejected.search(line), line
