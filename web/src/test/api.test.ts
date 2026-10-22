@@ -22,12 +22,12 @@ describe('API wrapper', () => {
     })
   }
 
-  it('listSessions fetches /sessions', async () => {
-    const sessions = [{ id: 's1', name: 'test', status: 'active' }]
+  it('listSessions fetches the strict listing', async () => {
+    const sessions = [{ id: 's1', name: 'test', status: 'active', session_incarnation_id: 'one' }]
     mockResponse(sessions)
     const result = await api.listSessions()
     expect(result).toEqual(sessions)
-    expect(mockFetch).toHaveBeenCalledWith('/sessions', expect.objectContaining({ signal: expect.any(AbortSignal) }))
+    expect(mockFetch).toHaveBeenCalledWith('/sessions?strict=true', expect.objectContaining({ signal: expect.any(AbortSignal) }))
   })
 
   it('updates and clears a terminal description with JSON', async () => {

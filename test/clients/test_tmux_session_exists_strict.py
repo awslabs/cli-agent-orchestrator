@@ -685,3 +685,20 @@ class TestLenientCheckIsUnchanged:
         _start_session(tmux_socket, "cao-alive")
 
         assert _client_on(tmux_socket).session_exists("cao-alive") is True
+
+
+def test_strict_listing_on_private_server(tmux_socket):
+    """The new listing reads attachment state directly from the real CLI."""
+    _start_session(tmux_socket, "cao-listing")
+    assert _client_on(tmux_socket).list_sessions_strict() == [
+        {"id": "cao-listing", "name": "cao-listing", "status": "detached"}
+    ]
+
+
+def test_strict_listing_unanswerable_transport(short_tmpdir):
+    with pytest.raises(TmuxLookupError):
+        _client_on(_unreachable(short_tmpdir)).list_sessions_strict()
+
+
+def test_strict_listing_missing_private_server(tmux_socket):
+    assert _client_on(tmux_socket).list_sessions_strict() == []

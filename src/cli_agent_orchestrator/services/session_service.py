@@ -265,11 +265,24 @@ def _enrich_session_ownership(
     return enriched
 
 
-def list_sessions() -> List[Dict]:
+def list_sessions(strict: bool = False) -> List[Dict]:
     """List all sessions from tmux."""
     try:
         backend = get_backend()
-        tmux_sessions = backend.list_sessions()
+        tmux_sessions = backend.list_sessions_strict() if strict else backend.list_sessions()
+        if strict and (
+            not isinstance(tmux_sessions, list)
+            or any(
+                not isinstance(s, dict)
+                or any(
+                    not isinstance(s.get(key), str) or not s[key]
+                    for key in ("id", "name", "status")
+                )
+                for s in tmux_sessions
+            )
+            or len({s["id"] for s in tmux_sessions}) != len(tmux_sessions)
+        ):
+            raise ValueError("Invalid complete session listing")
         cao_sessions = [
             s
             for s in tmux_sessions
@@ -286,15 +299,68 @@ def list_sessions() -> List[Dict]:
         # never reached.
         if not cao_sessions:
             return []
+        if strict:
+            incarnations = get_session_incarnations([s["id"] for s in cao_sessions])
+            # Ownership decoration is best effort; identity is deliberately not.
+            terminals_by_session = _terminals_grouped_by_session([s["id"] for s in cao_sessions])
+            return [
+                dict(
+                    _enrich_session_ownership(backend, s, terminals_by_session),
+                    session_incarnation_id=incarnations.get(s["id"]),
+                )
+                for s in cao_sessions
+            ]
         terminals_by_session = _terminals_grouped_by_session([s["id"] for s in cao_sessions])
         return [_enrich_session_ownership(backend, s, terminals_by_session) for s in cao_sessions]
     except Exception:
+        if strict:
+            raise
         # Swallowed to keep a caller's listing from raising, so exc_info for the
         # same reason as the two handlers above -- more so, in fact: this one
         # blanks the ENTIRE response rather than one session's metadata, and it
         # is the net for anything the grouping/enrichment above throws.
         logger.error("Failed to list sessions", exc_info=True)
         return []
+
+
+class SessionMembershipError(Exception):
+    """A strict membership read whose absence or identity cannot be accepted."""
+
+    def __init__(self, kind: str, status_code: int):
+        super().__init__(kind)
+        self.kind = kind
+        self.status_code = status_code
+
+
+def get_session_membership(session_name: str, expected_incarnation_id: Optional[str]) -> Dict:
+    """Read current members without deriving states or backfilling legacy identities.
+
+    The lifecycle lock excludes this process's writers. Recheck the durable pointer
+    to detect concurrent external changes; this is not a cross-process snapshot.
+    """
+    with session_lifecycle_lock(session_name):
+        sessions = get_backend().list_sessions_strict()
+        session = next((s for s in sessions if s["id"] == session_name), None)
+        if session is None:
+            raise SessionMembershipError("session_absent", 404)
+        incarnation = get_session_incarnation(session_name)
+        if not incarnation:
+            raise SessionMembershipError("session_identity_unverifiable", 409)
+        if incarnation != expected_incarnation_id:
+            raise SessionMembershipError("session_incarnation_changed", 409)
+        rows = list_terminals_by_session(session_name)
+        selected, _ = _select_current_incarnation_rows(rows, {}, incarnation)
+        ids = [row["id"] for row in selected]
+        if (
+            any(not isinstance(id, str) or not id for id in ids)
+            or len(set(ids)) != len(ids)
+            or get_session_incarnation(session_name) != incarnation
+        ):
+            raise SessionMembershipError("session_identity_unverifiable", 409)
+        return {
+            "session": dict(session, session_incarnation_id=incarnation),
+            "terminals": [{"id": id, "session_incarnation_id": incarnation} for id in ids],
+        }
 
 
 def _select_current_incarnation_rows(

@@ -82,6 +82,9 @@ interface Store {
   clearSelectedRun: () => void
 }
 
+let sessionListGeneration = 0
+let sessionListFlight: Promise<void> | null = null
+
 export const useStore = create<Store>((set, get) => ({
   sessions: [],
   activeSession: null,
@@ -99,22 +102,32 @@ export const useStore = create<Store>((set, get) => ({
   selectedIndex: 0,
   followConnected: false,
 
-  fetchSessions: async () => {
-    try {
-      const sessions = await api.listSessions()
-      const prev = get()
-      // Only skip empty responses when reconnecting (connected was false),
-      // not after intentional deletions.
-      if (sessions.length === 0 && prev.sessions.length > 0 && !prev.connected) {
-        set({ connected: true })
-        return
+  fetchSessions: () => {
+    if (sessionListFlight) return sessionListFlight
+    const request = (async () => {
+      // A confirmed DELETE invalidates acceptance, not the transport lock.
+      // Coalesce mutations during a slow GET into one subsequent fresh read.
+      try {
+        let generation: number
+        do {
+          generation = sessionListGeneration
+          try {
+            const sessions = await api.listSessions()
+            if (generation === sessionListGeneration && (!get().connected || !jsonEqual(get().sessions, sessions))) {
+              set({ sessions, connected: true })
+            }
+          } catch {
+            if (generation === sessionListGeneration && get().connected) set({ connected: false })
+          }
+        } while (generation !== sessionListGeneration)
+      } finally {
+        // Release synchronously with the completed read chain, before its
+        // promise resolves: a DELETE in the next microtask must queue a new GET.
+        sessionListFlight = null
       }
-      if (!prev.connected || !jsonEqual(prev.sessions, sessions)) {
-        set({ sessions, connected: true })
-      }
-    } catch {
-      if (get().connected) set({ connected: false })
-    }
+    })()
+    sessionListFlight = request
+    return request
   },
 
   selectSession: async (name) => {
@@ -161,6 +174,8 @@ export const useStore = create<Store>((set, get) => ({
   deleteSession: async (name) => {
     try {
       await api.deleteSession(name)
+      sessionListGeneration++
+      set({ sessions: get().sessions.filter(s => s.id !== name) })
       get().showSnackbar({ type: 'success', message: `Deleted ${name}` })
       if (get().activeSession === name) {
         set({ activeSession: null, activeSessionDetail: null })

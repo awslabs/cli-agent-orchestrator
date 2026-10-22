@@ -40,6 +40,7 @@ beforeEach(() => {
   vi.useFakeTimers()
   useStore.setState({ ...initialStore, sessions: [session], activeSession: session.name })
   vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('Unexpected network request'))
+  vi.spyOn(api, 'listSessions').mockResolvedValue([session])
   vi.spyOn(api, 'listProfiles').mockResolvedValue([])
   vi.spyOn(api, 'listProviders').mockResolvedValue([])
   vi.spyOn(api, 'getTerminalStatus').mockResolvedValue('idle')

@@ -374,6 +374,28 @@ class HerdrBackend(TerminalBackend):
         except (json.JSONDecodeError, KeyError):
             return []
 
+    def list_sessions_strict(self) -> List[Dict[str, str]]:
+        """Validate a complete workspace response instead of defaulting to empty."""
+        result = self._run_herdr(["workspace", "list"], check=False)
+        if result.returncode != 0:
+            raise TerminalBackendError("Could not list herdr workspaces")
+        try:
+            data = self._parse_herdr_json(result.stdout)
+            workspaces = data["workspaces"] if isinstance(data, dict) else data
+            if not isinstance(workspaces, list):
+                raise ValueError("Expected workspace array")
+            sessions = []
+            seen = set()
+            for ws in workspaces:
+                name = ws["label"]
+                if not isinstance(name, str) or not name or name in seen:
+                    raise ValueError("Invalid or duplicate workspace label")
+                seen.add(name)
+                sessions.append({"id": name, "name": name, "status": "active"})
+            return sessions
+        except (ValueError, KeyError, TypeError) as exc:
+            raise TerminalBackendError("Invalid herdr workspace listing") from exc
+
     def kill_session(self, session_name: str) -> bool:
         """Close a herdr workspace by workspace_id (herdr only accepts id, not --label)."""
         try:

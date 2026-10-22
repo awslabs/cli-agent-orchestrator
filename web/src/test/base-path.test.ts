@@ -68,7 +68,7 @@ describe('URL building under a path prefix', () => {
     vi.stubGlobal('fetch', mockFetch)
     await api.api.listSessions()
     expect(mockFetch).toHaveBeenCalledWith(
-      '/cao/sessions',
+      '/cao/sessions?strict=true',
       expect.objectContaining({ signal: expect.any(AbortSignal) })
     )
     vi.unstubAllGlobals()

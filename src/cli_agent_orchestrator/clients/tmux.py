@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 import uuid
-from typing import Callable, Dict, FrozenSet, List, Optional, Tuple, TypeVar, Union
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple, TypeVar, Union
 
 import libtmux
 import psutil
@@ -1917,6 +1917,37 @@ class TmuxClient:
             logger.error(f"Failed to list sessions: {e}")
             return []
 
+    def list_sessions_strict(self) -> List[Dict[str, str]]:
+        """Read the CLI result directly, preserving lookup failures as failures."""
+        try:
+            result = self.server.cmd("list-sessions", "-F", "#{session_name}\t#{session_attached}")
+            if result.returncode != 0:
+                self._classify_session_listing_failure(result)
+                return []
+            if result.stderr:
+                raise TmuxLookupError("Unexpected stderr in session listing")
+            sessions = []
+            seen = set()
+            for line in result.stdout:
+                fields = line.split("\t")
+                if (
+                    len(fields) != 2
+                    or not fields[0]
+                    or not fields[1].isdigit()
+                    or fields[0] in seen
+                ):
+                    raise TmuxLookupError("Malformed or duplicate session listing row")
+                name, attached = fields
+                seen.add(name)
+                sessions.append(
+                    {"id": name, "name": name, "status": "active" if int(attached) else "detached"}
+                )
+            return sessions
+        except TmuxLookupError:
+            raise
+        except Exception as exc:
+            raise TmuxLookupError("Could not read complete tmux session listing") from exc
+
     def get_session_windows(self, session_name: str) -> List[Dict[str, str]]:
         """Get all windows in a session.
 
@@ -2396,19 +2427,29 @@ class TmuxClient:
         if result.returncode == 0:
             return session_name in result.stdout
 
+        try:
+            self._classify_session_listing_failure(result)
+        except TmuxLookupError as exc:
+            raise TmuxLookupError(
+                f"could not determine whether tmux session '{session_name}' exists: {exc}"
+            ) from exc
+        return False
+
+    def _classify_session_listing_failure(self, result: Any) -> None:
+        """Return only for positively confirmed absence; share socket safeguards."""
         stderr_lines = [str(line) for line in result.stderr]
         stderr = " ".join(stderr_lines)
         lowered = stderr.lower()
 
         if any(marker in lowered for marker in _NO_SERVER_STDERR_MARKERS):
-            return False
+            return
 
         if any(marker in lowered for marker in _SOCKET_MISSING_STDERR_MARKERS):
             socket_path = _connect_error_socket_path(stderr_lines)
             if socket_path is not None:
                 liveness = _tmux_server_liveness(socket_path)
                 if liveness == _SERVER_ABSENT:
-                    return False
+                    return
                 verdict = (
                     "a tmux server is still bound to it"
                     if liveness == _SERVER_ALIVE
@@ -2416,15 +2457,15 @@ class TmuxClient:
                     "determined on this host"
                 )
                 raise TmuxLookupError(
-                    f"could not determine whether tmux session '{session_name}' "
-                    f"exists: the tmux socket {socket_path} is gone from the "
+                    "could not read tmux sessions "
+                    f"the tmux socket {socket_path} is gone from the "
                     f"filesystem and {verdict}, so the session may be alive. A "
                     "tmp-cleaner unlinking the socket does this; "
                     "`kill -USR1 <server-pid>` makes the server recreate it."
                 )
 
         raise TmuxLookupError(
-            f"could not determine whether tmux session '{session_name}' exists: "
+            "could not read tmux sessions: "
             f"list-sessions exited {result.returncode} "
             f"({stderr or 'no error output'})"
         )

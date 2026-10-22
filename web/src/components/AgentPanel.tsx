@@ -10,6 +10,7 @@ import { TerminalMeta } from '../api'
 import { StatusBadge } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
 import { AgentDescription } from './AgentDescription'
+import { useSessionActivity } from '../hooks/useSessionActivity'
 
 export const FALLBACK_PROVIDERS = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'gemini_cli', 'hermes', 'kimi_cli', 'copilot_cli', 'opencode_cli', 'cursor_cli', 'grok_cli']
 
@@ -22,7 +23,8 @@ const SOURCE_LABELS: Record<string, string> = {
 }
 
 export function AgentPanel() {
-  const { sessions, fetchSessions, activeSession, activeSessionDetail, selectSession, createSession, deleteSession, terminalStatuses, setTerminalStatus } = useStore()
+  const { sessions, fetchSessions, activeSession, activeSessionDetail, selectSession, createSession, deleteSession } = useStore()
+  const { sessionStatuses, terminalStatuses, invalidate } = useSessionActivity(sessions, fetchSessions)
   const [provider, setProvider] = useState('kiro_cli')
   const [profile, setProfile] = useState('')
   const [creating, setCreating] = useState(false)
@@ -72,6 +74,7 @@ export function AgentPanel() {
     setClosingTerminal(id)
     try {
       await api.deleteTerminal(id)
+      if (activeSession) invalidate(activeSession)
       if (liveTerminal?.id === id) setLiveTerminal(null)
       if (activeSession) await selectSession(activeSession)
       showSnackbar({ type: 'success', message: `Terminal ${id} closed — tmux window killed` })
@@ -128,21 +131,34 @@ export function AgentPanel() {
     }
   }, [activeSession])
 
-  // Poll terminal statuses for visible terminals in the session detail
+  // Legacy sessions cannot prove aggregate membership, but their visible
+  // terminals still support the pre-existing individual status endpoint.
+  // Keep this fallback local: it must never seed the session activity cache.
+  const legacyIds = activeSession && activeSessionDetail?.session.id === activeSession
+    && sessions.some(s => s.id === activeSession && !s.session_incarnation_id)
+    ? activeSessionDetail.terminals.map(t => t.id) : []
+  const legacyKey = legacyIds.length ? JSON.stringify([activeSession, legacyIds]) : ''
+  const legacyCurrent = useRef(legacyKey)
+  legacyCurrent.current = legacyKey
+  const legacyFlights = useRef(new Set<string>())
+  const [legacyStatuses, setLegacyStatuses] = useState<{ key: string; values: Record<string, string> }>({ key: '', values: {} })
   useEffect(() => {
-    if (!activeSessionDetail?.terminals.length) return
-    const terminalIds = activeSessionDetail.terminals.map(t => t.id)
-    const fetchStatuses = () => {
-      terminalIds.forEach(id => {
-        api.getTerminalStatus(id)
-          .then(status => { if (status) setTerminalStatus(id, status) })
-          .catch(() => {})
-      })
-    }
-    fetchStatuses()
-    const interval = setInterval(fetchStatuses, 3000)
-    return () => clearInterval(interval)
-  }, [activeSessionDetail?.terminals.map(t => t.id).join(',')])
+    if (!legacyKey) return
+    let mounted = true
+    setLegacyStatuses({ key: legacyKey, values: {} })
+    const poll = () => legacyIds.forEach(id => {
+      if (legacyFlights.current.has(id)) return
+      legacyFlights.current.add(id)
+      void api.getTerminalStatus(id).then(status => {
+        if (mounted && legacyCurrent.current === legacyKey && status) {
+          setLegacyStatuses(previous => ({ key: legacyKey, values: { ...previous.values, [id]: status } }))
+        }
+      }).catch(() => {}).finally(() => { legacyFlights.current.delete(id) })
+    })
+    poll()
+    const interval = setInterval(poll, 3000)
+    return () => { mounted = false; clearInterval(interval) }
+  }, [legacyKey])
 
   const handleCreate = async () => {
     if (creatingRef.current || !profile.trim()) return
@@ -181,6 +197,7 @@ export function AgentPanel() {
     setAddingAgent(true)
     try {
       await api.addTerminalToSession(activeSession, addProvider, addProfile.trim(), addWorkDir.trim() || undefined)
+      invalidate(activeSession)
       showSnackbar({ type: 'success', message: 'Agent added to session' })
       setShowAddAgent(false)
       setAddProfile('')
@@ -248,6 +265,7 @@ export function AgentPanel() {
                 <div className="flex items-center gap-3">
                   <Bot size={16} className="text-emerald-400" />
                   <span className="text-sm text-gray-200 font-mono">{s.id}</span>
+                  <StatusBadge status={sessionStatuses[s.id]} />
                   <span className={`text-xs px-2 py-0.5 rounded-full ${s.status === 'active' ? 'bg-emerald-900/50 text-emerald-400' : 'bg-gray-700 text-gray-400'}`}>
                     {s.status}
                   </span>
@@ -363,7 +381,7 @@ export function AgentPanel() {
                   <div className="flex items-center gap-3">
                     <TermIcon size={14} className="text-gray-400" />
                     <span className="text-sm font-mono text-gray-300">{t.id}</span>
-                    <StatusBadge status={terminalStatuses[t.id] || null} />
+                    <StatusBadge status={(legacyKey ? (legacyStatuses.key === legacyKey ? legacyStatuses.values[t.id] : null) : terminalStatuses[t.id]) || null} />
                     <span className="text-xs text-gray-500">{t.provider}</span>
                     {t.agent_profile && <span className="text-xs text-emerald-400">{t.agent_profile}</span>}
                   </div>

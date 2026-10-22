@@ -145,6 +145,10 @@ class TerminalBackend(ABC):
         """
         return self.session_exists(session_name)
 
+    def list_sessions_strict(self) -> List[Dict[str, str]]:
+        """Return a complete listing or fail; lenient adapters cannot prove absence."""
+        raise NotImplementedError("Backend does not support strict session listing")
+
     @abstractmethod
     def list_sessions(self) -> List[Dict[str, str]]:
         """List all sessions managed by this backend.

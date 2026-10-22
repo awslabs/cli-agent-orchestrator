@@ -106,6 +106,29 @@ export interface Session {
   id: string
   name: string
   status: string
+  session_incarnation_id?: string | null
+}
+
+export interface SessionMembership {
+  session: Session & { session_incarnation_id: string }
+  terminals: Array<{ id: string; session_incarnation_id: string }>
+}
+
+export interface TerminalStatusReading {
+  id: string
+  session_name: string
+  session_incarnation_id: string | null
+  status?: unknown
+}
+
+// Only the strict readers require identity. Legacy detail fixtures/consumers
+// retain their existing contract, including required TerminalMeta.description.
+function validSession(value: unknown): value is Session {
+  if (!value || typeof value !== 'object') return false
+  const s = value as Session
+  return ['id', 'name', 'status'].every(k => typeof (s as any)[k] === 'string' && (s as any)[k].length > 0)
+    && Object.prototype.hasOwnProperty.call(s, 'session_incarnation_id')
+    && (s.session_incarnation_id === null || (typeof s.session_incarnation_id === 'string' && s.session_incarnation_id.length > 0))
 }
 
 export interface Terminal {
@@ -663,7 +686,31 @@ export const api = {
     }),
 
   // Sessions
-  listSessions: () => fetchJSON<Session[]>('/sessions'),
+  listSessions: async (): Promise<Session[]> => {
+    const rows = await fetchJSON<unknown>('/sessions?strict=true')
+    if (!Array.isArray(rows) || !rows.every(validSession) || new Set(rows.map(s => s.id)).size !== rows.length) {
+      throw new Error('Invalid strict session listing')
+    }
+    return rows
+  },
+  getSessionMembership: async (name: string, incarnation: string): Promise<SessionMembership> => {
+    const result = await fetchJSON<SessionMembership>(`/sessions/${encodeURIComponent(name)}?view=membership&expected_incarnation_id=${encodeURIComponent(incarnation)}`)
+    if (!result || !validSession(result.session) || !result.session.session_incarnation_id
+      || !Array.isArray(result.terminals) || !result.terminals.every(t => t && typeof t.id === 'string' && t.id.length > 0 && typeof t.session_incarnation_id === 'string')
+      || new Set(result.terminals.map(t => t.id)).size !== result.terminals.length) {
+      throw new Error('Invalid session membership')
+    }
+    return result
+  },
+  getTerminalStatusReading: async (id: string): Promise<TerminalStatusReading> => {
+    const result = await fetchJSON<TerminalStatusReading>(`/terminals/${encodeURIComponent(id)}`)
+    if (!result || typeof result.id !== 'string' || typeof result.session_name !== 'string'
+      || !Object.prototype.hasOwnProperty.call(result, 'session_incarnation_id')
+      || !(result.session_incarnation_id === null || typeof result.session_incarnation_id === 'string')) {
+      throw new Error('Invalid terminal status reading')
+    }
+    return result
+  },
   getSession: async (name: string): Promise<SessionDetail> => {
     // Never return a pre-edit response, but let a future poll recover if edits
     // keep invalidating every read instead of keeping this request alive forever.

@@ -3724,11 +3724,16 @@ async def create_session(
 
 @app.get("/sessions")
 async def list_sessions(
+    strict: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[Dict]:
     try:
+        if strict:
+            return await asyncio.to_thread(session_service.list_sessions, strict=True)
         return session_service.list_sessions()
     except Exception as e:
+        if strict:
+            raise HTTPException(status_code=503, detail={"kind": "session_read_unavailable"}) from e
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list sessions: {str(e)}",
@@ -3738,6 +3743,8 @@ async def list_sessions(
 @app.get("/sessions/{session_name}")
 async def get_session(
     session_name: str,
+    view: Optional[str] = None,
+    expected_incarnation_id: Optional[str] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     # Validate before entering the try block so a malformed name surfaces
@@ -3746,6 +3753,15 @@ async def get_session(
         validate_tmux_name(session_name, "session_name")
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    if view == "membership":
+        try:
+            return await asyncio.to_thread(
+                session_service.get_session_membership, session_name, expected_incarnation_id
+            )
+        except session_service.SessionMembershipError as e:
+            raise HTTPException(status_code=e.status_code, detail={"kind": e.kind}) from e
+        except Exception as e:
+            raise HTTPException(status_code=503, detail={"kind": "session_read_unavailable"}) from e
     try:
         # session_service.get_session() calls status_monitor.get_status() once per
         # terminal in the session, which for a PROCESSING terminal can shell out to a
