@@ -47,11 +47,34 @@ role: developer
 Implement the requested change and verify it.
 ```
 
-MiniMax Code's public interactive CLI does not expose a model flag. CAO applies
-`model:` in an `mcode` profile or `--model` at launch by setting `defaultModel`
-only in the terminal-local copy of `config.yaml`; the explicit launch override
-wins over the profile value. The user's normal MiniMax Code configuration is
-not modified.
+CAO sets `defaultModel` only in the terminal-local copy of `config.yaml`.
+Selection precedence is an explicit session/terminal API `model` parameter,
+then the profile's `model:`, then the user's saved `defaultModel`. If none is
+set, CAO uses `minimax/MiniMax-M3`. The user's normal configuration is not modified.
+Saved legacy and custom selections, already-qualified model keys, and provider
+settings are preserved. An explicit bare `MiniMax-M3` is normalized to
+`minimax/MiniMax-M3`; this key follows MiniMax Code's configured managed or
+API-key model source.
+
+For example, add this frontmatter to an `mcode` agent profile and launch it with
+`cao launch --agents <profile-name> --provider mcode`:
+
+```yaml
+provider: mcode
+model: minimax/MiniMax-M3
+```
+
+`cao launch` has no `--model` option. Model selection is configured through the
+profile or the session/terminal API instead.
+
+M3 is the verified default for this adapter. The public
+[`@minimax-ai/code@0.6.12` package](https://www.npmjs.com/package/@minimax-ai/code/v/0.6.12)
+requires qualified `provider/model` keys and includes M3 in its managed and
+API-key catalogs. Its Flash entry is `MiniMax-M3.1-Flash-Preview`, not the final
+`MiniMax-M3.1-Flash` key, so CAO does not advertise final Flash support or alias
+that key to Preview. The CLI owns model discovery and inference; the CAO
+`/agents/providers` response retains its common `name`, `binary`, `installed`
+shape.
 
 ## Runtime behavior
 
