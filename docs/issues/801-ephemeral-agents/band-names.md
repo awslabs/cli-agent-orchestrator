@@ -217,9 +217,8 @@ an objective classifier. These exceptions make that limitation reviewable.
 The manual transcripts below are historical. At the design's 69909e98 pin,
 BAND_NAMES matches all 94 included entries. Existing E1 tests cover count,
 case-insensitive uniqueness, reserved-name composition and collision retry.
-A committed direct band-regex/built-in-clash/document-parity test remains an E3
-follow-up; manual validation here is not CI coverage.
-
+Full reserved composition already pins the band-segment regex. Committed built-in
+clash/document-parity checks remain E3 follow-ups; manual validation here is not CI coverage.
 
 Commands run against the included table's normalized-name column (94 rows),
 from a scratch file under a single `mktemp -d` directory (removed after use).
