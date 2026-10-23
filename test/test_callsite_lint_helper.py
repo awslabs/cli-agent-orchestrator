@@ -293,16 +293,44 @@ def test_declared_parameters_is_empty_for_an_unknown_name() -> None:
     assert cl.declared_parameters("nope", [_module("x = 1")]) == frozenset()
 
 
-def test_poll_until_done_has_no_min_generation_on_this_tree() -> None:
-    """Pins the fact rule 3's conditional rests on (#735 / PR #812).
+def test_poll_until_done_has_min_generation_so_rule_3_is_armed() -> None:
+    """Pins the handover rule 3 waited for (#735): the floor exists on this tree.
 
-    If this starts failing, ``min_generation`` has landed and
-    ``test_every_poll_until_done_passes_a_generation_floor`` has stopped
-    skipping -- which is the intended handover, not a breakage.
+    Until PR #999 this test asserted the opposite and rule 3 skipped. Now the
+    parameter is declared, so ``test_every_poll_until_done_passes_a_generation_floor``
+    runs for real; if this fails, the contract regressed and every caller that
+    passes ``min_generation=`` is broken, not merely ungated.
     """
     declared = cl.declared_parameters("poll_until_done")
     assert declared, "poll_until_done vanished from src/; rule 3 needs rewriting"
-    assert "min_generation" not in declared
+    assert "min_generation" in declared
+
+
+def test_marked_sites_reads_each_rules_marker_the_same_way() -> None:
+    """One marker mechanism for every rule: a ``# <prefix>: <reason>`` on the call
+    or the two lines above it, keyed by the site's line-free key."""
+    mod = _module("""
+        poll_until_done(tid)
+        # staleness-ok: the broker names no generation
+        poll_until_done(
+            tid,
+        )
+        # subset-ok: a different rule's marker does not count
+        poll_until_done(tid)
+        """)
+    sites = cl.missing_kwarg_sites("poll_until_done", "min_generation", [mod])
+    assert len(sites) == 3
+    marked = cl.marked_sites(sites, "staleness-ok", [mod])
+    key = ("pkg/mod.py", "poll_until_done", "min_generation")
+    assert marked == {(key, 4): "the broker names no generation"}, "per site: line 4 only"
+    assert cl.marked_sites(sites, "nothing-ok", [mod]) == {}
+    # The unmarked siblings on lines 2 and 8 share the key and must still fail.
+    with pytest.raises(AssertionError) as exc:
+        cl.check_against_allowlist(
+            rule="staleness-gate", sites=sites, allowlist={}, marked=marked, remedy="x"
+        )
+    assert "pkg/mod.py:2" in str(exc.value) and "pkg/mod.py:8" in str(exc.value)
+    assert "pkg/mod.py:4" not in str(exc.value)
 
 
 def test_missing_kwarg_sites_flags_an_omission_and_a_splat_but_not_an_explicit_pass() -> None:
@@ -383,9 +411,25 @@ def test_check_against_allowlist_accepts_an_inline_marker_instead_of_a_row() -> 
         rule="r",
         sites=[_site("a")],
         allowlist={},
-        marked={("pkg/mod.py", "a"): "deliberate"},
+        marked={(("pkg/mod.py", "a"), 7): "deliberate"},
         remedy="do the thing",
     )
+
+
+def test_check_against_allowlist_marks_exempt_one_site_not_its_same_key_siblings() -> None:
+    """A marker on one call must not cover an identical unmarked call in the
+    same module (PR #999 re-review, P3-1): line-free keys collide on purpose for
+    allowlist rows, which carry a reviewed count, but a mark carries none."""
+    with pytest.raises(AssertionError) as exc:
+        cl.check_against_allowlist(
+            rule="r",
+            sites=[_site("a", line=7), _site("a", line=30)],
+            allowlist={},
+            marked={(("pkg/mod.py", "a"), 7): "deliberate"},
+            remedy="do the thing",
+        )
+    message = str(exc.value)
+    assert "pkg/mod.py:30" in message and "pkg/mod.py:7" not in message
 
 
 def test_check_against_allowlist_fails_on_a_stale_inline_marker() -> None:
@@ -394,7 +438,7 @@ def test_check_against_allowlist_fails_on_a_stale_inline_marker() -> None:
             rule="r",
             sites=[],
             allowlist={},
-            marked={("pkg/mod.py", "gone"): "deliberate"},
+            marked={(("pkg/mod.py", "gone"), 7): "deliberate"},
             remedy="do the thing",
         )
     assert "no longer sit on a flagged" in str(exc.value)

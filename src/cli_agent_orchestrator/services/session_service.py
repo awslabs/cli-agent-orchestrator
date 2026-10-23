@@ -79,6 +79,7 @@ async def create_session(
     use_worktree: bool = False,
     idempotency_key: str | None = None,
     lookup_only: bool = False,
+    caller_ceiling: list[str] | None = None,
     resume_session_id: str | None = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
@@ -150,6 +151,7 @@ async def create_session(
         group=group,
         metadata=metadata,
         description=description,
+        caller_ceiling=caller_ceiling,
     )
     if lookup_only or last_create_was_replay():
         # A lookup, or a replay of an earlier keyed request, returned a terminal

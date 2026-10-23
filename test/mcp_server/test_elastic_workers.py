@@ -5,10 +5,18 @@ import threading
 import time
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+
 from cli_agent_orchestrator.mcp_server import server
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.utils import orchestration
+
+# Remote placement probes the target's /health for ``delegation_ceiling`` and
+# reads this terminal's own recorded ceiling before posting (fail closed on an
+# older node). The shared fixture answers both so these tests stay about elastic
+# provisioning; the probe itself is covered in test_delegation_remote.py.
+pytestmark = pytest.mark.usefixtures("remote_ceiling_ready")
 
 
 def test_assign_elastic_provisions_then_assigns(monkeypatch):

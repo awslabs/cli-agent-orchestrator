@@ -69,6 +69,15 @@ DEFAULT_PROVIDER = ProviderType.KIRO_CLI.value
 # Higher values provide more context but increase memory usage
 TMUX_HISTORY_LINES = 200
 
+# How long a wait gives a worker to show the first status EARNED for a newly
+# dispatched turn before concluding it will not: the server's deferred-init
+# confirmation uses it per attempt before resubmitting
+# (``terminal_service._DEFERRED_SUBMIT_CONFIRM_TIMEOUT``), and `cao session send`
+# uses it as the grace before it stops refusing an unstamped ready status
+# (``utils.terminal.STAMP_GRACE_SECONDS``). Both read the same stamp and ask the
+# same question, so one constant keeps them equal (#735).
+TURN_START_CONFIRM_SECONDS = 8.0
+
 # Scrollback floor CAO raises the operator's shared tmux server's global
 # ``history-limit`` to before it creates a pane.
 #
@@ -340,6 +349,54 @@ INBOX_RECONCILE_INTERVAL = 30  # seconds between reconciliation sweeps
 # messages — it only adopts ones those paths have already had their chance at
 # and missed.
 INBOX_RECONCILE_GRACE_SECONDS = 30
+
+# Inbox submit confirmation (issue #78). send_input delivers a message as
+# paste-buffer -> fixed submit delay -> Enter. That delay only GUESSES when the
+# receiving TUI is input-ready; when it guesses wrong the TUI swallows the Enter
+# and the message sits unsubmitted in the composer. Nothing raises, the receiver
+# stays IDLE, and the inbox has already marked the message DELIVERED — so no
+# path ever retries and the sender waits on a reply that cannot come. Worse, the
+# receiver still READS ready, so the next message is pasted on top of the first
+# ({MSG1}{MSG2} in the issue). Confirm the receiver actually began processing
+# THIS delivery, and re-submit if it did not.
+#
+# The confirmation runs synchronously inside the delivery, holding that
+# terminal's delivery lock. The lock DELAYS a second paste to the same terminal
+# until the first is confirmed or given up on; it does not prevent the pile-up
+# by itself -- only a successful recovery does (see the inbox docstring for which
+# providers can recover). Cost: one or two status reads on a healthy delivery;
+# on a dropped one, up to INBOX_SUBMIT_CONFIRM_TIMEOUT for the first wait plus
+# the same again per recovery attempt that is actually sent (so at most
+# INBOX_SUBMIT_CONFIRM_TIMEOUT * (1 + INBOX_SUBMIT_MAX_RESUBMITS)), all of it
+# inside that one terminal's lock. Each terminal's delivery runs on its own
+# worker thread, so the wait never holds up delivery to other terminals.
+INBOX_SUBMIT_CONFIRMATION = (
+    os.environ.get("CAO_INBOX_SUBMIT_CONFIRMATION", "true").lower() == "true"
+)
+
+# Per-attempt wait for evidence that the receiver began processing this delivery.
+INBOX_SUBMIT_CONFIRM_TIMEOUT = 8.0
+
+# Re-submit attempts after the first unconfirmed wait. Kept lower than the
+# deferred-init path's 3: inbox messages are not a session's only work, and the
+# reconcile sweep is not a second chance here (the message is already DELIVERED).
+INBOX_SUBMIT_MAX_RESUBMITS = 2
+
+# How long POST /terminals/{id}/inbox/messages waits for its immediate delivery
+# attempt to reach the pane before answering. The message is already stored
+# when the wait starts and the attempt keeps running in the background, so
+# this bounds API latency only -- it never decides whether a message is
+# delivered. It has to stay well inside the sender's HTTP timeout (30s default,
+# settings_service.py): a POST that lands while the receiver's lock is held by
+# an unconfirmed delivery could otherwise wait out that whole confirmation,
+# time out at the sender, and tempt it to send the message a second time.
+INBOX_IMMEDIATE_DELIVERY_WAIT = 5.0
+
+# Worker threads the OpenCode poller and the reconcile sweep fan out over.
+# Each receiver's delivery can hold its thread for a full confirmation cycle,
+# so the sweeps run receivers in parallel instead of one after another; the
+# cap bounds the thread count under a backlog.
+INBOX_SWEEP_FANOUT = 8
 
 # =============================================================================
 # Cleanup Service Configuration
@@ -826,6 +883,19 @@ ROLE_TOOL_DEFAULTS = {
     "workflow_scout": ["@builtin", "fs_read", "execute_bash", "@cao-mcp-server"],
 }
 
+# Delegation ceiling defaults, keyed by ROLE NAME. The ceiling is the most a
+# terminal may grant to the children it creates through assign, handoff and
+# workflow steps; a child's allowedTools must fit inside it, and the child's own
+# ceiling is capped by it. A profile declares its own with ``delegateTools``.
+# Only ``supervisor`` widens by default: its job is to launch workers that hold
+# tools it does not. Every other role, built-in or custom, defaults to its own
+# allowedTools (it can hand down what it holds, nothing more). A custom role
+# named ``supervisor`` in settings.json keeps this entry: the table is keyed by
+# the name, not by the built-in list. See docs/tool-restrictions.md.
+ROLE_DELEGATE_DEFAULTS = {
+    "supervisor": ["*"],
+}
+
 # Issue #432 design discussion (tedswinyar + klabulan, 2026-07-17/18): sibling
 # discovery (list_siblings/update_metadata) is a distinct capability from the
 # existing handoff/assign/send_message orchestration trio, and must be an
@@ -1038,6 +1108,48 @@ SCRIPT_LINT_DISALLOWED_IMPORT_PREFIXES = frozenset({"cli_agent_orchestrator"})
 # deterministic control flow keeps repeated work predictable. Import-level only
 # — no call-site analysis. A warning never fails a script (FR-1.7).
 SCRIPT_LINT_NONDETERMINISM_MODULES = frozenset({"random", "secrets", "uuid", "time", "datetime"})
+
+# Pre-parse source-length cap for the linter, in characters. This is a CRASH
+# guard, not a style limit. On CPython 3.10 the AST build inside ``ast.parse``
+# recurses in C once per nesting level with no recursion gate, so deeply nested
+# input overflows the C stack and SEGFAULTS the interpreter —
+# ``sys.setrecursionlimit`` does not reach it and no ``RecursionError`` is ever
+# raised, so ``lint_script``'s except arms cannot save it. CPython 3.11 added
+# the gate: 3.11+ raise ``RecursionError`` ("maximum recursion depth exceeded
+# during ast construction") from about 3,500 levels. Only 3.10 segfaults, and
+# 3.10 is the CI floor, so this cap is load-bearing.
+#
+# Why a LENGTH cap bounds DEPTH: every AST node needs at least one source
+# character, so max AST depth <= len(source). That makes the bound sound
+# without a second traversal, which matters for a module contracted to do one
+# ``ast.parse`` and one ``ast.walk``.
+#
+# Why 128 KiB specifically — do not raise it without re-measuring BOTH numbers:
+#   - Measured segfault cliff for ``"a" + ".b" * N`` on CPython 3.10, 8 MiB main
+#     thread stack, 3 runs per depth (2026-10-21/22):
+#       x86_64 Linux, uv cpython-3.10.22, ``ulimit -s`` 8192: 130,500 parse,
+#         131,000 SIGSEGV.
+#       macOS arm64, uv cpython-3.10.19: 130,600 parse, 130,800 SIGSEGV.
+#     That is ~64 bytes of C stack per level. The worst case admitted here is
+#     65,535 levels (2 characters per level), ~2.0x below the cliff. Other
+#     left-recursive constructs (binop, call, subscript) need at least as many
+#     characters per level; right-recursive ones (unary, ``**``, ``not``,
+#     ``if``/``else``, ``lambda``) stop at the parser's fixed stack depth with
+#     ``MemoryError`` long before the C stack is at risk.
+#   - Largest workflow script shipped in this repo is
+#     ``examples/workflows/pr-health/pr_health.py`` at ~58 KiB, so this leaves
+#     ~2.3x headroom for a legitimately large hand-written script.
+# Step 4 of ``test_ast_parse_depth_guard.py``'s child-process crash probe parses
+# a worst-case source at exactly this cap on every run, so a cap past the host's
+# cliff is a red test rather than a core dump of the pytest process.
+#
+# Deliberately BELOW ``WORKFLOW_MAX_SPEC_BYTES`` (256 KiB, above) rather than
+# matching it: that cap is sized for a legitimate spec's byte budget, not for
+# ast.parse's C-stack behaviour, and 256 KiB of a dense attribute chain is
+# 131,071 levels — PAST the measured cliff on both hosts above, so reusing it
+# here would reopen this crash. Do not "harmonise" the two values without
+# re-measuring the cliff on the target runner.
+SCRIPT_LINT_MAX_SOURCE_CHARS = 128 * 1024
 
 # Env-var injection allowlist for POST /terminals/run-step (Bolt 2, U2/C6,
 # NFR-SEC-4 BINDING). Deny-by-default: the injection surface into a tmux

@@ -14,6 +14,11 @@ from typing import Optional
 from cli_agent_orchestrator.services.memory_reconciliation import (
     _first_symlink_component,
 )
+from cli_agent_orchestrator.services.secret_gate import (
+    SecretMatch,
+    normalize_line_endings,
+    redact_secrets_with_acceptances,
+)
 from cli_agent_orchestrator.services.vault.boundary import (
     is_excluded_relpath,
     is_supported_relpath,
@@ -27,6 +32,8 @@ from cli_agent_orchestrator.services.vault.parser import (
     ParseResult,
     classify_secret,
     parse_note,
+    secret_acceptances,
+    secret_scan_text,
 )
 
 # Bounds the aggregate bytes opened in one scan even when independent config
@@ -200,11 +207,14 @@ def scan_vault(
         # authored body content; the writer separately rejects secret-shaped
         # generated ``cao`` metadata before publishing it.
         secret = classify_secret(
-            parsed.region.body,
+            secret_scan_text(parsed.region),
             secret_gate=candidate.mapping.secret_gate,
         )
         if secret is not None:
             findings += (ScanFinding(secret[0], secret[2], secret[1]),)
+        findings += _acceptance_findings(
+            parsed, secret_gate=candidate.mapping.secret_gate, has_secret=secret is not None
+        )
 
         quarantined = any(finding.severity == "error" for finding in findings)
         notes.append(
@@ -583,6 +593,71 @@ def _sync_conflict_name(filename: str) -> bool:
     )
 
 
+def _acceptance_findings(
+    parsed: ParseResult, *, secret_gate: str, has_secret: bool
+) -> tuple[ScanFinding, ...]:
+    """Report every ``cao.secret_ok`` entry: honoured per span, or inert and why.
+
+    The record is never silent (#644 AC10): an acceptance that passes raw bytes
+    is a ``secret_accepted`` finding per span, and one that matches nothing, or
+    sits on a ``reject`` mapping where acceptances are not honoured, is a
+    ``secret_acceptance_unmatched`` warning so the operator removes it or
+    changes the mapping. Details carry pattern names only, never bytes.
+    """
+    accepted = secret_acceptances(parsed.cao)
+    if not accepted:
+        return ()
+    findings: list[ScanFinding] = []
+    if secret_gate != "warn":
+        for pattern, _digest in accepted:
+            findings.append(
+                ScanFinding(
+                    FindingCode.SECRET_ACCEPTANCE_UNMATCHED,
+                    f"{pattern}: mapping secret_gate is not warn",
+                    finding_severity(FindingCode.SECRET_ACCEPTANCE_UNMATCHED, secret_gate="reject"),
+                )
+            )
+        return tuple(findings)
+    matches: tuple[SecretMatch, ...] = ()
+    if has_secret:
+        _text, matches = redact_secrets_with_acceptances(secret_scan_text(parsed.region), accepted)
+    # ``secret_accepted`` is reported only for a span the agent receives as
+    # fingerprinted. An accepted span inside an unaccepted match (the vendor
+    # value inside ``NAME_TOKEN=value``) is still redacted, so it is reported
+    # as unmatched with the second fingerprint the operator has to accept.
+    hits = {pair: [m for m in matches if (m.pattern, m.sha256) == pair] for pair in set(accepted)}
+    for pattern, digest in accepted:
+        spans = hits[(pattern, digest)]
+        if not spans:
+            findings.append(_unmatched(f"{pattern}: no current span matches"))
+            continue
+        for match in spans:
+            if match.passed:
+                findings.append(
+                    ScanFinding(
+                        FindingCode.SECRET_ACCEPTED,
+                        match.pattern,
+                        finding_severity(FindingCode.SECRET_ACCEPTED, secret_gate="reject"),
+                    )
+                )
+            else:
+                findings.append(
+                    _unmatched(
+                        f"{pattern}: span is inside an unaccepted {match.blocked_by} match; "
+                        "accept that fingerprint too"
+                    )
+                )
+    return tuple(findings)
+
+
+def _unmatched(detail: str) -> ScanFinding:
+    return ScanFinding(
+        FindingCode.SECRET_ACCEPTANCE_UNMATCHED,
+        detail,
+        finding_severity(FindingCode.SECRET_ACCEPTANCE_UNMATCHED, secret_gate="reject"),
+    )
+
+
 def _parse_findings(parsed: ParseResult) -> tuple[ScanFinding, ...]:
     if parsed.finding_code is None:
         return ()
@@ -619,9 +694,14 @@ def _relpath(path: str, root: str) -> str:
 
 
 def _normalize_line_endings(text: str) -> str:
+    """Note-level normalisation: drop a leading BOM, then apply the gate's LF rule.
+
+    The LF rule itself lives in :func:`secret_gate.normalize_line_endings`, so
+    the scan and the read boundary cannot disagree about what a line ending is.
+    """
     if text.startswith("\ufeff"):
         text = text[1:]
-    return text.replace("\r\n", "\n").replace("\r", "\n")
+    return normalize_line_endings(text)
 
 
 def _sha256(text: str) -> str:

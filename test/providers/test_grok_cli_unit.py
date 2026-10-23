@@ -977,7 +977,7 @@ def test_stale_processing_capture_opt_in_does_not_certify_deferred_task_pickup()
 
     with (
         patch.object(ts, "_worker_is_started_direct") as direct_probe,
-        patch.object(ts, "_message_visible_in_box", return_value=False),
+        patch.object(ts, "_message_in_composer", return_value=False),
         patch.object(ts, "dispatch_input") as resend,
     ):
         assert ts.redeliver_dropped_message("test-terminal", "new task", 1, provider) is False
@@ -1519,7 +1519,7 @@ def test_redeliver_dropped_message_full_resend_preserves_logical_turn(monkeypatc
     monkeypatch.setattr(ts.provider_manager, "get_provider", lambda _: provider)
     monkeypatch.setattr(ts, "inject_memory_context", lambda message, *_: message)
     monkeypatch.setattr(ts, "update_last_active", lambda _: None)
-    monkeypatch.setattr(ts, "_message_visible_in_box", lambda *_: False)
+    monkeypatch.setattr(ts, "_message_in_composer", lambda *_: None)
 
     assert ts.redeliver_dropped_message("grok-redelivery", "do the task", 1, provider) is False
     backend.send_keys.assert_called_once()

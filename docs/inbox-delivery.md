@@ -18,11 +18,41 @@ Both paths converge on `check_and_send_pending_messages()`, which gates delivery
 
 By default, messages are only delivered when the terminal status is **IDLE** or **COMPLETED**. This ensures the provider's TUI is ready to accept input and the message won't be lost or corrupt the terminal state.
 
+## Submit Confirmation
+
+A delivery is a bracketed paste, a fixed per-provider delay, then Enter. The delay only guesses when the TUI is ready; when it guesses wrong the TUI swallows the Enter and the message sits unsubmitted in the composer while the terminal still reads IDLE (issue #78). Nothing raises, and the message is already DELIVERED, so without a check the sender waits forever and the next message is pasted on top of the first.
+
+After each paste the inbox therefore waits for evidence that the receiver began processing **this** delivery: a PROCESSING / COMPLETED / WAITING_USER_ANSWER status whose output-generation stamp is newer than the dispatch boundary (a status latched from the previous turn does not count). If none arrives within `INBOX_SUBMIT_CONFIRM_TIMEOUT` (8s) the recovery runs, up to `INBOX_SUBMIT_MAX_RESUBMITS` (2) times:
+
+| Provider can... | Recovery |
+|-----------------|----------|
+| read its composer and the text is still there (`extract_current_composer`: codex, claude_code, kiro_cli) | bare Enter |
+| read its composer, the text is gone, and it has a direct status probe | full re-send |
+| neither read its composer nor probe (others) | nothing; the drop is logged |
+
+A full re-send is never attempted when the composer cannot be read: it would paste a second copy on top of the first and submit both.
+
+Neither recovery may answer an open dialog. The full re-send goes back through `dispatch_input`, so it inherits the WAITING_USER_ANSWER guard below. The bare Enter does not — it submits what is already in the composer — so it checks that guard itself and sends nothing when the receiver is parked on a prompt and its provider sets `blocks_orchestrated_input_while_waiting_user_answer`. Otherwise the one recovery that submits without pasting would be the one that can pick a highlighted option on a human's behalf (issue #896). Today every real dialog capture hides the composer box, so the bare-Enter branch is already out of reach there; the check makes that an invariant rather than a property of two providers' composer readers.
+
+Cost: a healthy delivery pays one or two status reads. A dropped one holds **that terminal's** delivery lock for the first wait plus one more wait per recovery actually sent (up to 24s with the defaults). Other terminals are not affected: each delivery runs on its own worker thread, and the sweeps fan out. `POST /terminals/{id}/inbox/messages` answers once the paste has reached the pane (bounded by `INBOX_IMMEDIATE_DELIVERY_WAIT`, 5s), not after the confirmation.
+
+Set `CAO_INBOX_SUBMIT_CONFIRMATION=false` before starting `cao-server` to turn the confirmation off; deliveries then behave as before #78 (paste, Enter, done). Event-inbox backends (herdr) skip it regardless.
+
 ## Eager Delivery
 
 Some providers (e.g., Claude Code) have TUIs that buffer pasted input even while processing. For these providers, waiting for IDLE introduces unnecessary latency between agent turns.
 
-Eager delivery allows messages to be delivered during **PROCESSING** and **WAITING_USER_ANSWER** states, eliminating the inter-turn gap.
+Eager delivery allows messages to be delivered during **PROCESSING**, eliminating the
+inter-turn gap. It also covers **WAITING_USER_ANSWER**, but only for providers whose
+`blocks_orchestrated_input_while_waiting_user_answer` is False.
+
+A provider that sets that property (e.g. Claude Code, Codex, MiniMax Code) is declaring that its
+choice widget consumes pasted text as the answer to the open dialog. Delivering there
+loses the message — it is marked DELIVERED but never reaches the agent — and the
+trailing Enter submits whichever option is highlighted, so an inbox message would
+answer a question reserved for a human (issue #896). For those providers the message
+stays PENDING and is delivered by the normal IDLE/COMPLETED consumer, or by the
+reconcile sweep, once the dialog closes.
 
 ### Enabling
 
