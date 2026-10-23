@@ -1741,11 +1741,11 @@ async def test_fresh_run_executes_approved_bytes_after_mid_start_update(monkeypa
 
     capture = launch_guard.capture
 
-    def update_in_window():
+    def update_in_window(profile_set=None):
         workflow_spec_service.update_workflow(
             spec.name, source_b, spec.content_hash, scan_dir=str(spec_dir)
         )
-        return capture()
+        return capture(profile_set=profile_set)
 
     monkeypatch.setattr(launch_guard, "capture", update_in_window)
     scratch = tmp_path / "scratch"
@@ -2021,8 +2021,8 @@ async def test_insert_failure_refuses_when_enforcement_turns_on_after_capture(
     real_capture = script_runner.launch_guard.capture
     captured = []
 
-    def capture():
-        guard = real_capture()
+    def capture(profile_set=None):
+        guard = real_capture(profile_set=profile_set)
         captured.append(guard)
         return guard
 

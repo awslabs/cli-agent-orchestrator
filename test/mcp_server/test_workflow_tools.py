@@ -75,6 +75,9 @@ class TestWorkflowRun:
                     "name_or_path": "wf",
                     "inputs": {},
                     "working_directory": "/terminal/project",
+                    # The tool names its terminal so the run's steps are bounded by
+                    # that terminal's recorded delegation ceiling.
+                    "caller_id": "term/one",
                 },
             ),
         ]

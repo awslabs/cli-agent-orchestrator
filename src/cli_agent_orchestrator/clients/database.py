@@ -165,6 +165,12 @@ class TerminalModel(Base):
     model_honored = Column(Boolean, nullable=True)  # NULL = unknown for pre-migration rows
     working_directory = Column(String, nullable=True)  # launch-time cwd (optional)
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
+    # JSON-encoded delegation ceiling: the most this terminal may grant to the
+    # children it creates (utils/delegation.py). Capped by the creator's own
+    # ceiling at creation time and read from THIS ROW when it creates children,
+    # never re-derived from its profile. NULL = pre-migration row, which is
+    # bounded by its own allowed_tools until relaunched.
+    delegate_tools = Column(Text, nullable=True)
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
     engine = Column(String, nullable=True)  # resolved Kiro engine; NULL for legacy/non-Kiro rows
@@ -1673,6 +1679,12 @@ def _migrate_workflow_run() -> None:
             if "kind" not in columns:
                 conn.execute("ALTER TABLE workflow_run ADD COLUMN kind TEXT DEFAULT NULL")
                 logger.info("Migration: added kind column to workflow_run")
+            if "caller_id" not in columns:
+                # The terminal that started the run; lets a resumed or recovered
+                # run re-bind to the ORIGINAL caller's delegation ceiling. NULL
+                # for operator-started runs and every pre-existing row.
+                conn.execute("ALTER TABLE workflow_run ADD COLUMN caller_id TEXT DEFAULT NULL")
+                logger.info("Migration: added caller_id column to workflow_run")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run migration skipped: {e}")
 
@@ -2019,6 +2031,13 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN model_honored BOOLEAN")
             conn.commit()
             logger.info("Migration: added model_honored column to terminals table")
+        if "delegate_tools" not in columns:
+            # Nullable on purpose: rows from before the column have no recorded
+            # ceiling and read back as None, which create_terminal treats as
+            # "bounded by its own allowed_tools" (utils/delegation.ceiling_from_row).
+            conn.execute("ALTER TABLE terminals ADD COLUMN delegate_tools TEXT")
+            conn.commit()
+            logger.info("Migration: added delegate_tools column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -2047,8 +2066,13 @@ def create_terminal(
     model_honored: Optional[bool] = None,
     initial_delivery: Optional[Dict[str, Any]] = None,
     description: Optional[str] = None,
+    delegate_tools: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
+
+    ``delegate_tools`` is the terminal's delegation ceiling as resolved and
+    capped by ``terminal_service.create_terminal``; it is persisted so children
+    of this terminal are bounded by the stored value rather than by a profile.
 
     ``idempotency_key``, when given, is persisted in the SAME ``SessionLocal``
     session as the terminal row -- one ``commit()``, so SQLite's single-writer
@@ -2096,6 +2120,7 @@ def create_terminal(
             # falsiness test stores it as SQL NULL, and every reader treats
             # NULL as "nothing resolved", which is unrestricted.
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools is not None else None,
+            delegate_tools=_json.dumps(delegate_tools) if delegate_tools is not None else None,
             shell_command=shell_command,
             caller_id=caller_id,
             engine=engine,
@@ -2134,6 +2159,7 @@ def create_terminal(
             "ephemeral": _is_ephemeral_terminal(db, str(terminal.id)),
             "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
+            "delegate_tools": delegate_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
             "engine": terminal.engine,
@@ -2233,6 +2259,10 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             f"Retrieved terminal metadata for {terminal_id}: provider={terminal.provider}, session={terminal.tmux_session}"
         )
         allowed_tools = _json.loads(terminal.allowed_tools) if terminal.allowed_tools else None
+        raw_delegate_tools = getattr(terminal, "delegate_tools", None)
+        delegate_tools = (
+            _json.loads(raw_delegate_tools) if isinstance(raw_delegate_tools, str) else None
+        )
         group = _json.loads(terminal.group) if terminal.group else None
         metadata = _json.loads(terminal.metadata_json) if terminal.metadata_json else None
         raw_deferred_failure = getattr(terminal, "deferred_init_failure_json", None)
@@ -2255,6 +2285,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "ephemeral": _is_ephemeral_terminal(db, str(terminal.id)),
             "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
+            "delegate_tools": delegate_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
             "engine": terminal.engine or ("v2" if terminal.provider == "kiro_cli" else None),

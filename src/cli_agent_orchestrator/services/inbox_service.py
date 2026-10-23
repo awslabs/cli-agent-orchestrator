@@ -31,7 +31,11 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import (
+    TerminalInputBlockedError,
+    TerminalInputBlockedReason,
+    TerminalStatus,
+)
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import terminal_service
@@ -165,10 +169,13 @@ class InboxService:
         Status comes from the StatusMonitor (the event-driven source of truth).
         Delivery normally happens on IDLE/COMPLETED; providers that accept input
         mid-turn (``accepts_input_while_processing``) also receive messages while
-        PROCESSING/WAITING_USER_ANSWER when ``EAGER_INBOX_DELIVERY`` is on (#251).
-        When a plugin registry is supplied, the originating sender and a
-        ``send_message`` orchestration type are threaded to ``terminal_service``
-        so ``PostSendMessageEvent`` hooks fire with correct attribution.
+        PROCESSING when ``EAGER_INBOX_DELIVERY`` is on (#251), and while
+        WAITING_USER_ANSWER unless the provider's choice widget would eat the
+        paste (``blocks_orchestrated_input_while_waiting_user_answer``, #896).
+        Every delivery is tagged with a ``send_message`` orchestration type so
+        ``terminal_service``'s own guards see machine-originated input (#896);
+        when a plugin registry is supplied the originating sender is threaded
+        too, so ``PostSendMessageEvent`` hooks fire with correct attribution.
 
         ``after_dispatch`` is called exactly once, as soon as the immediate
         dispatch decision is over: right after the paste reached the pane (BEFORE
@@ -223,6 +230,19 @@ class InboxService:
                 eager_eligible = provider is not None and getattr(
                     provider, "accepts_input_while_processing", False
                 )
+                # ...except into an open dialog on a provider whose choice widget
+                # EATS pasted text (#896). WAITING_USER_ANSWER on claude_code means
+                # an AskUserQuestion/approval dialog is up: the Ink Select consumes
+                # the paste as the answer and the trailing Enter submits whichever
+                # option is highlighted. The message would be marked DELIVERED, the
+                # agent would never see it, and a decision reserved for a human
+                # would have been made by an inbox message. The provider already
+                # declares this with the same property send_input's guard reads, so
+                # gate on the capability rather than banning the state outright.
+                if status == TerminalStatus.WAITING_USER_ANSWER and getattr(
+                    provider, "blocks_orchestrated_input_while_waiting_user_answer", False
+                ):
+                    eager_eligible = False
             if not eager_eligible:
                 return
             eager = True
@@ -255,7 +275,16 @@ class InboxService:
                 # swallowed Enter read as confirmed -- the exact failure this
                 # gate exists to catch.
                 if registry is None:
-                    boundary = terminal_service.dispatch_input(terminal_id, combined)
+                    # Still tagged send_message (#896) so dispatch_input's
+                    # WAITING_USER_ANSWER guard sees machine-originated input on
+                    # this path too; only the plugin attribution differs (no
+                    # registry means no PostSendMessageEvent, so sender_id has
+                    # nothing to attribute and is left off).
+                    boundary = terminal_service.dispatch_input(
+                        terminal_id,
+                        combined,
+                        orchestration_type=OrchestrationType.SEND_MESSAGE,
+                    )
                 else:
                     boundary = terminal_service.dispatch_input(
                         terminal_id,
@@ -317,6 +346,33 @@ class InboxService:
                     f"Pane not resolvable for terminal {terminal_id}; leaving "
                     f"{len(batch)} message(s) pending for retry: {e}"
                 )
+            except TerminalInputBlockedError as e:
+                # send_input's own guard refused. For a dialog this is transient
+                # -- the terminal flipped to WAITING_USER_ANSWER between the
+                # status gate above and the paste, and a human will answer it --
+                # so reset to PENDING for the reconcile sweep rather than FAILED,
+                # which would strand the message permanently (#896). The other
+                # raise site (provider process gone, status ERROR) is terminal:
+                # keep FAILED there, since no later sweep can ever deliver it.
+                #
+                # Branch on the exception's own reason, not a second status read:
+                # on herdr, status_monitor.get_status() shells out to the herdr CLI
+                # and returns UNKNOWN on any error, which would misclassify a
+                # provably-transient dialog refusal as FAILED and strand it anyway.
+                if e.reason == TerminalInputBlockedReason.WAITING_USER_ANSWER:
+                    for message in batch:
+                        update_message_status(message.id, MessageStatus.PENDING)
+                    logger.warning(
+                        f"Terminal {terminal_id} is waiting on a user answer; leaving "
+                        f"{len(batch)} message(s) pending for retry: {e}"
+                    )
+                else:
+                    for message in batch:
+                        logger.error(
+                            f"Delivery into terminal {terminal_id} refused for "
+                            f"message {message.id}: {e}"
+                        )
+                        update_message_status(message.id, MessageStatus.FAILED)
             except Exception as e:
                 for message in batch:
                     logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")

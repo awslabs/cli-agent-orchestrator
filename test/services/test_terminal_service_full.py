@@ -383,6 +383,8 @@ class TestCreateTerminal:
             idempotency_key=None,
             # No key supplied, so no fingerprint is computed (review on PR #634).
             request_fingerprint=None,
+            # Operator launch: the profile's own list is its delegation ceiling.
+            delegate_tools=["fs_read"],
         )
         assert mock_provider_manager.create_provider.call_args.args[5] == ["fs_read"]
 
@@ -502,8 +504,10 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.agent_profiles.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     async def test_create_terminal_persists_caller_id(
         self,
+        mock_caller_row,
         mock_load_profile,
         mock_gen_id,
         mock_gen_session,
@@ -517,6 +521,9 @@ class TestCreateTerminal:
         mock_delete_terminals_by_session,
     ):
         """caller_id reaches the database row and the returned Terminal (issue #284)."""
+        # The caller's stored row bounds the child; an unrestricted ceiling here
+        # keeps this test about persistence (test_delegation_ceiling.py covers the rule).
+        mock_caller_row.return_value = {"agent_profile": "supervisor", "delegate_tools": ["*"]}
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
@@ -2300,6 +2307,8 @@ class TestGetTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_terminal_success(self, mock_get_metadata, mock_status_monitor):
         """Test getting terminal successfully."""
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
         mock_get_metadata.return_value = {
             "id": "test1234",
             "tmux_window": "developer-abcd",
@@ -2309,7 +2318,9 @@ class TestGetTerminal:
             "session_incarnation_id": "inc-current",
             "last_active": datetime.now(),
         }
-        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_status_monitor.status_observation.return_value = StatusObservation(
+            TerminalStatus.IDLE, 1
+        )
 
         result = get_terminal("test1234")
 
@@ -2333,7 +2344,11 @@ class TestGetTerminal:
             "caller_id": None,
             "last_active": datetime.now(),
         }
-        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+        mock_status_monitor.status_observation.return_value = StatusObservation(
+            TerminalStatus.IDLE, 1
+        )
         with patch(
             "cli_agent_orchestrator.services.terminal_service.get_session_env",
             return_value={
@@ -2360,7 +2375,11 @@ class TestGetTerminal:
             "caller_id": "abcd1234",
             "last_active": datetime.now(),
         }
-        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+        mock_status_monitor.status_observation.return_value = StatusObservation(
+            TerminalStatus.IDLE, 1
+        )
         with patch(
             "cli_agent_orchestrator.services.terminal_service.get_session_env",
             return_value={"FOO": "bar"},
@@ -2380,6 +2399,8 @@ class TestGetTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_terminal_no_provider(self, mock_get_metadata, mock_status_monitor):
         """Test getting terminal returns status from status_monitor."""
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
         mock_get_metadata.return_value = {
             "id": "test1234",
             "tmux_window": "developer-abcd",
@@ -2388,7 +2409,9 @@ class TestGetTerminal:
             "agent_profile": "developer",
             "last_active": datetime.now(),
         }
-        mock_status_monitor.get_status.return_value = TerminalStatus.UNKNOWN
+        mock_status_monitor.status_observation.return_value = StatusObservation(
+            TerminalStatus.UNKNOWN, 0
+        )
 
         result = get_terminal("test1234")
 
@@ -2586,6 +2609,40 @@ class TestSendInput:
 
         assert "sending assign input" in str(exc_info.value)
         assert "OrchestrationType.ASSIGN" not in str(exc_info.value)
+        mock_tmux.send_keys.assert_not_called()
+        mock_update.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_blocks_send_message_when_provider_waits_for_user_answer(
+        self, mock_get_metadata, mock_tmux, mock_pm, mock_update, mock_status_monitor
+    ):
+        """Inbox (send_message) text must not answer an active provider prompt either (#896).
+
+        Before this fix the guard only covered ASSIGN/HANDOFF, so an inbox
+        delivery was pasted into an open AskUserQuestion dialog: the dialog ate
+        the text and the trailing Enter selected whichever option was
+        highlighted, while the message was marked DELIVERED.
+        """
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.blocks_orchestrated_input_while_waiting_user_answer = True
+        mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+
+        with pytest.raises(TerminalInputBlockedError, match="waiting for a user answer") as exc:
+            send_input(
+                "test1234",
+                "inbox message",
+                orchestration_type=OrchestrationType.SEND_MESSAGE,
+            )
+
+        assert "sending send_message input" in str(exc.value)
         mock_tmux.send_keys.assert_not_called()
         mock_update.assert_not_called()
 
@@ -4170,8 +4227,15 @@ class TestDeferredInitFailureNotification:
                 "update_terminal_deferred_init_external_owner",
                 database.update_terminal_deferred_init_external_owner,
             )
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
         monkeypatch.setattr(
             terminal_service.status_monitor, "get_status", lambda tid: TerminalStatus.ERROR
+        )
+        monkeypatch.setattr(
+            terminal_service.status_monitor,
+            "status_observation",
+            lambda tid: StatusObservation(TerminalStatus.ERROR, 1),
         )
 
         for _ in range(2):
@@ -4227,6 +4291,7 @@ class TestDeferredInitFailureNotification:
 
     def test_get_terminal_defers_external_error_until_failure_is_durable(self, monkeypatch):
         from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
 
         metadata = {
             "id": "worker99",
@@ -4245,6 +4310,7 @@ class TestDeferredInitFailureNotification:
         }
         monitor = MagicMock()
         monitor.get_status.return_value = TerminalStatus.ERROR
+        monitor.status_observation.return_value = StatusObservation(TerminalStatus.ERROR, 1)
         monkeypatch.setattr(terminal_service, "status_monitor", monitor)
         monkeypatch.setattr(
             terminal_service, "get_terminal_metadata", MagicMock(return_value=metadata)
@@ -4629,6 +4695,13 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
             return TerminalStatus.WAITING_USER_ANSWER
 
         mock_status_monitor.get_status.side_effect = fake_get_status
+
+        def fake_observation(terminal_id):
+            from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+            return StatusObservation(fake_get_status(terminal_id), 1)
+
+        mock_status_monitor.status_observation.side_effect = fake_observation
 
         def fake_send_input(terminal_id, message, **kwargs):
             # Stands in for dispatch_input's pre-dispatch work — most of it
@@ -5989,6 +6062,7 @@ class TestGetTerminalMasksPendingDelivery:
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_completable_status_reads_unknown_while_delivery_is_pending(self, mock_meta, raw):
         from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
 
         mock_meta.return_value = {
             "id": "pend5678",
@@ -6003,6 +6077,7 @@ class TestGetTerminalMasksPendingDelivery:
         }
         fake_monitor = MagicMock()
         fake_monitor.get_status.return_value = raw
+        fake_monitor.status_observation.return_value = StatusObservation(raw, 1)
         with (
             patch.object(terminal_service, "_pending_initial_delivery", {"pend5678"}),
             patch.object(terminal_service, "status_monitor", fake_monitor),
@@ -6014,6 +6089,7 @@ class TestGetTerminalMasksPendingDelivery:
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_status_is_unmasked_once_delivery_is_settled(self, mock_meta):
         from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
 
         mock_meta.return_value = {
             "id": "done5678",
@@ -6028,6 +6104,9 @@ class TestGetTerminalMasksPendingDelivery:
         }
         fake_monitor = MagicMock()
         fake_monitor.get_status.return_value = TerminalStatus.COMPLETED
+        fake_monitor.status_observation.return_value = StatusObservation(
+            TerminalStatus.COMPLETED, 1
+        )
         with (
             patch.object(terminal_service, "_pending_initial_delivery", set()),
             patch.object(terminal_service, "status_monitor", fake_monitor),

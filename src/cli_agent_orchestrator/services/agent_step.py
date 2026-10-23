@@ -452,8 +452,16 @@ async def run_agent_step(
     job_id: Optional[str] = None,
     claim_id: Optional[str] = None,
     description: Optional[str] = None,
+    delegating_terminal_id: Optional[str] = None,
+    caller_ceiling: Optional[list[str]] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
+
+    ``delegating_terminal_id`` and ``caller_ceiling`` are forwarded to
+    ``create_terminal`` unchanged; see its docstring. Workflow steps pass the
+    first (the terminal that started the run bounds every step's tools);
+    remote handoff passes the second (the supervisor's ceiling asserted from
+    another node). Both are ignored when a terminal is reused.
 
     Sequence:
       1. Create a terminal (or reuse ``reuse_terminal_id``).
@@ -700,6 +708,8 @@ async def run_agent_step(
             use_worktree=use_worktree,
             claim_id=claim_id,
             description=description,
+            delegating_terminal_id=delegating_terminal_id,
+            caller_ceiling=caller_ceiling,
         )
         terminal_id = terminal.id
 
@@ -785,6 +795,13 @@ async def run_agent_step(
     # gets the task re-delivered before the budget burns down. Raises
     # StepExecutionError on timeout/ERROR, or StepCancelledError if cancellation
     # fires mid-wait.
+    #
+    # LIVE SIBLING of #735, not fixed here (no lint reads this comment):
+    # _wait_for_completion polls status_monitor.get_status() and returns on the
+    # first COMPLETED after send_input discarded the boundary, so a step that
+    # reuses an existing terminal can settle on the previous turn's completion.
+    # Filed separately; gating it means threading dispatch_input's boundary
+    # through run_agent_step.
     try:
         await _wait_for_completion(terminal_id, timeout, cancel_event, prompt=prompt)
     except StepCancelledError:
