@@ -5,7 +5,7 @@ description = "Simulation-only ownership-zone transport with existing CAO CLI ag
 requires-python = ">=3.10"
 license = "Apache-2.0"
 dependencies = [
-    "fastmcp==4.1.0",
+    "fastmcp==4.1.2",
     "httpx2==2.13.1",
     "mujoco==3.16.0",
     "pydantic>=2.11,<3",
