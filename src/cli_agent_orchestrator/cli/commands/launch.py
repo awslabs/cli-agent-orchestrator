@@ -268,6 +268,7 @@ def launch(
 
         resolved_allowed_tools = None
         no_role_set = False
+        launch_profile = None
         if yolo:
             resolved_allowed_tools = ["*"]
         elif allowed_tools:
@@ -276,6 +277,7 @@ def launch(
             # Load profile to get role-based defaults
             try:
                 profile = load_agent_profile(agents)
+                launch_profile = profile
                 mcp_server_names = grantable_server_names(profile)
                 no_role_set = not profile.role and not profile.allowedTools
                 resolved_allowed_tools = resolve_allowed_tools(
@@ -285,6 +287,16 @@ def launch(
                 # Profile not found — use developer defaults (backward compatible)
                 no_role_set = True
                 resolved_allowed_tools = resolve_allowed_tools(None, None, None)
+        # The delegation ceiling the server will record for this terminal (what
+        # it may grant to workers it assigns/hands off to); see
+        # docs/tool-restrictions.md "Delegation ceiling".
+        from cli_agent_orchestrator.utils.delegation import resolve_delegate_tools
+
+        resolved_delegate_tools = resolve_delegate_tools(
+            getattr(launch_profile, "delegateTools", None),
+            getattr(launch_profile, "role", None),
+            resolved_allowed_tools,
+        )
 
         # Honour profile.provider whenever the user did not pass --provider
         # explicitly. This runs regardless of which permission-resolution
@@ -392,6 +404,7 @@ def launch(
                     f"\nAgent '{agents}' launching on {provider}:\n"
                     f"  Allowed:  {tool_summary}\n"
                     f"  Blocked:  {blocked_summary}\n"
+                    f"  Delegates: {format_tool_summary(resolved_delegate_tools)}\n"
                     f"  Enforcement: {describe_enforcement(provider, resolved_allowed_tools)}\n"
                     f"  Directory: {display_dir}\n"
                 )
@@ -505,6 +518,23 @@ def launch(
         click.echo(f"Session created: {terminal['session_name']}")
         click.echo(f"Terminal created: {terminal['name']}")
 
+        # --memory-manager: the sidecar is bounded by the primary's recorded
+        # delegation ceiling, and under a narrow primary the server refuses it.
+        # The refusal rides on the response (``memory_manager``) so it is said
+        # here, where the operator is, instead of only in the server log; the
+        # primary itself launched.
+        sidecar = terminal.get("memory_manager") if isinstance(terminal, dict) else None
+        if memory and isinstance(sidecar, dict) and sidecar.get("state") == "refused":
+            click.echo(
+                click.style(
+                    "  WARNING: the memory_manager sidecar was NOT launched.\n"
+                    f"  {sidecar.get('detail') or 'the server refused it'}\n"
+                    "  See docs/tool-restrictions.md (`cao launch --memory` needs a primary "
+                    "ceiling covering @cao-mcp-server, fs_read, fs_list).\n",
+                    fg="yellow",
+                )
+            )
+
         # Attach to tmux session unless headless. Wait for the provider to
         # finish initializing first — otherwise tmux attach races with the
         # TUI's input handler wiring, resizes the pty mid-init, and the TUI
@@ -580,7 +610,13 @@ def launch(
             # The task budget starts HERE, at confirmed delivery, so a slow but
             # successful init cannot eat into it. The terminal is no longer
             # masked, so ``poll_until_done``'s own working-then-idle gate judges
-            # completion on the task's activity only.
+            # completion on the task's activity only. No generation floor is
+            # passed: the message was dispatched by the server at creation, so
+            # there is no client-side dispatch boundary, and delivery was just
+            # confirmed on a status EARNED AFTER that dispatch
+            # (``_wait_for_post_dispatch_start``), so the latch already describes
+            # this turn and the previous frame cannot be read here (#735).
+            # staleness-ok: delivery confirmed server-side on a post-dispatch stamp
             poll_until_done(terminal["id"], timeout=_HEADLESS_TASK_TIMEOUT)
             output_resp = api_http.get(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/output",

@@ -4,7 +4,7 @@
   "targets": [
     "src/"
   ],
-  "total_errors": 177,
+  "total_errors": 175,
   "files": {
     "src/cli_agent_orchestrator/api/main.py": {
       "call-arg": 1
@@ -61,8 +61,7 @@
       "no-redef": 1
     },
     "src/cli_agent_orchestrator/services/terminal_service.py": {
-      "arg-type": 1,
-      "call-arg": 2
+      "arg-type": 1
     },
     "src/cli_agent_orchestrator/services/vault/migrate.py": {
       "arg-type": 9,
