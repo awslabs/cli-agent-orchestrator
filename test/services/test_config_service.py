@@ -548,3 +548,163 @@ class TestSetFailsClosedOverAnUnreadableFile:
         before = settings.read_bytes()
         ConfigService.get("logging.level")  # lenient read path, must not write
         assert settings.read_bytes() == before
+
+
+def test_config_set_get_explain_enabled(_isolated_settings, monkeypatch):
+    from click.testing import CliRunner
+
+    from cli_agent_orchestrator.cli.commands.config import config
+    from cli_agent_orchestrator.services.config_service import MemoryConfig
+
+    runner = CliRunner()
+    assert MemoryConfig().explain_enabled is True
+    assert ConfigService.get("memory.explain_enabled") is True
+    result = runner.invoke(config, ["set", "memory.explain_enabled", "false"])
+    assert result.exit_code == 0, result.output
+    assert runner.invoke(config, ["get", "memory.explain_enabled"]).output.strip() == "false"
+    assert (
+        json.loads(_isolated_settings["settings"].read_text())["memory"]["explain_enabled"] is False
+    )
+    assert ConfigService.list_all()["memory.explain_enabled"] is False
+    monkeypatch.setenv("CAO_MEMORY_EXPLAIN_ENABLED", "true")
+    assert ConfigService.get("memory.explain_enabled") is True
+
+
+@pytest.mark.parametrize(
+    "saved,env,expected",
+    [
+        ({}, {}, (True, False, False)),
+        (
+            {
+                "explain_enabled": False,
+                "non_accessing_inspection": True,
+                "lifecycle": {"enabled": True},
+            },
+            {},
+            (False, True, True),
+        ),
+        (
+            {
+                "explain_enabled": True,
+                "non_accessing_inspection": False,
+                "lifecycle": {"enabled": True},
+            },
+            {"CAO_MEMORY_EXPLAIN_ENABLED": "false", "CAO_MEMORY_NON_ACCESSING_INSPECTION": "true"},
+            (False, True, True),
+        ),
+        (
+            {
+                "explain_enabled": False,
+                "non_accessing_inspection": True,
+                "lifecycle": {"enabled": True},
+            },
+            {
+                "CAO_MEMORY_EXPLAIN_ENABLED": "true",
+                "CAO_MEMORY_NON_ACCESSING_INSPECTION": "false",
+                "CAO_MEMORY_LIFECYCLE_ENABLED": "false",
+            },
+            (True, False, False),
+        ),
+        (
+            {},
+            {
+                "CAO_MEMORY_EXPLAIN_ENABLED": "false",
+                "CAO_MEMORY_NON_ACCESSING_INSPECTION": "true",
+                "CAO_MEMORY_LIFECYCLE_ENABLED": "true",
+            },
+            (False, True, True),
+        ),
+        (
+            {"lifecycle": {"enabled": False}},
+            {"CAO_MEMORY_LIFECYCLE_ENABLED": "yes"},
+            (True, False, True),
+        ),
+        (
+            {
+                "explain_enabled": False,
+                "non_accessing_inspection": True,
+                "lifecycle": {"enabled": True},
+            },
+            {
+                "CAO_MEMORY_EXPLAIN_ENABLED": "",
+                "CAO_MEMORY_NON_ACCESSING_INSPECTION": "",
+                "CAO_MEMORY_LIFECYCLE_ENABLED": "",
+            },
+            (False, True, True),
+        ),
+        ({"lifecycle": {"enabled": "yes"}}, {}, (True, False, False)),
+        (
+            {
+                "lifecycle": {"enabled": True},
+                "explain_enabled": False,
+                "non_accessing_inspection": True,
+            },
+            {
+                "CAO_MEMORY_LIFECYCLE_ENABLED": "  ",
+                "CAO_MEMORY_EXPLAIN_ENABLED": "  ",
+                "CAO_MEMORY_NON_ACCESSING_INSPECTION": "  ",
+            },
+            (False, True, True),
+        ),
+        (
+            {"explain_enabled": "false", "non_accessing_inspection": "false"},
+            {},
+            (True, True, False),
+        ),
+        ({"explain_enabled": "maybe"}, {}, (True, False, False)),
+    ],
+)
+def test_typed_memory_config_matches_resolved_flags(
+    _isolated_settings, monkeypatch, saved, env, expected
+):
+    _isolated_settings["settings"].write_text(json.dumps({"memory": saved}))
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    memory = ConfigService.get_config().memory
+    actual = (memory.explain_enabled, memory.non_accessing_inspection, memory.lifecycle.enabled)
+    assert actual == expected
+    assert actual == tuple(
+        ConfigService.get(path)
+        for path in (
+            "memory.explain_enabled",
+            "memory.non_accessing_inspection",
+            "memory.lifecycle.enabled",
+        )
+    )
+    assert actual == (
+        settings_service.is_memory_explain_enabled(),
+        settings_service.is_non_accessing_inspection_enabled(),
+        settings_service.is_memory_lifecycle_enabled(),
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["memory.lifecycle.enabled", "memory.explain_enabled", "memory.non_accessing_inspection"],
+)
+@pytest.mark.parametrize("content", [b'{"memory": {"enabled": true,}}', b"\xff\xfe{}", b"null"])
+def test_memory_flag_cli_set_refuses_unreadable_settings(_isolated_settings, path, content):
+    """All #861 flags must use #997's fail-closed settings mutation."""
+    from click.testing import CliRunner
+
+    from cli_agent_orchestrator.cli.commands.config import config
+
+    settings = _isolated_settings["settings"]
+    settings.write_bytes(content)
+    result = CliRunner().invoke(config, ["set", path, "true"])
+    assert result.exit_code != 0, result.output
+    assert "could not be read" in result.output
+    assert "Nothing was written" in result.output
+    assert settings.read_bytes() == content
+
+
+def test_lifecycle_set_keeps_nested_and_top_level_siblings(_isolated_settings):
+    settings = _isolated_settings["settings"]
+    original = {
+        "terminal": {"backend": "tmux"},
+        "memory": {"enabled": True, "lifecycle": {"future_policy": "keep", "enabled": False}},
+    }
+    settings.write_text(json.dumps(original))
+    ConfigService.set("memory.lifecycle.enabled", True)
+    original["memory"]["lifecycle"]["enabled"] = True
+    assert json.loads(settings.read_text()) == original

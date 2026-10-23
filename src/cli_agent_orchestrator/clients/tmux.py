@@ -25,6 +25,7 @@ from cli_agent_orchestrator.backends.base import (
 from cli_agent_orchestrator.constants import (
     BRACKETED_PASTE_INCOMPATIBLE_SHELLS,
     SESSION_PREFIX,
+    TMUX_HISTORY_LIMIT,
     TMUX_HISTORY_LINES,
 )
 from cli_agent_orchestrator.utils import fifo_writer
@@ -639,6 +640,125 @@ class TmuxClient:
                 "; ".join(result.stderr) or f"tmux exited {result.returncode}",
             )
 
+    def _read_server_history_limit(self) -> Optional[int]:
+        """Read the shared server's current global ``history-limit``.
+
+        ``start-server ; show-options`` in ONE invocation, for the reason
+        :meth:`_set_server_exit_empty_off` documents: on a clean socket a bare
+        ``show-options`` finds no server and fails, and the caller could not
+        tell "nothing to preserve" from "could not tell". Starting the server
+        first also sources the operator's ``.tmux.conf``, so a ``history-limit
+        100000`` set there is read as the live value and preserved, instead of
+        being overwritten by the ``set-option`` that follows ``start-server``.
+
+        Returns ``None`` only when the read genuinely failed (nonzero exit, or
+        output that is not ``history-limit <int>``). The caller then leaves
+        the option alone: a failed read is not a licence to overwrite whatever
+        a live server has.
+        """
+        try:
+            result = self.server.cmd("start-server", ";", "show-options", "-g", "history-limit")
+        except Exception:
+            logger.warning("failed to read tmux option 'history-limit'", exc_info=True)
+            return None
+        if result.returncode != 0:
+            logger.warning(
+                "failed to read tmux option 'history-limit': %s",
+                "; ".join(result.stderr) or f"tmux exited {result.returncode}",
+            )
+            return None
+        for line in result.stdout or []:
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "history-limit":
+                try:
+                    return int(parts[1])
+                except ValueError:
+                    break
+        logger.warning("unparseable tmux 'history-limit' output: %r", result.stdout)
+        return None
+
+    def _set_server_history_limit(self) -> None:
+        """Raise the shared tmux server's global ``history-limit`` to CAO's floor.
+
+        CAO does not run its own tmux server -- :meth:`__init__` opens a plain
+        ``libtmux.Server()``, i.e. the operator's default shared server (see
+        the module-level note on ``kill_session``) -- so this is a FLOOR: a
+        value already at or above ``TMUX_HISTORY_LIMIT`` is left untouched,
+        and a lower one (tmux's 2000 default, or an operator's own lower
+        setting) IS raised. The option is global, so the operator's own new
+        windows and sessions on that server get the floor too; panes that
+        already exist keep the scrollback they have. An operator who wants a
+        smaller floor sets ``CAO_TMUX_HISTORY_LIMIT`` (0 disables the raise);
+        ``docs/tmux.md`` has the cost (about 38 MB of tmux memory for a pane
+        that fills 50000 lines of 100 characters, allocated lazily as output
+        arrives). If the current value cannot be read, nothing is set: a
+        failed read on a live server must not become an overwrite.
+
+        Why a floor at all: tmux keeps 2000 scrollback lines per pane by
+        default -- shallower than the deepest rung of ``get_output``'s
+        extraction escalation (5000 lines). Measured on tmux 3.2a against a
+        pane that had printed 3000 lines: ``-S -1000`` returned 1023 lines,
+        while BOTH ``-S -5000`` and ``-S -`` returned 2004, and the first
+        ~1000 lines were simply gone. So on a default server the top of the
+        ladder cannot reach further than the middle of it, and a long reply
+        plus the full-screen redraw burst a TUI emits at the end of a turn can
+        push the response marker out of scrollback -- the supervisor then gets
+        a truncated reply or nothing, and the worker's pane is torn down right
+        after (#728).
+
+        Set before ``new_session``, and again from :meth:`create_window` and
+        :meth:`create_pane`: the session those run against may never have had
+        the floor raised (created before this fix, or by a different process),
+        and whether an existing pane picks up a raised global at all depends
+        on the tmux version: from 3.7 it does, for output that arrives
+        afterwards ("When history-limit is changed, apply to existing panes",
+        tmux CHANGES, issue 4705; measured on 3.4 and 3.8); before 3.7 it keeps
+        the limit it was created with. Either way, lines a pane has already
+        discarded at 2000 do not come back, so the raise has to be in place
+        before the pane produces output -- that is, before it is created.
+
+        Same ``start-server ; set-option`` single-invocation idiom as
+        :meth:`_set_server_exit_empty_off`, and for the same reason: on a clean
+        socket a bare ``set-option`` finds no server and lands nowhere. Kept as
+        a separate invocation from that one so neither option's failure can
+        swallow the other's. Retried once on a nonzero result for the same
+        reason documented there (a create right after an external
+        ``kill-server`` can reach the dying old server). Best-effort: a
+        shallower scrollback degrades extraction, it does not prevent a
+        launch.
+        """
+        current = self._read_server_history_limit()
+        if current is None:
+            # Already logged by the read. Leave a live server's value alone.
+            return
+        if current >= TMUX_HISTORY_LIMIT:
+            return
+
+        try:
+            result = self.server.cmd(
+                "start-server", ";", "set-option", "-g", "history-limit", str(TMUX_HISTORY_LIMIT)
+            )
+            if result.returncode != 0:
+                time.sleep(self._EXIT_EMPTY_RETRY_DELAY_S)
+                result = self.server.cmd(
+                    "start-server",
+                    ";",
+                    "set-option",
+                    "-g",
+                    "history-limit",
+                    str(TMUX_HISTORY_LIMIT),
+                )
+        except Exception:
+            logger.warning("failed to set tmux option 'history-limit'", exc_info=True)
+            return
+
+        if result.returncode != 0:
+            logger.warning(
+                "failed to set tmux option 'history-limit %d': %s",
+                TMUX_HISTORY_LIMIT,
+                "; ".join(result.stderr) or f"tmux exited {result.returncode}",
+            )
+
     # ── libtmux listing boundary ─────────────────────────────────────────
     #
     # Every read that makes libtmux shell out to `list-sessions` /
@@ -1089,6 +1209,10 @@ class TmuxClient:
             # mass teardown (harness-control#845). Runs before new_session, and
             # starts the server if it isn't up yet.
             self._set_server_exit_empty_off()
+            # Deepen scrollback BEFORE new_session: the session's first pane is
+            # an agent terminal, and lines it discards at the 2000 default
+            # before the raise do not come back (#728).
+            self._set_server_history_limit()
 
             working_directory = self._resolve_and_validate_working_directory(working_directory)
 
@@ -1275,6 +1399,12 @@ class TmuxClient:
         the web UI inherit the same context as the supervisor. See issue #248.
         """
         try:
+            # The server's global history-limit may still be at tmux's 2000
+            # default if this session predates the fix for #728 (or was
+            # created by a different process entirely). Raise it before the
+            # window exists so none of its output is discarded at 2000.
+            self._set_server_history_limit()
+
             working_directory = self._resolve_and_validate_working_directory(working_directory)
 
             session = self._find_session(session_name)
@@ -1448,6 +1578,10 @@ class TmuxClient:
                     f"Unknown pane layout '{pane_layout}'; expected one of "
                     f"{', '.join(sorted(PANE_LAYOUTS))}"
                 )
+            # See create_window(): a session that predates the fix for #728
+            # needs the floor raised before this pane exists as well.
+            self._set_server_history_limit()
+
             working_directory = self._resolve_and_validate_working_directory(working_directory)
 
             session = self._find_session(session_name)
