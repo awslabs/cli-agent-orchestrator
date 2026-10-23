@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Inbox deliveries confirm the submit and recover a swallowed Enter** (#78). A delivery is
+  paste, delay, Enter; when the TUI swallows the Enter the message sat unsubmitted while the
+  terminal still read IDLE, so the sender waited forever and the next message was pasted on top
+  of the first. The inbox now waits for a post-dispatch started status and, when it does not come,
+  sends a bare Enter if the provider can read its composer (`codex`, `claude_code`, `kiro_cli`),
+  re-sends in full only when the composer is known to be empty and the provider has a direct
+  probe, and otherwise logs the drop. A dropped delivery holds that one terminal's inbox for up
+  to 24s; other terminals, the sweeps and the inbox POST are not held. New env var
+  `CAO_INBOX_SUBMIT_CONFIRMATION` (default `true`) turns the confirmation off.
+
 - **The MCP server sent no bearer on 14 of its calls to the local API** (#990). Ten
   `requests` calls in `mcp_server/server.py` reached scope-guarded routes with no
   `Authorization` header, so on an auth-enabled server each one got `401`. Two were

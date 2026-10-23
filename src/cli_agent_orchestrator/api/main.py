@@ -70,6 +70,7 @@ from cli_agent_orchestrator.constants import (
     CORS_ORIGINS,
     DEFAULT_PROVIDER,
     HANDOFF_RESULTS_ROUTE,
+    INBOX_IMMEDIATE_DELIVERY_WAIT,
     INBOX_POLLING_INTERVAL,
     INBOX_RECONCILE_INTERVAL,
     MODEL_ID_MAX_LEN,
@@ -8043,15 +8044,48 @@ async def create_inbox_message_endpoint(
 
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.
-    try:
-        # deliver_pending reads status_monitor.get_status() (which can fork a tmux
-        # capture-pane via the stale-PROCESSING fallback) and, on delivery, paste-bombs
-        # the pane — blocking I/O either way, so keep it off the event loop.
-        await asyncio.to_thread(
-            inbox_service.deliver_pending, receiver_id, registry=get_plugin_registry(request)
+    #
+    # deliver_pending reads status_monitor.get_status() (which can fork a tmux
+    # capture-pane via the stale-PROCESSING fallback), paste-bombs the pane on
+    # delivery, and then waits for the receiver to confirm the submit (#78) --
+    # blocking I/O throughout, so it runs on a worker thread. The response does
+    # NOT wait for that confirmation: the message is stored, so a reply of
+    # success is already true, and a sender held past its own HTTP timeout
+    # (30s default) would be tempted to send the message again (PR #1004
+    # review, P2-2). We wait only until the paste has reached the pane, and
+    # only up to INBOX_IMMEDIATE_DELIVERY_WAIT; the attempt itself keeps running
+    # in the background either way.
+    loop = asyncio.get_running_loop()
+    dispatched = asyncio.Event()
+
+    def _mark_dispatched() -> None:
+        loop.call_soon_threadsafe(dispatched.set)
+
+    delivery = asyncio.create_task(
+        asyncio.to_thread(
+            inbox_service.deliver_pending,
+            receiver_id,
+            registry=get_plugin_registry(request),
+            after_dispatch=_mark_dispatched,
         )
-    except Exception as e:
-        logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
+    )
+
+    def _log_outcome(task: "asyncio.Task[None]") -> None:
+        if not task.cancelled() and task.exception() is not None:
+            logger.warning(
+                f"Immediate delivery attempt failed for {receiver_id}: {task.exception()}"
+            )
+
+    delivery.add_done_callback(_log_outcome)
+    try:
+        await asyncio.wait_for(dispatched.wait(), timeout=INBOX_IMMEDIATE_DELIVERY_WAIT)
+    except asyncio.TimeoutError:
+        logger.debug(
+            "Immediate delivery attempt for %s still waiting after %ss; answering "
+            "while it continues in the background",
+            receiver_id,
+            INBOX_IMMEDIATE_DELIVERY_WAIT,
+        )
 
     return {
         "success": True,
