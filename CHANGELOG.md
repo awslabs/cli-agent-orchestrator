@@ -222,6 +222,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Ephemeral profiles explicitly omit the inherited skill catalog while keeping named skill
+  loading available. Every live-profile load verifies the parsed bytes against the registry
+  hash and fails closed on missing or modified data, including claim-less launches and provider
+  reloads. `workflow_cancel` now requires `ephemeral.child_may_delegate` for ephemeral callers;
+  the guide also reflects terminal-target binding for MCP messaging, answers and deletion (#801).
+
 - Every client call that creates a session or terminal synchronously (`cao launch` without
   `--headless`, `cao agent handoff`, the `launch_agent` app gesture and the `cao-ops`
   `launch_session` tool without a message) now sizes its wait from `provider_init_timeout`

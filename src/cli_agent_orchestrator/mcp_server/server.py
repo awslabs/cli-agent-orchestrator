@@ -1630,6 +1630,7 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
         "workflow_run",
         "workflow_resume",
         "workflow_start",
+        "workflow_cancel",
     }:
         try:
             from cli_agent_orchestrator.services.settings_service import child_may_delegate
@@ -2759,6 +2760,10 @@ async def workflow_cancel(
     cancel is cooperative: the in-flight step runs to natural completion before the
     run settles to CANCELLED.
     """
+    denied = await asyncio.to_thread(_tool_denied_reason, "workflow_cancel")
+    if denied:
+        return {"ok": False, "error": denied}
+
     try:
         response = requests.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/cancel",

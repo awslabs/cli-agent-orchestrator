@@ -46,6 +46,8 @@ def load_launch_profile(name: str) -> tuple[AgentProfile, ProfileSource]:
     """Load a launch profile; reserved names never fall back to installed stores."""
     if not routes_to_ephemeral_store(name):
         return load_agent_profile(name), ProfileSource.INSTALLED
+    from cli_agent_orchestrator.clients import database
+
     try:
         path = _safe_join(EPHEMERAL_LIVE_DIR, f"{name}.md")
         if path is None:
@@ -58,7 +60,12 @@ def load_launch_profile(name: str) -> tuple[AgentProfile, ProfileSource]:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise OSError("ephemeral store file is unsafe")
             with os.fdopen(fd, "rb", closefd=False) as stream:
-                profile = parse_agent_profile_text(stream.read().decode("utf-8"), name)
+                payload = stream.read()
+            row = database.get_ephemeral_agent(name)
+            if row is None or hashlib.sha256(payload).hexdigest() != row.get("profile_sha256"):
+                raise ValueError("live profile integrity check failed")
+            # Parse exactly the bytes verified above, never a second file read.
+            profile = parse_agent_profile_text(payload.decode("utf-8"), name)
         finally:
             os.close(fd)
     except Exception as exc:
