@@ -4262,20 +4262,44 @@ async def send_terminal_input(
     orchestration_type: Optional[OrchestrationType] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
+    """Paste a message into a terminal and name the turn it starts.
+
+    ``dispatch_boundary`` is ``status_monitor.output_generation()`` sampled inside
+    the dispatch, after the monitor is armed and the rolling buffer cleared but
+    before any key reaches the pane. A client that must know whether a later
+    reading describes THIS send compares it against the ``status_generation`` on
+    ``GET /terminals/{id}``: only a status earned at a strictly greater generation
+    is evidence for this turn. Without it a caller cannot distinguish the previous
+    turn's COMPLETED, still latched because ``notify_input_sent`` deliberately
+    leaves ``_last_status`` alone, from this turn finishing — the #735/#407 defect.
+
+    ``success`` is unchanged and still first in the body, so existing clients that
+    read only that key are unaffected.
+    """
     try:
-        # send_input is blocking tmux I/O (bracketed paste + key sends). Run it
+        # dispatch_input is blocking tmux I/O (bracketed paste + key sends). Run it
         # off the event loop so a slow tmux call can't freeze every other
         # request — including /health and concurrent assign/handoff. Same
         # hazard class as issue #382 (only fixed for DELETE /sessions there).
-        success = await asyncio.to_thread(
-            terminal_service.send_input,
+        #
+        # Called instead of the ``send_input`` bool wrapper purely to keep the
+        # boundary it computes; the behaviour is identical.
+        boundary: Optional[int] = await asyncio.to_thread(
+            terminal_service.dispatch_input,
             terminal_id,
             message,
             registry=get_plugin_registry(request),
             sender_id=sender_id,
             orchestration_type=orchestration_type,
         )
-        return {"success": success}
+        # Event-inbox backends (herdr) never advance the output generation, so
+        # dispatch_input's boundary is always the meaningless int 0 for them —
+        # naming it would make the CLI skip its 3-second grace sleep while
+        # GET /terminals/{id}'s status_generation (None, for the same reason)
+        # never engages the poll gate either. Report no boundary at all.
+        if get_backend().supports_event_inbox():
+            boundary = None
+        return {"success": True, "dispatch_boundary": boundary}
     except TerminalInputBlockedError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
@@ -6109,10 +6133,16 @@ async def submit_workflow_run_endpoint(
         manifest_json = frozen.manifest_json
         try:
             # Keep the admission snapshot even if the profile set changes during
-            # the gate. Preserve the gate's refusal precedence on capture failure.
+            # the gate: the guard is built from the SAME profile-set read the plan_id
+            # was computed from (PR #1000, P3-3). Preserve the gate's refusal
+            # precedence on capture failure.
             capture_error = None
             try:
-                guard = await asyncio.to_thread(launch_guard.capture)
+                # Called inside the lambda, not passed to to_thread as a value, so the
+                # call-site lint (test_callsite_lint_rules rule 4) can see the keyword.
+                guard = await asyncio.to_thread(
+                    lambda: launch_guard.capture(profile_set=frozen.profile_set)
+                )
             except approval_gate.PlanIdentityUnavailableError as exc:
                 capture_error = exc
             approval_gate.ensure_plan_approved(

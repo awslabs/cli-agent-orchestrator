@@ -2300,6 +2300,8 @@ class TestGetTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_terminal_success(self, mock_get_metadata, mock_status_monitor):
         """Test getting terminal successfully."""
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
         mock_get_metadata.return_value = {
             "id": "test1234",
             "tmux_window": "developer-abcd",
@@ -2309,7 +2311,9 @@ class TestGetTerminal:
             "session_incarnation_id": "inc-current",
             "last_active": datetime.now(),
         }
-        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_status_monitor.status_observation.return_value = StatusObservation(
+            TerminalStatus.IDLE, 1
+        )
 
         result = get_terminal("test1234")
 
@@ -2333,7 +2337,11 @@ class TestGetTerminal:
             "caller_id": None,
             "last_active": datetime.now(),
         }
-        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+        mock_status_monitor.status_observation.return_value = StatusObservation(
+            TerminalStatus.IDLE, 1
+        )
         with patch(
             "cli_agent_orchestrator.services.terminal_service.get_session_env",
             return_value={
@@ -2360,7 +2368,11 @@ class TestGetTerminal:
             "caller_id": "abcd1234",
             "last_active": datetime.now(),
         }
-        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+        mock_status_monitor.status_observation.return_value = StatusObservation(
+            TerminalStatus.IDLE, 1
+        )
         with patch(
             "cli_agent_orchestrator.services.terminal_service.get_session_env",
             return_value={"FOO": "bar"},
@@ -2380,6 +2392,8 @@ class TestGetTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_terminal_no_provider(self, mock_get_metadata, mock_status_monitor):
         """Test getting terminal returns status from status_monitor."""
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
         mock_get_metadata.return_value = {
             "id": "test1234",
             "tmux_window": "developer-abcd",
@@ -2388,7 +2402,9 @@ class TestGetTerminal:
             "agent_profile": "developer",
             "last_active": datetime.now(),
         }
-        mock_status_monitor.get_status.return_value = TerminalStatus.UNKNOWN
+        mock_status_monitor.status_observation.return_value = StatusObservation(
+            TerminalStatus.UNKNOWN, 0
+        )
 
         result = get_terminal("test1234")
 
@@ -4204,8 +4220,15 @@ class TestDeferredInitFailureNotification:
                 "update_terminal_deferred_init_external_owner",
                 database.update_terminal_deferred_init_external_owner,
             )
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
         monkeypatch.setattr(
             terminal_service.status_monitor, "get_status", lambda tid: TerminalStatus.ERROR
+        )
+        monkeypatch.setattr(
+            terminal_service.status_monitor,
+            "status_observation",
+            lambda tid: StatusObservation(TerminalStatus.ERROR, 1),
         )
 
         for _ in range(2):
@@ -4261,6 +4284,7 @@ class TestDeferredInitFailureNotification:
 
     def test_get_terminal_defers_external_error_until_failure_is_durable(self, monkeypatch):
         from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
 
         metadata = {
             "id": "worker99",
@@ -4279,6 +4303,7 @@ class TestDeferredInitFailureNotification:
         }
         monitor = MagicMock()
         monitor.get_status.return_value = TerminalStatus.ERROR
+        monitor.status_observation.return_value = StatusObservation(TerminalStatus.ERROR, 1)
         monkeypatch.setattr(terminal_service, "status_monitor", monitor)
         monkeypatch.setattr(
             terminal_service, "get_terminal_metadata", MagicMock(return_value=metadata)
@@ -4663,6 +4688,13 @@ class TestDeferredDeliveryNotCompletableBeforeDispatch:
             return TerminalStatus.WAITING_USER_ANSWER
 
         mock_status_monitor.get_status.side_effect = fake_get_status
+
+        def fake_observation(terminal_id):
+            from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+            return StatusObservation(fake_get_status(terminal_id), 1)
+
+        mock_status_monitor.status_observation.side_effect = fake_observation
 
         def fake_send_input(terminal_id, message, **kwargs):
             # Stands in for dispatch_input's pre-dispatch work — most of it
@@ -6023,6 +6055,7 @@ class TestGetTerminalMasksPendingDelivery:
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_completable_status_reads_unknown_while_delivery_is_pending(self, mock_meta, raw):
         from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
 
         mock_meta.return_value = {
             "id": "pend5678",
@@ -6037,6 +6070,7 @@ class TestGetTerminalMasksPendingDelivery:
         }
         fake_monitor = MagicMock()
         fake_monitor.get_status.return_value = raw
+        fake_monitor.status_observation.return_value = StatusObservation(raw, 1)
         with (
             patch.object(terminal_service, "_pending_initial_delivery", {"pend5678"}),
             patch.object(terminal_service, "status_monitor", fake_monitor),
@@ -6048,6 +6082,7 @@ class TestGetTerminalMasksPendingDelivery:
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_status_is_unmasked_once_delivery_is_settled(self, mock_meta):
         from cli_agent_orchestrator.services import terminal_service
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
 
         mock_meta.return_value = {
             "id": "done5678",
@@ -6062,6 +6097,9 @@ class TestGetTerminalMasksPendingDelivery:
         }
         fake_monitor = MagicMock()
         fake_monitor.get_status.return_value = TerminalStatus.COMPLETED
+        fake_monitor.status_observation.return_value = StatusObservation(
+            TerminalStatus.COMPLETED, 1
+        )
         with (
             patch.object(terminal_service, "_pending_initial_delivery", set()),
             patch.object(terminal_service, "status_monitor", fake_monitor),

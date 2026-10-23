@@ -41,6 +41,7 @@ import yaml
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import (
+    SCRIPT_LINT_MAX_SOURCE_CHARS,
     WORKFLOW_INPUT_TYPES,
     WORKFLOW_MAX_SPEC_BYTES,
     WORKFLOW_NAME_RE,
@@ -891,13 +892,41 @@ def _extract_inputs(source: str) -> Dict[str, InputDecl]:
       literal with keys ``⊆ {type, required, default}``; ``type`` one of
       ``WORKFLOW_INPUT_TYPES``; a default whose type disagrees with ``type`` is a
       ``ValueError`` (reuses the shared author-time ``_default_matches_type``).
+
+    Bounded on its own (#969, #970 review P2-1): a source over
+    ``SCRIPT_LINT_MAX_SOURCE_CHARS`` is refused before ``ast.parse`` runs. Both real
+    callers (``_read_script_spec``, ``_validated_script_spec``) run ``lint_script``
+    first and skip or refuse on its oversize ``syntax`` finding, so in practice this
+    check does not fire -- but "lint runs first" is a coupling between two functions,
+    not a bound, and on CPython 3.10 a parse past the host's C-stack cliff segfaults
+    with no exception to convert. 256 KiB of ``a.b.b...`` (the most the read path's
+    byte budget admits) is past that cliff on every 3.10 host measured. Same unit
+    (characters) and same constant as the linter's cap, so the two parser entry
+    points can never disagree about which source is admissible;
+    ``test_ast_parse_depth_guard.py`` checks that a comparison against the constant
+    precedes every parser call in ``src/``.
+
+    The ``RecursionError``/``MemoryError`` arms below cover what the bound admits:
+    CPython 3.11+ gates the AST build and raises ``RecursionError`` well under the
+    cap, and a right-recursive construct (a chain of unary operators) overflows the
+    parser's fixed stack with ``MemoryError`` at about 6,000 levels on every
+    supported minor.
     """
+    if len(source) > SCRIPT_LINT_MAX_SOURCE_CHARS:
+        raise ValueError(
+            f"workflow script is {len(source)} characters, over the "
+            f"{SCRIPT_LINT_MAX_SOURCE_CHARS}-character limit; split it into smaller scripts"
+        )
     try:
         tree = ast.parse(source)
     except SyntaxError as e:
         # SyntaxError is not a ValueError subclass; map it so the run-route
         # boundary (ValueError -> 400) and rebuild's ``except ValueError`` catch it.
         raise ValueError(f"malformed workflow script: {e}") from e
+    except RecursionError as e:
+        raise ValueError(f"workflow script is too deeply nested to parse: {e}") from e
+    except MemoryError as e:
+        raise ValueError(f"workflow script is too complex to parse: {e}") from e
 
     inputs_node: Optional[ast.expr] = None
     for stmt in tree.body:  # module-level statements only (no nested scopes)
@@ -1074,14 +1103,31 @@ def _validated_script_spec(name: str, source: str, target_path: str) -> ScriptSp
     its finding intact, and it is unreachable here because a syntax error is an ERROR
     finding that the gate refuses first (TS-3A3-5).
 
+    The ``WORKFLOW_MAX_SPEC_BYTES`` check runs BEFORE ``lint_script``, not after: both
+    caps reject oversize input, but they are different budgets with different public
+    messages (#969/#970), and ``SCRIPT_LINT_MAX_SOURCE_CHARS`` (128 KiB) is smaller than
+    ``WORKFLOW_MAX_SPEC_BYTES`` (256 KiB). Linting first would mean a spec over 256 KiB
+    surfaces the lint cap's "syntax" finding instead of the stable "spec exceeds N bytes"
+    error callers already depend on. A spec between 128 and 256 KiB passes the byte
+    budget and is refused by the lint cap, whose finding names the size and the limit.
+
     Raises:
-        ValueError: a lint ERROR, or a malformed ``INPUTS`` literal. Lint findings
-            travel on the message rather than in a new exception type (TS-3A3-6).
+        ValueError: over the byte cap, a lint ERROR, or a malformed ``INPUTS`` literal.
+            Lint findings travel on the message rather than in a new exception type
+            (TS-3A3-6).
     """
+    if len(source.encode("utf-8")) > WORKFLOW_MAX_SPEC_BYTES:
+        raise ValueError(f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)")
     result = lint_script(source, target_path)
     if result.status == "fail":
+        # rule_id, line AND message: this string is the 400 detail of POST /workflows and
+        # PUT /workflows/{name}, and without the message a valid-but-oversize script showed
+        # only "syntax (line 1)" with no way to learn about the character limit (#970
+        # review P3-1). The validate route already returns the full finding.
         errors = "; ".join(
-            f"{f.rule_id} (line {f.line})" for f in result.findings if f.severity == "error"
+            f"{f.rule_id} (line {f.line}): {f.message}"
+            for f in result.findings
+            if f.severity == "error"
         )
         raise ValueError(f"workflow '{name}' has lint errors and would not be runnable: {errors}")
     inputs = _extract_inputs(source)  # AST-only; never executes the module (SR-3A3-8)

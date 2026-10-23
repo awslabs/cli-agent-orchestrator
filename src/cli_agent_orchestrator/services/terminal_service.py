@@ -76,12 +76,14 @@ from cli_agent_orchestrator.constants import (
     PIPE_LIVENESS_TAIL_LINES,
     SESSION_PREFIX,
     TERMINAL_LOG_DIR,
+    TURN_START_CONFIRM_SECONDS,
 )
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
+    ProviderExitedInputBlockedError,
     Terminal,
     TerminalInputBlockedError,
     TerminalInputBlockedReason,
@@ -2950,7 +2952,9 @@ async def _surface_deferred_init_failure(
 # never started and NO exception raised — the supervisor then waits on a
 # callback that can never arrive. Confirm the worker actually began processing
 # and re-submit if it did not.
-_DEFERRED_SUBMIT_CONFIRM_TIMEOUT = 8.0  # per-attempt wait for the PROCESSING edge
+_DEFERRED_SUBMIT_CONFIRM_TIMEOUT = (
+    TURN_START_CONFIRM_SECONDS  # per-attempt wait for the PROCESSING edge
+)
 _DEFERRED_SUBMIT_MAX_RESUBMITS = 3
 # Statuses proving the worker accepted the task (left the ready IDLE state).
 # WAITING_USER_ANSWER counts: the worker consumed the input and is now asking.
@@ -3497,6 +3501,12 @@ def _schedule_deferred_init(
 
     async def _run() -> None:
         caller_id: Optional[str] = initial_caller_id
+        # Whether the first dispatch_input() returned, i.e. the task was pasted
+        # at least once. A provider-exited refusal before that point means
+        # nothing was typed; one after it (a refused resubmit) means the task
+        # went into the pane once already and its effect is unknown (#1018
+        # review round 2, P3).
+        task_dispatched = False
         try:
             await provider_instance.initialize()
             shell_command = provider_instance.shell_baseline
@@ -3552,6 +3562,7 @@ def _schedule_deferred_init(
                     sender_id=caller_id,
                     orchestration_type=effective_orchestration_type,
                 )
+                task_dispatched = True
                 # The pending mark is deliberately NOT released here.
                 #
                 # Round-4 review (haofeif), P1. An earlier revision cleared it at
@@ -3686,6 +3697,47 @@ def _schedule_deferred_init(
                 # delivered never sees an unmasked status first (#566).
                 await asyncio.to_thread(_persist_initial_delivery, terminal_id, "delivered")
             await _clear_deferred_init_external_owner(terminal_id)
+        except ProviderExitedInputBlockedError as e:
+            # Caught BEFORE the TerminalInputBlockedError branch below, whose
+            # "alive, parked on a prompt, keep it" handling is wrong for this
+            # case (#1018 review, P2-2): the delivery guard refused because the
+            # provider process is gone -- status ERROR, or the pane's foreground
+            # process is the pre-launch shell again. There is no prompt to
+            # answer (answer_user_prompt refuses, the status is not
+            # WAITING_USER_ANSWER), a re-send is refused the same way, and the
+            # pane is a bare shell. Treat it as the startup failure it is: tear
+            # the worker down and tell the caller the provider exited.
+            #
+            # Two refusals land here and they must not be described the same
+            # way (#1018 review round 2, P3). Before the first dispatch_input()
+            # returned, nothing was typed. After it -- the confirm loop's
+            # resubmit was refused -- the task was pasted once already, into the
+            # provider or, if it stopped inside the check-then-send window, into
+            # the shell, and the message must not invite the supervisor to
+            # assign it again as if it never ran. The guard's own text says
+            # "may have exited" for the ERROR case; neither message claims more.
+            if task_dispatched:
+                kind = "provider_exited_after_dispatch"
+                detail = (
+                    f"Worker {terminal_id} provider process stopped after the task had been "
+                    f"typed once; a re-delivery was refused. The task's effect is unknown: "
+                    f"inspect the worker's output before assigning it again. {e}"
+                )
+            else:
+                kind = "provider_exited"
+                detail = (
+                    f"Worker {terminal_id} provider process exited before the task could be "
+                    f"delivered; nothing was typed into the pane. {e}"
+                )
+            logger.error("Deferred init for terminal %s: %s", terminal_id, detail)
+            await _surface_deferred_init_failure(
+                terminal_id,
+                kind=kind,
+                message=detail,
+                exception_type=type(e).__name__,
+                registry=registry,
+                delete_on_failure=delete_on_failure,
+            )
         except TerminalInputBlockedError as e:
             # The worker initialized but is parked on an interactive prompt
             # (WAITING_USER_ANSWER). It is alive and can be driven via
@@ -3861,8 +3913,33 @@ def get_terminal(terminal_id: str) -> Dict:
         # unlike StatusMonitor's in-memory latch.
         if deferred_failure is not None:
             status = TerminalStatus.ERROR.value
+            # A durable failure marker is not earned from terminal output, so it
+            # carries no generation; a client must not be able to read it as
+            # evidence for the send it just made. ERROR is honoured by the CLI
+            # gate whatever the generations say, so the counter is not needed.
+            status_generation: Optional[int] = None
+            output_generation: Optional[int] = None
         else:
-            observed_status = status_monitor.get_status(terminal_id)
+            # Read the status and the generation it was earned at as one pair
+            # (status_observation), not two separate lock acquisitions -- a
+            # detector applying this turn's PROCESSING between two separate
+            # reads would otherwise pair the previous turn's COMPLETED with
+            # the new turn's generation, defeating the #735 gate it feeds.
+            observation = status_monitor.status_observation(terminal_id)
+            observed_status = observation.status
+            status_generation = observation.output_generation
+            # The current counter, read AFTER the observation so it is never
+            # older than the stamp it is reported with. It lets a client tell
+            # "nothing has landed since my send" from "output landed but the
+            # status was never re-earned" -- the latch does not re-stamp
+            # COMPLETED -> COMPLETED or the COMPLETED -> IDLE -> COMPLETED
+            # round trip, so a fast turn can finish with the stamp still at
+            # the previous turn's value, and a client that refused that reading
+            # unconditionally waited out its whole timeout (#735 review, P2-2).
+            # None exactly when the stamp is None (event-inbox backends).
+            output_generation = (
+                None if status_generation is None else status_monitor.output_generation(terminal_id)
+            )
             # External deferred initialization has a short two-phase window:
             # the provider can render ERROR before the background init task has
             # durably written ``deferred_init_failure``. Publishing that
@@ -3903,6 +3980,8 @@ def get_terminal(terminal_id: str) -> Dict:
             "initial_delivery": metadata.get("initial_delivery"),
             "session_incarnation_id": metadata.get("session_incarnation_id"),
             "status": status,
+            "status_generation": status_generation,
+            "output_generation": output_generation,
             "last_active": metadata["last_active"],
         }
 
@@ -4049,6 +4128,74 @@ def send_input(
     return True
 
 
+def _pane_back_at_shell(provider: Any, metadata: Dict[str, Any]) -> Optional[str]:
+    """Return the shell's name when the pane's foreground process is the pre-launch shell again.
+
+    The baseline is the provider's ``shell_baseline`` (captured by its
+    ``initialize()`` before it launched the CLI) or, for a provider rebuilt after
+    a cao-server restart, the ``shell_command`` persisted with the terminal.
+    With neither there is nothing to compare against and the answer is None:
+    providers that do not record a baseline keep the status-only guard. A
+    failed lookup is also None -- it is not evidence of an exit, and the
+    status guard still applies -- but it is logged, because silently skipping a
+    safety check is how #1018 happened in the first place.
+    """
+    baseline = getattr(provider, "shell_baseline", None) if provider is not None else None
+    if not isinstance(baseline, str) or not baseline:
+        baseline = metadata.get("shell_command")
+    if not isinstance(baseline, str) or not baseline:
+        return None
+    try:
+        current = get_backend().get_pane_current_command(
+            metadata["tmux_session"], metadata["tmux_window"]
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed probe must not block delivery
+        logger.warning(
+            "Could not read the pane's foreground process before delivering input (%r); "
+            "relying on the status guard alone",
+            exc,
+        )
+        return None
+    if isinstance(current, str) and current == baseline:
+        return baseline
+    return None
+
+
+def _refuse_if_provider_gone(terminal_id: str, provider: Any, metadata: Dict[str, Any]) -> None:
+    """Raise ``TerminalInputBlockedError`` unless the terminal can safely receive typed input.
+
+    Called immediately before the keystroke is sent (#1018). Two independent
+    checks, either of which refuses:
+
+    1. The monitor's current status is ERROR -- the same guard that already ran
+       at the top of ``dispatch_input``, re-read now because the first read is
+       stale by the time we type (the reporter measured 150 ms between readiness
+       and ERROR, and 700 ms more before the send).
+    2. The pane's foreground process is the shell that was running before the
+       CLI launched. This does not consult the provider's own ``get_status`` or
+       its ``_initialized`` flag, so it holds during startup, after a restart,
+       and for every provider that records a baseline, whatever its frame parser
+       made of the pane.
+    """
+    if status_monitor.get_status(terminal_id) == TerminalStatus.ERROR:
+        raise ProviderExitedInputBlockedError(
+            f"Terminal {terminal_id} provider is in ERROR state "
+            "(provider process may have exited). Refusing to deliver input."
+        )
+    shell = _pane_back_at_shell(provider, metadata)
+    if shell is not None:
+        logger.error(
+            "Terminal %s: the pane's foreground process is the shell (%s) that was running "
+            "before the provider launched; the provider has exited. Refusing to deliver input.",
+            terminal_id,
+            shell,
+        )
+        raise ProviderExitedInputBlockedError(
+            f"Terminal {terminal_id} is a bare shell ({shell}): the provider process has "
+            "exited and typed input would be executed as commands. Refusing to deliver input."
+        )
+
+
 def dispatch_input(
     terminal_id: str,
     message: str,
@@ -4108,9 +4255,11 @@ def dispatch_input(
 
             # Guard: refuse to type into a terminal whose provider process has
             # exited. Without this check, queued messages would be pasted into
-            # a bare shell and executed as arbitrary commands.
+            # a bare shell and executed as arbitrary commands. The subclass
+            # tells the deferred-init path this is a dead worker to tear down,
+            # not a prompt to leave for the operator (#1018 review).
             if current_status == TerminalStatus.ERROR:
-                raise TerminalInputBlockedError(
+                raise ProviderExitedInputBlockedError(
                     f"Terminal {terminal_id} provider is in ERROR state "
                     "(provider process may have exited). Refusing to deliver input.",
                     reason=TerminalInputBlockedReason.PROVIDER_ERROR,
@@ -4141,6 +4290,30 @@ def dispatch_input(
         # internal <cao-memory> block that we paste into the TUI.
         original_message = message
         message = inject_memory_context(message, terminal_id, frozen_memory)
+
+        # THE LAST CHECK BEFORE TYPING (#1018). The status read above is now
+        # one memory-service call old, and it was only ever the monitor's
+        # cached verdict: in the reporter's log the monitor flipped the
+        # terminal to ERROR 154 ms after initialize() finished and the task was
+        # typed 700 ms after that regardless. Re-read the status, and --
+        # independently of any status and of whether the provider finished
+        # initializing -- compare the pane's foreground process with the shell
+        # that was running before the CLI launched. A pane whose foreground
+        # process is that shell again is a bare shell, and bash executes every
+        # line pasted into it.
+        #
+        # What remains between here and send_keys: the monitor arm, the buffer
+        # clear, the provider's dispatch bookkeeping -- which for codex
+        # includes one pane capture in record_dispatched_message() -- and then
+        # the paste itself. That is a check-then-act window of one tmux
+        # round trip, far shorter than before but not zero; a CLI that exits
+        # after the paste and before Enter can still hand the pasted bytes to
+        # its shell, and a design that types input cannot close that. Placed
+        # after inject_memory_context() deliberately, because the memory
+        # lookup is the slow step; the cost is that a refused send has
+        # consumed the terminal's one-time memory block (#1018 review, P3-3).
+        # A refusal here raises before any of that bookkeeping runs.
+        _refuse_if_provider_gone(terminal_id, provider, metadata)
 
         # Check how many Enter keys the provider needs after paste
         enter_count = provider.paste_enter_count if provider else 1

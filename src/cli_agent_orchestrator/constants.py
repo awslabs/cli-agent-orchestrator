@@ -69,6 +69,15 @@ DEFAULT_PROVIDER = ProviderType.KIRO_CLI.value
 # Higher values provide more context but increase memory usage
 TMUX_HISTORY_LINES = 200
 
+# How long a wait gives a worker to show the first status EARNED for a newly
+# dispatched turn before concluding it will not: the server's deferred-init
+# confirmation uses it per attempt before resubmitting
+# (``terminal_service._DEFERRED_SUBMIT_CONFIRM_TIMEOUT``), and `cao session send`
+# uses it as the grace before it stops refusing an unstamped ready status
+# (``utils.terminal.STAMP_GRACE_SECONDS``). Both read the same stamp and ask the
+# same question, so one constant keeps them equal (#735).
+TURN_START_CONFIRM_SECONDS = 8.0
+
 # Scrollback floor CAO raises the operator's shared tmux server's global
 # ``history-limit`` to before it creates a pane.
 #
@@ -1086,6 +1095,48 @@ SCRIPT_LINT_DISALLOWED_IMPORT_PREFIXES = frozenset({"cli_agent_orchestrator"})
 # deterministic control flow keeps repeated work predictable. Import-level only
 # — no call-site analysis. A warning never fails a script (FR-1.7).
 SCRIPT_LINT_NONDETERMINISM_MODULES = frozenset({"random", "secrets", "uuid", "time", "datetime"})
+
+# Pre-parse source-length cap for the linter, in characters. This is a CRASH
+# guard, not a style limit. On CPython 3.10 the AST build inside ``ast.parse``
+# recurses in C once per nesting level with no recursion gate, so deeply nested
+# input overflows the C stack and SEGFAULTS the interpreter —
+# ``sys.setrecursionlimit`` does not reach it and no ``RecursionError`` is ever
+# raised, so ``lint_script``'s except arms cannot save it. CPython 3.11 added
+# the gate: 3.11+ raise ``RecursionError`` ("maximum recursion depth exceeded
+# during ast construction") from about 3,500 levels. Only 3.10 segfaults, and
+# 3.10 is the CI floor, so this cap is load-bearing.
+#
+# Why a LENGTH cap bounds DEPTH: every AST node needs at least one source
+# character, so max AST depth <= len(source). That makes the bound sound
+# without a second traversal, which matters for a module contracted to do one
+# ``ast.parse`` and one ``ast.walk``.
+#
+# Why 128 KiB specifically — do not raise it without re-measuring BOTH numbers:
+#   - Measured segfault cliff for ``"a" + ".b" * N`` on CPython 3.10, 8 MiB main
+#     thread stack, 3 runs per depth (2026-10-21/22):
+#       x86_64 Linux, uv cpython-3.10.22, ``ulimit -s`` 8192: 130,500 parse,
+#         131,000 SIGSEGV.
+#       macOS arm64, uv cpython-3.10.19: 130,600 parse, 130,800 SIGSEGV.
+#     That is ~64 bytes of C stack per level. The worst case admitted here is
+#     65,535 levels (2 characters per level), ~2.0x below the cliff. Other
+#     left-recursive constructs (binop, call, subscript) need at least as many
+#     characters per level; right-recursive ones (unary, ``**``, ``not``,
+#     ``if``/``else``, ``lambda``) stop at the parser's fixed stack depth with
+#     ``MemoryError`` long before the C stack is at risk.
+#   - Largest workflow script shipped in this repo is
+#     ``examples/workflows/pr-health/pr_health.py`` at ~58 KiB, so this leaves
+#     ~2.3x headroom for a legitimately large hand-written script.
+# Step 4 of ``test_ast_parse_depth_guard.py``'s child-process crash probe parses
+# a worst-case source at exactly this cap on every run, so a cap past the host's
+# cliff is a red test rather than a core dump of the pytest process.
+#
+# Deliberately BELOW ``WORKFLOW_MAX_SPEC_BYTES`` (256 KiB, above) rather than
+# matching it: that cap is sized for a legitimate spec's byte budget, not for
+# ast.parse's C-stack behaviour, and 256 KiB of a dense attribute chain is
+# 131,071 levels — PAST the measured cliff on both hosts above, so reusing it
+# here would reopen this crash. Do not "harmonise" the two values without
+# re-measuring the cliff on the target runner.
+SCRIPT_LINT_MAX_SOURCE_CHARS = 128 * 1024
 
 # Env-var injection allowlist for POST /terminals/run-step (Bolt 2, U2/C6,
 # NFR-SEC-4 BINDING). Deny-by-default: the injection surface into a tmux

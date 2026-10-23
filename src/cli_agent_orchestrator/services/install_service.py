@@ -43,7 +43,7 @@ from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.opencode_agent import OpenCodeAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.services.profile_store import write_profile
-from cli_agent_orchestrator.utils import agent_profiles
+from cli_agent_orchestrator.utils import agent_profiles, opencode_config
 from cli_agent_orchestrator.utils.agent_profiles import (
     _read_agent_profile_source,
     parse_agent_profile_text,
@@ -1142,6 +1142,47 @@ def _provider_artifact_path(provider: str, profile_name: str) -> Optional[Path]:
     if _is_opencode(provider):
         return OPENCODE_AGENTS_DIR / f"{to_opencode_agent_id(profile_name)}.md"
     return None
+
+
+def installed_artifact_paths(profile_name: str) -> Dict[str, Path]:
+    """Every per-profile file ``install_agent`` writes that a provider reads at launch, by path-free label.
+
+    One entry per provider with a per-agent sink (:func:`_provider_artifact_path`, keyed by the
+    ``ProviderType`` value) and one ``context:<n>`` entry per directory in :func:`_context_lookup_dirs`
+    (the configured directory, then the legacy default while an override is active), resolved the way
+    the ownership guard resolves a copy (:func:`_installed_context_copy_path`).
+
+    This is a PLAN-IDENTITY input list (#827, PR #1000 P2-2). A Kiro step starts as
+    ``kiro-cli chat --agent <name>``; Kiro reads ``tools``, ``allowedTools``, ``toolsSettings``,
+    ``hooks`` and ``mcpServers`` from the JSON written here and the system prompt from the context copy
+    that JSON references by ``file://``. A Copilot step reads its prompt from ``<name>.agent.md``. CAO
+    consults its own profile at launch only for ``model``. So these files decide what an approved plan
+    executes, and ``agent_profiles.read_profile_entry`` hashes each one (or its absence) into the entry.
+    Labels, not paths, so the digest does not depend on the machine.
+
+    ``opencode_cli:config`` is the SHARED ``opencode.json`` (PR #1000 round 2, P2-1). For OpenCode the
+    per-agent ``.md`` carries only the prompt and the permission map; :func:`_materialize_opencode_mcp`
+    writes the MCP servers -- each one's ``command`` -- into that file's ``mcp`` map and the agent's
+    grant into ``agent.<id>.tools``, and the provider launches with ``OPENCODE_CONFIG=<that file>`` and
+    reads the whole of it. The whole file is bound, not the agent's section: OpenCode's ``mcp`` map is
+    global (every agent sees every enabled server unless its own ``tools`` map says otherwise) and the
+    file's top-level ``instructions``, ``permission`` and ``model`` apply to every agent, so there is no
+    smaller part that decides what one agent executes. The cost is that an operator's edit to their own
+    key in that file moves every ``plan_id``, which the docs record. The path is looked up on the
+    ``opencode_config`` module at call time, as the installer's own writers do.
+
+    ``test_install_ownership_guard`` pins this list against the files a real install WRITES (a
+    filesystem diff around ``install_agent``), not only against the fields ``InstallResult`` reports.
+    """
+    paths: Dict[str, Path] = {}
+    for provider in ProviderType:
+        path = _provider_artifact_path(provider.value, profile_name)
+        if path is not None:
+            paths[provider.value] = path
+    paths[f"{ProviderType.OPENCODE_CLI.value}:config"] = opencode_config.OPENCODE_CONFIG_FILE
+    for index, directory in enumerate(_context_lookup_dirs()):
+        paths[f"context:{index}"] = _installed_context_copy_path(profile_name, directory)
+    return paths
 
 
 def _entry_occupying(path: Path) -> Optional[str]:

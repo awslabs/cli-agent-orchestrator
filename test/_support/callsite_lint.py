@@ -214,6 +214,39 @@ def inline_marker(module: Module, lineno: int, prefix: str) -> Optional[str]:
     return None
 
 
+#: One inline-marked call site: the site's line-free key plus the line the
+#: marker was found for. A mark exempts exactly that site; the line is what
+#: stops one marker from covering an unmarked sibling under the same key.
+MarkedSite = Tuple[Tuple[str, ...], int]
+
+
+def marked_sites(
+    sites: Iterable[Site],
+    prefix: str,
+    sources: Optional[Sequence[Module]] = None,
+) -> Dict[MarkedSite, str]:
+    """``{(site.key, site.line): reason}`` for every site carrying ``# <prefix>: <reason>``.
+
+    The one way a rule reads its inline opt-out markers, so every rule spells
+    them the same way (``subset-ok``, ``staleness-ok``) and :func:`inline_marker`'s
+    two-line lookback applies to all of them. Marks are PER SITE: a marker on
+    one call does not exempt an identical unmarked call in the same module
+    (PR #999 re-review, P3-1). The result feeds :func:`check_against_allowlist`'s
+    ``marked``.
+    """
+    srcs = parse_sources() if sources is None else sources
+    by_path = {module.relpath: module for module in srcs}
+    marked: Dict[MarkedSite, str] = {}
+    for site in sites:
+        module = by_path.get(site.relpath)
+        if module is None:
+            continue
+        reason = inline_marker(module, site.line, prefix)
+        if reason is not None:
+            marked[(site.key, site.line)] = reason
+    return marked
+
+
 # ---------------------------------------------------------------------------
 # The ratchet
 # ---------------------------------------------------------------------------
@@ -237,7 +270,7 @@ def check_against_allowlist(
     sites: Iterable[Site],
     allowlist: Mapping[Tuple[str, ...], AllowlistRow],
     remedy: str,
-    marked: Optional[Mapping[Tuple[str, ...], str]] = None,
+    marked: Optional[Mapping[MarkedSite, str]] = None,
 ) -> None:
     """Fail unless every flagged site is explained and every row still matches.
 
@@ -258,8 +291,9 @@ def check_against_allowlist(
             :data:`AllowlistRow`.
         remedy: What the author of a *new* violation should do, in one or two
             sentences. This is the whole value of the rule, so it is required.
-        marked: ``{key: reason}`` for sites that carried an inline marker.
-            Treated exactly like an allowlist row but reported separately so a
+        marked: ``{(key, line): reason}`` for sites that carried an inline
+            marker (see :func:`marked_sites`). A mark skips only the site it
+            sits on, never a same-key sibling; it is reported separately so a
             stale inline marker is not blamed on the table.
 
     Raises:
@@ -268,14 +302,14 @@ def check_against_allowlist(
     """
     sites = list(sites)
     marked = {} if marked is None else marked
-    marked_keys = set(marked)
+    marked_keys = {key for key, _ in marked}
     seen = {site.key for site in sites}
 
     unexplained: List[Site] = []
     overflow: List[Site] = []
     consumed: Dict[Tuple[str, ...], int] = {}
     for site in sites:
-        if site.key in marked_keys:
+        if (site.key, site.line) in marked:
             continue
         if site.key not in allowlist:
             unexplained.append(site)

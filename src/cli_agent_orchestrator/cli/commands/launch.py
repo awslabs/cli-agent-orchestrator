@@ -580,7 +580,13 @@ def launch(
             # The task budget starts HERE, at confirmed delivery, so a slow but
             # successful init cannot eat into it. The terminal is no longer
             # masked, so ``poll_until_done``'s own working-then-idle gate judges
-            # completion on the task's activity only.
+            # completion on the task's activity only. No generation floor is
+            # passed: the message was dispatched by the server at creation, so
+            # there is no client-side dispatch boundary, and delivery was just
+            # confirmed on a status EARNED AFTER that dispatch
+            # (``_wait_for_post_dispatch_start``), so the latch already describes
+            # this turn and the previous frame cannot be read here (#735).
+            # staleness-ok: delivery confirmed server-side on a post-dispatch stamp
             poll_until_done(terminal["id"], timeout=_HEADLESS_TASK_TIMEOUT)
             output_resp = api_http.get(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/output",

@@ -30,19 +30,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an operator runs `cao workflow approve <plan_id>`; operators choosing the previous behaviour set
   `workflow.require_approval: false` in `settings.json`. Script runs journaled before this upgrade
   cannot launch further agent steps while approval enforcement is on; start a new run. With
-  approval enforcement off, those runs continue. Plan identifiers keep the `plan-v1:` scheme.
+  approval enforcement off, those runs continue. Plan identifiers used the `plan-v1:` scheme; see the
+  `plan-v2` entry below.
 
 - **Breaking / migration:** a fresh script run now executes a private copy of the approved source.
   Modules beside the spec are not importable and `__file__` names the copy; this matches resume.
 - **Breaking / migration:** reserved ephemeral names are refused as fresh script-run agent steps
-  while approval is enforced: they have no installed definition for the launch guard to digest.
+  while approval is enforced: they have no installed definition for the launch guard to digest. The
+  ephemeral namespace is also outside the `plan-v2` profile-set digest by design: those profiles are
+  created by the run after admission and are bound on their own path.
 - **Breaking / migration:** non-Git roots now bind the directory's canonical path into `plan_id`.
   Moving or renaming such a directory requires a new approval; Git-repository plan identifiers are
   unchanged.
-- **Breaking / migration:** plan approval binds the script source, its resolved inputs and the working
-  directory's state (the Git commit and worktree, or the canonical path of a non-Git directory). It
-  does not bind the content of agent profiles or memory: a later run of an approved plan uses their
-  current content (#827, #828).
+- **Breaking / migration:** plan approval binds the script source, its resolved inputs, the working
+  directory's state (the Git commit and worktree, or the canonical path of a non-Git directory) and,
+  since `plan-v2`, the installed agent profile set. It does not bind memory content (#828), the
+  managed `.env` values a profile references, installed skills, agent-plugin MCP servers for the
+  providers that receive them at launch (`with_plugin_mcp`; for Kiro and OpenCode `cao install`
+  writes them into files that are bound, so an agent-plugin change moves `plan_id` there), the Kiro
+  `resources` files and global `mcp.json`, or a same-name profile shadowed in a lower-priority
+  directory: a later run of an approved plan uses their current content.
+- **Breaking / migration:** script-run plan identifiers move from `plan-v1:` to `plan-v2:` and now
+  bind the installed agent profile set — every installed profile's source text plus the files
+  `cao install` wrote for it (the Kiro agent JSON, the Copilot and OpenCode agent files, the shared
+  OpenCode `opencode.json`, the installed context copy) — because a step's system prompt and tool
+  policy come from those files, not from the script (#827, first acceptance criterion). Every stored
+  `plan-v1` approval stops matching: the first new run of each plan is refused with its `plan-v2`
+  identifier until an operator approves it again. A run frozen and approved before the upgrade still
+  resumes on its stored `plan-v1` identifier, and its launch guard record (which has no scheme
+  marker) keeps checking each agent launch under the rule it was admitted with, the profile text
+  alone; new runs record `launch-guard-v2`.
+  Editing or installing any profile, and a CAO upgrade that changes a bundled profile, moves every
+  `plan_id`. An entry the launch path cannot serve (a symlink leaving the store, a `..` name) is
+  digested by name only; a profile store CAO cannot read refuses the run as `profiles_unreadable`.
+  Binding the project root by device and inode (#827, second criterion) is not part of this change.
 
 ### Added
 
@@ -223,6 +244,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   covers the swallowed-Enter recovery from #78: a bare Enter submits what is already in the
   composer without going through `dispatch_input`, so it checks the same predicate itself rather
   than relying on a dialog happening to hide the composer box.
+- Workflow scripts over 131,072 characters (128 KiB) now fail `validate`, `create`, `update`,
+  `run` and `submit` with a `syntax` finding that names the size and the limit, instead of being
+  parsed. On CPython 3.10 `ast.parse` segfaults the interpreter on deeply nested source and no
+  exception can catch it, so the linter and the `INPUTS` extractor each refuse oversize source
+  before parsing. A script between 128 KiB and the 256 KiB spec budget that ran before this
+  release must be split (#969).
 - Vault scan now re-reads a note whose size, mtime or ctime changed across the read window up to
   three times with a short backoff, as ADR-006 specifies, instead of skipping it on the first
   torn read. A note saved by Obsidian during a reconcile is indexed from the clean re-read; a
@@ -252,6 +279,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and logs a warning, whether enforcement is on or off. Its launch guard also
   refuses fresh agent launches while approval is enforced.
 - Kiro CLI agent specs installed by CAO now carry `includeMcpJson`, the name Kiro CLI documents, instead of the retired `useLegacyMcpJson` alias, which Kiro rejected as a duplicate field whenever another writer added the canonical key (#1026). The profile field keeps its `useLegacyMcpJson` spelling and is now actually forwarded into the spec; previously it was accepted and ignored.
+- `cao session send` no longer prints the previous turn's answer, and no longer
+  waits out its timeout on a turn that finished (#735). `POST /terminals/{id}/input`
+  now returns the `dispatch_boundary` of the turn it started, and
+  `GET /terminals/{id}` reports `status_generation` (the output generation the
+  status was earned at) and `output_generation` (the current counter). The CLI
+  refuses a status earned at or before the boundary; once output has landed
+  without the status being re-earned it gives the stamp 8 s to move, then warns
+  on stderr and finishes on the frame as before. A cao-server restart during the
+  wait is detected and warned about instead of waiting out the timeout. Both
+  fields are additive: `success` is unchanged, and an older server gets the
+  previous behaviour.
+- **Security:** a task's text could be executed by the worker's login shell. If `codex`
+  exited during startup (for example on a network timeout while reading the account),
+  its `› Error: ...` line read as an idle composer, the exit-to-shell check was switched
+  off until initialization had completed, and the assigned task was pasted into bash,
+  which ran every line of it including backtick and `$(...)` substitutions. Codex
+  startup now reads the pane's foreground process on every readiness poll and once more
+  before declaring ready, a ready verdict from a pane that is back at the shell is ERROR
+  whether or not initialization has finished, and the shared delivery path re-checks the
+  status and the pane's foreground process immediately before typing, for every provider
+  that records a shell baseline. `assign` and `handoff` now tear down a worker whose
+  provider is in ERROR or has exited to the shell by delivery time and report
+  `provider_exited` (or `provider_exited_after_dispatch` when a resubmit was refused after
+  the task had been typed once); previously the dead worker was kept and reported as
+  waiting on a prompt (#1018).
 - Corrective workflow re-prompts now reuse the attempt's rendered prompt, so
   workflow inputs and earlier step outputs stay filled in when structured output
   is missing or invalid (#966).

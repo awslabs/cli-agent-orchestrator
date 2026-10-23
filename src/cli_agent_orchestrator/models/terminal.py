@@ -77,6 +77,22 @@ class TerminalInputBlockedError(Exception):
         self.reason = reason
 
 
+class ProviderExitedInputBlockedError(TerminalInputBlockedError):
+    """Input was refused because the provider process is gone, not because it asked a question.
+
+    Raised by ``services/terminal_service.py``'s delivery guards when the
+    terminal's status is ERROR or its pane's foreground process is the shell that
+    was running before the CLI launched (#1018). Still a
+    ``TerminalInputBlockedError`` so every existing handler keeps its answer --
+    409 at ``/terminals/{id}/input``, 504 at ``run_step``, FAILED in the inbox --
+    but the deferred-init path catches this subclass FIRST and tears the worker
+    down: there is no prompt to answer, ``answer_user_prompt`` refuses because
+    the status is not WAITING_USER_ANSWER, and a re-send is refused again, so
+    "leave it alive for the operator" would keep a dead worker registered and
+    tell the supervisor to wait on a prompt that does not exist.
+    """
+
+
 class TerminalLimitError(Exception):
     """Raised when creating a terminal would exceed this node's tracked-terminal cap.
 
@@ -113,7 +129,7 @@ class Terminal(BaseModel):
         None, description="Terminal that created this one via handoff/assign (callback target)"
     )
     callback_terminal_id: Optional[str] = Field(
-        None,
+        default=None,
         description=(
             "For a worker created from ANOTHER node (assign/handoff with target_host): "
             "the creating supervisor's terminal id, read back from the "
@@ -151,7 +167,7 @@ class Terminal(BaseModel):
         ),
     )
     initial_delivery: Optional[Dict[str, Any]] = Field(
-        None,
+        default=None,
         description=(
             "Durable outcome of the initial message this terminal was created with "
             "(deferred init): state pending/delivered/failed plus kind and message. "
@@ -167,6 +183,34 @@ class Terminal(BaseModel):
     )
     status: Optional[TerminalStatus] = Field(
         None, description="Current terminal status (live only)"
+    )
+    status_generation: Optional[int] = Field(
+        default=None,
+        description=(
+            "Output generation that ``status`` was EARNED at, from "
+            "StatusMonitor.status_observation(). A status counts as evidence for a "
+            "particular send only when this is strictly greater than the dispatch "
+            "boundary that POST /terminals/{id}/input returned for that send: a status "
+            "VALUE alone cannot carry recency, so a ready status cached before a send is "
+            "otherwise indistinguishable from one earned after it (#735, #407). None for "
+            "event-inbox backends (herdr), which derive status on demand and never advance "
+            "the generation, and None on a server that does not report it."
+        ),
+    )
+    output_generation: Optional[int] = Field(
+        default=None,
+        description=(
+            "The terminal's CURRENT output generation (StatusMonitor.output_generation()), "
+            "reported alongside ``status_generation`` so a client can tell three cases "
+            "apart against the dispatch boundary of a send: equal to it, nothing has "
+            "landed since the send; above it while ``status_generation`` is still at or "
+            "below it, output landed but the status was never re-earned, which is either "
+            "a turn so fast its PROCESSING was never sampled or a repaint of the previous "
+            "frame and the server cannot tell which, so a client must bound its wait rather "
+            "than refuse until timeout (#735 review, P2-2); below it, the server's counter "
+            "was reset (restart) and the boundary no longer shares its timeline. None for "
+            "event-inbox backends (herdr) and on a server that does not report it."
+        ),
     )
     last_active: Optional[datetime] = Field(None, description="Last active timestamp (UTC)")
 

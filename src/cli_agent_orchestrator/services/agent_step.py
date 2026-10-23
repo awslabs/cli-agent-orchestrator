@@ -785,6 +785,13 @@ async def run_agent_step(
     # gets the task re-delivered before the budget burns down. Raises
     # StepExecutionError on timeout/ERROR, or StepCancelledError if cancellation
     # fires mid-wait.
+    #
+    # LIVE SIBLING of #735, not fixed here (no lint reads this comment):
+    # _wait_for_completion polls status_monitor.get_status() and returns on the
+    # first COMPLETED after send_input discarded the boundary, so a step that
+    # reuses an existing terminal can settle on the previous turn's completion.
+    # Filed separately; gating it means threading dispatch_input's boundary
+    # through run_agent_step.
     try:
         await _wait_for_completion(terminal_id, timeout, cancel_event, prompt=prompt)
     except StepCancelledError:

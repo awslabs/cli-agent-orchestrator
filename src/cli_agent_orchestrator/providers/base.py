@@ -51,6 +51,20 @@ class OutputExtractionError(ValueError):
     """
 
 
+class ProviderExitedError(RuntimeError):
+    """The CLI process exited back to the shell before it was ready (#1018).
+
+    Raised by a provider's ``initialize()`` when the pane's foreground process is
+    again the shell it captured as ``shell_baseline`` before launching the CLI.
+    Distinct from ``TimeoutError``: the pane is not slow, it IS a shell, and the
+    task that was about to be delivered would have been executed by it as
+    commands. Not a ``TerminalInputBlockedError`` either -- that one means
+    "alive, parked on a prompt, leave it running"; this terminal has nothing
+    left to answer, so the deferred-init path tears it down like any other
+    startup failure.
+    """
+
+
 class OutputExtractionRejected(OutputExtractionError):
     """A deliberate refusal to publish extracted content.
 
