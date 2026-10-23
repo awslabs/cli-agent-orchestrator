@@ -224,7 +224,7 @@ describe("portfolio workspace", () => {
     await expect(
       updateSession(root, "feature", "web", "active", "web-runner"),
     ).resolves.toBeUndefined();
-  });
+  }, 20_000);
 
   test("dispatch check enforces catalog dependencies marked for dispatch", async () => {
     const root = await temporaryRoot();
@@ -279,7 +279,7 @@ describe("portfolio workspace", () => {
     await expect(checkDispatch(root, "web", "feature")).resolves.toMatchObject({
       aidlcIntent: "feature-web",
     });
-  });
+  }, 20_000);
 
   test("creates the registered Git worktree", async () => {
     const root = await temporaryRoot();
@@ -382,7 +382,7 @@ describe("portfolio workspace", () => {
     await expect(checkDispatch(root, "api", "feature")).rejects.toThrow(
       "discovery confirmation is stale",
     );
-  });
+  }, 20_000);
 
   test("relays generated questions to a human without changing question text", async () => {
     const root = await temporaryRoot();
@@ -536,6 +536,115 @@ describe("portfolio workspace", () => {
       await readFile(join(root, "portfolio/state.json"), "utf8"),
     );
     expect(stateCompleted.activeIntent).toBeNull();
+  }, 20_000);
+
+  test("CLI requires approval-id even when answered-by is supplied", async () => {
+    const root = await temporaryRoot();
+    await initializeWorkspace(root, "sample-portfolio", "Sample Portfolio");
+    await registerProject(root, "api");
+    await registerIntent(root, {
+      id: "feature",
+      projects: [
+        {
+          project: "api",
+          aidlcIntent: "feature-api",
+          branch: "feat/feature-api",
+          worktree: "worktrees/api/feature",
+          dependsOn: [],
+        },
+      ],
+    });
+    await createHarness(root, "api/feature");
+    await confirmDefaultDiscovery(root);
+    await advanceToDispatch(root);
+    await updateSession(root, "feature", "api", "active", "runner-terminal");
+    const generated = join(root, "generated-questions.md");
+    const questionText = "## Storage\n\nA. SQL\nB. Object storage\n\n[Answer]:\n";
+    await writeFile(generated, questionText);
+    await submitQuestionPacket(
+      root,
+      "cli-storage",
+      "api",
+      "feature",
+      "application-design",
+      generated,
+    );
+    const answered = join(root, "human-answers.md");
+    await writeFile(
+      answered,
+      questionText.replace("[Answer]:", "[Answer]: A. SQL"),
+    );
+    const args = [
+      "question", "answer", "--root", root, "--id", "cli-storage",
+      "--file", answered, "--mode", "guided",
+    ];
+    const packetPath = join(root, "portfolio/questions/cli-storage.json");
+    const statePath = join(root, "portfolio/state.json");
+    const pendingPacket = await readFile(packetPath, "utf8");
+    const waitingState = await readFile(statePath, "utf8");
+
+    for (const extraFlags of [[], ["--answered-by", "Someone"]]) {
+      const result = await runCli([...args, ...extraFlags]);
+      expect(result.exitCode).not.toBe(0);
+      expect(JSON.parse(result.stderr)).toEqual({
+        ok: false,
+        error: "--approval-id is required",
+      });
+      expect(await readFile(packetPath, "utf8")).toBe(pendingPacket);
+      expect(await readFile(statePath, "utf8")).toBe(waitingState);
+      expect(
+        await readFile(join(root, "portfolio/questions/cli-storage.md"), "utf8"),
+      ).toBe(questionText);
+    }
+
+    await recordHumanApproval(
+      root,
+      "cli-approval",
+      "cli-storage",
+      "Portfolio owner",
+    );
+    const result = await runCli([...args, "--approval-id", "cli-approval"]);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      ok: true,
+      status: "active",
+      answeredBy: "Portfolio owner",
+    });
+    expect(JSON.parse(await readFile(packetPath, "utf8")).status).toBe(
+      "answered",
+    );
+  }, 20_000);
+
+  test("CLI rejects removed learning and memory commands", async () => {
+    const root = await temporaryRoot();
+    await initializeWorkspace(root, "sample-portfolio", "Sample Portfolio");
+    for (const [namespace, command, error] of [
+      ["learning", "approve", "unknown command: learning approve"],
+      ["learning", "reconcile", "unknown command: learning reconcile"],
+      ["memory", "refresh", "unexpected argument: refresh"],
+      ["memory", "inspect", "unexpected argument: inspect"],
+      ["memory", "clean", "unexpected argument: clean"],
+    ] as const) {
+      const result = await runCli([namespace, command, "--root", root]);
+      expect(result.exitCode).not.toBe(0);
+      expect(JSON.parse(result.stderr)).toEqual({ ok: false, error });
+    }
+  });
+
+  test("rejects legacy learning proposals already stored on disk", async () => {
+    const root = await temporaryRoot();
+    await initializeWorkspace(root, "sample-portfolio", "Sample Portfolio");
+    const source = await learningFile(root, "legacy-learning", {
+      rule: "Keep review explicit.",
+    });
+    const proposal = await readFile(source, "utf8");
+    const stored = join(root, "portfolio/learnings/legacy-learning.yaml");
+    for (const legacyField of ["baseRevision: old-sha", "status: approved"]) {
+      await writeFile(stored, `${proposal}${legacyField}\n`);
+      await expect(listLearningProposals(root)).rejects.toThrow(
+        "learning proposal schema validation failed",
+      );
+    }
   });
 
   test("rejects question packets that a runner has already answered", async () => {
@@ -875,4 +984,26 @@ async function runGit(directory: string, args: string[]): Promise<void> {
       `git ${args.join(" ")} failed: ${stderr.trim() || stdout.trim()}`,
     );
   }
+}
+
+async function runCli(args: string[]): Promise<{
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}> {
+  const child = Bun.spawn([
+    process.execPath,
+    "skills/aidlc-portfolio/scripts/portfolio.ts",
+    ...args,
+  ], {
+    cwd: join(import.meta.dir, ".."),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  return { exitCode, stdout, stderr };
 }

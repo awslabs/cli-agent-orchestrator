@@ -177,10 +177,11 @@ interface QuestionPacket {
 
 // A human-decision approval minted by CAO's human-approval surface (an AG-UI
 // approval card the user actioned, a workflow resume a verified human posted).
-// `source` is stamped by that surface and MUST be "human-surface": an agent
-// cannot forge it, because the agent-facing CLI exposes no command that writes
-// an approval record. `answeredBy` is the identity the surface verified; it is
-// NOT a free-text argument an agent supplies to `question answer`.
+// `source` MUST be "human-surface"; `answeredBy` comes from this record, not a
+// free-text argument to `question answer`. The sample has no agent-facing
+// subcommand that mints an approval, but its JSON records are agent-writable.
+// Real enforcement requires records outside the agent's write reach or signed
+// with a key the agent does not hold.
 type ApprovalSource = "human-surface";
 
 interface HumanApprovalRecord {
@@ -860,11 +861,10 @@ export async function answerQuestionPacket(
       throw new PortfolioError("every generated question requires a human answer");
     }
 
-    // The answerer is NOT a free-text argument. It is bound to a human-surface
-    // approval record that only CAO's human-approval surface can mint. The
-    // agent-facing CLI exposes no command that writes one, so an agent cannot
-    // fabricate an answerer or forge a self-approval: without a matching
-    // human-surface approval, `question answer` is refused outright.
+    // The answerer comes from a matching, unconsumed approval record.
+    // No agent-facing CLI subcommand mints one. This models the protocol shape;
+    // protecting records from agent writes requires an external write boundary
+    // or a signature made with a key the agent does not hold.
     const approval = await readHumanApproval(root, approvalId);
     if (approval.source !== "human-surface") {
       throw new PortfolioError(
@@ -914,11 +914,11 @@ export async function answerQuestionPacket(
 
 // HUMAN-SURFACE WRITE PATH. This stands in for CAO's human-approval surface
 // (an AG-UI approval card the user actioned, or a verified-human workflow
-// resume). It is deliberately NOT wired to any agent CLI subcommand: the agent
-// cannot call it, so it cannot mint an approval for itself. In a live
-// deployment the identity and token come from the verified human session that
-// drove the surface; here the record carries that verified identity so the
-// `question answer` binding has something real to match against.
+// resume). It is deliberately NOT wired to any agent CLI subcommand. This
+// helper writes an ordinary JSON file within the agent's write reach; real
+// enforcement requires protecting or signing that record. In a live deployment
+// the identity and token must come from the verified human session that drove
+// the surface; here the record supplies the packet and identity binding.
 export async function recordHumanApproval(
   rootInput: string,
   approvalId: string,

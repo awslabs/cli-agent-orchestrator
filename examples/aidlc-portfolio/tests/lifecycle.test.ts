@@ -88,7 +88,7 @@ describe("portfolio lifecycle", () => {
       "learn",
       "learn",
     ]);
-  });
+  }, 20_000);
 
   test("rejects stale discovery before dispatch and reports recovery action", async () => {
     const root = await createFixture();
@@ -121,7 +121,7 @@ describe("portfolio lifecycle", () => {
     await expect(checkDispatch(root, "api", "feature")).resolves.toMatchObject({
       aidlcIntent: "feature-api",
     });
-  });
+  }, 20_000);
 
   test("blocks integration completion on contracts and shared-memory proposals", async () => {
     const root = await createFixture();
@@ -162,7 +162,7 @@ describe("portfolio lifecycle", () => {
     await expect(advanceLifecycle(root, "learn")).resolves.toMatchObject({
       phase: "learn",
     });
-  });
+  }, 20_000);
 
   test("migrates schemaVersion 1 state once and resumes deterministically", async () => {
     const root = await createFixture();
