@@ -814,6 +814,29 @@ class TestT8LogInjection:
 
 
 class TestT9SortByValidation:
+    def test_relevance_accepted(self):
+        assert validate_sort_by("relevance") == "relevance"
+
+    def test_mcp_tool_accepts_relevance(self, svc, hybrid_starvation_corpus, monkeypatch):
+        from cli_agent_orchestrator.mcp_server import server
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.memory_service.MemoryService", lambda *a, **kw: svc
+        )
+        tool = getattr(server.memory_recall, "fn", server.memory_recall)
+        result = _run(
+            tool(
+                query="kafka streams",
+                scope="global",
+                memory_type=None,
+                sort_by="relevance",
+                limit=1,
+                include_related=False,
+            )
+        )
+        assert result["success"] is True
+        assert [m["key"] for m in result["memories"]] == ["strong-old"]
+
     def test_sort_by_unknown_raises_value_error(self):
         with pytest.raises(ValueError, match="sort_by must be one of"):
             validate_sort_by("hybrid")
@@ -1897,3 +1920,238 @@ class TestHybridScoredTextSnapshot:
             ("partial", "global", None, "native"),
         }
         assert len(identities) == 2
+
+
+def test_order_candidates_has_no_side_effects(svc, hybrid_starvation_corpus, monkeypatch):
+    rows = _run(svc._metadata_recall(query="kafka streams", scope="global", limit=10))
+
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("ordering must not increment access or expand related")
+
+    monkeypatch.setattr(svc, "_increment_access_count", forbidden)
+    monkeypatch.setattr(svc, "_expand_related", forbidden)
+    for sort_by in ["recency", "score", "usage"]:
+        assert svc._order_candidates(list(rows), "global", sort_by, query="kafka streams")
+    assert calls == []
+
+
+class TestRelevanceRecencyFactor:
+    def test_range_is_floor_to_one(self):
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        for days in [0, 1, 30, 365, 100000]:
+            factor = memory_scoring.relevance_recency_factor(now - timedelta(days=days), now=now)
+            assert 0.85 <= factor <= 1.0
+
+    @pytest.mark.parametrize(
+        "days,expected", [(0, 1), (30, 0.925), (90, 0.8875), (365, 0.8613924050632911)]
+    )
+    def test_values_at_0_30_90_365_days(self, days, expected):
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        assert memory_scoring.relevance_recency_factor(
+            now - timedelta(days=days), now=now
+        ) == pytest.approx(expected)
+
+    def test_future_dated_is_one(self):
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        assert memory_scoring.relevance_recency_factor(now + timedelta(days=1), now=now) == 1
+
+    def test_naive_is_utc(self):
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        assert memory_scoring.relevance_recency_factor(now.replace(tzinfo=None), now=now) == 1
+
+
+class TestRelevanceRecall:
+    def test_recovers_old_exact_match_at_limit_one(self, svc, hybrid_starvation_corpus):
+        args = dict(
+            query="kafka streams",
+            scope="global",
+            limit=1,
+            terminal_context=hybrid_starvation_corpus,
+        )
+        assert [m.key for m in _run(svc.recall(**args))] == ["weak-new"]
+        assert [m.key for m in _run(svc.recall(**args, sort_by="relevance"))] == ["strong-old"]
+
+    def test_all_term_tier_ranks_before_partial_fill(
+        self, svc, hybrid_starvation_corpus, monkeypatch
+    ):
+        rows = _run(svc._metadata_recall(scope="global", limit=20))
+        all_terms = {svc._identity(m) for m in rows if m.key == "weak-new"}
+        monkeypatch.setattr(
+            svc,
+            "_bm25_relevance",
+            lambda *a, **kw: {svc._identity(m): 100 if m.key == "strong-old" else 1 for m in rows},
+        )
+        ordered = svc._order_candidates(
+            rows, "global", "relevance", query="kafka streams", all_term_identities=all_terms
+        )
+        assert ordered[0].key == "weak-new"
+
+    def _pair(self, svc, monkeypatch, scope, source_kind, scores=(1, 1)):
+        from cli_agent_orchestrator.models.memory import Memory
+
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        rows = [
+            Memory(
+                id=k,
+                key=k,
+                scope=scope,
+                scope_id="p" if scope == "project" else None,
+                source_kind=source_kind,
+                content="kafka streams",
+                file_path="/unused",
+                memory_type="reference",
+                created_at=now,
+                updated_at=now - timedelta(days=d),
+            )
+            for k, d in [("a-old", 365), ("z-new", 0)]
+        ]
+        monkeypatch.setattr(
+            svc, "_bm25_relevance", lambda *a, **kw: dict(zip(map(svc._identity, rows), scores))
+        )
+        monkeypatch.setattr(svc, "_superseded_keys", lambda rows: set())
+        return rows, now
+
+    @pytest.mark.parametrize("scope", ["project", "global"])
+    def test_vault_rows_time_neutral(self, svc, monkeypatch, scope):
+        rows, now = self._pair(svc, monkeypatch, scope, "vault")
+        assert [m.key for m in svc._order_candidates(rows, scope, "relevance", now=now)] == [
+            "a-old",
+            "z-new",
+        ]
+
+    @pytest.mark.parametrize("scope", ["session", "global", "agent", "federated"])
+    def test_non_project_rows_time_neutral(self, svc, monkeypatch, scope):
+        rows, now = self._pair(svc, monkeypatch, scope, "native")
+        assert [m.key for m in svc._order_candidates(rows, scope, "relevance", now=now)] == [
+            "a-old",
+            "z-new",
+        ]
+
+    @pytest.mark.parametrize("fresh,expected", [(0.85, "a-old"), (0.862, "z-new"), (1, "z-new")])
+    def test_project_native_tie_break_bounded_by_floor(self, svc, monkeypatch, fresh, expected):
+        rows, now = self._pair(svc, monkeypatch, "project", "native", (1, fresh))
+        assert svc._order_candidates(rows, "project", "relevance", now=now)[0].key == expected
+
+    @pytest.mark.parametrize("search_mode", ["hybrid", "metadata", "bm25"])
+    @pytest.mark.parametrize("query", [None, "", "   "])
+    def test_no_query_is_exactly_recency(self, svc, db_engine, search_mode, query):
+        ctx = _ctx(caller_scope="global")
+        now = datetime.now(timezone.utc)
+        for key, days in [("a-old", 10), ("z-new", 1)]:
+            _run(
+                svc.store(key=key, content="query-free body", scope="global", terminal_context=ctx)
+            )
+            _stamp_updated_at(db_engine, key, "global", now - timedelta(days=days))
+        snapshots = []
+        for sort_by in ["recency", "relevance"]:
+            with sessionmaker(bind=db_engine)() as db:
+                db.query(MemoryMetadataModel).update({"access_count": 0, "last_accessed_at": None})
+                db.commit()
+            rows = _run(
+                svc.recall(
+                    query=query, scope="global", limit=1, search_mode=search_mode, sort_by=sort_by
+                )
+            )
+            with sessionmaker(bind=db_engine)() as db:
+                snapshots.append(
+                    (
+                        [svc._identity(m) for m in rows],
+                        {r.key: r.access_count for r in db.query(MemoryMetadataModel)},
+                    )
+                )
+        assert snapshots[0] == snapshots[1]
+
+    def test_only_returned_rows_bump_access(self, svc, db_engine, hybrid_starvation_corpus):
+        _run(svc.recall(query="kafka streams", scope="global", limit=1, sort_by="relevance"))
+        assert _row(db_engine, "strong-old").access_count == 41
+        assert _row(db_engine, "weak-new").access_count == 0
+        assert all(_row(db_engine, f"ballast-{i}").access_count == 0 for i in range(4))
+
+    @pytest.mark.parametrize("flag", ["false", "true"])
+    def test_superseded_demoted_regardless_of_lifecycle_flag(
+        self, svc, db_engine, hybrid_starvation_corpus, monkeypatch, flag
+    ):
+        from cli_agent_orchestrator.clients.database import MemoryRelationshipModel
+        from cli_agent_orchestrator.services import memory_relationship_service
+
+        factory = sessionmaker(bind=db_engine)
+        monkeypatch.setattr(memory_relationship_service, "SessionLocal", factory)
+        monkeypatch.setenv("CAO_MEMORY_LIFECYCLE_ENABLED", flag)
+        with factory() as db:
+            db.add(
+                MemoryRelationshipModel(
+                    scope="global",
+                    scope_id="",
+                    source_key="weak-new",
+                    target_key="strong-old",
+                    type="supersedes",
+                    status="active",
+                    origin="human",
+                )
+            )
+            db.commit()
+        assert [
+            m.key
+            for m in _run(
+                svc.recall(query="kafka streams", scope="global", limit=2, sort_by="relevance")
+            )
+        ] == ["weak-new", "strong-old"]
+
+    def test_total_order_is_deterministic_under_shuffled_input(self, svc, monkeypatch):
+        import itertools
+
+        rows, now = self._pair(svc, monkeypatch, "project", "vault")
+        rows += [
+            rows[0].model_copy(update={"scope_id": "other"}),
+            rows[0].model_copy(update={"source_kind": "native"}),
+        ]
+        monkeypatch.setattr(
+            svc, "_bm25_relevance", lambda *a, **kw: {svc._identity(m): 1 for m in rows}
+        )
+        expected = [
+            ("a-old", "project", "other", "vault"),
+            ("a-old", "project", "p", "vault"),
+            ("z-new", "project", "p", "vault"),
+            ("a-old", "project", "p", "native"),
+        ]
+        for permutation in itertools.permutations(rows):
+            ordered = svc._order_candidates(list(permutation), "project", "relevance", now=now)
+            assert [svc._identity(m) for m in ordered] == expected
+
+    @pytest.mark.parametrize("search_mode", ["metadata", "bm25"])
+    @pytest.mark.parametrize("limit,expected", [(1, 50), (100, 200), (250, 250)])
+    def test_metadata_and_bm25_modes_widen(
+        self, svc, hybrid_starvation_corpus, monkeypatch, search_mode, limit, expected
+    ):
+        calls = []
+        name = "_metadata_recall" if search_mode == "metadata" else "_bm25_search"
+        original = getattr(svc, name)
+        if search_mode == "metadata":
+
+            async def source(**kwargs):
+                calls.append(kwargs)
+                return await original(**kwargs)
+
+        else:
+
+            def source(**kwargs):
+                calls.append(kwargs)
+                return original(**kwargs)
+
+        monkeypatch.setattr(svc, name, source)
+        rows = _run(
+            svc.recall(
+                query="kafka streams",
+                scope="global",
+                sort_by="relevance",
+                search_mode=search_mode,
+                limit=limit,
+            )
+        )
+        assert rows[0].key == "strong-old"
+        assert calls[0]["limit"] == expected
+        if search_mode == "bm25":
+            assert calls[0]["all_terms_first"] is True

@@ -17,7 +17,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.utils.orchestration import (
-    _HANDOFF_CREATE_TIMEOUT_S,
     HandoffContext,
     _handoff_impl,
     _shape_handoff_message,
@@ -545,7 +544,13 @@ class TestHandoffEarlyTerminalId:
         mock_create.return_value = ("dev-t1", "kiro_cli")
         seen = []
 
-        with patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests:
+        with (
+            patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests,
+            patch(
+                "cli_agent_orchestrator.utils.orchestration.synchronous_create_timeout",
+                return_value=(5.0, 430.0),
+            ) as mock_budget,
+        ):
             mock_requests.post.return_value = _ok_run_step_response(terminal_id="dev-t1")
             mock_requests.Timeout = Exception
             result = asyncio.run(_handoff_impl("developer", "Do task", on_terminal_id=seen.append))
@@ -553,7 +558,57 @@ class TestHandoffEarlyTerminalId:
         assert seen == ["dev-t1"]
         assert result.success is True
         assert result.terminal_id == "dev-t1"
-        assert mock_create.call_args[1]["create_timeout"] == _HANDOFF_CREATE_TIMEOUT_S
+        # The create is synchronous (no defer_init), so its budget is the
+        # init-derived one, resolved for THIS profile (issue #710).
+        mock_budget.assert_called_once_with("developer")
+        assert mock_create.call_args[1]["create_timeout"] == (5.0, 430.0)
+
+    @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
+    def test_synchronous_create_budget_follows_provider_init_timeout(
+        self, mock_create, mock_provider, _nudge
+    ):
+        """Issue #710 (review on PR #1002, P2-1): the early-terminal-id path
+        creates the worker SYNCHRONOUSLY, so cao-server does not answer until
+        ``provider.initialize()`` returns. A flat 150s (#634) was below a
+        successful Claude init at 3T=180s. The budget must now be a
+        ``(connect, read)`` tuple whose read half moves with
+        ``provider_init_timeout`` -- the property that separates a derivation
+        from a second hard-coded constant."""
+        mock_provider.return_value = _ctx("kiro_cli")
+        mock_create.return_value = ("dev-t1", "kiro_cli")
+
+        reads = []
+        for init_timeout in (60, 240):
+            with (
+                patch("cli_agent_orchestrator.utils.orchestration.requests") as mock_requests,
+                patch(
+                    "cli_agent_orchestrator.services.settings_service.get_server_settings",
+                    return_value={
+                        "provider_init_timeout": init_timeout,
+                        "mcp_request_timeout": 30,
+                    },
+                ),
+                patch(
+                    "cli_agent_orchestrator.utils.agent_profiles.load_launch_profile",
+                    side_effect=FileNotFoundError("no override on this box"),
+                ),
+            ):
+                mock_requests.post.return_value = _ok_run_step_response(terminal_id="dev-t1")
+                mock_requests.Timeout = Exception
+                result = asyncio.run(
+                    _handoff_impl("developer", "Do task", on_terminal_id=lambda _tid: None)
+                )
+            assert result.success is True
+            budget = mock_create.call_args[1]["create_timeout"]
+            assert isinstance(budget, tuple), f"expected (connect, read), got {budget!r}"
+            connect, read = budget
+            assert connect == 5.0
+            assert read > 150.0, "the #634 literal was below a successful 3T Claude init"
+            reads.append(read)
+
+        assert reads[1] > reads[0]
 
     @patch("cli_agent_orchestrator.utils.orchestration._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.utils.orchestration._resolve_handoff_provider")

@@ -324,6 +324,7 @@ class TerminalBackend(ABC):
         strip_escapes: bool = False,
         full_history: bool = False,
         visible_only: bool = False,
+        join_wrapped: bool = False,
     ) -> str:
         """Get terminal output/history from a window.
 
@@ -339,9 +340,33 @@ class TerminalBackend(ABC):
                 nothing from scrollback (overrides tail_lines/full_history). A
                 backend without a viewport concept may approximate with its
                 closest bounded recent read.
+            join_wrapped: If True, return lines the terminal soft-wrapped at its
+                width rejoined into the logical lines the program wrote, so a
+                one-line message is one line whatever the width. A backend that
+                has no wrap concept, or already returns logical lines, ignores
+                it. Callers must treat the result as best-effort: reassemble
+                nothing load-bearing from it (see codex._find_config_rejection).
 
         Returns:
             Terminal output as a string
+        """
+        ...
+
+    @property
+    @abstractmethod
+    def max_history_lines(self) -> int:
+        """The most lines one :meth:`get_history` call can return on this backend.
+
+        ``get_output`` escalates through read depths (200 -> 500 -> 1000 ->
+        5000 lines) and, when no response marker is found at any of them,
+        labels the result "overflow" or "no response" against a threshold
+        derived from the deepest depth. That only means something if the
+        backend can actually serve that depth: a rung above the backend's
+        ceiling returns the same bytes as the rung below it, and an overflow
+        that filled the whole readable depth is then reported as "the agent
+        produced no text response" (#728, herdr). Each backend states its
+        ceiling here and ``get_output`` clips the ladder and the threshold to
+        it. Must be at least the shallowest rung.
         """
         ...
 

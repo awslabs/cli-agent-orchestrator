@@ -56,7 +56,7 @@ class DelegationAdapter(EngineAdapter):
         patch.setattr(o, "_get_cleanup_nudge", lambda: "")
         patch.setattr(o, "_auth_headers", lambda: {})
         patch.setattr(o, "_auth_headers_for", lambda url: {})
-        patch.setattr(o, "_resolve_child_allowed_tools", lambda *a: None)
+        patch.setattr(o, "_resolve_child_allowed_tools", lambda *a, **k: None)
         patch.setattr(
             o,
             "_resolve_handoff_provider",
@@ -97,6 +97,21 @@ class DelegationAdapter(EngineAdapter):
 
                 _, backend, _ = install_launch_stubs(
                     patch, self.store.key_path.parent, profile_model=self.profile_model
+                )
+                from cli_agent_orchestrator.clients.database import (
+                    create_terminal as db_create_terminal,
+                )
+
+                # This is an explicitly unrestricted synthetic supervisor. Keep the
+                # real server ceiling check in the capability-reprobe path.
+                db_create_terminal(
+                    "a1b2c3d4",
+                    "cao-fixture",
+                    "supervisor",
+                    self.provider,
+                    "supervisor",
+                    ["*"],
+                    delegate_tools=["*"],
                 )
                 backend.session_exists.return_value = not options.get("new_session", False)
                 backend.session_exists_strict.return_value = not options.get("new_session", False)
@@ -151,10 +166,16 @@ class DelegationAdapter(EngineAdapter):
 
         patch.setattr(terminal_service, "create_terminal", create)
         patch.setattr(session_service, "create_terminal", create)
+        from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
         patch.setattr(
             terminal_service,
             "get_terminal_metadata",
-            lambda tid: {"provider": self.provider, "engine": None},
+            lambda tid: (
+                get_terminal_metadata(tid)
+                if tid == "a1b2c3d4" and self.reprobe
+                else {"provider": self.provider, "engine": None}
+            ),
         )
         patch.setattr(
             terminal_service,
@@ -183,7 +204,9 @@ class DelegationAdapter(EngineAdapter):
             {
                 "provider": self.provider,
                 "session_name": "cao-fixture",
-                "allowed_tools": None,
+                "allowed_tools": ["*"],
+                "delegate_tools": ["*"],
+                "features": ["delegation_ceiling"],
                 "working_directory": "/workspace",
             },
             url,
