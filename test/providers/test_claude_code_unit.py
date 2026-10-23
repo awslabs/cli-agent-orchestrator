@@ -3591,9 +3591,28 @@ class TestClaudeCodeStatusAreaRows:
             "  The patch is in src/app.py.",
             "",
             "✻ Worked for 3m 12s",
+            *self.TASKS_5[:1],
+            "     ◻ Run the tests",
         )
         assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
         assert self._p().get_status("\n".join(screen)) == TerminalStatus.COMPLETED
+
+    # Same control with a dispatch recorded: the turn gate must not hold a
+    # finished turn open either (the summary is the newest conversation row, so
+    # the gate clears instead of waiting out TURN_END_GRACE_S).
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_finished_turn_with_stale_task_rows_stays_completed_after_dispatch(self, mock_backend):
+        provider = self._dispatched(mock_backend)
+        screen = self._screen(
+            "● Done. The fix is in place… (3m 12s)",
+            "  The patch is in src/app.py.",
+            "",
+            "✻ Worked for 3m 12s",
+            *self.TASKS_5[:1],
+            "     ◻ Run the tests",
+        )
+        assert provider.get_status_from_screen(screen) == TerminalStatus.COMPLETED
+        assert provider.get_status("\n".join(screen)) == TerminalStatus.COMPLETED
 
 
 class TestWrappedChromeContinuationRows:
