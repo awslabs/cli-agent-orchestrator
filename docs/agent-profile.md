@@ -35,6 +35,11 @@ portable and make profile listings useful.
   `reviewer`, or `workflow_scout`.
 - `allowedTools` (array of strings): explicit CAO tool allowlist; when present,
   it overrides the role defaults.
+- `delegateTools` (array of strings): delegation ceiling, the most this agent may
+  grant to workers it creates through `assign`, `handoff` or a workflow step.
+  Defaults to `["*"]` for `role: supervisor` and to the agent's own
+  `allowedTools` otherwise. See
+  [tool-restrictions.md](tool-restrictions.md#cross-provider-inheritance).
 - `capabilities` (array of strings): profile-discovery statements, with at most
   32 strings and 128 characters per string.
 - `tags` (array of strings): profile-discovery keywords, with at most 32 values;
@@ -66,7 +71,10 @@ portable and make profile listings useful.
   CAO's own MCP tools, which are granted by the `@cao-mcp-server` selector.
   See [Tool Restrictions](tool-restrictions.md).
 - `resources` (array), `hooks` (object), and `useLegacyMcpJson` (boolean):
-  provider-native configuration passed through where supported.
+  provider-native configuration passed through where supported. For Kiro CLI,
+  `useLegacyMcpJson` is written into the installed agent spec under Kiro's
+  current name for that setting, `includeMcpJson` (the spelling Kiro retired
+  is accepted on input only); unset means `false`.
 - `model` (string): provider model selection.
 - `engine` (string): Kiro CLI engine selection, either `v2` (the default) or
   `kas`. Valid only for the `kiro_cli` provider; an explicit `--engine` at

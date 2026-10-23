@@ -20,8 +20,8 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from cli_agent_orchestrator.constants import SCRIPT_LINT_MAX_SOURCE_CHARS
 from cli_agent_orchestrator.models.workflow import LintFinding, ScriptValidationResult
-from cli_agent_orchestrator.services import script_lint as script_lint_module
 from cli_agent_orchestrator.services.script_lint import lint_script
 
 
@@ -79,12 +79,21 @@ class TestSyntaxRule:
         assert result.findings[0].line == 1
 
     def test_deeply_nested_expression_is_total(self):
-        # Deep attribute chains MAY overflow the parser's recursion (3.10/3.11)
-        # or MAY parse cleanly (3.12+ raised its limits, and CPython's C parser
-        # is not gated by sys.setrecursionlimit). Per the never-assert-which-arm
-        # rule (gh-96670), assert only totality: a result is returned, the status
-        # is in-domain, and any failure is fail-closed as a syntax ERROR.
-        source = "a" + ".b" * 200_000 + "\n"
+        # Deep attribute chains MAY overflow the parser's recursion or MAY parse
+        # cleanly, depending on the CPython minor (3.12+ raised its limits) and
+        # on the C stack, which sys.setrecursionlimit does not gate. Per the
+        # never-assert-which-arm rule (gh-96670), assert only totality: a result
+        # is returned, the status is in-domain, and any failure is fail-closed
+        # as a syntax ERROR.
+        #
+        # The depth here MUST stay under SCRIPT_LINT_MAX_SOURCE_CHARS, or the
+        # oversize guard answers instead and this stops testing the parse path.
+        # It used to be 200_000, which is past the guard AND past the point
+        # where ast.parse segfaults on 3.10 — that exact input is now exercised
+        # safely in a child interpreter by
+        # test/services/test_ast_parse_depth_guard.py's crash probe.
+        source = "a" + ".b" * 20_000 + "\n"
+        assert len(source) <= SCRIPT_LINT_MAX_SOURCE_CHARS  # still the parse path
         result = lint_script(source, "deep.py")
         assert isinstance(result, ScriptValidationResult)
         assert result.status in ("pass", "fail")
@@ -93,21 +102,85 @@ class TestSyntaxRule:
             assert f.rule_id == "syntax"
             assert f.severity == "error"
 
-    def test_recursion_error_arm_is_fail_closed_syntax(self, monkeypatch):
+    def test_recursion_error_arm_is_fail_closed_syntax(self, scoped_ast_parse):
         # Deterministic coverage of the RecursionError arm on ALL supported
         # versions: sys.setrecursionlimit does not gate CPython's C parser, so
         # instead force ast.parse to raise RecursionError and assert the arm
-        # converts it to a fail-closed syntax ERROR anchored at line 1.
-        def _raise(*args, **kwargs):
-            raise RecursionError("maximum recursion depth exceeded")
-
-        monkeypatch.setattr(script_lint_module.ast, "parse", _raise)
+        # converts it to a fail-closed syntax ERROR anchored at line 1. The fake
+        # is scoped to this one source (see ``scoped_ast_parse``): a global fake
+        # would also break pytest's own failure rendering (#970 review, P3-3).
+        scoped_ast_parse("a.b.c\n", RecursionError("maximum recursion depth exceeded"))
         result = lint_script("a.b.c\n", "deep.py")
         assert result.status == "fail"
         f = result.findings[0]
         assert f.rule_id == "syntax"
         assert f.severity == "error"
         assert f.line == 1
+
+
+class TestOversizeSourceGuard:
+    """The pre-parse length cap — a crash guard, not a style limit.
+
+    On CPython 3.10 the AST build inside ``ast.parse`` recurses in C once per
+    nesting level with no recursion gate, so a deeply nested source overflows
+    the C stack and SEGFAULTS: no exception is raised, so none of
+    ``lint_script``'s except arms can convert it into a finding and the
+    whole test process dies mid-run. These tests are the regression guard for
+    that crash class; the first one took the interpreter down before the cap
+    existed.
+
+    Nothing deep is parsed here in-process — not the 200_000-level input that
+    used to segfault pytest, and not the deepest source the cap admits either
+    (#970 review P3-4: at a cap of 262,002 characters or more that parse
+    segfaults the pytest process on CPython 3.10, so the margin check must run
+    in a child). Both run in a child interpreter, in
+    ``test/services/test_ast_parse_depth_guard.py``'s crash probe. Here, only
+    the length branch (shared by the deep case, since depth is irrelevant once
+    the length cap rejects first) is asserted in-process.
+    """
+
+    def test_oversize_source_is_rejected_before_ast_parse(self, scoped_ast_parse):
+        # Ordering is the invariant: the cap is worthless if the parse has
+        # already run by the time it is checked. Record the parser's calls for
+        # THIS source and assert there were none once lint_script returns --
+        # recording, not raising from inside the subject, so a regression is an
+        # ordinary red test rather than an INTERNALERROR (#970 review, P3-3).
+        source = "#" + "x" * SCRIPT_LINT_MAX_SOURCE_CHARS + "\n"
+        parse_calls = scoped_ast_parse(source)
+        result = lint_script(source, "big.py")
+        assert parse_calls == [], "ast.parse ran on a source over the cap"
+        assert result.status == "fail"
+        assert [f.rule_id for f in result.findings] == ["syntax"]
+        assert str(SCRIPT_LINT_MAX_SOURCE_CHARS) in result.findings[0].message
+        # ERRORs are mirrored into the legacy list (Q5=A), warnings never are.
+        assert len(result.errors) == 1
+
+    def test_source_just_under_the_cap_still_reaches_the_rules(self):
+        # The cap must not swallow a large-but-legitimate script: the repo's
+        # own biggest workflow example is ~58 KB, well inside this.
+        padding = "# pad\n" * 2_000
+        source = padding + "import cli_agent_orchestrator\n"
+        assert len(source) <= SCRIPT_LINT_MAX_SOURCE_CHARS
+        result = lint_script(source, "large_but_fine.py")
+        assert result.status == "fail"
+        assert _findings_by_rule(result, "disallowed-import")
+
+    def test_dense_unary_chain_under_the_cap_is_fail_closed_not_memoryerror(self):
+        # The length cap bounds AST depth for a 2-bytes-per-level attribute
+        # chain, but a right-recursive construct hits a DIFFERENT failure well
+        # under the cap: the PEG parser's stack has a fixed depth, and a chain
+        # of about 6,000 unary minus signs overflows it, so ast.parse raises
+        # MemoryError (the parser's "source too complex" signal, not a real
+        # out-of-memory), not a SyntaxError/ValueError/RecursionError. The same
+        # depth does it on 3.10, 3.12 and 3.13; 10_000 (~10 KB, far under the
+        # 128 KiB cap) reproduces it with margin.
+        source = "-" * 10_000 + "1"
+        result = lint_script(source, "unary.py")
+        assert isinstance(result, ScriptValidationResult)
+        assert result.status == "fail"
+        f = result.findings[0]
+        assert f.rule_id == "syntax"
+        assert f.severity == "error"
 
 
 class TestDisallowedImportRule:

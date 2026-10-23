@@ -52,9 +52,14 @@ the YAML tier at all.
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from cli_agent_orchestrator.services import execution_manifest, plan_identifier
+from cli_agent_orchestrator.utils.agent_profiles import (
+    ProfileEntry,
+    profile_set_digest,
+    read_profile_set,
+)
 from cli_agent_orchestrator.utils.git_baseline import derive_baseline, normalize_unavailable_reason
 
 logger = logging.getLogger(__name__)
@@ -62,7 +67,9 @@ logger = logging.getLogger(__name__)
 OMITTED_FIELDS_NOTE = (
     "provider, model, profile, permissions, limits and retry_policy are omitted: they have no "
     "run-level source in the script tier (each is a per-step argument to step()). They are covered "
-    "transitively by source_hash, because the script's own source chooses them."
+    "transitively by source_hash, because the script's own source chooses them. The profile NAME is "
+    "covered that way; the profile's CONTENT is not, and is covered instead by the profile_set digest "
+    "folded into plan_id under scheme plan-v2 (issue #827)."
 )
 """Recorded IN the envelope, not only in the design documents.
 
@@ -76,6 +83,16 @@ most likely misread as missing data.
 class FrozenManifest:
     manifest_json: Optional[str]
     unavailable_reason: Optional[str] = None
+    profile_set: Optional[Mapping[str, ProfileEntry]] = None
+    """The ONE read of the installed profile set the ``plan_id`` in ``manifest_json`` was computed from.
+
+    The start paths hand this to ``launch_guard.capture(profile_set=...)`` so the per-run guard record
+    describes the same snapshot the approval was checked against. Before that, the guard re-read the
+    store after the gate, and a profile edited in that window was recorded as the approved state and
+    accepted by ``launch_guard.check`` for the rest of the run (PR #1000, P3-3). It also removes the
+    second full scan of the profile set from the start path. ``None`` when the freeze did not get as
+    far as reading the set.
+    """
 
 
 def freeze_manifest(
@@ -101,6 +118,24 @@ def freeze_manifest(
             logger.warning("manifest freeze unavailable repository baseline: reason=%s", reason)
             return FrozenManifest(None, reason)
 
+        # issue #827: the ONE thing neither the source hash nor the repository baseline can cover. A
+        # step's behaviour and tool policy come from its agent profile's CONTENT, resolved from a file
+        # outside the script at launch time, so the transitive-coverage argument below does not reach
+        # it: rewriting a profile changed no byte of the script and therefore no byte of the plan_id.
+        #
+        # An entry the launch path REFUSES (a symlink escaping the store, a ``..`` name, a directory
+        # without ``agent.md``) is digested as a sentinel, not raised: it is a classification the reader
+        # itself made, and a persistent stray entry must not refuse every script run. An entry that
+        # cannot be READ (``PermissionError`` and kin) is a different thing — CAO cannot know what the
+        # set is — and fails closed under its own closed reason so the operator is told to look at the
+        # profile store rather than to retry a CAO-side failure (PR #1000, P2-1).
+        try:
+            profile_snapshot = read_profile_set()
+        except OSError:
+            logger.warning("manifest freeze unavailable profile set: reason=profiles_unreadable")
+            return FrozenManifest(None, "profiles_unreadable")
+        profile_set = profile_set_digest(profile_snapshot)
+
         # Six of FR-8's nine fields are None here because they have no run-level source in this tier
         # (see the module docstring). ``plan_identifier`` renders a None scalar as a distinct
         # not-supplied sentinel, so their absence is part of the identity rather than invisible to it.
@@ -114,6 +149,7 @@ def freeze_manifest(
             permissions=None,
             limits=None,
             retry_policy=None,
+            profile_set=profile_set,
         )
         plan_id = plan_identifier.compute(fields)
 
@@ -142,7 +178,7 @@ def freeze_manifest(
             memory_content="",
             memory_source="",
         )
-        return FrozenManifest(execution_manifest.serialise(envelope))
+        return FrozenManifest(execution_manifest.serialise(envelope), profile_set=profile_snapshot)
     except Exception:  # noqa: BLE001 - freeze failure refuses admission, never exposes inputs
         logger.warning("manifest freeze failed: reason=internal")
         return FrozenManifest(None, "internal")

@@ -18,7 +18,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.base import BaseProvider, ProviderExitedError
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils import agent_profiles
 from cli_agent_orchestrator.utils.mcp_resolution import (
@@ -71,7 +71,15 @@ IDLE_PROMPT_STRICT_PATTERN = r"^\s*(?:❯|›|»|codex>)\s*$"
 
 PROCESSING_PATTERN = r"\b(thinking|working|running|executing|processing|analyzing)\b"
 WAITING_PROMPT_PATTERN = r"^(?:Approve|Allow)\b.*\b(?:y/n|yes/no|yes|no)\b"
-ERROR_PATTERN = r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|panic:)"
+# Codex prints the same config rejection behind one of two prefixes: "Error:"
+# (observed from codex-cli 0.163.0 in a tmux pane, the CAO case) and "Error
+# loading config.toml:" (the text #967 reported from a run under CAO; the TUI
+# start path in the 0.162 source writes it with no tty check). Which prefix a
+# given release writes to a pty is not pinned down, so both are anchors and
+# detection does not depend on the answer.
+ERROR_PATTERN = (
+    r"^(?:Error:|ERROR:|Error loading config\.toml:|Traceback \(most recent call last\):|panic:)"
+)
 
 # Codex TUI footer indicators (status bar below the idle prompt).
 # Used to detect when the bottom lines contain TUI chrome rather than user input.
@@ -144,6 +152,49 @@ ERROR_CELL_PATTERN = r"^■\s"
 # ("• Ran ...", "└ ..."), the reply, or an error cell.
 TURN_ACTIVITY_PATTERN = r"^[^\S\n]*[•◦└■]"
 
+# Codex refuses to start when `--profile <name>` is combined with the legacy
+# `[profiles.<name>]` table (or a top-level `profile = "<name>"` selector) in
+# config.toml: since the CONFIG_PROFILE_V2 relocation, profile settings must
+# live in their own `$CODEX_HOME/<name>.config.toml`. The process exits before
+# drawing a banner, so without this pattern the only symptom CAO could report
+# was a generic `provider_init_timeout` expiry -- an operator who had followed
+# CAO's own (previously wrong) docs got a message pointing at host slowness
+# rather than at the config line they needed to move (#967). Matched on the
+# distinguishing phrase rather than the whole sentence because codex
+# interpolates absolute CODEX_HOME paths into it. Verified against codex-cli
+# 0.162.1 and 0.163.0.
+CONFIG_PROFILE_ERROR_PATTERN = r"cannot be used while.*contains legacy"
+# The same phrase with every space removed, matched against text that has had
+# ALL its whitespace removed. tmux wraps codex's one-line message at the exact
+# pane column, inside words when that is where the column falls ("co" /
+# "ntains legacy" on an 80-column pane with a short CODEX_HOME), and a joiner
+# cannot know whether a wrap fell inside a word or on a space tmux then
+# trimmed. Comparing with no whitespace on either side makes detection
+# independent of the pane width.
+_CONFIG_PROFILE_ERROR_COMPACT = re.compile(CONFIG_PROFILE_ERROR_PATTERN.replace(" ", ""))
+# How many pane rows a rejection that still carries the pane's soft wraps may
+# span. Observed at 5 rows on an 80-column pane with a short CODEX_HOME. A
+# capture taken with get_history(join_wrapped=True) holds the message as ONE
+# row, so this bounds only the fallback for captures that were not joined.
+CONFIG_ERROR_MESSAGE_ROWS = 8
+# A row that is nothing but a bare shell prompt glyph. Ends the wrapped
+# rejection message when the launch row (and so the real prompt prefix) is not
+# in the capture; a usual prompt is prefixed (`operator@host:/repo$`) and is
+# recognised from the launch row instead, see _find_config_rejection().
+SHELL_PROMPT_ONLY_PATTERN = r"^[$%#>❯›»]\s*$"
+# The shell prompt plus the `codex` invocation CAO itself typed to start this
+# terminal. Anchors _find_config_rejection() on the most recent launch attempt:
+# tmux scrollback can still hold an old rejection from an earlier, already-fixed
+# config above a *later* launch that failed for an unrelated reason, and that
+# stale message must not be reported as explaining the current failure.
+# The prompt is normally prefixed (`operator@host:/repo$ codex ...`, zsh `%`, starship
+# `❯`), so the glyph is matched anywhere on the row, not only at column 0. The failure
+# direction of the wider match is a false negative (a rejection row that happens to
+# contain `$ codex` is taken as a launch line and the generic timeout stands), which is
+# the safe one. The `prompt` group is everything before `codex`: the operator's prompt
+# as this pane renders it, which is also what codex exits back to.
+LAUNCH_COMMAND_PATTERN = r"(?P<prompt>.*[$%#>❯›»])\s*codex\b"
+
 # Workspace trust/approval prompt shown when Codex opens a new directory.
 # Two known variants:
 #   v0.98+: "allow Codex to work in this folder"
@@ -200,6 +251,13 @@ STARTUP_PROMPT_BOTTOM_LINES = 15
 # write, and small next to provider_init_timeout.
 POST_READINESS_TRANSITIONAL_REREADS = 6
 STARTUP_ACTIVITY_PATTERN = r"^\s*•[^\S\n]+\S"
+# A turn's own structure, as opposed to a bare `•` bullet: the tree
+# continuation under a tool row, the dim secondary row, and the error cell that
+# ends a failed turn. Codex never draws any of these outside a turn, so unlike
+# the bare bullet above they are unambiguous activity. Kept separate from
+# TURN_ACTIVITY_PATTERN, which deliberately includes `•` because its callers
+# are judging a frame that already has a submitted user message above it.
+STARTUP_TURN_STRUCTURE_PATTERN = r"^[^\S\n]*[◦└■]"
 # Codex's runtime approval prompt as actually rendered by codex-cli 0.147.0,
 # verified against a live tmux capture (test/providers/fixtures/
 # codex_approval_modal_raw.txt):
@@ -405,6 +463,57 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
     return len("\n".join(all_lines[:footer_start_idx]))
 
 
+def _is_pre_turn_startup_frame(clean_output: str) -> bool:
+    """Return True when the frame shows a Codex that has never run a turn.
+
+    Codex prints account and product notices into its startup chrome as
+    ordinary bullets -- codex-cli 0.153 draws
+
+        • You have 1 usage limit reset available. Run /usage to use one.
+
+    between the welcome banner and the idle composer. Glyph-wise that is
+    indistinguishable from a tool row or from the model's own reply, and both of
+    the places that read a bullet got it wrong (#739): the startup readiness
+    veto refused a pane sitting at its idle composer, so the startup handler
+    could only end at its outer cap; and ``get_status`` took the "reply whose
+    user marker was evicted" branch and answered COMPLETED for a worker that
+    had never been given a task -- the dangerous direction, it tells the
+    conductor the agent is free.
+
+    The discriminator is the one the surrounding code already uses ("Only a
+    terminal that has not had a turn shows the startup banner instead", in
+    ``_status_of_frame``), and it is structural rather than a list of the notice
+    copy somebody has happened to see: a turn cannot exist without a submitted
+    user message, so a frame that still shows the welcome banner AND has no
+    user cell above the TUI footer cutoff has had no turn, and every bullet on
+    it is startup chrome. The cutoff is computed exactly as
+    ``_status_of_frame`` computes it, so the composer's own placeholder row
+    ("› Ask Codex to do anything", a USER_PREFIX_PATTERN match) is excluded by
+    both and the two cannot disagree about whether a turn has started.
+
+    Fails toward today's behaviour: a shell prompt glyph that USER_PREFIX_PATTERN
+    happens to match, or a banner scrolled out of the buffer, returns False and
+    leaves the old conservative readings in place.
+
+    Anchored on BANNER_VERSION_PATTERN rather than the bare "OpenAI Codex"
+    substring: a reply that merely quotes the product name (e.g. "I'm OpenAI
+    Codex, here is...") would otherwise also read as pre-turn (#739 review).
+    The versioned banner line ("OpenAI Codex (v0.153.2)") is startup chrome
+    the model does not render into a reply.
+    """
+    if not re.search(BANNER_VERSION_PATTERN, clean_output):
+        return False
+    all_lines = clean_output.splitlines()
+    if any(re.search(TUI_FOOTER_PATTERN, line) for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]):
+        cutoff = _compute_tui_footer_cutoff(all_lines)
+    else:
+        cutoff = len(clean_output)
+    return not any(
+        match.start() < cutoff
+        for match in re.finditer(USER_PREFIX_PATTERN, clean_output, re.IGNORECASE | re.MULTILINE)
+    )
+
+
 def _banner_version(text: str) -> tuple[int, int, int]:
     """Return the release in the Codex startup banner, or (0, 0, 0) if none is drawn."""
     matches = re.findall(BANNER_VERSION_PATTERN, text)
@@ -412,6 +521,83 @@ def _banner_version(text: str) -> tuple[int, int, int]:
         return (0, 0, 0)
     major, minor, patch = (int(part) for part in matches[-1])
     return (major, minor, patch)
+
+
+def _without_whitespace(text: str) -> str:
+    """``text`` with every whitespace character removed."""
+    return "".join(text.split())
+
+
+def _find_config_rejection(clean_output: str) -> Optional[str]:
+    """Return codex's config-rejection message from a pane capture, or None.
+
+    Codex prints this and exits before any banner, so the pane text is the ONLY
+    evidence of the failure that reaches CAO -- there is no exit status to read
+    back through tmux.
+
+    Codex prints the rejection as ONE logical line. Captured with
+    ``get_history(join_wrapped=True)`` (``capture-pane -J``) it arrives as one
+    row whatever the pane width, and that row is the message. A capture that
+    still carries the pane's soft wraps (a backend without the flag, or a
+    caller that did not ask for joined rows) is reassembled across the rows
+    after the anchor instead. Such a reassembly is CONTEXT ONLY: tmux wraps at
+    the exact pane column, so a word can be split (``cao_reviewer.confi`` /
+    ``g.toml`` at CAO's default 220 columns), and the joiner cannot tell a
+    split word from a space tmux trimmed at the row end. The operator-facing
+    text therefore names the file from CAO's own data, not from this string
+    (see CodexProvider._find_startup_config_error). Detection compares with all
+    whitespace removed, so a wrap that lands inside the distinguishing phrase
+    cannot hide the rejection either.
+
+    Scans only the most recent launch attempt, not the whole scrollback: tmux
+    retains history across restarts, so an old rejection from a previous
+    launch can sit above a current, unrelated failure, and that stale
+    rejection must not be reported as explaining a failure it did not cause.
+    The scan is bounded to the rows at or after the last line matching
+    LAUNCH_COMMAND_PATTERN (the `$ codex ...` CAO itself typed); a pane
+    fragment with no visible launch line (e.g. captured mid-attempt) falls
+    back to scanning everything, keeping the LAST match as before.
+
+    The launch row also shows what this pane's shell prompt looks like: all of
+    it before ``codex``. The prompt codex exits back to is normally prefixed
+    (``op@devbox:~/repo$``), which a bare-glyph test does not recognise, so the
+    message would otherwise absorb it (and anything typed after it). A row
+    that starts with the launch row's prompt ends the message.
+    """
+    rows = [line.strip() for line in clean_output.splitlines() if line.strip()]
+    prompt_prefix = ""
+    for index in range(len(rows) - 1, -1, -1):
+        launch = re.match(LAUNCH_COMMAND_PATTERN, rows[index])
+        if launch:
+            rows = rows[index:]
+            prompt_prefix = launch.group("prompt").strip()
+            break
+
+    def ends_message(row: str) -> bool:
+        if prompt_prefix and row.startswith(prompt_prefix):
+            return True
+        return re.match(SHELL_PROMPT_ONLY_PATTERN, row) is not None
+
+    rejection = None
+    for index, row in enumerate(rows):
+        # Anchor on the row that OPENS the message, not on the row carrying the
+        # distinguishing phrase: an unjoined pane wraps "cannot be used while"
+        # and "contains legacy" onto different rows, so the phrase only exists
+        # once the rows are rejoined.
+        if not re.match(ERROR_PATTERN, row):
+            continue
+        message_rows = [row]
+        for continuation in rows[index + 1 : index + CONFIG_ERROR_MESSAGE_ROWS]:
+            # Stop at the prompt codex exits back to, so the operator-facing
+            # string cannot absorb it or anything typed after it. On a joined
+            # capture this stops at once: the whole message is the anchor row.
+            if ends_message(continuation):
+                break
+            message_rows.append(continuation)
+        joined = " ".join(message_rows)
+        if _CONFIG_PROFILE_ERROR_COMPACT.search(_without_whitespace(joined)):
+            rejection = joined
+    return rejection
 
 
 def _is_completion_footer(row: str, version: tuple[int, int, int]) -> bool:
@@ -1019,7 +1205,18 @@ def _has_startup_idle_composer(clean_output: str) -> bool:
     tail_lines = all_lines[-STARTUP_PROMPT_BOTTOM_LINES:]
     tail_output = "\n".join(tail_lines)
 
-    if re.search(STARTUP_ACTIVITY_PATTERN, tail_output, re.MULTILINE):
+    # The activity veto. A live spinner and a turn's tree/error rows are
+    # unambiguous and always veto. A bare `•` bullet is not: on a frame that has
+    # had no turn it is the account notice Codex prints into its startup chrome,
+    # and vetoing on it meant the startup handler could never return "settled"
+    # for such an account (#739). See _is_pre_turn_startup_frame.
+    if re.search(TUI_PROGRESS_PATTERN, tail_output, re.MULTILINE):
+        return False
+    if re.search(STARTUP_TURN_STRUCTURE_PATTERN, tail_output, re.MULTILINE):
+        return False
+    if re.search(STARTUP_ACTIVITY_PATTERN, tail_output, re.MULTILINE) and not (
+        _is_pre_turn_startup_frame(clean_output)
+    ):
         return False
     if re.search(WAITING_PROMPT_PATTERN, tail_output, re.IGNORECASE | re.MULTILINE):
         return False
@@ -1169,6 +1366,12 @@ class CodexProvider(BaseProvider):
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        # The codex `--profile <name>` the last _build_codex_command() launched
+        # with, or None for a --yolo launch. Read by _find_startup_config_error()
+        # so the operator is told which $CODEX_HOME/<name>.config.toml to create
+        # from CAO's own data rather than from pane text the terminal may have
+        # wrapped mid-path (#967).
+        self._launched_codex_profile: Optional[str] = None
         # Explicit per-call override for profile.model, see _build_codex_command.
         self._model = model
         # The release in the startup banner, and whether it ends each turn with
@@ -1180,6 +1383,11 @@ class CodexProvider(BaseProvider):
         # The cached result of the exit check (see _exited_to_shell).
         self._exit_checked_at: Optional[float] = None
         self._exited = False
+        # Set by initialize() once the codex command has been sent. Before that
+        # the pane IS the shell by construction, so a ready-looking frame (a
+        # `❯` prompt theme reads as an idle composer) must not be vetoed into
+        # ERROR by the pane command (#1018 review, P3-2).
+        self._launched = False
         # Dispatch attribution is provider-local and intentionally ephemeral.
         # Screen parsing only reads snapshots; lifecycle hooks own mutations.
         self._dispatch_lock = threading.Lock()
@@ -1368,8 +1576,10 @@ class CodexProvider(BaseProvider):
         # --yolo (alias for --dangerously-bypass-approvals-and-sandbox)
         # is the default because CAO runs codex non-interactively in tmux
         # where approval prompts would block handoff/assign. Profiles can
-        # opt out via `codexProfile` (names a [profiles.<name>] block in
-        # ~/.codex/config.toml), unless unrestricted allowed tools are enabled.
+        # opt out via `codexProfile` (names a $CODEX_HOME/<name>.config.toml
+        # file, NOT a [profiles.<name>] table inside config.toml -- codex
+        # rejects --profile outright when that legacy table is present, #967),
+        # unless unrestricted allowed tools are enabled.
         # In practice, allowed_tools containing "*" is treated as yolo mode
         # and overrides codexProfile in the same way as an explicit yolo launch.
         yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
@@ -1383,7 +1593,9 @@ class CodexProvider(BaseProvider):
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
+        self._launched_codex_profile = None
         if profile and profile.codexProfile and not yolo:
+            self._launched_codex_profile = profile.codexProfile
             command_parts = ["codex", "--profile", profile.codexProfile]
         else:
             if profile and profile.codexProfile:
@@ -1413,7 +1625,8 @@ class CodexProvider(BaseProvider):
                     "settings in ~/.codex/config.toml, including "
                     "[sandbox_workspace_write].network_access, do NOT apply. Set "
                     "codexProfile on the agent profile to launch under a named "
-                    "[profiles.<name>] block instead.",
+                    "profile config file ($CODEX_HOME/<name>.config.toml, by "
+                    "default ~/.codex/<name>.config.toml) instead.",
                     self.terminal_id,
                 )
             command_parts = ["codex", "--yolo"]
@@ -1849,6 +2062,59 @@ class CodexProvider(BaseProvider):
         )
         return "blocked" if blocked else "unresolved"
 
+    async def _find_startup_config_error(self) -> Optional[str]:
+        """Operator-facing message when the pane shows codex rejecting its config.
+
+        Returns None when the pane shows anything else, so every caller keeps
+        its existing failure. Called only from paths that are already failing.
+        """
+        try:
+            # Joined rows: codex prints the rejection as one long line and tmux
+            # wraps it at the exact pane column, often inside the very path the
+            # operator needs (#967). Asking tmux to rejoin its own wraps is the
+            # one way to get that line back intact at any pane width.
+            output = await asyncio.to_thread(
+                get_backend().get_history,
+                self.session_name,
+                self.window_name,
+                join_wrapped=True,
+            )
+        except Exception:
+            # A transient capture failure must not replace the startup failure
+            # this helper exists to explain -- the caller's own TimeoutError
+            # (or "blocked" dialog) stands instead.
+            logger.exception(
+                "Terminal %s: failed to capture pane for config-rejection check",
+                self.terminal_id,
+            )
+            return None
+        if not output:
+            return None
+        clean_output = strip_terminal_escapes(re.sub(ANSI_CODE_PATTERN, "", output))
+        rejection = _find_config_rejection(clean_output)
+        if not rejection:
+            return None
+        # The file to create is named from CAO's own data (the codexProfile it
+        # launched with), never parsed back out of the pane: a backend that
+        # does not join wrapped rows can hand back the path split mid-word, and
+        # the quoted codex text below is context, not the instruction.
+        name = self._launched_codex_profile or "<name>"
+        config_file = "$CODEX_HOME/<name>.config.toml".replace("<name>", name)
+        detail = (
+            f"Codex refused to start and exited: it rejects `--profile {name}`."
+            f" Move that profile's settings into {config_file} (under ~/.codex/ when"
+            " CODEX_HOME is unset) and remove the legacy profile table or selector"
+            " from config.toml; see 'Custom Codex Profile' in docs/codex-cli.md."
+            " CAO passed --profile because the agent profile sets codexProfile."
+            f" Codex said: {rejection}"
+        )
+        # Logged as well as raised: the raised text reaches the caller that
+        # requested this terminal, but an operator debugging a failed fleet
+        # launch reads the server log, and this is the only record of why the
+        # pane is empty.
+        logger.error("Terminal %s: %s", self.terminal_id, detail)
+        return detail
+
     async def _current_startup_state(self) -> Optional[str]:
         """Resolve the startup state of the pane as it is right now."""
         output = await asyncio.to_thread(
@@ -1901,6 +2167,15 @@ class CodexProvider(BaseProvider):
         self.shell_baseline = await asyncio.to_thread(
             get_backend().get_pane_current_command, self.session_name, self.window_name
         )
+        if not self.shell_baseline:
+            # Said once, here, rather than on every readiness poll: without a
+            # baseline the exit-to-shell checks below and in get_status() have
+            # nothing to compare against and silently stand down (#1018).
+            logger.warning(
+                "Terminal %s: the pane's foreground process could not be read before launching "
+                "codex; an exit to the shell during startup cannot be detected",
+                self.terminal_id,
+            )
 
         # Send a warm-up command before launching codex.
         # Codex exits immediately in freshly-created tmux sessions where the shell
@@ -1924,6 +2199,9 @@ class CodexProvider(BaseProvider):
         await asyncio.to_thread(
             get_backend().send_keys, self.session_name, self.window_name, command
         )
+        # From here on a pane whose foreground process is the shell again means
+        # codex exited; before this line it meant codex had not started.
+        self._launched = True
 
         # Handle workspace trust prompt if it appears (new/untrusted directories).
         # The handler's bounds now come from settings rather than a hard-coded
@@ -1947,6 +2225,16 @@ class CodexProvider(BaseProvider):
                 f"Codex startup prompt could not be dismissed within {init_timeout}s: "
                 "a trust or update dialog is still on screen"
             )
+        if outcome == "unresolved":
+            # The handler ran to its cap having seen neither a prompt nor a
+            # welcome banner. That is exactly what a codex process which
+            # rejected its own config and exited looks like from here, so this
+            # is the one place worth paying for an extra capture: the pane still
+            # holds codex's error text (#967). Checked here rather than on a
+            # poll during startup so the happy path reads no extra frames.
+            config_error = await self._find_startup_config_error()
+            if config_error:
+                raise ProviderError(config_error)
 
         # WAITING_USER_ANSWER is included here specifically for the first-run login/auth
         # menu (see LOGIN_MENU_PATTERN's own comment) — an account with no credentials
@@ -1964,12 +2252,28 @@ class CodexProvider(BaseProvider):
         # path can't let an assign/handoff paste the orchestrated task into the live login
         # menu -- the same composition hazard PR #539's review flagged for ClaudeCodeProvider's
         # own choice-prompt widening, fixed here the same way rather than left open.
+        #
+        # ``on_poll`` reads the pane's foreground process after every status
+        # poll (#1018): a codex that exits during startup leaves its
+        # `› Error: ...` line and the shell prompt in the pane, the `›` reads
+        # as an idle composer, and the status pipeline had no other way to tell
+        # that frame from a ready one until ``_initialized`` was already true.
+        # The task delivered on that verdict was executed by bash. The hook
+        # raises ProviderExitedError, which ends startup with the real reason
+        # instead of the init timeout, and which no ready status can outvote.
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.WAITING_USER_ANSWER},
             timeout=float(init_timeout),
             polling_interval=1.0,
+            on_poll=self._raise_if_exited_during_startup,
         ):
+            # A readiness wait that expired can also be a codex that never
+            # started: when the pane carries codex's own config rejection, that
+            # text is what the operator needs, not the elapsed seconds (#967).
+            config_error = await self._find_startup_config_error()
+            if config_error:
+                raise ProviderError(config_error)
             # Interpolated, not the old hard-coded "60 seconds": the bound is
             # ``provider_init_timeout``, so an operator who changed it was told
             # a number the code never used.
@@ -2016,8 +2320,51 @@ class CodexProvider(BaseProvider):
             ".".join(str(part) for part in version) if any(version) else "(no banner)",
             self._ends_turns_with_footer,
         )
+        # The last word before readiness is declared belongs to the pane's
+        # foreground process, not to the frame: the re-reads above took up to
+        # a few seconds. In the reporter's log codex had already exited when
+        # the readiness wait read IDLE on its first poll; the ERROR that
+        # followed 154 ms after this method returned was the old,
+        # ``_initialized``-gated check finally being allowed to look.
+        await self._raise_if_exited_during_startup()
         self._initialized = True
         return True
+
+    async def _raise_if_exited_during_startup(self) -> None:
+        """Raise ``ProviderExitedError`` if the pane's foreground process is the shell again.
+
+        Awaited by the readiness wait after every status poll and once more
+        before ``_initialized`` is set. A fresh read every time -- never the
+        cached verdict -- because the caller is about to declare the terminal
+        ready and the next thing CAO does with a ready terminal is type the task
+        into it. No baseline (the lookup failed before launch) means no
+        comparison is possible; that case keeps the previous behaviour, and
+        ``initialize()`` has already logged it once.
+        """
+        if not self.shell_baseline:
+            return
+        if not await asyncio.to_thread(self._exited_to_shell, fresh=True):
+            return
+        tail = ""
+        try:
+            output = await asyncio.to_thread(
+                get_backend().get_history, self.session_name, self.window_name
+            )
+            rows = [row for row in strip_terminal_escapes(output or "").splitlines() if row.strip()]
+            tail = " | ".join(row.strip()[:160] for row in rows[-3:])
+        except Exception:  # noqa: BLE001 - the tail is diagnostic only
+            pass
+        logger.error(
+            "Terminal %s: codex exited during startup; the pane is back at the shell (%s). "
+            "Pane tail: %s",
+            self.terminal_id,
+            self.shell_baseline,
+            tail,
+        )
+        raise ProviderExitedError(
+            f"Codex exited during startup; the pane is back at the shell "
+            f"({self.shell_baseline}). Nothing was delivered. Pane tail: {tail}"
+        )
 
     def get_status(self, output: str) -> TerminalStatus:
         return self._get_status(output, rendered=False)
@@ -2050,12 +2397,26 @@ class CodexProvider(BaseProvider):
         # (e.g. "zsh") that was running before we launched codex. Returning
         # ERROR prevents the inbox service from typing a queued message into
         # the shell — which would execute it as arbitrary commands.
+        #
+        # A READY verdict is checked from the moment the codex command has been
+        # sent, not only once initialization has finished (#1018). It is the
+        # verdict initialize()'s readiness wait accepts, and the frame alone
+        # cannot be trusted to produce it: a codex that died during startup
+        # leaves `› Error: ...` above the shell prompt, and that `›` reads as
+        # an idle composer. Gating this on ``_initialized`` meant the one check
+        # that could veto the misreading was switched off for exactly the
+        # window in which it was needed, and the task was typed into bash.
+        # ``_launched`` keeps the veto off before the launch: the pane is the
+        # shell then by construction, and a `❯` prompt theme (pure, starship,
+        # powerlevel10k) reads as an idle composer, which would otherwise show a
+        # false ERROR during the warm-up. Non-ready verdicts keep the
+        # ``_initialized`` gate: nobody acts on PROCESSING/UNKNOWN, and the read
+        # costs a tmux round trip per frame.
+        ready_verdict = status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
         if (
-            self._initialized
-            and self.shell_baseline
-            and self._exited_to_shell(
-                fresh=status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
-            )
+            self.shell_baseline
+            and (self._initialized or (ready_verdict and self._launched))
+            and self._exited_to_shell(fresh=ready_verdict)
         ):
             return TerminalStatus.ERROR
         return status
@@ -2364,7 +2725,19 @@ class CodexProvider(BaseProvider):
             #   e2e tests would time out.
             # Search above the TUI footer cutoff so the › suggestion-hint and
             # status-bar lines aren't confused with a model reply.
-            if _find_assistant_marker(clean_output[:cutoff_pos]) is not None:
+            #
+            # A frame that still shows the welcome banner with no user cell on
+            # it has had no turn at all, so its bullets are the account notices
+            # Codex prints into its startup chrome, not a reply whose marker
+            # scrolled away (#739): a notice bullet here answered COMPLETED for
+            # a worker that was never given a task. IDLE is the honest verdict
+            # and still satisfies initialize()'s {IDLE, COMPLETED} wait. The
+            # eviction case this branch exists for cannot look like this -- a
+            # transcript long enough to evict its user marker has pushed the
+            # banner out of the buffer too.
+            if _find_assistant_marker(
+                clean_output[:cutoff_pos]
+            ) is not None and not _is_pre_turn_startup_frame(clean_output):
                 return TerminalStatus.COMPLETED
             return TerminalStatus.IDLE
 

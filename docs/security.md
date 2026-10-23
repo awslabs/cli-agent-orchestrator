@@ -184,4 +184,9 @@ the removed history** — so it must not be used.
   capture live-CLI fixtures on a synthetic/throwaway account and scrub any
   login/banner line before committing.
 - **The runtime redactor** (`src/cli_agent_orchestrator/services/secret_gate.py`)
-  strips credential shapes from memory writes and archive exports at runtime.
+  strips credential shapes from memory writes and archive exports at runtime, and
+  from every Obsidian-vault note on its way to an agent: a `secret_gate: "warn"`
+  mapping indexes a secret-bearing note but serves `[REDACTED:<pattern>]` on
+  recall and injection unless the note carries a per-finding `cao.secret_ok`
+  acceptance (pattern name plus SHA-256 of the matched span). See
+  [obsidian-vault.md](obsidian-vault.md#secret-handling).
