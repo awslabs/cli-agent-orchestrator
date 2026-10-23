@@ -32,6 +32,7 @@ from cli_agent_orchestrator.services.vault.config import MAX_FRONTMATTER_BYTES_L
 from cli_agent_orchestrator.services.vault.parser import (
     parse_note,
     secret_acceptances,
+    secret_scan_text,
     split_frontmatter,
 )
 
@@ -389,8 +390,12 @@ def load_candidate(
         region = split_frontmatter(text, MAX_FRONTMATTER_BYTES_LIMIT)
     except ValueError:
         return None
-    body = _strip_leading_h1(region.body)
-    body, redacted_patterns = _redact_for_model(candidate, text, body)
+    # Redact the text the scanner fingerprinted, THEN present it. A pattern may
+    # match across a line break, so stripping the H1 first left the reader
+    # looking at a different text than the scan hashed and a match that began on
+    # the heading line reached the agent raw (#644 AC10).
+    body, redacted_patterns = _redact_for_model(candidate, text, secret_scan_text(region))
+    body = _strip_leading_h1(body)
     truncated = byte_truncated or len(body) > max_body_chars
     if truncated:
         body = body[: max(0, max_body_chars - len(_TRUNCATION_MARKER))] + _TRUNCATION_MARKER
@@ -434,6 +439,21 @@ def _redact_for_model(
     candidate: VaultCandidate, text: str, body: str
 ) -> tuple[str, tuple[str, ...]]:
     """Redact credential-shaped spans before note text leaves the read boundary.
+
+    ``body`` must be :func:`secret_scan_text` of the note's region, the same
+    bytes the scan classified and ``vault scan --fingerprints`` hashed, because
+    ``bearer_token`` and ``secret_assignment`` match across a line break: a
+    heading ending in a key word and a value on the next line are one match, and
+    a caller that trimmed the heading first would hand this function a text no
+    pattern matches. Presentation transforms belong on the result, so
+    :func:`_strip_leading_h1` runs on what this returns.
+
+    One intended side effect of that order: when a match begins on the leading
+    H1 line, the marker stands where the line break was, so the rest of the
+    value's line is now part of the H1 line and the strip removes both. The
+    agent is served less than the note holds rather than the credential, which
+    is the direction to fail in; accepting the printed fingerprint puts the line
+    break back and only the heading line goes.
 
     Returns the redacted body and the deduplicated, pattern-order names of the
     patterns whose spans did not reach the output raw. The cascade is run once
@@ -494,8 +514,16 @@ def increment_counter(vault_id: str, counter_name: str, amount: int) -> None:
 
 
 def _strip_leading_h1(body: str) -> str:
-    """Remove one ordinary Markdown H1 without imposing native wiki syntax."""
-    lines = body.lstrip("\n").splitlines()
+    """Remove one ordinary Markdown H1 without imposing native wiki syntax.
+
+    Presentation only, and it runs on the redacted text, never before it. Lines
+    are split on LF alone: ``splitlines()`` also breaks on U+2028/9, the
+    vertical tab, the form feed and NEL, and rejoining turned each of those into
+    an LF, rewriting body bytes the scanner had fingerprinted. The patterns
+    match across those characters, so the one transform this function is for is
+    dropping a leading heading line, not normalising separators.
+    """
+    lines = body.lstrip("\n").split("\n")
     if lines and lines[0].startswith("# ") and not lines[0].startswith("## "):
         return "\n".join(lines[1:]).lstrip("\n")
     return body

@@ -32,6 +32,7 @@ from cli_agent_orchestrator.clients.database import VaultFindingModel, VaultNote
 from cli_agent_orchestrator.services import settings_service
 from cli_agent_orchestrator.services.secret_gate import (
     fingerprint_secrets,
+    normalize_line_endings,
     pattern_names,
     redact_secrets,
     redact_secrets_with_acceptances,
@@ -43,6 +44,8 @@ from cli_agent_orchestrator.services.vault.parser import (
     frontmatter_boundary,
     parse_note,
     secret_acceptances,
+    secret_scan_text,
+    split_frontmatter,
 )
 from cli_agent_orchestrator.services.vault.reader import (
     NO_REQUESTER_IDENTITY,
@@ -133,6 +136,52 @@ _ENV_TOKEN_BODY, _ENV_TOKEN_VALUE, _ENV_TOKEN_CHAIN = _NESTED["github_token_env"
 # LF-normalised note, the reader hashes the file as written.
 _CRLF_SPAN_BODY = "token:\r\n  abcdef0123456789ABCDEF"
 _FINGERPRINT_LINE = re.compile(r"pattern=(\S+) sha256=([0-9a-f]{64})(?: inside=(\S+))?")
+
+_BEARER_VALUE = "abcdef0123456789ABCDEF"
+# U+2028 LINE SEPARATOR: ``splitlines()`` treats it as a line break, splitting
+# on ``"\n"`` does not, and ``.`` in ``aws_secret_access_key`` matches it, so a
+# span can cross it.
+_LINE_SEPARATOR = "\u2028"
+
+# A match may begin on the leading H1 line and end on the next one, because
+# ``bearer_token`` and ``secret_assignment`` allow a line break between the key
+# and the value. (note body, pattern, the value that must never reach an agent,
+# the content the agent is served.) Where the marker replaces the line break the
+# value's line joins the H1 line and the H1 strip removes both; the agent is
+# served less than the note holds, never the credential. The last row is the
+# control: no H1, so nothing is stripped and the marker stands in place.
+_H1_SPAN_ROWS: dict[str, tuple[str, str, str, str]] = {
+    "h1_ends_in_token": (
+        f"# Deploy token\n{_BEARER_VALUE}",
+        "bearer_token",
+        _BEARER_VALUE,
+        "",
+    ),
+    "h1_ends_in_api_token": (
+        f"# Staging API token\n{_BEARER_VALUE}",
+        "bearer_token",
+        _BEARER_VALUE,
+        "",
+    ),
+    "h1_ends_in_password": (
+        "# Password:\nhunter2hunter2",
+        "secret_assignment",
+        "hunter2hunter2",
+        "",
+    ),
+    "line_separator_under_h1": (
+        f"# Notes\naws{_LINE_SEPARATOR}access: {_AWS_DOC_SAMPLE}",
+        "aws_secret_access_key",
+        _AWS_DOC_SAMPLE,
+        "[REDACTED:aws_secret_access_key]",
+    ),
+    "control_no_h1": (
+        f"Deploy token\n{_BEARER_VALUE}",
+        "bearer_token",
+        _BEARER_VALUE,
+        "Deploy [REDACTED:bearer_token]",
+    ),
+}
 
 
 def _warn_renderer(tmp_path, monkeypatch):
@@ -424,6 +473,185 @@ def test_crlf_note_accepts_the_fingerprint_scan_printed(tmp_path, monkeypatch):
     assert _findings(session_factory)["secret_accepted"] == ["bearer_token"]
     assert "secret_acceptance_unmatched" not in _findings(session_factory)
     assert _counter_values(session_factory)["secret_acceptance.spans_passed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# One text for the scan and the reader: redact first, present second
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", sorted(_H1_SPAN_ROWS))
+def test_a_match_starting_in_the_h1_is_redacted_on_every_model_bound_path(
+    name, tmp_path, monkeypatch
+):
+    """The reader redacts the text the scan hashed, leading H1 included.
+
+    ``bearer_token`` and ``secret_assignment`` allow a line break between the
+    key and the value, so a heading that ends in a key word and a value on the
+    next line are one match for the scan. The reader used to strip the H1
+    first, leaving the value alone with nothing to match it, so the note was
+    indexed ``secret_detected`` while the agent was served the raw bytes.
+    """
+    from cli_agent_orchestrator.cli.commands import memory as memory_cli
+
+    body, pattern, must_not_leak, served = _H1_SPAN_ROWS[name]
+    service, session_factory, vault_root, warn_config, vault = _warn_renderer(tmp_path, monkeypatch)
+    _write_note(vault_root, body)
+    printed = _printed_fingerprints(memory_cli, monkeypatch, warn_config, vault)
+    assert [p for p, _h, _i in printed] == [pattern]
+    _reconcile(vault, f"warn-h1-{name}")
+    assert _note_status(session_factory) == "indexed"
+    assert _findings(session_factory)["secret_detected"] == [pattern]
+
+    recalled = _recall(warn_config)
+    block = service.get_memory_context_for_terminal("worker")
+    context = dict(service._get_terminal_context("worker"))
+    results = asyncio.run(
+        service.recall(scope="project", limit=10, terminal_context=context, search_mode="metadata")
+    )
+
+    assert recalled is not None
+    assert recalled.content == served
+    assert must_not_leak not in recalled.content
+    assert recalled.redacted_patterns == [pattern]
+    assert must_not_leak not in block
+    assert all(must_not_leak not in m.content for m in results if m.source_kind == "vault")
+    assert _counter_values(session_factory)["secret_redaction.memories_redacted"] >= 1
+
+
+def test_a_marker_spanning_the_h1_fails_safe_and_an_acceptance_restores_the_line(
+    tmp_path, monkeypatch
+):
+    """The documented side effect of redacting before the strip, both ways round.
+
+    Unaccepted, the marker stands where the line break was, so the value's line
+    joins the H1 line and the strip removes both: the agent is served less than
+    the note holds, never the credential. Accepting the printed fingerprint puts
+    the line break back, so only the H1 line goes.
+    """
+    from cli_agent_orchestrator.cli.commands import memory as memory_cli
+
+    body = f"# Deploy token\n{_BEARER_VALUE}"
+    _service, _session_factory, vault_root, warn_config, vault = _warn_renderer(
+        tmp_path, monkeypatch
+    )
+    _write_note(vault_root, body)
+    printed = _printed_fingerprints(memory_cli, monkeypatch, warn_config, vault)
+    _reconcile(vault, "warn-h1-failsafe")
+
+    assert _recall(warn_config).content == ""
+
+    _write_note(vault_root, body, cao_extra=_acceptances_yaml([(p, h) for p, h, _i in printed]))
+    accepted = _recall(warn_config)
+
+    assert accepted is not None
+    assert accepted.content == _BEARER_VALUE
+    assert accepted.redacted_patterns == []
+
+
+def test_the_reader_scans_exactly_the_text_the_scanner_fingerprints():
+    """One helper defines "the text we scan", so the two paths cannot drift.
+
+    The scan LF-normalises the whole note before it parses; the reader parses
+    the file as written. ``secret_scan_text`` is the single definition of the
+    text the gate scans, fingerprints and redacts, so a note carrying CRLF, a
+    U+2028 line separator and an H1 fingerprints identically on both paths.
+    """
+    body = (
+        f"# Notes\r\nAPI token\r\n{_BEARER_VALUE}\r\n"
+        f"aws{_LINE_SEPARATOR}access: {_AWS_DOC_SAMPLE}\r\n"
+    )
+    text = f"---\r\ncao:\r\n  key: design\r\n---\r\n{body}"
+
+    scanned = secret_scan_text(split_frontmatter(normalize_line_endings(text), 4096))
+    read = secret_scan_text(split_frontmatter(text, 4096))
+
+    assert read == scanned
+    assert "\r" not in read
+    # A line separator is content the patterns match across, not a line ending.
+    assert _LINE_SEPARATOR in read
+    assert fingerprint_secrets(read).fingerprints == fingerprint_secrets(scanned).fingerprints
+    assert {p for p, _h in fingerprint_secrets(read).fingerprints} == {
+        "bearer_token",
+        "aws_secret_access_key",
+    }
+
+
+def test_strip_leading_h1_leaves_every_byte_but_one_lf_delimited_line():
+    """The H1 strip splits on LF only; it is not a line-separator rewrite.
+
+    ``splitlines()`` treated U+2028, U+2029, U+000B, U+000C and U+0085 as line
+    breaks and the rejoin turned each into an LF, rewriting body bytes the scan
+    had fingerprinted. Splitting on LF keeps the transform to what it is for:
+    dropping one leading heading line.
+    """
+    from cli_agent_orchestrator.services.vault.reader import _strip_leading_h1
+
+    for separator in ("\u2028", "\u2029", "\v", "\f", "\x85"):
+        assert _strip_leading_h1(f"# Title\nkept{separator}text") == f"kept{separator}text"
+        # The separator inside the heading is not a line break, so the whole
+        # first LF-delimited line goes.
+        assert _strip_leading_h1(f"# Ti{separator}tle\nkept") == "kept"
+    assert _strip_leading_h1("## Not an h1\nkept") == "## Not an h1\nkept"
+    assert _strip_leading_h1("no heading\nkept") == "no heading\nkept"
+
+
+def test_presentation_transforms_run_only_on_the_redacted_text():
+    """Structural guard for the ordering defect class: scan text in, presentation out.
+
+    Two properties, checked on the source so a new surface fails loudly:
+
+    1. In ``load_candidate`` the redaction call takes ``secret_scan_text`` and
+       the H1 strip comes after it. Swapping the two lines fails this test.
+    2. Every vault surface that hands note text to the secret gate routes it
+       through ``secret_scan_text``. That is what keeps the scanned, the
+       fingerprinted and the redacted bytes equal: reading ``region.body``
+       directly at any one of them reintroduces the drift.
+    """
+    reader_path = SOURCE_ROOT / "services" / "vault" / "reader.py"
+    reader_tree = ast.parse(reader_path.read_text(encoding="utf-8"), filename=str(reader_path))
+    load_definition = _function(reader_tree, "load_candidate")
+    calls = [node for node in ast.walk(load_definition) if isinstance(node, ast.Call)]
+    redact_call = next(node for node in calls if _call_name(node) == "_redact_for_model")
+    strip_call = next(node for node in calls if _call_name(node) == "_strip_leading_h1")
+
+    assert redact_call.lineno < strip_call.lineno, "redact before any presentation transform"
+    assert isinstance(redact_call.args[2], ast.Call)
+    assert _call_name(redact_call.args[2]) == "secret_scan_text"
+
+    # Callee -> index of the positional argument carrying vault note text.
+    note_text_argument = {
+        "classify_secret": 0,
+        "redact_secrets_with_acceptances": 0,
+        "_redact_for_model": 2,
+    }
+    routed: set[tuple[str, str | None, str]] = set()
+    unrouted: list[str] = []
+    for path in SOURCE_ROOT.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        parents = {
+            child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            index = note_text_argument.get(_call_name(node) or "")
+            if index is None or len(node.args) <= index:
+                continue
+            argument = node.args[index]
+            where = (path.name, _enclosing_function(node, parents), _call_name(node) or "")
+            if isinstance(argument, ast.Call) and _call_name(argument) == "secret_scan_text":
+                routed.add(where)
+            else:
+                unrouted.append(f"{path.name}:{node.lineno} {_call_name(node)}")
+
+    assert unrouted == []
+    assert routed == {
+        ("scan.py", "scan_vault", "classify_secret"),
+        ("scan.py", "_acceptance_findings", "redact_secrets_with_acceptances"),
+        ("memory.py", "vault_scan", "redact_secrets_with_acceptances"),
+        ("reader.py", "load_candidate", "_redact_for_model"),
+    }
 
 
 # ---------------------------------------------------------------------------

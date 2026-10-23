@@ -177,6 +177,14 @@ Each mapping has a `secret_gate`:
   note's text reaches an agent, whether by automatic injection or by explicit
   recall. The note itself is never altered.
 
+Redaction runs on the note body exactly as the scan read it, including a leading
+`# Heading`, which recall removes only afterwards for display. That matters
+because `bearer_token` and `secret_assignment` match across a line break, so a
+heading ending in a key word with the value on the next line is one match. Where
+a marker takes the place of that line break the rest of the value's line becomes
+part of the heading line and is removed with it, so recall can show less of the
+note than it holds. Accepting the printed fingerprint puts the line break back.
+
 Pattern matching is deliberately conservative. A note about credential
 handling can legitimately match a credential-shaped pattern, for example a
 runbook quoting `password: example-value`. To let one specific match through

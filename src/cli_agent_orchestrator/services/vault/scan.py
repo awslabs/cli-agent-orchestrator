@@ -16,6 +16,7 @@ from cli_agent_orchestrator.services.memory_reconciliation import (
 )
 from cli_agent_orchestrator.services.secret_gate import (
     SecretMatch,
+    normalize_line_endings,
     redact_secrets_with_acceptances,
 )
 from cli_agent_orchestrator.services.vault.boundary import (
@@ -32,6 +33,7 @@ from cli_agent_orchestrator.services.vault.parser import (
     classify_secret,
     parse_note,
     secret_acceptances,
+    secret_scan_text,
 )
 
 # Bounds the aggregate bytes opened in one scan even when independent config
@@ -205,7 +207,7 @@ def scan_vault(
         # authored body content; the writer separately rejects secret-shaped
         # generated ``cao`` metadata before publishing it.
         secret = classify_secret(
-            parsed.region.body,
+            secret_scan_text(parsed.region),
             secret_gate=candidate.mapping.secret_gate,
         )
         if secret is not None:
@@ -618,7 +620,7 @@ def _acceptance_findings(
         return tuple(findings)
     matches: tuple[SecretMatch, ...] = ()
     if has_secret:
-        _text, matches = redact_secrets_with_acceptances(parsed.region.body, accepted)
+        _text, matches = redact_secrets_with_acceptances(secret_scan_text(parsed.region), accepted)
     # ``secret_accepted`` is reported only for a span the agent receives as
     # fingerprinted. An accepted span inside an unaccepted match (the vendor
     # value inside ``NAME_TOKEN=value``) is still redacted, so it is reported
@@ -692,9 +694,14 @@ def _relpath(path: str, root: str) -> str:
 
 
 def _normalize_line_endings(text: str) -> str:
+    """Note-level normalisation: drop a leading BOM, then apply the gate's LF rule.
+
+    The LF rule itself lives in :func:`secret_gate.normalize_line_endings`, so
+    the scan and the read boundary cannot disagree about what a line ending is.
+    """
     if text.startswith("\ufeff"):
         text = text[1:]
-    return text.replace("\r\n", "\n").replace("\r", "\n")
+    return normalize_line_endings(text)
 
 
 def _sha256(text: str) -> str:

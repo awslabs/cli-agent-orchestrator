@@ -272,6 +272,7 @@ def vault_scan(fingerprints, dry_run):
     never stored.
     """
     from cli_agent_orchestrator.services.secret_gate import redact_secrets_with_acceptances
+    from cli_agent_orchestrator.services.vault.parser import secret_scan_text
     from cli_agent_orchestrator.services.vault.scan import scan_vault
 
     _config, configured_vault = _configured_vault()
@@ -280,7 +281,9 @@ def vault_scan(fingerprints, dry_run):
         for note in report.notes:
             if note.parsed is None:
                 continue
-            _text, matches = redact_secrets_with_acceptances(note.parsed.region.body, ())
+            _text, matches = redact_secrets_with_acceptances(
+                secret_scan_text(note.parsed.region), ()
+            )
             for match in matches:
                 # A span inside another match (the value inside NAME_TOKEN=value)
                 # passes raw only when both fingerprints are accepted.

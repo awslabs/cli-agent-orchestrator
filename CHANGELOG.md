@@ -852,7 +852,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   they never change with what is accepted; a credential two patterns match, such as
   `NAME_TOKEN=value`, prints two fingerprints and needs both accepted before the value is served
   raw. The config-load warning for `warn` with `inject: true` is retired because the pairing no
-  longer carries exposure. `reject` is unchanged.
+  longer carries exposure. Redaction runs over the body exactly as the scan read it, leading
+  `# Heading` included, and the heading is dropped only afterwards for display; because
+  `bearer_token` and `secret_assignment` match across a line break, a heading ending in a key word
+  with the value beneath it is one match, and where the marker replaces that line break the rest of
+  the value's line goes with the heading, so recall can show less of the note than it holds.
+  `reject` is unchanged.
   **Migration:** operators who relied on `warn` passing raw bytes to agents must add a per-finding
   acceptance to each note for each span they want served raw; until then those spans are redacted.
 

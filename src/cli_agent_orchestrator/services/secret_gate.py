@@ -377,10 +377,20 @@ def span_sha256(span: str) -> str:
     the file as written, and a CRLF note would otherwise print a fingerprint
     the reader could never match.
     """
-    return hashlib.sha256(_normalize_line_endings(span).encode("utf-8")).hexdigest()
+    return hashlib.sha256(normalize_line_endings(span).encode("utf-8")).hexdigest()
 
 
-def _normalize_line_endings(text: str) -> str:
+def normalize_line_endings(text: str) -> str:
+    """CRLF and lone CR to LF, leaving every other code point alone.
+
+    This is the one definition of the gate's line-ending rule. ``span_sha256``
+    applies it to a matched span and the vault's ``secret_scan_text`` applies it
+    to the body it hands the cascade, so the bytes a fingerprint is taken from
+    and the bytes a later caller checks against it agree. Unicode line
+    separators (U+2028/9) and the vertical tab, form feed and NEL are NOT line
+    endings here: the patterns match across them, so rewriting them would
+    change what the gate sees.
+    """
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 

@@ -14,7 +14,11 @@ from cli_agent_orchestrator.models.relationship import (
     VALID_STATUSES,
     VALID_TYPES,
 )
-from cli_agent_orchestrator.services.secret_gate import pattern_names, scan_for_secrets
+from cli_agent_orchestrator.services.secret_gate import (
+    normalize_line_endings,
+    pattern_names,
+    scan_for_secrets,
+)
 from cli_agent_orchestrator.services.vault.findings import FindingCode, finding_severity
 from cli_agent_orchestrator.services.vault.identity import validate_cao_key
 
@@ -272,6 +276,25 @@ def _validate_cao_link(link: Any) -> None:
         or not 0 <= link["confidence"] <= 1
     ):
         raise ValueError("cao.links[].confidence must be between 0 and 1")
+
+
+def secret_scan_text(region: FrontmatterRegion) -> str:
+    """The one body text the secret gate scans, fingerprints and redacts.
+
+    Every vault surface that feeds note text to the gate goes through here: the
+    scan that raises ``secret_detected``, ``vault scan --fingerprints``, the
+    acceptance report and the reader's read-boundary redaction. They must agree
+    byte for byte, because a fingerprint is the SHA-256 of a matched span and a
+    pattern may match across a line break, so a surface that scans a different
+    rendering of the same note silently matches different spans.
+
+    Only the frontmatter is dropped, and CRLF is LF-normalised because the scan
+    normalises the whole note before it parses while the reader parses the file
+    as written. Nothing else is touched. A presentation transform such as the
+    reader's leading-H1 strip is not part of the scanned text and must run on
+    the redaction's output, never on its input.
+    """
+    return normalize_line_endings(region.body)
 
 
 def classify_secret(body: str, *, secret_gate: str) -> Optional[tuple[FindingCode, str, str]]:
