@@ -983,6 +983,13 @@ class StatusMonitor:
         if get_backend().supports_event_inbox():
             return StatusObservation(status, None)
         with self._lock:
+            if terminal_id not in self._last_status:
+                # No detection has ever been applied/stamped for this terminal --
+                # there is no turn stamp to pair, so trust whatever get_status()
+                # just computed (e.g. a persisted or natively-derived verdict)
+                # instead of defaulting to UNKNOWN for a status that is actually
+                # known.
+                return StatusObservation(status, self._status_generation.get(terminal_id, 0))
             applied = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
             return StatusObservation(applied, self._status_generation.get(terminal_id, 0))
 

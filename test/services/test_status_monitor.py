@@ -2083,6 +2083,23 @@ class TestStatusObservationIsStampedWhenEarned:
         assert observation.status == TerminalStatus.UNKNOWN
         assert observation.output_generation == 0
 
+    def test_unstamped_terminal_observes_get_status_verdict_not_unknown(self):
+        """A terminal with a knowable status but no applied/stamped detection
+        (e.g. recovered after a server restart, or a row written directly) must
+        not read as UNKNOWN -- there is no turn to pair, so get_status()'s own
+        verdict is trusted (#735 CI regression: get_terminal switched from
+        get_status to status_observation and this case fell through to the
+        UNKNOWN default instead)."""
+        with patch(
+            "cli_agent_orchestrator.backends.registry.get_backend",
+            return_value=self._tmux_backend(),
+        ):
+            sm = StatusMonitor()
+            with patch.object(sm, "get_status", return_value=TerminalStatus.ERROR):
+                observation = sm.status_observation("never-stamped")
+        assert observation.status == TerminalStatus.ERROR
+        assert observation.output_generation == 0
+
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.status_monitor.get_server_settings")
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")

@@ -51,6 +51,20 @@ class OutputExtractionError(ValueError):
     """
 
 
+class ProviderExitedError(RuntimeError):
+    """The CLI process exited back to the shell before it was ready (#1018).
+
+    Raised by a provider's ``initialize()`` when the pane's foreground process is
+    again the shell it captured as ``shell_baseline`` before launching the CLI.
+    Distinct from ``TimeoutError``: the pane is not slow, it IS a shell, and the
+    task that was about to be delivered would have been executed by it as
+    commands. Not a ``TerminalInputBlockedError`` either -- that one means
+    "alive, parked on a prompt, leave it running"; this terminal has nothing
+    left to answer, so the deferred-init path tears it down like any other
+    startup failure.
+    """
+
+
 class OutputExtractionRejected(OutputExtractionError):
     """A deliberate refusal to publish extracted content.
 
@@ -374,12 +388,19 @@ class BaseProvider(ABC):
 
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
-        """Whether assign/handoff should pause when the provider is waiting on UI input.
+        """Whether orchestrated input should pause when the provider waits on UI input.
 
         Some CLIs render interactive pickers or approval prompts where pasted
         task text would be interpreted as the answer to that prompt. Providers
         with those surfaces can opt in so CAO blocks orchestrated task delivery
         while still allowing explicit user-prompt answers.
+
+        Read on two paths: ``terminal_service.send_input`` refuses assign,
+        handoff AND send_message (inbox) deliveries into WAITING_USER_ANSWER,
+        and ``inbox_service`` excludes WAITING_USER_ANSWER from eager delivery
+        for these providers. Both were needed for #896 — before that fix an
+        inbox message was pasted into an open Claude Code AskUserQuestion
+        dialog, which swallowed the text and answered itself.
         """
         return False
 

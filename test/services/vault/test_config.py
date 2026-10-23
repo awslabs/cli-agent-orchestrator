@@ -298,7 +298,8 @@ def test_secret_gate_defaults_to_reject(tmp_path):
     assert config.vaults[0].mappings[0].secret_gate == "reject"
 
 
-def test_rule_20_warn_and_inject_loads_with_persistent_warning(tmp_path, caplog):
+def test_warn_and_inject_loads_without_a_warning(tmp_path, caplog):
+    """#644 retired ADR-007 rule 20: warn + inject is redacted on every model-bound path."""
     document = _document(str(tmp_path))
     document["vaults"][0]["mappings"][1].update(inject=True, secret_gate="warn")
 
@@ -306,8 +307,8 @@ def test_rule_20_warn_and_inject_loads_with_persistent_warning(tmp_path, caplog)
 
     assert config.vaults[0].mappings[1].inject is True
     assert config.vaults[0].mappings[1].secret_gate == "warn"
-    assert config.warnings == ("mapping 'References' has secret_gate='warn' with inject=true",)
-    assert "secret_gate='warn' with inject=true" in caplog.text
+    assert config.warnings == ()
+    assert "secret_gate='warn' with inject=true" not in caplog.text
 
 
 def test_recall_budget_warns_when_it_exceeds_the_injection_scope_budget(tmp_path, caplog):

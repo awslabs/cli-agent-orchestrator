@@ -26,6 +26,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    TypedDict,
     cast,
 )
 
@@ -48,7 +49,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
@@ -66,6 +74,7 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
     API_BASE_URL,
+    CALLBACK_TERMINAL_ID_ENV,
     CAO_HOME_DIR,
     CORS_ORIGINS,
     DEFAULT_PROVIDER,
@@ -183,8 +192,9 @@ from cli_agent_orchestrator.services.workflow_journal import (
 from cli_agent_orchestrator.services.workflow_journal import EventRow, GapMarker, StepRow
 from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
-from cli_agent_orchestrator.utils import server_lock
+from cli_agent_orchestrator.utils import delegation, server_lock
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.delegation import DelegationCeilingError
 from cli_agent_orchestrator.utils.forwarded_env import ForwardedEnvError, validate_forwarded_env
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
@@ -288,6 +298,49 @@ class CreateTerminalBody(BaseModel):
     initial_message_orchestration_type: Optional[str] = None
 
 
+#: Request keys that name a caller on the create routes. The operator form of
+#: the in-session create (``POST /sessions/{name}/terminals:operator``) refuses
+#: every one of them, in the query string or the body, so an agent client
+#: cannot fall into the operator branch while still carrying an identity.
+_CALLER_IDENTITY_KEYS = ("caller_id", "caller_ceiling", "delegating_terminal_id")
+
+
+class OperatorTerminalBody(BaseModel):
+    """Optional JSON body for ``POST /sessions/{name}/terminals:operator``.
+
+    Only ``description`` is read. ``extra="allow"`` is deliberate: the route
+    inspects unknown keys so a body that carries ``caller_id``,
+    ``caller_ceiling``, ``delegating_terminal_id`` or a callback environment is
+    REFUSED with 400 rather than silently dropped, which is what pydantic's
+    default ``extra="ignore"`` would do.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    description: Optional[str] = None
+
+
+def _caller_identity_in_operator_request(
+    request: Request, body: Optional[OperatorTerminalBody]
+) -> List[str]:
+    """Names of caller-identity fields present on an operator-form request.
+
+    The operator form exists so a first-party operator client (the Web UI) can
+    add a terminal to a session without a delegating terminal. A request that
+    uses the operator path AND names a caller is the laundering shape: an agent
+    asking to be recorded unbounded while still identifying itself. The route
+    refuses it outright; a caller-identified create belongs on the sibling
+    route, where the ceiling applies.
+    """
+    found = [key for key in _CALLER_IDENTITY_KEYS if key in request.query_params]
+    extra = (body.model_extra or {}) if body is not None else {}
+    found += [key for key in _CALLER_IDENTITY_KEYS if key in extra and key not in found]
+    env_vars = extra.get("env_vars")
+    if isinstance(env_vars, dict) and CALLBACK_TERMINAL_ID_ENV in env_vars:
+        found.append(f"env_vars.{CALLBACK_TERMINAL_ID_ENV}")
+    return found
+
+
 def _check_group_size(group: Optional[List[str]]) -> Optional[List[str]]:
     """Enforce structural caps on ``group`` (call-me-ram, PR #433 review).
 
@@ -351,6 +404,11 @@ class CreateSessionBody(CreateTerminalBody):
     env_vars: Optional[Dict[str, str]] = None
     group: Optional[List[str]] = None
     metadata: Optional[Dict] = None
+    # Delegation ceiling asserted by a caller on ANOTHER node (assign with
+    # target_host). This node has no row for that caller, so the client sends
+    # its own stored ceiling and the created terminal is bounded by it
+    # (utils/delegation.py). Rejected (400) together with a local caller.
+    caller_ceiling: Optional[List[str]] = None
 
     @field_validator("env_vars")
     @classmethod
@@ -494,7 +552,19 @@ class RunStepRequest(BaseModel):
     )
     allowed_tools: Optional[list[str]] = Field(
         default=None,
-        description="Resolved allowed-tools list for a freshly created terminal (handoff inheritance)",
+        description=(
+            "Resolved allowed-tools list for a freshly created terminal (handoff "
+            "inheritance). Checked against the caller's recorded delegation ceiling; "
+            "a list wider than the caller may delegate is refused with 403."
+        ),
+    )
+    caller_ceiling: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "Delegation ceiling asserted by a caller on another node (handoff with "
+            "target_host), which has no row here. Bounds the created terminal exactly "
+            "as a stored ceiling would. Rejected with 400 together with caller_id."
+        ),
     )
     use_worktree: bool = Field(
         default=False,
@@ -749,6 +819,29 @@ class StepOutputRequest(BaseModel):
     )
 
 
+class _WorkflowCallerKwargs(TypedDict, total=False):
+    """The one keyword ``_workflow_caller_kwargs`` may forward.
+
+    A TypedDict rather than ``Dict[str, str]`` so that ``**``-unpacking it into a
+    workflow entry point type-checks against that entry point's ``caller_id``
+    parameter only; a plain ``Dict[str, str]`` could, as far as mypy knows, fill
+    any parameter (``decisions``, say) with a ``str``.
+    """
+
+    caller_id: str
+
+
+def _workflow_caller_kwargs(caller_id: Optional[str]) -> _WorkflowCallerKwargs:
+    """``{"caller_id": ...}`` when a terminal started the run, else ``{}``.
+
+    The workflow service entry points take ``caller_id`` as an optional keyword;
+    forwarding it only when present keeps the operator path (no caller) a
+    byte-identical call, so existing callers and test doubles with the original
+    positional signature keep working.
+    """
+    return {"caller_id": caller_id} if caller_id else {}
+
+
 class WorkflowRunRequest(BaseModel):
     """Request body for ``POST /workflows/runs`` (Bolt 3, N5, C5)."""
 
@@ -778,6 +871,16 @@ class WorkflowRunRequest(BaseModel):
             raise ValueError("working_directory must be a non-empty absolute path without NUL or ~")
         return value
 
+    caller_id: Optional[TerminalId] = Field(
+        default=None,
+        description=(
+            "Terminal that is starting this run (the MCP workflow tools send their "
+            "CAO_TERMINAL_ID). Every agent step the run creates is bounded by that "
+            "terminal's recorded delegation ceiling; a step profile wider than it "
+            "fails the step. Omitted for operator-started runs."
+        ),
+    )
+
 
 class ResumeRunRequest(BaseModel):
     """Request body for ``POST /workflows/runs/{run_id}/resume`` (issue #583, FR-7).
@@ -804,11 +907,25 @@ class ResumeRunRequest(BaseModel):
             "400 and applies nothing at all."
         ),
     )
+    caller_id: Optional[TerminalId] = Field(
+        default=None,
+        description=(
+            "Terminal that is resuming this run; the re-run steps are bounded by its "
+            "recorded delegation ceiling (see WorkflowRunRequest.caller_id)."
+        ),
+    )
 
 
 class StepReplayRequest(BaseModel):
     """Request body for ``POST /workflows/runs/{run_id}/steps/{step_id}:replay`` (#640)."""
 
+    caller_id: Optional[TerminalId] = Field(
+        default=None,
+        description=(
+            "Terminal replaying this step; the replayed worker is bounded by its "
+            "recorded delegation ceiling (see WorkflowRunRequest.caller_id)."
+        ),
+    )
     prompt_override: Optional[str] = Field(
         default=None,
         description=(
@@ -1827,6 +1944,11 @@ async def health_check():
         "status": "ok",
         "service": "cli-agent-orchestrator",
         "terminal_backend": backend_name,
+        # Capabilities a peer node can rely on. ``delegation_ceiling``: this
+        # node bounds created terminals by the caller's delegation ceiling and
+        # honours ``caller_ceiling`` on POST /sessions and /terminals/run-step;
+        # a client placing work here with target_host checks for it first.
+        "features": [delegation.REMOTE_FEATURE],
         # The init budget THIS server applies (issue #710). Clients size their
         # wait for a synchronous create from their own settings, so an operator
         # can compare the two here when the client runs with a different
@@ -3652,6 +3774,7 @@ async def create_session(
                 if body and "description" in body.model_fields_set
                 else {}
             ),
+            caller_ceiling=body.caller_ceiling if body else None,
         )
 
         if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
@@ -3683,6 +3806,20 @@ async def create_session(
                 f"{idempotency_key}:memory-manager-sidecar" if idempotency_key else None
             )
 
+            # The sidecar is bounded by the primary's recorded ceiling (below), so
+            # under a narrow primary (one that lacks fs_list or @cao-mcp-server)
+            # the background create is refused. A refusal that only reaches
+            # logger.warning in a background task leaves the operator with a
+            # launch that reported success and no sidecar, so the bound is
+            # checked HERE, with the same comparator, and the outcome rides on
+            # the response as ``memory_manager`` for `cao launch` to print.
+            refusal = terminal_service.memory_sidecar_refusal(result, provider=sidecar_provider)
+            if refusal is not None:
+                logger.warning(f"memory_manager sidecar not launched: {refusal}")
+                result.memory_manager = {"state": "refused", "detail": refusal}
+                return result
+            result.memory_manager = {"state": "scheduled", "detail": None}
+
             async def _spawn_sidecar() -> None:
                 try:
                     from cli_agent_orchestrator.services import terminal_service
@@ -3694,6 +3831,12 @@ async def create_session(
                         working_directory=working_directory,
                         registry=registry,
                         idempotency_key=sidecar_idempotency_key,
+                        # The sidecar is a helper of the primary, not a new
+                        # authority: it is bounded by the PRIMARY's recorded
+                        # delegation ceiling (read from its row), so a restricted
+                        # primary cannot gain an unbounded supervisor-role sidecar
+                        # that launches what the primary may not.
+                        delegating_terminal_id=result.id,
                     )
                 except Exception as e:
                     logger.warning(f"Failed to spawn memory_manager sidecar: {e}")
@@ -3716,6 +3859,10 @@ async def create_session(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except EphemeralPolicyError as e:
         raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
+    except DelegationCeilingError as e:
+        # The created terminal would hold tools its caller may not delegate; an
+        # authorization refusal, not a bad request or a missing resource.
+        raise HTTPException(status_code=e.status_code, detail=str(e)) from None
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except WorktreeError as e:
@@ -3894,6 +4041,21 @@ async def create_terminal_in_session(
             _validate_model_id(model)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    if caller_id is None:
+        # An in-session create is how a running terminal adds a worker beside
+        # itself (assign/handoff name their caller). Without caller_id the
+        # server has nothing to bound the new terminal by and would launch it
+        # unbounded; an operator creates a session with POST /sessions instead.
+        # caller_id remains a client assertion under the shared bearer (see
+        # docs/api.md); requiring it closes the omission, not the substitution.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "caller_id is required: an in-session terminal is created on behalf of "
+                "the terminal that delegates to it and is bounded by that terminal's "
+                "recorded delegation ceiling. Operator launches use POST /sessions."
+            ),
+        )
     try:
         if provider is None:
             resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
@@ -3983,12 +4145,128 @@ async def create_terminal_in_session(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except EphemeralPolicyError as e:
         raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
+    except DelegationCeilingError as e:
+        # The requested allowed_tools (client string or profile resolution)
+        # exceed what the caller_id row may delegate: 403, before the generic
+        # ValueError arm, and never masked as "session not found".
+        raise HTTPException(status_code=e.status_code, detail=str(e)) from None
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except WorktreeError as e:
         # use_worktree=true against a working_directory that isn't a git repo,
         # or the 'git worktree add' itself failed -- a client-input problem,
         # not a server crash.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create terminal: {str(e)}",
+        )
+
+
+@app.post(
+    "/sessions/{session_name}/terminals:operator",
+    response_model=Terminal,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_terminal_in_session_as_operator(
+    request: Request,
+    session_name: str,
+    agent_profile: str,
+    provider: Optional[str] = None,
+    working_directory: Optional[str] = None,
+    allowed_tools: Optional[str] = None,
+    engine: Optional[KiroEngine] = None,
+    model: Optional[str] = None,
+    use_worktree: bool = False,
+    idempotency_key: Optional[str] = None,
+    body: Optional[OperatorTerminalBody] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Terminal:
+    """Add a terminal to an EXISTING session as the operator.
+
+    The sibling ``POST /sessions/{name}/terminals`` is how a running terminal
+    adds a worker beside itself and requires ``caller_id`` (403 without it);
+    ``POST /sessions`` is the operator's launch but always starts a NEW
+    session. This is the operator's form of the in-session create: no
+    delegating terminal exists, so the new terminal records the profile's
+    declared ceiling exactly as a ``POST /sessions`` launch does. The Web UI's
+    "Add Agent" action uses it.
+
+    It is a distinct sub-path rather than a flag on the sibling so that no
+    request shape a client already sends can land here by accident: an older
+    agent client that omits ``caller_id`` on the sibling still gets its 403,
+    and nothing it sends is reinterpreted as an operator launch. A request
+    that reaches this path AND names a caller (``caller_id``,
+    ``caller_ceiling`` or ``delegating_terminal_id`` in the query or body, or
+    a body ``env_vars`` carrying the remote-assign callback environment) is
+    refused with 400: that is an agent asking to be recorded unbounded while
+    still identifying itself, and the caller-identified create belongs on the
+    sibling route where the ceiling applies.
+
+    Residual, shared with ``POST /sessions``: under the shared bearer the
+    server cannot tell an operator client from an agent's process that chooses
+    to send no identity at all (docs/tool-restrictions.md, "What the server can
+    and cannot know"); binding caller identity to an authenticated terminal is
+    the tracked follow-up. Synchronous only: no ``defer_init``, no initial
+    message; a message is sent to the created terminal afterwards.
+    """
+    try:
+        validate_tmux_name(session_name, "session_name")
+        if model is not None:
+            _validate_model_id(model)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    identity = _caller_identity_in_operator_request(request, body)
+    if identity:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "the operator form of the in-session create carries no caller identity, "
+                f"but this request names one ({', '.join(identity)}). A terminal created "
+                "on behalf of a delegating terminal uses POST /sessions/{name}/terminals "
+                "with caller_id, where the caller's recorded delegation ceiling applies."
+            ),
+        )
+    try:
+        if provider is None:
+            resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
+        else:
+            resolved_provider = provider
+        allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
+
+        # No caller_id, delegating_terminal_id or caller_ceiling: the operator
+        # branch of create_terminal, which records the profile's declared
+        # ceiling (test_launch_path_invariant.py classifies this site).
+        return await terminal_service.create_terminal(
+            provider=resolved_provider,
+            agent_profile=agent_profile,
+            session_name=session_name,
+            new_session=False,
+            working_directory=working_directory,
+            allowed_tools=allowed_tools_list,
+            registry=get_plugin_registry(request),
+            description=body.description if body else None,
+            engine=engine,
+            model=model,
+            use_worktree=use_worktree,
+            idempotency_key=idempotency_key,
+        )
+    except HTTPException:
+        raise
+    except IdempotencyKeyConflict as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except (KiroPhase0KASError, KiroCapabilityError, KiroAgentPathError) as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except TerminalLimitError as e:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+    except EphemeralPolicyError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
+    except DelegationCeilingError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e)) from None
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except WorktreeError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         raise HTTPException(
@@ -4262,20 +4540,44 @@ async def send_terminal_input(
     orchestration_type: Optional[OrchestrationType] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
+    """Paste a message into a terminal and name the turn it starts.
+
+    ``dispatch_boundary`` is ``status_monitor.output_generation()`` sampled inside
+    the dispatch, after the monitor is armed and the rolling buffer cleared but
+    before any key reaches the pane. A client that must know whether a later
+    reading describes THIS send compares it against the ``status_generation`` on
+    ``GET /terminals/{id}``: only a status earned at a strictly greater generation
+    is evidence for this turn. Without it a caller cannot distinguish the previous
+    turn's COMPLETED, still latched because ``notify_input_sent`` deliberately
+    leaves ``_last_status`` alone, from this turn finishing — the #735/#407 defect.
+
+    ``success`` is unchanged and still first in the body, so existing clients that
+    read only that key are unaffected.
+    """
     try:
-        # send_input is blocking tmux I/O (bracketed paste + key sends). Run it
+        # dispatch_input is blocking tmux I/O (bracketed paste + key sends). Run it
         # off the event loop so a slow tmux call can't freeze every other
         # request — including /health and concurrent assign/handoff. Same
         # hazard class as issue #382 (only fixed for DELETE /sessions there).
-        success = await asyncio.to_thread(
-            terminal_service.send_input,
+        #
+        # Called instead of the ``send_input`` bool wrapper purely to keep the
+        # boundary it computes; the behaviour is identical.
+        boundary: Optional[int] = await asyncio.to_thread(
+            terminal_service.dispatch_input,
             terminal_id,
             message,
             registry=get_plugin_registry(request),
             sender_id=sender_id,
             orchestration_type=orchestration_type,
         )
-        return {"success": success}
+        # Event-inbox backends (herdr) never advance the output generation, so
+        # dispatch_input's boundary is always the meaningless int 0 for them —
+        # naming it would make the CLI skip its 3-second grace sleep while
+        # GET /terminals/{id}'s status_generation (None, for the same reason)
+        # never engages the poll gate either. Report no boundary at all.
+        if get_backend().supports_event_inbox():
+            boundary = None
+        return {"success": True, "dispatch_boundary": boundary}
     except TerminalInputBlockedError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
@@ -4547,9 +4849,12 @@ async def run_step(
     from cli_agent_orchestrator.services import script_runner, step_replay, workflow_service
     from cli_agent_orchestrator.services.launch_guard import PlanInputsChangedError
     from cli_agent_orchestrator.services.script_runner import (
+        OrphanedScriptRunError,
         make_step_terminal_recorder,
         record_step_completion,
         record_step_replay,
+        require_live_script_run,
+        step_delegating_terminal_id,
     )
     from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
     from cli_agent_orchestrator.services.workflow_errors import (
@@ -4632,6 +4937,16 @@ async def run_step(
             )
         except KeyError as e:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+        # A script-tier run id that names NO live record is an orphan: the server
+        # restarted and the in-memory caller binding went with it, while the
+        # script subprocess (a plain child) kept running and its generation still
+        # matches the journal. Launching its step would take the operator branch
+        # unbounded, so refuse; `cao workflow resume` re-binds the run to the
+        # journaled caller and re-drives it.
+        try:
+            require_live_script_run(fence_run_id)
+        except OrphanedScriptRunError as e:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
 
     # Mark the job as in-progress before the long-running substrate starts.
     # This is best-effort; a failure here must not block execution. Placed
@@ -4822,6 +5137,12 @@ async def run_step(
             use_worktree=body.use_worktree,
             job_id=job_id,
             claim_id=body.claim_id,
+            caller_ceiling=body.caller_ceiling,
+            # Script-tier step: bounded by the ceiling of the terminal that started
+            # the run, read from the live ScriptRunRecord the generation-fenced run
+            # id names (never from anything the script subprocess asserts). None for
+            # handoff/YAML/operator callers, whose own paths carry the bound.
+            delegating_terminal_id=step_delegating_terminal_id(body.env_vars),
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure
@@ -4968,6 +5289,12 @@ async def run_step(
         _settle_step(None, str(e))
         await _record_job_state(job_id, "error", error_message=str(e))
         raise HTTPException(status_code=e.status_code, detail=e.as_detail()) from None
+    except DelegationCeilingError as e:
+        # The step's worker would hold tools the caller may not delegate.
+        # Nothing ran; 403 with the message naming parent, child and tools.
+        _settle_step(None, str(e))
+        await _record_job_state(job_id, "error", error_message=str(e))
+        raise HTTPException(status_code=e.status_code, detail=str(e)) from None
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
         await _record_job_state(job_id, "error", error_message=str(e))
@@ -5921,6 +6248,7 @@ async def start_workflow_run_endpoint(
                 resolved,
                 run_id,
                 working_directory=root,
+                **_workflow_caller_kwargs(body.caller_id),
             )
         except script_runner.ScriptLintError as e:
             raise HTTPException(
@@ -5948,7 +6276,11 @@ async def start_workflow_run_endpoint(
         return result.model_dump()
 
     try:
-        result = await workflow_service.start_run(spec, body.inputs, run_id)
+        # ``caller_id`` is forwarded only when supplied, so an operator-started
+        # run is byte-identical to the pre-ceiling call.
+        result = await workflow_service.start_run(
+            spec, body.inputs, run_id, **_workflow_caller_kwargs(body.caller_id)
+        )
     except NotBuiltYetError as e:
         raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(e))
     except KeyError as e:
@@ -6109,10 +6441,16 @@ async def submit_workflow_run_endpoint(
         manifest_json = frozen.manifest_json
         try:
             # Keep the admission snapshot even if the profile set changes during
-            # the gate. Preserve the gate's refusal precedence on capture failure.
+            # the gate: the guard is built from the SAME profile-set read the plan_id
+            # was computed from (PR #1000, P3-3). Preserve the gate's refusal
+            # precedence on capture failure.
             capture_error = None
             try:
-                guard = await asyncio.to_thread(launch_guard.capture)
+                # Called inside the lambda, not passed to to_thread as a value, so the
+                # call-site lint (test_callsite_lint_rules rule 4) can see the keyword.
+                guard = await asyncio.to_thread(
+                    lambda: launch_guard.capture(profile_set=frozen.profile_set)
+                )
             except approval_gate.PlanIdentityUnavailableError as exc:
                 capture_error = exc
             approval_gate.ensure_plan_approved(
@@ -6166,6 +6504,7 @@ async def submit_workflow_run_endpoint(
                 # ``approval-gate`` (Bolt 2 unit 7) built this value at Step 4b and has already gated
                 # on it; reusing it rather than rebuilding is what makes checked-equals-stored true.
                 manifest_json,
+                **_workflow_caller_kwargs(body.caller_id),
             )
         except sqlite3.IntegrityError:
             # TOCTOU (PR #525 review): step 0's uniqueness check and this insert are
@@ -6198,6 +6537,7 @@ async def submit_workflow_run_endpoint(
             finished_at=None,
             tier="script",
             working_directory=root,
+            caller_id=body.caller_id,
         )
         tier = "script"
     else:
@@ -6225,6 +6565,7 @@ async def submit_workflow_run_endpoint(
                 started_at,
                 "yaml",
                 "1",
+                **_workflow_caller_kwargs(body.caller_id),
             )
         except sqlite3.IntegrityError:
             # Same TOCTOU → 409 mapping as the script arm above; ordered before the
@@ -6251,6 +6592,7 @@ async def submit_workflow_run_endpoint(
                 step.id: workflow_service.StepRunState(step_id=step.id) for step in spec.steps
             },
             started_at=started_at,
+            caller_id=body.caller_id,
         )
         tier = "yaml"
 
@@ -7651,11 +7993,17 @@ async def resume_workflow_run_endpoint(
     if row.tier == "script":
         try:
             if decisions:
-                result = await script_runner.resume_script_run(run_id, decisions=decisions)
+                result = await script_runner.resume_script_run(
+                    run_id,
+                    decisions=decisions,
+                    **_workflow_caller_kwargs(body.caller_id if body is not None else None),
+                )
             else:
                 # Byte-identical to the pre-#583 call, so an ordinary resume cannot
                 # regress on a code path it never enters.
-                result = await script_runner.resume_script_run(run_id)
+                result = await script_runner.resume_script_run(
+                    run_id, **_workflow_caller_kwargs(body.caller_id if body is not None else None)
+                )
         except KeyError:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'"
@@ -7700,7 +8048,9 @@ async def resume_workflow_run_endpoint(
         )
 
     try:
-        result = await workflow_service.resume_from_last_completed(run_id)
+        result = await workflow_service.resume_from_last_completed(
+            run_id, **_workflow_caller_kwargs(body.caller_id if body is not None else None)
+        )
     except KeyError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
     except workflow_service.ResumeNotAllowedError as e:
@@ -7756,6 +8106,7 @@ async def replay_workflow_step_endpoint(
             run_id,
             step_id,
             prompt_override=body.prompt_override if body is not None else None,
+            **_workflow_caller_kwargs(body.caller_id if body is not None else None),
         )
     except KeyError as e:
         # The service distinguishes "unknown run" from "unknown step" in the message;
@@ -8863,6 +9214,7 @@ async def vault_status_endpoint(
                 "process_local_unmapped_project_identities": item.process_local_unmapped_project_identities,
                 "process_local_non_writable_write_refusals": item.process_local_non_writable_write_refusals,
                 "process_local_secret_gate_write_refusals": item.process_local_secret_gate_write_refusals,
+                "secret_acceptances": dict(item.secret_acceptances),
             }
             for item in get_vault_status(config, vault_id=vault_id)
         ],

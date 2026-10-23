@@ -91,6 +91,7 @@ from cli_agent_orchestrator.services.workflow_errors import (
 from cli_agent_orchestrator.services.workflow_errors import (
     ReplayDivergenceError as ReplayDivergenceError,
 )
+from cli_agent_orchestrator.utils.delegation import DelegationCeilingError
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +211,17 @@ class RunRecord:
     # constructed here; it binds to the running loop lazily on first await, so
     # building a RunRecord outside a loop (unit tests) is safe.
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # The terminal that started this run, when an agent did
+    # (``WorkflowRunRequest.caller_id``, sent by the MCP workflow tools and by
+    # ``cao workflow`` from inside a terminal). Every step's worker is created
+    # with ``delegating_terminal_id=caller_id`` so its tools are bounded by that
+    # terminal's RECORDED delegation ceiling (utils/delegation.py). Persisted on
+    # the journal row (``workflow_run.caller_id``) at start, so a resume or a
+    # recovery after a restart re-binds to the ORIGINAL starter through
+    # ``bound_caller`` and never widens; only a run started with no caller
+    # takes the resumer's bound. None for operator-started runs (CLI, curl),
+    # which are unbounded.
+    caller_id: Optional[str] = None
 
 
 # Process-local run registry (ADR-8, B3-LC-2 singleton). A process restart loses
@@ -283,6 +295,17 @@ def _record_from_json(output_json: Optional[str]) -> Optional[StepOutputRecord]:
     )
 
 
+def bound_caller(original: Optional[str], resumer: Optional[str]) -> Optional[str]:
+    """The terminal whose ceiling bounds a resumed run: the original starter if known.
+
+    Journaled ``caller_id`` (the agent that started the run) wins over whoever
+    resumes it, so an operator or a wider agent resuming a reviewer's run does
+    not widen its steps. A run started with no caller is bounded by the resumer,
+    which can only narrow it.
+    """
+    return original if original else resumer
+
+
 def _journal_insert_run(record: RunRecord) -> None:
     """Best-effort INSERT of the run + its seeded steps at ``start_run`` (§1)."""
     try:
@@ -293,6 +316,9 @@ def _journal_insert_run(record: RunRecord) -> None:
             inputs_json=json.dumps(record.inputs),
             state=record.state.value,
             started_at=record.started_at,
+            # Only when an agent started the run, so operator runs write the
+            # same call as before.
+            **({"caller_id": record.caller_id} if record.caller_id else {}),
         )
         workflow_journal.insert_steps(
             record.run_id,
@@ -695,6 +721,7 @@ async def _collect_structured_output(
                 "CAO_WORKFLOW_STEP_ID": step.id,
             },
             cancel_event=record.cancel_event,
+            delegating_terminal_id=record.caller_id,
         )
         st.terminal_id = result.terminal_id
         rec = step_output_store.get(record.run_id, step.id)
@@ -771,6 +798,9 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
                     "CAO_WORKFLOW_STEP_ID": step.id,
                 },
                 cancel_event=record.cancel_event,
+                # The agent that started the run bounds every step it dispatches
+                # (utils/delegation.py); None for an operator-started run.
+                delegating_terminal_id=record.caller_id,
             )
             st.terminal_id = result.terminal_id
             # U2 emission: a terminal exists for this step (after the id is bound).
@@ -819,6 +849,28 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
                 step.id,
             )
             return
+        except DelegationCeilingError as exc:
+            # The step's worker would hold tools the run's caller may not delegate
+            # (utils/delegation.py). Raised by create_terminal BEFORE any terminal
+            # exists, deterministic for the run, so it consumes the whole budget:
+            # retrying would refuse again. Settle the step FAILED with the refusal
+            # text (kind ``error``), journal it, and let the drive loop finish the
+            # run as any other step failure, rather than escaping the engine.
+            st.error = str(exc)
+            last_error_kind = "error"
+            await _ajournal(_journal_step, record, step.id, last_error_kind)
+            await _journal_event(
+                record,
+                "step.attempt.failed",
+                step_id=step.id,
+                attempt=attempt,
+                state=st.state.value,
+                error_kind=last_error_kind,
+                terminal_id=None,
+                provider=step.provider,
+                agent_profile=step.agent,
+            )
+            break  # no retry: the refusal does not change between attempts
         except StepExecutionError as exc:
             st.error = str(exc)
             last_error_kind = exc.kind
@@ -1098,8 +1150,17 @@ def _check_run_id_available(run_id: str) -> None:
 # ---------------------------------------------------------------------------
 # §1 — start_run entry point
 # ---------------------------------------------------------------------------
-async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> WorkflowRunResult:
+async def start_run(
+    spec: WorkflowSpec,
+    inputs: Dict[str, Any],
+    run_id: str,
+    caller_id: Optional[str] = None,
+) -> WorkflowRunResult:
     """Run a validated workflow spec to completion, awaited inline (§1, Q1=A).
+
+    ``caller_id`` is the terminal starting the run, if an agent did; it is
+    recorded on the ``RunRecord`` so every step is bounded by that terminal's
+    delegation ceiling (see ``RunRecord.caller_id``).
 
     Steps: validate the run_id key (B3-BR-1, shared validator) and the inputs
     against ``spec.inputs`` (B3-BR-2) — failing BEFORE any terminal is created;
@@ -1138,6 +1199,7 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
         cancelled=False,
         step_states={step.id: StepRunState(step_id=step.id) for step in spec.steps},
         started_at=_now(),
+        caller_id=caller_id,
     )
     # 4. Register (in-memory floor) + mark the drive live + journal the run +
     # seed every step (§1). The ``finally`` guarantees the liveness mark is
@@ -1319,6 +1381,7 @@ def _rebuild_record_from_journal(run_id: str) -> Optional[RunRecord]:
             current_step_id=row.current_step_id,
             started_at=row.started_at,
             finished_at=row.finished_at,
+            caller_id=row.caller_id,
         )
     except (ValidationError, ValueError, TypeError) as e:
         # ValidationError subclasses ValueError (pydantic v2) but is named for clarity;
@@ -1507,8 +1570,16 @@ def _dispatch_reserved_mode(spec: WorkflowSpec) -> None:
     raise NotBuiltYetError(f"workflow mode '{spec.mode}' is reserved (not built yet)")
 
 
-async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
+async def resume_from_last_completed(
+    run_id: str, caller_id: Optional[str] = None
+) -> WorkflowRunResult:
     """Resume a crashed/failed run from its durable journal (§3, FR-6.2, N6).
+
+    ``caller_id`` is the terminal resuming the run, if an agent is. The re-run
+    steps are bounded by the ORIGINAL starter's ceiling when the journal row
+    carries one (``workflow_run.caller_id``, see ``bound_caller``): an operator
+    or a wider agent resuming a reviewer's run cannot widen its steps. Only a
+    run that was started with no caller is bounded by the resumer.
 
     Un-reserves the B3-BR-10 stub. The algorithm (business-logic-model §3):
 
@@ -1601,6 +1672,10 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
     record.cancelled = False
     record.current_step_id = None
     record.finished_at = None
+    # The ORIGINAL caller (journaled at start) keeps bounding the run; a resume by
+    # a different actor must not widen it. Only a run that was started with no
+    # caller (operator) takes the resumer's bound.
+    record.caller_id = bound_caller(row.caller_id, caller_id)
     run_registry[run_id] = record
     # Mark the drive live BEFORE the first await: the off-loop journal writes
     # below yield, and a concurrent resume for the same run_id must hit the
@@ -1635,8 +1710,12 @@ async def replay_single_step(
     run_id: str,
     step_id: str,
     prompt_override: Optional[str] = None,
+    caller_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Re-execute ONE recorded step live, leaving the source run untouched (#640).
+
+    ``caller_id``: the terminal replaying the step, if an agent is; the replayed
+    worker is bounded by its delegation ceiling like any workflow step.
 
     The authoring loop this exists for: on a 57-step workflow, fixing two sentences
     of step 55's prompt should not cost a full re-run to reach step 55 again. The
@@ -1795,6 +1874,7 @@ async def replay_single_step(
                     "CAO_WORKFLOW_RUN_ID": replay_run_id,
                     "CAO_WORKFLOW_STEP_ID": step_id,
                 },
+                delegating_terminal_id=caller_id,
             )
         except StepExecutionError as e:
             # Recorded, not raised (the drive loop's posture). Deliberately NO retry
@@ -1830,6 +1910,12 @@ async def replay_single_step(
             # registry either: the in-process engine path dispatches no plugin hooks.
             if e.terminal_id is not None:
                 await _best_effort_teardown(e.terminal_id, None)
+        except DelegationCeilingError as e:
+            # The replayed worker would hold tools the replaying terminal may not
+            # delegate. Nothing ran and no terminal exists, so there is nothing to
+            # tear down; report it in the payload like any other step failure.
+            payload["error"] = str(e)
+            payload["error_kind"] = "error"
         except (TimeoutError, OutputExtractionError) as e:
             # Two terminal-layer failures ``run_agent_step`` propagates verbatim instead
             # of wrapping in ``StepExecutionError``, and both are the STEP failing rather
