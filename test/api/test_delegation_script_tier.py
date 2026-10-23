@@ -381,7 +381,6 @@ class TestCallerBindingSurvivesRestart:
     def test_orphaned_script_run_step_is_refused(self, client, isolated_journal):
         """Journal row for a reviewer-started script run, registry empty (the server
         restarted): the step is refused, nothing launches."""
-        from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 
         workflow_journal.insert_run(
             "r9",
