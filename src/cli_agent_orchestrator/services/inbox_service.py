@@ -4,12 +4,16 @@ Consumer: terminal.{id}.status
 """
 
 import asyncio
+import functools
 import logging
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import groupby
-from typing import Dict
+from typing import Callable, Dict, Iterable, Optional, Set
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     fail_orphaned_pending_messages,
     get_pending_messages,
@@ -20,6 +24,10 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.constants import (
     EAGER_INBOX_DELIVERY,
     INBOX_RECONCILE_GRACE_SECONDS,
+    INBOX_SUBMIT_CONFIRM_TIMEOUT,
+    INBOX_SUBMIT_CONFIRMATION,
+    INBOX_SUBMIT_MAX_RESUBMITS,
+    INBOX_SWEEP_FANOUT,
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
@@ -32,6 +40,22 @@ from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
+
+# Poll interval for the submit-confirmation wait. Short because the common case
+# is a healthy delivery that is already PROCESSING on the first or second read.
+# A dropped delivery costs INBOX_SUBMIT_CONFIRM_TIMEOUT for the first wait plus
+# one more per recovery actually sent, so up to
+# INBOX_SUBMIT_CONFIRM_TIMEOUT * (1 + INBOX_SUBMIT_MAX_RESUBMITS) -- all of it
+# on that one terminal's delivery thread, under that terminal's lock.
+_SUBMIT_CONFIRM_POLL_INTERVAL = 0.25
+
+# Statuses proving the receiver consumed this delivery (left its ready state).
+# WAITING_USER_ANSWER counts: the message was read and the agent is now asking.
+_SUBMIT_STARTED_STATUSES = {
+    TerminalStatus.PROCESSING,
+    TerminalStatus.COMPLETED,
+    TerminalStatus.WAITING_USER_ANSWER,
+}
 
 
 class InboxService:
@@ -60,31 +84,81 @@ class InboxService:
             return lock
 
     async def run(self, registry: PluginRegistry | None = None) -> None:
+        """Consume status events and deliver to each ready terminal on its own task.
+
+        One task per terminal, never one shared await: a delivery now includes
+        the submit confirmation (#78), which can hold that terminal's lock for
+        INBOX_SUBMIT_CONFIRM_TIMEOUT * (1 + INBOX_SUBMIT_MAX_RESUBMITS) seconds
+        when the receiver swallowed the Enter. Awaiting it inline here (as this
+        loop did before) stalled delivery to EVERY other terminal for that long
+        (PR #1004 review, P2-2). Spawning instead keeps the consumer reading;
+        the per-terminal delivery lock still keeps deliveries to one terminal
+        in order.
+
+        Events for a terminal whose delivery is still in flight are coalesced
+        into a single re-check that runs when that delivery finishes, so a
+        burst of status transitions cannot queue a thread per event behind the
+        lock -- and the re-check preserves the old semantics, where the later
+        event's delivery ran after the earlier one and saw the pending rows it
+        left behind.
+        """
         queue = bus.subscribe("terminal.*.status")
         logger.info("InboxService started")
 
-        while True:
-            try:
-                event = await queue.get()
-                status_value = event["data"]["status"]
-                if status_value in (TerminalStatus.IDLE.value, TerminalStatus.COMPLETED.value):
-                    terminal_id = terminal_id_from_topic(event["topic"])
-                    # deliver_pending does blocking DB + tmux I/O. Offload it to a
-                    # worker thread so this consumer keeps yielding to the event loop
-                    # (StatusMonitor/LogWriter must not be starved — see the threading
-                    # note in docs/event-driven-architecture.md). The registry is
-                    # threaded through so status-driven deliveries fire
-                    # PostSendMessageEvent hooks with the same attribution as the
-                    # immediate and OpenCode-poller paths.
-                    await asyncio.to_thread(self.deliver_pending, terminal_id, registry=registry)
-            except Exception as e:
-                logger.error(f"Error in InboxService: {e}")
+        in_flight: Dict[str, asyncio.Task] = {}
+        recheck: Set[str] = set()
+
+        def _finished(terminal_id: str, task: "asyncio.Task[None]") -> None:
+            in_flight.pop(terminal_id, None)
+            if not task.cancelled() and task.exception() is not None:
+                logger.error(f"Error in InboxService: {task.exception()}")
+            if terminal_id in recheck:
+                recheck.discard(terminal_id)
+                _spawn(terminal_id)
+
+        def _spawn(terminal_id: str) -> None:
+            # deliver_pending does blocking DB + tmux I/O (and now the
+            # confirmation wait). Offload it to a worker thread so this consumer
+            # keeps yielding to the event loop (StatusMonitor/LogWriter must not
+            # be starved — see the threading note in
+            # docs/event-driven-architecture.md). The registry is threaded
+            # through so status-driven deliveries fire PostSendMessageEvent
+            # hooks with the same attribution as the immediate and
+            # OpenCode-poller paths.
+            task = asyncio.create_task(
+                asyncio.to_thread(self.deliver_pending, terminal_id, registry=registry)
+            )
+            in_flight[terminal_id] = task
+            task.add_done_callback(functools.partial(_finished, terminal_id))
+
+        try:
+            while True:
+                try:
+                    event = await queue.get()
+                    status_value = event["data"]["status"]
+                    if status_value in (
+                        TerminalStatus.IDLE.value,
+                        TerminalStatus.COMPLETED.value,
+                    ):
+                        terminal_id = terminal_id_from_topic(event["topic"])
+                        if terminal_id in in_flight:
+                            recheck.add(terminal_id)
+                        else:
+                            _spawn(terminal_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"Error in InboxService: {e}")
+        finally:
+            for task in in_flight.values():
+                task.cancel()
 
     def deliver_pending(
         self,
         terminal_id: str,
         num_messages: int = 1,
         registry: PluginRegistry | None = None,
+        after_dispatch: Optional[Callable[[], None]] = None,
     ) -> None:
         """Deliver pending message(s) to a ready terminal. Use num_messages=0 for all.
 
@@ -96,17 +170,38 @@ class InboxService:
         ``send_message`` orchestration type are threaded to ``terminal_service``
         so ``PostSendMessageEvent`` hooks fire with correct attribution.
 
+        ``after_dispatch`` is called exactly once, as soon as the immediate
+        dispatch decision is over: right after the paste reached the pane (BEFORE
+        the submit confirmation, which can take a long time), or on return when
+        nothing was delivered. It lets a caller that only needs to know the
+        attempt was made -- the inbox POST -- answer without waiting out a
+        confirmation. It is never an acknowledgement that the receiver accepted
+        the message.
+
         Safe to call from any thread: the whole read→mark→send sequence is
         serialized per terminal (see __init__ for why that is load-bearing).
         """
-        with self._delivery_lock(terminal_id):
-            self._deliver_pending_locked(terminal_id, num_messages, registry)
+        notified = False
+
+        def notify() -> None:
+            nonlocal notified
+            if notified or after_dispatch is None:
+                return
+            notified = True
+            after_dispatch()
+
+        try:
+            with self._delivery_lock(terminal_id):
+                self._deliver_pending_locked(terminal_id, num_messages, registry, notify)
+        finally:
+            notify()
 
     def _deliver_pending_locked(
         self,
         terminal_id: str,
         num_messages: int,
         registry: PluginRegistry | None,
+        after_dispatch: Callable[[], None] = lambda: None,
     ) -> None:
         limit = num_messages if num_messages > 0 else 100
         messages = get_pending_messages(terminal_id, limit=limit)
@@ -114,6 +209,7 @@ class InboxService:
             return
 
         status = status_monitor.get_status(terminal_id)
+        eager = False
         if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
             # Not ready on the normal path. Eager delivery (#251) lets providers
             # that accept input mid-turn receive messages while PROCESSING or
@@ -129,6 +225,7 @@ class InboxService:
                 )
             if not eager_eligible:
                 return
+            eager = True
 
         # Mark DELIVERED before sending (#164). send_input() types into the tmux
         # pane; that output flows back through the FIFO/StatusMonitor pipeline and
@@ -148,10 +245,19 @@ class InboxService:
             batch = list(group)
             combined = "\n".join(m.message for m in batch)
             try:
+                # Taken from dispatch_input's return value -- sampled AFTER the
+                # monitor is armed and the rolling buffer cleared, before any key
+                # reaches the pane (terminal_service.py:4008-4022). That is the
+                # only correct boundary: anything sampled earlier (e.g. a plain
+                # output_generation() call before send_input) can be exceeded by
+                # unrelated output that lands in the window before send_input
+                # does its provider work and clears the buffer, which would let a
+                # swallowed Enter read as confirmed -- the exact failure this
+                # gate exists to catch.
                 if registry is None:
-                    terminal_service.send_input(terminal_id, combined)
+                    boundary = terminal_service.dispatch_input(terminal_id, combined)
                 else:
-                    terminal_service.send_input(
+                    boundary = terminal_service.dispatch_input(
                         terminal_id,
                         combined,
                         registry=registry,
@@ -159,6 +265,47 @@ class InboxService:
                         orchestration_type=OrchestrationType.SEND_MESSAGE,
                     )
                 logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
+                # The paste is in the pane: the immediate-delivery caller may
+                # answer now. Everything below is confirmation and recovery.
+                after_dispatch()
+                if INBOX_SUBMIT_CONFIRMATION and not eager:
+                    if get_backend().supports_event_inbox():
+                        # Event-inbox backends (herdr) push delivery synchronously
+                        # inline on their single asyncio event loop thread
+                        # (herdr_inbox_service.py's _event_loop -> _deliver, with
+                        # no asyncio.to_thread offload -- see the TODO at
+                        # herdr_inbox_service.py:1276-1277). _confirm_submitted's
+                        # blocking time.sleep() would stall that whole session's
+                        # event processing for up to
+                        # INBOX_SUBMIT_CONFIRM_TIMEOUT * (1 + INBOX_SUBMIT_MAX_RESUBMITS)
+                        # seconds. Skip confirmation there until that offload
+                        # exists -- the drop stays undetected on herdr, same as
+                        # before this fix, instead of freezing the session.
+                        logger.debug(
+                            "Skipping inbox submit confirmation for terminal %s: "
+                            "event-inbox backend delivery runs on the API event loop",
+                            terminal_id,
+                        )
+                    else:
+                        # Still holding the per-terminal delivery lock,
+                        # deliberately: the pile-up in #78 ({MSG1}{MSG2} in one
+                        # composer) is a second delivery landing while the first
+                        # sits unsubmitted. The lock only DELAYS that second
+                        # delivery until this confirmation ends; what prevents
+                        # the pile-up is a recovery that submits the first paste
+                        # (bare Enter), which needs the provider to read its
+                        # composer -- see _confirm_submitted. Other terminals
+                        # are not held: each delivery runs on its own thread.
+                        # Eager delivery is excluded because its receiver was
+                        # already PROCESSING -- "left the ready state" proves
+                        # nothing there.
+                        self._confirm_submitted(
+                            terminal_id,
+                            combined,
+                            boundary,
+                            registry=registry,
+                            sender_id=sender_id,
+                        )
             except TerminalNotFoundError as e:
                 # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
                 # for this window). Treat as transient: reset to PENDING so the
@@ -175,6 +322,165 @@ class InboxService:
                     logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
                     update_message_status(message.id, MessageStatus.FAILED)
 
+    def _wait_for_pickup(
+        self,
+        terminal_id: str,
+        boundary: int,
+    ) -> bool:
+        """Wait for a started status that is EVIDENCE OF THIS DELIVERY.
+
+        Mirrors ``terminal_service._wait_for_post_dispatch_start`` (the
+        deferred-init path's confirmation) in synchronous form, and for the same
+        reason: a status VALUE cannot say when it was earned. A COMPLETED latched
+        from the receiver's previous turn satisfies "not ready" instantly, so the
+        causal pair from ``status_observation`` is required -- the generation the
+        status was EARNED at must exceed the delivery boundary.
+
+        Callers never pass event-inbox (herdr) terminals here: that backend
+        pushes delivery inline on its own asyncio event loop thread, so
+        ``_deliver_pending_locked`` skips confirmation for it entirely rather
+        than block that loop (see the caller).
+        """
+        deadline = time.monotonic() + INBOX_SUBMIT_CONFIRM_TIMEOUT
+        while True:
+            observation = status_monitor.status_observation(terminal_id)
+            if (
+                observation.status in _SUBMIT_STARTED_STATUSES
+                and observation.output_generation is not None
+                and observation.output_generation > boundary
+            ):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_SUBMIT_CONFIRM_POLL_INTERVAL)
+
+    def _confirm_submitted(
+        self,
+        terminal_id: str,
+        message: str,
+        boundary: int,
+        *,
+        registry: PluginRegistry | None,
+        sender_id: str | None,
+    ) -> bool:
+        """Confirm the receiver began processing this delivery; re-submit if not.
+
+        Reuses ``terminal_service.redeliver_dropped_message_with_boundary`` --
+        the same decision helper the deferred-init (#479/#496) and synchronous
+        step (#562) paths use -- so the three delivery paths share one notion of
+        what a dropped send looks like and how to recover from it. The recovery
+        is bare Enter when the text is still visible in the receiver's composer
+        (only the Enter was swallowed), a full re-send when the provider read
+        its composer and the text is NOT there and the provider is
+        probe-capable, and nothing at all otherwise.
+
+        Both gates are on on purpose. ``full_resend_requires_probe``: without a
+        direct status probe there is no way to tell "paste dropped" from "the
+        agent already read it and the prompt scrolled away", and re-pasting an
+        inbox message into a working agent delivers the same instruction twice.
+        ``full_resend_requires_composer_evidence``: a full re-send pastes into
+        the composer without clearing it, so unless the provider can show the
+        composer does not still hold the first paste, the re-send would join the
+        two copies and submit both (PR #1004 review, P2-3). A provider with
+        neither ``extract_current_composer`` nor a probe therefore gets no
+        recovery at all, only the log line; which providers those are is
+        enumerated in ``TestInboxRecoveryCoverageByProvider``
+        (test/services/test_inbox_service.py). ``screen_may_show_previous_turn``:
+        an inbox receiver usually still shows its last turn's completion
+        marker, so a probe that cannot tell turns apart must not read that as
+        pickup.
+
+        Returns True when the delivery was confirmed (or the receiver was found
+        already working), False when it stayed unconfirmed. The message is left
+        DELIVERED either way: it HAS been typed into the pane, so reverting it to
+        PENDING would let the reconcile sweep paste it a second time.
+        """
+        if self._wait_for_pickup(terminal_id, boundary):
+            return True
+
+        for attempt in range(1, INBOX_SUBMIT_MAX_RESUBMITS + 1):
+            logger.warning(
+                "Inbox delivery to %s shows no pickup %ss after send — "
+                "attempting recovery (attempt %d)",
+                terminal_id,
+                INBOX_SUBMIT_CONFIRM_TIMEOUT,
+                attempt,
+            )
+            try:
+                already_started, new_boundary = (
+                    terminal_service.redeliver_dropped_message_with_boundary(
+                        terminal_id,
+                        message,
+                        attempt,
+                        full_resend_requires_probe=True,
+                        full_resend_requires_composer_evidence=True,
+                        screen_may_show_previous_turn=True,
+                        registry=registry,
+                        sender_id=sender_id,
+                        orchestration_type=OrchestrationType.SEND_MESSAGE,
+                    )
+                )
+            except Exception:
+                # A failed recovery is not a failed delivery: the message was
+                # typed into the pane and is already DELIVERED. Log and stop.
+                logger.warning(
+                    "Inbox redelivery to %s failed (attempt %d)",
+                    terminal_id,
+                    attempt,
+                    exc_info=True,
+                )
+                return False
+            if already_started:
+                # The helper's direct probe found the receiver running under a
+                # lagging cached status (#496): delivery is confirmed.
+                return True
+            if new_boundary is None:
+                # The helper deliberately sent nothing (not probe-capable, or
+                # execution evidence was ambiguous). Waiting again would only
+                # burn another timeout against the same unchanged state.
+                return False
+            # The recency bar advances per attempt: evidence has to be earned
+            # after THIS re-submission, not after the original send.
+            boundary = new_boundary
+            if self._wait_for_pickup(terminal_id, boundary):
+                return True
+
+        logger.error(
+            "Inbox delivery to %s is unconfirmed after %d recovery attempt(s); "
+            "the message may be sitting unsubmitted in the agent's prompt",
+            terminal_id,
+            INBOX_SUBMIT_MAX_RESUBMITS,
+        )
+        return False
+
+    def _deliver_to_each(
+        self,
+        terminal_ids: Iterable[str],
+        registry: PluginRegistry | None,
+        failure_label: str,
+    ) -> None:
+        """Run ``deliver_pending`` for every receiver, in parallel, failures isolated.
+
+        The sweeps used to walk receivers one after another. With the submit
+        confirmation inside each delivery, one receiver that swallowed its Enter
+        held the whole sweep for up to a full confirmation cycle per such
+        receiver (PR #1004 review, P2-2). Fan out instead; the per-terminal lock
+        keeps this from racing the status-event and POST paths.
+        """
+        ids = list(terminal_ids)
+        if not ids:
+            return
+        with ThreadPoolExecutor(max_workers=min(len(ids), INBOX_SWEEP_FANOUT)) as pool:
+            futures = {
+                pool.submit(self.deliver_pending, terminal_id, registry=registry): terminal_id
+                for terminal_id in ids
+            }
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.debug(f"{failure_label} failed for {futures[future]}: {e}")
+
     def poll_opencode_pending_messages(self, registry: PluginRegistry | None = None) -> None:
         """Poll OpenCode terminals for pending inbox messages.
 
@@ -182,11 +488,11 @@ class InboxService:
         change after the TUI settles, so the FIFO-driven StatusMonitor may not
         emit an IDLE/COMPLETED transition to trigger delivery on its own.
         """
-        for terminal_id in list_pending_receiver_ids_by_provider(ProviderType.OPENCODE_CLI.value):
-            try:
-                self.deliver_pending(terminal_id, registry=registry)
-            except Exception as e:
-                logger.debug(f"OpenCode inbox poll failed for {terminal_id}: {e}")
+        self._deliver_to_each(
+            list_pending_receiver_ids_by_provider(ProviderType.OPENCODE_CLI.value),
+            registry,
+            "OpenCode inbox poll",
+        )
 
     def reconcile_orphaned_messages(self, registry: PluginRegistry | None = None) -> None:
         """Re-attempt delivery for messages stuck in PENDING past the grace window.
@@ -219,11 +525,11 @@ class InboxService:
         except Exception as e:
             logger.error(f"Failed to sweep orphaned inbox messages: {e}")
 
-        for terminal_id in list_pending_receiver_ids_older_than(INBOX_RECONCILE_GRACE_SECONDS):
-            try:
-                self.deliver_pending(terminal_id, registry=registry)
-            except Exception as e:
-                logger.debug(f"Inbox reconciliation failed for {terminal_id}: {e}")
+        self._deliver_to_each(
+            list_pending_receiver_ids_older_than(INBOX_RECONCILE_GRACE_SECONDS),
+            registry,
+            "Inbox reconciliation",
+        )
 
 
 inbox_service = InboxService()
