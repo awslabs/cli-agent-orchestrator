@@ -234,6 +234,38 @@ NEW_TUI_BOX_SUMMARY_PATTERN = re.compile(
 )
 # Chrome the TUI paints between the newest conversation line and the box.
 NEW_TUI_BOX_CHROME_PATTERN = re.compile(r"^[ \t]*(?:⎿|tmux (?:detected|focus-events)\b)")
+# A chrome row's WRAPPED CONTINUATION (PR #975 review, P2-2). "  ⎿  Tip: …" and
+# "  ⎿  $ sleep 60 (27s)" put their text at column 5; when the line is wider
+# than the pane, the TUI indents the rest to that column and does NOT repeat ⎿.
+# The continuation therefore does not match NEW_TUI_BOX_CHROME_PATTERN, and a
+# walker that stops on it never sees the spinner above — a working agent read as
+# completed, the #908 harm. Both live 2.1.308 captures wrap their tip row this
+# way at 80 columns, and a person who attaches with a smaller terminal shrinks
+# the pane CAO created at 220x50 (clients/tmux.py, the resize note).
+#
+# This pattern CANNOT decide on its own that an indented row is a wrap: a
+# response's indented code block renders identically. Only what sits ABOVE the
+# row tells them apart, so _newest_conversation_row carries such a row as a
+# candidate and lets a ⎿ row above it clear the candidate; see its docstring.
+# Threshold 5 is the ⎿ text column — response body prose sits at column 2, so
+# a wrapped sentence never matches.
+CHROME_CONTINUATION_ROW_PATTERN = re.compile(r"^[ \t]{5,}\S")
+# Status-area rows the TUI can draw UNDER the live spinner (PR #975 review,
+# P2-1): the task list's indented checkbox rows (only the FIRST task row starts
+# with ⎿, which NEW_TUI_BOX_CHROME_PATTERN already skips) and an indented
+# queued-message row ("  ❯ /effort"). These are not conversation — a walker
+# that stops on one of them never sees the spinner above and reports a working
+# agent as completed (the #908 harm). Glyph sources: ✔/◼/◻ and the indented ❯
+# from the 2.1.119 frame in anthropics/claude-code#52688; ☒/☐ from the older
+# task layout in anthropics/claude-code#10174; ✓/✓-variants kept for the glyph
+# the docs show. A live 2.1.308 capture (test/providers/fixtures/
+# claude_code_974_*.txt) confirms queued messages; its build has no TodoWrite,
+# so the task-row glyphs rest on the two public frames (see COMPOSER_FIXTURES.md).
+# Requires leading indent: a column-0 "❯ …" row is the user's prompt echo (and
+# 2.1.308 draws queued messages at column 0 ABOVE the spinner, where no skip is
+# needed), and skipping the echo would misread a just-dispatched frame, whose
+# newest conversation row must stay the echo, as the previous turn's summary.
+STATUS_AREA_ROW_PATTERN = re.compile(r"^[ \t]+(?:[✔✓◼◻☐☒]|❯)[ \t\xa0]")
 # A gated frame unchanged for this long falls back to the legacy verdict, so an
 # end state that paints no summary (an operator's slash command, an exhausted
 # retry loop) costs one grace period rather than the step timeout. A streaming
@@ -278,7 +310,34 @@ NEW_TUI_SPINNER_PATTERN = r"[✶✢✽✻✳·*][^\n]*ing…"
 # Requiring the gerund as the FIRST word rejects a response bullet
 # ("* Remember to deploy…") or the version footer ("· latest: … update…")
 # sitting directly above the box from being misread as a live spinner.
-NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+\w*ing\b.*…")
+#
+# "Gerund" has to allow the punctuation Claude Code's own default verb list
+# carries: a hyphen inside the word ("Dilly-dallying") and the dropped-g
+# contraction ("Beboppin'", with either ASCII ' or the typographic ’). A plain
+# "\w*ing\b" rejects both — \w spans no "-" and no "'" — which is why #956
+# dropped the first-word anchor from the reduced-motion pattern rather than
+# widening it. Those verbs run straight into the ellipsis ("Dilly-dallying…"),
+# whereas a hyphenated -ing compound in response prose is followed by more
+# words ("* Long-running jobs now stop after 30 minutes…", "* Self-hosting is
+# supported, see the docs…") — and "*" / "·" are markdown bullets as well as
+# spinner frames. So the "-" / "'" forms are accepted only when the ellipsis
+# follows at once (PR #975 review, P3-1); the plain form still carries the
+# multi-word spinner ("✢ Compacting conversation…", "✻ Running the test suite…").
+# No "\b" after the contraction: the next character is the "…", so there is no
+# word boundary to assert there.
+_SPINNER_VERB = r"(?:\w*ing\b|[\w'’-]*(?:ing|in['’])(?=…))"
+NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+" + _SPINNER_VERB + r".*…")
+# The same spinner shape, anywhere in the boxless tail after an interim summary
+# (see get_status): the cleaned raw stream can leave the spinner mid-line, so
+# no line-start anchor. Built from _SPINNER_VERB so the "-" / "'" default verbs
+# ("✢ Dilly-dallying…") are a live spinner here too; a plain "\w*ing\b" let
+# them read COMPLETED after "✻ Pondered for 8s" (PR #975 review, P3-4).
+AFTER_SUMMARY_SPINNER_PATTERN = re.compile(r"[✶✢✽✻✳·*][ \t]+" + _SPINNER_VERB + r"[^\n]*…")
+# Any glyph + ellipsis, for get_status()'s walk back from the last separator:
+# deliberately loose (no verb, "·" included, "*" excluded) because it is applied
+# only to the lines between the last two separators, where the newest TUI
+# draws nothing but the live turn. Named so the busy-pattern guard sees it.
+SEPARATOR_WALK_SPINNER_PATTERN = re.compile(r"[✶✢✽✻✳·][^\n]*\u2026")
 # Live spinner under Claude Code's prefersReducedMotion setting (GH #908): the
 # animated glyph is replaced by a static "●", e.g. "● Leavening… (running
 # UserPromptSubmit hook)" or "● Sublimating… (12s · ↓ 300 tokens)". "●" is also
@@ -291,6 +350,26 @@ NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+\w*i
 # "thought for Ns", or the older "esc to interrupt". A response like
 # "● Analyzing… the diff is fine" and the tool-call line
 # "● Calling cao-mcp-server… (ctrl+o to expand)" do not match.
+#
+# GH #974: a finished response can carry a duration or token parenthetical of
+# its own — "● Done. The fix is in place… (3m 12s)", "● Approved the plan…
+# (↓ 1.2k tokens)" — and "●" is the response marker, so this pattern matches
+# that row too. It cannot be tightened: the message is not a property of the
+# spinner row (a custom spinnerVerbs entry, the verb a hook interrupted, a task
+# row in another language), and a first-word rule reopened #908 for all of
+# those (PR #975 review). What separates the two is POSITION. The live spinner
+# is always the newest CONVERSATION row above the input box — where blank rows,
+# chrome rows, a chrome row's WRAPPED CONTINUATION (PR #975 review P2-2) and
+# the STATUS AREA the TUI draws under the spinner (task-list rows, queued
+# messages; PR #975 review P2-1) do not count as conversation — and a finished
+# response has the end-of-turn summary under it. So both call
+# sites apply this pattern only to the row _newest_conversation_row returns:
+# get_status()'s input-box walk and get_status_from_screen(), which used to take
+# ANY match in the bottom 25 rows (which let the settled line pin PROCESSING
+# for good, so _wait_for_completion burned its budget as a timeout). The one
+# frame position cannot separate is a settled "●" status row directly above
+# the box with no summary painted; it reads PROCESSING, the #908 direction,
+# until a live capture of such a turn says otherwise.
 _REDUCED_MOTION_STATUS = (
     r"(?:running[ \t][^)\n]*\bhooks?\b"
     r"|\d+(?:\.\d+)?[smhd]\b"
@@ -1085,15 +1164,15 @@ class ClaudeCodeProvider(BaseProvider):
             _after_summary = _tail[_last_summary.end() :] if _last_summary else ""
             if (
                 _last_summary is not None
-                and not re.search(r"[✶✢✽✻✳·*][ \t]+\w*ing\b[^\n]*…", _after_summary)
+                and not AFTER_SUMMARY_SPINNER_PATTERN.search(_after_summary)
                 and not REDUCED_MOTION_SPINNER_PATTERN.search(_after_summary)
             ):
                 _boxless_completion_tail = True
         if _sep_positions and not _boxless_completion_tail:
             pre_sep_lines = output[: _sep_positions[-1]].rstrip("\n").split("\n")
             for line in reversed(pre_sep_lines):
-                if re.search(
-                    r"[✶✢✽✻✳·][^\n]*\u2026", line
+                if SEPARATOR_WALK_SPINNER_PATTERN.search(
+                    line
                 ) or REDUCED_MOTION_SPINNER_PATTERN.search(line):
                     return TerminalStatus.PROCESSING  # spinner before another separator
                 if _sep_re.search(line):
@@ -1203,26 +1282,24 @@ class ClaudeCodeProvider(BaseProvider):
                 if m.start() <= last_idle.start() < m.end():
                     input_box = m
         if input_box is not None:
-            # Walk up from the box past footer chrome — "⎿ Tip: …" hint lines,
-            # blanks, and (GH #459) an own-line effort footer ("● high ·
-            # /effort") — render BETWEEN the live spinner and the box's top
-            # border, so checking only the single line above the box misses
-            # an active spinner (false COMPLETED during MCP calls, or IDLE
-            # once fix #1 above stops the footer from false-matching COMPLETED
-            # via EXTRACTION_RESPONSE_PATTERN).
+            # Walk up from the box to the newest conversation row: footer chrome
+            # ("⎿ Tip: …" hints and the rows they WRAP onto — PR #975 review,
+            # P2-2 — blanks, the GH #459 own-line effort footer) and the status
+            # area (the task list's indented checkbox rows, an indented
+            # queued-message row — PR #975 review, P2-1) render BETWEEN the
+            # live spinner and the box's top border, so checking only the
+            # lines directly above the box misses an active spinner (false
+            # COMPLETED during MCP calls, or IDLE once fix #1 above stops the
+            # footer from false-matching COMPLETED via
+            # EXTRACTION_RESPONSE_PATTERN). _newest_conversation_row is the one
+            # definition of that row, shared with get_status_from_screen.
             above_lines = output[: input_box.start()].rstrip("\n").split("\n")
-            for line in reversed(above_lines[-4:]):
-                if (
-                    not line.strip()
-                    or line.lstrip().startswith("⎿")
-                    or EFFORT_FOOTER_LINE_PATTERN.match(line)
-                ):
-                    continue
-                if NEW_TUI_BOX_SPINNER_PATTERN.search(
-                    line
-                ) or REDUCED_MOTION_SPINNER_PATTERN.search(line):
-                    return TerminalStatus.PROCESSING
-                break
+            newest_row = self._newest_conversation_row(above_lines)
+            if newest_row is not None and (
+                NEW_TUI_BOX_SPINNER_PATTERN.search(newest_row)
+                or REDUCED_MOTION_SPINNER_PATTERN.search(newest_row)
+            ):
+                return TerminalStatus.PROCESSING
             # No spinner is drawn while text streams; see NEW_TUI_BOX_SUMMARY_PATTERN.
             if self._turn_still_in_flight("raw", above_lines):
                 return TerminalStatus.PROCESSING
@@ -1294,19 +1371,55 @@ class ClaudeCodeProvider(BaseProvider):
         return TerminalStatus.UNKNOWN
 
     @staticmethod
-    def _turn_ended_above_box(above_lines: List[str]) -> bool:
+    def _newest_conversation_row(above_lines: List[str]) -> Optional[str]:
+        """The newest conversation row above the input box, where conversation
+        excludes blank rows, chrome rows ("⎿ Tip: …", the effort footer, the
+        tmux notices), THEIR WRAPPED CONTINUATIONS, and status-area rows
+        (indented task-list and queued-message rows) — or None when nothing else
+        sits above the box. This is the only row the live spinner can be on, and
+        the row the end-of-turn summary lands on — and it is the ONLY definition
+        of that row: both detector paths (get_status's input-box walk and
+        get_status_from_screen) must go through this helper, never re-decide
+        what counts as conversation (PR #975 review, P2-1 and P2-2; guarded by
+        test_busy_pattern_settled_output_guard.py).
+
+        One row shape is ambiguous in isolation (P2-2). A row indented to the ⎿
+        text column (CHROME_CONTINUATION_ROW_PATTERN) is either the wrap of the
+        "⎿ Tip: …"/"⎿ $ cmd" line above it — chrome, skip it — or a response's
+        indented code block, which IS conversation and IS the newest row. The
+        two render identically; only what sits above decides. So the walk keeps
+        the first such row it meets (from the bottom) as a CANDIDATE and carries
+        on up: a ⎿ row clears the candidate, because the rows below it were its
+        wrap; a conversation row hands the candidate back, because the rows
+        below it were a code block; and if the walk runs off the top the
+        candidate is all there is. Later continuations do not replace the
+        candidate, so a multi-row code block still reports its newest row.
+        """
+        candidate: Optional[str] = None
+        for line in reversed(above_lines):
+            if NEW_TUI_BOX_CHROME_PATTERN.match(line):
+                candidate = None
+                continue
+            if (
+                not line.strip()
+                or EFFORT_FOOTER_LINE_PATTERN.match(line)
+                or STATUS_AREA_ROW_PATTERN.match(line)
+            ):
+                continue
+            if CHROME_CONTINUATION_ROW_PATTERN.match(line):
+                if candidate is None:
+                    candidate = line
+                continue
+            return candidate if candidate is not None else line
+        return candidate
+
+    @classmethod
+    def _turn_ended_above_box(cls, above_lines: List[str]) -> bool:
         """True when the newest conversation line above the input box is the
         end-of-turn summary. Blank rows and box chrome are skipped on the way up.
         """
-        for line in reversed(above_lines):
-            if (
-                not line.strip()
-                or NEW_TUI_BOX_CHROME_PATTERN.match(line)
-                or EFFORT_FOOTER_LINE_PATTERN.match(line)
-            ):
-                continue
-            return NEW_TUI_BOX_SUMMARY_PATTERN.match(line) is not None
-        return False
+        newest = cls._newest_conversation_row(above_lines)
+        return newest is not None and NEW_TUI_BOX_SUMMARY_PATTERN.match(newest) is not None
 
     def _turn_still_in_flight(self, path: str, above_lines: List[str]) -> bool:
         """After a dispatch, a box without the summary as its newest line above is
@@ -1383,6 +1496,30 @@ class ClaudeCodeProvider(BaseProvider):
         joined = "\n".join(rows)
         bottom = rows[-25:]
 
+        # Real input box: a prompt line with a "────" rail BOTH within 2 rows
+        # above AND within 2 rows below — the "──── / ❯ / ────" box Claude pins
+        # to the bottom of the viewport. Located first because the spinner scan
+        # below is scoped to it.
+        sep_idx = [i for i, ln in enumerate(rows) if re.search(r"─{8,}", ln)]
+        # Prompt line: ❯/> followed by whitespace OR alone at end-of-line. The
+        # bare-glyph case matters because rows are rstrip()ed: an EMPTY prompt
+        # box renders as "❯" + pyte's space padding, which rstrip reduces to a
+        # bare "❯" that IDLE_PROMPT_PATTERN (glyph + whitespace) cannot match.
+        # We deliberately do NOT require the prompt line to be empty — a ready
+        # box carries placeholder text (❯ Try "fix typecheck errors").
+        prompt_idx = [i for i, ln in enumerate(rows) if re.search(r"[>❯](?:[\s\xa0]|$)", ln)]
+        # Require BOTH rails, not just one nearby separator: during launch the
+        # echoed "> " system-prompt quote can land within 2 rows of a single
+        # early-painted ──── rule, which a one-sided adjacency misread as a ready
+        # prompt (premature IDLE on init — the first task then hits a not-ready
+        # agent). The real box always has a rail above AND below the prompt.
+        boxed_rows = [
+            pi
+            for pi in prompt_idx
+            if any(0 < pi - si <= 2 for si in sep_idx) and any(0 < si - pi <= 2 for si in sep_idx)
+        ]
+        box_top = max(si for si in sep_idx if 0 < boxed_rows[-1] - si <= 2) if boxed_rows else None
+
         # Live spinner: "✻ <gerund>… (…)" — the boxed-prompt spinner or a bare
         # spinner line. Visible in a composited frame ⇒ genuinely working.
         #
@@ -1395,9 +1532,32 @@ class ClaudeCodeProvider(BaseProvider):
         # then latches and starves InboxService (delivers only on IDLE/COMPLETED).
         # The raw get_status() path already switched to the tight pattern for the
         # same reason; the screen path must match.
+        #
+        # GH #974: with the box on screen, only the NEWEST conversation row above
+        # it can be the live spinner — the TUI draws the spinner under everything
+        # the turn has printed so far, with only non-conversation rows (blank
+        # rows, chrome rows and the rows they WRAP onto — PR #975 review P2-2 —
+        # and the STATUS AREA: task-list rows and queued messages, PR #975
+        # review P2-1) between it and the box. A conversation
+        # row higher up is history, whatever it looks like: a finished response's
+        # own duration parenthetical ("● Done. The fix is in place… (3m 12s)") is
+        # the same text as a reduced-motion spinner row, and only its position
+        # tells them apart. Scanning every bottom row for ANY match let that
+        # settled row pin PROCESSING until it scrolled off, so
+        # _wait_for_completion burned its whole budget as a timeout; stopping on
+        # a status-area row instead hid a live spinner and reported a working
+        # agent completed. _newest_conversation_row is the one definition of the
+        # row, shared with the raw path's input-box walk in get_status(). Without
+        # a box (launch, a full-screen dialog) nothing has settled yet, so the
+        # whole bottom region is scanned as before.
+        if box_top is not None:
+            newest = self._newest_conversation_row(rows[:box_top])
+            spinner_rows = [newest] if newest is not None else []
+        else:
+            spinner_rows = bottom
         if any(
             NEW_TUI_BOX_SPINNER_PATTERN.search(ln) or REDUCED_MOTION_SPINNER_PATTERN.search(ln)
-            for ln in bottom
+            for ln in spinner_rows
         ):
             return TerminalStatus.PROCESSING
 
@@ -1423,30 +1583,8 @@ class ClaudeCodeProvider(BaseProvider):
         if any(BACKGROUND_WAIT_PATTERN.search(ln) for ln in bottom):
             return TerminalStatus.PROCESSING
 
-        # Real input box: a prompt line with a "────" rail BOTH within 2 rows
-        # above AND within 2 rows below — the "──── / ❯ / ────" box Claude pins
-        # to the bottom of the viewport.
-        sep_idx = [i for i, ln in enumerate(rows) if re.search(r"─{8,}", ln)]
-        # Prompt line: ❯/> followed by whitespace OR alone at end-of-line. The
-        # bare-glyph case matters because rows are rstrip()ed: an EMPTY prompt
-        # box renders as "❯" + pyte's space padding, which rstrip reduces to a
-        # bare "❯" that IDLE_PROMPT_PATTERN (glyph + whitespace) cannot match.
-        # We deliberately do NOT require the prompt line to be empty — a ready
-        # box carries placeholder text (❯ Try "fix typecheck errors").
-        prompt_idx = [i for i, ln in enumerate(rows) if re.search(r"[>❯](?:[\s\xa0]|$)", ln)]
-        # Require BOTH rails, not just one nearby separator: during launch the
-        # echoed "> " system-prompt quote can land within 2 rows of a single
-        # early-painted ──── rule, which a one-sided adjacency misread as a ready
-        # prompt (premature IDLE on init — the first task then hits a not-ready
-        # agent). The real box always has a rail above AND below the prompt.
-        boxed_rows = [
-            pi
-            for pi in prompt_idx
-            if any(0 < pi - si <= 2 for si in sep_idx) and any(0 < si - pi <= 2 for si in sep_idx)
-        ]
-        if boxed_rows:
+        if box_top is not None:
             # No spinner is drawn while text streams; see NEW_TUI_BOX_SUMMARY_PATTERN.
-            box_top = max(si for si in sep_idx if 0 < boxed_rows[-1] - si <= 2)
             if self._turn_still_in_flight("screen", rows[:box_top]):
                 return TerminalStatus.PROCESSING
             if re.search(

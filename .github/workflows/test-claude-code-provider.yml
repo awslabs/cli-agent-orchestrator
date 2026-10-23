@@ -21,6 +21,7 @@ on:
     paths:
       - 'src/cli_agent_orchestrator/providers/claude_code.py'
       - 'test/providers/test_claude_code_unit.py'
+      - 'test/providers/test_busy_pattern_settled_output_guard.py'
       - 'pyproject.toml'
       - '.github/workflows/test-claude-code-provider.yml'
   pull_request:
@@ -28,6 +29,7 @@ on:
     paths:
       - 'src/cli_agent_orchestrator/providers/claude_code.py'
       - 'test/providers/test_claude_code_unit.py'
+      - 'test/providers/test_busy_pattern_settled_output_guard.py'
       - 'pyproject.toml'
       - '.github/workflows/test-claude-code-provider.yml'
 
@@ -57,7 +59,11 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
+          # The busy-pattern guard (GH #974) runs here too: this gate fires on a
+          # claude_code.py-only change, which is exactly when a spinner pattern
+          # can be widened back onto settled output.
           uv run pytest test/providers/test_claude_code_unit.py \
+            test/providers/test_busy_pattern_settled_output_guard.py \
             --cov=src/cli_agent_orchestrator/providers/claude_code.py \
             --cov-report=xml \
             --cov-report=term-missing \
