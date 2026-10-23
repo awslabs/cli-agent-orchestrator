@@ -447,6 +447,16 @@ class TestWorkingDirectoryNormalizationAtTheBoundary:
     """Both creation endpoints accept operator-typed spellings and reject an
     unusable path with a clear 400 before any service is reached."""
 
+    #: ``POST /sessions/{name}/terminals`` is a delegation, not an operator
+    #: launch: #948 made it answer 403 without a ``caller_id``, BEFORE the
+    #: working-directory normalization below. Every in-session create in this
+    #: class therefore goes through ``_post_terminal``, which supplies the id
+    #: in ONE place -- the next requirement that endpoint grows is then a
+    #: one-line change here rather than a sweep of seven near-identical
+    #: request literals. ``test_in_session_create_without_caller_id_is_403``
+    #: covers the omitted-id case deliberately.
+    CALLER_ID = "dcba8765"
+
     @staticmethod
     def _terminal(session="cao-demo"):
         return Terminal(
@@ -455,6 +465,15 @@ class TestWorkingDirectoryNormalizationAtTheBoundary:
             session_name=session,
             provider="kiro_cli",
             agent_profile="developer",
+        )
+
+    @classmethod
+    def _post_terminal(cls, client, params, **kwargs):
+        """POST the in-session create with the delegation fields it requires."""
+        return client.post(
+            "/sessions/cao-demo/terminals",
+            params={"caller_id": cls.CALLER_ID, **params},
+            **kwargs,
         )
 
     def test_create_session_strips_quotes_and_forwards_the_normalized_path(self, client, tmp_path):
@@ -618,7 +637,7 @@ class TestWorkingDirectoryNormalizationAtTheBoundary:
         }
         if endpoint == "session":
             return client.post("/sessions", params=params)
-        return client.post("/sessions/cao-demo/terminals", params=params)
+        return TestWorkingDirectoryNormalizationAtTheBoundary._post_terminal(client, params)
 
     def test_create_terminal_in_session_normalizes_too(self, client, tmp_path):
         with (
@@ -627,9 +646,9 @@ class TestWorkingDirectoryNormalizationAtTheBoundary:
         ):
             svc.get_session.return_value = {"session": {"id": "cao-demo"}, "terminals": []}
             ts.create_terminal = AsyncMock(return_value=self._terminal())
-            resp = client.post(
-                "/sessions/cao-demo/terminals",
-                params={
+            resp = self._post_terminal(
+                client,
+                {
                     "provider": "kiro_cli",
                     "agent_profile": "developer",
                     "working_directory": f'"{tmp_path}"',
@@ -650,9 +669,9 @@ class TestWorkingDirectoryNormalizationAtTheBoundary:
         ):
             svc.get_session.return_value = {"session": {"id": "cao-demo"}, "terminals": []}
             ts.create_terminal = AsyncMock()
-            resp = client.post(
-                "/sessions/cao-demo/terminals",
-                params={
+            resp = self._post_terminal(
+                client,
+                {
                     "provider": "kiro_cli",
                     "agent_profile": "developer",
                     "working_directory": str(target),
@@ -671,9 +690,9 @@ class TestWorkingDirectoryNormalizationAtTheBoundary:
         ):
             svc.get_session.return_value = {"session": {"id": "cao-demo"}, "terminals": []}
             ts.create_terminal = AsyncMock()
-            resp = client.post(
-                "/sessions/cao-demo/terminals",
-                params={
+            resp = self._post_terminal(
+                client,
+                {
                     "provider": "kiro_cli",
                     "agent_profile": "developer",
                     "working_directory": "relative/not/absolute",
@@ -681,4 +700,34 @@ class TestWorkingDirectoryNormalizationAtTheBoundary:
             )
         assert resp.status_code == 400
         assert "absolute" in resp.json()["detail"].lower()
+        ts.create_terminal.assert_not_called()
+
+    def test_in_session_create_without_caller_id_is_403_and_creates_no_directory(
+        self, client, tmp_path
+    ):
+        """How #948's delegation guard and #724's working-directory handling
+        compose on ``POST /sessions/{name}/terminals``: a missing ``caller_id``
+        is a 403 that never reaches ``create_terminal``, so the point-of-use
+        mkdir inside the service never runs and an unauthorized create cannot
+        leave an operator's directory behind. Pinned because the two guards
+        arrived in the same endpoint from different PRs; this is the one test
+        that holds them together."""
+        target = tmp_path / "unauthorized" / "deep" / "tree"
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as ts,
+            patch("cli_agent_orchestrator.api.main.session_service") as svc,
+        ):
+            svc.get_session.return_value = {"session": {"id": "cao-demo"}, "terminals": []}
+            ts.create_terminal = AsyncMock()
+            resp = client.post(
+                "/sessions/cao-demo/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "working_directory": str(target),
+                },
+            )
+        assert resp.status_code == 403, resp.json()
+        assert "caller_id is required" in resp.json()["detail"]
+        assert not target.exists(), "a 403'd create left a directory tree behind"
         ts.create_terminal.assert_not_called()
