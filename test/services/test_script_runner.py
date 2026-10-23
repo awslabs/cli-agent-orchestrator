@@ -2021,7 +2021,7 @@ async def test_insert_failure_refuses_when_enforcement_turns_on_after_capture(
     real_capture = script_runner.launch_guard.capture
     captured = []
 
-    def capture(profile_set=None):
+    def capture(profile_set=None, root_identity=None):
         guard = real_capture(profile_set=profile_set)
         captured.append(guard)
         return guard

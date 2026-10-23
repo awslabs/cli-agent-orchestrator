@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **A plan approval now names the working directory it was granted for, not just its path** (#827,
+  #1000). A path is not an identity. Move a non-Git working directory away, put a different directory
+  at the same path, and every value the plan identifier recorded was byte-identical, so the
+  replacement ran under the first directory's approval. A non-Git root now contributes its device and
+  inode (`st_dev`, `st_ino`) to the `plan_id` and to the per-run launch guard: the next run of a
+  replaced root is refused until re-approved, and a root swapped while a run is in flight stops that
+  run's next agent step with `plan_inputs_changed`. A Git root is deliberately unchanged, because its
+  identity is the commit plus the worktree digest, so two checkouts in the same state still share one
+  approval. Where the filesystem supplies no usable inode (some network mounts, container overlays,
+  Windows volumes with no file index), CAO falls back to the previous path-only identity rather than
+  refusing the run, and records the fallback instead of skipping it: the manifest carries
+  `repo_baseline.root_identity.bound: false` with a closed reason, the server logs that reason with no
+  path, and the unbound marker is part of the `plan_id`, so the weaker binding is visible in the
+  identifier an operator approves.
+
+- **Breaking / migration:** every plan whose working directory is outside Git gets a new identifier
+  and is refused once, until re-approved under it (#827). The `plan-v2` scheme is not bumped: the
+  field set is unchanged and the root identity is new content inside the existing repository-baseline
+  field. Plans in a Git working directory keep their existing identifiers. A run already admitted and
+  left resumable keeps launching its steps, because a `launch-guard-v2` record written before the
+  binding carries no root identity and is checked without it rather than refused.
+
 - **Inbox deliveries confirm the submit and recover a swallowed Enter** (#78). A delivery is
   paste, delay, Enter; when the TUI swallows the Enter the message sat unsubmitted while the
   terminal still read IDLE, so the sender waited forever and the next message was pasted on top

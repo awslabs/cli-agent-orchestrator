@@ -134,7 +134,7 @@ def test_the_plan_id_does_not_depend_on_the_working_directory(monkeypatch, tmp_p
     monkeypatch.setattr(
         manifest_freeze,
         "derive_baseline",
-        lambda _cwd: {"available": True, "commit": "c", "dirty": False},
+        lambda _cwd, **_kw: {"available": True, "commit": "c", "dirty": False},
     )
     a = _frozen(cwd=str(tmp_path))["plan_id"]
     b = _frozen(cwd="/some/other/path")["plan_id"]
@@ -155,7 +155,7 @@ def test_an_unavailable_worktree_snapshot_has_no_approvable_plan_id(monkeypatch)
     monkeypatch.setattr(
         manifest_freeze,
         "derive_baseline",
-        lambda _cwd: {
+        lambda _cwd, **_kw: {
             "available": False,
             "commit": "deadbeef",
             "worktree_state": {"status": "unavailable"},
@@ -177,7 +177,7 @@ def test_an_unavailable_snapshot_reaches_the_gate_without_a_plan_id(monkeypatch)
         "worktree_state": {"status": "unavailable"},
     }
     baselines = iter((available, unavailable))
-    monkeypatch.setattr(manifest_freeze, "derive_baseline", lambda _cwd: next(baselines))
+    monkeypatch.setattr(manifest_freeze, "derive_baseline", lambda _cwd, **_kw: next(baselines))
     monkeypatch.setattr(approval_gate, "is_workflow_approval_required", lambda: True)
 
     approved_manifest = manifest_freeze.build_manifest_json(source_hash="abc123", inputs={"k": "v"})
@@ -208,7 +208,7 @@ def test_an_available_baseline_is_part_of_the_identity_and_unavailable_baselines
     monkeypatch.setattr(
         manifest_freeze,
         "derive_baseline",
-        lambda _cwd: {
+        lambda _cwd, **_kw: {
             "available": True,
             "commit": "first",
             "worktree_state": {"status": "clean"},
@@ -218,7 +218,7 @@ def test_an_available_baseline_is_part_of_the_identity_and_unavailable_baselines
     monkeypatch.setattr(
         manifest_freeze,
         "derive_baseline",
-        lambda _cwd: {
+        lambda _cwd, **_kw: {
             "available": True,
             "commit": "second",
             "worktree_state": {"status": "clean"},
@@ -229,7 +229,7 @@ def test_an_available_baseline_is_part_of_the_identity_and_unavailable_baselines
     monkeypatch.setattr(
         manifest_freeze,
         "derive_baseline",
-        lambda _cwd: {
+        lambda _cwd, **_kw: {
             "available": False,
             "commit": "second",
             "worktree_state": {"status": "unavailable"},
@@ -257,7 +257,7 @@ def test_non_git_plan_ids_bind_root_and_git_golden_is_unchanged(tmp_path, monkey
     monkeypatch.setattr(
         manifest_freeze,
         "derive_baseline",
-        lambda root: {
+        lambda root, **_kw: {
             "available": True,
             "commit": "0123456789abcdef0123456789abcdef01234567",
             "worktree_state": {"status": "clean"},
@@ -448,7 +448,7 @@ def test_a_freeze_that_fails_before_the_profile_set_carries_no_snapshot(monkeypa
     monkeypatch.setattr(
         manifest_freeze,
         "derive_baseline",
-        lambda root: {"available": False, "reason": "git_timeout"},
+        lambda root, **_kw: {"available": False, "reason": "git_timeout"},
     )
     frozen = manifest_freeze.freeze_manifest(source_hash="h", inputs={})
     assert frozen.manifest_json is None
