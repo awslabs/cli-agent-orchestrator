@@ -324,6 +324,7 @@ class TerminalBackend(ABC):
         strip_escapes: bool = False,
         full_history: bool = False,
         visible_only: bool = False,
+        join_wrapped: bool = False,
     ) -> str:
         """Get terminal output/history from a window.
 
@@ -339,6 +340,12 @@ class TerminalBackend(ABC):
                 nothing from scrollback (overrides tail_lines/full_history). A
                 backend without a viewport concept may approximate with its
                 closest bounded recent read.
+            join_wrapped: If True, return lines the terminal soft-wrapped at its
+                width rejoined into the logical lines the program wrote, so a
+                one-line message is one line whatever the width. A backend that
+                has no wrap concept, or already returns logical lines, ignores
+                it. Callers must treat the result as best-effort: reassemble
+                nothing load-bearing from it (see codex._find_config_rejection).
 
         Returns:
             Terminal output as a string

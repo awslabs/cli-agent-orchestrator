@@ -510,6 +510,28 @@ class TestHerdrBackendCommands:
         assert cmd[cmd.index("--format") + 1] == "text"
 
     @patch("subprocess.run")
+    def test_get_history_accepts_join_wrapped_and_reads_the_same_way(self, mock_run, backend):
+        """Contract parity: herdr has no rejoin flag, so join_wrapped changes
+        nothing here rather than raising (a TypeError inside the codex startup
+        check would be swallowed and silently disable the diagnostic)."""
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(stdout="pane output here"),  # pane read
+        ]
+
+        result = backend.get_history("cao-test", "window-0", join_wrapped=True)
+
+        assert result == "pane output here"
+        cmd = mock_run.call_args_list[-1][0][0]
+        assert cmd[-5:] == ["read", "w1-1", "--source", "recent", "--lines", "500"][-5:]
+
+    @patch("subprocess.run")
     def test_get_history_default_omits_format(self, mock_run, backend):
         """strip_escapes=False leaves format unset (herdr default preserved)."""
         ws = [{"label": "cao-test", "workspace_id": "w1"}]

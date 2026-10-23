@@ -453,9 +453,34 @@ default.
 For a working directory outside any Git repository, the plan identifier records the directory's canonical path and nothing about its contents.
 
 A script-tier run freezes an **execution manifest** at run start — the workflow's source hash, its
-resolved inputs, and the repository/worktree baseline — and derives a **plan identifier** (`plan_id`,
-of the form `plan-v1:<digest>`) from the execution-affecting fields. Change any of them and the
-`plan_id` changes, which is the mechanism by which a changed plan needs its own approval.
+resolved inputs, the repository/worktree baseline, and a digest of the installed agent profile set —
+and derives a **plan identifier** (`plan_id`, of the form `plan-v2:<digest>`) from the
+execution-affecting fields. Change any of them and the `plan_id` changes, which is the mechanism by
+which a changed plan needs its own approval. What the manifest actually persists is the resulting
+opaque `plan_id`, not the profile-set digest itself — the digest is computed, folded into `plan_id`,
+and discarded; it is never written to the manifest as its own value.
+
+> **The agent profile set is part of plan identity, and the whole set is.** A step's behaviour and tool
+> policy come from whichever agent profile it names, resolved from a file outside the script at launch
+> time, so editing a profile changes how an approved plan executes. Script-tier steps are discovered by
+> executing the Python, so at approval time there is no list of which profiles a run will name — the
+> digest therefore covers **every installed profile**, not just the ones a script happens to use. The
+> practical consequence: `cao install <anything>`, or editing any profile in your agent store or any
+> file `cao install` wrote for a profile (the Kiro agent JSON, the Copilot or OpenCode agent file, the
+> shared OpenCode `opencode.json`, the installed context copy), invalidates every existing approval and
+> the next run of each plan is refused until re-approved. The packaged built-in profiles are in the set
+> too, so a CAO upgrade that changes a bundled profile also moves every `plan_id`.
+
+> **Migration: new runs move to `plan-v2`; approved `plan-v1` resumes still pass.** A `plan_id` computed after
+> upgrading always uses the new `plan-v2:` scheme, so the first NEW run of every plan is refused until
+> re-approved under its `plan-v2:` identifier — a `plan-v1` approval attested to a plan whose agent
+> profiles were never examined, so it cannot satisfy the new scheme. This does **not** reach a run that
+> was already frozen and approved before the upgrade and left resumable: resume reuses that run's
+> frozen `plan_id` verbatim rather than recomputing it, so an approved `plan-v1` resume still proceeds
+> on its original approval. Its per-run launch guard record carries no scheme marker, so each of its
+> agent launches is still checked under the rule it was admitted with (the profile text alone, without
+> the installed files); new runs record `launch-guard-v2` and are checked under the full rule.
+> Re-approve each plan once it is run fresh.
 
 ### It is on by default
 
@@ -518,8 +543,8 @@ The missing-approval and missing-identity refusal bodies carry the identifier as
 {
   "detail": {
     "kind": "approval_required",
-    "plan_id": "plan-v1:9f3c…",
-    "message": "Plan 'plan-v1:9f3c…' has not been approved. …"
+    "plan_id": "plan-v2:9f3c…",
+    "message": "Plan 'plan-v2:9f3c…' has not been approved. …"
   }
 }
 ```
@@ -552,7 +577,7 @@ been approved yet**. The loop is:
 
 ```bash
 cao workflow run my-script          # refused; the error carries the plan_id
-cao workflow approve plan-v1:<digest>
+cao workflow approve plan-v2:<digest>
 cao workflow run my-script          # starts
 ```
 
@@ -600,18 +625,21 @@ rather than what survived the redaction rules of the day.
 
 ### What an approval does not cover
 
-An approval binds three things: the script source, its resolved inputs, and the state of the run's
-working directory when the run is admitted. For a Git repository that state is the commit and the
-worktree changes, not the path, so two checkouts in the same state share one approval. For a directory
-outside any Git repository it is only the directory's canonical path.
+An approval binds four things: the script source, its resolved inputs, the state of the run's
+working directory when the run is admitted, and the installed agent profile set (every profile's
+source text plus the files `cao install` wrote for it, including the shared OpenCode `opencode.json`,
+which is bound whole because OpenCode reads the whole file, so an edit to your own key in it also moves
+every `plan_id`). For a Git repository the directory state is
+the commit and the worktree changes, not the path, so two checkouts in the same state share one
+approval. For a directory outside any Git repository it is only the directory's canonical path.
 
 Everything else is read when a step runs, so a new run of an approved plan can do something different
 from what was reviewed and still match the same `plan_id`:
 
-- **Agent profiles.** A step's system prompt, tools and model come from the profile it names, read
-  when the step launches. If that profile is edited after approval, the next run uses the edited
-  profile under the original `plan_id`. Within one run, CAO refuses further agent launches once a
-  profile changes (`plan_inputs_changed`); a new run is not refused. Tracked in #827.
+- **Agent profile edits within one run.** A profile edit after a run is admitted is caught at the
+  next agent launch in that run (`plan_inputs_changed`); the next NEW run gets a new `plan_id` and is
+  refused until re-approved. What a profile edit cannot change is a run that already launched its
+  steps.
 - **Memory content.** CAO memory is resolved at a run's first agent terminal and is not part of the
   `plan_id`. Memory added or edited after approval, including through the `memory_store` tool, reaches
   the next run's steps under the original `plan_id`. Only the memory-enabled setting is checked, and
@@ -619,6 +647,33 @@ from what was reviewed and still match the same `plan_id`:
 - **Files in a non-Git working directory.** The `plan_id` records the directory's path, not its
   contents. Files added, changed or removed there after approval are used by the next run under the
   original `plan_id`.
+- **Managed `.env` values a profile references.** A profile's `${VAR}` placeholders are resolved from
+  the CAO-managed `.env` file (`cao env set`) when the step launches. The placeholder text is bound; the
+  value is not, because that file is where credentials live and a digest of the substituted text would
+  carry a hash of each credential into an identifier that is logged and displayed. Changing a referenced
+  value with `cao env set` does not change the `plan_id`.
+- **MCP servers from installed agent plugins, for providers that receive them at launch.** Where
+  `cao install` materialises agent-plugin MCP servers into a file the provider reads (the Kiro agent
+  JSON, the shared OpenCode `opencode.json`), they ARE bound: an agent-plugin install or uninstall
+  rewrites those files for every installed profile, so it moves every `plan_id`. For the providers that
+  receive agent-plugin MCP servers at launch instead (`with_plugin_mcp`: Claude Code, Codex, Copilot,
+  Kimi, Cursor, Grok, OMP, Antigravity, MiniMax), nothing on disk changes for the profile, so adding or
+  removing an agent plugin does not change the `plan_id` there.
+- **Kiro launch inputs `cao install` does not write.** The files a Kiro agent's `resources` point at,
+  other than the installed context copy, and the global Kiro `mcp.json` when a profile opts in with
+  `useLegacyMcpJson` (`includeMcpJson`), are read by Kiro at launch and are not part of the `plan_id`.
+- **Installed skills.** The skill catalog under the CAO skills directory is injected into a launching
+  agent's context and is not part of the `plan_id`.
+- **A same-name profile shadowed in a lower-priority directory.** Only the profile that wins
+  resolution, plus the files `cao install` wrote for that name, is bound; a same-named file in a
+  directory that loses resolution is not.
+- **The reserved ephemeral namespace.** Ephemeral profiles are created by the run after admission and
+  are bound on their own path, so they are outside the installed-set digest by design.
+
+Each of these is a launch input the next run reads live. Binding any of them is a separate change from
+#827; the `.env` case needs a design that does not leak values, and the others need a product ruling on
+whether an operator's agent-plugin or skill change should invalidate every approval on every provider
+(today it does so only where `cao install` writes the servers to disk).
 - **Repository changes after admission.** The repository state is read once, when the run is
   admitted. Changes made after that, including while a submitted run waits for a free slot, are not
   detected.

@@ -1,4 +1,4 @@
-"""Three call-site lint rules built on ``test/_support/callsite_lint.py`` (#1005).
+"""Call-site lint rules built on ``test/_support/callsite_lint.py`` (#1005).
 
 Each rule closes one half of a defect class the repo has already paid for:
 
@@ -16,8 +16,13 @@ Each rule closes one half of a defect class the repo has already paid for:
 * **Rule 3 (staleness gate, #735)** -- a poll that accepts whatever frame is on
   screen can report "done" for a turn that had not started. The fix is a
   generation/sequence floor at every call site.
+* **Rule 4 (admission snapshot, #827 / PR #1000 P3-3)** -- ``launch_guard.capture``
+  records the profile set a run is admitted under. Called without the snapshot
+  the freeze already read, it re-reads the store AFTER the approval gate, so a
+  profile edited in that window is recorded as the approved state. Every
+  production call must pass ``profile_set=frozen.profile_set``.
 
-All three rules are **ratchets**. A new unexplained call site fails; so does a
+All four rules are **ratchets**. A new unexplained call site fails; so does a
 site beyond its row's reviewed occurrence count (a key collision does not
 grant unlimited headroom); so does an allowlist row that no longer matches
 anything, so the tables can only shrink. The failure message names
@@ -512,4 +517,95 @@ def test_every_poll_until_done_passes_a_generation_floor() -> None:
         allowlist=STALENESS_OPT_OUT,
         marked=cl.marked_sites(sites, STALENESS_MARKER, sources),
         remedy=STALENESS_REMEDY,
+    )
+
+
+# ===========================================================================
+# Rule 4: launch_guard.capture is built from the freeze's own profile-set read (#827, PR #1000 P3-3)
+# ===========================================================================
+
+ADMISSION_FUNC = "capture"
+ADMISSION_KWARG = "profile_set"
+
+#: The complete census of ``launch_guard.capture`` call sites. A new start path
+#: that admits a script run has to be reviewed for the same obligation, so a
+#: new caller fails here first.
+ADMISSION_CALL_SITES = {
+    ("cli_agent_orchestrator/services/script_runner.py", ADMISSION_FUNC): (
+        "blocking script-run start (Step 0b): guard built from frozen.profile_set"
+    ),
+    ("cli_agent_orchestrator/api/main.py", ADMISSION_FUNC): (
+        "async script-run submit (Step 4b): guard built from frozen.profile_set"
+    ),
+}
+
+#: Call sites allowed to let ``capture`` read the store itself. Empty on
+#: purpose: a production admission path never has a reason to.
+ADMISSION_OPT_OUT: dict = {}
+
+ADMISSION_REMEDY = (
+    "`launch_guard.capture` records the launch state a run is admitted under. "
+    "Without the snapshot `manifest_freeze.freeze_manifest` already read, it "
+    "re-reads the profile store AFTER the approval gate, so a profile edited in "
+    f"that window is recorded as the approved state (PR #1000 P3-3). Pass "
+    f"`{ADMISSION_KWARG}=frozen.{ADMISSION_KWARG}`."
+)
+
+
+def _capture_passed_as_a_value() -> list:
+    """``launch_guard.capture`` referenced anywhere except as the callee of a call.
+
+    Rules 4a and 4b see ``ast.Call`` nodes whose callee is ``capture``. The pre-fix shape was
+    ``asyncio.to_thread(launch_guard.capture)`` -- the function passed as a VALUE, so neither rule
+    sees it and both pass vacuously. This closes that door: the only legal reference is a direct call.
+    """
+    import ast
+
+    flagged = []
+    for module in cl.parse_sources():
+        callees = {id(node.func) for node in ast.walk(module.tree) if isinstance(node, ast.Call)}
+        for node in ast.walk(module.tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr == ADMISSION_FUNC
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "launch_guard"
+                and id(node) not in callees
+            ):
+                flagged.append(f"{module.relpath}:{node.lineno}")
+    return flagged
+
+
+def test_launch_guard_capture_is_only_ever_called_directly() -> None:
+    assert not _capture_passed_as_a_value(), (
+        "launch_guard.capture is passed as a value here, which hides its keyword arguments from "
+        "rules 4a/4b. Call it directly (inside a lambda for asyncio.to_thread): "
+        + ", ".join(_capture_passed_as_a_value())
+    )
+
+
+def test_launch_guard_capture_call_site_census_is_complete() -> None:
+    cl.check_against_allowlist(
+        rule="admission-snapshot-census",
+        sites=cl.call_sites(ADMISSION_FUNC),
+        allowlist=ADMISSION_CALL_SITES,
+        remedy=(
+            "You added a `capture` call site. If it is `launch_guard.capture`, it admits a "
+            "script run and must pass the freeze's snapshot; add a row to ADMISSION_CALL_SITES "
+            "in this file. " + ADMISSION_REMEDY
+        ),
+    )
+
+
+def test_every_launch_guard_capture_passes_the_freeze_snapshot() -> None:
+    declared = cl.declared_parameters(ADMISSION_FUNC)
+    assert ADMISSION_KWARG in declared, (
+        f"launch_guard.capture no longer declares {ADMISSION_KWARG}; the admission snapshot "
+        "contract (PR #1000 P3-3) has been removed, update or delete this rule deliberately"
+    )
+    cl.check_against_allowlist(
+        rule="admission-snapshot",
+        sites=cl.missing_kwarg_sites(ADMISSION_FUNC, ADMISSION_KWARG),
+        allowlist=ADMISSION_OPT_OUT,
+        remedy=ADMISSION_REMEDY,
     )

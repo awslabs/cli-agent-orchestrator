@@ -797,6 +797,39 @@ class TestGetHistory:
         # full_history uses "-S" "-" (no line count), strip_escapes omits "-e"
         mock_pane.cmd.assert_called_once_with("capture-pane", "-p", "-S", "-")
 
+    def test_get_history_join_wrapped_asks_tmux_to_rejoin_soft_wraps(self, tmux):
+        """-J: a one-line message a program printed comes back as ONE row at any
+        pane width, instead of split at the exact column (#967)."""
+        mock_pane = MagicMock()
+        mock_result = MagicMock()
+        mock_result.stdout = ["line"]
+        mock_pane.cmd.return_value = mock_result
+        mock_window = MagicMock()
+        mock_window.panes = [mock_pane]
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        tmux.get_history("ses", "win", tail_lines=50, join_wrapped=True)
+
+        mock_pane.cmd.assert_called_once_with("capture-pane", "-e", "-J", "-p", "-S", "-50")
+
+    def test_get_history_default_does_not_rejoin_soft_wraps(self, tmux):
+        """Every other caller parses the RENDERED rows; -J is opt-in."""
+        mock_pane = MagicMock()
+        mock_result = MagicMock()
+        mock_result.stdout = ["line"]
+        mock_pane.cmd.return_value = mock_result
+        mock_window = MagicMock()
+        mock_window.panes = [mock_pane]
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        tmux.get_history("ses", "win", tail_lines=50)
+
+        assert "-J" not in mock_pane.cmd.call_args.args
+
 
 # ── list_sessions ────────────────────────────────────────────────────
 
