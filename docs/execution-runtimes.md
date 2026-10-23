@@ -53,6 +53,81 @@ waits for an older one's, and one replaced while it is being handled drops no
 further record (the newer connection registers only once a drop in progress
 has landed), so the newer hello decides which records stay.
 
+## Running `cao-bridge`
+
+You need `cao-bridge` only where agents are to run apart from the server: in
+another pod, on another machine, or beside a server started with
+`CAO_LOCAL_EXECUTION=0`. Local mode needs none: a `cao-server` on its own runs
+agents in its own tmux, as before.
+
+`cao-bridge` is a console script installed with CAO, like `cao-server`. It
+serves nothing: it dials the server, runs the commands it is sent against the
+tmux beside it, and pushes each terminal's status back. Give it its own
+`CAO_HOME_DIR`, since the server's database is not the runtime's, and its own
+provider credentials and agent profiles, since launches resolve them there.
+
+| Environment variable | Side | Default | Purpose |
+|---|---|---|---|
+| `CAO_RUNTIME_TOKEN_FILE` | both | *(none)* | File holding the shared runtime token. Read first; when it is set, only the file counts. |
+| `CAO_RUNTIME_TOKEN` | both | *(none)* | The token itself, when no file is set. Both are removed from the process environment once read. |
+| `CAO_BRIDGE_SERVER_URL` | runtime | *(required)* | The server's channel, `ws://` or `wss://`, e.g. `ws://cao-server:9889/runtime/channel`. |
+| `CAO_BRIDGE_RUNTIME_ID` | runtime | *(required)* | This runtime's id: letters, digits, `.`, `_` and `-`, starting with a letter or digit, at most 128 characters. In the EKS example, the pod name. |
+| `CAO_BRIDGE_READY_FILE` | runtime | `$CAO_HOME_DIR/bridge-ready` | Exists only while the channel is up; a readiness probe can test for it. |
+| `CAO_HOME_DIR` | both | `~/.aws/cli-agent-orchestrator` | Each side's state; give the runtime its own. |
+| `CAO_LOCAL_EXECUTION` | server | on | `0` (or `false`, `no`, `off`) and the server starts no agents itself. |
+| `CAO_RUNTIME_LAUNCH_TIMEOUT` | server | `240` | Seconds a launch may take before it is reported as `504`. |
+| `CAO_NODE_MODE` | runtime | `server` | In the EKS image only: `bridge` makes its entrypoint start `cao-bridge` instead of `cao-server`. |
+
+To try it on one machine, start a server that runs no agents and a runtime
+beside it, each with its own state:
+
+```bash
+openssl rand -hex 32 > /tmp/cao-runtime-token
+
+CAO_HOME_DIR=/tmp/cao-server CAO_API_PORT=9889 CAO_LOCAL_EXECUTION=0 \
+  CAO_RUNTIME_TOKEN_FILE=/tmp/cao-runtime-token cao-server &
+
+CAO_HOME_DIR=/tmp/cao-runtime CAO_BRIDGE_RUNTIME_ID=laptop \
+  CAO_BRIDGE_SERVER_URL=ws://127.0.0.1:9889/runtime/channel \
+  CAO_RUNTIME_TOKEN_FILE=/tmp/cao-runtime-token cao-bridge &
+
+curl -s http://127.0.0.1:9889/runtimes      # lists "laptop"
+curl -s -X POST http://127.0.0.1:9889/runtimes/laptop/terminals \
+  -H 'Content-Type: application/json' \
+  -d '{"agent_profile": "developer", "provider": "claude_code"}'
+```
+
+The terminal's tmux session is the runtime's, and every operation on it goes
+through the server's API as in [Commands](#commands). Both processes here
+share your tmux server; nothing else is shared. The `mock_cli` provider needs
+its binary on the runtime's `PATH` (it is
+`test/providers/fixtures/bin/mock_cli` in this repository, and is installed
+in the EKS image).
+
+Once started, `cao-bridge`:
+
+- connects, sends its hello and reports Ready (the ready file) once the
+  server answers. It logs each connect, reconnect and refusal at INFO and
+  above to stderr, so `kubectl logs` shows them, and in full to its log file
+  under `$CAO_HOME_DIR/logs`.
+- reconnects after a lost channel, with backoff from 1 s doubling to 30 s,
+  reset once a connection has held for 10 s. While it is away it is not
+  Ready, and the server reads its terminals as `unknown`.
+- exits, rather than retrying, on a configuration it cannot use (a missing
+  setting, an invalid URL or runtime id), a refused token (HTTP 401 or 403),
+  a different protocol version, or a ready file it cannot remove.
+- at startup, forgets terminals whose tmux session is gone (lost with an
+  earlier container), so its first hello lists only what it runs.
+- runs at most 1024 terminals, the most a hello may list. A runtime that
+  runs more logs an error and keeps retrying without dialling, until some
+  are stopped.
+- rereads, every 3 s, the status of each terminal it last reported as
+  `processing`, and reports it once it has changed.
+
+Run it under an init that reaps child processes: agents leave finished
+processes behind, and `cao-bridge` does not reap them. The EKS example runs it
+under `tini`. See [Security](#security) for what the shared token allows.
+
 ## Commands
 
 The server sends one command per operation and waits for its result, which it
