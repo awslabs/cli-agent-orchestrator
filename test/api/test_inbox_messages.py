@@ -1,5 +1,6 @@
 """Tests for the new inbox messages GET endpoint."""
 
+import asyncio
 import json
 from datetime import datetime
 from unittest.mock import Mock, patch
@@ -333,3 +334,167 @@ class TestDatabaseFunctionCompatibility:
         # This should work without errors
         result = get_pending_messages("test_terminal", limit=5)
         assert isinstance(result, list)
+
+
+class TestCreateInboxMessageResponseTiming:
+    """PR #1004 review, P2-2: the POST must not wait out a submit confirmation.
+
+    The message is stored before the immediate delivery attempt starts, so the
+    response is already truthful once the paste has reached the pane. Holding
+    the response for the confirmation (up to a full confirmation cycle, longer
+    when the receiver's lock is already held) pushes the sender past its own
+    30s HTTP timeout and tempts it to send the message again.
+
+    No stopwatch anywhere (CI round 2, the #1020 lesson): the fake delivery
+    blocks on an Event only the test sets, so "the response arrived while that
+    Event is still unset" proves the handler did not wait for the delivery to
+    finish, however slow the runner. The endpoint coroutine is called directly
+    rather than through ``TestClient``: its per-request portal closes the event
+    loop when the handler returns, and that shutdown waits for the default
+    executor's threads, so through the client a response can never be observed
+    while the delivery thread is still running. The server's loop lives for the
+    whole process.
+    """
+
+    @staticmethod
+    def _stored_message():
+        return InboxMessage(
+            id=7,
+            sender_id="sender01",
+            receiver_id="abcdef12",
+            message="hello",
+            status=MessageStatus.PENDING,
+            created_at=datetime(2025, 12, 6, 12, 0, 0),
+        )
+
+    @staticmethod
+    def _request():
+        from starlette.requests import Request
+
+        from cli_agent_orchestrator.plugins import PluginRegistry
+
+        app.state.plugin_registry = PluginRegistry()
+        return Request({"type": "http", "method": "POST", "path": "/", "headers": [], "app": app})
+
+    @staticmethod
+    async def _drain_background_tasks():
+        """Await every task the endpoint left running (its delivery task)."""
+        others = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        await asyncio.gather(*others, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_responds_after_the_paste_while_confirmation_is_still_running(self):
+        import threading
+
+        from cli_agent_orchestrator.api.main import create_inbox_message_endpoint
+
+        release = threading.Event()  # held by the test: the confirmation never ends on its own
+        finished = threading.Event()
+
+        def deliver(receiver_id, registry=None, after_dispatch=None):
+            try:
+                after_dispatch()  # the paste reached the pane
+                # Deadlock guard only: the test sets release; a timeout here means
+                # a mutant made the endpoint wait for the whole delivery, and the
+                # finished/not-finished assertion below reports it.
+                release.wait(10)  # ...and the confirmation wait begins
+            finally:
+                finished.set()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.create_inbox_message",
+                return_value=self._stored_message(),
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.inbox_service.deliver_pending",
+                side_effect=deliver,
+            ),
+        ):
+            try:
+                body = await create_inbox_message_endpoint(
+                    self._request(), "abcdef12", "sender01", "hello", _scopes=[]
+                )
+                # The response is here and the delivery provably has not
+                # finished: it is blocked on an Event nobody has set.
+                assert body["message_id"] == 7
+                assert not release.is_set()
+                assert not finished.is_set()
+            finally:
+                release.set()
+            await self._drain_background_tasks()
+        assert finished.is_set()
+
+    @pytest.mark.asyncio
+    async def test_responds_within_the_budget_when_the_paste_itself_is_delayed(self):
+        """The receiver's lock is held by another delivery: answer anyway, the
+        attempt keeps running in the background and still completes."""
+        import threading
+
+        from cli_agent_orchestrator.api.main import create_inbox_message_endpoint
+
+        release = threading.Event()  # the other delivery's lock, held by the test
+        pasted = threading.Event()
+
+        def deliver(receiver_id, registry=None, after_dispatch=None):
+            release.wait(10)  # blocked on the per-terminal lock, no paste yet (guard, see above)
+            after_dispatch()
+            pasted.set()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.create_inbox_message",
+                return_value=self._stored_message(),
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.inbox_service.deliver_pending",
+                side_effect=deliver,
+            ),
+            # Any budget works: the delivery is blocked on an Event only the
+            # test sets, so the response can only come from the budget expiring.
+            patch("cli_agent_orchestrator.api.main.INBOX_IMMEDIATE_DELIVERY_WAIT", 0.05),
+        ):
+            try:
+                body = await create_inbox_message_endpoint(
+                    self._request(), "abcdef12", "sender01", "hello", _scopes=[]
+                )
+                assert body["success"] is True
+                assert not pasted.is_set(), "the attempt was still running when we answered"
+                assert not release.is_set()
+            finally:
+                release.set()
+            # Answering early did not abandon the attempt.
+            await self._drain_background_tasks()
+        assert pasted.is_set()
+
+    @pytest.mark.asyncio
+    async def test_delivery_failure_in_the_background_is_logged_not_raised(self):
+        from cli_agent_orchestrator.api.main import create_inbox_message_endpoint
+
+        def deliver(receiver_id, registry=None, after_dispatch=None):
+            raise RuntimeError("pane gone")
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.create_inbox_message",
+                return_value=self._stored_message(),
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.inbox_service.deliver_pending",
+                side_effect=deliver,
+            ),
+            patch("cli_agent_orchestrator.api.main.logger") as mock_logger,
+        ):
+            body = await create_inbox_message_endpoint(
+                self._request(), "abcdef12", "sender01", "hello", _scopes=[]
+            )
+            assert body["success"] is True
+            # The done callback runs when the delivery task completes; awaiting
+            # that task is the barrier (its callback was registered first, so it
+            # has run by the time gather returns).
+            await self._drain_background_tasks()
+
+        assert any(
+            "Immediate delivery attempt failed" in str(c)
+            for c in mock_logger.warning.call_args_list
+        )
