@@ -861,8 +861,14 @@ export const api = {
     fetchJSON<{ working_directory: string | null }>(`/terminals/${id}/working-directory`),
   // Synchronous create: no `defer_init`, so the server holds the response until
   // provider.initialize() returns. Budget from createBudgetMs() (#710, #1002).
+  // The operator form of the in-session create. `POST /sessions/{name}/terminals`
+  // is the agents' route and requires caller_id (403 without it); the UI has no
+  // delegating terminal, so it uses the distinct `:operator` sub-path, which the
+  // server records like a `POST /sessions` launch. test/api/test_web_client_contract.py
+  // posts this exact shape at the real route, so a server-side tightening that
+  // breaks this button fails CI instead of the browser.
   addTerminalToSession: async (sessionName: string, provider: string, agentProfile: string, workingDirectory?: string) =>
-    fetchJSON<Terminal>(`/sessions/${sessionName}/terminals?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: await createBudgetMs() }),
+    fetchJSON<Terminal>(`/sessions/${sessionName}/terminals:operator?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: await createBudgetMs() }),
 
   // Inbox
   getInboxMessages: (terminalId: string, limit?: number, status?: string) =>

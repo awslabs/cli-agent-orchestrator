@@ -1849,3 +1849,52 @@ def test_launch_init_allowance_follows_the_profile_init_timeout():
         # An unloadable profile sizes the wait from the server default rather
         # than failing the launch; the server resolves the real profile itself.
         assert _init_allowance("missing", {"provider_init_timeout": 60}) == 10 + 2 * 180 + 60
+
+
+def test_launch_prints_a_refused_memory_sidecar():
+    """``--memory`` asks for a memory_manager sidecar that the server bounds by the
+    primary's recorded ceiling. When the server refuses it, the refusal rides on
+    the response as ``memory_manager`` and the CLI must say so: before this, the
+    launch reported success and the sidecar silently never existed."""
+    runner = CliRunner()
+    detail = (
+        "Delegation refused: terminal 0000a1b2 (profile 'workflow_scout') may not launch "
+        "'memory_manager' with tools it cannot delegate: fs_list."
+    )
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.sync_backend_from_server"),
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "0000a1b2",
+            "name": "test-terminal",
+            "memory_manager": {"state": "refused", "detail": detail},
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        result = runner.invoke(
+            launch, ["--agents", "workflow_scout", "--headless", "--yolo", "--memory"]
+        )
+    assert result.exit_code == 0, result.output
+    assert mock_post.call_args.kwargs["params"]["memory_manager"] == "true"
+    assert "memory_manager sidecar was NOT launched" in result.output
+    assert "fs_list" in result.output
+    assert "cao launch --memory" in result.output
+
+
+def test_launch_is_quiet_about_a_scheduled_memory_sidecar():
+    runner = CliRunner()
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.api_http.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.sync_backend_from_server"),
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "0000a1b2",
+            "name": "test-terminal",
+            "memory_manager": {"state": "scheduled", "detail": None},
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        result = runner.invoke(launch, ["--agents", "reviewer", "--headless", "--yolo", "--memory"])
+    assert result.exit_code == 0, result.output
+    assert "NOT launched" not in result.output

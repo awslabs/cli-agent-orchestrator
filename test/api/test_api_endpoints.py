@@ -370,6 +370,7 @@ class TestCreateSession:
             resume_session_id=None,
             group=None,
             metadata=None,
+            caller_ceiling=None,
         )
 
     def test_create_session_forwards_use_worktree_true(self, client):
@@ -951,7 +952,11 @@ class TestCreateSession:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             response = client.post(
                 f"/sessions/{bad_name}/terminals",
-                params={"provider": "kiro_cli", "agent_profile": "developer"},
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                },
             )
 
         assert response.status_code == 400
@@ -1166,6 +1171,7 @@ class TestCreateTerminalInSession:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "claude_code",
                     "agent_profile": "reviewer",
                 },
@@ -1189,6 +1195,7 @@ class TestCreateTerminalInSession:
             response = client.post(
                 "/sessions/nonexistent/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "developer",
                 },
@@ -1205,6 +1212,7 @@ class TestCreateTerminalInSession:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "developer",
                 },
@@ -1233,6 +1241,7 @@ class TestCreateTerminalInSession:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "developer",
                     "idempotency_key": "job-1",
@@ -1258,7 +1267,11 @@ class TestCreateTerminalInSession:
 
             response = client.post(
                 "/sessions/test-session/terminals",
-                params={"provider": "kiro_cli", "agent_profile": "developer"},
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                },
             )
 
         assert response.status_code == 404
@@ -1282,6 +1295,7 @@ class TestCreateTerminalInSession:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "developer",
                     "idempotency_key": "job-1",

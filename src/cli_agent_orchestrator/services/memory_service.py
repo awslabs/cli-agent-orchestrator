@@ -39,7 +39,6 @@ from cli_agent_orchestrator.services.memory_format import (
     normalize_memory_tags,
     parse_index_entry,
 )
-from cli_agent_orchestrator.services.secret_gate import redact_secrets
 from cli_agent_orchestrator.services.vault.binding import VaultBinding
 from cli_agent_orchestrator.services.vault.reader import (
     MEMORY_MANAGER_PROFILE,
@@ -129,14 +128,6 @@ async def _offload_vault_projection(
         # Content-free by design: never log the memory key, body, or arguments.
         logger.warning("vault_projection_offload_cancelled vault=%s", vault.id)
         raise
-
-
-def _redact_injected_vault_content(memory: Memory) -> tuple[str, tuple[str, ...]]:
-    """Redact vault credentials only at the automatic provider-bound boundary."""
-    if getattr(memory, "source_kind", "native") != "vault":
-        return memory.content, ()
-    content, fired = redact_secrets(memory.content)
-    return content, tuple(fired)
 
 
 class MemoryDisabledError(RuntimeError):
@@ -4651,8 +4642,13 @@ class MemoryService:
             scope_used_chars = 0
             for position, mem in enumerate(scope_memories):
                 tag = " [related]" if getattr(mem, "is_related", False) else ""
-                rendered_content, redacted_patterns = _redact_injected_vault_content(mem)
-                line = f"- [{mem.scope}] {mem.key}{tag}: {rendered_content}"
+                # Vault content is already redacted: ``load_candidate`` is the
+                # single chokepoint (#644), and ``redacted_patterns`` is its
+                # content-free receipt. There is deliberately no second
+                # redaction here, so a bypass of the chokepoint fails the
+                # structural guard instead of being masked.
+                redacted_patterns = tuple(getattr(mem, "redacted_patterns", ()) or ())
+                line = f"- [{mem.scope}] {mem.key}{tag}: {mem.content}"
                 line_len = len(line) + 1
                 if scope_used_chars + line_len > scope_char_cap:
                     if getattr(mem, "is_related", False):

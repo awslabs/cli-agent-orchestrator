@@ -57,7 +57,8 @@ const API_TS = join(REPO_ROOT, 'web', 'src', 'api.ts')
  * A "create" is a POST the server answers only AFTER `provider.initialize()`
  * returns, so its client deadline is a function of `provider_init_timeout` and
  * of nothing else. The route shapes below are the same two the Python lint
- * matches (`POST /sessions`, `POST /sessions/{}/terminals`) plus the flow run,
+ * matches (`POST /sessions`, `POST /sessions/{}/terminals`, and since #948 the UI's
+ * `POST /sessions/{}/terminals:operator` form) plus the flow run,
  * which launches a session synchronously behind one POST.
  *
  * Registering a name here is a claim that it is a create. The reverse check —
@@ -68,7 +69,7 @@ const API_TS = join(REPO_ROOT, 'web', 'src', 'api.ts')
 const CREATE_CALL_SITES = ['createSession', 'addTerminalToSession', 'runFlow'] as const
 
 /** Route shapes (interpolations reduced to `{}`, query string dropped) that initialize synchronously. */
-const CREATE_ROUTE_SHAPES = [/\/sessions$/, /\/sessions\/\{\}\/terminals$/, /\/flows\/\{\}\/run$/]
+const CREATE_ROUTE_SHAPES = [/\/sessions$/, /\/sessions\/\{\}\/terminals(?::operator)?$/, /\/flows\/\{\}\/run$/]
 
 // ── api.ts source parsing ────────────────────────────────────────────────────
 

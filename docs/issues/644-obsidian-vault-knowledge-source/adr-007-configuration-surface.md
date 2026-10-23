@@ -1,7 +1,7 @@
 # ADR-007: Configuration surface for the vault source
 
 **Issue:** [#644](https://github.com/awslabs/cli-agent-orchestrator/issues/644)
-**Status:** Proposed. **Revision 3** — `secret_gate` governs index-time behaviour as well as writes (rulings R5 and R14). Revision 2 changed the path-validation rules and the binding's scope_id handling.
+**Status:** Proposed. **Revision 3, amended 2026-10-21** (#644 AC10: rule 16 redact-and-inject with per-finding acceptances; rule 20 retired) — `secret_gate` governs index-time behaviour as well as writes (rulings R5 and R14). Revision 2 changed the path-validation rules and the binding's scope_id handling.
 **Decision owner:** the issue's Proposed Solution "configure one vault root, folder-to-scope mappings, exclusions, and a managed write folder"
 **Related:** [design.md](design.md), [adr-002-vault-cardinality.md](adr-002-vault-cardinality.md), [adr-003-read-and-write-surface.md](adr-003-read-and-write-surface.md), [adr-005-index-vs-injection-policies.md](adr-005-index-vs-injection-policies.md)
 
@@ -173,7 +173,8 @@ Every rule raises with a message naming the offending key. None sanitizes and co
     per-mapping shape matches the granularity at which the operator already chose the scope.
     **The finding is reported in both modes.** The mode governs indexing, never disclosure.
     `reject` is the shipped default so that the safe posture is what you get without reading
-    the documentation, and `warn` exists because one of the six patterns is
+    the documentation, and `warn` exists because one of the twelve patterns (six when this
+    was written) is
     `(?i)(?:password|passwd|secret|pwd)\s*[:=]\s*\S{6,}` and notes **about** credential
     handling are ordinary content in a knowledge vault.
     **On the one pairing that deserves special handling: `secret_gate: "warn"` together with
@@ -183,6 +184,17 @@ Every rule raises with a message naming the offending key. None sanitizes and co
     permitted because it is *coherent*, unlike rule 15's `inject: true` with `index: false`
     which is a contradiction and a hard error; and it is never silent, because the warning
     fires at load and `status` names it for as long as it holds. Full reasoning in rule 20.
+    **Amended 2026-10-21 (#644 AC10):** `warn` now means redact-and-inject. The note is
+    indexed and recallable, but every match is replaced by `[REDACTED:<pattern_name>]` at the
+    read chokepoint (`reader.py::load_candidate`) before text reaches any agent, by injection
+    or by recall. Raw bytes pass only through a per-finding acceptance in the note's own
+    frontmatter, `cao.secret_ok: [{pattern: <name>, sha256: <hex of the matched span>}]`;
+    a boolean or pattern-only entry is an invalid `cao` block. `cao.secret_ok` is validated
+    by the parser (list of at most 64 objects, exactly those two members, a known pattern
+    name, 64 lowercase hex) and is retained across managed rewrites like `cao.links`.
+    Acceptances are reported as `secret_accepted` findings and in `status`; inert ones as
+    `secret_acceptance_unmatched`. `reject` is unchanged, and acceptances are not honoured
+    under it. The previous paragraph's warning is retired; see rule 20.
 17. `allow_hardlinks` is a bool, default `false`.
 18. `max_note_bytes`, `max_notes`, `max_frontmatter_bytes` and `max_recall_body_chars`
     are positive integers with documented defaults and finite shipped ceilings:
@@ -209,6 +221,14 @@ Every rule raises with a message naming the offending key. None sanitizes and co
     emitted as **one combined line naming the mapping**, not two lines an operator has to
     correlate. The whole value of the warning is that the pairing is visible as a single
     fact.
+    **Retired 2026-10-21 (#644 AC10).** The warning fired because `warn` forwarded raw matches
+    to a model; it no longer does. Every model-bound read is redacted at the chokepoint, so the
+    pairing has no exposure of its own, and a standing warning for a safe configuration is the
+    click-through shape (70% of Chrome SSL warnings were clicked through; what helped was
+    opinionated design, not text). There is no load warning and no status line for
+    `warn` + `inject`. What *is* reported is the thing that now carries the exposure: each
+    per-finding acceptance, as a `secret_accepted` finding and in `status.secret_acceptances`.
+    `VaultConfig.warnings` remains as the channel for future config observations.
 
 ### Scope-id stability guidance (F13)
 

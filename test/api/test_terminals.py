@@ -154,6 +154,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "working_directory": str(tmp_path),
@@ -187,6 +188,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "caller_id": "dcba8765",
@@ -221,6 +223,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "claude_code",
                     "agent_profile": "analyst",
                     "model": "fable-5",
@@ -251,7 +254,11 @@ class TestTerminalCreationWithWorkingDirectory:
 
             response = client.post(
                 "/sessions/test-session/terminals",
-                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                },
             )
 
             assert response.status_code == 201
@@ -274,6 +281,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "model": "fable-5\nrm -rf /",
@@ -307,6 +315,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "engine": "kas",
@@ -349,7 +358,12 @@ class TestTerminalCreationWithWorkingDirectory:
             ),
         ):
             response = client.post(
-                endpoint, params={"provider": "kiro_cli", "agent_profile": "analyst"}
+                endpoint,
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                },
             )
 
         assert response.status_code == 400, response.text
@@ -368,7 +382,11 @@ class TestTerminalCreationWithWorkingDirectory:
         ):
             response = client.post(
                 "/sessions/missing/terminals",
-                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                },
             )
 
         assert response.status_code == 404
@@ -387,6 +405,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "caller_id": "not-a-terminal-id!",
@@ -418,6 +437,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "working_directory": "/session/path",
@@ -451,6 +471,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "use_worktree": "true",
@@ -481,7 +502,11 @@ class TestTerminalCreationWithWorkingDirectory:
 
             response = client.post(
                 "/sessions/test-session/terminals",
-                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                },
             )
 
             assert response.status_code == 201
@@ -507,6 +532,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "use_worktree": "true",
@@ -538,6 +564,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "idempotency_key": "retry-1",
@@ -562,7 +589,11 @@ class TestTerminalCreationWithWorkingDirectory:
 
             response = client.post(
                 "/sessions/test-session/terminals",
-                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                },
                 json={"initial_message": "do work"},
             )
 
@@ -1411,6 +1442,7 @@ class TestCrossProviderResolution:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "agent_profile": "developer",
                 },
             )
@@ -1443,6 +1475,7 @@ class TestCrossProviderResolution:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "reviewer",
                 },
@@ -1494,6 +1527,7 @@ class TestCrossProviderResolution:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "agent_profile": "developer",
                 },
             )

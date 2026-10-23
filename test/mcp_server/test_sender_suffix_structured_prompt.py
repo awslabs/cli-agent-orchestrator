@@ -273,6 +273,11 @@ class TestAssignRemoteWorker:
     """``_assign_impl`` with ``target_host``: the provider lives in the remote
     node's profile store (``_resolve_remote_provider``)."""
 
+    # Remote placement proves the target enforces delegation ceilings before it
+    # posts. These tests are about the message text, not the probe, so the
+    # shared fixture answers it (and blocks the network).
+    pytestmark = pytest.mark.usefixtures("remote_ceiling_ready")
+
     _ENV = {
         "CAO_TERMINAL_ID": "a1b2c3d4",
         "CAO_ADVERTISED_URL": "http://cao-supervisor:9889",
