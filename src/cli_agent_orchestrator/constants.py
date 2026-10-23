@@ -69,6 +69,40 @@ DEFAULT_PROVIDER = ProviderType.KIRO_CLI.value
 # Higher values provide more context but increase memory usage
 TMUX_HISTORY_LINES = 200
 
+# Scrollback floor CAO raises the operator's shared tmux server's global
+# ``history-limit`` to before it creates a pane.
+#
+# CAO does not run its own tmux server -- it shares the operator's default one
+# (see ``TmuxClient.__init__``) -- so this is a FLOOR: a global already at or
+# above it is left alone; a lower one (tmux's 2000 default, or an operator's own
+# lower setting) is raised (see ``TmuxClient._set_server_history_limit``). The
+# option is global, so the operator's own new windows on that server get it
+# too. ``CAO_TMUX_HISTORY_LIMIT`` overrides the value; 0 disables the raise
+# (``docs/tmux.md`` documents the memory cost).
+#
+# tmux's default is 2000 lines, which is SHALLOWER than the deepest rung of
+# ``get_output``'s extraction escalation (5000 lines, see
+# ``terminal_service._ESCALATION_STEPS``). On a default server the top rungs are
+# dead weight -- ``capture-pane -S -5000`` and ``-S -`` both return the same
+# ~2000 lines -- and a long worker reply plus the redraw burst a TUI emits at the
+# end of a turn can push the response marker out of scrollback entirely. The
+# supervisor then receives a truncated reply, or none (#728).
+#
+# 50000 matches the repo's own recommended ``.tmux.conf`` and leaves the whole
+# ladder, including the overflow threshold, reachable. ``TmuxBackend`` reports
+# it as the read ceiling ``get_output`` clips its ladder to. Cost is bounded:
+# tmux allocates scrollback lazily, per pane, as output arrives.
+TMUX_HISTORY_LIMIT = _env_int("CAO_TMUX_HISTORY_LIMIT", 50000)
+
+# The most lines herdr returns from one ``pane read``, whatever ``--lines`` asks
+# for: herdr clamps the request server-side (``lines.min(1000)``, herdr v0.9.5
+# ``src/app/api_helpers.rs:117``; the flagless default is 80 at ``:118``).
+# ``HerdrBackend.max_history_lines`` reports this so ``get_output`` clips its
+# escalation ladder and overflow threshold to a depth the backend can actually
+# serve; a rung above it returns the same 1000 lines as the rung below (#728).
+# Not operator-tunable: it is herdr's number, not CAO's.
+HERDR_PANE_READ_MAX_LINES = 1000
+
 # Foreground commands to treat as bracketed-paste INCOMPATIBLE.
 # (\x1b[200~...\x1b[201~). send_keys(force_bracketed_paste=True) checks the
 # pane's live #{pane_current_command} against this set before wrapping, so a
@@ -306,6 +340,54 @@ INBOX_RECONCILE_INTERVAL = 30  # seconds between reconciliation sweeps
 # messages — it only adopts ones those paths have already had their chance at
 # and missed.
 INBOX_RECONCILE_GRACE_SECONDS = 30
+
+# Inbox submit confirmation (issue #78). send_input delivers a message as
+# paste-buffer -> fixed submit delay -> Enter. That delay only GUESSES when the
+# receiving TUI is input-ready; when it guesses wrong the TUI swallows the Enter
+# and the message sits unsubmitted in the composer. Nothing raises, the receiver
+# stays IDLE, and the inbox has already marked the message DELIVERED — so no
+# path ever retries and the sender waits on a reply that cannot come. Worse, the
+# receiver still READS ready, so the next message is pasted on top of the first
+# ({MSG1}{MSG2} in the issue). Confirm the receiver actually began processing
+# THIS delivery, and re-submit if it did not.
+#
+# The confirmation runs synchronously inside the delivery, holding that
+# terminal's delivery lock. The lock DELAYS a second paste to the same terminal
+# until the first is confirmed or given up on; it does not prevent the pile-up
+# by itself -- only a successful recovery does (see the inbox docstring for which
+# providers can recover). Cost: one or two status reads on a healthy delivery;
+# on a dropped one, up to INBOX_SUBMIT_CONFIRM_TIMEOUT for the first wait plus
+# the same again per recovery attempt that is actually sent (so at most
+# INBOX_SUBMIT_CONFIRM_TIMEOUT * (1 + INBOX_SUBMIT_MAX_RESUBMITS)), all of it
+# inside that one terminal's lock. Each terminal's delivery runs on its own
+# worker thread, so the wait never holds up delivery to other terminals.
+INBOX_SUBMIT_CONFIRMATION = (
+    os.environ.get("CAO_INBOX_SUBMIT_CONFIRMATION", "true").lower() == "true"
+)
+
+# Per-attempt wait for evidence that the receiver began processing this delivery.
+INBOX_SUBMIT_CONFIRM_TIMEOUT = 8.0
+
+# Re-submit attempts after the first unconfirmed wait. Kept lower than the
+# deferred-init path's 3: inbox messages are not a session's only work, and the
+# reconcile sweep is not a second chance here (the message is already DELIVERED).
+INBOX_SUBMIT_MAX_RESUBMITS = 2
+
+# How long POST /terminals/{id}/inbox/messages waits for its immediate delivery
+# attempt to reach the pane before answering. The message is already stored
+# when the wait starts and the attempt keeps running in the background, so
+# this bounds API latency only -- it never decides whether a message is
+# delivered. It has to stay well inside the sender's HTTP timeout (30s default,
+# settings_service.py): a POST that lands while the receiver's lock is held by
+# an unconfirmed delivery could otherwise wait out that whole confirmation,
+# time out at the sender, and tempt it to send the message a second time.
+INBOX_IMMEDIATE_DELIVERY_WAIT = 5.0
+
+# Worker threads the OpenCode poller and the reconcile sweep fan out over.
+# Each receiver's delivery can hold its thread for a full confirmation cycle,
+# so the sweeps run receivers in parallel instead of one after another; the
+# cap bounds the thread count under a backlog.
+INBOX_SWEEP_FANOUT = 8
 
 # =============================================================================
 # Cleanup Service Configuration

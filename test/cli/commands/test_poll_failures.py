@@ -11,8 +11,10 @@ for `worker send`, which reads status through `FleetClient`. Each one scripts
 what the status route answers on each request and asserts on the command's exit
 code and output.
 
-The last test walks the source for loops that read a terminal's status, so a
-new wait loop cannot skip the shared failure policy without failing here.
+The last test walks the source for loops that re-read a terminal's status, so
+a new wait loop cannot skip the shared failure policy without failing here. A
+loop that reads a DIFFERENT row on each pass (one GET per candidate node or per
+terminal) is a fan-out, not a wait, and is not a poll loop (#1028 vs #1037).
 """
 
 import ast
@@ -182,9 +184,10 @@ def test_every_poll_failing_times_out_naming_the_last_error(sender):
 
 # -- every loop that waits on a terminal's status uses the shared policy -------
 
-# The loops allowed to read a terminal's status, and why, keyed by module and
-# function. A new wait loop must either call one of the first two or be added
-# here with its reason.
+# The loops allowed to re-read a terminal's status, and why, keyed by module
+# and function. A new wait loop must either call one of the first two or be
+# added here with its reason. A loop whose status address names its own
+# iteration variable reads each row once and is not listed: it never waits.
 _STATUS_LOOPS = {
     ("utils/terminal.py", "poll_until_done"): "classifies failures with _is_transient_poll_error",
     ("utils/terminal.py", "wait_for_initial_delivery"): (
@@ -213,10 +216,37 @@ def _assignments(function):
     return assigned
 
 
-def _reads_terminal_status(call: ast.Call, assigned) -> bool:
+def _names_in(source: str) -> set:
+    """Names an expression's source refers to; empty when it is not an expression."""
+    try:
+        expression = ast.parse(source, mode="eval")
+    except SyntaxError:
+        return set()
+    return {node.id for node in ast.walk(expression) if isinstance(node, ast.Name)}
+
+
+def _loop_targets(loop) -> set:
+    """Names a ``for`` loop rebinds on every pass; a ``while`` loop rebinds none."""
+    if not isinstance(loop, ast.For):
+        return set()
+    return {node.id for node in ast.walk(loop.target) if isinstance(node, ast.Name)}
+
+
+def _reads_terminal_status(call: ast.Call, assigned, per_pass=frozenset()) -> bool:
+    """Whether ``call`` reads the SAME terminal's status on every pass of a loop.
+
+    ``per_pass`` holds the names the enclosing loop rebinds each pass. A status
+    address that names one of them (``f"{base}/terminals/{t}"`` under
+    ``for base in bases``, or ``client.terminal_status("w", t)`` under
+    ``for t in ids``) reads a different row each time: that is a fan-out that
+    reads each row once, not a loop waiting on one terminal.
+    """
     func = ast.unparse(call.func).split(".")[-1]
     if func in {"terminal_status", "read_status"}:
-        return True
+        address = [ast.unparse(arg) for arg in call.args] + [
+            ast.unparse(kw.value) for kw in call.keywords
+        ]
+        return not any(_names_in(source) & per_pass for source in address)
     if func != "get":
         return False
     url = (
@@ -231,7 +261,9 @@ def _reads_terminal_status(call: ast.Call, assigned) -> bool:
     else:
         sources = [ast.unparse(url)]
     return any(
-        "/terminals/" in source and not source.rstrip("'\"").endswith("/output")
+        "/terminals/" in source
+        and not source.rstrip("'\"").endswith("/output")
+        and not (_names_in(source) & per_pass)
         for source in sources
     )
 
@@ -252,17 +284,35 @@ def _calls_outside_lambdas(node):
 
 
 def _status_wait_loops(tree):
-    """Names of the functions in ``tree`` with a loop that reads a terminal's status."""
+    """Functions in ``tree`` with a loop that re-reads one terminal's status.
+
+    Each loop is judged on its own: a ``while`` nested in ``for base in bases``
+    still polls, because the ``while`` rebinds nothing between its passes.
+    """
     for function in ast.walk(tree):
         if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         assigned = _assignments(function)
         for loop in ast.walk(function):
-            if isinstance(loop, (ast.While, ast.For)) and any(
-                _reads_terminal_status(call, assigned) for call in _calls_outside_lambdas(loop)
+            if not isinstance(loop, (ast.While, ast.For)):
+                continue
+            per_pass = _loop_targets(loop)
+            if any(
+                _reads_terminal_status(call, assigned, per_pass)
+                for call in _calls_outside_lambdas(loop)
             ):
                 yield function
                 break
+
+
+def _census(package: pathlib.Path):
+    """``(module, function)`` -> node for every status wait loop under ``cli/`` and ``utils/``."""
+    found = {}
+    for path in sorted((package / "cli").rglob("*.py")) + sorted((package / "utils").rglob("*.py")):
+        module = path.relative_to(package).as_posix()
+        for function in _status_wait_loops(ast.parse(path.read_text(encoding="utf-8"))):
+            found[(module, function.name)] = function
+    return found
 
 
 _GUARD_CASES = {
@@ -287,6 +337,44 @@ _GUARD_CASES = {
             for _ in range(3):
                 c.terminal_status("w", t)
     """,
+    "retry-counter-not-in-the-url": """
+        def f(t):
+            for attempt in range(3):
+                api_http.get(f"{BASE}/terminals/{t}")
+    """,
+    "poll-nested-in-a-node-fan-out": """
+        def f(bases, t):
+            for base in bases:
+                while True:
+                    requests.get(f"{base}/terminals/{t}")
+    """,
+}
+
+# One read per row: each pass of the loop addresses a different node or
+# terminal, so nothing is waited on. `_receiver_provider` (#1028) is the first
+# of these shapes; it tries this node then the callback node, once each.
+_FAN_OUT_CASES = {
+    "one-get-per-node": """
+        def f(bases, t):
+            for base in bases:
+                requests.get(f"{base}/terminals/{t}")
+    """,
+    "one-get-per-node-url-in-a-variable": """
+        def f(bases, t):
+            for base in bases:
+                url = f"{base}/terminals/{t}"
+                api_http.get(url)
+    """,
+    "one-get-per-terminal": """
+        def f(ids):
+            for t in ids:
+                api_http.get(f"{BASE}/terminals/{t}")
+    """,
+    "one-fleet-read-per-terminal": """
+        def f(c, ids):
+            for t in ids:
+                c.terminal_status("w", t)
+    """,
 }
 
 
@@ -305,13 +393,28 @@ def test_the_guard_ignores_output_reads():
     assert list(_status_wait_loops(ast.parse(textwrap.dedent(source)))) == []
 
 
+@pytest.mark.parametrize("case", _FAN_OUT_CASES)
+def test_the_guard_ignores_a_loop_that_reads_each_row_once(case):
+    tree = ast.parse(textwrap.dedent(_FAN_OUT_CASES[case]))
+    assert list(_status_wait_loops(tree)) == []
+
+
+def test_the_census_still_catches_an_unlisted_wait_loop(tmp_path):
+    """Planting one unlisted poll loop under ``cli/`` makes the census disagree with the table."""
+    (tmp_path / "cli").mkdir()
+    (tmp_path / "utils").mkdir()
+    (tmp_path / "cli" / "rogue.py").write_text(
+        textwrap.dedent(_GUARD_CASES["url-in-a-variable"]), encoding="utf-8"
+    )
+    (tmp_path / "utils" / "fan_out.py").write_text(
+        textwrap.dedent(_FAN_OUT_CASES["one-get-per-node"]), encoding="utf-8"
+    )
+    assert set(_census(tmp_path)) == {("cli/rogue.py", "f")}
+    assert set(_census(tmp_path)) != set(_STATUS_LOOPS)
+
+
 def test_every_status_wait_loop_goes_through_the_shared_failure_policy():
-    package = pathlib.Path(cli_agent_orchestrator.__file__).parent
-    found = {}
-    for path in sorted((package / "cli").rglob("*.py")) + sorted((package / "utils").rglob("*.py")):
-        module = path.relative_to(package).as_posix()
-        for function in _status_wait_loops(ast.parse(path.read_text(encoding="utf-8"))):
-            found[(module, function.name)] = function
+    found = _census(pathlib.Path(cli_agent_orchestrator.__file__).parent)
 
     assert set(found) == set(_STATUS_LOOPS), (
         "a loop reads terminal status outside the known wait helpers; route it "

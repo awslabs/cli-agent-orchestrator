@@ -18,6 +18,7 @@ from cli_agent_orchestrator.clients.tmux import (
     PaneSpawnUnavailable,
     TmuxClient,
 )
+from cli_agent_orchestrator.constants import TMUX_HISTORY_LIMIT
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +173,14 @@ class TmuxBackend(TerminalBackend):
         self._client.send_special_key(session_name, window_name, key)
 
     # --- Output ---
+
+    @property
+    def max_history_lines(self) -> int:
+        # The per-pane scrollback floor TmuxClient raises history-limit to
+        # before every pane is created (#728). A pane may retain more if the
+        # operator configured more; capture-pane never returns more than the
+        # pane retains, so this is the depth CAO can count on.
+        return TMUX_HISTORY_LIMIT
 
     def get_history(
         self,

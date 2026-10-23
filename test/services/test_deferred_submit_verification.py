@@ -129,7 +129,7 @@ class TestRedeliverDroppedMessageHelper:
             started = ts.redeliver_dropped_message("t1", "Analyze the logs", 1)
         assert started is True
         mgr.get_provider.assert_called_once_with("t1")
-        probe.assert_called_once_with("t1", provider)
+        probe.assert_called_once_with("t1", provider, accept_retained_completed=True)
         key.assert_not_called()
         send.assert_not_called()
 
@@ -137,7 +137,7 @@ class TestRedeliverDroppedMessageHelper:
         # Registry blowup must not lose the redelivery — box check still runs.
         with (
             patch.object(ts, "provider_manager") as mgr,
-            patch.object(ts, "_message_visible_in_box", return_value=True) as box,
+            patch.object(ts, "_message_in_composer", return_value=True) as box,
             patch.object(ts, "send_special_key") as key,
             patch.object(ts, "dispatch_input") as send,
         ):
@@ -154,7 +154,7 @@ class TestRedeliverDroppedMessageHelper:
         provider = MagicMock(supports_direct_status_probe=True)
         with (
             patch.object(ts, "_worker_is_started_direct", return_value=False),
-            patch.object(ts, "_message_visible_in_box", return_value=False),
+            patch.object(ts, "_message_in_composer", return_value=False),
             patch.object(ts, "send_special_key") as key,
             patch.object(ts, "dispatch_input") as send,
         ):
@@ -172,7 +172,7 @@ class TestRedeliverDroppedMessageHelper:
         provider = MagicMock(supports_direct_status_probe=False)
         with (
             patch.object(ts, "_worker_is_started_direct") as probe,
-            patch.object(ts, "_message_visible_in_box", return_value=False),
+            patch.object(ts, "_message_in_composer", return_value=False),
             patch.object(ts, "send_special_key") as key,
             patch.object(ts, "dispatch_input") as send,
         ):
@@ -190,7 +190,7 @@ class TestRedeliverDroppedMessageHelper:
         # the gate.
         provider = MagicMock(supports_direct_status_probe=False)
         with (
-            patch.object(ts, "_message_visible_in_box", return_value=True),
+            patch.object(ts, "_message_in_composer", return_value=True),
             patch.object(ts, "send_special_key") as key,
             patch.object(ts, "dispatch_input") as send,
         ):
@@ -206,7 +206,7 @@ class TestRedeliverDroppedMessageHelper:
         # full re-send, exactly as before the helper was extracted.
         provider = MagicMock(supports_direct_status_probe=False)
         with (
-            patch.object(ts, "_message_visible_in_box", return_value=False),
+            patch.object(ts, "_message_in_composer", return_value=False),
             patch.object(ts, "send_special_key") as key,
             patch.object(ts, "dispatch_input") as send,
         ):
@@ -238,7 +238,7 @@ class TestConfirmWorkerStartedOrResubmit:
             patch.object(
                 ts, "_wait_for_post_dispatch_start", new=AsyncMock(side_effect=[False, True])
             ),
-            patch.object(ts, "_message_visible_in_box", return_value=True),
+            patch.object(ts, "_message_in_composer", return_value=True),
             patch.object(ts, "send_special_key") as key,
             patch.object(ts, "dispatch_input") as send,
         ):
@@ -255,7 +255,7 @@ class TestConfirmWorkerStartedOrResubmit:
             patch.object(
                 ts, "_wait_for_post_dispatch_start", new=AsyncMock(side_effect=[False, True])
             ),
-            patch.object(ts, "_message_visible_in_box", return_value=False),
+            patch.object(ts, "_message_in_composer", return_value=False),
             patch.object(ts, "send_special_key") as key,
             patch.object(ts, "dispatch_input") as send,
         ):
@@ -272,7 +272,7 @@ class TestConfirmWorkerStartedOrResubmit:
         # Every confirm fails through all resubmit attempts.
         with (
             patch.object(ts, "_wait_for_post_dispatch_start", new=AsyncMock(return_value=False)),
-            patch.object(ts, "_message_visible_in_box", return_value=True),
+            patch.object(ts, "_message_in_composer", return_value=True),
             patch.object(ts, "send_special_key"),
             patch.object(ts, "dispatch_input"),
         ):
@@ -311,7 +311,7 @@ class TestConfirmWorkerStartedOrResubmit:
                 ts, "_wait_for_post_dispatch_start", new=AsyncMock(side_effect=[False, True])
             ),
             patch.object(ts, "_worker_is_started_direct", return_value=False),
-            patch.object(ts, "_message_visible_in_box", return_value=True),
+            patch.object(ts, "_message_in_composer", return_value=True),
             patch.object(ts, "send_special_key") as key,
             patch.object(ts, "dispatch_input") as send,
         ):
@@ -336,7 +336,7 @@ class TestConfirmWorkerStartedOrResubmit:
                 ts, "_wait_for_post_dispatch_start", new=AsyncMock(side_effect=[False, True])
             ),
             patch.object(ts, "_worker_is_started_direct") as probe,
-            patch.object(ts, "_message_visible_in_box", return_value=True),
+            patch.object(ts, "_message_in_composer", return_value=True),
             patch.object(ts, "send_special_key"),
             patch.object(ts, "dispatch_input"),
         ):
@@ -358,7 +358,7 @@ class TestConfirmWorkerStartedOrResubmit:
                 ts, "_wait_for_post_dispatch_start", new=AsyncMock(side_effect=[False, True])
             ),
             patch.object(ts, "_worker_is_started_direct") as probe,
-            patch.object(ts, "_message_visible_in_box", return_value=True),
+            patch.object(ts, "_message_in_composer", return_value=True),
             patch.object(ts, "send_special_key"),
             patch.object(ts, "dispatch_input"),
         ):
@@ -490,7 +490,7 @@ class TestConfirmBranchSelectionAndResubmitBoundary:
             patch.object(
                 ts, "_wait_for_post_dispatch_start", new=AsyncMock(side_effect=[False, True])
             ) as gate,
-            patch.object(ts, "_message_visible_in_box", return_value=False),
+            patch.object(ts, "_message_in_composer", return_value=False),
             patch.object(ts, "dispatch_input", return_value=12) as dispatch,
             patch.object(ts, "send_special_key") as key,
         ):
@@ -521,7 +521,7 @@ class TestConfirmBranchSelectionAndResubmitBoundary:
             patch.object(
                 ts, "_wait_for_post_dispatch_start", new=AsyncMock(side_effect=[False, True])
             ) as gate,
-            patch.object(ts, "_message_visible_in_box", return_value=True),
+            patch.object(ts, "_message_in_composer", return_value=True),
             patch.object(ts, "dispatch_input") as dispatch,
             patch.object(ts, "send_special_key", side_effect=lambda *_a: order.append("enter")),
         ):
@@ -551,7 +551,7 @@ class TestConfirmBranchSelectionAndResubmitBoundary:
             patch.object(
                 ts, "_wait_for_post_dispatch_start", new=AsyncMock(side_effect=[False, True])
             ) as gate,
-            patch.object(ts, "_message_visible_in_box", return_value=False),
+            patch.object(ts, "_message_in_composer", return_value=False),
             patch.object(ts, "dispatch_input") as dispatch,
         ):
             ok = await ts._confirm_worker_started_or_resubmit(
@@ -575,7 +575,7 @@ class TestConfirmBranchSelectionAndResubmitBoundary:
             patch.object(
                 ts, "_wait_for_post_dispatch_start", new=AsyncMock(side_effect=[False, True])
             ) as gate,
-            patch.object(ts, "_message_visible_in_box", return_value=False),
+            patch.object(ts, "_message_in_composer", return_value=False),
             patch.object(ts, "dispatch_input", return_value=3),
         ):
             ok = await ts._confirm_worker_started_or_resubmit(
@@ -770,7 +770,7 @@ async def test_kimi_confirmation_requires_execution_even_when_cached_status_says
         patch.object(ts.status_monitor, "probe_execution_evidence", execution_probe),
         patch.object(ts, "_DEFERRED_SUBMIT_CONFIRM_TIMEOUT", 8.0 if accepted else 0.0),
         patch.object(ts.asyncio, "sleep", new=AsyncMock()) as sleep,
-        patch.object(ts, "_message_visible_in_box", return_value=False),
+        patch.object(ts, "_message_in_composer", return_value=False),
         patch.object(ts, "dispatch_input", return_value=0) as send,
     ):
         assert (
@@ -975,3 +975,193 @@ def test_kimi_paused_old_probe_cannot_certify_real_new_send_input(monkeypatch):
     assert monitor.get_buffer(provider.terminal_id) == ""
     assert provider._execution_observed is False
     assert ts._worker_is_started_direct(provider.terminal_id, provider) is False
+
+
+class TestMessageInComposerTriState:
+    """PR #1004 review, P2-3: "message absent" and "composer unreadable" differ."""
+
+    @staticmethod
+    def _answer(composer, message="Analyze the logs"):
+        with patch.object(ts, "_capture_current_composer_region", return_value=composer):
+            return ts._message_in_composer("t1", message)
+
+    def test_true_when_the_composer_holds_the_message(self):
+        assert self._answer("❯ Analyze the logs") is True
+
+    def test_false_when_the_composer_was_read_and_the_message_is_absent(self):
+        assert self._answer("❯") is False
+
+    def test_none_when_the_composer_cannot_be_read(self):
+        assert self._answer(None) is None
+
+    def test_none_when_the_message_is_too_short_to_probe_for(self):
+        assert self._answer("❯ go", message="go") is None
+
+    def test_bool_view_treats_unknown_as_not_visible(self):
+        with patch.object(ts, "_message_in_composer", return_value=None):
+            assert ts._message_visible_in_box("t1", "Analyze the logs") is False
+        with patch.object(ts, "_message_in_composer", return_value=True):
+            assert ts._message_visible_in_box("t1", "Analyze the logs") is True
+
+
+class TestInboxRecoveryGates:
+    """PR #1004 review, P2-3: the inbox path's two extra gates on the helper.
+
+    A full re-send pastes into a composer that may still hold the first paste;
+    a probe COMPLETED may be the receiver's previous turn. Neither can be told
+    apart without the provider's help, so the inbox path refuses both unless
+    the provider supplies the evidence.
+    """
+
+    def _provider(self, **attrs):
+        base = dict(
+            supports_direct_status_probe=True,
+            direct_status_probe_has_turn_identity=False,
+            requires_execution_evidence=False,
+            execution_evidence_ambiguous=False,
+        )
+        base.update(attrs)
+        return MagicMock(**base)
+
+    def test_composer_evidence_gate_sends_nothing_when_the_composer_cannot_be_read(self):
+        provider = self._provider()
+        with (
+            patch.object(ts, "_worker_is_started_direct", return_value=False),
+            patch.object(ts, "_message_in_composer", return_value=None),
+            patch.object(ts, "send_special_key") as key,
+            patch.object(ts, "dispatch_input") as send,
+            patch.object(ts, "logger") as log,
+        ):
+            started, boundary = ts.redeliver_dropped_message_with_boundary(
+                "t1",
+                "Analyze the logs",
+                1,
+                provider,
+                full_resend_requires_probe=True,
+                full_resend_requires_composer_evidence=True,
+            )
+        assert (started, boundary) == (False, None)
+        key.assert_not_called()
+        send.assert_not_called()
+        assert any(
+            "composer cannot be read" in str(c.args[0]) for c in log.warning.call_args_list
+        ), "the skipped recovery must be logged, not silent"
+
+    def test_composer_evidence_gate_still_full_resends_when_the_composer_is_read_and_empty(self):
+        provider = self._provider()
+        with (
+            patch.object(ts, "_worker_is_started_direct", return_value=False),
+            patch.object(ts, "_message_in_composer", return_value=False),
+            patch.object(ts, "send_special_key") as key,
+            patch.object(ts, "dispatch_input", return_value=9) as send,
+        ):
+            started, boundary = ts.redeliver_dropped_message_with_boundary(
+                "t1",
+                "Analyze the logs",
+                1,
+                provider,
+                full_resend_requires_probe=True,
+                full_resend_requires_composer_evidence=True,
+            )
+        assert (started, boundary) == (False, 9)
+        key.assert_not_called()
+        send.assert_called_once()
+        assert send.call_args.kwargs["redelivery"] is True
+
+    def test_composer_evidence_gate_still_sends_a_bare_enter_when_the_message_is_visible(self):
+        provider = self._provider(supports_direct_status_probe=False)
+        with (
+            patch.object(ts, "_message_in_composer", return_value=True),
+            patch.object(ts, "send_special_key") as key,
+            patch.object(ts, "dispatch_input") as send,
+            patch.object(ts, "status_monitor") as sm,
+        ):
+            sm.output_generation.return_value = 4
+            started, boundary = ts.redeliver_dropped_message_with_boundary(
+                "t1",
+                "Analyze the logs",
+                1,
+                provider,
+                full_resend_requires_probe=True,
+                full_resend_requires_composer_evidence=True,
+            )
+        assert (started, boundary) == (False, 4)
+        key.assert_called_once_with("t1", "Enter")
+        send.assert_not_called()
+
+    def test_gate_off_keeps_the_deferred_init_behaviour(self):
+        # Pre-existing contract for the fresh-worker path: unknown composer and
+        # a probe that ruled out a working worker -> full re-send.
+        provider = self._provider()
+        with (
+            patch.object(ts, "_worker_is_started_direct", return_value=False),
+            patch.object(ts, "_message_in_composer", return_value=None),
+            patch.object(ts, "send_special_key") as key,
+            patch.object(ts, "dispatch_input", return_value=9) as send,
+        ):
+            started, boundary = ts.redeliver_dropped_message_with_boundary(
+                "t1", "Analyze the logs", 1, provider, full_resend_requires_probe=True
+            )
+        assert (started, boundary) == (False, 9)
+        key.assert_not_called()
+        send.assert_called_once()
+
+    def test_helper_forwards_the_previous_turn_flag_to_the_probe(self):
+        provider = self._provider()
+        with (
+            patch.object(ts, "_worker_is_started_direct", return_value=False) as probe,
+            patch.object(ts, "_message_in_composer", return_value=None),
+            patch.object(ts, "dispatch_input"),
+        ):
+            ts.redeliver_dropped_message_with_boundary(
+                "t1", "Analyze the logs", 1, provider, screen_may_show_previous_turn=True
+            )
+        probe.assert_called_once_with("t1", provider, accept_retained_completed=False)
+
+    def _probe(self, status, provider, **kwargs):
+        provider.get_status.return_value = status
+        backend = MagicMock()
+        backend.get_history.return_value = "screen"
+        with (
+            patch.object(
+                ts, "get_terminal_metadata", return_value={"tmux_session": "s", "tmux_window": "w"}
+            ),
+            patch.object(ts, "get_backend", return_value=backend),
+        ):
+            return ts._worker_is_started_direct("t1", provider, **kwargs)
+
+    def test_probe_completed_is_not_pickup_when_the_screen_may_show_the_previous_turn(self):
+        provider = self._provider()
+        assert (
+            self._probe(TerminalStatus.COMPLETED, provider, accept_retained_completed=False)
+            is False
+        )
+        # The deferred-init default is unchanged: a fresh worker's COMPLETED is its own.
+        assert self._probe(TerminalStatus.COMPLETED, provider) is True
+
+    def test_probe_completed_counts_when_the_provider_binds_it_to_the_turn(self):
+        provider = self._provider(direct_status_probe_has_turn_identity=True)
+        assert (
+            self._probe(TerminalStatus.COMPLETED, provider, accept_retained_completed=False) is True
+        )
+
+    def test_probe_live_verdicts_count_regardless_of_history(self):
+        provider = self._provider()
+        assert (
+            self._probe(TerminalStatus.PROCESSING, provider, accept_retained_completed=False)
+            is True
+        )
+        assert (
+            self._probe(
+                TerminalStatus.WAITING_USER_ANSWER, provider, accept_retained_completed=False
+            )
+            is True
+        )
+        assert self._probe(TerminalStatus.IDLE, provider, accept_retained_completed=False) is False
+
+    def test_turn_identity_opt_in_matches_the_providers_detectors(self):
+        from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider
+        from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
+
+        assert MiniMaxCodeProvider.direct_status_probe_has_turn_identity is True
+        assert OpenCodeCliProvider.direct_status_probe_has_turn_identity is False
