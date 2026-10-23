@@ -16,9 +16,13 @@ _SRV = "cli_agent_orchestrator.utils.orchestration"
 
 @pytest.mark.parametrize("base_url, expected_headers", _TARGETS)
 @patch(f"{_SRV}.get_local_bearer", return_value="local-machine-token")
+@patch(f"{_SRV}._own_delegation_ceiling", return_value=["*"])
+@patch(f"{_SRV}._require_remote_delegation_ceiling", return_value=None)
 @patch(f"{_SRV}.requests.post")
 def test_assign_bearer_is_scoped_to_target(
     mock_post: MagicMock,
+    _remote_ceiling: MagicMock,
+    _own_ceiling: MagicMock,
     _bearer: MagicMock,
     base_url: str,
     expected_headers: dict[str, str] | None,
