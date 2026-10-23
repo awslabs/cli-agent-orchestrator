@@ -416,7 +416,7 @@ line_length = 100
 #     F401 unused import        165      selected  (165 of them autofixable)
 #     F841 unused local          27      selected  (the #752 class exactly)
 #     F821 undefined name         0      selected  (same-file half of F401's inverse -- see below)
-#     F822 undefined in __all__   0      selected  (26 src/ files define __all__)
+#     F822 undefined in __all__   0      selected  (reaches 13 of the 26 src/ __all__ lists)
 #     F811 redefinition         104      NOT selected -- see below, and see #1005
 #     ARG  unused argument     3718      NOT selected
 #     B    flake8-bugbear        609      NOT selected (B904 346, B008 204, B905 23 ...)
@@ -453,8 +453,20 @@ target-version = "py310"
 [tool.ruff.lint]
 # F821 (undefined name) and F822 (undefined name in __all__) are the inverse of F401.
 # F401's autofix REMOVES an import; these two report a use of the removed name IN THE SAME
-# FILE, including quoted and `from __future__ import annotations` annotations, and in the
-# file's own `__all__`. Without them the gate is one-sided: haofeif's review of #1006 found
+# FILE, including quoted and `from __future__ import annotations` annotations, and -- with
+# the one exception below -- in the file's own `__all__`.
+#
+# F822'S EXCEPTION: stable ruff does not apply it to `__init__.py` files. `ruff rule F822`
+# says "In preview, this rule will flag undefined names in `__init__.py` file", and preview
+# is off here (turning it on would change F401, F841 and the rest of the selection too,
+# which is not a ride-along). 13 of the 26 `__all__` lists under src/ are in an
+# `__init__.py` -- telemetry/, backends/, services/agui/ and 10 others -- so for those,
+# ruff says nothing and a stale entry surfaces only as AttributeError at the first
+# `from pkg import *`. test/test_package_imports.py closes that half: its import walk also
+# resolves every name in every module's own `__all__`, all 26 lists, one hasattr per name
+# on a module it has already imported (haofeif, #1006 review at a4db1db7, P3-1).
+#
+# Without F821/F822 the gate is one-sided: haofeif's review of #1006 found
 # that merging main re-introduced a use of `Optional` in utils/agent_profiles.py after this
 # PR had deleted the import, the module raised NameError at import, 132 test modules failed
 # collection, and `ruff check` was green. F821 reports that break at the exact line, in the
@@ -464,7 +476,8 @@ target-version = "py310"
 # A use of a removed name from ANOTHER module (`from a import X`, `a.X`, a `mock.patch`
 # target string) is invisible to F821/F822. test/test_package_imports.py covers the
 # module-level `from a import X` shape by importing every .py file under src/ in a fresh
-# interpreter; function-scope imports, attribute access and patch strings are caught only
+# interpreter, and the `__all__` shape that F822 cannot see in an `__init__.py`;
+# function-scope imports, attribute access and patch strings are caught only
 # by the unit tests that execute them. That test also pins F821 and F822 as selected.
 select = ["F401", "F821", "F822", "F841"]
 

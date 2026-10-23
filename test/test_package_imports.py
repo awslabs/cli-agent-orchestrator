@@ -25,11 +25,6 @@ ruff is per-file and cannot):
    a module no test happens to import. The subprocess is deliberate: in-process, a
    module ``conftest.py`` already imported would pass without being exercised here.
 
-Outside both: a function-scope ``from a import X``, an attribute use ``a.X``, and a
-``mock.patch("pkg.a.X")`` target string. Those fail only when a unit test executes
-them (ImportError / AttributeError), so a green lint step plus a green import guard is
-not proof that no use of a removed name remains anywhere.
-
    The module list comes from the FILES, not from ``pkgutil.walk_packages``. The walk
    only descends into directories that have an ``__init__.py``, and ``services/`` and
    ``clients/`` have none (they are namespace-package portions), so the first version
@@ -38,8 +33,23 @@ not proof that no use of a removed name remains anywhere.
    subprocess to have attempted exactly that set, so the enumeration cannot drift from
    what is on disk without failing here.
 
+   The same walk also resolves every name in each module's own ``__all__``, because
+   check 1 cannot: stable ruff does not apply F822 to ``__init__.py`` files (``ruff rule
+   F822``: "In preview, this rule will flag undefined names in ``__init__.py`` file"),
+   and 13 of the 26 ``__all__`` lists under ``src/`` are in one. A stale entry there
+   passed both checks and raised ``AttributeError`` only at the first
+   ``from pkg import *`` at run time (haofeif, #1006 review at ``a4db1db7``, P3-1). The
+   check is one ``hasattr`` per exported name on a module the walk has already imported,
+   so it costs nothing and covers all 26 lists, not only the 13 ruff can see.
+
+Outside both: a function-scope ``from a import X``, an attribute use ``a.X``, and a
+``mock.patch("pkg.a.X")`` target string. Those fail only when a unit test executes
+them (ImportError / AttributeError), so a green lint step plus a green import guard is
+not proof that no use of a removed name remains anywhere.
+
 Neither check pins a module count. Counts drift with every file added; the assertions
-are "the attempted set equals the files on disk" and "no module fails".
+are "the attempted set equals the files on disk", "no module fails", and "every
+``__all__`` name resolves".
 """
 
 from __future__ import annotations
@@ -89,11 +99,16 @@ def modules_under(src_root: Path) -> set[str]:
 
 # Runs in the subprocess. argv[1] is the src root; the enumeration is the same as
 # modules_under() above, repeated here on purpose so the test can compare the two.
+#
+# The `__all__` pass is what covers ruff's F822 blind spot (see the docstring): for each
+# module that imported, every name in its own `__all__` must resolve as an attribute.
+# That is precisely what `from <module> import *` does, minus the side effect of binding
+# 26 modules' worth of names into this interpreter, and it names the offender.
 _IMPORT_ALL = r"""
 import importlib, json, pathlib, sys, traceback
 
 src_root = pathlib.Path(sys.argv[1])
-attempted, failures = [], []
+attempted, failures, dangling_all = [], [], []
 for path in sorted(src_root.rglob("*.py")):
     if "__pycache__" in path.parts:
         continue
@@ -103,7 +118,7 @@ for path in sorted(src_root.rglob("*.py")):
     name = ".".join(parts)
     attempted.append(name)
     try:
-        importlib.import_module(name)
+        module = importlib.import_module(name)
     except BaseException as exc:  # report every failure shape, SystemExit included
         failures.append(
             {
@@ -112,7 +127,18 @@ for path in sorted(src_root.rglob("*.py")):
                 "traceback": traceback.format_exc(limit=3),
             }
         )
-print(json.dumps({"attempted": attempted, "failures": failures}))
+        continue
+    exported = getattr(module, "__all__", None)
+    if exported is None:
+        continue
+    missing = [str(n) for n in exported if not hasattr(module, str(n))]
+    if missing:
+        dangling_all.append({"module": name, "missing": missing})
+print(
+    json.dumps(
+        {"attempted": attempted, "failures": failures, "dangling_all": dangling_all}
+    )
+)
 """
 
 
@@ -192,4 +218,9 @@ def test_every_module_under_src_imports_in_a_fresh_interpreter(tmp_path: Path) -
     )
     assert not report["failures"], "modules under src/ that do not import:\n" + "\n".join(
         f"  {f['module']}: {f['error']}\n{f['traceback']}" for f in report["failures"]
+    )
+    assert not report["dangling_all"], (
+        "__all__ names that do not resolve, so `from <module> import *` raises "
+        "AttributeError (ruff's F822 does not reach __init__.py outside preview):\n"
+        + "\n".join(f"  {d['module']}: {', '.join(d['missing'])}" for d in report["dangling_all"])
     )
