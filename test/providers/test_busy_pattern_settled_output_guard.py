@@ -10,7 +10,11 @@ ANY match in the bottom rows, so the settled line pinned PROCESSING until it
 scrolled off: ``_wait_for_completion`` saw neither COMPLETED nor IDLE and
 burned its whole budget as a timeout, and InboxService (IDLE or COMPLETED only)
 starved. That is #908 -> #956 -> #974. The scan is now scoped to the newest
-conversation row above the input box; this file guards the patterns themselves.
+CONVERSATION row above the input box — blank rows, box chrome and the status
+area the TUI draws under the spinner (task-list rows, queued messages) do not
+count, so they cannot hide a live spinner either (PR #975 review, P2-1) — via
+the one shared walker, ``_newest_conversation_row`` (pinned by
+``TestSingleConversationRowWalker``); this file guards the patterns themselves.
 
 This file enumerates the busy patterns instead of the lines: every module-level
 pattern in every provider module whose NAME says it is a live-status pattern
@@ -282,3 +286,66 @@ class TestSettledFrameNeverPinsProcessing:
         must be skipped on the way up, not mistaken for the newest row."""
         screen = self._screen(line, "", END_OF_TURN_SUMMARY, "⎿ Tip: press ctrl+o to expand")
         self._assert_never_processing(screen)
+
+
+class TestSingleConversationRowWalker:
+    """One walker decides what counts as a conversation row (PR #975, P2-1).
+
+    The #974 defect class was "two walkers each decide what counts as a
+    conversation row": the screen path and the raw input-box walk each skipped
+    their own idea of chrome, so when the skip set grew (the status area the
+    TUI draws under the spinner — task-list rows, queued messages) one path was
+    fixed and the other kept the gap. ``_newest_conversation_row`` is now the
+    single definition; this test pins that structurally, so a third walker
+    cannot appear quietly.
+    """
+
+    @staticmethod
+    def _functions_referencing(names: set) -> dict:
+        """Map name -> set of claude_code functions whose body references it."""
+        import ast
+        import inspect
+
+        import cli_agent_orchestrator.providers.claude_code as cc
+
+        tree = ast.parse(inspect.getsource(cc))
+        hits: dict = {name: set() for name in names}
+
+        class Visitor(ast.NodeVisitor):
+            def __init__(self):
+                self.stack = []
+
+            def _visit_func(self, node):
+                self.stack.append(node.name)
+                self.generic_visit(node)
+                self.stack.pop()
+
+            visit_FunctionDef = _visit_func
+            visit_AsyncFunctionDef = _visit_func
+
+            def visit_Name(self, node):
+                if node.id in hits and self.stack:
+                    hits[node.id].add(self.stack[-1])
+
+            def visit_Attribute(self, node):
+                if node.attr in hits and self.stack:
+                    hits[node.attr].add(self.stack[-1])
+                self.generic_visit(node)
+
+        Visitor().visit(tree)
+        return hits
+
+    def test_the_row_skip_set_has_one_definition(self):
+        """The chrome/status-area patterns may be consulted by the shared walker
+        only. A new walker would have to reference them (or silently diverge by
+        reproducing their text, which the behaviour tests above catch)."""
+        hits = self._functions_referencing(
+            {"NEW_TUI_BOX_CHROME_PATTERN", "STATUS_AREA_ROW_PATTERN"}
+        )
+        assert hits["NEW_TUI_BOX_CHROME_PATTERN"] == {"_newest_conversation_row"}
+        assert hits["STATUS_AREA_ROW_PATTERN"] == {"_newest_conversation_row"}
+
+    def test_both_detector_paths_walk_through_the_shared_helper(self):
+        hits = self._functions_referencing({"_newest_conversation_row"})
+        callers = hits["_newest_conversation_row"]
+        assert {"get_status", "get_status_from_screen"} <= callers, callers

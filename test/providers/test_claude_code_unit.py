@@ -3439,3 +3439,158 @@ class TestClaudeCodeReducedMotionFinishedResponse:
             for _ in range(3):
                 assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
                 assert self._p().get_status("\n".join(screen)) == TerminalStatus.COMPLETED
+
+
+class TestClaudeCodeStatusAreaRows:
+    """PR #975 review (haofeif), P2-1: the TUI draws its STATUS AREA — the task
+    list (up to five rows, only the first starting with ⎿) and queued-message
+    rows (indented "❯ …") — BETWEEN the live spinner and the input box. The
+    #974 position rule tested only the newest conversation row above the box,
+    so any status-area row under the spinner hid it: the screen path read
+    COMPLETED (or IDLE) mid-turn — the #908 harm — and the raw input-box walk
+    had the same newest-row limit. Status-area rows are not conversation; the
+    shared walker must skip them on the way up to the spinner.
+
+    Frames from the review: Claude Code 2.1.119 (anthropics/claude-code#52688)
+    and the older layout in anthropics/claude-code#10174, confirmed against a
+    live 2.1.308 capture (test/providers/fixtures, COMPOSER_FIXTURES.md).
+    """
+
+    BOX = "─" * 60
+    SPINNER = "✻ Building configmgr with ibm-clang64… ({t} · ↑ 4.0k tokens · thought for 8s)"
+    TASKS_5 = [
+        "  ⎿  ✔ Fetch + checkout feature branch on z/OS",
+        "     ◼ Run build_cmgr_clang.sh zos on z/OS",
+        "     ◻ Functional test configmgr on z/OS",
+        "     ◻ Fix em-dash chars in source comments",
+        "     ◻ Verify binary parity after the refactor",
+    ]
+    QUEUED_3 = [
+        "  ❯ /effort",
+        "  ❯ rerun the suite when done",
+        "  ❯ post the summary to the channel",
+    ]
+
+    def _p(self):
+        return ClaudeCodeProvider("test123", "test-session", "window-0")
+
+    def _screen(self, *lines):
+        return [
+            "❯ review the diff",
+            *lines,
+            self.BOX,
+            "❯ ",
+            self.BOX,
+            "  esc to interrupt · ctrl+t to hide tasks",
+        ]
+
+    @staticmethod
+    def _dispatched(mock_backend) -> ClaudeCodeProvider:
+        mock_backend.get_native_status.return_value = None
+        mock_backend.supports_event_inbox.return_value = False
+        mock_backend.get_history.return_value = ""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider.mark_input_received()
+        return provider
+
+    # (a) Task list under the spinner, no recorded dispatch (a human-typed pane,
+    # or a provider re-created from the DB after a server restart).
+    def test_spinner_above_task_list_is_processing(self):
+        screen = self._screen(self.SPINNER.format(t="1m 22s"), *self.TASKS_5[:4])
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+        assert self._p().get_status("\n".join(screen)) == TerminalStatus.PROCESSING
+
+    # (b) The exact rows of the 2.1.119 frame (anthropics/claude-code#52688).
+    # The queued-message placeholder renders INSIDE the input box, so this is
+    # a screen-path frame as pasted; no separate empty-❯ box follows.
+    FRAME_2_1_119 = [
+        "✻ Building configmgr with ibm-clang64… (1m 22s · ↑ 4.0k tokens · thought for 8s)",
+        "  ⎿  ✔ Fetch + checkout feature branch on z/OS",
+        "     ◼ Run build_cmgr_clang.sh zos on z/OS",
+        "     ◻ Functional test configmgr on z/OS",
+        "     ◻ Fix em-dash chars in source comments",
+        "",
+        "  ❯ /effort",
+        "────────",
+        "❯ Press up to edit queued messages",
+        "────────",
+        "  esc to interrupt · ctrl+t to hide tasks",
+    ]
+
+    def test_2_1_119_frame_is_processing_on_the_screen_path(self):
+        assert self._p().get_status_from_screen(self.FRAME_2_1_119) == TerminalStatus.PROCESSING
+
+    # (c)/(d) Eight-plus rows under a ticking spinner, with a dispatch: the
+    # turn gate's frame is the newest 8 rows above the box, so the tick never
+    # changes it, and after TURN_END_GRACE_S the gate fell back to the legacy
+    # verdict — COMPLETED mid-turn. Polls are 16 s apart, past the grace.
+    def _ticking_frames(self, spinner_fmt):
+        for t in ("1m 22s", "1m 38s", "1m 54s"):
+            yield self._screen(
+                "● Starting the refactor now.",
+                spinner_fmt.format(t=t),
+                *self.TASKS_5,
+                *self.QUEUED_3,
+            )
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_ticking_spinner_above_eight_status_rows_outlasts_the_grace(self, mock_backend):
+        from cli_agent_orchestrator.providers.claude_code import TURN_END_GRACE_S
+
+        provider = self._dispatched(mock_backend)
+        clock = {"now": 1000.0}
+        provider._turn_gate_clock = lambda: clock["now"]
+        for screen in self._ticking_frames(self.SPINNER):
+            assert provider.get_status_from_screen(screen) == TerminalStatus.PROCESSING
+            assert provider.get_status("\n".join(screen)) == TerminalStatus.PROCESSING
+            clock["now"] += TURN_END_GRACE_S + 1
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_ticking_reduced_motion_spinner_above_eight_status_rows_outlasts_the_grace(
+        self, mock_backend
+    ):
+        from cli_agent_orchestrator.providers.claude_code import TURN_END_GRACE_S
+
+        provider = self._dispatched(mock_backend)
+        clock = {"now": 1000.0}
+        provider._turn_gate_clock = lambda: clock["now"]
+        for screen in self._ticking_frames("● Dilly-dallying… ({t} · ↓ 300 tokens)"):
+            assert provider.get_status_from_screen(screen) == TerminalStatus.PROCESSING
+            assert provider.get_status("\n".join(screen)) == TerminalStatus.PROCESSING
+            clock["now"] += TURN_END_GRACE_S + 1
+
+    # (e) The older layout (anthropics/claude-code#10174): a todo list of 8
+    # checkbox rows under the spinner, no dispatch. No ● row is on screen, so
+    # the legacy verdict was IDLE, not even COMPLETED.
+    def test_older_todo_layout_with_eight_rows_is_processing(self):
+        screen = self._screen(
+            "* Forging… (2m 14s · ↑ 1.1k tokens)",
+            "  ⎿  ☒ Define the data model",
+            *[f"     ☐ Step {n} of the refactor" for n in range(2, 9)],
+        )
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+        assert self._p().get_status("\n".join(screen)) == TerminalStatus.PROCESSING
+
+    # (f) Two task rows; (g) a single queued row.
+    def test_spinner_above_two_task_rows_is_processing(self):
+        screen = self._screen(self.SPINNER.format(t="12s"), *self.TASKS_5[:2])
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+        assert self._p().get_status("\n".join(screen)) == TerminalStatus.PROCESSING
+
+    def test_spinner_above_one_queued_row_is_processing(self):
+        screen = self._screen(self.SPINNER.format(t="12s"), self.QUEUED_3[0])
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+        assert self._p().get_status("\n".join(screen)) == TerminalStatus.PROCESSING
+
+    # Control: the #974 frame. A finished response with the end-of-turn summary
+    # under it stays COMPLETED — status-area skipping must not resurrect it,
+    # even with stale task rows between the summary and the box.
+    def test_finished_turn_with_stale_task_rows_stays_completed(self):
+        screen = self._screen(
+            "● Done. The fix is in place… (3m 12s)",
+            "  The patch is in src/app.py.",
+            "",
+            "✻ Worked for 3m 12s",
+        )
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+        assert self._p().get_status("\n".join(screen)) == TerminalStatus.COMPLETED
