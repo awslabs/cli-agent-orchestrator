@@ -74,7 +74,7 @@ class _FakeBus:
     async def drain(self, queue):
         # Yield nothing so the stream finishes immediately.
         return
-        yield  # noqa: make it an async generator
+        yield  # unreachable, but it is what makes this an async generator
 
 
 # ---------------------------------------------------------------------------
