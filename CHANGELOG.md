@@ -318,12 +318,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (3m 12s)` with the end-of-turn summary under it — is the same text, so both
   detectors now look for a spinner only on the newest conversation row above the
   input box, instead of holding the worker at processing until the step timed
-  out (#974). Blank rows, box chrome and the status area Claude Code draws under
-  the spinner — the task list's indented checkbox rows and queued messages — are
-  not conversation: one shared walker skips them on the way up, so a task list
-  or a queued message under the spinner cannot hide it and report a working
-  agent as completed either. The same scope stops a response bullet in the
-  bottom rows from reading as a spinner.
+  out (#974). Blank rows, box chrome, the rows a wrapped chrome line continues
+  onto, and the status area Claude Code draws under the spinner — the task
+  list's indented checkbox rows and queued messages — are not conversation: one
+  shared walker skips them on the way up, so a `⎿ Tip:` line that wrapped in a
+  narrow pane, a task list or a queued message under the spinner cannot hide it
+  and report a working agent as completed either. The same scope stops a
+  response bullet in the bottom rows from reading as a spinner.
 
 - `store_lesson` no longer decides the learning gate, authorizes itself, or opens
   SQLite inside the agent's process. It writes through a new `POST /lessons`

@@ -234,6 +234,22 @@ NEW_TUI_BOX_SUMMARY_PATTERN = re.compile(
 )
 # Chrome the TUI paints between the newest conversation line and the box.
 NEW_TUI_BOX_CHROME_PATTERN = re.compile(r"^[ \t]*(?:⎿|tmux (?:detected|focus-events)\b)")
+# A chrome row's WRAPPED CONTINUATION (PR #975 review, P2-2). "  ⎿  Tip: …" and
+# "  ⎿  $ sleep 60 (27s)" put their text at column 5; when the line is wider
+# than the pane, the TUI indents the rest to that column and does NOT repeat ⎿.
+# The continuation therefore does not match NEW_TUI_BOX_CHROME_PATTERN, and a
+# walker that stops on it never sees the spinner above — a working agent read as
+# completed, the #908 harm. Both live 2.1.308 captures wrap their tip row this
+# way at 80 columns, and a person who attaches with a smaller terminal shrinks
+# the pane CAO created at 220x50 (clients/tmux.py, the resize note).
+#
+# This pattern CANNOT decide on its own that an indented row is a wrap: a
+# response's indented code block renders identically. Only what sits ABOVE the
+# row tells them apart, so _newest_conversation_row carries such a row as a
+# candidate and lets a ⎿ row above it clear the candidate; see its docstring.
+# Threshold 5 is the ⎿ text column — response body prose sits at column 2, so
+# a wrapped sentence never matches.
+CHROME_CONTINUATION_ROW_PATTERN = re.compile(r"^[ \t]{5,}\S")
 # Status-area rows the TUI can draw UNDER the live spinner (PR #975 review,
 # P2-1): the task list's indented checkbox rows (only the FIRST task row starts
 # with ⎿, which NEW_TUI_BOX_CHROME_PATTERN already skips) and an indented
@@ -343,9 +359,10 @@ SEPARATOR_WALK_SPINNER_PATTERN = re.compile(r"[✶✢✽✻✳·][^\n]*\u2026")
 # row in another language), and a first-word rule reopened #908 for all of
 # those (PR #975 review). What separates the two is POSITION. The live spinner
 # is always the newest CONVERSATION row above the input box — where blank rows,
-# box chrome and the STATUS AREA the TUI draws under the spinner (task-list
-# rows, queued messages; PR #975 review P2-1) do not count as conversation —
-# and a finished response has the end-of-turn summary under it. So both call
+# chrome rows, a chrome row's WRAPPED CONTINUATION (PR #975 review P2-2) and
+# the STATUS AREA the TUI draws under the spinner (task-list rows, queued
+# messages; PR #975 review P2-1) do not count as conversation — and a finished
+# response has the end-of-turn summary under it. So both call
 # sites apply this pattern only to the row _newest_conversation_row returns:
 # get_status()'s input-box walk and get_status_from_screen(), which used to take
 # ANY match in the bottom 25 rows (which let the settled line pin PROCESSING
@@ -1266,10 +1283,11 @@ class ClaudeCodeProvider(BaseProvider):
                     input_box = m
         if input_box is not None:
             # Walk up from the box to the newest conversation row: footer chrome
-            # ("⎿ Tip: …" hints, blanks, the GH #459 own-line effort footer) and
-            # the status area (the task list's indented checkbox rows, an
-            # indented queued-message row — PR #975 review, P2-1) render BETWEEN
-            # the live spinner and the box's top border, so checking only the
+            # ("⎿ Tip: …" hints and the rows they WRAP onto — PR #975 review,
+            # P2-2 — blanks, the GH #459 own-line effort footer) and the status
+            # area (the task list's indented checkbox rows, an indented
+            # queued-message row — PR #975 review, P2-1) render BETWEEN the
+            # live spinner and the box's top border, so checking only the
             # lines directly above the box misses an active spinner (false
             # COMPLETED during MCP calls, or IDLE once fix #1 above stops the
             # footer from false-matching COMPLETED via
@@ -1355,26 +1373,45 @@ class ClaudeCodeProvider(BaseProvider):
     @staticmethod
     def _newest_conversation_row(above_lines: List[str]) -> Optional[str]:
         """The newest conversation row above the input box, where conversation
-        excludes blank rows, box chrome ("⎿ Tip: …", the effort footer, the
-        tmux notices) and the status area (indented task-list and queued-message
-        rows), or None when nothing else sits above the box. This is the only
-        row the live spinner can be on, and the row the end-of-turn summary
-        lands on — and it is the ONLY definition of that row: both detector
-        paths (get_status's input-box walk and get_status_from_screen) must go
-        through this helper, never re-decide what counts as conversation
-        (PR #975 review, P2-1; guarded by
+        excludes blank rows, chrome rows ("⎿ Tip: …", the effort footer, the
+        tmux notices), THEIR WRAPPED CONTINUATIONS, and status-area rows
+        (indented task-list and queued-message rows) — or None when nothing else
+        sits above the box. This is the only row the live spinner can be on, and
+        the row the end-of-turn summary lands on — and it is the ONLY definition
+        of that row: both detector paths (get_status's input-box walk and
+        get_status_from_screen) must go through this helper, never re-decide
+        what counts as conversation (PR #975 review, P2-1 and P2-2; guarded by
         test_busy_pattern_settled_output_guard.py).
+
+        One row shape is ambiguous in isolation (P2-2). A row indented to the ⎿
+        text column (CHROME_CONTINUATION_ROW_PATTERN) is either the wrap of the
+        "⎿ Tip: …"/"⎿ $ cmd" line above it — chrome, skip it — or a response's
+        indented code block, which IS conversation and IS the newest row. The
+        two render identically; only what sits above decides. So the walk keeps
+        the first such row it meets (from the bottom) as a CANDIDATE and carries
+        on up: a ⎿ row clears the candidate, because the rows below it were its
+        wrap; a conversation row hands the candidate back, because the rows
+        below it were a code block; and if the walk runs off the top the
+        candidate is all there is. Later continuations do not replace the
+        candidate, so a multi-row code block still reports its newest row.
         """
+        candidate: Optional[str] = None
         for line in reversed(above_lines):
+            if NEW_TUI_BOX_CHROME_PATTERN.match(line):
+                candidate = None
+                continue
             if (
                 not line.strip()
-                or NEW_TUI_BOX_CHROME_PATTERN.match(line)
                 or EFFORT_FOOTER_LINE_PATTERN.match(line)
                 or STATUS_AREA_ROW_PATTERN.match(line)
             ):
                 continue
-            return line
-        return None
+            if CHROME_CONTINUATION_ROW_PATTERN.match(line):
+                if candidate is None:
+                    candidate = line
+                continue
+            return candidate if candidate is not None else line
+        return candidate
 
     @classmethod
     def _turn_ended_above_box(cls, above_lines: List[str]) -> bool:
@@ -1499,8 +1536,9 @@ class ClaudeCodeProvider(BaseProvider):
         # GH #974: with the box on screen, only the NEWEST conversation row above
         # it can be the live spinner — the TUI draws the spinner under everything
         # the turn has printed so far, with only non-conversation rows (blank
-        # rows, box chrome, and the STATUS AREA: task-list rows and queued
-        # messages, PR #975 review P2-1) between it and the box. A conversation
+        # rows, chrome rows and the rows they WRAP onto — PR #975 review P2-2 —
+        # and the STATUS AREA: task-list rows and queued messages, PR #975
+        # review P2-1) between it and the box. A conversation
         # row higher up is history, whatever it looks like: a finished response's
         # own duration parenthetical ("● Done. The fix is in place… (3m 12s)") is
         # the same text as a reduced-motion spinner row, and only its position

@@ -3594,3 +3594,223 @@ class TestClaudeCodeStatusAreaRows:
         )
         assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
         assert self._p().get_status("\n".join(screen)) == TerminalStatus.COMPLETED
+
+
+class TestWrappedChromeContinuationRows:
+    """PR #975 review (haofeif), P2-2: a chrome row's WRAPPED CONTINUATION is
+    not conversation either.
+
+    "  ⎿  Tip: …" puts its text at column 5. When the line is wider than the
+    pane, the TUI indents the rest to that column and does NOT repeat ⎿, so
+    NEW_TUI_BOX_CHROME_PATTERN does not match the continuation and the walker
+    stopped on it — never testing the spinner directly above. Both live
+    2.1.308 captures (80 columns) wrap their tip row exactly this way, so the
+    screen path read COMPLETED in the middle of a turn whenever no dispatch was
+    recorded: the #908 harm, and a regression from main, which scanned the whole
+    bottom region for the spinner.
+
+    The one ambiguity: an indented row that follows a ⎿ row is that line's wrap,
+    but the same indentation under a ● row is a response's indented code block,
+    which IS conversation. The two render identically; only what sits above
+    them tells them apart, which is why the walker carries the row as a
+    candidate rather than deciding on the row alone. The two
+    ``test_indented_*`` cases below pin one side each.
+    """
+
+    BOX = "─" * 60
+    SPINNER = "✻ Skedaddling… ({t} · ↓ 778 tokens)"
+    WRAPPED_TIP = [
+        "  ⎿  Tip: /loop runs any prompt on a recurring schedule. Great for",
+        "     monitoring deploys, babysitting PRs, or polling status.",
+    ]
+
+    def _p(self):
+        return ClaudeCodeProvider("test123", "test-session", "window-0")
+
+    def _screen(self, *lines):
+        return [
+            "❯ review the diff",
+            *lines,
+            self.BOX,
+            "❯ ",
+            self.BOX,
+            "  esc to interrupt · ctrl+t to hide tasks",
+        ]
+
+    def _both(self, lines):
+        return (
+            self._p().get_status_from_screen(lines),
+            self._p().get_status("\n".join(lines)),
+        )
+
+    # The captured shape: the live spinner, then a tip that wraps onto one more
+    # row. Read COMPLETED on the screen path before the fix.
+    def test_spinner_above_wrapped_tip_is_processing(self):
+        screen = self._screen(self.SPINNER.format(t="41s"), *self.WRAPPED_TIP)
+        assert self._both(screen) == (TerminalStatus.PROCESSING, TerminalStatus.PROCESSING)
+
+    # A narrower pane wraps the tip onto two more rows: the walk has to clear
+    # every continuation, not just the one directly under the ⎿ row.
+    def test_spinner_above_tip_wrapped_to_three_rows_is_processing(self):
+        screen = self._screen(
+            self.SPINNER.format(t="41s"),
+            "  ⎿  Tip: /loop runs any prompt on a recurring schedule. Great for",
+            "     monitoring deploys, babysitting PRs, or polling the status of",
+            "     a long build.",
+        )
+        assert self._both(screen) == (TerminalStatus.PROCESSING, TerminalStatus.PROCESSING)
+
+    # The reduced-motion spinner (GH #974's own frame) above a wrapped tip.
+    def test_reduced_motion_spinner_above_wrapped_tip_is_processing(self):
+        screen = self._screen("● Dilly-dallying… (2m 4s · ↓ 300 tokens)", *self.WRAPPED_TIP)
+        assert self._both(screen) == (TerminalStatus.PROCESSING, TerminalStatus.PROCESSING)
+
+    # A ⎿ tool row wraps the same way ("  ⎿  $ sleep 60 (27s)" + its hint row);
+    # both live captures carry it.
+    def test_spinner_above_wrapped_tool_row_is_processing(self):
+        screen = self._screen(
+            self.SPINNER.format(t="41s"),
+            "  ⎿  $ sleep 60 (27s)",
+            "     (ctrl+b ctrl+b (twice) to run in background)",
+        )
+        assert self._both(screen) == (TerminalStatus.PROCESSING, TerminalStatus.PROCESSING)
+
+    # A wrapped tip under the live spinner AND the status area under both: the
+    # skip set and the candidate rule have to compose.
+    def test_spinner_above_wrapped_tip_and_queued_row_is_processing(self):
+        screen = self._screen(self.SPINNER.format(t="41s"), *self.WRAPPED_TIP, "  ❯ /effort")
+        assert self._both(screen) == (TerminalStatus.PROCESSING, TerminalStatus.PROCESSING)
+
+    # Ambiguity, side A: indentation under a ⎿ row is that line's wrap, so the
+    # summary above stays the newest conversation row and the turn is done.
+    def test_indented_row_under_chrome_is_the_chrome_rows_wrap(self):
+        screen = self._screen("✻ Worked for 3m 12s", *self.WRAPPED_TIP)
+        assert self._both(screen) == (TerminalStatus.COMPLETED, TerminalStatus.COMPLETED)
+
+    # Ambiguity, side B: the same indentation under a ● row is a response's
+    # code block, which IS conversation — it stays the newest conversation row,
+    # so the summary further up does NOT end the turn. (Unchanged by the fix.)
+    def test_indented_row_under_a_response_is_conversation(self):
+        from cli_agent_orchestrator.providers.claude_code import TURN_END_GRACE_S
+
+        rows = [
+            "✻ Worked for 1m 4s",
+            "",
+            "● Here is the patch:",
+            "",
+            "      def retry(fn):",
+            "          return fn()",
+        ]
+        assert ClaudeCodeProvider._newest_conversation_row(rows) == "          return fn()"
+        # Not the summary ⇒ a dispatched turn is still in flight until the grace.
+        with patch("cli_agent_orchestrator.backends.registry._backend") as mock_backend:
+            mock_backend.get_native_status.return_value = None
+            mock_backend.supports_event_inbox.return_value = False
+            mock_backend.get_history.return_value = ""
+            provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+            provider.mark_input_received()
+            clock = {"now": 1000.0}
+            provider._turn_gate_clock = lambda: clock["now"]
+            screen = self._screen(*rows)
+            assert provider.get_status_from_screen(screen) == TerminalStatus.PROCESSING
+            clock["now"] += TURN_END_GRACE_S + 1
+            assert provider.get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
+    # A finished turn whose code block sits ABOVE the summary: the summary is
+    # still the newest conversation row, so nothing is held open.
+    def test_finished_turn_with_a_code_block_above_the_summary_is_completed(self):
+        screen = self._screen(
+            "● Here is the patch:",
+            "",
+            "      def retry(fn):",
+            "          return fn()",
+            "",
+            "✻ Worked for 3m 12s",
+        )
+        assert self._both(screen) == (TerminalStatus.COMPLETED, TerminalStatus.COMPLETED)
+
+    # Body prose renders at column 2, not 5, so a plain wrapped sentence under a
+    # ● row is never mistaken for chrome.
+    def test_response_body_prose_is_still_conversation(self):
+        rows = ["● Done. The fix is in place.", "  The patch is in src/app.py."]
+        assert ClaudeCodeProvider._newest_conversation_row(rows) == "  The patch is in src/app.py."
+
+
+class TestLiveCaptureFixtures:
+    """The three live Claude Code 2.1.308 captures from PR #975, driven through
+    both detector paths. They were added at 5174d687 as documentation only, so
+    CI never saw that their wrapped "⎿ Tip:" row hid the live spinner (P2-2).
+    A capture in the tree that no test loads cannot catch a regression.
+
+    Frames are real ``tmux capture-pane -p`` reads at 80x45; see
+    ``test/providers/fixtures/COMPOSER_FIXTURES.md``.
+    """
+
+    FIXTURES = Path(__file__).parent / "fixtures"
+
+    @classmethod
+    def _frame(cls, name: str) -> list:
+        return (
+            (cls.FIXTURES / f"claude_code_974_{name}.txt").read_text(encoding="utf-8").split("\n")
+        )
+
+    @staticmethod
+    def _provider(mock_backend, *, dispatched: bool) -> ClaudeCodeProvider:
+        mock_backend.get_native_status.return_value = None
+        mock_backend.supports_event_inbox.return_value = False
+        mock_backend.get_history.return_value = ""
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        if dispatched:
+            provider.mark_input_received()
+        return provider
+
+    # Mid-turn, no recorded dispatch (a pane a person typed into, or a provider
+    # re-created from the DB after a server restart): the screen path must read
+    # the live spinner through the wrapped tip row under it.
+    #
+    # The RAW path reads COMPLETED on these two frames on main and at the head
+    # alike, and this PR does not change that: NEW_TUI_BOX_PATTERN needs an
+    # empty ❯ row, and the "❯ Press up to edit queued messages" placeholder
+    # fills it, so the raw walk never finds the box. Asserted as-is rather than
+    # skipped so the gap is recorded; accepting the placeholder is a follow-up
+    # (PR #975 review, Notes).
+    @pytest.mark.parametrize("name", ["queued_rows_mid_turn", "tool_row_queued_spinner"])
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_mid_turn_capture_is_processing_on_the_screen_path(self, mock_backend, name):
+        frame = self._frame(name)
+        assert (
+            self._provider(mock_backend, dispatched=False).get_status_from_screen(frame)
+            == TerminalStatus.PROCESSING
+        )
+        assert (
+            self._provider(mock_backend, dispatched=False).get_status("\n".join(frame))
+            == TerminalStatus.COMPLETED
+        )
+
+    # Same frames with a dispatch recorded: the turn gate already held these
+    # PROCESSING (the spinner's elapsed time is inside the gate frame), and it
+    # must keep doing so.
+    @pytest.mark.parametrize("name", ["queued_rows_mid_turn", "tool_row_queued_spinner"])
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_mid_turn_capture_is_processing_after_a_dispatch(self, mock_backend, name):
+        frame = self._frame(name)
+        assert (
+            self._provider(mock_backend, dispatched=True).get_status_from_screen(frame)
+            == TerminalStatus.PROCESSING
+        )
+
+    # The finished turn: the end-of-turn summary is the newest conversation row
+    # above the now-empty box, so both paths read COMPLETED either way. This is
+    # the control that the P2-2 skipping does not resurrect a done turn.
+    @pytest.mark.parametrize("dispatched", [False, True])
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_turn_ended_capture_is_completed(self, mock_backend, dispatched):
+        frame = self._frame("turn_ended_queued_in_transcript")
+        assert (
+            self._provider(mock_backend, dispatched=dispatched).get_status_from_screen(frame)
+            == TerminalStatus.COMPLETED
+        )
+        assert (
+            self._provider(mock_backend, dispatched=dispatched).get_status("\n".join(frame))
+            == TerminalStatus.COMPLETED
+        )

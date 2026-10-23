@@ -49,3 +49,17 @@ Observed: at 2.1.308 queued messages render at column 0 ABOVE the spinner (the
 2.1.119 frame had an indented `❯ /effort` BELOW it), the queued-box placeholder
 replaces the empty `❯ ` prompt, and the spinner row stayed short enough at 80
 columns that wrapping was not observed.
+
+All three are LOADED BY TESTS — `TestLiveCaptureFixtures` in
+`test/providers/test_claude_code_unit.py` drives each frame through both
+detector paths, with and without a recorded dispatch. They were added as
+documentation only, and CI therefore never saw that the wrapped second row of
+their `⎿ Tip:` line hid the live spinner (PR #975 review, P2-2). A capture in
+the tree that no test loads cannot catch a regression, so keep them wired in.
+
+Known gap, not caused by #974/#975: the RAW `get_status` path reads `completed`
+on the two mid-turn frames, because `NEW_TUI_BOX_PATTERN` needs an empty `❯`
+row and the `❯ Press up to edit queued messages` placeholder fills it, so the
+raw walk never finds the input box. `TestLiveCaptureFixtures` asserts that
+verdict as-is rather than skipping it, so the gap is recorded; accepting the
+placeholder is a follow-up.
