@@ -172,14 +172,59 @@ Each mapping has a `secret_gate`:
 
 - `reject` is the default. A secret-bearing note is quarantined at index time
   and reported.
-- `warn` indexes the note and still reports the secret finding.
+- `warn` indexes the note and still reports the secret finding, and every
+  credential-shaped span is replaced by `[REDACTED:<pattern_name>]` before the
+  note's text reaches an agent, whether by automatic injection or by explicit
+  recall. The note itself is never altered.
+
+Redaction runs on the note body exactly as the scan read it, including a leading
+`# Heading`, which recall removes only afterwards for display. That matters
+because `bearer_token` and `secret_assignment` match across a line break, so a
+heading ending in a key word with the value on the next line is one match. Where
+a marker takes the place of that line break the rest of the value's line becomes
+part of the heading line and is removed with it, so recall can show less of the
+note than it holds. Accepting the printed fingerprint puts the line break back.
 
 Pattern matching is deliberately conservative. A note about credential
-handling can legitimately match a credential-shaped pattern; `warn` is the
-operator escape hatch for indexing and explicit recall in that case. CAO does
-not alter the note, but automatic provider-bound vault injection always
-redacts credential-shaped substrings, including on `warn` mappings configured
-with `inject: true`. That configuration remains visible as a status warning.
+handling can legitimately match a credential-shaped pattern, for example a
+runbook quoting `password: example-value`. To let one specific match through
+raw, add a per-finding acceptance to that note's frontmatter, bound to the
+pattern name and the SHA-256 of the exact matched span:
+
+```yaml
+---
+cao:
+  key: deploy-runbook
+  secret_ok:
+    - pattern: secret_assignment
+      sha256: 3f1a…  # sha256 of the matched span, from `vault scan --fingerprints`
+---
+```
+
+Run `cao memory vault scan --fingerprints` to print the pattern name and hash of
+every match in each note; nothing is stored. An acceptance is honoured only on a
+`warn` mapping and only while the span still matches: editing the value, or a
+new credential of the same shape appearing in the note, falls back to
+redaction. `secret_ok: true` or an entry without `sha256` is an invalid `cao`
+block and quarantines the note. Each honoured acceptance is reported as a
+`secret_accepted` finding and under `secret_acceptances` in
+`cao memory vault status`; one that matches nothing, or sits on a `reject`
+mapping, is reported as `secret_acceptance_unmatched`. Recall counters
+`secret_redaction.*` and `secret_acceptance.spans_passed` count redacted loads
+and raw spans served.
+
+A credential written as an assignment, such as `GITHUB_TOKEN=ghp_…` or
+`Authorization: Bearer ghp_…`, matches twice: the vendor pattern on the value
+and `bearer_token` (or `secret_assignment`) on the assignment around it.
+`--fingerprints` prints both lines, the inner one marked `inside=bearer_token`,
+and both must be accepted before the value is served raw. Fingerprints do not
+change with what you accept: they come from one acceptance-free pass over the
+note, and acceptances are applied to that result. Accepting only the inner pair
+leaves the outer match redacted and reports `secret_acceptance_unmatched`
+naming the fingerprint still needed. `secret_accepted` and `spans_passed` count
+only spans the agent actually received. Line endings inside a span do not
+affect its fingerprint, so a note saved with CRLF gets the same values as one
+saved with LF.
 
 For managed writes, the gate checks the authored body and CAO-generated
 `cao` metadata before publishing. Preserved user frontmatter is not scanned or
@@ -198,7 +243,7 @@ rescanning or mutating a vault.
 
 ```text
 cao memory vault status [--format table|json]
-cao memory vault scan [--dry-run]
+cao memory vault scan [--dry-run] [--fingerprints]
 cao memory vault reconcile [--apply] [--format table|json]
 cao memory vault rebuild --apply
 cao memory vault migrate --scope {global|project|agent} [--scope-id ID] [--apply] [--delete-source] [--confirm-delete-source]

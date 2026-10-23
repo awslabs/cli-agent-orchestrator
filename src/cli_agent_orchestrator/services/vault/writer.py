@@ -331,9 +331,13 @@ def _merge_cao_fields(
     cao: Mapping[str, Any],
     boundary: Optional[tuple[FrontmatterRegion, str]],
 ) -> Mapping[str, Any]:
-    """Update caller-owned CAO fields while retaining authored links."""
+    """Update caller-owned CAO fields while retaining authored links and acceptances.
+
+    ``cao.secret_ok`` is operator-authored (#644): a managed rewrite must not
+    drop a per-finding acceptance the operator wrote into the note.
+    """
     merged = dict(cao)
-    if "links" in merged or boundary is None:
+    if boundary is None or ("links" in merged and "secret_ok" in merged):
         return merged
     region, _newline = boundary
     try:
@@ -343,8 +347,10 @@ def _merge_cao_fields(
     if not isinstance(loaded, Mapping):
         return merged
     existing_cao = loaded.get("cao")
-    if isinstance(existing_cao, Mapping) and "links" in existing_cao:
-        merged["links"] = existing_cao["links"]
+    if isinstance(existing_cao, Mapping):
+        for retained in ("links", "secret_ok"):
+            if retained not in merged and retained in existing_cao:
+                merged[retained] = existing_cao[retained]
     return merged
 
 

@@ -737,8 +737,15 @@ class HerdrBackend(TerminalBackend):
         strip_escapes: bool = False,
         full_history: bool = False,
         visible_only: bool = False,
+        join_wrapped: bool = False,
     ) -> str:
-        """Read pane output via herdr pane read."""
+        """Read pane output via herdr pane read.
+
+        ``join_wrapped`` is accepted for contract parity and ignored: ``herdr
+        pane read`` has no rejoin flag, so a caller gets whatever line shape
+        herdr returns. Callers that need a wrapped line intact must not rely
+        on it here (codex._find_config_rejection reassembles as context only).
+        """
         pane_id = self._resolve_pane_id_from_window(session_name, window_name)
 
         args = ["pane", "read", pane_id]

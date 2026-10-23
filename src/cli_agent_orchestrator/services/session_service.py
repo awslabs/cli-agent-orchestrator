@@ -82,6 +82,7 @@ async def create_session(
     model: str | None = None,
     use_worktree: bool = False,
     idempotency_key: str | None = None,
+    caller_ceiling: list[str] | None = None,
     resume_session_id: str | None = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
@@ -155,6 +156,7 @@ async def create_session(
         metadata=metadata,
         description=description,
         create_working_directory=create_working_directory,
+        caller_ceiling=caller_ceiling,
     )
     dispatch_plugin_event(
         registry,
