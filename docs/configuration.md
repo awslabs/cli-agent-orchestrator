@@ -465,6 +465,18 @@ Rendered-screen status detection adds `CAO_PYTE_STATUS` (default `true`) and `CA
 | `CAO_PIPE_LIVENESS_COLD_START_GRACE_S` | `3.0` | float | Grace period after a terminal is registered before a FIFO that has never delivered a single byte is treated as a cold-start stall (harness-control#93) instead of "still booting". |
 | `CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS` | `5` | int | Consecutive cold-start re-arm attempts (rearm() succeeded but the pipe still never delivered) before the watchdog gives up on a terminal — a separate failure class and counter from `CAO_PIPE_LIVENESS_MAX_REARM_FAILURES`, which only counts rearm() raising. |
 
+Execution runtimes ([#745](https://github.com/awslabs/cli-agent-orchestrator/issues/745)) add the variables below, read directly by `cao-server` and `cao-bridge`. [Running `cao-bridge`](execution-runtimes.md#running-cao-bridge) has their full rules.
+
+| Env var | Default | Type | Purpose |
+|---|---|---|---|
+| `CAO_LOCAL_EXECUTION` | on | bool | `0`/`false`/`no`/`off`: the server starts no agents itself; local terminal creation answers `409`. |
+| `CAO_RUNTIME_TOKEN_FILE` | *(none)* | str (path) | File holding the shared runtime token (server and `cao-bridge`). Takes precedence over `CAO_RUNTIME_TOKEN`. |
+| `CAO_RUNTIME_TOKEN` | *(none)* | str | The runtime token itself. With neither set, the server refuses every runtime. |
+| `CAO_RUNTIME_LAUNCH_TIMEOUT` | `240` | float (s) | How long the server waits for a runtime's launch before `504`. |
+| `CAO_BRIDGE_SERVER_URL` | *(required)* | str (`ws://`/`wss://` URL) | The server channel `cao-bridge` dials. |
+| `CAO_BRIDGE_RUNTIME_ID` | *(required)* | str | `cao-bridge`'s runtime id, one URL path segment. |
+| `CAO_BRIDGE_READY_FILE` | `$CAO_HOME_DIR/bridge-ready` | str (path) | Exists only while `cao-bridge`'s channel is up. |
+
 The `cao fleet` / `cao worker` commands ([control planes](control-planes.md#remote-fleets)) add two more, read directly in `utils/fleet.py`. They are the only configuration those commands take, and neither has a default: without both, every leaf exits with `No fleet configured.` rather than falling back to the local server.
 
 | Env var | Default | Type | Purpose |

@@ -82,6 +82,15 @@ async def _validate_reused_terminal(
     metadata = await asyncio.to_thread(terminal_service.get_terminal_metadata, terminal_id)
     if metadata is None:
         raise ValueError(f"Terminal '{terminal_id}' not found")
+    if metadata.get("runtime_id") is not None:
+        from cli_agent_orchestrator.models.terminal import LocalExecutionDisabledError
+
+        # Its status and output live in an execution runtime (#745); this
+        # step's wait and extraction read them on this server.
+        raise LocalExecutionDisabledError(
+            f"terminal {terminal_id} runs in an execution runtime; run-step drives "
+            "terminals on this server only"
+        )
 
     persisted_provider = metadata.get("provider")
     if persisted_provider != requested_provider:

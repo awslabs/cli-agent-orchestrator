@@ -84,8 +84,16 @@ def install_access_log_redaction() -> None:
             logger_.addFilter(RedactQueryTokenFilter())
 
 
-def setup_logging() -> None:
-    """Setup logging configuration."""
+def setup_logging(
+    command: str = "cao-server",
+    label: str = "Server",
+    console_level: int = logging.WARNING,
+) -> None:
+    """Setup logging configuration; the console banner names ``label`` and ``command``.
+
+    ``console_level`` is the least a record must be to reach stderr as well as
+    the log file.
+    """
     log_level = str(ConfigService.get("logging.level", default="INFO")).upper()
 
     # Ensure log directory exists
@@ -99,7 +107,7 @@ def setup_logging() -> None:
     # events surface on the console (and in a subprocess's captured stdout/stderr,
     # which the e2e harness asserts on) rather than being buried in the log file.
     stderr_handler = logging.StreamHandler(sys.stderr)
-    stderr_handler.setLevel(logging.WARNING)
+    stderr_handler.setLevel(console_level)
     stderr_handler.setFormatter(logging.Formatter(fmt))
 
     logging.basicConfig(
@@ -108,6 +116,7 @@ def setup_logging() -> None:
         handlers=[logging.FileHandler(log_file), stderr_handler],
     )
 
-    print(f"Server logs: {log_file}")
-    print("For debug logs: export CAO_LOG_LEVEL=DEBUG && cao-server")
+    # Flushed: on a pipe (a container's stdout) print is block-buffered.
+    print(f"{label} logs: {log_file}", flush=True)
+    print(f"For debug logs: export CAO_LOG_LEVEL=DEBUG && {command}", flush=True)
     logging.info(f"Logging to: {log_file}")

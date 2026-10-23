@@ -142,6 +142,11 @@ provider override while keeping the same sequence.
   provider enforcement.
 - [Kubernetes deployment](examples/cao-clusters/kubernetes/eks/README.md): run a supervisor and worker fleet on
   Amazon EKS, with shared workspace, per-pod state, and credential delivery.
+- [Execution runtimes](docs/execution-runtimes.md): run agents in separate
+  runtime processes or pods (`cao-bridge`) behind one `cao-server` that runs
+  none itself; local mode needs no `cao-bridge` (first slice; see
+  [Running `cao-bridge`](docs/execution-runtimes.md#running-cao-bridge) and the
+  [EKS example](examples/cao-clusters/kubernetes/remote-runtime/README.md)).
 - [Updating CAO](docs/updating.md): update an installed uv tool.
 
 ### Configure and integrate
