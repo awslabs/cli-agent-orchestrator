@@ -1289,6 +1289,7 @@ class TestCreateTerminalInSession:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "developer",
                     "idempotency_key": "job-1",
@@ -1306,6 +1307,7 @@ class TestCreateTerminalInSession:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "developer",
                     "lookup_only": "true",
@@ -1325,6 +1327,7 @@ class TestCreateTerminalInSession:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "developer",
                     "idempotency_key": "job-1",
