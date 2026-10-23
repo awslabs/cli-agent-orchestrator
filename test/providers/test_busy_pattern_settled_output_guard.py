@@ -336,15 +336,53 @@ class TestSingleConversationRowWalker:
         Visitor().visit(tree)
         return hits
 
+    # Patterns the walker consults that also have a job OUTSIDE it, so the
+    # one-function rule below cannot apply to them. The effort footer is also
+    # stripped out of response text (_strip_effort_footer_lines and the
+    # response extractor), which is a different question from "is this row
+    # conversation". Anything not listed here is skip-set-only.
+    SHARED_WITH_OTHER_JOBS = {"EFFORT_FOOTER_LINE_PATTERN"}
+
+    @staticmethod
+    def _patterns_referenced_in(func_name: str) -> set:
+        """The ``*_PATTERN`` names the body of ``func_name`` consults."""
+        import ast
+        import inspect
+
+        import cli_agent_orchestrator.providers.claude_code as cc
+
+        found: set = set()
+        for node in ast.walk(ast.parse(inspect.getsource(cc))):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
+                for inner in ast.walk(node):
+                    if isinstance(inner, ast.Name) and inner.id.endswith("_PATTERN"):
+                        found.add(inner.id)
+        return found
+
     def test_the_row_skip_set_has_one_definition(self):
-        """The chrome/status-area patterns may be consulted by the shared walker
-        only. A new walker would have to reference them (or silently diverge by
-        reproducing their text, which the behaviour tests above catch)."""
-        hits = self._functions_referencing(
-            {"NEW_TUI_BOX_CHROME_PATTERN", "STATUS_AREA_ROW_PATTERN"}
-        )
-        assert hits["NEW_TUI_BOX_CHROME_PATTERN"] == {"_newest_conversation_row"}
-        assert hits["STATUS_AREA_ROW_PATTERN"] == {"_newest_conversation_row"}
+        """Every pattern the shared walker consults may be consulted by the
+        shared walker only. A new walker would have to reference them (or
+        silently diverge by reproducing their text, which the behaviour tests
+        above catch).
+
+        The skip set is read OUT of the walker rather than listed here. Listing
+        it was the smaller version of the same defect class: when P2-2 added
+        CHROME_CONTINUATION_ROW_PATTERN to the walker, a hand-written list of
+        two names would have gone on passing while the new pattern was
+        unguarded. Deriving it means a pattern is covered the moment it joins
+        the walker.
+        """
+        skip_set = self._patterns_referenced_in("_newest_conversation_row")
+        # Sanity: the derivation found the walker and its three row patterns.
+        assert {
+            "NEW_TUI_BOX_CHROME_PATTERN",
+            "STATUS_AREA_ROW_PATTERN",
+            "CHROME_CONTINUATION_ROW_PATTERN",
+        } <= skip_set, skip_set
+        guarded = skip_set - self.SHARED_WITH_OTHER_JOBS
+        hits = self._functions_referencing(guarded)
+        for name in sorted(guarded):
+            assert hits[name] == {"_newest_conversation_row"}, (name, hits[name])
 
     def test_both_detector_paths_walk_through_the_shared_helper(self):
         hits = self._functions_referencing({"_newest_conversation_row"})
