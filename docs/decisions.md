@@ -180,6 +180,7 @@ provider has been built and its start has completed or been scheduled. A
 deferred startup failure updates the record to `launch_failed` without emitting
 a second decision span. A cancelled deferred start also moves a previously
 launched row to `launch_failed`, with no second emission.
+A launch refused by the creator's delegation ceiling is recorded as `not_launched`.
 
 Records never hold task messages, descriptions, purposes, prompts or working directories.
 Messages, descriptions and purposes are redacted before every decider call, including the
@@ -236,3 +237,8 @@ expose decision access through agent-tool registration hooks. This version inclu
 - Terminal records expose the launched model and whether it was honored, independently of decision state; decision fields stay in operator records.
 - If a policy tightens between a launch and `create_terminal`'s own idempotent retry, the retry can be refused before replaying the existing terminal. This does not occur with an identity policy. Each replayed delegation create writes its own `not_launched` row; in shadow or on the decider is asked again.
 - A direct API delegation to a reserved ephemeral name without a claim, carrying a per-call model, is refused at the delegation site with HTTP 400 "set the tier in the spec instead of a per-call model". The response names no reason code and no decision record is written. The ephemeral launch policy never sees the request, so it does not log the refusal either. Assign and handoff refuse reserved names before sending any request. A claimed launch skips the delegation site and is refused, and logged, by the ephemeral policy itself.
+- A delegation is decided before the server applies the creator's delegation ceiling. A launch
+  the ceiling refuses (403) has still been decided: in shadow or on, the decider was asked once
+  with the redacted message, and in on mode the refusal waits for that answer. Its records are
+  `not_launched` with no terminal ID. Local assign and handoff check the ceiling before sending,
+  so this affects direct API calls, remote placement and installed-policy refusals.

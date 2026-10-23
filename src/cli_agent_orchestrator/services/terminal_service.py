@@ -2441,7 +2441,14 @@ async def _create_terminal_unguarded(
         return terminal
 
     except Exception as e:
-        _bind_decision_launch(launch_plan, launch_status="launch_failed")
+        # A delegation-ceiling refusal (#948, Steps 0c/0d) is raised before
+        # anything is allocated: the launch was refused, not attempted.
+        _bind_decision_launch(
+            launch_plan,
+            launch_status=(
+                "not_launched" if isinstance(e, DelegationCeilingError) else "launch_failed"
+            ),
+        )
         if not isinstance(e, ephemeral_service.EphemeralPolicyError):
             logger.error(f"Failed to create terminal: {e}")
         # Everything this call built is torn down by ONE owned operation

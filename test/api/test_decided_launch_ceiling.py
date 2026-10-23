@@ -8,6 +8,7 @@ check; this pins the current ordering pending the architect's separate ruling.
 
 from test.api.test_delegation_script_tier import TestRunStepHandler as _ScriptTier
 from test.api.test_delegation_script_tier import isolated_journal  # noqa: F401
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,17 +28,18 @@ def decisions_on(monkeypatch):
     from cli_agent_orchestrator.api import main
     from cli_agent_orchestrator.decisions import engine
 
-    calls = []
+    state = SimpleNamespace(requests=[], binds=[])
 
     async def fake_prepare(req, **kw):
-        calls.append(req)
+        state.requests.append(req)
         return LaunchPlan(model=None)
 
     monkeypatch.setattr(main, "prepare_launch", fake_prepare)
-    monkeypatch.setattr(main, "bind_launch", lambda *a, **k: None)
+    record_bind = lambda plan, **k: state.binds.append(k.get("launch_status"))
+    monkeypatch.setattr(main, "bind_launch", record_bind)
     monkeypatch.setattr(main, "launch_note", lambda *a, **k: None)
-    monkeypatch.setattr(engine, "bind_launch", lambda *a, **k: None)
-    return calls
+    monkeypatch.setattr(engine, "bind_launch", record_bind)
+    return state
 
 
 class TestScriptTierUnderDecisionsOn(_ScriptTier):
@@ -47,7 +49,9 @@ class TestScriptTierUnderDecisionsOn(_ScriptTier):
 @pytest.mark.usefixtures("isolated_memory_db", "isolated_journal")
 class TestDecidedLaunchKeepsCreatorCeiling:
     def _refused(self, resp, backend, decisions_on, tools=True):
-        assert len(decisions_on) == 1, "the decision-routed branch must be taken"
+        assert len(decisions_on.requests) == 1, "the decision-routed branch must be taken"
+        # 76b: a ceiling refusal is recorded as not launched, never as a failed launch.
+        assert decisions_on.binds and set(decisions_on.binds) == {"not_launched"}
         assert resp.status_code == 403, resp.text
         detail = resp.json()["detail"]
         assert "Delegation refused" in detail
