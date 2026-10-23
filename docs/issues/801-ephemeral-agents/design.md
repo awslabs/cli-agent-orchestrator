@@ -175,17 +175,20 @@ not explicitly disabled. See section 0 for checked code and coverage.
   and a free `model` string (`models/agent_profile.py`). A creator that writes frontmatter can escalate through any of
   them.
 - **Historical #810 author proposal (2026-09-30; awaiting confirmation):**
-  - a literal `auto` marks a field for CAO to fill;
-  - the fallback for an `auto` field is the first of these that exists: (a) the profile default, (b) the operator's
-    policy default, (c) leaving the field out;
-  - an explicit value wins over the decider only. An explicit value above the policy ceiling is rejected, and the error
-    names the ceiling.
+  - the [09-30 #801 comment](https://github.com/awslabs/cli-agent-orchestrator/issues/801#issuecomment-5903684322)
+    proposed model tier and effort as `auto`, supplied by #810's model.route and effort.route decision points;
+  - its stated rule was "an explicit value always wins".
 - **Shipped vocabulary from #863, not the earlier #810 wording:**
   - `decisions/types.py:26` defines POINTS.options as small/medium/large model sizes
     and low/medium/high effort, with a separate unsure answer.
   - #810's earlier issue/author text used simple/medium/complex classifications;
     its small tier-table example did not establish the later shipped option set.
 - **Proposed ephemeral integration (awaiting confirmation):**
+  - the design's own earlier proposal expands fallback into (a) profile default,
+    (b) operator policy default, then (c) omit; that chain is not stated in the 09-30 comment;
+  - the design's own earlier proposal says an explicit value wins over the decider only,
+    and rejects values above the policy ceiling with an error naming that ceiling;
+    those qualifications are not attributed to the 09-30 comment;
   - the spec is the only source of tier for an ephemeral target;
   - an unmapped tier never means "pass no model".
 
@@ -1464,8 +1467,9 @@ request/creation/approval (Q8–Q10), and decider content/policy/eligibility
 about what main implements, nor a claim of maintainer approval.
 
 E2's M1–M7 and optional min_tier MF1–MF6 remain pending; see the linked public
-proposals in the status block. E3 security/catalog/lifecycle follow-ups also need
-review. The document does not say the E side has no open items.
+proposals in the status block. Small E1 follow-ups for every-load profile_sha256,
+`skills: []` and workflow_cancel, and E3 lifecycle follow-ups also need review.
+The document does not say the E side has no open items.
 
 ## 7. Assumptions
 
