@@ -35,19 +35,12 @@ from cli_agent_orchestrator.utils.orchestration import (
 _SRV = "cli_agent_orchestrator.utils.orchestration"
 
 
-@pytest.fixture(autouse=True)
-def _remote_node_enforces_ceilings(request):
-    """Every remote placement first probes the target's /health for the
-    ``delegation_ceiling`` feature and reads this terminal's own recorded
-    ceiling. Those two seams are stubbed here (target enforces; ceiling ``*``)
-    so the placement tests below stay about placement. The probe itself is
-    covered in test_delegation_remote.py.
-    """
-    with (
-        patch(f"{_SRV}._require_remote_delegation_ceiling", return_value=None),
-        patch(f"{_SRV}._own_delegation_ceiling", return_value=["*"]),
-    ):
-        yield
+# Every remote placement first probes the target's /health for the
+# ``delegation_ceiling`` feature and reads this terminal's own recorded ceiling.
+# The shared fixture answers both (target enforces; ceiling ``*``) so the tests
+# below stay about placement. The probe itself is covered in
+# test_delegation_remote.py.
+pytestmark = pytest.mark.usefixtures("remote_ceiling_ready")
 
 
 def _response(status_code=200, json_body=None):
