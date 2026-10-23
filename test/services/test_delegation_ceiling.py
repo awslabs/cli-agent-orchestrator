@@ -5,8 +5,7 @@ intermediate terminal's recorded ceiling the way the server does; tmux, the
 provider and the FIFO pipeline are mocked.
 """
 
-import os
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 

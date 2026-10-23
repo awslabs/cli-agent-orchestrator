@@ -569,22 +569,28 @@ class TestPreExpansionMarker:
     def test_only_the_unmarked_entry_is_re_resolved(self, monkeypatch):
         """CAO's ``${VAR}`` pass must skip a marked entry and process the rest.
 
-        Scoped to the predicate's *effect on the pass*, deliberately. An earlier
-        version of this test re-implemented ``install_service``'s comprehension
-        over a hand-built dict, which meant it passed whether or not the real
-        module contained that branch at all — and for a while the real branch was
-        unreachable because nothing ever put a marked entry into a profile.
+        Driven through the REAL comprehension, in the module that owns it. Two
+        earlier versions of this test did not do that and so could not fail:
+        the first re-implemented the comprehension over a hand-built dict, and
+        the second monkeypatched ``install_service.resolve_mcp_server_config``
+        and then *called that monkeypatch itself*, asserting its own lambda had
+        run. The second only needed the three names to exist as attributes of
+        ``install_service`` -- and they were stale re-import aliases there,
+        unreferenced by any code in that module since the pass moved to
+        ``agent_plugins/mcp_delivery.py`` (``_deliverable``, line ~494). Removing
+        those dead imports is what exposed this (#1005).
 
-        The end-to-end assertions now live in ``test_mcp_delivery.py``, which
+        The end-to-end assertions live in ``test_mcp_delivery.py``, which
         installs a plugin, runs ``install_agent``, and reads the provider config.
-        What is left here is the unit-level fact that module owns: given a mixed
-        dict, ``resolve_mcp_server_config`` sees exactly the unmarked entries.
+        What is left here is the unit-level fact ``mcp_delivery`` owns: given a
+        mixed ``mcpServers`` dict, CAO's resolution sees exactly the unmarked
+        entries, and the marked one keeps its unexpanded literal.
         """
-        from cli_agent_orchestrator.services import install_service
+        from cli_agent_orchestrator.agent_plugins import mcp_delivery
 
         seen = []
         monkeypatch.setattr(
-            install_service,
+            mcp_delivery,
             "resolve_mcp_server_config",
             lambda cfg, persisted=False: seen.append(dict(cfg)) or cfg,
         )
@@ -592,15 +598,19 @@ class TestPreExpansionMarker:
         marked = {"type": "stdio", "command": "x", "args": ["${FOO}"], PRE_EXPANDED_KEY: True}
         ordinary = {"type": "stdio", "command": "y"}
 
-        assert install_service.is_plugin_mcp_entry(marked)
-        assert not install_service.is_plugin_mcp_entry(ordinary)
+        class _Profile:
+            mcpServers = {"marked": dict(marked), "ordinary": dict(ordinary)}
 
-        install_service.resolve_mcp_server_config(dict(ordinary), persisted=True)
-        assert seen == [ordinary]
+        profile = _Profile()
+        # No store, so nothing is merged IN -- the profile's own two entries are
+        # all that reach the comprehension, which is exactly what is under test.
+        mcp_delivery.apply_plugin_mcp_servers(profile, persisted=True, normalize_existing=True)
 
-        stripped = install_service.strip_plugin_mcp_marker(marked)
-        assert stripped["args"] == ["${FOO}"], "the plugin's literal must survive unexpanded"
-        assert PRE_EXPANDED_KEY not in stripped
+        assert seen == [ordinary], "CAO's resolution must see the unmarked entry and only it"
+        assert profile.mcpServers["marked"]["args"] == [
+            "${FOO}"
+        ], "the plugin's literal must survive unexpanded"
+        assert PRE_EXPANDED_KEY not in profile.mcpServers["marked"]
 
 
 class TestDocumentLevelFailures:

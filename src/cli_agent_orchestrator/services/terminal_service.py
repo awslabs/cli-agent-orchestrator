@@ -23,7 +23,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import threading
 import time
 import uuid
@@ -38,9 +37,13 @@ from pydantic import ValidationError
 
 from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.clients.database import (
-    delete_terminals_by_session,  # Compatibility/test seam: creation no longer bulk-deletes with this helper, but older integrations/tests patch the imported symbol while exercising create_terminal. Keep the name exported from this module until that seam can be retired separately.
-)
+
+# Compatibility/test seam: creation no longer bulk-deletes with this helper, but older
+# integrations/tests patch the imported symbol while exercising create_terminal. Keep the
+# name exported from this module until that seam can be retired separately. ``isort: skip``
+# keeps the line out of the merged import below so the ``noqa`` stays on this name only, and
+# ``fmt: skip`` stops black from wrapping it, which would move both pragmas off the name.
+from cli_agent_orchestrator.clients.database import delete_terminals_by_session  # noqa: F401  # isort: skip  # fmt: skip
 from cli_agent_orchestrator.clients.database import (
     count_runtime_allocated_terminals,
     create_inbox_message,
@@ -52,7 +55,6 @@ from cli_agent_orchestrator.clients.database import (
     get_idempotency_record,
     get_session_incarnation,
     get_terminal_metadata,
-    list_all_terminals,
     list_pending_deferred_init_external_owner_terminal_ids,
     list_pending_initial_delivery_terminal_ids,
     list_siblings_by_group_prefix,
@@ -60,7 +62,6 @@ from cli_agent_orchestrator.clients.database import (
     update_last_active,
     update_terminal_deferred_init_external_owner,
     update_terminal_deferred_init_failure,
-    update_terminal_deferred_init_runtime_reclaimed,
     update_terminal_description,
     update_terminal_group,
     update_terminal_initial_delivery,
