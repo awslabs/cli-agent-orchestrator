@@ -137,6 +137,18 @@ means an assumption in section 7.
 
 ### ADR-1: Spec shape
 
+**Proposed amendment ([#801 comment 6282810139](https://github.com/awslabs/cli-agent-orchestrator/issues/801#issuecomment-6282810139); pending M1–M7).**
+A1-1: reuse #863's load_model_tiers unchanged with the same raw settings dict as
+block validation, not a second settings read. Unreadable settings remain a
+configuration error, not an empty table. A1-2: after block validation, check the
+ceiling before mapping; tier_unmapped is reachable without max_tier, while a
+ceiling yields tier_exceeds_policy or policy_config_error:model_tiers. A1-3:
+resolve tier/effort once at create and store them on the row; map the ID at create
+and again in finalize from the claim snapshot. A claimed launch picks up remaps;
+a claim-less owner launch uses the ID in its already loaded create/previous-finalize
+profile. Defaults are not silently re-resolved. These amendments supersede the
+original future-plan phrasing below if confirmed.
+
 **As built: shipped in #881.** The shape below is the intended full contract.
 E1 accepts omitted tier/effort only; explicit values refuse tier_not_supported or
 effort_not_supported, and auto refuses auto_requires_decision_platform even though
@@ -173,7 +185,7 @@ Effort is ordered so that a ceiling can compare it (C10).
 - **Explicit:**
   - Used as given, and never sent to a decider.
   - Policy still applies (ADR-5). A value above the ceiling is **rejected** at create, with an error that names the ceiling: `tier_exceeds_policy: max_tier=medium`, or `effort_exceeds_policy: max_effort=medium` (C10). It is never clamped.
-  - An explicit tier with no `model_tiers.<provider>.<tier>` entry is rejected at create with `tier_unmapped`, naming the key, with or without `max_tier`.
+  - Without max_tier, an unmapped explicit tier refuses tier_unmapped. With max_tier, block validation and then the ceiling take precedence (proposed A1-2).
 - **Omitted:**
   - Gets the fallback. It is resolved at create and written into the live profile.
   - No decider is asked.
@@ -362,6 +374,25 @@ agent directory needs a later owned-file manifest.
 
 ### ADR-5: Policy envelope and tool ceiling
 
+**Proposed amendment ([#801 comment 6282810139](https://github.com/awslabs/cli-agent-orchestrator/issues/801#issuecomment-6282810139); pending M1–M7).**
+A5-1: use #863's pure PolicyBounds.validate for rules 1–7 from E2, keeping E's key
+validation and stable policy_config_error:<key> messages; do not wait until E5.
+A5-2: preserve E's public tier_exceeds_policy/effort_exceeds_policy/tier_unmapped
+vocabulary through E5, translating S1 reason values rather than exception types.
+A5-3: a stored NULL tier/effort under a newly added ceiling is tightening, not a
+silent switch to the new default; refuse and collect with the corresponding E rule.
+A5-4: a broken block reverts any owner kind to pending as E1 already does; planned
+E4 validates before create/claim on EXECUTE, so it should never reach that revert.
+end_claim failure for workflow ownership is a different transition. These notes
+supersede the old validator-swap and S1-reason vocabulary proposals below.
+
+**Proposed: optional min_tier floor ([#801 comment 6306655853](https://github.com/awslabs/cli-agent-orchestrator/issues/801#issuecomment-6306655853);
+pending MF1–MF6).** An operator may optionally bound model tiers from below as
+well as above. Floor/default/ceiling consistency, explicit refusal, claim-time
+recheck, decider/fallback treatment and the S1 policy seam need confirmation.
+This is not an E1 setting or an accepted E2 requirement; the linked proposal
+contains the alternatives and full rules.
+
 **As built: shipped in #866/#881/#898/#905.** E1 validates enabled state, allowed
 providers, positive max_brief_bytes/pending_ttl_seconds/claim_lease_seconds, and
 max_depth exactly 1. It enforces the recorded literal-atom tool ceiling and stored
@@ -423,13 +454,13 @@ This is not fixed by the general middleware because children hold its server gra
     - Only a block that passes can produce `policy_changed`.
     - *Example:* there is no `max_tier`, `default_tier=small`, and a stored explicit `small`. The operator then deletes `model_tiers.claude_code.small`. Rule 4 fails, so the claim returns `policy_config_error`, naming that key, and the name returns to `pending`. The name does not become `gc(policy_changed)`, whether through E's `tier_unmapped` or S1's `explicit_unmapped`.
     - *Contrast:* with no `default_tier`, deleting the mapping of a stored explicit tier breaks no block rule. It is a violation (`tier_unmapped`; from E5, S1's `explicit_unmapped`), so the name goes to `gc(policy_changed)`. That is correct, because the creator can fix it by re-creating with a mapped tier or with none.
-    - **One implementation per rule** (proposed for #810; awaiting maintainer confirmation). From E5, rules 1-7 call S1's `PolicyBounds.validate` in place of E's own code. Otherwise the two validators could drift, and a block could pass E's check and then fail S1's on the same rule. Rule 8 stays E's own, because `PolicyBounds` does not cover it. E builds `PolicyBounds` with `allowed_providers` set to its resolved, non-empty list (rule 8), never `None`. From E5, E keeps no other check of its own, and relies on #810's S1c fix to `validate` (E5 *Requires*). With the list set, `validate` then checks rules 3-4 for every allowed provider, including one with no entries in `model_tiers`, which fails with `policy_invalid` naming `model_tiers.<provider>.<tier>`. With `None`, it would check only the providers listed in `model_tiers`. So rules 3-4 mean the same before and from E5. From E5, S1's `default_unmapped` cannot fire for E, even in the settings race. `prepare_launch` reads one settings snapshot for `validate` and for the fallbacks, and its provider check comes before the default check. `validate` then requires `default_tier` to be mapped for every allowed provider, so a settings edit between E's read and `prepare_launch` shows up as `policy_invalid`. E still maps `default_unmapped` (E5), but only as a safeguard.
+    - **One implementation per rule** (proposed A5-1, awaiting confirmation). From E2, rules 1–7 reuse #863's pure PolicyBounds.validate. Otherwise the two validators could drift, and a block could pass E's check and then fail S1's on the same rule. Rule 8 stays E's own, because `PolicyBounds` does not cover it. E builds `PolicyBounds` with `allowed_providers` set to its resolved, non-empty list (rule 8), never `None`. From E5, E keeps no other check of its own, and relies on #810's S1c fix to `validate` (E5 *Requires*). With the list set, `validate` then checks rules 3-4 for every allowed provider, including one with no entries in `model_tiers`, which fails with `policy_invalid` naming `model_tiers.<provider>.<tier>`. With `None`, it would check only the providers listed in `model_tiers`. So rules 3-4 mean the same before and from E5. From E5, S1's `default_unmapped` cannot fire for E, even in the settings race. `prepare_launch` reads one settings snapshot for `validate` and for the fallbacks, and its provider check comes before the default check. `validate` then requires `default_tier` to be mapped for every allowed provider, so a settings edit between E's read and `prepare_launch` shows up as `policy_invalid`. E still maps `default_unmapped` (E5), but only as a safeguard.
 - **Tier, effort and provider rules:**
   - **Explicit tier above `max_tier`:** `tier_exceeds_policy: max_tier=<t>`. **Explicit effort above `max_effort`:** `effort_exceeds_policy: max_effort=<e>`. Both are rejected at create and never clamped.
-  - **Explicit tier unmapped** for the spec's provider: `tier_unmapped: model_tiers.<provider>.<tier> is not set; map it or omit model_tier`, with or without `max_tier`.
+  - **Explicit tier unmapped:** tier_unmapped without max_tier; with a ceiling, block validation/ceiling refusal take precedence (proposed A1-2).
   - **Per-call `model`** on an ephemeral target: `model_override_not_allowed` (ADR-1). There is no reverse-mapping, and `model_exceeds_policy` is dropped.
   - **Claim re-check (authoritative; create gives the early error; Q12; proposed, awaiting maintainer confirmation).** Claim, which runs before the decision (ADR-2), validates the stored values again against the current block and tier table. A retry of an already launched claim is answered before this check (ADR-2). In workflows the check runs only on run-step's EXECUTE branch (ADR-7), so a replayed, completed step is never refused.
-    - **A tightened policy** refuses the launch with `policy_changed_since_create:<reason> (<detail>); re-create the ephemeral agent`, and moves the name straight to `gc(policy_changed)`. It does not return to `pending`. Before E5, `<reason>` is E's own rule: `tier_exceeds_policy`, `effort_exceeds_policy`, `tier_unmapped` or `provider_not_allowed`. From E5 the check is #810's `prepare_launch` with E's `PolicyBounds`, and `<reason>` is its policy-violation reason (`above_ceiling`, `explicit_unmapped` or `provider_not_allowed`), with S1's detail naming the key or the provider. E classifies a refusal by the error's `reason`, not by its exception class (E5).
+    - **A tightened policy** refuses the launch with `policy_changed_since_create:<reason> (<detail>); re-create the ephemeral agent`, and moves the name straight to `gc(policy_changed)`. It does not return to `pending`. Before E5, `<reason>` is E's own rule: `tier_exceeds_policy`, `effort_exceeds_policy`, `tier_unmapped` or `provider_not_allowed`. From E5, proposed A5-2 maps #810's prepare_launch reasons to the same E vocabulary; S1's reason never replaces the public E rule. E classifies a refusal by the error's `reason`, not by its exception class (E5).
     - **A block that fails validation** is a configuration error, not a tightening (proposed decision, awaiting maintainer confirmation). The error says what to fix: `policy_config_error:<reason> (<detail>); the operator must fix <key> in settings before any launch can succeed`.
       - Before E5, `<reason>` is the failing block rule above, and `<key>` is the key it names.
       - From E5, a failure of rules 1-7 comes from `PolicyBounds.validate`. `<reason>` is then S1's `policy_invalid`, the only reason `validate` gives, and `<key>` comes from S1's detail, for example `model_tiers.<provider>.<tier>`. A failure of rule 8 keeps E's own reason.
@@ -612,6 +643,19 @@ list is still a data-only change.
 
 ### ADR-9: The decision seam (consumes the #810 contract)
 
+**Proposed amendment ([#801 comment 6282810139](https://github.com/awslabs/cli-agent-orchestrator/issues/801#issuecomment-6282810139); pending M1–M7).**
+A9-1: introduce finalize(name, claim_id, values) in E2; values hold resolved tier,
+model ID and effort from the claim snapshot. The file replacement and guarded hash
+update must also be fenced against stale claimers before remaps can change bytes.
+A9-2: terminal model/model_honored already ship; E2 tests explicit/default mapped
+launches without a duplicate record. Audit finalized values describe the file;
+links to decision records remain E5. v1 providers honor the model (Claude has no
+native_agent), so honored=false is a test-double case, not an expected v1 launch.
+A9-3: decision placement is M7, flagged but not decided. Claim-call placement and
+server launch-site placement remain alternatives; E2 adds no decider/engine code
+and must permit either. The detailed original sequence below describes the
+claim-call alternative, not the selected architecture.
+
 **Status:** Planned E5. E1 has finalize(name, claim_id), no values parameter, no decision_inputs and no decider calls. Terminal model records already ship; M7 keeps placement open.
 **Context.**
 - The 2026-09-30 decision [recorded on #810](https://github.com/awslabs/cli-agent-orchestrator/issues/810#issuecomment-5903684048) makes #810 (the decision platform in CAO core) the single owner of the decider contract. Dynamic agents use it and must not define a parallel interface, record or states.
@@ -641,7 +685,7 @@ list is still a data-only change.
 **Decision (proposal; awaiting maintainer confirmation).**
 1. **No parallel contract.** The E layer defines no decider types, record shape or states; it imports #810's.
 2. **Mapping.** `model_tier: auto` becomes a `model.route` question, and `effort: auto` becomes an `effort.route` question, both in one decider request. Explicit and omitted fields are never asked about.
-3. **When and where: in the delegation handler, after the claim** (C7; #810 S1 pins the exact spot). For an ephemeral target, the order is:
+3. **Claim-call alternative (M7 pending): after the claim.** Exact E5 placement is not selected. For an ephemeral target, the order is:
    1. The handler finds source `EPHEMERAL` (ADR-3) and rejects a per-call `model`.
    2. Claim (ADR-2). If the claim fails, there is no decider request and no record. A retry of an already launched claim returns its terminal here, with no decision. If the policy re-check refuses a won claim, there is no decider request. From E5, in shadow or on, S1 writes its rejected record with terminal ID null, unless E's block validation refused the claim first (ADR-5), in which case `prepare_launch` is not called.
    3. Decision, for the `auto` fields only.
@@ -680,7 +724,7 @@ list is still a data-only change.
    - E fills its "what CAO would have done anyway" with the resolved fallback, including (c) as "omitted (provider default)".
    - The applied value is the fallback, the answer, or the capped answer marked `capped`.
    - The E audit copy stores only the record IDs, next to the spec and lifecycle. There may be none, because #810 records only the fields E passes (E5).
-9. **Launched model.** This comes from #810 slice 1 (S1)'s terminal record. E adds no record of its own.
+9. **Launched model.** Terminal model/model_honored already ship (section 0); E2 applies/tests mapped values without a duplicate record. Decision audit links remain E5.
 10. **Tools are never a decision.** The creator declares them, and ADR-5 caps them.
 11. **Explicit values never reach the decider.**
     - Spec fields are validated at create (ADR-5).
@@ -695,7 +739,7 @@ list is still a data-only change.
 **Consequences.**
 - Ephemeral decisions made in shadow or on show up in `cao decisions report` like any other.
 - Effort routing needs no new core flag.
-- E5 is blocked until S1 freezes the contract.
+- E5 awaits the integration review, M7 placement and pending policy/record seams; #863 already supplies the core.
 
 **Alternatives rejected.**
 1. *An ephemeral-specific `ModelDecider` interface:* a second contract for one job, contradicting decision 1 recorded on #810.
@@ -797,10 +841,15 @@ Existing band tests check count=94, case-insensitive uniqueness, full reserved
 composition and collision retry. A CI test comparing BAND_NAMES with band-names.md,
 plus a direct band-segment regex and built-in clash check, remains an E3 follow-up.
 
-**E2: Explicit and default tier and effort**
+**E2: Explicit and default tier and effort — proposed, pending M1–M7**
+
+Proposed split: E2a model tiers, then E2b effort. Reuse #863's pure policy/types
+and reader, validate one settings snapshot, and fence finalize's replacement
+against stale claimers. No decision engine is imported or invoked. See the ADR
+amendment notes; the optional floor remains separately pending MF1–MF6.
 - *Scope:*
   - explicit `model_tier`/`effort`;
-  - the top-level `model_tiers` reader if E2 merges before S1, else S1's unchanged (tier-table ownership), and the effort-to-provider-config mapping (E's in v1);
+  - the unchanged #863 model_tiers reader using the same settings snapshot (A1-1), and the effort-to-provider-config mapping (E's in v1);
   - the `default_tier`/`default_effort` fallback (resolved at create: (b), then (c));
   - `max_tier`/`max_effort` rejection, the eight block-validation rules, the always-on unmapped-tier rules, and the policy re-check at claim, with `gc(policy_changed)` on a tightened policy and `policy_config_error` (the name back to `pending`) on a broken block, with block validation run first (ADR-5; C10, C11);
   - the audit copy records the requested model and effort.
@@ -809,7 +858,7 @@ plus a direct band-segment regex and built-in clash check, remains an E3 follow-
 - *Files:* `services/ephemeral_service.py` (claim-time re-check), `services/settings_service.py`, docs.
 - *Tests:*
   - command-build unit tests: `--model` comes from the table, and `--effort` and `-c model_reasoning_effort` appear when set;
-  - an explicit tier that is unmapped for the provider gives `tier_unmapped`, naming the key, both with and without `max_tier`, and nothing is written;
+  - without max_tier, an unmapped explicit tier gives tier_unmapped; with max_tier, verify block-error/ceiling precedence and nothing persisted (A1-2);
   - an unmapped `default_tier` for any allowed provider gives `policy_config_error`, and so does, with `max_tier` set, any unmapped tier at or below it;
   - each of these gives `policy_config_error`, naming the keys:
     - `max_tier` without `default_tier`;
@@ -823,7 +872,7 @@ plus a direct band-segment regex and built-in clash check, remains an E3 follow-
   - after the operator fixes the block, the next launch gets a new `claim_id`, re-runs the check and launches, with the live file rewritten from the stored spec;
   - atomic revert (a CI unit test on a real SQLite file): two threads go through a barrier to launch one name while the block is broken, and the winner is held inside the re-check until the other returns. Exactly one wins the claim, and the other gets `already_claimed`. The row ends `pending` with `claim_id` null, and no terminal is created. A revert carrying a `claim_id` that is no longer current (the lease lapsed and the name was claimed again) changes no row, and the current claim stands;
   - an omitted value with no default passes neither `--model` nor an effort flag.
-- *Unblocks:* useful ephemerals before #810 lands, and the `tier_unmapped` parts of AC-1.9 and AC-2.7. Their `honored=false` parts need S1's launched-model record and land in E5.
+- *Unblocks:* useful ephemerals before #810 lands, and the `tier_unmapped` parts of AC-1.9 and AC-2.7. Terminal model/model_honored checks are possible in E2; honored=false is only a provider-test-double case (A9-2).
 
 **E3: Hardening**
 - *Scope:*
@@ -878,51 +927,41 @@ plus a direct band-segment regex and built-in clash check, remains an E3 follow-
   - e2e (local, not CI): kill the script mid-step; the BR-31 sweep removes the live file (AC-2.6).
 - *Unblocks:* scenario 2; #827 and #637 can wire it in.
 
-**E5: `auto` via #810 (requires #810 slice 1 (S1))**
-- *Requires:* #810 slice 1 (S1) with its S1c additions: the `validate` fix, so that with `allowed_providers` set it checks every allowed provider (ADR-5 rules 3-4), and the exported `POLICY_REJECTION_REASONS` (the reason-map table test). E5 does not merge before S1c. The merged table test imports `POLICY_REJECTION_REASONS`. A hard-coded list of the six reasons in E5 scope is only for development before S1c, and is not merged. E5 also needs the `profile_source` swap (C8), which lands in E1b or in #810 S1b (E1b *Requires*).
-- *Scope:*
-  - accept a literal `auto`;
-  - the `decision_inputs(name, claim_id)` adapter, and the decision step between claim and `finalize`, in one cao-server call (ADR-9 items 3-4); `finalize` re-caps and returns the applied values;
-  - the policy checks at claim and at run-step EXECUTE, including the provider check, move onto #810's `prepare_launch`, with E's `PolicyBounds` (ADR-5). E sets `allowed_providers` in it to its resolved non-empty list, never `None`. Every `prepare_launch` call, at claim and at run-step EXECUTE, passes `target_kind=EPHEMERAL`, so the policy checks run in every mode whatever #810's own source lookup returns. `field_states` holds E's explicit and `auto` fields, never omitted ones. At claim and at run-step EXECUTE, E first runs its eight block rules (ADR-5). Rules 1-7 now call S1's `PolicyBounds.validate` in place of E's own code, and only rule 8 stays E's own, with no extra check for rules 3-4 (one implementation per rule; proposed for #810; awaiting maintainer confirmation). A failure there is `policy_config_error:<reason>`, and E does not call `prepare_launch` for that attempt. Otherwise E calls `prepare_launch` and classifies a refusal by the error's `reason`, which every #810 policy error carries, not by exception class: `PolicyViolation` alone is the base class of four reasons. At claim, `above_ceiling`, `explicit_unmapped` and `provider_not_allowed` give `policy_changed_since_create:<reason>` with `gc(policy_changed)`. `policy_invalid` and `default_unmapped` give `policy_config_error:<reason>`, naming the key from S1's detail, with the name back to `pending` in one guarded statement (ADR-2). `model_override_not_allowed` refuses the launch with the name back to `pending`, and is not wrapped; it is not expected, because E refuses a per-call `model` before the claim. Any other reason, or none, refuses the launch, returns the name to `pending` and logs an error, so a reason E does not know never sends a name to `gc`. The next launch runs claim, `prepare_launch` and the decision again, and `finalize` rewrites from the stored spec. Records (proposed for #810; awaiting maintainer confirmation): a refusal by E's block validation writes no S1 record, because `prepare_launch` is not called. E's audit copy keeps one refusal entry per (name, reason), with a count and the first and last times, and cao-server logs a warning on the first one, so the operator sees a broken block. A policy violation ends the name in `gc`, so only one attempt is refused and recorded (two at most, in the risk-18 window). #810 writes a rejected record, with terminal ID null, only for a field E passes whose point is shadow or on. That is one per such field for `provider_not_allowed` and `policy_invalid`, and one for the field whose explicit value it refuses. So a spec with no explicit or `auto` field leaves no S1 record in any mode. A `policy_invalid` refusal from `prepare_launch` after E's check passed (a settings race) keeps those records. A later launch gets its own record. At run-step EXECUTE the reason is the 400's rule. `model_override_not_allowed` stays E's own and is never wrapped;
-  - one decision path per ephemeral launch (C8): E's call at claim, or at run-step EXECUTE, is the only one, and #810's handler sites ask nothing for an ephemeral (E1b or #810 S1b, E4 or #810 S1c);
-  - the lease floor ([A15]). The lease starts at the atomic claim, before the decision, so the effective lease is at least the on-mode hard timeout plus 30 s. A lower `claim_lease_seconds` is raised to that floor;
-  - the audit copy stores #810 record IDs, which may be none, and links to S1's launched-model record (the #810-S1-dependent parts of AC-1.9 and AC-2.7);
-  - the SDK set is unchanged: `auto` is already a member, rejected server-side until E5;
-  - workflow `auto` fields get the fallback with `out_of_scope`, recorded with decider null only in shadow or on (the shadow/on record rule).
-- *Files:* `services/ephemeral_service.py`, `utils/agent_profiles.py` (source helper, from E1a), tests. The `profile_source` swap lands earlier (C8: E1b or #810 S1b).
-- *Tests* (with #810's test deciders):
-  - off: the fallback, with no request and no record;
-  - shadow: the fallback launches, the answer is recorded and not applied, and the launch is not delayed (a fake clock and a decider that blocks until released);
-  - on: a tier above `max_tier`, or an effort above `max_effort`, is capped and recorded as `capped`;
-  - a tier that is unmapped after the cap gets the fallback with reason `tier_unmapped`, with or without a policy;
-  - timeout, `unsure` or error: the fallback;
-  - an explicit field is never asked about, and tools are never in the request;
-  - normal-assign Auto model does not ask about an ephemeral with an omitted tier;
-  - in shadow and on, the record's "what CAO would have done anyway" equals the (b)-then-(c) fallback, and no decider computes it;
-  - a non-owner, an expired name or an already claimed name makes no decider request and writes no record;
-  - two concurrent launches of one name make exactly one decider request (two threads through a barrier on a real SQLite file);
-  - one decision path per ephemeral launch (C8), parametrized over an `auto` spec and an explicit-only spec, on a provider that honors the model, with a test decider whose tier differs from the spec's explicit or fallback tier. On assign, on handoff's default and early paths, and on run-step's `agent_spec` branch, with `model.route` on and with it in shadow:
-    - after the shadow runner drains, the decider has been called exactly once per `auto` field whose point is on or in shadow at a session launch, and never on the `agent_spec` branch or for the explicit-only spec;
-    - the #810 record IDs written for the launch equal E's `LaunchPlan.record_ids` (empty when there is no plan): one per `auto` field whose point is on or in shadow, so none for the explicit-only spec;
-    - the launched model equals `finalize`'s;
-  - the launched `--model` and effort both equal the record's applied values, which shows that `finalize` ran before the profile load;
-  - `finalize` given a value above the cap writes the fallback and returns it;
-  - `auto` in a workflow step, or on a raw-API launch, makes no decider request, uses the fallback, and leaves the fingerprint unchanged; in shadow or on it records decider null and `out_of_scope`, in off nothing;
-  - an agent in a step terminal matched by `script_step_of_terminal` assigns an `auto` ephemeral, point on: the decider is asked, with `in_workflow=true` as a fact only (Q13);
-  - the test decider runs in the cao-server process, not the MCP subprocess (server-side execution).
-  - a provider test double that reports a different launched model gives `honored=false` in S1's launched-model record, and the audit copy links to it (AC-1.9, AC-2.7);
-  - policy tightened after create (AC-1.15): no decider request; in shadow or on, S1's rejected record with terminal ID null; in off, no record;
-  - provider removed after create, in off, shadow and on: a Codex ephemeral is created, then `codex` is removed from `allowed_providers`. The claim calls `prepare_launch`, which refuses with `provider_not_allowed`. E gives `policy_changed_since_create:provider_not_allowed` and `gc(policy_changed)`, with no decider request and no terminal. In shadow or on, S1 writes a rejected record, with terminal ID null, for each field E passed whose point is active; in off, no record. With no stored tier, no stored effort and no `auto` field, E passes no field, so there is no record in any mode. The refusal holds with a mapped stored tier, with no stored tier, and with `default_tier` set and `model_tiers.codex` also deleted, where the reason is still `provider_not_allowed`, not `default_unmapped`;
-  - reason map (table test): a `prepare_launch` stub raises each #810 policy error class in turn, and each `reason` gives its mapped error and transition. The map's keys must equal #810's reason set, imported from its exported constant (`POLICY_REJECTION_REASONS`, added in S1c), so a reason added to or removed from #810 fails CI. A hard-coded list of the six values is only for development before S1c, and is not merged. An unknown reason, or none, returns the name to `pending`, never `gc`;
-  - the `PolicyBounds` that E passes to `validate` and `prepare_launch` has `allowed_providers` equal to E's resolved list compared as a set (#810 holds a frozenset), never `None`. That includes the case where the key is absent and the set is `{"claude_code"}`. Every `prepare_launch` call, at claim and at run-step EXECUTE, passes `target_kind=EPHEMERAL` and `field_states` holding exactly the spec's explicit and `auto` fields;
-  - no tier entries: with `default_tier=small`, `allowed_providers=["claude_code", "codex"]` and no `model_tiers.codex` entry, the create is refused with `policy_config_error` naming `model_tiers.codex.small`, both before and from E5. A claim after `model_tiers.codex` is deleted is refused the same way, both before and from E5. From E5 that refusal comes from `validate` with S1c's fix: the reason is `policy_invalid`, and `prepare_launch` is not called;
-  - a block broken after create, caught by E's validation: in every mode, no `prepare_launch` call, no decider request and no S1 record. After three refused launches, E's audit copy holds one refusal entry for (name, reason), with count 3, and the server log holds one warning. After the fix, the next launch asks the decider and gets its own record;
-  - settings-race stand-in: the block passes E's check, then `prepare_launch` returns a `PolicyConfigError`. In shadow or on there is S1's rejected record with terminal ID null, and the name is back in `pending`;
-  - one implementation per rule: `PolicyBounds.validate` is stubbed to fail on a block that E's pre-E5 rules accept. The claim then refuses with S1's reason, before any `prepare_launch` call, which shows that the claim calls it;
-  - precedence: the ADR-5 double fault, where S1 alone would report `explicit_unmapped`, gives `policy_config_error` with no `prepare_launch` call. The name is back in `pending`, and the message does not contain `re-create`;
-  - the lease floor: with `claim_lease_seconds=10` and an on-mode hard timeout of 60 s, the effective lease is 90 s. A decider that answers at 59 s (fake clock) still binds;
-  - crash stand-in, point on, policy tightened: a fault injected after S1's rejected record and before E's transition leaves the name `claimed`. Once the lease lapses (fake clock), the next launch claims it again, is refused again, and moves it to `gc(policy_changed)`. The name has two rejected records and no terminal.
-- *Unblocks:* Auto tier and effort for dynamic agents.
+**E5: auto via #810 — planned, awaiting maintainer confirmation**
+
+- *Requires:* E2, E4 for workflow support, and the reviewed #810 integration.
+  #863's core is present; exported reason-map/parity seams and M7 placement must
+  be checked against main before implementation. Do not hard-code an assumed
+  rejection set or infer current integration from a historical S1 schedule.
+- *Scope:* accept literal auto; claim before a decision; apply bounded fallback
+  or a usable capped answer; finalize before load and bind. Keep one decision
+  path on assign, both handoff paths, and workflow EXECUTE. Never ask about an
+  omitted/explicit field or let a decider grant tools/providers.
+- Reuse pure policy validation already adopted in proposed E2. Map engine
+  refusals to E's stable public rules (A5-2), including policy_changed_since_create
+  only for tightening, and policy_config_error:<key> for a broken block. Unknown
+  reasons refuse and return the claim to pending, never silently launch or GC.
+- A stored NULL under a newly added ceiling remains E's refusal even when engine
+  field_states omit that field (A5-3). Provider bounds are the resolved nonempty
+  list, never None. Block validation precedes decisions and stored-value checks.
+- Write rejected shadow/on records before guarded E transitions; registry state
+  is authoritative. Record IDs enter the audit; terminal model fields already
+  ship. Off writes no record; shadow does not delay or mutate a running child.
+- Own workflow step/raw owner launches ask no decider, apply policy and use
+  fallback; proposed shadow/on records use out_of_scope with decider=null.
+  Delegations inside step terminals remain ordinary eligibility, with advisory
+  in_workflow. Reconcile proposed facts with #863 types before adding the adapter.
+- Raise the claim lease to at least on-mode timeout plus 30 seconds (proposed A15).
+  No slow answer can bind an expired or replaced claim.
+- *Tests:* through real routes with fake deciders, cover off/shadow/on, unsure,
+  timeout, error, out-of-set and unmapped answers; explicit omission; ceiling cap;
+  nonowner/expired/already-claimed no-record refusal; concurrent claims with one
+  decision; finalized values equal emitted provider values and recorded application;
+  no shadow mutation; workflow replay skips policy; provider removal; NULL-value
+  tightening; broken-block precedence and atomic revert; stale claim fencing;
+  reason-map equality with the exported S1 set, including unknown/None reasons;
+  effective allowed_providers parity; rejected-record crash window and lease floor.
+- *Unblocks:* auto model tier/effort after these gates, never from #863 alone.
 
 **Deferred: Kiro.** #836 has merged, and Kiro enforcement is now "Hard (install time)" (`docs/tool-restrictions.md`). What still blocks ephemerals is that the enforced file is written at install time into the user-shared agents dir (`KIRO_AGENTS_DIR`, default `~/.kiro/agents`, `constants.py`). The slice adds an owned-file manifest for `KIRO_AGENTS_DIR/<name>.json` plus its context file, written through the install helpers . Release and sweep remove manifest paths only. Until it lands, Kiro gets `provider_unsupported`.
 
@@ -993,7 +1032,7 @@ plus a direct band-segment regex and built-in clash check, remains an E3 follow-
 
 - **AC-1.15: policy tightened after create (Q12).** *Given* an ephemeral created with `model_tier=large`, then `max_tier=medium`, `default_tier=small` set. *When* T assigns it. *Then*:
   - before E5: `policy_changed_since_create:tier_exceeds_policy`;
-  - from E5: `policy_changed_since_create:above_ceiling`, from #810's `prepare_launch`;
+  - from E5: the same E rule via proposed A5-2 mapping, not S1 above_ceiling in the public rule;
   - in both, the error tells T to re-create the agent, no decider request is made, no terminal is created, and the name moves to `gc(policy_changed)`;
   - records: none before E5 or in off; from E5 in shadow or on, S1's rejected record with terminal ID null.
 
