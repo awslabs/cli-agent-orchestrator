@@ -52,8 +52,9 @@ class TestSendMessageSelfSendGuard:
         assert "own CAO_TERMINAL_ID" in result["error"]
         mock_inbox.assert_not_called()
 
+    @patch("cli_agent_orchestrator.utils.orchestration._target_binding_denial", return_value=None)
     @patch("cli_agent_orchestrator.utils.orchestration._send_to_inbox")
-    def test_send_message_allows_distinct_receiver(self, mock_inbox):
+    def test_send_message_allows_distinct_receiver(self, mock_inbox, _unbound):
         """Sending to a different terminal should still go through."""
         from cli_agent_orchestrator.utils.orchestration import _send_message_impl
 
@@ -82,9 +83,10 @@ class TestSendMessageSelfSendGuard:
 class TestSendMessageSenderIdInjection:
     """Tests for sender ID injection in _send_message_impl."""
 
+    @patch("cli_agent_orchestrator.utils.orchestration._target_binding_denial", return_value=None)
     @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", True)
     @patch("cli_agent_orchestrator.utils.orchestration._send_to_inbox")
-    def test_send_message_appends_sender_id_when_injection_enabled(self, mock_inbox):
+    def test_send_message_appends_sender_id_when_injection_enabled(self, mock_inbox, _unbound):
         """When injection is enabled, send_message should append sender ID suffix."""
         from cli_agent_orchestrator.utils.orchestration import _send_message_impl
 
@@ -98,9 +100,10 @@ class TestSendMessageSenderIdInjection:
         assert "[Message from terminal deadbeef" in sent_message
         assert "Use send_message MCP tool for any follow-up work.]" in sent_message
 
+    @patch("cli_agent_orchestrator.utils.orchestration._target_binding_denial", return_value=None)
     @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", False)
     @patch("cli_agent_orchestrator.utils.orchestration._send_to_inbox")
-    def test_send_message_no_suffix_when_injection_disabled(self, mock_inbox):
+    def test_send_message_no_suffix_when_injection_disabled(self, mock_inbox, _unbound):
         """When injection is disabled, send_message should pass the message unchanged."""
         from cli_agent_orchestrator.utils.orchestration import _send_message_impl
 
@@ -128,9 +131,10 @@ class TestSendMessageSenderIdInjection:
         assert sent_message == "Status update"
         assert "unknown" not in sent_message
 
+    @patch("cli_agent_orchestrator.utils.orchestration._target_binding_denial", return_value=None)
     @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", True)
     @patch("cli_agent_orchestrator.utils.orchestration._send_to_inbox")
-    def test_send_message_suffix_is_appended_not_prepended(self, mock_inbox):
+    def test_send_message_suffix_is_appended_not_prepended(self, mock_inbox, _unbound):
         """The sender ID should be a suffix, not a prefix."""
         from cli_agent_orchestrator.utils.orchestration import _send_message_impl
 
@@ -205,10 +209,11 @@ class TestSendMessageCallerDefault:
         assert "CAO_TERMINAL_ID not set" in result["error"]
         mock_inbox.assert_not_called()
 
+    @patch("cli_agent_orchestrator.utils.orchestration._target_binding_denial", return_value=None)
     @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", False)
     @patch("cli_agent_orchestrator.utils.orchestration.requests")
     @patch("cli_agent_orchestrator.utils.orchestration._send_to_inbox")
-    def test_explicit_receiver_skips_caller_lookup(self, mock_inbox, mock_requests):
+    def test_explicit_receiver_skips_caller_lookup(self, mock_inbox, mock_requests, _unbound):
         """An explicit receiver_id must be used as-is, no API lookup."""
         from cli_agent_orchestrator.utils.orchestration import _send_message_impl
 
@@ -246,9 +251,10 @@ class TestSendMessageCallerDefault:
         assert "receiver_id" in result["error"]
         mock_inbox.assert_not_called()
 
+    @patch("cli_agent_orchestrator.utils.orchestration._target_binding_denial", return_value=None)
     @patch("cli_agent_orchestrator.utils.orchestration.ENABLE_SENDER_ID_INJECTION", False)
     @patch("cli_agent_orchestrator.utils.orchestration._send_to_inbox")
-    def test_receiver_deleted_before_reply_errors_clearly(self, mock_inbox):
+    def test_receiver_deleted_before_reply_errors_clearly(self, mock_inbox, _unbound):
         """Recorded caller deleted before the reply lands → the API detail is
         surfaced so the agent knows the address is gone."""
         from cli_agent_orchestrator.utils.orchestration import _send_message_impl

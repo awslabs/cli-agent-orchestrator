@@ -1,4 +1,4 @@
-"""CI supply-chain guards for ``.github/workflows`` (#820).
+"""CI supply-chain guards for workflows and local composite actions (#820).
 
 Two properties a green CI run cannot attest on its own:
 
@@ -35,9 +35,17 @@ def _steps(doc):
     for job in (doc.get("jobs") or {}).values():
         for step in job.get("steps") or []:
             yield step
+    runs = doc.get("runs") or {}
+    if runs.get("using") == "composite":
+        yield from runs.get("steps") or []
 
 
-@pytest.mark.parametrize("path", _workflows(), ids=lambda p: p.name)
+def _action_manifests():
+    actions = WORKFLOWS.parent / "actions"
+    return sorted(actions.glob("**/action.yml")) + sorted(actions.glob("**/action.yaml"))
+
+
+@pytest.mark.parametrize("path", _workflows() + _action_manifests(), ids=lambda p: p.name)
 def test_every_action_is_pinned_to_a_commit_sha(path):
     doc = yaml.safe_load(path.read_text(encoding="utf-8"))
     unpinned = []
@@ -48,6 +56,11 @@ def test_every_action_is_pinned_to_a_commit_sha(path):
         if not SHA_PINNED.match(uses):
             unpinned.append(uses)
     assert unpinned == [], f"{path.name}: actions referenced by tag or branch: {unpinned}"
+
+
+def test_composite_action_steps_are_checked():
+    steps = [{"uses": "example/action@v1"}]
+    assert list(_steps({"runs": {"using": "composite", "steps": steps}})) == steps
 
 
 @pytest.mark.parametrize("path", _workflows(), ids=lambda p: p.name)

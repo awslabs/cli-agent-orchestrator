@@ -35,6 +35,11 @@ portable and make profile listings useful.
   `reviewer`, or `workflow_scout`.
 - `allowedTools` (array of strings): explicit CAO tool allowlist; when present,
   it overrides the role defaults.
+- `delegateTools` (array of strings): delegation ceiling, the most this agent may
+  grant to workers it creates through `assign`, `handoff` or a workflow step.
+  Defaults to `["*"]` for `role: supervisor` and to the agent's own
+  `allowedTools` otherwise. See
+  [tool-restrictions.md](tool-restrictions.md#cross-provider-inheritance).
 - `capabilities` (array of strings): profile-discovery statements, with at most
   32 strings and 128 characters per string.
 - `tags` (array of strings): profile-discovery keywords, with at most 32 values;
@@ -56,10 +61,9 @@ portable and make profile listings useful.
   or `url` for a remote one, with `type` naming its transport (for example
   `http` or `sse`) and optional `headers` for a remote server that
   authenticates. An entry defining neither is invalid. For a worked example
-  of a remote-URL MCP server, see
-  [examples/youcom-search](../examples/youcom-search/README.md); for one that
-  authenticates with a header and keeps the key out of the committed profile,
-  see [examples/serply-research](../examples/serply-research/README.md).
+  of a remote-URL MCP server that authenticates with a header and keeps the
+  key out of the committed profile, see
+  [examples/serply-research](../examples/serply-research/README.md).
 - `tools` (array), `toolAliases` (object), and `toolsSettings` (object):
   provider tool configuration. `tools` is the provider's own tool catalog and
   is passed through to it; it is not the CAO allowlist and does not restrict
@@ -67,7 +71,10 @@ portable and make profile listings useful.
   CAO's own MCP tools, which are granted by the `@cao-mcp-server` selector.
   See [Tool Restrictions](tool-restrictions.md).
 - `resources` (array), `hooks` (object), and `useLegacyMcpJson` (boolean):
-  provider-native configuration passed through where supported.
+  provider-native configuration passed through where supported. For Kiro CLI,
+  `useLegacyMcpJson` is written into the installed agent spec under Kiro's
+  current name for that setting, `includeMcpJson` (the spelling Kiro retired
+  is accepted on input only); unset means `false`.
 - `model` (string): provider model selection.
 - `engine` (string): Kiro CLI engine selection, either `v2` (the default) or
   `kas`. Valid only for the `kiro_cli` provider; an explicit `--engine` at
@@ -151,6 +158,29 @@ cao install https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/mai
 
 Packaged examples are available in the
 [agent store](https://github.com/awslabs/cli-agent-orchestrator/tree/main/src/cli_agent_orchestrator/agent_store).
+
+Installing writes a copy of the profile to the shared context directory
+(`agents.dirs.cao_installed`, `~/.aws/cli-agent-orchestrator/agent-context` by
+default). CAO stamps that copy's frontmatter with `x-cao-source-stem`, the
+name the profile was installed under. The key is reserved: it is written by
+CAO, not authored: a source profile that declares it at the top level of its
+frontmatter has that line replaced by CAO's own at install, and the install is
+refused if the result does not read back as the marker CAO wrote (a quoted or
+folded spelling that the YAML parser would resolve to a different value, or the
+key declared inside flow-style `{...}` frontmatter, where CAO cannot replace
+it). Only that top-level entry is CAO's: text inside a `description: |` scalar
+or a nested key spelled the same way is left exactly as written, and
+frontmatter written as one flow mapping gets the marker as an entry inside the
+braces.
+It lets a reinstall recognise its own earlier copy, and lets `cao install`
+refuse -- for every provider -- a different profile whose `name:` would
+overwrite an installed one: the context copy is what the installed agent reads
+at runtime, and for OpenCode the agent file and `opencode.json` section share
+the same id (see [OpenCode CLI](opencode-cli.md)). The check reads the
+destination itself, so it also holds when the installed copy is shadowed in
+profile discovery by a same-named file in another directory. If
+`agents.dirs.cao_installed` is configured away from its default, copies written
+by earlier releases to the default directory still count.
 
 ### Profile discovery
 

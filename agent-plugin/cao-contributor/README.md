@@ -27,7 +27,7 @@ Any Agent-Plugins-compatible client can install this directory the same way.
 
 ## Contents
 
-Version `2.5.0`, synced from CAO's package metadata.
+Version `2.5.3`, synced from CAO's package metadata.
 
 - `cao-provider`
 - `cao-plugin`

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { api, InboxMessage } from '../api'
 import { X, Send, Mail, Loader2 } from 'lucide-react'
+import { parseServerTime } from '../time'
 
 interface InboxPanelProps {
   terminalId: string
@@ -19,7 +20,7 @@ const STATUS_FILTERS: { key: StatusFilter; label: string }[] = [
 function formatRelativeTime(dateStr: string | null): string {
   if (!dateStr) return ''
   const now = Date.now()
-  const then = new Date(dateStr).getTime()
+  const then = parseServerTime(dateStr).getTime()
   const diffSec = Math.floor((now - then) / 1000)
   if (diffSec < 0) return 'just now'
   if (diffSec < 60) return `${diffSec}s ago`

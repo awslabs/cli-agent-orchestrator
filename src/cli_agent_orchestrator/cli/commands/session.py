@@ -56,15 +56,35 @@ def _resolve_conductor(session_name):
     return terminals[0], terminals
 
 
+def _format_launch_model(terminal):
+    """Return operator text for the stored launch-model state."""
+    honored = terminal.get("model_honored")
+    if honored is None:
+        return "unknown", "unknown"
+    return terminal.get("model") or "provider default", "yes" if honored else "no"
+
+
 @click.group()
 def session():
-    """Manage CAO sessions."""
+    """Manage CAO sessions.
+
+    Requires a running cao-server.
+
+    \b
+    Examples:
+      cao session list
+      cao session status cao-1a2b3c4d --workers
+      cao session send cao-1a2b3c4d "Summarize your progress" --timeout 600
+    """
 
 
 @session.command("list")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 def list_sessions(as_json):
-    """List all active CAO sessions."""
+    """List all active CAO sessions.
+
+    Requires a running cao-server.
+    """
     try:
         sessions = _get_sessions()
     except api_http.exceptions.RequestException as e:
@@ -128,7 +148,10 @@ def list_sessions(as_json):
 )
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 def status(session_name, terminal_id, workers, as_json):
-    """Show status of a session's conductor (or specific terminal)."""
+    """Show status of a session's conductor (or specific terminal).
+
+    Requires a running cao-server.
+    """
     try:
         if terminal_id:
             target = _get_terminal(terminal_id)
@@ -136,6 +159,10 @@ def status(session_name, terminal_id, workers, as_json):
         else:
             conductor_raw, all_terminals = _resolve_conductor(session_name)
             target = _get_terminal(conductor_raw["id"])
+            if workers:
+                # The session list contains stored metadata, not live status.
+                # Read workers through the same detail endpoint as the conductor.
+                all_terminals[1:] = [_get_terminal(t["id"]) for t in all_terminals[1:]]
     except api_http.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {e}")
 
@@ -152,6 +179,8 @@ def status(session_name, terminal_id, workers, as_json):
                 "id": target["id"],
                 "agent_profile": target.get("agent_profile"),
                 "provider": target.get("provider"),
+                "model": target.get("model"),
+                "model_honored": target.get("model_honored"),
                 "status": target.get("status"),
                 "last_output": last_output,
             },
@@ -162,6 +191,8 @@ def status(session_name, terminal_id, workers, as_json):
                     "id": t["id"],
                     "agent_profile": t.get("agent_profile"),
                     "provider": t.get("provider"),
+                    "model": t.get("model"),
+                    "model_honored": t.get("model_honored"),
                     "status": t.get("status"),
                 }
                 for t in all_terminals[1:]
@@ -173,6 +204,9 @@ def status(session_name, terminal_id, workers, as_json):
     click.echo(f"Terminal: {target['id']}")
     click.echo(f"Agent:    {target.get('agent_profile', 'N/A')}")
     click.echo(f"Provider: {target.get('provider', 'N/A')}")
+    target_model, target_honored = _format_launch_model(target)
+    click.echo(f"Model:    {target_model}")
+    click.echo(f"Honored:  {target_honored}")
     click.echo(f"Status:   {target.get('status', 'N/A')}")
 
     if last_output:
@@ -188,12 +222,18 @@ def status(session_name, terminal_id, workers, as_json):
     if workers and not terminal_id:
         worker_terminals = all_terminals[1:]
         if worker_terminals:
-            click.echo(f"\n{'ID':<12} {'AGENT':<20} {'PROVIDER':<15} {'STATUS':<15}")
-            click.echo("-" * 65)
+            click.echo(
+                f"\n{'ID':<12} {'AGENT':<20} {'PROVIDER':<15} "
+                f"{'MODEL':<20} {'HONORED':<8} {'STATUS':<15}"
+            )
+            click.echo("-" * 95)
             for t in worker_terminals:
+                worker_model, worker_honored = _format_launch_model(t)
                 click.echo(
                     f"{t['id']:<12} {t.get('agent_profile', 'N/A'):<20} "
-                    f"{t.get('provider', 'N/A'):<15} {t.get('status', 'N/A'):<15}"
+                    f"{t.get('provider', 'N/A'):<15} "
+                    f"{worker_model:<20} "
+                    f"{worker_honored:<8} {t.get('status', 'N/A'):<15}"
                 )
         else:
             click.echo("\nNo worker terminals")
@@ -214,7 +254,10 @@ def status(session_name, terminal_id, workers, as_json):
     help=f"Timeout in seconds (default: {_DEFAULT_SEND_TIMEOUT}s; ignored with --async)",
 )
 def send(session_name, message, terminal_id, is_async, timeout):
-    """Send a message to a session's conductor (or specific terminal)."""
+    """Send a message to a session's conductor (or specific terminal).
+
+    Requires a running cao-server.
+    """
     try:
         if terminal_id:
             target_id = terminal_id
@@ -224,7 +267,9 @@ def send(session_name, message, terminal_id, is_async, timeout):
 
         status_resp = api_http.get(f"{API_BASE_URL}/terminals/{target_id}")
         status_resp.raise_for_status()
-        current_status = status_resp.json().get("status")
+        status_payload = status_resp.json()
+        status_payload = status_payload if isinstance(status_payload, dict) else {}
+        current_status = status_payload.get("status")
         # "completed" is a valid pre-send state: the terminal has finished its
         # previous task and is ready to accept a new message.
         if current_status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
@@ -237,18 +282,28 @@ def send(session_name, message, terminal_id, is_async, timeout):
             params={"message": message},
         )
         response.raise_for_status()
-    except api_http.exceptions.RequestException as e:
+        # The dispatch boundary names the turn we just started, so the wait below
+        # can refuse a status earned before it — otherwise the previous turn's
+        # COMPLETED, still on screen, ends the wait at once and we print its
+        # answer or a half-drawn frame (#735). An older cao-server omits it; then
+        # we fall back to the flat sleep and the frame-based wait.
+        input_payload = response.json()
+        input_payload = input_payload if isinstance(input_payload, dict) else {}
+        boundary = input_payload.get("dispatch_boundary")
+        boundary = boundary if isinstance(boundary, int) else None
+    except (api_http.exceptions.RequestException, ValueError) as e:
         raise click.ClickException(f"Failed to connect to cao-server: {e}")
 
     if is_async:
         click.echo(f"Message sent to terminal {target_id}")
         return
 
-    time.sleep(3)
+    if boundary is None:
+        time.sleep(3)
     effective_timeout = timeout if timeout is not None else _DEFAULT_SEND_TIMEOUT
     interrupted = False
     try:
-        poll_until_done(target_id, effective_timeout)
+        poll_until_done(target_id, effective_timeout, min_generation=boundary)
     except KeyboardInterrupt:
         interrupted = True
 

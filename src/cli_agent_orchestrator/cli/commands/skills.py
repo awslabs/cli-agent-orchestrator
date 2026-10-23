@@ -170,7 +170,10 @@ def add(folder_path: Path, force: bool) -> None:
 @skills.command("remove")
 @click.argument("name")
 def remove(name: str) -> None:
-    """Remove an installed skill."""
+    """Remove an installed skill.
+
+    Acts immediately; there is no confirmation prompt.
+    """
     try:
         skill_name = validate_skill_name(name)
         skill_dir = SKILLS_DIR / skill_name

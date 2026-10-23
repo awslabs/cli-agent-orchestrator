@@ -30,11 +30,56 @@ describe('API wrapper', () => {
     expect(mockFetch).toHaveBeenCalledWith('/sessions', expect.objectContaining({ signal: expect.any(AbortSignal) }))
   })
 
+  it('updates and clears a terminal description with JSON', async () => {
+    for (const description of ['Review', null]) {
+      mockResponse({ id: 'abcd1234', description })
+      const terminal = await api.updateTerminalDescription('abcd1234', description)
+      expect(terminal.description).toBe(description)
+      expect(mockFetch).toHaveBeenLastCalledWith('/terminals/abcd1234/description', expect.objectContaining({
+        method: 'PATCH', body: JSON.stringify({ description }),
+      }))
+    }
+  })
+
+  it('reports description PATCH errors', async () => {
+    mockResponse({ detail: 'Description must be at most 64 characters' }, 422)
+    await expect(api.updateTerminalDescription('abcd1234', 'x'.repeat(65))).rejects.toMatchObject({ status: 422, detail: 'Description must be at most 64 characters' })
+  })
+
+  it('revalidates a session response that started before a successful description PATCH', async () => {
+    let finish!: (response: unknown) => void
+    mockFetch.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    const reading = api.getSession('cao-demo')
+    mockResponse({ id: 'abcd1234', description: 'New' })
+    await api.updateTerminalDescription('abcd1234', 'New')
+    const fresh = { session: { name: 'cao-demo' }, terminals: [{ id: 'abcd1234', description: 'New' }] }
+    mockResponse(fresh)
+    finish({ ok: true, text: async () => JSON.stringify({ terminals: [{ id: 'abcd1234', description: 'Old' }] }) })
+    expect(await reading).toEqual(fresh)
+  })
+
   it('listProfiles fetches /agents/profiles', async () => {
     const profiles = [{ name: 'dev', description: 'Developer', source: 'built-in' }]
     mockResponse(profiles)
     const result = await api.listProfiles()
     expect(result).toEqual(profiles)
+  })
+
+  it('stops revalidating when descriptions change throughout every read', async () => {
+    let reads = 0
+    mockFetch.mockImplementation(async (url: string) => ({
+      ok: true,
+      text: async () => {
+        if (url.startsWith('/sessions/')) {
+          if (++reads > 5) throw new Error('Too many reads')
+          await api.updateTerminalDescription('abcd1234', 'New')
+          return JSON.stringify({ terminals: [{ description: 'Old' }] })
+        }
+        return JSON.stringify({ id: 'abcd1234', description: 'New' })
+      },
+    }))
+    await expect(api.getSession('cao-demo')).rejects.toThrow('Session descriptions kept changing')
+    expect(mockFetch.mock.calls.filter(([url]) => url === '/sessions/cao-demo')).toHaveLength(3)
   })
 
   it('listProviders fetches /agents/providers', async () => {
@@ -67,12 +112,28 @@ describe('API wrapper', () => {
     )
   })
 
-  it('addTerminalToSession sends POST with opencode_cli provider', async () => {
+  it('addTerminalToSession posts the operator form of the in-session create', async () => {
+    // `/sessions/{name}/terminals` requires caller_id since the delegation
+    // ceiling landed; the UI is the operator and must use `:operator`, and it
+    // must never send a caller identity (the server refuses that shape).
     const terminal = { id: 't3', name: 'dev', provider: 'opencode_cli', session_name: 's1' }
     mockResponse(terminal)
     await api.addTerminalToSession('s1', 'opencode_cli', 'developer')
     expect(mockFetch).toHaveBeenCalledWith(
-      expect.stringContaining('/sessions/s1/terminals?provider=opencode_cli&agent_profile=developer'),
+      expect.stringContaining('/sessions/s1/terminals:operator?provider=opencode_cli&agent_profile=developer'),
+      expect.objectContaining({ method: 'POST' })
+    )
+    const [url, opts] = mockFetch.mock.calls[0]
+    expect(url).not.toContain('caller_id')
+    expect(url).not.toContain('caller_ceiling')
+    expect(opts.body).toBeUndefined()
+  })
+
+  it('addTerminalToSession includes working directory when provided', async () => {
+    mockResponse({ id: 't3' })
+    await api.addTerminalToSession('s1', 'kiro_cli', 'developer', '/home/user/project')
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.stringMatching(/\/sessions\/s1\/terminals:operator\?.*working_directory=%2Fhome%2Fuser%2Fproject/),
       expect.objectContaining({ method: 'POST' })
     )
   })

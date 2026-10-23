@@ -13,6 +13,7 @@ coverage.json
 coverage.xml
 .pytest_cache/
 .env.local
+/dependency-security-results/
 
 # MyPy
 .mypy_cache/

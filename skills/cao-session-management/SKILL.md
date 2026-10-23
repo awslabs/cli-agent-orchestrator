@@ -1,132 +1,62 @@
 ---
 name: cao-session-management
-description: Interact with CAO (CLI Agent Orchestrator) — launch multi-agent sessions,
-  check status, send follow-up instructions, unblock stuck terminals, or shut down
-  sessions. Use when working with CAO sessions in any capacity.
+description: Find available CAO (CLI Agent Orchestrator) agent profiles, and talk to the
+  conductor and worker terminals of a running CAO session, including unblocking a stuck
+  worker. Use when choosing a profile to launch, messaging or unblocking workers, or
+  diagnosing a stuck session. For preflight, launching, session commands, statuses,
+  delegation and safety, run `cao --skill` first.
 ---
 
 # CAO Session Management
 
-## Overview
+## Operating CAO
 
-CAO runs multi-agent workflows in named sessions. A conductor agent inside each
-session orchestrates the work.
+Run `cao --skill` for the CAO operating guide: preflight, launch, session commands,
+statuses, delegation, and safety. Run `cao <group> --help` for exact syntax.
 
-## Core Concepts
+Two rules apply to every launch from an agent:
 
-- **Session**: A group of agent terminals working together
-- **Conductor**: The supervisor terminal — receives instructions, delegates to workers
-- **Provider**: LLM backend. Default `kiro_cli`, override with `--provider`
+- Use `--auto-approve`. It skips the confirmation prompt and leaves the profile's tool
+  policy unchanged; whether that policy is enforced depends on the provider (read the
+  `Enforcement:` line launch prints). `--yolo` also skips the prompt but removes all
+  tool restrictions, so the agent can run any command, including `aws`, `rm` and
+  `curl`. Use `--yolo` only when the user asks for it.
+- If a `cao` command cannot reach the server, check it with
+  `curl -sf http://localhost:9889/health`.
 
-## Prerequisites
-
-Before launching a session, verify:
-
-- **`cao-server` is running** at `localhost:9889`. Quick check:
-  ```bash
-  curl -sf http://localhost:9889/sessions >/dev/null && echo OK || echo "start cao-server"
-  ```
-  If not running, start it in a separate terminal: `cao-server`.
-- **The agent profile is installed.** `cao launch --agents <profile>` fails if the profile is unknown. Install built-ins or custom files with `cao install <profile|path|url>`.
+A reported status is inferred from the rendered terminal screen, so it can disagree
+with reality. Before reporting readiness, progress, or completion to a user,
+corroborate the status with an output read; see
+[cao-session-liveness](../cao-session-liveness/SKILL.md).
 
 ## Discovering Available Profiles
 
-Profiles are CAO-level entities, installed with `cao install` regardless of which CLI provider runs them. To find available profiles:
+Profiles are CAO-level entities, installed with `cao install` regardless of which CLI
+provider runs them. To find available profiles:
 
 | Source | Command |
 |--------|---------|
-| All available profiles across built-in store + local store + provider directories | `curl -sf http://localhost:9889/agents/profiles` — canonical, provider-agnostic |
+| All available profiles, with the source each one resolved from | `cao profile list` (no server needed), or `curl -sf http://localhost:9889/agents/profiles` |
+| Profiles matching a keyword | `cao profile find "<keywords>"` |
 | Custom/local profile files only | `ls ~/.aws/cli-agent-orchestrator/agent-store/` |
-| Built-in profiles installed via `cao install <name>` | `ls ~/.aws/cli-agent-orchestrator/agent-context/` |
+| Profiles installed via `cao install <name>` | `ls ~/.aws/cli-agent-orchestrator/agent-context/` |
 | Profile installation and keyword discovery | see [Agent profile installation](../../docs/agent-profile.md#installation) and [profile discovery](../../docs/agent-profile.md#profile-discovery) |
-| Provider-native list (`kiro_cli` only) | `kiro-cli agent list` — useful because CAO mirrors profiles into `~/.kiro/agents/` |
+| Provider-native list (`kiro_cli` only) | `kiro-cli agent list`, useful because CAO mirrors profiles into `~/.kiro/agents/` |
 
-The HTTP endpoint is the recommended check: it scans the built-in packaged store, the local store (`agent-store/`), and provider-specific directories (including `agent-context/`), then returns a deduplicated list (by profile name, built-in wins) with a `source` label on each entry.
+`cao profile list` and the HTTP endpoint return the same list. Discovery scans the
+local store (`agent-store/`) first, then provider-specific directories (including
+`agent-context/`), then extra directories from settings, and the built-in packaged
+store last. The first match wins, so a local copy of a profile shadows the built-in
+one with the same name. Each entry has a `source` label showing where it came from.
+
+A profile runs on its frontmatter `provider:` unless `--provider` overrides it; the
+default is `kiro_cli`. Run `cao install --help` for the provider IDs.
 
 If unsure which profile to use, ask the user rather than guessing.
 
-## Quick Example
-
-A complete, copy-pasteable supervisor launch. The default provider is `kiro_cli`; pass `--provider <name>` to use another (`claude_code`, `codex`, `antigravity_cli`, `kimi_cli`, `copilot_cli`, `opencode_cli`, `cursor_cli`).
-
-This example assumes a configured CAO setup (server running, profiles installed). On an already-configured host you can skip straight to `cao launch`. The `cao install` lines below are only for first-time setup; remove them if your CAO is already configured.
-
-```bash
-# Optional — skip if your CAO is already configured with these profiles.
-# Provider-agnostic: `cao install` works for any provider.
-cao install code_supervisor
-cao install developer
-cao install reviewer
-
-# Launch headlessly (assumes cao-server is already running)
-cao launch --agents code_supervisor --headless --yolo \
-  --session-name my-task --working-directory '/path/to/project' \
-  "Build a hello-world Python script. Delegate to developer, then reviewer."
-
-# Same launch on a different provider
-# cao launch --agents code_supervisor --provider claude_code --headless --yolo \
-#   --session-name my-task --working-directory '/path/to/project' "..."
-
-# Check progress / final output
-cao session status cao-my-task
-cao session status cao-my-task --workers
-
-# Clean up
-cao shutdown --session cao-my-task
-```
-
-## Launching a Session
-
-Every `cao launch` MUST include:
-
-- `--agents PROFILE` — see [Discovering Available Profiles](#discovering-available-profiles) above; if unclear, ask the user
-- `--headless` — required from an LLM agent; without it cao tries to attach tmux
-- `--session-name NAME` — cao adds `cao-` prefix automatically
-- `--working-directory DIR` — a wrong path silently breaks the session with no
-  recovery short of shutdown and relaunch. Ask the user if unclear. Always wrap
-  in single quotes to pass the literal path to the server (prevents local shell
-  expansion of `~` or variables before the value reaches cao).
-
-```bash
-cao launch --agents <profile> --headless --yolo \
-  --session-name <name> --working-directory '<path>' "<task>"
-```
-
-`--yolo` skips confirmation prompts. Required when launching from an agent — interactive
-prompts will stall the session.
-
-For SOP-driven workflows (Kiro provider): launch with `/prompts` to discover
-available SOPs, then send the matched SOP name prefixed with `@` (e.g.,
-`@my-sop-name`), then send the task — each as separate messages after
-polling for `completed` status.
-
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `cao session list` | List active sessions |
-| `cao session status SESSION` | Conductor status and last response |
-| `cao session status SESSION --workers` | Include worker terminals |
-| `cao session status SESSION --terminal ID` | Drill into a specific terminal |
-| `cao session status SESSION --json` | Machine-readable output; use to extract terminal IDs |
-| `cao session send SESSION "msg"` | Send and wait until completion (sync) |
-| `cao session send SESSION "msg" --timeout N` | Send and wait up to N seconds |
-| `cao session send SESSION "msg" --async` | Fire-and-forget without waiting |
-| `cao session send SESSION "msg" --terminal ID` | Send to a specific terminal |
-| `cao shutdown --session SESSION` | Shut down a session |
-| `cao shutdown --all` | Shut down all sessions |
-
-> `cao session send` waits for completion and returns output inline by default. With `--async`, it sends and returns immediately without waiting. With `--timeout N`, it waits up to N seconds — if the timeout expires, the agent is still running; check status later.
-> Session names in commands use the `cao-` prefixed form (e.g. `--session-name mywork` → use `cao-mywork`).
-
-A reported status is inferred from the rendered terminal screen, not from a
-structured protocol, so it can disagree with reality. Before reporting readiness,
-progress, or completion to a user, corroborate the status with an output read —
-see [cao-session-liveness](../cao-session-liveness/SKILL.md).
-
 ## Worker Communication
 
-Inside a session, the conductor talks to workers via two MCP tools:
+Inside a session, the conductor talks to workers via two MCP tools, described below.
 
 **Prefer communicating through the conductor** (`cao session send SESSION "msg"`) rather
 than directly to worker terminals. Bypassing the conductor leaves it without state on
@@ -151,9 +81,22 @@ worker. In this case, sending directly to the worker terminal is appropriate:
 cao session send SESSION "<follow-up question>" --terminal <worker-terminal-id>
 ```
 
+## Kiro SOP Workflows
+
+For SOP-driven work on the `kiro_cli` provider, send `/prompts` to discover the
+available SOPs, then the matched SOP name prefixed with `@` (for example
+`@my-sop-name`), then the task. Send each as a separate message, and wait for
+`completed` status between them.
+
 ## Common Mistakes
 
 **Wrong working directory** — agents won't find files, builds fail with confusing errors.
+Pass an absolute path in single quotes to `--working-directory`. A wrong path cannot be fixed
+without shutting down and relaunching; ask the user if the path is unclear.
+
+**Launching with `--yolo` to avoid prompts** — `--auto-approve` already skips the
+confirmation prompt. `--yolo` additionally removes every tool restriction, which the
+task almost never needs.
 
 **Stuck conductor** — conductor is waiting on a worker that stopped responding. Check
 the worker's status first, then decide: prompt it to continue and send results back,

@@ -228,14 +228,14 @@ WELCOME_BANNER_RE = re.compile(r"^\s*Welcome to Kimi Code(?: CLI)?!\s*$")
 # reaches IDLE.
 BOOT_MESSAGE_ROW_RE = re.compile(
     r"^\s*(?:[\u2800-\u28ff]\s*)?(?:"
-    r"Loading configuration|Loading agent|Resolving dependencies|Restoring conversation"
+    r"(?:Loading configuration|Loading agent|Resolving dependencies|Restoring conversation"
     r"|Send /help for help information"
-    r"|No session yet(?:\s*[—–-].*)?"
-    r"|Run /web to continue your session in the browser"
-    r"|✦\s*Try Kimi Code Web UI.*"
-    r"|MCP server \"[^\"]*\" connected(?:\s*·.*)?"
-    r"|tmux extended-keys is off.*"
-    r")\s*[.…\s]*$",
+    r"|Run /web to continue your session in the browser)[.…\s]*"
+    # A newline separates arbitrary detail text (.*) from any remaining suffix.
+    r"|No session yet(?:[.…\s]*|\s*[—–-].*(?:\n[.…\s]*)?)"
+    r"|MCP server \"[^\"]*\" connected(?:[.…\s]*|\s*·.*(?:\n[.…\s]*)?)"
+    r"|(?:✦\s*Try Kimi Code Web UI|tmux extended-keys is off).*(?:\n[.…\s]*)?"
+    r")$",
     re.IGNORECASE,
 )
 
@@ -251,10 +251,11 @@ BOOT_MESSAGE_ROW_RE = re.compile(
 # punctuation / counts — so "... is only a phrase" stays content.
 MCP_BOOT_ROW_RE = re.compile(
     r"^\s*(?:"
-    r"[\u2800-\u28ff]\s*MCP Servers:\s*\d+/\d+.*"
+    # One digit establishes the second count; the suffix accepts any remaining digits.
+    r"[\u2800-\u28ff]\s*MCP Servers:\s*\d+/\d.*(?:\n\s*)?"
     r"|[\u2800-\u28ff]\s*\S.*\(connecting\)\s*"
     r"|connecting to mcp servers[\s.…·()0-9/]*"
-    r")\s*$",
+    r")$",
     re.IGNORECASE,
 )
 
@@ -296,12 +297,6 @@ FOOTER_SEGMENT_RES: Tuple[re.Pattern, ...] = (
 FOOTER_TIP_RE = re.compile(
     r"ctrl-o to hide or reveal tool output|shift-tab to Plan mode|/goal for multi-step"
 )
-#: The same tips carrying the footer's own foreground colour.
-FOOTER_TIP_STYLE_RE = re.compile(
-    r"\x1b\[38;5;242m[^\x1b]*(?:ctrl-o to hide or reveal tool output"
-    r"|shift-tab to Plan mode|/goal for multi-step)"
-)
-
 # Segments that constitute a footer row on their own.
 LEGACY_STATUS_ROW_RE = re.compile(r"^\s*\d+:\d+\s.*(?:agent|shell)\s*\(")
 
@@ -368,7 +363,7 @@ LEGACY_IDLE_PROMPT_RE = re.compile(r"^\s*[✨💫]\s*$")
 # it — reproduced: `• The UI shows … (3 more lines, ctrl+o to expand) when output
 # is collapsed.` — was classified as execution plumbing and dropped from the
 # answer, even with a colour-253 answer bullet.
-COLLAPSED_TOOL_OUTPUT_RE = re.compile(r"^\s*[•●]?\s*…\s*\(\d+ more lines")
+COLLAPSED_TOOL_OUTPUT_RE = re.compile(r"^\s*(?:[•●]\s*)?…\s*\(\d+ more lines")
 
 # Kimi Code's inline key hints that sit under a running tool call. Matched as
 # the exact observed strings, not as a loose `^Press ` prefix: an assistant
@@ -1101,7 +1096,11 @@ def is_status_footer_line(clean_line: str, raw_line: str = "") -> bool:
     if not FOOTER_TIP_RE.search(clean_line):
         return False
     if _SGR_RE.search(raw_line or ""):
-        return bool(FOOTER_TIP_STYLE_RE.search(raw_line))
+        # A tip must occur before the next escape, not under a later colour.
+        return any(
+            segment.startswith("[38;5;242m") and FOOTER_TIP_RE.search(segment)
+            for segment in raw_line.split("\x1b")[1:]
+        )
     return segments >= 1
 
 
@@ -1744,10 +1743,10 @@ def classify_line(
 
 _SWARM_HEADER_RE = re.compile(r"^\s*─ Agent Swarm(?:\s+─|\s*$)")
 _SWARM_MEMBER_RE = re.compile(r"^\s*\d{3,}\s+\S")
-_SWARM_STATUS_RE = re.compile(
+_SWARM_STATUS_PREFIX_RE = re.compile(
     r"^\s*(?:[🌑🌒🌓🌔🌕🌖🌗🌘⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✓✗⊘]\s+)?"
     r"(?P<state>Working…|Orchestrating…|Prompting…|Rate limited…|Completed\.|Failed\.|Aborted\.)"
-    r"(?:\s+(?P<detail>.*))?\s*$"
+    r"(?=\s|$)"
 )
 
 
@@ -1773,10 +1772,12 @@ def _swarm_progress_rows(
             if end in quoted:
                 break
             row = cleans[end]
-            status = _SWARM_STATUS_RE.match(row)
+            if "\n" in row:
+                break
+            status = _SWARM_STATUS_PREFIX_RE.match(row)
             if status:
                 state = status.group("state")
-                detail = (status.group("detail") or "").strip()
+                detail = row[status.end() :].strip()
                 if state not in {"Prompting…", "Orchestrating…"} and detail.strip("━"):
                     break
                 if not _FOREGROUND_COLOR_RE.search(raws[end]):

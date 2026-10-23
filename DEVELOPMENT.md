@@ -200,10 +200,14 @@ uv run isort --check-only src/ test/
 
 ### Type Checking
 
-The project uses `mypy` for static type checking:
+The project uses `mypy` for static type checking, gated by a per-file ratchet against a
+committed baseline (see [CONTRIBUTING.md](CONTRIBUTING.md#type-checking-the-mypy-ratchet)):
 
 ```bash
-# Run type checker
+# Run the blocking gate (what CI runs)
+uv run python scripts/mypy_ratchet.py
+
+# Run mypy directly for raw, unfiltered output
 uv run mypy src/
 ```
 
@@ -213,7 +217,7 @@ uv run mypy src/
 # Format, sort imports, type check, and run tests
 uv run black src/ test/
 uv run isort src/ test/
-uv run mypy src/
+uv run python scripts/mypy_ratchet.py
 uv run pytest -v
 ```
 
@@ -258,7 +262,7 @@ uv run pytest test/ --ignore=test/providers/test_kiro_cli_integration.py \
 ```bash
 uv run black src/ test/
 uv run isort src/ test/
-uv run mypy src/
+uv run python scripts/mypy_ratchet.py
 ```
 
 ### 6. Commit and Push
@@ -281,6 +285,7 @@ Runs on all pushes to `main` and all PRs targeting `main`:
 - **Unit tests**: Python 3.10, 3.11, 3.12 matrix with coverage
 - **Code quality**: black, isort, mypy
 - **Security scan**: Trivy filesystem scan — fails on a finding of **any** severity (see [SECURITY.md](SECURITY.md#running-security-scans-locally) for why the workflow's `CRITICAL,HIGH` input is ignored)
+- **Dependency Security**: Full locked npm, Bun, uv, and Cargo graphs, including dev dependencies and unfixed advisories; every HIGH/CRITICAL finding or scan error blocks. Also verifies the installed dependency mitigations. The Python 3.12 unit job runs a real-Trivy dev-inventory regression; see [SECURITY.md](SECURITY.md#full-dependency-gate).
 - **Dependency review**: License and vulnerability checks on PRs
 
 ### Provider-Specific Workflows (path-triggered)

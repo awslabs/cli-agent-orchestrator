@@ -77,6 +77,10 @@ _REQUIRED_RUN_COLUMNS = frozenset(
         "finished_at",
         "tier",
         "generation",
+        # The starting terminal (delegation ceiling, PR #948): registered here for the
+        # same reason as manifest_json below, so a failed ALTER cannot leave a journal
+        # that silently forgets who a run is bounded by.
+        "caller_id",
         # manifest-column (issue #583 Bolt 2, ADR-583-12). Registering the column here is
         # NOT bookkeeping — it is what gives the silent-migration risk a RUNTIME mitigation.
         # ``_migrate_workflow_run`` swallows its own failures at debug level, so a failed
@@ -90,6 +94,7 @@ _REQUIRED_RUN_COLUMNS = frozenset(
         # exists to catch.
         "manifest_json",
         "error",
+        "kind",
     }
 )
 _REQUIRED_STEP_COLUMNS = frozenset(
@@ -132,6 +137,16 @@ class RunRow:
     manifest_json: Optional[str] = None
     # Issue #753: redacted, bounded script-level failure diagnostic.
     error: Optional[str] = None
+    # PR #849 review: run-level terminal verdict persisted independently of the
+    # per-step diagnostic.  A script can catch a provider_error/timeout step and
+    # later fail for an unrelated reason; this column keeps live and cold reads
+    # aligned on the run's actual terminal kind.
+    kind: Optional[str] = None
+    # The terminal that started the run, when an agent did. Persisted so a
+    # resumed or recovered run re-binds to the ORIGINAL caller's recorded
+    # delegation ceiling rather than to whoever resumes it (utils/delegation.py).
+    # NULL for operator-started runs and for rows written before the column.
+    caller_id: Optional[str] = None
 
 
 @dataclass
@@ -380,8 +395,12 @@ def insert_run(
     tier: str = "yaml",
     generation: str = "1",
     manifest_json: Optional[str] = None,
+    caller_id: Optional[str] = None,
 ) -> None:
     """INSERT the ``workflow_run`` row at ``start_run`` (lifecycle table, E1).
+
+    ``caller_id`` (additive, defaulted) persists the starting terminal so the
+    run's delegation bound survives a server restart; see ``RunRow.caller_id``.
 
     A plain ``INSERT``: a re-INSERT for an already-journaled ``run_id`` raises
     ``sqlite3.IntegrityError`` rather than silently overwriting the durable row
@@ -400,8 +419,9 @@ def insert_run(
         conn.execute(
             "INSERT INTO workflow_run "
             "(run_id, workflow_name, spec_snapshot, inputs_json, state, "
-            " current_step_id, started_at, finished_at, tier, generation, manifest_json) "
-            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?)",
+            " current_step_id, started_at, finished_at, tier, generation, manifest_json, "
+            " caller_id) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?)",
             (
                 run_id,
                 workflow_name,
@@ -412,6 +432,7 @@ def insert_run(
                 tier,
                 generation,
                 manifest_json,
+                caller_id,
             ),
         )
 
@@ -428,6 +449,7 @@ def insert_run_with_steps(
     tier: str = "yaml",
     generation: str = "1",
     manifest_json: Optional[str] = None,
+    caller_id: Optional[str] = None,
 ) -> None:
     """Atomically INSERT the run row AND seed its step rows in ONE transaction (U2, TR-1).
 
@@ -457,8 +479,9 @@ def insert_run_with_steps(
         conn.execute(
             "INSERT INTO workflow_run "
             "(run_id, workflow_name, spec_snapshot, inputs_json, state, "
-            " current_step_id, started_at, finished_at, tier, generation, manifest_json) "
-            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?)",
+            " current_step_id, started_at, finished_at, tier, generation, manifest_json, "
+            " caller_id) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?)",
             (
                 run_id,
                 workflow_name,
@@ -469,6 +492,7 @@ def insert_run_with_steps(
                 tier,
                 generation,
                 manifest_json,
+                caller_id,
             ),
         )
         conn.executemany(
@@ -554,13 +578,16 @@ def update_run_state(
     state: str,
     finished_at: Optional[str],
     error: Optional[str] = None,
+    kind: Optional[str] = None,
 ) -> None:
-    """UPDATE run state, finish time, and optional run-level diagnostic (E1).
+    """UPDATE run state, finish time, optional diagnostic, and terminal kind (E1).
 
     ``finished_at`` is set on a terminal transition and cleared (``None``) when a
     resume re-opens a previously-settled run (business-logic-model §3).
-    ``error`` is cleared by every caller that omits it, preventing a resumed or
-    subsequently completed run from retaining a stale script failure.
+    ``error`` and ``kind`` are cleared by every caller that omits them, preventing a
+    resumed or subsequently completed run from retaining a stale script failure or
+    verdict.  ``kind`` is a trailing additive parameter; older callers keep the
+    existing three- or four-argument behaviour unchanged.
 
     UNCONDITIONAL BY CONTRACT. Do NOT add a ``WHERE state = ...`` predicate here:
     the resume path calls this to write state BACK to ``running`` on an already
@@ -571,8 +598,9 @@ def update_run_state(
     """
     with _connect() as conn:
         conn.execute(
-            "UPDATE workflow_run SET state = ?, finished_at = ?, error = ? WHERE run_id = ?",
-            (state, finished_at, error, run_id),
+            "UPDATE workflow_run SET state = ?, finished_at = ?, error = ?, "
+            "kind = ? WHERE run_id = ?",
+            (state, finished_at, error, kind, run_id),
         )
 
 
@@ -874,8 +902,8 @@ def get_run(run_id: str) -> Optional[RunRow]:
     with _connect() as conn:
         row = conn.execute(
             "SELECT run_id, workflow_name, spec_snapshot, inputs_json, state, "
-            "current_step_id, started_at, finished_at, tier, generation, manifest_json, error "
-            "FROM workflow_run WHERE run_id = ?",
+            "current_step_id, started_at, finished_at, tier, generation, manifest_json, error, "
+            "kind, caller_id FROM workflow_run WHERE run_id = ?",
             (run_id,),
         ).fetchone()
     if row is None:
@@ -895,6 +923,8 @@ def get_run(run_id: str) -> Optional[RunRow]:
         # failed. Both read back as None, which the resume gate refuses when enforcement is on.
         manifest_json=row[10],
         error=row[11],
+        kind=row[12],
+        caller_id=row[13],
     )
 
 
@@ -1164,15 +1194,18 @@ def settle_step(
     result_json: Optional[str],
     output_json: Optional[str],
     error: Optional[str],
+    error_kind: Optional[str] = None,
 ) -> bool:
     """Settle a script call's row — state, count, envelope, output, error — atomically (B).
 
     The second half of the split write, and the whole of FR-4 guard 1: ``state``,
-    ``attempts``, ``result_json``, ``output_json`` and ``error`` land in ONE
-    statement on ONE connection, so there is no window in which the row reads
-    settled and carries no result (BR-1, INV-1). A failure writes nothing and
-    leaves the row as :func:`begin_step` set it — ``running``, which is not
-    settled (BR-2). Atomic means never half-written, not never-failing.
+    ``attempts``, ``result_json``, ``output_json``, ``error`` and the optional
+    ``error_kind`` land in ONE statement on ONE connection, so there is no window
+    in which the row reads settled and carries no result (BR-1, INV-1). A failure
+    writes nothing and leaves the row as :func:`begin_step` set it — ``running``,
+    which is not settled (BR-2). Atomic means never half-written, not never-failing.
+    ``error_kind`` is a trailing additive parameter; its default preserves every
+    existing seven-argument caller.
 
     Returns ``True`` when a row already existed and ``False`` when this settle
     created it — the no-begin rescue path below. The caller logs that
@@ -1254,17 +1287,27 @@ def settle_step(
         )
         conn.execute(
             "INSERT INTO workflow_run_step "
-            "(run_id, step_id, state, attempts, output_json, error, updated_at, "
-            " result_json) "
-            "VALUES (?, ?, ?, 1, ?, ?, ?, ?) "
+            "(run_id, step_id, state, attempts, output_json, error, error_kind, "
+            " updated_at, result_json) "
+            "VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?) "
             "ON CONFLICT(run_id, step_id) DO UPDATE SET "
             "state = excluded.state, "
             "attempts = workflow_run_step.attempts + 1, "
             "output_json = excluded.output_json, "
             "error = excluded.error, "
+            "error_kind = excluded.error_kind, "
             "updated_at = excluded.updated_at, "
             "result_json = excluded.result_json",
-            (run_id, step_id, state, output_json, error, updated_at, result_json),
+            (
+                run_id,
+                step_id,
+                state,
+                output_json,
+                error,
+                error_kind,
+                updated_at,
+                result_json,
+            ),
         )
     return existed
 

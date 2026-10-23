@@ -77,7 +77,7 @@ at all, and two migration details that would have made U2 misbehave forever.
 | **The U2 idempotence gate is specified as a column-list comparison, not a name check.** A named table-level UNIQUE yields `sqlite_autoindex_<table>_1` and the constraint name is **discarded**, so a name-based gate can never match and would rebuild a shared table on every `init_db()` forever | N5 |
 | **Index-recreation ordering relative to `_migrate_memory_indexes` is stated** | N6 |
 | **The secret gate now runs at INDEX time (reconcile)**, quarantining a secret-bearing note with a reported finding code. This reverses my revision-2 recommendation | ruling R5 |
-| **`mappings[].secret_gate` governs both boundaries**, `reject` by default, `warn` a deliberate per-mapping election, finding reported in either mode; `warn` + `inject: true` warns at config load and is named in `status` | ruling R14 |
+| **`mappings[].secret_gate` governs both boundaries**, `reject` by default, `warn` a deliberate per-mapping election, finding reported in either mode; `warn` + `inject: true` warns at config load and is named in `status`. **Amended 2026-10-21 (#644 AC10):** under `warn` every model-bound read is redacted at the `load_candidate` chokepoint; raw bytes pass only via per-finding `cao.secret_ok` acceptances; the `warn` + `inject` load warning is retired | ruling R14, amended |
 | **U5 gets a security review** — it carries the four maintenance-refusal guards that are the only thing preventing unattended de-indexing of a user's vault notes | ruling R13 |
 | **U9's `GraphView.meta` distinguishes three causes** for absent lint enrichment rather than conflating a design boundary with a live failure | self-identified |
 | **Each new refusal guard gets its own test that passes on the current tree**, because an assertion bolted into a test class that is red **on the implementer's machine** can appear covered while never executing | self-identified |
@@ -313,7 +313,7 @@ Four modules assume the native layout and are reached by ordinary commands:
 | Containment | `safe_join_under_base` — per-segment validation then `realpath` containment |
 | Read-time traversal guard | `_metadata_recall` line 2218 skips an index entry whose realpath is not under `wiki_resolved + os.sep` rather than raising. **This inline shape is the primitive the vault read path adopts** |
 | Symlink detection | `memory_reconciliation.py::_first_symlink_component` line 205, `_under` line 197 |
-| Secret gate | `services/secret_gate.py` — six ordered named patterns; `scan_for_secrets` returns a pattern **name**; `redact_secrets` for export |
+| Secret gate | `services/secret_gate.py` — twelve ordered named patterns (`aws_access_key`, `aws_secret_access_key`, `pem_private_key`, `anthropic_api_key`, `openai_api_key`, `github_fine_grained_pat`, `github_pat`, `gitlab_pat`, `slack_token`, `jwt`, `bearer_token`, `secret_assignment`); `scan_for_secrets` returns a pattern **name**; `redact_secrets` for export; `redact_secrets_with_acceptances` for the vault read chokepoint (#644) |
 | Atomic write and locking | `utils/atomic_file.py` — `locked_atomic_write`, `locked_atomic_rewrite`, `_file_lock`, `LockTimeoutError`, umask-respecting mode, unique temp plus `os.replace` |
 | Audit | `services/audit_log.py` — append-only daily markdown, `O_NOFOLLOW`/`O_CLOEXEC`, `fstat` `0o600` check, day cap, injection sanitization. `AUDIT_EVENT_WHITELIST` is **closed**: an unlisted event is dropped silently |
 | CodeQL path-injection precedent | `services/workflow_spec_service.py:162-200` documents that `str.startswith` is a **flow-sensitive, function-local** barrier, so a checked path does not survive a `return`; alerts 166/167/168 were caused by exactly that. `_read_contained_spec_bytes` (line 198) is the fix shape: resolve, re-assert containment **inline**, then own the `isfile`/`open` sinks in the same function. Lines 238-243 add that the guard must be a **single positive** `startswith(base + os.sep)`, not a compound `!= base and not startswith(...)`, whose equal-to-base branch reaches the sink unguarded |
@@ -1052,8 +1052,8 @@ other people. Ten controls, each mapped to an existing primitive.
    paths — never note bytes, never a secret-gate match. `_sanitize_for_log` is reused.
 10. **Secret scanning applies at index time** (ruling R5), so a credential-bearing note is
     quarantined by default rather than becoming recallable. Two residuals, named rather
-    than papered over. First, the gate is a **heuristic deny-list** — one of its six
-    patterns is `(?i)(?:password|passwd|secret|pwd)\s*[:=]\s*\S{6,}`, which matches
+    than papered over. First, the gate is a **heuristic deny-list** — one of its twelve
+    patterns (six when this was written; see the R14 amendment) is `(?i)(?:password|passwd|secret|pwd)\s*[:=]\s*\S{6,}`, which matches
     ordinary vault prose such as a runbook quoting `password: hunter2` as an example — so
     `secret_gate: "warn"` exists as a documented per-mapping election for an operator who
     knows their corpus, with `reject` as the shipped default (ruling R14) and the finding
@@ -1064,6 +1064,11 @@ other people. Ten controls, each mapped to an existing primitive.
     non-goal rather than an oversight, and `index_freshness` is what makes it visible: a
     criterion cannot demand continuous enforcement while a non-goal forbids continuous
     watching.
+    **Amended 2026-10-21 (#644 AC10):** both residuals are now bounded by read-time redaction.
+    Under `warn` the note is indexed but every match is redacted at `load_candidate` on the way
+    to any agent, and a secret added after reconcile is redacted the same way, so the
+    reconcile-time window exposes a `stale` label, not bytes. Raw bytes pass only through a
+    per-finding `cao.secret_ok` acceptance. See the R14 amendment below.
 
 **Divergence is never silent (F13).** `ScopeBinding` keyed on a raw `scope_id` was a
 hole: `resolve_project_id` (line 210) falls back to a cwd hash, and `_get_search_dirs`
@@ -1171,7 +1176,7 @@ Closed by human ruling. Not open, not to be revisited in review.
 | R11 | `allow_hardlinks` defaults **false** |
 | R12 | `ck_related_keys_length` is **omitted** from the rebuilt table, so U2 changes uniqueness and nothing else. `substr` truncation rejected outright — silently destroying data during a uniqueness migration is the one thing it must never do. Pre-scan-and-refuse rejected as still blocking startup |
 | R13 | **U5 gets a security review.** Its four maintenance-refusal guards are the only thing preventing unattended de-indexing of a user's vault notes |
-| R14 | `mappings[].secret_gate` — the same key and the same two values — **governs the index boundary as well as the write boundary**, with `reject` as the default. No third value, no second key. The finding is reported in **both** modes: the mode governs indexing, never disclosure. Rejected: always-quarantine-with-no-override (leaves a credential-documenting vault partly unrecallable with no remedy), `warn`-by-default (inverts the reason AC10 was flagged), and a per-pattern confidence policy (the natural future refinement, deferred because classifying six patterns by confidence becomes its own security-relevant review surface) |
+| R14 | `mappings[].secret_gate` — the same key and the same two values — **governs the index boundary as well as the write boundary**, with `reject` as the default. No third value, no second key. The finding is reported in **both** modes: the mode governs indexing, never disclosure. Rejected: always-quarantine-with-no-override (leaves a credential-documenting vault partly unrecallable with no remedy), `warn`-by-default (inverts the reason AC10 was flagged), and a per-pattern confidence policy (the natural future refinement, deferred because classifying six patterns by confidence becomes its own security-relevant review surface). **Amendment 2026-10-21 (maintainer ruling, #644 AC10).** R14 judged whether the configuration was *coherent*, not whether the data flow was *safe*: under `warn` the raw match left the machine and persisted in a model provider's request logs for the retention window, a shape no surveyed secret scanner offers (each blocks by default and overrides **per finding**, with the override recorded). `warn` now means **redact-and-inject**: the note is indexed and recallable, but every match is replaced by `[REDACTED:<pattern_name>]` at the single read chokepoint, `services/vault/reader.py::load_candidate`, which every model-bound path (automatic injection, explicit recall, related-key expansion, BM25 ranking) goes through. Raw bytes pass only when the note's own frontmatter carries a per-finding acceptance bound to the pattern name **and** the SHA-256 of the matched span, `cao.secret_ok: [{pattern, sha256}]`; a boolean or pattern-only entry is an invalid `cao` block and quarantines the note. Acceptances are reported as `secret_accepted` findings and in `cao memory vault status` (`secret_acceptances`); an acceptance matching nothing, or on a `reject` mapping, is `secret_acceptance_unmatched`. `cao memory vault scan --fingerprints` prints the pattern and hash an operator needs, to the terminal only. `reject` is unchanged. The pattern table is twelve, not six: `aws_access_key`, `aws_secret_access_key`, `pem_private_key`, `anthropic_api_key`, `openai_api_key`, `github_fine_grained_pat`, `github_pat`, `gitlab_pat`, `slack_token`, `jwt`, `bearer_token`, `secret_assignment`. |
 
 ## Open questions for a human
 
@@ -1189,6 +1194,10 @@ One consequence of R14 is carried into the acceptance-criteria audit rather than
 reintroduces the exposure the criterion describes. It is marked `Conditional` in
 [traceability.md](traceability.md) rather than Satisfied on the strength of the default
 alone.
+
+**Amended 2026-10-21:** with redact-and-inject under `warn` (#644 AC10 ruling, R14 amendment)
+the exposure no longer depends on the setting, and AC10 is marked **Satisfied** in
+[traceability.md](traceability.md) with the evidence listed there.
 
 Two interpretive positions are also recorded rather than left implicit, both endorsed by
 ruling R6 and the AC10 re-audit but both open to a reviewer disagreeing with the

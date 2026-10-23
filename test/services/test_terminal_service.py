@@ -439,6 +439,9 @@ class TestListSiblingsDepthClamping:
         assert result == [
             {"id": "sib-1", "group": ["tenant_1"], "metadata": None, "status": "idle"}
         ]
+        assert set(result[0]) == {"id", "group", "metadata", "status"}
+        assert "model" not in result[0]
+        assert "model_honored" not in result[0]
 
     @patch(f"{_TS}.status_monitor")
     @patch(f"{_TS}.list_siblings_by_group_prefix")

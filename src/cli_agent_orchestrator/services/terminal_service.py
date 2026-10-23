@@ -27,7 +27,8 @@ import re
 import threading
 import time
 import uuid
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -37,29 +38,32 @@ from pydantic import ValidationError
 
 from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam: creation no longer bulk-deletes with this helper,; but older integrations/tests patch the imported symbol while exercising; create_terminal. Keep the name exported from this module until that seam; can be retired separately.
+from cli_agent_orchestrator.clients.database import (
+    delete_terminals_by_session,  # Compatibility/test seam: creation no longer bulk-deletes with this helper, but older integrations/tests patch the imported symbol while exercising create_terminal. Keep the name exported from this module until that seam can be retired separately.
+)
+from cli_agent_orchestrator.clients.database import (
     count_runtime_allocated_terminals,
     create_inbox_message,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
-from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam: creation no longer bulk-deletes with this helper,; but older integrations/tests patch the imported symbol while exercising; create_terminal. Keep the name exported from this module until that seam; can be retired separately.
-    delete_idempotency_key,
-)
+from cli_agent_orchestrator.clients.database import delete_idempotency_key
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
-from cli_agent_orchestrator.clients.database import (  # Compatibility/test seam: creation no longer bulk-deletes with this helper,; but older integrations/tests patch the imported symbol while exercising; create_terminal. Keep the name exported from this module until that seam; can be retired separately.
-    delete_terminals_by_session,
+from cli_agent_orchestrator.clients.database import (
     get_idempotency_record,
     get_session_incarnation,
     get_terminal_metadata,
     list_all_terminals,
     list_pending_deferred_init_external_owner_terminal_ids,
+    list_pending_initial_delivery_terminal_ids,
     list_siblings_by_group_prefix,
     list_terminals_by_session,
     update_last_active,
     update_terminal_deferred_init_external_owner,
     update_terminal_deferred_init_failure,
     update_terminal_deferred_init_runtime_reclaimed,
+    update_terminal_description,
     update_terminal_group,
+    update_terminal_initial_delivery,
     update_terminal_metadata,
     update_terminal_provider_variant,
     update_terminal_shell_command,
@@ -72,14 +76,17 @@ from cli_agent_orchestrator.constants import (
     PIPE_LIVENESS_TAIL_LINES,
     SESSION_PREFIX,
     TERMINAL_LOG_DIR,
+    TURN_START_CONFIRM_SECONDS,
 )
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import (
+    ProviderExitedInputBlockedError,
     Terminal,
     TerminalInputBlockedError,
+    TerminalInputBlockedReason,
     TerminalLimitError,
     TerminalStatus,
 )
@@ -100,14 +107,16 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     probe_kiro_capabilities,
     requested_kiro_capabilities,
 )
-from cli_agent_orchestrator.providers.manager import provider_manager
-from cli_agent_orchestrator.services import worktree_service
+from cli_agent_orchestrator.providers.manager import ProviderManager, provider_manager
+from cli_agent_orchestrator.services import ephemeral_service, worktree_service
 from cli_agent_orchestrator.services.elastic_worker_gateway import (
     elastic_worker_gateway_headers,
 )
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.install_service import (
+    installed_kiro_tools,
+    installed_opencode_permission,
     kiro_install_predates_native_enforcement,
 )
 from cli_agent_orchestrator.services.memory_gateway import (
@@ -125,7 +134,11 @@ from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
 from cli_agent_orchestrator.services.settings_service import get_max_terminals
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
-from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils import agent_profiles, delegation
+from cli_agent_orchestrator.utils.delegation import (
+    DelegationCeilingError,
+    InstalledPolicyExceedsAllowlistError,
+)
 from cli_agent_orchestrator.utils.enforcement import NATIVE as NATIVE_ENFORCEMENT
 from cli_agent_orchestrator.utils.enforcement import (
     PROVIDER_ENFORCEMENT,
@@ -138,10 +151,61 @@ from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
     generate_window_name,
-    wait_until_status,
 )
 
 logger = logging.getLogger(__name__)
+
+#: Every orchestration-type value that marks input as machine-originated, derived
+#: from the enum rather than hand-enumerated (#896). The dialog guard in
+#: ``send_input`` used to test ``{ASSIGN, HANDOFF}`` and ``SEND_MESSAGE`` walked
+#: past it into an open AskUserQuestion dialog. Deriving the set means a member
+#: added to ``OrchestrationType`` later inherits the guard the day it is defined;
+#: test/services/test_orchestrated_input_guard_invariants.py pins that per member
+#: and test/test_callsite_lint_rules.py refuses a return to a literal subset.
+_ORCHESTRATED_INPUT_VALUES = frozenset(t.value for t in OrchestrationType)
+
+
+def _orchestration_value(orchestration_type: "Optional[OrchestrationType]") -> str:
+    """Normalize an orchestration type to the string the dialog guard tests.
+
+    An operator typing by hand carries no type at all, which normalizes to ``""``
+    and is therefore never in ``_ORCHESTRATED_INPUT_VALUES``.
+    """
+    return (
+        orchestration_type.value
+        if isinstance(orchestration_type, OrchestrationType)
+        else str(orchestration_type or "")
+    )
+
+
+def _dialog_blocks_orchestrated_input(
+    provider: Any,
+    orchestration_type: "Optional[OrchestrationType]",
+    current_status: TerminalStatus,
+) -> bool:
+    """Whether machine-originated input must not be submitted into this terminal now.
+
+    The #896 predicate, in one place because it now has two enforcement sites and
+    they must not drift:
+
+    - :func:`dispatch_input`, which refuses the paste itself, and
+    - :func:`redeliver_dropped_message_with_boundary`'s bare-Enter recovery, which
+      submits what is already in the composer and so never reaches
+      ``dispatch_input`` at all.
+
+    Only a real ``answer_user_prompt`` call, or the operator typing by hand (no
+    orchestration type), may resolve a prompt. Keeping the membership test derived
+    from the enum means a member added to ``OrchestrationType`` inherits both
+    sites the day it is defined; test/test_callsite_lint_rules.py refuses a return
+    to a hand-written subset.
+    """
+    return (
+        provider is not None
+        and getattr(provider, "blocks_orchestrated_input_while_waiting_user_answer", False) is True
+        and _orchestration_value(orchestration_type) in _ORCHESTRATED_INPUT_VALUES
+        and current_status == TerminalStatus.WAITING_USER_ANSWER
+    )
+
 
 _DEFERRED_INIT_FAILURE_MESSAGE_MAX = 4096
 _DEFERRED_INIT_FAILURE_SCAN_MAX = 16384
@@ -202,6 +266,12 @@ TERMINAL_RANGE_MAX_LENGTH = 1024 * 1024
 # pin the thread.
 CROSS_NODE_NOTIFY_TIMEOUT = 10.0
 
+
+def resolve_launch_model(model: Optional[str], profile: Optional[AgentProfile]) -> Optional[str]:
+    """Resolve the model CAO passes to a provider for this launch."""
+    return model or (profile.model if profile else None)
+
+
 # Track terminals that have already received memory injection (first message only).
 _memory_injected_terminals: set = set()
 _memory_injected_lock = threading.Lock()
@@ -213,6 +283,77 @@ _CURRENT_COMPOSER_PROBE_MAX_CHARS = 64
 # deferred provider.initialize() + input-send task could be GC'd mid-run,
 # silently leaving a worker uninitialized. Tasks drop themselves on completion.
 _deferred_init_tasks: set = set()
+
+# Terminals whose deferred initial message has been ACCEPTED but not yet
+# dispatched to the pane. Written on the event loop by _schedule_deferred_init,
+# read from worker threads by the status-reporting helpers below, hence the lock
+# (mirrors _memory_injected_lock above).
+_pending_initial_delivery: set = set()
+_pending_initial_delivery_lock = threading.Lock()
+
+# Statuses a poller may read as "there is nothing left to wait for". While an
+# initial message is still pending these are exactly the readings that must not
+# escape: see reported_status().
+_COMPLETABLE_STATUSES = (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
+
+
+def _mark_initial_delivery_pending(terminal_id: str) -> None:
+    """Record that an accepted initial message has not been dispatched yet."""
+    with _pending_initial_delivery_lock:
+        _pending_initial_delivery.add(terminal_id)
+
+
+def _clear_initial_delivery_pending(terminal_id: str) -> None:
+    """Release the pending mark. Idempotent — every exit path may call it."""
+    with _pending_initial_delivery_lock:
+        _pending_initial_delivery.discard(terminal_id)
+
+
+def initial_delivery_pending(terminal_id: str) -> bool:
+    """True while an accepted initial message has not reached the pane yet."""
+    with _pending_initial_delivery_lock:
+        return terminal_id in _pending_initial_delivery
+
+
+def reported_status(terminal_id: str, status: TerminalStatus) -> TerminalStatus:
+    """Mask a completable status while the initial message is still undispatched.
+
+    PR #566 review (haofeif), P1. A client that polls for completion decides
+    "done" from the terminal's status alone, and every such poller needs the same
+    thing: evidence that is causally DOWNSTREAM of the send it is waiting on.
+    Provider startup does not qualify. On the deferred path the pane can sit at a
+    perfectly genuine IDLE for seconds after ``initialize()`` returns while
+    ``_schedule_deferred_init`` resolves shell_baseline and metadata and
+    ``send_input`` runs ``inject_memory_context`` — all strictly BEFORE any
+    keystroke is dispatched. A poller sampling that window sees a stable IDLE and
+    concludes the agent finished a task it was never given: the synchronous
+    ``cao launch`` printed empty output and exited 0.
+
+    Reporting UNKNOWN closes that window at the source, for every client at once,
+    rather than asking each one to remember to wait for a separate handshake.
+    UNKNOWN is the honest reading — the terminal exists but is not tracking the
+    task yet — and pollers already treat it as neither progress nor completion
+    (``utils.terminal.poll_until_done``, ``services.agent_step``), so no number
+    of pre-dispatch samples can satisfy an idle gate.
+
+    Deliberately NOT masked:
+
+    - **WAITING_USER_ANSWER / PROCESSING / ERROR.** Masking WAITING_USER_ANSWER
+      would hide a pane genuinely parked on a prompt, which is the one state an
+      operator has to see to clear it (and which ``send_input``'s own guard turns
+      into a TerminalInputBlockedError that releases the pending mark anyway).
+      Letting it through is harmless here: it flips a poller's "has started" flag
+      early, but with IDLE masked no idle streak can accumulate to act on it.
+    - **The internal callers of ``status_monitor.get_status``.** send_input's
+      ERROR/WAITING_USER_ANSWER guards, inbox/flow/memory services and the
+      deferred path's own retry loop all need the RAW state; masking there would
+      change delivery decisions, not just reporting. This is a reporting-layer
+      concern only, applied where a status crosses the API boundary.
+    """
+    if status in _COMPLETABLE_STATUSES and initial_delivery_pending(terminal_id):
+        return TerminalStatus.UNKNOWN
+    return status
+
 
 # External-owner deferred-init rows survive provider startup failures so Bridge
 # and other external observers can read a durable verdict. Restart recovery
@@ -640,6 +781,8 @@ def _roll_back_failed_create(
         # cleanup deferral with enough information to retry safely.
         cleanup_complete = True
     if cleanup_complete:
+        if terminal_id is not None:
+            ephemeral_service.release(terminal_id, "launch_failed")
         try:
             if terminal_id is not None:
                 db_delete_terminal(terminal_id)
@@ -748,8 +891,22 @@ def _request_fingerprint(
     resume_session_id: Optional[str],
     initial_message: Optional[str],
     initial_message_orchestration_type: Optional[OrchestrationType],
+    claim_id: Optional[str] = None,
+    description: Optional[str] = None,
+    caller_ceiling: Optional[List[str]] = None,
+    delegating_terminal_id: Optional[str] = None,
 ) -> str:
     """Fingerprint the create-terminal request an idempotency key stands for.
+
+    ``caller_ceiling`` (a remote caller's asserted delegation ceiling, see
+    ``create_terminal``) and ``delegating_terminal_id`` (the terminal whose
+    recorded ceiling bounds the create when no ``caller_id`` names it: workflow
+    steps, the memory sidecar) are appended ONLY when supplied, like
+    ``claim_id``, so every request that does not carry them keeps the digest it
+    had before the fields existed. Both are hashed because each decides the
+    created terminal's recorded ceiling, i.e. a privilege, exactly as
+    ``allowed_tools`` does: two keyed creates that differ only in the bounding
+    terminal must collide (409), not resolve to the first one's terminal.
 
     Review on PR #634, issue #616. Stored alongside the key so a later call
     presenting the same key can be told apart: same fingerprint is a RETRY
@@ -928,9 +1085,26 @@ def _request_fingerprint(
         initial_message or "",
         orchestration_value,
     ]
+    if description is not None:
+        parts.extend(["description", description])
+    if claim_id is not None:
+        parts.append(claim_id)
+    if caller_ceiling is not None:
+        parts.append(
+            _FP_TOOLS_SET + "".join(_fingerprint_component(t) for t in sorted(caller_ceiling))
+        )
+    if delegating_terminal_id is not None:
+        parts.extend(["delegating_terminal_id", delegating_terminal_id])
     return hashlib.sha256(
         "\x00".join(_fingerprint_component(part) for part in parts).encode("utf-8")
     ).hexdigest()
+
+
+@dataclass
+class _EphemeralLaunchState:
+    """What the create body bound, for the caller's compensation."""
+
+    bound_terminal_id: Optional[str] = None
 
 
 async def create_terminal(
@@ -954,6 +1128,10 @@ async def create_terminal(
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
+    claim_id: Optional[str] = None,
+    description: Optional[str] = None,
+    delegating_terminal_id: Optional[str] = None,
+    caller_ceiling: Optional[list[str]] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -983,7 +1161,25 @@ async def create_terminal(
         caller_id: Terminal ID of the supervisor that created this terminal
             via handoff/assign. Recorded so send_message can route callbacks
             structurally instead of parsing IDs out of message text (issue #284).
-            None for operator-launched terminals.
+            None for operator-launched terminals. When set, the caller's STORED
+            ROW also bounds this terminal: its resolved ``allowed_tools`` must
+            fit inside the caller's recorded delegation ceiling and its own
+            ceiling is capped by it (``utils/delegation.py``); a caller whose
+            row cannot be read refuses the create (fail closed). A client
+            ``allowed_tools`` list is therefore never trusted beyond what the
+            caller may delegate.
+        delegating_terminal_id: The terminal whose stored ceiling bounds this
+            create when it is NOT recorded as ``caller_id``. Workflow steps use
+            it: the agent that ran ``workflow_run`` is not the step's callback
+            parent, but the step still inherits its ceiling. Ignored when
+            ``caller_id`` is set (the caller row wins).
+        caller_ceiling: A ceiling ASSERTED by the client, for a caller whose
+            row lives on another node (``assign``/``handoff`` with
+            ``target_host``). Accepted only when neither ``caller_id`` nor
+            ``delegating_terminal_id`` names a local row; the created
+            terminal is bounded by it exactly as by a stored ceiling. The
+            client sends its own stored ceiling and refuses to place on a node
+            that does not advertise ``delegation_ceiling`` in ``/health``.
         engine: Explicit Kiro engine. For Kiro, it must agree with the selected
             profile's engine when both are present; omitted resolves to v2.
         kiro_capability_probe: Optional test seam for the bounded wrapper probe.
@@ -1185,12 +1381,82 @@ async def create_terminal(
             server.max_terminals; unset = unlimited) is already reached
         TimeoutError: If provider initialization times out
     """
+    state = _EphemeralLaunchState()
+    try:
+        return await _create_terminal_unguarded(
+            provider=provider,
+            agent_profile=agent_profile,
+            session_name=session_name,
+            new_session=new_session,
+            working_directory=working_directory,
+            allowed_tools=allowed_tools,
+            registry=registry,
+            env_vars=env_vars,
+            caller_id=caller_id,
+            defer_init=defer_init,
+            initial_message=initial_message,
+            initial_message_orchestration_type=initial_message_orchestration_type,
+            engine=engine,
+            kiro_capability_probe=kiro_capability_probe,
+            model=model,
+            resume_session_id=resume_session_id,
+            use_worktree=use_worktree,
+            group=group,
+            metadata=metadata,
+            description=description,
+            idempotency_key=idempotency_key,
+            claim_id=claim_id,
+            delegating_terminal_id=delegating_terminal_id,
+            caller_ceiling=caller_ceiling,
+            ephemeral_state=state,
+        )
+    except BaseException as exc:
+        if state.bound_terminal_id is None:
+            if claim_id is not None:
+                ephemeral_service.end_claim(agent_profile, claim_id)
+        elif isinstance(exc, asyncio.CancelledError):
+            ephemeral_service.release(state.bound_terminal_id, "launch_failed")
+        raise
+
+
+async def _create_terminal_unguarded(
+    provider: str,
+    agent_profile: str,
+    session_name: Optional[str] = None,
+    new_session: bool = False,
+    working_directory: Optional[str] = None,
+    allowed_tools: Optional[list[str]] = None,
+    registry: PluginRegistry | None = None,
+    env_vars: Optional[dict[str, str]] = None,
+    caller_id: Optional[str] = None,
+    defer_init: bool = False,
+    initial_message: Optional[str] = None,
+    initial_message_orchestration_type: Optional[OrchestrationType] = None,
+    engine: Optional[KiroEngine | str] = None,
+    kiro_capability_probe: Optional[Callable[[KiroEngine, set[str]], KiroCapabilities]] = None,
+    model: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
+    use_worktree: bool = False,
+    group: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    idempotency_key: Optional[str] = None,
+    claim_id: Optional[str] = None,
+    description: Optional[str] = None,
+    delegating_terminal_id: Optional[str] = None,
+    caller_ceiling: Optional[list[str]] = None,
+    *,
+    ephemeral_state: _EphemeralLaunchState,
+) -> Terminal:
+    """Create body; the caller compensates an unbound claim or a cancelled bind."""
     # Idempotency resolution runs BEFORE the terminal cap check below, and the
     # order is deliberate: a key HIT returns an already-existing terminal and
     # allocates nothing, so charging it against the cap would 429 a legitimate
     # retry on a full node -- the one case this feature exists to make safe.
     # The cap still precedes every actual allocation (worktree, tmux window, DB
     # row, provider process), which is all its own placement-guard needs.
+    from cli_agent_orchestrator.utils.description import normalize_description
+
+    description = normalize_description(description, truncate=True)
     request_fingerprint: Optional[str] = None
     if idempotency_key:
         request_fingerprint = _request_fingerprint(
@@ -1207,6 +1473,10 @@ async def create_terminal(
             resume_session_id,
             initial_message,
             initial_message_orchestration_type,
+            claim_id,
+            description,
+            caller_ceiling=caller_ceiling,
+            delegating_terminal_id=delegating_terminal_id,
         )
         existing_record = get_idempotency_record(idempotency_key)
         existing_terminal_id = existing_record.terminal_id if existing_record else None
@@ -1302,6 +1572,7 @@ async def create_terminal(
             )
 
     terminal_id: Optional[str] = None
+    created_terminal_facts: Optional[Dict[str, Any]] = None
     # The window name the failure handler rolls back. ``window_name`` itself is
     # first bound inside the try, so a failure before that point (capability
     # probe, worktree) would leave it unassigned; this mirror is set from the
@@ -1326,8 +1597,15 @@ async def create_terminal(
         # Resolve profile policy and Kiro engine BEFORE allocating any backend
         # resource. A KAS request must probe then fail closed with no window,
         # database row, FIFO, Herdr registration, or provider process.
+        source = agent_profiles.ProfileSource.INSTALLED
         try:
-            profile = load_agent_profile(agent_profile)
+            profile, source = agent_profiles.load_launch_profile(agent_profile)
+            if source is agent_profiles.ProfileSource.EPHEMERAL:
+                allowed_tools = ephemeral_service.prepare_ephemeral_launch(
+                    agent_profile, model, allowed_tools, caller_id, provider
+                )
+        except agent_profiles.EphemeralProfileUnavailable:
+            ephemeral_service.refuse_unavailable(agent_profile, caller_id)
         except FileNotFoundError:
             profile = None
         # Production loaders return AgentProfile. Treat a test double or an
@@ -1335,6 +1613,12 @@ async def create_terminal(
         # accepting arbitrary attributes as configuration.
         if profile is not None and not isinstance(profile, AgentProfile):
             profile = None
+        launch_model = resolve_launch_model(model, profile)
+        model_honored = ProviderManager.provider_class(provider).honors_model(
+            agent_profile=agent_profile,
+            profile=profile,
+            requested_model=launch_model,
+        )
 
         if provider == ProviderType.KIRO_CLI.value:
             resolved_engine = resolve_kiro_engine(
@@ -1357,7 +1641,7 @@ async def create_terminal(
             # explicit override launch --model on a wrapper never probed for it.
             requested = requested_kiro_capabilities(
                 resolved_engine,
-                model=model or (profile.model if profile else None),
+                model=launch_model,
                 yolo=True,
             )
             probe = kiro_capability_probe or probe_kiro_capabilities
@@ -1381,8 +1665,244 @@ async def create_terminal(
                 profile.allowedTools, profile.role, mcp_server_names
             )
 
+        # Step 0c: Delegation ceiling (utils/delegation.py). Runs on EVERY
+        # creation path -- in-session create, assign/handoff, run-step and
+        # workflow steps, remote placement -- because this is the one function
+        # they all reach, and before any backend resource is allocated. The
+        # bounding ceiling comes from the CALLER'S STORED ROW (never from a
+        # profile, which is how an intermediate ``role: supervisor`` profile
+        # would otherwise launder privilege), or, for a caller on another node,
+        # from the ceiling that caller asserted in the request. Whatever
+        # ``allowed_tools`` the client sent is checked against it here, so the
+        # server never trusts a client list beyond what the caller may delegate.
+        bounding_id = caller_id if caller_id is not None else delegating_terminal_id
+        if caller_ceiling is not None and bounding_id is not None:
+            raise ValueError(
+                "caller_ceiling is only accepted without caller_id/delegating_terminal_id: "
+                "a caller with a row on this node is bounded by that row"
+            )
+        declared_ceiling = delegation.resolve_delegate_tools(
+            getattr(profile, "delegateTools", None),
+            getattr(profile, "role", None),
+            allowed_tools,
+        )
+        parent_ceiling: Optional[List[str]] = None
+        parent_profile_name: Optional[str] = None
+        if bounding_id is not None:
+            parent_row = get_terminal_metadata(bounding_id)
+            if parent_row is None:
+                raise DelegationCeilingError(
+                    f"Delegation refused: caller terminal {bounding_id} has no registered "
+                    f"row on this node, so its delegation ceiling cannot be evaluated and "
+                    f"'{agent_profile}' is not launched. A remote caller must place through "
+                    f"assign/handoff with target_host, which carries its ceiling.",
+                    parent_id=bounding_id,
+                    child_profile=agent_profile,
+                )
+            parent_profile_name = parent_row.get("agent_profile")
+            try:
+                parent_ceiling = delegation.ceiling_from_row(parent_row)
+            except Exception as exc:  # noqa: BLE001  (an unresolvable ceiling must refuse)
+                parent_ceiling = None
+                logger.warning(
+                    "delegation ceiling of caller %s could not be resolved: %s", bounding_id, exc
+                )
+            if parent_ceiling is None:
+                raise DelegationCeilingError(
+                    f"Delegation refused: the delegation ceiling of caller terminal "
+                    f"{bounding_id} (profile '{parent_profile_name}') could not be resolved, "
+                    f"so '{agent_profile}' is not launched. Relaunch the caller so its "
+                    f"ceiling is recorded.",
+                    parent_id=bounding_id,
+                    child_profile=agent_profile,
+                )
+        else:
+            # Remote placement (assign/handoff with target_host) is recognised by
+            # the callback terminal the supervisor injects into the worker's env.
+            # Such a create MUST carry the supervisor's ceiling: without it the
+            # request would take the operator branch below and launch unbounded,
+            # which is exactly what an older or edited client would produce. When
+            # the callback terminal happens to have a row on THIS node (loopback,
+            # single-node fleets), the asserted ceiling must fit inside what that
+            # row records, and the ASSERTION then bounds the child: it is equal to
+            # or narrower than the row, so using it never widens, and a client
+            # that narrowed its own ceiling gets the narrower bound it asked for.
+            remote_marker = (env_vars or {}).get(CALLBACK_TERMINAL_ID_ENV)
+            if remote_marker and caller_ceiling is None:
+                raise DelegationCeilingError(
+                    f"Delegation refused: a remote placement for terminal {remote_marker} "
+                    f"must carry caller_ceiling (the supervisor's recorded delegation "
+                    f"ceiling); without it '{agent_profile}' would launch unbounded. "
+                    f"Upgrade the placing node's cao so assign/handoff send it.",
+                    parent_id=remote_marker,
+                    child_profile=agent_profile,
+                )
+            if remote_marker and caller_ceiling is not None:
+                local_row = get_terminal_metadata(remote_marker)
+                if local_row is not None:
+                    local_ceiling = delegation.ceiling_from_row(local_row)
+                    if local_ceiling is None:
+                        raise DelegationCeilingError(
+                            f"Delegation refused: the delegation ceiling of terminal "
+                            f"{remote_marker} (profile '{local_row.get('agent_profile')}') "
+                            f"could not be resolved, so '{agent_profile}' is not launched. "
+                            f"Relaunch it so its ceiling is recorded.",
+                            parent_id=remote_marker,
+                            child_profile=agent_profile,
+                        )
+                    over = delegation.tools_exceeding(caller_ceiling, local_ceiling)
+                    if over:
+                        raise DelegationCeilingError(
+                            f"Delegation refused: the asserted caller_ceiling for terminal "
+                            f"{remote_marker} grants {', '.join(over)} beyond that terminal's "
+                            f"recorded ceiling [{', '.join(local_ceiling)}]; the recorded "
+                            f"ceiling is authoritative.",
+                            excess=over,
+                            parent_id=remote_marker,
+                            child_profile=agent_profile,
+                        )
+                    parent_profile_name = local_row.get("agent_profile")
+                    bounding_id = remote_marker
+            if caller_ceiling is not None:
+                parent_ceiling = list(caller_ceiling)
+        if parent_ceiling is not None:
+            delegate_tools = delegation.bound_child(
+                child_allowed_tools=allowed_tools,
+                child_declared_ceiling=declared_ceiling,
+                caller_ceiling=parent_ceiling,
+                parent_id=bounding_id,
+                parent_profile=parent_profile_name,
+                child_profile=agent_profile,
+            )
+        else:
+            # Operator-launched (cao launch, POST /sessions without a caller):
+            # the operator is the authority and the profile's declaration stands.
+            delegate_tools = declared_ceiling
+
+        # Step 0d: install-time providers run the INSTALLED policy, not the list
+        # this request resolved. For a create bounded by a RESTRICTED ceiling the
+        # row must be the effective policy, so a Kiro agent file that grants more
+        # than the row is refused here, before allocation, with the remedy. An
+        # unrestricted delegator (ceiling ``*``) and operator launches keep the
+        # launch-time warning instead: nothing the creator may not delegate can
+        # leak there, and the launch prompt already says what runs.
+        if (
+            provider == ProviderType.KIRO_CLI.value
+            and parent_ceiling is not None
+            and "*" not in parent_ceiling
+            and allowed_tools is not None
+            and "*" not in allowed_tools
+        ):
+            from cli_agent_orchestrator.utils.tool_mapping import kiro_agent_tools
+
+            installed = installed_kiro_tools(agent_profile)
+            if installed is None:
+                # No readable agent file with a `tools` list: on Kiro the installed
+                # file IS the policy, so the server cannot say what this launch
+                # would run. A bounded create fails closed here rather than
+                # skipping the check; the operator path is untouched (Kiro would
+                # fail to start the agent anyway, this just names the reason).
+                raise InstalledPolicyExceedsAllowlistError(
+                    f"Delegation refused: no installed Kiro agent file with a `tools` list "
+                    f"was found for '{agent_profile}', so the policy this bounded launch "
+                    f"would run cannot be compared with the bounded allowlist "
+                    f"[{', '.join(allowed_tools)}] this terminal is allowed to run with. "
+                    f"Remedy: `cao install {agent_profile} --provider kiro_cli`, then retry.",
+                    parent_id=bounding_id,
+                    child_profile=agent_profile,
+                )
+            else:
+                permitted = set(kiro_agent_tools(allowed_tools))
+                wider = [tool for tool in installed if tool not in permitted]
+                if wider:
+                    raise InstalledPolicyExceedsAllowlistError(
+                        f"Delegation refused: the installed Kiro agent '{agent_profile}' "
+                        f"grants {', '.join(wider)} beyond the bounded allowlist "
+                        f"[{', '.join(allowed_tools)}] this terminal is allowed to run with; "
+                        f"Kiro enforces the installed file, so the launch would exceed the "
+                        f"creator's delegation ceiling. Remedy: reinstall the profile with "
+                        f"the narrower policy (`cao install {agent_profile} --provider "
+                        f"kiro_cli` after setting allowedTools), or launch it without an "
+                        f"allowed_tools override.",
+                        excess=wider,
+                        parent_id=bounding_id,
+                        child_profile=agent_profile,
+                    )
+
+        # Same rule for OpenCode, the other install-time provider: the launch
+        # runs the installed ``permission:`` block, so under a restricted ceiling
+        # a block that allows a tool the bounded allowlist does not is refused.
+        if (
+            provider == ProviderType.OPENCODE_CLI.value
+            and parent_ceiling is not None
+            and "*" not in parent_ceiling
+            and allowed_tools is not None
+            and "*" not in allowed_tools
+        ):
+            from cli_agent_orchestrator.providers import opencode_cli
+            from cli_agent_orchestrator.utils.opencode_permissions import (
+                ALL_OPENCODE_TOOLS,
+                cao_tools_to_opencode_permission,
+            )
+
+            installed_permission = installed_opencode_permission(
+                agent_profile, opencode_cli.OPENCODE_CONFIG_DIR / "agents"
+            )
+            if installed_permission is None:
+                # No readable agent file with a dict `permission:` block: on
+                # OpenCode the installed file IS the policy, so the server
+                # cannot say what this launch would run. A bounded create
+                # fails closed here rather than skipping the check, mirroring
+                # the Kiro branch above.
+                raise InstalledPolicyExceedsAllowlistError(
+                    f"Delegation refused: no installed OpenCode agent file with a "
+                    f"`permission:` block was found for '{agent_profile}', so the policy "
+                    f"this bounded launch would run cannot be compared with the bounded "
+                    f"allowlist [{', '.join(allowed_tools)}] this terminal is allowed to "
+                    f"run with. Remedy: `cao install {agent_profile} --provider "
+                    f"opencode_cli`, then retry.",
+                    parent_id=bounding_id,
+                    child_profile=agent_profile,
+                )
+            else:
+                bounded = cao_tools_to_opencode_permission(allowed_tools)
+                # Iterate the full vocabulary, not installed_permission's own keys:
+                # OpenCode treats an omitted tool as allowed, so a `{}` or partial
+                # block (e.g. only `read: allow`) must be read as allowing every
+                # tool it does not explicitly deny.
+                wider = sorted(
+                    tool
+                    for tool in ALL_OPENCODE_TOOLS
+                    if installed_permission.get(tool) != "deny" and bounded.get(tool) != "allow"
+                )
+                if wider:
+                    raise InstalledPolicyExceedsAllowlistError(
+                        f"Delegation refused: the installed OpenCode agent '{agent_profile}' "
+                        f"allows {', '.join(wider)} beyond the bounded allowlist "
+                        f"[{', '.join(allowed_tools)}] this terminal is allowed to run with; "
+                        f"OpenCode enforces the installed permission block, so the launch "
+                        f"would exceed the creator's delegation ceiling. Remedy: reinstall the "
+                        f"profile with the narrower policy (`cao install {agent_profile} "
+                        f"--provider opencode_cli` after setting allowedTools), or launch it "
+                        f"without an allowed_tools override.",
+                        excess=wider,
+                        parent_id=bounding_id,
+                        child_profile=agent_profile,
+                    )
+
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
+        if source is agent_profiles.ProfileSource.EPHEMERAL:
+            ephemeral_service.bind_ephemeral_agent(
+                agent_profile,
+                terminal_id,
+                caller_id,
+                provider,
+                claim_id,
+                allowed_tools,
+                idempotency_key,
+            )
+            ephemeral_state.bound_terminal_id = terminal_id
 
         if not session_name:
             session_name = generate_session_name()
@@ -1542,7 +2062,7 @@ async def create_terminal(
             not own, leaving ITS row pointing at nothing. Under the lock the
             name goes free -> free with no observable intermediate state.
             """
-            nonlocal deferred_delete_on_failure, session_incarnation_id
+            nonlocal deferred_delete_on_failure, session_incarnation_id, created_terminal_facts
             assert session_name is not None  # narrowed by the caller
             with session_lifecycle_lock(session_name):
                 if new_session:
@@ -1634,17 +2154,20 @@ async def create_terminal(
                     # the launch policy already resolved above (allowed_tools,
                     # engine), so API reads and snapshots report what was actually
                     # launched.
-                    db_create_terminal(
+                    created_terminal_facts = db_create_terminal(
                         terminal_id,
                         session_name,
                         created_window_name,
                         provider,
                         agent_profile,
                         allowed_tools,
+                        model=launch_model,
+                        model_honored=model_honored,
                         caller_id=caller_id,
                         engine=resolved_engine.value if resolved_engine is not None else None,
                         group=group,
                         metadata=metadata,
+                        description=description,
                         working_directory=resolved_working_directory,
                         deferred_init_external_owner=bool(
                             defer_init and deferred_delete_on_failure is False
@@ -1653,6 +2176,17 @@ async def create_terminal(
                         idempotency_key=idempotency_key,
                         request_fingerprint=request_fingerprint,
                         new_session_incarnation=created_session,
+                        delegate_tools=delegate_tools,
+                        # The initial message is ACCEPTED the moment this row is
+                        # visible, so its outcome starts life as pending in the same
+                        # transaction (#566): a restart between here and the deferred
+                        # task's first write leaves a row the startup sweep can settle,
+                        # never one a client waits on forever.
+                        **(
+                            {"initial_delivery": {"state": "pending"}}
+                            if defer_init and initial_message
+                            else {}
+                        ),
                     )
                 except BaseException:
                     _clear_deferred_init_external_owner_active(terminal_id)
@@ -1744,7 +2278,7 @@ async def create_terminal(
             agent_profile,
             allowed_tools,
             skill_prompt=skill_prompt,
-            model=model or (profile.model if profile else None),
+            model=launch_model,
             engine=resolved_engine,
             resume_session_id=resume_session_id,
         )
@@ -1805,16 +2339,24 @@ async def create_terminal(
             provider=ProviderType(provider),
             session_name=session_name,
             agent_profile=agent_profile,
+            model=launch_model,
+            model_honored=model_honored,
+            ephemeral=(
+                isinstance(created_terminal_facts, dict)
+                and created_terminal_facts.get("ephemeral") is True
+            ),
             caller_id=caller_id,
             allowed_tools=allowed_tools,
+            delegate_tools=delegate_tools,
             engine=resolved_engine,
             shell_command=shell_command,
             group=group,
             metadata=metadata,
+            description=description,
             deferred_init_failure=None,
             session_incarnation_id=session_incarnation_id,
             status=initial_status,
-            last_active=datetime.now(),
+            last_active=datetime.now(timezone.utc),
         )
 
         logger.info(
@@ -1843,7 +2385,8 @@ async def create_terminal(
         return terminal
 
     except Exception as e:
-        logger.error(f"Failed to create terminal: {e}")
+        if not isinstance(e, ephemeral_service.EphemeralPolicyError):
+            logger.error(f"Failed to create terminal: {e}")
         # Everything this call built is torn down by ONE owned operation
         # (``_roll_back_failed_create``) on ONE worker thread, and the await
         # is not cancellable: if the create request is cancelled while the
@@ -1981,6 +2524,7 @@ def _notify_caller_of_deferred_failure(
             terminal_id,
         )
 
+    ephemeral_service.release(terminal_id, "launch_failed")
     if delete_worker:
         try:
             # Pass registry so post_kill_terminal hooks fire — parity with the
@@ -2467,6 +3011,101 @@ async def retry_interrupted_deferred_init_external_owners(
         delay = min(cap, max(0.1, delay * 2 if delay else 0.1))
 
 
+def _persist_initial_delivery(
+    terminal_id: str,
+    state: str,
+    *,
+    kind: str | None = None,
+    message: str | None = None,
+    only_if_pending: bool = True,
+) -> bool:
+    """Settle the durable ``initial_delivery`` outcome of a deferred-init terminal.
+
+    ``delivered`` is written once ``_confirm_worker_started_or_resubmit`` has
+    seen post-dispatch evidence; ``failed`` carries the same ``kind`` vocabulary
+    as ``deferred_init_failure`` plus ``waiting_user_answer`` (worker parked on
+    a prompt, alive, message not delivered) and ``interrupted`` (settled by the
+    restart sweep). Conditional on the row still reading ``pending`` so a late
+    failure never overwrites a confirmed delivery and a terminal created with
+    no initial message is left alone. Blocking DB I/O: callers to_thread it.
+    """
+    payload: dict[str, Any] = {"state": state}
+    if kind:
+        payload["kind"] = str(kind)
+    if message:
+        payload["message"] = _sanitize_deferred_failure_message(message)
+    try:
+        return update_terminal_initial_delivery(
+            terminal_id, payload, only_if_pending=only_if_pending
+        )
+    except Exception as exc:  # noqa: BLE001 — the delivery itself must not fail on bookkeeping
+        logger.warning("Could not persist initial_delivery=%s for %s: %s", state, terminal_id, exc)
+        return False
+
+
+async def recover_interrupted_initial_deliveries() -> bool:
+    """Settle initial deliveries stranded by a cao-server restart.
+
+    The deferred task that owned a terminal's initial message lives only in the
+    process that accepted it. After a restart a row still reading
+    ``initial_delivery.state == "pending"`` can never progress, and a client
+    waiting on it (``cao launch`` / ``--async``) would wait until its own
+    deadline for a verdict nobody will write. Mark such rows ``failed`` with kind
+    ``interrupted`` and, unless a failure is already recorded, publish the same
+    ``interrupted_init`` deferred-init failure the external-owner sweep uses, so
+    ``GET /terminals/{id}`` reads ERROR with the reason. Rows whose delivery is
+    pending in THIS process (the in-memory mark is set) are skipped; the sweep
+    runs at startup, before any new terminal can exist, so that is a safety net
+    rather than a race the sweep relies on.
+
+    Returns False when the enumeration itself failed, so the caller can retry.
+    """
+    try:
+        terminal_ids = await asyncio.to_thread(list_pending_initial_delivery_terminal_ids)
+    except Exception as exc:  # noqa: BLE001 — startup remains resilient
+        logger.warning("Could not list interrupted initial deliveries: %s", exc)
+        return False
+
+    complete = True
+    for terminal_id in terminal_ids:
+        if initial_delivery_pending(terminal_id):
+            continue
+        message = (
+            f"Worker {terminal_id}'s initial message was accepted but cao-server restarted "
+            "before its delivery was confirmed. Re-send the task or re-launch."
+        )
+        try:
+            settled = await asyncio.to_thread(
+                _persist_initial_delivery,
+                terminal_id,
+                "failed",
+                kind="interrupted",
+                message=message,
+            )
+            if not settled:
+                continue
+            metadata = await asyncio.to_thread(get_terminal_metadata, terminal_id)
+            if not metadata:
+                continue
+            if (
+                get_deferred_init_failure(terminal_id, metadata.get("deferred_init_failure"))
+                is None
+            ):
+                await asyncio.to_thread(
+                    _persist_deferred_init_failure,
+                    terminal_id,
+                    kind="interrupted_init",
+                    message=message,
+                    exception_type="ServerRestart",
+                )
+        except Exception as exc:  # noqa: BLE001 — retry on the next pass
+            complete = False
+            logger.warning(
+                "Could not settle interrupted initial delivery for %s: %s", terminal_id, exc
+            )
+    return complete
+
+
 def _persist_deferred_init_failure(
     terminal_id: str,
     *,
@@ -2559,6 +3198,13 @@ async def _surface_deferred_init_failure(
             await asyncio.to_thread(
                 _publish_deferred_failure_fallback, terminal_id, failure_payload
             )
+    # The initial message (if this terminal had one) is now known not to have
+    # been delivered; settle its durable outcome alongside the failure marker
+    # so a client waiting on initial_delivery stops with the reason (#566).
+    if not terminal_missing:
+        await asyncio.to_thread(
+            _persist_initial_delivery, terminal_id, "failed", kind=kind, message=message
+        )
     notification = _sanitize_deferred_failure_message(message)
     if delete_worker:
         notification += " The failed worker terminal will be torn down."
@@ -2583,7 +3229,9 @@ async def _surface_deferred_init_failure(
 # never started and NO exception raised — the supervisor then waits on a
 # callback that can never arrive. Confirm the worker actually began processing
 # and re-submit if it did not.
-_DEFERRED_SUBMIT_CONFIRM_TIMEOUT = 8.0  # per-attempt wait for the PROCESSING edge
+_DEFERRED_SUBMIT_CONFIRM_TIMEOUT = (
+    TURN_START_CONFIRM_SECONDS  # per-attempt wait for the PROCESSING edge
+)
 _DEFERRED_SUBMIT_MAX_RESUBMITS = 3
 # Statuses proving the worker accepted the task (left the ready IDLE state).
 # WAITING_USER_ANSWER counts: the worker consumed the input and is now asking.
@@ -2594,7 +3242,9 @@ _DEFERRED_STARTED_STATUSES = {
 }
 
 
-def _worker_is_started_direct(terminal_id: str, provider) -> bool:
+def _worker_is_started_direct(
+    terminal_id: str, provider, *, accept_retained_completed: bool = True
+) -> bool:
     """Direct visible-screen status check bypassing the event-driven status cache.
 
     The deferred-init retry loop polls ``status_monitor.get_status()`` which
@@ -2602,6 +3252,15 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
     (pyte screener at rising-edge/quiescence edges). When that lags behind
     reality the cached status stays IDLE even though the worker already
     transitioned to PROCESSING.
+
+    ``accept_retained_completed=False`` is for callers whose receiver may still
+    show an EARLIER turn's completion marker (the inbox path: every receiver
+    has history). A probe that cannot tell which turn completed then counts
+    only live verdicts -- PROCESSING and WAITING_USER_ANSWER -- as started; a
+    provider whose detector binds COMPLETED to the dispatched turn
+    (``direct_status_probe_has_turn_identity``) keeps COMPLETED as evidence.
+    The deferred-init caller keeps the default: a fresh worker has no earlier
+    turn on screen, so its COMPLETED can only be this turn's.
 
     Kimi requires evidence from the rolling byte buffer cleared by send_input
     before dispatch. Capture-pane history can retain a previous completed turn,
@@ -2646,6 +3305,14 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
             exc_info=True,
         )
         return False
+    if (
+        status == TerminalStatus.COMPLETED
+        and not accept_retained_completed
+        and getattr(provider, "direct_status_probe_has_turn_identity", False) is not True
+    ):
+        # The marker on screen may belong to the previous turn; this probe
+        # cannot tell, so it is not evidence that THIS delivery was accepted.
+        return False
     return status in _DEFERRED_STARTED_STATUSES
 
 
@@ -2674,23 +3341,45 @@ def _normalized_box_text(text: str) -> str:
     return "".join(character.casefold() for character in text if character.isalnum())
 
 
-def _message_visible_in_box(terminal_id: str, message: str) -> bool:
-    """True when the current editable composer contains the message text.
+def _message_in_composer(terminal_id: str, message: str) -> Optional[bool]:
+    """Whether the current editable composer contains the message text, if knowable.
 
-    A bare Enter is safe only when the provider extracts the bounded trailing
-    message probe from its current composer. The pane can retain historical
-    deliveries, so cursor-adjacent or transcript text is not an input boundary.
-    A miss takes the safer full-redelivery path.
+    Three answers, and the difference between the last two is load-bearing:
+
+    - ``True``: the provider extracted its live composer and the bounded
+      trailing probe of the message is in it. Only the Enter was swallowed; a
+      bare Enter submits exactly what is there.
+    - ``False``: the composer was extracted and the message is NOT in it. The
+      paste itself was dropped, so a full re-send cannot double anything.
+    - ``None``: the composer cannot be read -- the provider has no
+      ``extract_current_composer``, the capture failed, or the message is too
+      short to probe for. Nothing is known about what a full re-send would land
+      on top of. A caller that must not duplicate (the inbox path) sends nothing
+      in this case; the deferred-init path's ``_message_visible_in_box`` keeps
+      treating it like ``False`` (its worker is fresh, see
+      ``redeliver_dropped_message_with_boundary``).
+
+    The pane can retain historical deliveries, so cursor-adjacent or transcript
+    text is never an input boundary; only the provider's own composer is.
     """
     normalized_message = _normalized_box_text(message)
     probe = normalized_message[-_CURRENT_COMPOSER_PROBE_MAX_CHARS:]
     if len(probe) < 8:
-        return False
+        return None
 
     composer = _capture_current_composer_region(terminal_id)
     if composer is None:
-        return False
+        return None
     return probe in _normalized_box_text(composer)
+
+
+def _message_visible_in_box(terminal_id: str, message: str) -> bool:
+    """True when the current editable composer is known to contain the message.
+
+    Bool view of :func:`_message_in_composer` for callers that only choose
+    between a bare Enter and a full re-send; "unknown" takes the re-send path.
+    """
+    return _message_in_composer(terminal_id, message) is True
 
 
 def redeliver_dropped_message(
@@ -2705,6 +3394,39 @@ def redeliver_dropped_message(
     orchestration_type: Optional[OrchestrationType] = None,
 ) -> bool:
     """Re-deliver a message the TUI never accepted (blocking; to_thread it).
+
+    Thin wrapper over :func:`redeliver_dropped_message_with_boundary` that keeps
+    the ``bool`` contract the synchronous step path (#562) relies on. The
+    deferred-init confirm loop calls the underlying function directly because it
+    also needs the dispatch boundary the redelivery sampled.
+    """
+    started, _boundary = redeliver_dropped_message_with_boundary(
+        terminal_id,
+        message,
+        attempt,
+        provider,
+        full_resend_requires_probe=full_resend_requires_probe,
+        registry=registry,
+        sender_id=sender_id,
+        orchestration_type=orchestration_type,
+    )
+    return started
+
+
+def redeliver_dropped_message_with_boundary(
+    terminal_id: str,
+    message: str,
+    attempt: int,
+    provider=None,
+    *,
+    full_resend_requires_probe: bool = False,
+    full_resend_requires_composer_evidence: bool = False,
+    screen_may_show_previous_turn: bool = False,
+    registry: "PluginRegistry | None" = None,
+    sender_id: Optional[str] = None,
+    orchestration_type: Optional[OrchestrationType] = None,
+) -> tuple[bool, Optional[int]]:
+    """Re-deliver a message the TUI never accepted and report the new dispatch boundary.
 
     One attempt of the confirm-and-redeliver loop shared by the deferred-init
     path (#479) and the synchronous step path (#562). First, when the provider
@@ -2732,17 +3454,53 @@ def redeliver_dropped_message(
     bare-Enter branch (which cannot duplicate a task) is still taken
     whenever the text is visible; otherwise nothing is sent and False is
     returned, leaving the caller's own timeout to classify the outcome. The
-    deferred-init path keeps the default (off) because it loops on
-    ``wait_until_status`` for the PROCESSING edge before ever reaching here,
-    and that pre-existing behavior is unchanged by this helper's extraction.
+    deferred-init path keeps the default (off) because it waits on
+    ``_wait_for_post_dispatch_start`` for post-dispatch evidence before ever
+    reaching here, and that pre-existing behavior is unchanged by this helper's
+    extraction.
 
-    The full re-send is forwarded to ``send_input`` as ``redelivery=True``: it
+    ``full_resend_requires_composer_evidence`` closes the other duplicate (PR
+    #1004 review, P2-3): a full re-send pastes INTO the composer without
+    clearing it, so if the first paste is still sitting there (Enter swallowed,
+    not paste dropped) the two copies join and the next Enter submits both --
+    the agent gets the instruction twice in one prompt and plugins see two
+    ``post_send_message`` events for one message. The probe cannot rule that
+    out: it says whether the agent is working, not whether the composer is
+    empty. With this gate on, the full re-send runs only when
+    ``_message_in_composer`` returned ``False`` -- the provider read its own
+    composer and the message is not in it. When the composer cannot be read
+    (``None``: no ``extract_current_composer``) nothing is sent and the drop is
+    logged, exactly as for providers without a probe.
+
+    ``screen_may_show_previous_turn`` tells the direct probe that a COMPLETED on
+    screen may be the receiver's EARLIER turn; see
+    ``_worker_is_started_direct``. The inbox path sets both; the deferred-init
+    path keeps both off (fresh worker, pre-existing behavior unchanged).
+
+    The full re-send goes through ``dispatch_input`` with ``redelivery=True``: it
     repeats the dispatch CAO is already waiting on, so the provider must treat
     it as another delivery attempt of the same logical turn rather than as a
-    newly dispatched turn.
+    newly dispatched turn. That also means the full re-send inherits
+    ``dispatch_input``'s own guards: a terminal in ERROR or (for a dialog-blocking
+    provider carrying an orchestration type) in WAITING_USER_ANSWER raises
+    ``TerminalInputBlockedError`` out of this function rather than being pasted
+    into. The bare Enter does NOT go through ``dispatch_input``, so it checks
+    ``_dialog_blocks_orchestrated_input`` itself and sends nothing when a dialog
+    is open (#896) -- otherwise the one recovery that submits without pasting
+    would be the one recovery that can answer a human's question.
 
-    Returns True when the worker was found already started and nothing was
-    sent; False when a redelivery was attempted (or deliberately skipped).
+    Returns ``(started, boundary)``. ``started`` is True when the worker was
+    found already running and nothing was sent; False when a redelivery was
+    attempted (or deliberately skipped). ``boundary`` is the output generation
+    sampled before the redelivery's keys reached the pane -- the fresh baseline
+    the next confirmation wait must use, so that evidence has to be earned
+    after THIS attempt rather than after the original dispatch (PR #566 review,
+    gutosantos82: the recency bar has to advance per attempt). It is ``None``
+    when nothing was sent, in which case the caller keeps its current baseline.
+    A bare Enter samples the current generation directly: it submits the paste
+    that is already in the composer, so there is no monitor arm or buffer clear
+    to repeat, but output that follows it is still the only output that can
+    prove this attempt was accepted.
     """
     if provider is None:
         try:
@@ -2753,16 +3511,62 @@ def redeliver_dropped_message(
         provider, "supports_direct_status_probe", False
     )
     if probe_capable:
-        if _worker_is_started_direct(terminal_id, provider):
-            return True
-    if _message_visible_in_box(terminal_id, message):
+        if _worker_is_started_direct(
+            terminal_id,
+            provider,
+            accept_retained_completed=not screen_may_show_previous_turn,
+        ):
+            return True, None
+    in_composer = _message_in_composer(terminal_id, message)
+    if in_composer is True:
+        # The bare Enter is machine-originated input too, and it is the ONE
+        # recovery that does not go through ``dispatch_input`` -- so #896's
+        # dialog guard, which lives there, never sees it. An Enter into an open
+        # choice widget is worse than a paste: it submits whichever option is
+        # highlighted, answering a question reserved for a human, with no text
+        # involved at all.
+        #
+        # Today this branch happens to be unreachable with a prompt open: on
+        # every real capture in test/providers/fixtures the dialog replaces the
+        # composer box, so ``extract_current_composer`` returns None for the only
+        # two providers that both block dialogs and read a composer (claude_code
+        # and codex -- the overlap is enumerated in
+        # test/services/test_inbox_service.py's
+        # TestDialogGuardCoversSubmitRecovery). But that is a property of those
+        # two extractors, not an invariant: the moment one of them learns to read
+        # the composer under an overlaying permission prompt, this Enter starts
+        # answering dialogs. Check the guard here rather than inherit it by
+        # coincidence.
+        if _dialog_blocks_orchestrated_input(
+            provider, orchestration_type, status_monitor.get_status(terminal_id)
+        ):
+            logger.warning(
+                "Delivery to %s is unsubmitted but the terminal is waiting on a user "
+                "answer; skipping the bare-Enter re-submit so it cannot answer the "
+                "dialog (attempt %d)",
+                terminal_id,
+                attempt,
+            )
+            return False, None
         logger.warning(
             "Delivery to %s unsubmitted (Enter swallowed); " "re-submitting via Enter (attempt %d)",
             terminal_id,
             attempt,
         )
+        boundary = status_monitor.output_generation(terminal_id)
         send_special_key(terminal_id, "Enter")
-        return False
+        return False, boundary
+    if full_resend_requires_composer_evidence and in_composer is None:
+        # The composer cannot be read, so a full re-send might land on top of
+        # the first paste and submit the instruction twice. Send nothing; the
+        # caller's own deadline classifies the outcome.
+        logger.warning(
+            "Delivery to %s not accepted and its composer cannot be read; "
+            "skipping full re-send to avoid a duplicate task (attempt %d)",
+            terminal_id,
+            attempt,
+        )
+        return False, None
     if getattr(provider, "execution_evidence_ambiguous", False) is True:
         logger.warning(
             "Delivery to %s is unconfirmed after execution context was evicted; "
@@ -2770,7 +3574,7 @@ def redeliver_dropped_message(
             terminal_id,
             attempt,
         )
-        return False
+        return False, None
     if full_resend_requires_probe and not probe_capable:
         # No probe → cannot rule out a working worker whose prompt left the
         # pane; a full re-send could silently duplicate the task. Skip the
@@ -2781,13 +3585,13 @@ def redeliver_dropped_message(
             terminal_id,
             attempt,
         )
-        return False
+        return False, None
     logger.warning(
         "Delivery to %s not accepted (paste dropped); " "re-delivering message (attempt %d)",
         terminal_id,
         attempt,
     )
-    send_input(
+    boundary = dispatch_input(
         terminal_id,
         message,
         registry=registry,
@@ -2795,7 +3599,80 @@ def redeliver_dropped_message(
         orchestration_type=orchestration_type,
         redelivery=True,
     )
-    return False
+    return False, boundary
+
+
+async def _wait_for_post_dispatch_start(
+    terminal_id: str,
+    dispatch_generation: Optional[int],
+    timeout: float,
+    polling_interval: float = 0.5,
+    *,
+    pre_dispatch_status: Optional[TerminalStatus] = None,
+) -> bool:
+    """Wait for a started status that is EVIDENCE OF THIS TURN, not a cached one.
+
+    Round-6 review (haofeif), P1. ``wait_until_status`` returns on the first poll
+    whose value is in the target set, and a status VALUE cannot say when it was
+    earned. Provider startup output can legitimately parse as COMPLETED, which
+    then latches (``_STICKY_READY_STATUSES``), and ``send_input`` only ARMS the
+    next transition without touching the cached value. So a pre-dispatch
+    COMPLETED satisfied confirmation instantly -- measured at 0.008s against an
+    exact head -- releasing the pending-delivery mask before the new task had
+    emitted anything.
+
+    Round-9 review (haofeif), P1. Reading the cached status and the global output
+    generation as two independent values was not enough either: any post-boundary
+    frame (a spinner redraw, a late MCP startup line) advances the generation
+    without downgrading the sticky COMPLETED, and the pair then reads as "started
+    status + new output" -- a false confirmation of a send whose Enter was
+    swallowed. The requirement is causal, so it is checked on ONE observation:
+    ``status_monitor.status_observation`` returns the applied status together with
+    the output generation it was EARNED at (stamped when the detection was
+    applied), and confirmation requires that stamp, not the current counter, to
+    exceed ``dispatch_generation``. A status latched before the send keeps its
+    pre-send stamp however much unrelated output lands afterwards; a status the
+    worker earned by producing output for this task carries a newer one.
+
+    ``dispatch_generation`` is ``status_monitor.output_generation()`` sampled at
+    the dispatch boundary INSIDE ``dispatch_input`` -- armed, buffer cleared, no
+    key sent yet. Two things are deliberately NOT in it: the arm bump (so a
+    redelivery's own ``notify_input_sent`` cannot satisfy the gate on a
+    still-cached COMPLETED), and output emitted during ``send_keys``' submit delay
+    (so a fast worker that completes before the send returns is confirmed, not
+    resubmitted to and torn down).
+
+    Event-inbox backends (herdr) start no FIFO reader, so no output generation
+    ever advances for them and ``dispatch_generation`` is ``None``. That used to
+    disable the recency requirement outright, which the round-9 review named as a
+    bypass: ``get_native_status`` can keep reporting the PREVIOUS turn's COMPLETED
+    until the new inbox event lands, and an unconditional pass accepted it. They
+    are now judged by TRANSITION instead: the caller samples the on-demand status
+    immediately before dispatching (``pre_dispatch_status``), and a started
+    status counts only if it differs from that sample or is PROCESSING (herdr's
+    ``working`` is a live state, never a retained verdict). A turn whose
+    pre-dispatch reading was already COMPLETED must therefore be seen working or
+    waiting before its completion is believed; a sub-poll-interval turn that goes
+    straight from the old COMPLETED to a new one is the residual this cannot
+    distinguish, and it fails toward resubmission rather than toward a false
+    confirmation.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        observation = status_monitor.status_observation(terminal_id)
+        status = observation.status
+        if status in _DEFERRED_STARTED_STATUSES:
+            if dispatch_generation is None:
+                if status == TerminalStatus.PROCESSING or status != pre_dispatch_status:
+                    return True
+            elif (
+                observation.output_generation is not None
+                and observation.output_generation > dispatch_generation
+            ):
+                return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(polling_interval)
 
 
 async def _confirm_worker_started_or_resubmit(
@@ -2805,12 +3682,15 @@ async def _confirm_worker_started_or_resubmit(
     sender_id: Optional[str],
     orchestration_type: Optional[OrchestrationType],
     provider=None,
+    dispatch_generation: Optional[int] = None,
+    pre_dispatch_status: Optional[TerminalStatus] = None,
 ) -> bool:
     """Confirm a deferred-init worker began processing; re-submit if not.
 
-    Returns True once the terminal reaches a started status, False if it is
-    still stuck at IDLE after all resubmit attempts. Blocking tmux/DB I/O runs
-    off the loop via to_thread so concurrent deferred inits aren't frozen.
+    Returns True once the terminal reaches a started status EARNED AFTER dispatch
+    (see ``_wait_for_post_dispatch_start``), False if it never does after all
+    resubmit attempts. Blocking tmux/DB I/O runs off the loop via to_thread so
+    concurrent deferred inits aren't frozen.
     """
     if provider is None:
         try:
@@ -2818,7 +3698,7 @@ async def _confirm_worker_started_or_resubmit(
         except Exception:
             provider = None
 
-    async def wait_for_start() -> bool:
+    async def wait_for_start(boundary: Optional[int]) -> bool:
         if getattr(provider, "requires_execution_evidence", False) is True:
             # Cached PROCESSING/COMPLETED may be dispatch-derived too. Poll
             # independent evidence for the full grace period before resending.
@@ -2829,22 +3709,22 @@ async def _confirm_worker_started_or_resubmit(
                 if time.monotonic() >= deadline:
                     return False
                 await asyncio.sleep(0.5)
-        return await wait_until_status(
+        return await _wait_for_post_dispatch_start(
             terminal_id,
-            _DEFERRED_STARTED_STATUSES,
+            boundary,
             timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
-            polling_interval=0.5,
+            pre_dispatch_status=pre_dispatch_status,
         )
 
-    if await wait_for_start():
+    if await wait_for_start(dispatch_generation):
         return True
 
     for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
         # The redelivery decision (box check + #496's direct-probe guard for
-        # providers that opt in) lives in ``redeliver_dropped_message`` —
-        # shared with the synchronous step path (#562).
-        already_started = await asyncio.to_thread(
-            redeliver_dropped_message,
+        # providers that opt in) lives in ``redeliver_dropped_message_with_boundary``
+        # — shared, via its bool wrapper, with the synchronous step path (#562).
+        already_started, redelivery_boundary = await asyncio.to_thread(
+            redeliver_dropped_message_with_boundary,
             terminal_id,
             message,
             attempt,
@@ -2855,7 +3735,17 @@ async def _confirm_worker_started_or_resubmit(
         )
         if already_started:
             return True
-        if await wait_for_start():
+        # Same recency requirement as the first wait, measured from THIS attempt:
+        # a resubmit that lands on a still-cached pre-dispatch COMPLETED must not
+        # read as success, and neither may a status earned between the original
+        # dispatch and this redelivery -- the previous wait already judged that
+        # window and found nothing. The redelivery's own paste echo is inside the
+        # new baseline, so it cannot pass for evidence either. Event-inbox
+        # backends stay on the transition check (``None``); a skipped redelivery
+        # returns no boundary and the current one is kept.
+        if redelivery_boundary is not None and dispatch_generation is not None:
+            dispatch_generation = redelivery_boundary
+        if await wait_for_start(dispatch_generation):
             return True
 
     return False
@@ -2872,7 +3762,7 @@ def _schedule_deferred_init(
     delete_on_failure: bool | None = None,
 ) -> asyncio.Task | None:
     """Kick off provider.initialize() in the background and, on success,
-    deliver the initial message via send_input.
+    deliver the initial message via dispatch_input.
 
     Runs as an asyncio task on the running event loop so it doesn't block
     the caller. Because assign() has already returned success=True by the
@@ -2888,6 +3778,12 @@ def _schedule_deferred_init(
 
     async def _run() -> None:
         caller_id: Optional[str] = initial_caller_id
+        # Whether the first dispatch_input() returned, i.e. the task was pasted
+        # at least once. A provider-exited refusal before that point means
+        # nothing was typed; one after it (a refused resubmit) means the task
+        # went into the pane once already and its effect is unknown (#1018
+        # review round 2, P3).
+        task_dispatched = False
         try:
             await provider_instance.initialize()
             shell_command = provider_instance.shell_baseline
@@ -2911,39 +3807,105 @@ def _schedule_deferred_init(
                 # Round-3 review fix (call-me-ram): a raw POST /sessions caller that
                 # supplies initial_message with no orchestration_type previously sailed
                 # straight past send_input's WAITING_USER_ANSWER guard entirely -- the
-                # guard only fires for OrchestrationType.ASSIGN/HANDOFF, so an unstated
-                # type meant no protection at all against pasting the initial task into
-                # a live choice prompt. Every call that reaches THIS function is by
+                # guard fires only for input carrying an OrchestrationType (every
+                # member, derived from the enum since #896), so an unstated type meant
+                # no protection at all against pasting the initial task into a live
+                # choice prompt. Every call that reaches THIS function is by
                 # construction an unattended initial-task delivery (never an interactive
                 # human answer -- those go through answer_user_prompt's own separate
                 # /terminals/{id}/input call, which never routes through
                 # _schedule_deferred_init), so defaulting an unstated orchestration_type
                 # to ASSIGN here is always correct and cannot affect answer_user_prompt.
                 effective_orchestration_type = orchestration_type or OrchestrationType.ASSIGN
-                # send_input is blocking tmux I/O — off the loop so it can't
+                # dispatch_input is blocking tmux I/O — off the loop so it can't
                 # freeze the server for concurrent requests.
-                await asyncio.to_thread(
-                    send_input,
+                # Event-inbox backends (herdr) derive status on demand and have no
+                # output generation, so their recency check is a TRANSITION from
+                # the reading immediately before dispatch (round-9 P1; see
+                # _wait_for_post_dispatch_start). Sampled here, with nothing yet
+                # sent, so it is the last pre-dispatch value by construction.
+                # Pipe-pane backends do not use it; their gate is the stamped
+                # output generation.
+                pre_dispatch_status: Optional[TerminalStatus] = None
+                if get_backend().supports_event_inbox():
+                    pre_dispatch_status = await asyncio.to_thread(
+                        status_monitor.get_status, terminal_id
+                    )
+                dispatch_boundary = await asyncio.to_thread(
+                    dispatch_input,
                     terminal_id,
                     initial_message,
                     registry=registry,
                     sender_id=caller_id,
                     orchestration_type=effective_orchestration_type,
                 )
+                task_dispatched = True
+                # The pending mark is deliberately NOT released here.
+                #
+                # Round-4 review (haofeif), P1. An earlier revision cleared it at
+                # this dispatch boundary, reasoning that a keystroke had been
+                # issued so a poller's evidence was now downstream of the send. It
+                # isn't. dispatch_input only calls status_monitor.notify_input_sent(),
+                # which ARMS the next transition without changing the cached
+                # status, and no current provider enables
+                # assume_processing_on_dispatch. The status a poller reads right
+                # after this line is therefore still the pre-send IDLE, and stays
+                # that way until the agent's first output chunk is detected. The
+                # reviewer measured ~1.4s of it against a real worker; the
+                # regression test here reproduced 0.93s. Either way it is far
+                # longer than idle_stable_polls samples, so releasing at this line
+                # only moved the false-completion window from before the send to
+                # after it.
+                #
+                # _run's outer ``finally`` releases it instead, which is reached
+                # only after _confirm_worker_started_or_resubmit has observed a
+                # status in _DEFERRED_STARTED_STATUSES. That set includes
+                # COMPLETED, so holding the mark across the confirm window does
+                # NOT hide a genuine early completion (the concern that motivated
+                # releasing here): confirm returns as soon as the completion is
+                # visible, and the mark lifts with it.
+                #
+                # Cost of the change: when NO started status is ever observed the
+                # mark is now held for the confirm loop's whole budget
+                # (_DEFERRED_SUBMIT_CONFIRM_TIMEOUT x (1 + max resubmits) = ~32s)
+                # instead of being dropped at dispatch. That is inside `cao
+                # launch`'s 420s headless budget, and the worker is torn down at
+                # the end of it anyway, so UNKNOWN is the honest reading for a
+                # delivery we cannot confirm.
                 # Delivery can be silently dropped (Enter swallowed / paste lost)
                 # when the TUI isn't input-ready. Confirm the worker actually
                 # started and re-submit if not; if it never starts, surface the
                 # failure so the supervisor re-routes instead of waiting forever.
+                # The output generation at the dispatch boundary, captured INSIDE
+                # dispatch_input between arming the monitor and sending the first
+                # key. Confirmation requires the generation to exceed it, i.e. real
+                # output arrived after the send -- so a COMPLETED cached during
+                # provider startup can no longer read as this task starting.
+                # It is not sampled here, after the send returned: send_keys'
+                # submit delay is long enough for a fast worker to emit and
+                # complete, and a baseline taken afterwards would contain that
+                # output and reject the genuine completion (reviewer-reproduced).
+                #
+                # None for event-inbox backends (herdr): they run no FIFO reader,
+                # so the generation never advances from output and the requirement
+                # could never be met -- every resubmit would burn and the worker
+                # would be torn down. Their status is derived on demand instead, so
+                # there is no stale cached value for the gate to protect against.
+                dispatch_generation = (
+                    None if get_backend().supports_event_inbox() else dispatch_boundary
+                )
                 started = await _confirm_worker_started_or_resubmit(
                     terminal_id,
                     initial_message,
                     registry,
                     caller_id,
-                    # Same guard-eligible default as the initial send_input above --
+                    # Same guard-eligible default as the initial dispatch_input above --
                     # a resubmit is still an unattended initial-task delivery, so it
                     # must not silently drop back to the unguarded original type.
                     effective_orchestration_type,
                     provider=provider_instance,
+                    dispatch_generation=dispatch_generation,
+                    pre_dispatch_status=pre_dispatch_status,
                 )
                 # Strict execution-evidence providers (currently Kimi) do not
                 # accept cached PROCESSING/COMPLETED as pickup proof. Their
@@ -3006,7 +3968,53 @@ def _schedule_deferred_init(
                         delete_on_failure=delete_on_failure,
                     )
                     return
+                # Post-dispatch evidence observed (and, for strict providers, no
+                # ERROR behind it): the delivery is confirmed. Persist it BEFORE the
+                # in-memory mask lifts in ``finally`` so a client that reads
+                # delivered never sees an unmasked status first (#566).
+                await asyncio.to_thread(_persist_initial_delivery, terminal_id, "delivered")
             await _clear_deferred_init_external_owner(terminal_id)
+        except ProviderExitedInputBlockedError as e:
+            # Caught BEFORE the TerminalInputBlockedError branch below, whose
+            # "alive, parked on a prompt, keep it" handling is wrong for this
+            # case (#1018 review, P2-2): the delivery guard refused because the
+            # provider process is gone -- status ERROR, or the pane's foreground
+            # process is the pre-launch shell again. There is no prompt to
+            # answer (answer_user_prompt refuses, the status is not
+            # WAITING_USER_ANSWER), a re-send is refused the same way, and the
+            # pane is a bare shell. Treat it as the startup failure it is: tear
+            # the worker down and tell the caller the provider exited.
+            #
+            # Two refusals land here and they must not be described the same
+            # way (#1018 review round 2, P3). Before the first dispatch_input()
+            # returned, nothing was typed. After it -- the confirm loop's
+            # resubmit was refused -- the task was pasted once already, into the
+            # provider or, if it stopped inside the check-then-send window, into
+            # the shell, and the message must not invite the supervisor to
+            # assign it again as if it never ran. The guard's own text says
+            # "may have exited" for the ERROR case; neither message claims more.
+            if task_dispatched:
+                kind = "provider_exited_after_dispatch"
+                detail = (
+                    f"Worker {terminal_id} provider process stopped after the task had been "
+                    f"typed once; a re-delivery was refused. The task's effect is unknown: "
+                    f"inspect the worker's output before assigning it again. {e}"
+                )
+            else:
+                kind = "provider_exited"
+                detail = (
+                    f"Worker {terminal_id} provider process exited before the task could be "
+                    f"delivered; nothing was typed into the pane. {e}"
+                )
+            logger.error("Deferred init for terminal %s: %s", terminal_id, detail)
+            await _surface_deferred_init_failure(
+                terminal_id,
+                kind=kind,
+                message=detail,
+                exception_type=type(e).__name__,
+                registry=registry,
+                delete_on_failure=delete_on_failure,
+            )
         except TerminalInputBlockedError as e:
             # The worker initialized but is parked on an interactive prompt
             # (WAITING_USER_ANSWER). It is alive and can be driven via
@@ -3020,6 +4028,21 @@ def _schedule_deferred_init(
                 e,
             )
             await _clear_deferred_init_external_owner(terminal_id)
+            # Not a deferred_init_failure (the worker is alive and answerable), but
+            # the initial message was NOT delivered and a client waiting on the
+            # outcome must learn that rather than watch WAITING_USER_ANSWER until
+            # its deadline (round-9 P1, --async durability).
+            await asyncio.to_thread(
+                _persist_initial_delivery,
+                terminal_id,
+                "failed",
+                kind="waiting_user_answer",
+                message=(
+                    f"Worker {terminal_id} is waiting on an interactive prompt; the initial "
+                    "message was not delivered. Answer the prompt (answer_user_prompt, or "
+                    "attach), then send the task again."
+                ),
+            )
             await asyncio.to_thread(
                 _notify_caller_of_deferred_failure,
                 terminal_id,
@@ -3049,6 +4072,19 @@ def _schedule_deferred_init(
                 registry=registry,
                 delete_on_failure=delete_on_failure,
             )
+        finally:
+            # The single release point for every path, and on the happy path the
+            # first moment a completion poller's evidence is genuinely downstream
+            # of the send: reached only once _confirm_worker_started_or_resubmit
+            # has seen PROCESSING, COMPLETED or WAITING_USER_ANSWER.
+            #
+            # It also covers every abnormal exit, so a terminal can never be left
+            # permanently masked: initialize() raising, send_input raising
+            # TerminalInputBlockedError (the pane is parked on a prompt — the
+            # terminal is then honestly WAITING_USER_ANSWER and the operator has
+            # to see it), the worker never starting after all resubmits, or the
+            # loop being torn down. Idempotent, so double-clearing is harmless.
+            _clear_initial_delivery_pending(terminal_id)
 
     try:
         loop = asyncio.get_running_loop()
@@ -3056,7 +4092,51 @@ def _schedule_deferred_init(
         logger.error(f"Deferred init for {terminal_id}: no running event loop; init skipped")
         _clear_deferred_init_external_owner_active(terminal_id)
         return None
-    task = loop.create_task(_run())
+    # Mirrors _run's own ``if initial_message`` condition: defer_init is also used
+    # with no message at all (see the create_terminal call site), and there is
+    # nothing pending to mask on that path.
+    #
+    # Set here rather than inside _run so the mark is established by the time this
+    # function returns — the point at which the message has been accepted and the
+    # caller is free to start polling. That keeps the invariant independent of when
+    # the event loop first schedules _run instead of relying on it winning a race.
+    if initial_message:
+        _mark_initial_delivery_pending(terminal_id)
+    # Only _run's finally releases the mark, so a create_task that raises would
+    # leave it set with nothing left to clear it — create_terminal's own exception
+    # cleanup does not know about this mark. Cheap to close, so closed.
+    #
+    # Deliberately NOT claiming the obvious trigger: "the loop closed between the
+    # check above and this line" cannot happen. get_running_loop() only succeeds
+    # on the loop thread, so reaching here means we ARE the running loop, and
+    # loop.close() on a running loop raises "Cannot close a running event loop".
+    # What remains is the unglamorous set: _run() not being a coroutine
+    # (programming error), MemoryError, or a KeyboardInterrupt landing in the gap.
+    #
+    # Known and deliberately unguarded: after loop.stop(), create_task SUCCEEDS
+    # and the coroutine is never run, so the mark leaks with nothing raised for
+    # this to catch. That only arises while the loop is being torn down, and
+    # _pending_initial_delivery is module state that dies with the process, so
+    # there is nothing for it to leak into. Guarding it would mean a shutdown hook
+    # for state that cannot outlive shutdown.
+    # BaseException rather than Exception is deliberate, and matches the rollback
+    # guards at :415 and :796. KeyboardInterrupt is one of the two realistic
+    # triggers named above and is not an Exception subclass, so narrowing this
+    # would skip the case it exists for. The bare ``raise`` leaves shutdown
+    # semantics intact — this only cleans up on the way past.
+    coro = _run()
+    try:
+        task = loop.create_task(coro)
+    except BaseException:
+        # The coroutine object exists but was never handed to a task, so close it
+        # or the interpreter warns "coroutine was never awaited" when it is GC'd.
+        coro.close()
+        # Only clear what this call may have set: with no initial_message no mark
+        # was taken, and an unconditional discard would be reaching for state this
+        # call does not own.
+        if initial_message:
+            _clear_initial_delivery_pending(terminal_id)
+        raise
     if delete_on_failure is False:
         # Direct callers of this private scheduler may not have come through
         # create_terminal's pre-insert fence. Marking again is idempotent.
@@ -3069,6 +4149,78 @@ def _schedule_deferred_init(
 
     task.add_done_callback(_on_done)
     return task
+
+
+def memory_sidecar_refusal(
+    primary: Terminal, *, provider: str, sidecar_profile: str = "memory_manager"
+) -> Optional[str]:
+    """Why the ``memory_manager`` sidecar would be refused under ``primary``, or ``None``.
+
+    The sidecar is created with ``delegating_terminal_id=primary.id`` and so is
+    bounded by the primary's RECORDED ceiling in Step 0c. Its profile resolves
+    (``role: supervisor``, no ``allowedTools``) to ``@cao-mcp-server, fs_read,
+    fs_list``, which a narrow primary (``workflow_scout`` lacks ``fs_list``; a
+    profile with an explicit ``allowedTools`` list lacks ``@cao-mcp-server``)
+    does not cover. ``POST /sessions`` asks this BEFORE scheduling the
+    background create so the refusal reaches the operator in the response
+    instead of only a server log line. Same comparator, same text as the
+    refusal the create would raise. Returns ``None`` when the sidecar fits, and
+    also when the primary's ceiling is not readable from the response (no
+    ``delegate_tools`` and no ``allowed_tools``): then the create itself decides
+    and logs, exactly as before.
+    """
+    ceiling = (
+        primary.delegate_tools if primary.delegate_tools is not None else primary.allowed_tools
+    )
+    if ceiling is None:
+        return None
+    try:
+        profile, _ = agent_profiles.load_launch_profile(sidecar_profile)
+    except Exception:  # noqa: BLE001  (an unresolvable sidecar profile is the create's problem)
+        return None
+    if not isinstance(profile, AgentProfile):
+        return None
+    from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
+    from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+    sidecar_tools = resolve_allowed_tools(
+        profile.allowedTools, profile.role, grantable_server_names(profile)
+    )
+    excess = delegation.tools_exceeding(sidecar_tools, ceiling)
+    if not excess:
+        return None
+    return delegation.describe_rejection(
+        parent_id=primary.id,
+        parent_profile=primary.agent_profile,
+        child_profile=sidecar_profile,
+        excess=excess,
+        ceiling=ceiling,
+    ) + (
+        " The memory_manager sidecar (`cao launch --memory`, memory_manager=true) needs a primary whose delegation "
+        "ceiling covers @cao-mcp-server, fs_read and fs_list; it was not launched."
+    )
+
+
+def callback_terminal_id_for_session(session_name: Optional[str]) -> Optional[str]:
+    """Return the cross-node creator recorded for ``session_name``, if any.
+
+    A worker placed here from another node (``assign``/``handoff`` with
+    ``target_host``) has ``caller_id`` None, because its supervisor has no row
+    on this node. What it does have is ``CAO_CALLBACK_TERMINAL_ID`` in the
+    session env the supervisor injected at creation (persisted via
+    ``set_session_env``). ``get_terminal`` publishes it as
+    ``callback_terminal_id`` so the supervisor's own MCP server can recognise
+    its worker when it deletes it through ``target_host``. The store is
+    process-local, so after a cao-server restart this is None again; the
+    ``caller_id`` branch of the same check is unaffected by that.
+    """
+    if not session_name:
+        return None
+    try:
+        return get_session_env(str(session_name)).get(CALLBACK_TERMINAL_ID_ENV) or None
+    except Exception as exc:  # noqa: BLE001 — a missing creator must not break reads
+        logger.warning(f"Failed to read callback terminal id for session {session_name}: {exc}")
+        return None
 
 
 def get_terminal(terminal_id: str) -> Dict:
@@ -3088,8 +4240,33 @@ def get_terminal(terminal_id: str) -> Dict:
         # unlike StatusMonitor's in-memory latch.
         if deferred_failure is not None:
             status = TerminalStatus.ERROR.value
+            # A durable failure marker is not earned from terminal output, so it
+            # carries no generation; a client must not be able to read it as
+            # evidence for the send it just made. ERROR is honoured by the CLI
+            # gate whatever the generations say, so the counter is not needed.
+            status_generation: Optional[int] = None
+            output_generation: Optional[int] = None
         else:
-            observed_status = status_monitor.get_status(terminal_id)
+            # Read the status and the generation it was earned at as one pair
+            # (status_observation), not two separate lock acquisitions -- a
+            # detector applying this turn's PROCESSING between two separate
+            # reads would otherwise pair the previous turn's COMPLETED with
+            # the new turn's generation, defeating the #735 gate it feeds.
+            observation = status_monitor.status_observation(terminal_id)
+            observed_status = observation.status
+            status_generation = observation.output_generation
+            # The current counter, read AFTER the observation so it is never
+            # older than the stamp it is reported with. It lets a client tell
+            # "nothing has landed since my send" from "output landed but the
+            # status was never re-earned" -- the latch does not re-stamp
+            # COMPLETED -> COMPLETED or the COMPLETED -> IDLE -> COMPLETED
+            # round trip, so a fast turn can finish with the stamp still at
+            # the previous turn's value, and a client that refused that reading
+            # unconditionally waited out its whole timeout (#735 review, P2-2).
+            # None exactly when the stamp is None (event-inbox backends).
+            output_generation = (
+                None if status_generation is None else status_monitor.output_generation(terminal_id)
+            )
             # External deferred initialization has a short two-phase window:
             # the provider can render ERROR before the background init task has
             # durably written ``deferred_init_failure``. Publishing that
@@ -3108,7 +4285,7 @@ def get_terminal(terminal_id: str) -> Dict:
             ):
                 status = TerminalStatus.UNKNOWN.value
             else:
-                status = observed_status.value
+                status = reported_status(terminal_id, observed_status).value
 
         return {
             "id": metadata["id"],
@@ -3116,14 +4293,23 @@ def get_terminal(terminal_id: str) -> Dict:
             "provider": metadata["provider"],
             "session_name": metadata["tmux_session"],
             "agent_profile": metadata["agent_profile"],
+            "model": metadata.get("model"),
+            "model_honored": metadata.get("model_honored"),
+            "ephemeral": metadata.get("ephemeral", False),
             "caller_id": metadata.get("caller_id"),
+            "callback_terminal_id": callback_terminal_id_for_session(metadata["tmux_session"]),
             "allowed_tools": metadata.get("allowed_tools"),
+            "delegate_tools": metadata.get("delegate_tools"),
             "engine": metadata.get("engine"),
             "group": metadata.get("group"),
             "metadata": public_metadata,
+            "description": metadata.get("description"),
             "deferred_init_failure": deferred_failure,
+            "initial_delivery": metadata.get("initial_delivery"),
             "session_incarnation_id": metadata.get("session_incarnation_id"),
             "status": status,
+            "status_generation": status_generation,
+            "output_generation": output_generation,
             "last_active": metadata["last_active"],
         }
 
@@ -3204,7 +4390,9 @@ def list_siblings(
         caller_id, prefix, caller_session=caller_session, cross_session=cross_session
     )
     for sibling in siblings:
-        sibling["status"] = status_monitor.get_status(sibling["id"]).value
+        sibling["status"] = reported_status(
+            sibling["id"], status_monitor.get_status(sibling["id"])
+        ).value
     return siblings
 
 
@@ -3247,6 +4435,116 @@ def send_input(
 ) -> bool:
     """Send input to terminal via tmux paste buffer.
 
+    Thin wrapper over :func:`dispatch_input` that keeps the ``bool`` contract.
+    The contract is load-bearing, not ceremony: ``POST /terminals/{id}/input``
+    returns this value on the wire as ``{"success": ...}``, so returning the
+    dispatch boundary here would change the API response -- and a first-ever
+    dispatch, whose boundary is 0, would read as ``"success": 0``. A caller that
+    must later prove the terminal produced output FOR THIS SEND (the deferred
+    initial-message path) calls ``dispatch_input`` directly and keeps the
+    boundary it returns.
+    """
+    dispatch_input(
+        terminal_id,
+        message,
+        registry=registry,
+        sender_id=sender_id,
+        orchestration_type=orchestration_type,
+        redelivery=redelivery,
+        frozen_memory=frozen_memory,
+    )
+    return True
+
+
+def _pane_back_at_shell(provider: Any, metadata: Dict[str, Any]) -> Optional[str]:
+    """Return the shell's name when the pane's foreground process is the pre-launch shell again.
+
+    The baseline is the provider's ``shell_baseline`` (captured by its
+    ``initialize()`` before it launched the CLI) or, for a provider rebuilt after
+    a cao-server restart, the ``shell_command`` persisted with the terminal.
+    With neither there is nothing to compare against and the answer is None:
+    providers that do not record a baseline keep the status-only guard. A
+    failed lookup is also None -- it is not evidence of an exit, and the
+    status guard still applies -- but it is logged, because silently skipping a
+    safety check is how #1018 happened in the first place.
+    """
+    baseline = getattr(provider, "shell_baseline", None) if provider is not None else None
+    if not isinstance(baseline, str) or not baseline:
+        baseline = metadata.get("shell_command")
+    if not isinstance(baseline, str) or not baseline:
+        return None
+    try:
+        current = get_backend().get_pane_current_command(
+            metadata["tmux_session"], metadata["tmux_window"]
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed probe must not block delivery
+        logger.warning(
+            "Could not read the pane's foreground process before delivering input (%r); "
+            "relying on the status guard alone",
+            exc,
+        )
+        return None
+    if isinstance(current, str) and current == baseline:
+        return baseline
+    return None
+
+
+def _refuse_if_provider_gone(terminal_id: str, provider: Any, metadata: Dict[str, Any]) -> None:
+    """Raise ``TerminalInputBlockedError`` unless the terminal can safely receive typed input.
+
+    Called immediately before the keystroke is sent (#1018). Two independent
+    checks, either of which refuses:
+
+    1. The monitor's current status is ERROR -- the same guard that already ran
+       at the top of ``dispatch_input``, re-read now because the first read is
+       stale by the time we type (the reporter measured 150 ms between readiness
+       and ERROR, and 700 ms more before the send).
+    2. The pane's foreground process is the shell that was running before the
+       CLI launched. This does not consult the provider's own ``get_status`` or
+       its ``_initialized`` flag, so it holds during startup, after a restart,
+       and for every provider that records a baseline, whatever its frame parser
+       made of the pane.
+    """
+    if status_monitor.get_status(terminal_id) == TerminalStatus.ERROR:
+        raise ProviderExitedInputBlockedError(
+            f"Terminal {terminal_id} provider is in ERROR state "
+            "(provider process may have exited). Refusing to deliver input."
+        )
+    shell = _pane_back_at_shell(provider, metadata)
+    if shell is not None:
+        logger.error(
+            "Terminal %s: the pane's foreground process is the shell (%s) that was running "
+            "before the provider launched; the provider has exited. Refusing to deliver input.",
+            terminal_id,
+            shell,
+        )
+        raise ProviderExitedInputBlockedError(
+            f"Terminal {terminal_id} is a bare shell ({shell}): the provider process has "
+            "exited and typed input would be executed as commands. Refusing to deliver input."
+        )
+
+
+def dispatch_input(
+    terminal_id: str,
+    message: str,
+    registry: PluginRegistry | None = None,
+    sender_id: str | None = None,
+    orchestration_type: OrchestrationType | None = None,
+    redelivery: bool = False,
+    frozen_memory: str | None = None,
+) -> int:
+    """Send input to terminal via tmux paste buffer and return its dispatch boundary.
+
+    The return value is ``status_monitor.output_generation()`` sampled at the
+    dispatch boundary: after the monitor has been armed and the rolling buffer
+    cleared, and before any key reaches the pane. Any output generation strictly
+    greater than it is output the terminal produced after this send -- the
+    evidence ``_wait_for_post_dispatch_start`` needs. It has to be captured here
+    rather than by the caller after this function returns, because ``send_keys``
+    includes the provider's submit delay, during which a fast worker can already
+    emit and complete; sampled afterwards, those chunks would be inside the
+    baseline and a genuine completion would read as pre-dispatch.
+
     Uses bracketed paste mode (-p) to bypass TUI hotkey handling. The number
     of Enter keys sent after pasting is determined by the provider's
     ``paste_enter_count`` property (e.g., some TUIs need 2 Enters because
@@ -3278,34 +4576,36 @@ def send_input(
             raise KiroPhase0KASError(profile_has_v2_policy=False)
 
         provider = provider_manager.get_provider(terminal_id)
-        orchestration_value = (
-            orchestration_type.value
-            if isinstance(orchestration_type, OrchestrationType)
-            else str(orchestration_type or "")
-        )
+        orchestration_value = _orchestration_value(orchestration_type)
 
         if provider:
             current_status = status_monitor.get_status(terminal_id)
 
             # Guard: refuse to type into a terminal whose provider process has
             # exited. Without this check, queued messages would be pasted into
-            # a bare shell and executed as arbitrary commands.
+            # a bare shell and executed as arbitrary commands. The subclass
+            # tells the deferred-init path this is a dead worker to tear down,
+            # not a prompt to leave for the operator (#1018 review).
             if current_status == TerminalStatus.ERROR:
-                raise TerminalInputBlockedError(
+                raise ProviderExitedInputBlockedError(
                     f"Terminal {terminal_id} provider is in ERROR state "
-                    "(provider process may have exited). Refusing to deliver input."
+                    "(provider process may have exited). Refusing to deliver input.",
+                    reason=TerminalInputBlockedReason.PROVIDER_ERROR,
                 )
 
-            if (
-                provider.blocks_orchestrated_input_while_waiting_user_answer is True
-                and orchestration_value
-                in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
-                and current_status == TerminalStatus.WAITING_USER_ANSWER
-            ):
+            # Any orchestration type is machine-originated input (#896): an inbox
+            # delivery is just as much so as an assign, and the dialog cannot
+            # tell them apart -- it ate the paste and the trailing Enter answered
+            # the question. Only a real answer_user_prompt call or the operator
+            # typing by hand (no orchestration type, so an empty value here) may
+            # resolve a prompt. Shared with the bare-Enter recovery's own check;
+            # see ``_dialog_blocks_orchestrated_input``.
+            if _dialog_blocks_orchestrated_input(provider, orchestration_type, current_status):
                 raise TerminalInputBlockedError(
                     f"Terminal {terminal_id} is waiting for a user answer. "
                     "Use answer_user_prompt to submit a selection or approval before "
-                    f"sending {orchestration_value} input."
+                    f"sending {orchestration_value} input.",
+                    reason=TerminalInputBlockedReason.WAITING_USER_ANSWER,
                 )
 
         # Inject memory context into the very first user message after init.
@@ -3318,6 +4618,30 @@ def send_input(
         # internal <cao-memory> block that we paste into the TUI.
         original_message = message
         message = inject_memory_context(message, terminal_id, frozen_memory)
+
+        # THE LAST CHECK BEFORE TYPING (#1018). The status read above is now
+        # one memory-service call old, and it was only ever the monitor's
+        # cached verdict: in the reporter's log the monitor flipped the
+        # terminal to ERROR 154 ms after initialize() finished and the task was
+        # typed 700 ms after that regardless. Re-read the status, and --
+        # independently of any status and of whether the provider finished
+        # initializing -- compare the pane's foreground process with the shell
+        # that was running before the CLI launched. A pane whose foreground
+        # process is that shell again is a bare shell, and bash executes every
+        # line pasted into it.
+        #
+        # What remains between here and send_keys: the monitor arm, the buffer
+        # clear, the provider's dispatch bookkeeping -- which for codex
+        # includes one pane capture in record_dispatched_message() -- and then
+        # the paste itself. That is a check-then-act window of one tmux
+        # round trip, far shorter than before but not zero; a CLI that exits
+        # after the paste and before Enter can still hand the pasted bytes to
+        # its shell, and a design that types input cannot close that. Placed
+        # after inject_memory_context() deliberately, because the memory
+        # lookup is the slow step; the cost is that a refused send has
+        # consumed the terminal's one-time memory block (#1018 review, P3-3).
+        # A refusal here raises before any of that bookkeeping runs.
+        _refuse_if_provider_gone(terminal_id, provider, metadata)
 
         # Check how many Enter keys the provider needs after paste
         enter_count = provider.paste_enter_count if provider else 1
@@ -3348,6 +4672,22 @@ def send_input(
         # rolling byte buffer.  Grok uses this to distinguish a new,
         # byte-identical completion from a retained completion screen.
         status_monitor.clear_rolling_buffer(terminal_id, provider)
+
+        # THE DISPATCH BOUNDARY. Sampled here -- armed, buffer cleared, no key
+        # sent yet -- and returned to the caller. Output that lands from this
+        # point on is output produced after this send; output that landed before
+        # it is already inside the value and can never count as evidence. This
+        # is the only place the sample is correct: one line later send_keys
+        # starts, and its submit delay is exactly the window in which a fast
+        # worker emits and completes (reviewer-reproduced on PR #566).
+        #
+        # Deliberately a separate lock acquisition AFTER the clear, not atomic
+        # with it. A chunk that lands between the two is pre-dispatch output (no
+        # key has been sent), and this ordering folds it INTO the baseline, so it
+        # cannot pass for evidence. Sampling under the clear's own lock would
+        # leave that chunk outside the baseline and count it -- the false
+        # confirmation this gate exists to prevent.
+        dispatch_boundary = status_monitor.output_generation(terminal_id)
 
         # Mark the provider before send_keys rather than after it.  send_keys
         # includes the provider-specific submit delay, during which a fast CLI
@@ -3404,7 +4744,7 @@ def send_input(
                         traceparent=inject_traceparent(),
                     ),
                 )
-        return True
+        return dispatch_boundary
 
     except Exception as e:
         logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
@@ -3474,6 +4814,47 @@ def exit_terminal_cli(terminal_id: str) -> None:
         send_input(terminal_id, exit_command)
 
 
+def get_output_context(terminal_id: str) -> Optional[str]:
+    """Return raw terminal output for provider-owned error classification.
+
+    This is deliberately separate from :func:`get_output`: that function returns
+    extracted assistant text, where a legitimate answer and provider chrome can be
+    byte-identical.  The raw capture carries the adapter's response-marker context,
+    so the classifier can distinguish ownership instead of guessing from words.
+
+    Best-effort by design.  A missing terminal, backend, or buffer means there is
+    no positive ownership evidence; callers must treat ``None`` as "do not classify"
+    rather than as a step failure.
+    """
+    try:
+        metadata = get_terminal_metadata(terminal_id)
+        if not metadata:
+            return None
+        output = status_monitor.get_buffer(terminal_id)
+        if output:
+            return output
+        return get_backend().get_history(metadata["tmux_session"], metadata["tmux_window"])
+    except Exception as exc:  # noqa: BLE001 — classifier context is best-effort
+        logger.debug("get_output_context: %s unavailable: %s", terminal_id, exc)
+        return None
+
+
+def _backend_read_cap(backend: Any) -> Optional[int]:
+    """How many lines one ``get_history`` call can return on ``backend``, or ``None``.
+
+    Read from ``TerminalBackend.max_history_lines`` (#728). ``None`` means the
+    backend did not declare a usable ceiling, and ``get_output`` then climbs the
+    whole ladder as before. That tolerance exists for the test doubles that
+    stand in for a backend; the shipped backends all declare one, and
+    ``test/backends/test_history_read_cap.py`` enumerates them so a new one
+    cannot ship without it.
+    """
+    cap = getattr(backend, "max_history_lines", None)
+    if isinstance(cap, bool) or not isinstance(cap, int) or cap <= 0:
+        return None
+    return cap
+
+
 def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     """Get terminal output.
 
@@ -3498,9 +4879,13 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
 
     Otherwise, extraction uses an escalating fetch strategy: start with a
     small capture window and widen until the response marker is found.
-    Steps: 200 -> 500 -> 1000 -> 5000.  If no marker is found at 5000 lines,
-    the raw tail is returned with a [PARTIAL RESPONSE] prefix so the caller
-    knows the output may be incomplete.
+    Steps: 200 -> 500 -> 1000 -> 5000, clipped to the backend's own read
+    ceiling (``TerminalBackend.max_history_lines``: 50000 on tmux, 1000 on
+    herdr), then one full-scrollback read. If no marker is found anywhere, the
+    deepest capture is returned with a [PARTIAL RESPONSE] prefix when it fills
+    at least 90% of the deepest depth this backend can serve (the marker was
+    likely pushed out), or a [NO RESPONSE] prefix when it is sparser than that
+    (the agent likely produced no text response).
     """
     # Escalation steps used when the provider does not declare extraction_tail_lines.
     _ESCALATION_STEPS = [200, 500, 1000, 5000]
@@ -3571,15 +4956,45 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             # the response marker is found or we hit the cap.
             last_err = None
             full_output = ""
-            for step_lines in _ESCALATION_STEPS:
+            # Deepest capture seen across every rung, by line count. The ladder
+            # is not guaranteed monotonic by the backend contract: a deepest
+            # rung CAN return less than a shallower one (seen on herdr, where
+            # the then-flagless full_history read returned 80 lines right
+            # after the 5000-line rung returned 604 — #728; HerdrBackend now
+            # asks for its ceiling explicitly). The raw fallback below must
+            # publish the most content any rung managed to read, not whatever
+            # the last rung happened to return.
+            best_output = ""
+            best_lines = 0
+
+            def _remember(candidate: str) -> None:
+                nonlocal best_output, best_lines
+                lines = candidate.count("\n") + 1 if candidate else 0
+                if lines > best_lines:
+                    best_output, best_lines = candidate, lines
+
+            # Clip the ladder to what this backend can return from one read.
+            # A rung above the ceiling costs a round trip and hands back the
+            # same bytes as the rung below it: herdr clamps every read to
+            # 1000 lines, so its 5000-line rung was dead weight (#728).
+            read_cap = _backend_read_cap(get_backend())
+            if read_cap is None:
+                steps = list(_ESCALATION_STEPS)
+            else:
+                # A ceiling below the shallowest rung: read what there is.
+                steps = [s for s in _ESCALATION_STEPS if s <= read_cap] or [read_cap]
+            deepest_reachable = steps[-1]
+
+            for step_lines in steps:
                 full_output = get_backend().get_history(
                     metadata["tmux_session"],
                     metadata["tmux_window"],
                     tail_lines=step_lines,
                 )
+                _remember(full_output)
                 try:
                     result = provider.extract_last_message_from_script(full_output)
-                    if step_lines > _ESCALATION_STEPS[0]:
+                    if step_lines > steps[0]:
                         logger.debug(
                             "get_output: %s marker found at %d lines",
                             terminal_id,
@@ -3608,6 +5023,7 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                 metadata["tmux_window"],
                 full_history=True,
             )
+            _remember(full_output)
             try:
                 result = provider.extract_last_message_from_script(full_output)
                 logger.debug("get_output: %s marker found in full_history", terminal_id)
@@ -3632,8 +5048,20 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             # response marker was likely produced but pushed past the scrollback
             # limit (overflow).  If the buffer is mostly empty, the agent never
             # produced a text response (e.g. only tool calls, crash, or timeout).
-            actual_lines = full_output.count("\n") + 1
-            overflow_threshold = int(_ESCALATION_STEPS[-1] * 0.9)
+            # Measured against the DEEPEST capture any rung achieved, not
+            # against whatever the final rung returned: on a backend whose last
+            # rung reads shallower than an earlier one, counting the final
+            # read's lines reports "sparse buffer -> the agent produced no text
+            # response" for a worker that in fact produced thousands of lines
+            # (#728). A supervisor reads that label as a worker failure and
+            # re-delegates the whole task.
+            # And against the deepest depth THIS backend can serve, not the
+            # ladder's nominal top: with the threshold fixed at 90% of 5000, a
+            # herdr pane that overflowed its entire 1000-line readable depth
+            # could never be labelled an overflow (#728).
+            full_output = best_output
+            actual_lines = best_lines
+            overflow_threshold = int(deepest_reachable * 0.9)
             if actual_lines >= overflow_threshold:
                 logger.warning(
                     "get_output: %s response marker not found, buffer near-full "
@@ -3803,8 +5231,18 @@ def capture_terminal_snapshot(terminal_id: str) -> Optional[Dict]:
             strip_escapes=True,
             full_history=True,
         )
+        # Scrollback is raw terminal history and can hold anything the agent
+        # printed, so both sidecars are published 0600 through the atomic
+        # writer: a symlink planted at either path is replaced, not followed.
+        # The UNLOCKED variant on purpose: every terminal gets its own sidecar
+        # names, and the locked writer keeps one lock file per target in
+        # LOCK_DIR forever, so it would grow by two files per teardown with
+        # nothing to reap them. Unique temp + os.replace is enough here: two
+        # concurrent teardowns of the same id cannot tear a file.
+        from cli_agent_orchestrator.utils.atomic_file import unlocked_atomic_write
+
         scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
-        scrollback_path.write_text(scrollback, encoding="utf-8")
+        unlocked_atomic_write(scrollback_path, scrollback, mode=0o600)
 
         import json as _json
 
@@ -3819,7 +5257,7 @@ def capture_terminal_snapshot(terminal_id: str) -> Optional[Dict]:
             "caller_id": metadata.get("caller_id"),
         }
         snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
-        snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
+        unlocked_atomic_write(snapshot_path, _json.dumps(snapshot, indent=2), mode=0o600)
     except Exception as e:
         logger.warning(f"Failed to snapshot terminal {terminal_id}: {e}")
 
@@ -3998,6 +5436,7 @@ def dismantle_terminal_runtime(
     # temporary process race into a permanent private-home leak.
     if provider_manager.cleanup_provider(terminal_id) is False:
         return False
+    ephemeral_service.release(terminal_id, "terminal_deleted")
     with _memory_injected_lock:
         _memory_injected_terminals.discard(terminal_id)
     # Drop any per-curator dispatch lock so the registry doesn't grow
@@ -4044,6 +5483,8 @@ def delete_terminal_row(
         # DB row was already deleted by another lifecycle owner.
         _delete_deferred_failure_fallback(terminal_id)
         _delete_deferred_init_complete_fallback(terminal_id)
+    if deleted:
+        ephemeral_service.release(terminal_id, "terminal_gone")
     logger.info(f"Deleted terminal: {terminal_id}")
     if deleted and metadata:
         dispatch_plugin_event(
@@ -4080,3 +5521,10 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
     except Exception as e:
         logger.error(f"Failed to delete terminal {terminal_id}: {e}")
         raise
+
+
+def update_description(terminal_id: str, description: Optional[str]) -> bool:
+    """Normalize and validate an operator edit without touching lifecycle facts."""
+    from cli_agent_orchestrator.utils.description import normalize_description
+
+    return update_terminal_description(terminal_id, normalize_description(description))

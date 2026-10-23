@@ -11,11 +11,11 @@
   },
   "dependencies": {
     "ajv": "^8.17.1",
-    "yaml": "^2.8.1"
+    "yaml": "^2.9.1"
   },
   "devDependencies": {
-    "@types/bun": "^1.3.10",
-    "typescript": "^5.9.3"
+    "@types/bun": "^1.4.3",
+    "typescript": "^7.0.2"
   },
   "overrides": {
     "fast-uri": "^3.1.7"

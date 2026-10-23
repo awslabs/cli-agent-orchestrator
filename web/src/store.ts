@@ -1,6 +1,9 @@
 import { create } from 'zustand'
 import {
   api,
+  sessionDescriptionRevision,
+  SESSION_DESCRIPTION_READ_ATTEMPTS,
+  ApiError,
   Session,
   SessionDetail,
   TerminalMeta,
@@ -121,12 +124,27 @@ export const useStore = create<Store>((set, get) => ({
     }
     set({ activeSession: name })
     try {
-      const detail = await api.getSession(name)
-      if (!jsonEqual(get().activeSessionDetail, detail)) {
-        set({ activeSessionDetail: detail })
+      // A PATCH can complete between the API promise resolving and this
+      // continuation. Bound this second revision check as well as the API's.
+      for (let attempt = 0; attempt < SESSION_DESCRIPTION_READ_ATTEMPTS; attempt++) {
+        const revision = sessionDescriptionRevision
+        const detail = await api.getSession(name)
+        if (get().activeSession !== name) return
+        if (revision !== sessionDescriptionRevision) continue
+        if (!jsonEqual(get().activeSessionDetail, detail)) {
+          set({ activeSessionDetail: detail })
+        }
+        return
       }
-    } catch {
-      set({ activeSessionDetail: null })
+      throw new Error('Session descriptions kept changing; retry on the next poll')
+    } catch (error) {
+      // Preserve the mounted editor on transient failures, but remove deleted
+      // sessions. A late failure must never clear a different selection.
+      if (get().activeSession === name && (
+        (error as ApiError | null)?.status === 404 || get().activeSessionDetail?.session.id !== name
+      )) {
+        set({ activeSessionDetail: null })
+      }
     }
   },
 

@@ -59,8 +59,9 @@ def _looks_like_git(location: str) -> bool:
     """Whether a source string should be resolved as a repository.
 
     Deliberately syntactic: a URL scheme, an ``scp``-style SSH target, or a
-    ``.git`` suffix. Anything else is a local path, which keeps a directory
-    literally named ``github.com`` from being cloned instead of copied.
+    ``.git`` suffix. Explicit local paths take precedence, including a ``./``
+    prefix on an otherwise ambiguous name. No filesystem probe is needed to
+    distinguish them, and a directory literally named ``github.com`` stays local.
 
     A ``git+`` location is git-shaped here even when CAO refuses it. Answering
     "no" would be worse than refusing: the source would fall through to the path
@@ -69,11 +70,14 @@ def _looks_like_git(location: str) -> bool:
     message that names the forms that work.
     """
     candidate = location.strip()
+    if candidate.startswith(("./", "../", "/", "~")):
+        return False
     if candidate.startswith(("http://", "https://", "git://", "ssh://", "git+")):
         return True
     if candidate.endswith(".git"):
         return True
-    return "@" in candidate and ":" in candidate.split("@", 1)[1] and not Path(candidate).exists()
+    user_host, separator, _ = candidate.partition(":")
+    return bool(separator) and "@" in user_host and "/" not in user_host and "\\" not in user_host
 
 
 def _make_source(location: str, ref: Optional[str], subdir: Optional[str]) -> PluginSource:

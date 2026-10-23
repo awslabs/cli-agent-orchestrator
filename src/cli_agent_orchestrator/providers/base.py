@@ -51,6 +51,20 @@ class OutputExtractionError(ValueError):
     """
 
 
+class ProviderExitedError(RuntimeError):
+    """The CLI process exited back to the shell before it was ready (#1018).
+
+    Raised by a provider's ``initialize()`` when the pane's foreground process is
+    again the shell it captured as ``shell_baseline`` before launching the CLI.
+    Distinct from ``TimeoutError``: the pane is not slow, it IS a shell, and the
+    task that was about to be delivered would have been executed by it as
+    commands. Not a ``TerminalInputBlockedError`` either -- that one means
+    "alive, parked on a prompt, leave it running"; this terminal has nothing
+    left to answer, so the deferred-init path tears it down like any other
+    startup failure.
+    """
+
+
 class OutputExtractionRejected(OutputExtractionError):
     """A deliberate refusal to publish extracted content.
 
@@ -85,6 +99,21 @@ class BaseProvider(ABC):
         _status: Internal status cache (use get_status() for current status)
         _allowed_tools: CAO-vocabulary tool names this agent is allowed to use
     """
+
+    @classmethod
+    def honors_model(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+        requested_model: Optional[str],
+    ) -> bool:
+        """Return whether this provider applies a per-launch model request.
+
+        Providers must override this declaration explicitly. The conservative
+        default prevents an undeclared provider from being reported as having
+        honored a model it may ignore.
+        """
+        return False
 
     def __init__(
         self,
@@ -207,12 +236,39 @@ class BaseProvider(ABC):
     # depends on raw \r) whose detectors are tuned for the raw stream.
     supports_screen_detection: bool = False
 
+    # Opt-in, with supports_screen_detection, for the screen in the cheap
+    # re-check that StatusMonitor.get_status() runs for a poller while a
+    # terminal reads PROCESSING. By default that re-check parses the raw
+    # rolling buffer. Set True when the raw stream of the provider does not
+    # parse like its screen: Codex redraws only the cells that change, so the
+    # raw buffer of a working turn can parse as IDLE, and that IDLE ended the
+    # PROCESSING of the turn just after it began. Claude Code's Ink TUI repaints
+    # changed cells only, so the raw window holds glyph fragments and, once a
+    # long answer has pushed the input box past the size cap, no box at all
+    # for its detector to anchor on (GH #865). Providers that leave this False
+    # keep the raw re-check, which their detectors and turn bookkeeping were
+    # built around.
+    status_recheck_uses_screen: bool = False
+
     # Opt-in for the deferred-init direct status probe (capture-pane bypass).
     # Set True on providers whose get_status() detector is line-oriented and
     # works correctly on a rendered capture-pane snapshot. Providers whose
     # get_status() relies on dispatch bookkeeping (e.g. kiro_cli) must leave
     # this False — their COMPLETED/IDLE split is not screen-detectable.
     supports_direct_status_probe: bool = False
+
+    # Whether the direct probe's COMPLETED verdict identifies WHICH turn
+    # completed. A rendered pane keeps the previous turn's completion marker on
+    # screen, so a probe that only pattern-matches the marker reports COMPLETED
+    # for a receiver that never accepted the new paste. The deferred-init path
+    # never hits this (a fresh worker has no earlier turn on screen); the inbox
+    # path always can, so it treats a probe COMPLETED as evidence only when the
+    # provider sets this True -- i.e. its detector binds the completion to the
+    # dispatched turn (minimax_code: completion identity + buffer epoch). With
+    # it False the inbox path accepts only live verdicts (PROCESSING,
+    # WAITING_USER_ANSWER) from the probe. Meaningless unless
+    # ``supports_direct_status_probe`` is also True.
+    direct_status_probe_has_turn_identity: bool = False
 
     # Opt-in only for StatusMonitor's quiet stale-PROCESSING capture-pane
     # recovery. This is intentionally distinct from
@@ -223,6 +279,9 @@ class BaseProvider(ABC):
     # rendered viewport without being safe as delivery evidence.
     supports_stale_processing_capture: bool = False
 
+    # Uses the stale-processing probe/commit contract; active dialogs must stay waiting.
+    supports_stale_waiting_capture: bool = False
+
     # Opt-in for the mid-burst PROCESSING probe (StatusMonitor._midburst_processing_probe).
     # Set True ONLY alongside a probe_processing_from_screen() override that is
     # side-effect free. The probe runs on a HALF-DRAWN frame, off the two edges
@@ -232,6 +291,10 @@ class BaseProvider(ABC):
     # grok_cli's _turn_activity_seen) would have that bookkeeping applied from a
     # frame the monitor then throws away. Providers that leave this False are
     # never probed: the terminal keeps the status the edges give it.
+    #
+    # Composes with ``assume_processing_on_dispatch``: the dispatch latch is an
+    # optimistic PROCESSING, not an observation, so the probe still runs until
+    # the turn's work is actually seen (#814).
     supports_midburst_processing_probe: bool = False
 
     def probe_processing_from_screen(self, screen_lines: List[str]) -> bool:
@@ -325,12 +388,19 @@ class BaseProvider(ABC):
 
     @property
     def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
-        """Whether assign/handoff should pause when the provider is waiting on UI input.
+        """Whether orchestrated input should pause when the provider waits on UI input.
 
         Some CLIs render interactive pickers or approval prompts where pasted
         task text would be interpreted as the answer to that prompt. Providers
         with those surfaces can opt in so CAO blocks orchestrated task delivery
         while still allowing explicit user-prompt answers.
+
+        Read on two paths: ``terminal_service.send_input`` refuses assign,
+        handoff AND send_message (inbox) deliveries into WAITING_USER_ANSWER,
+        and ``inbox_service`` excludes WAITING_USER_ANSWER from eager delivery
+        for these providers. Both were needed for #896 — before that fix an
+        inbox message was pasted into an open Claude Code AskUserQuestion
+        dialog, which swallowed the text and answered itself.
         """
         return False
 
@@ -342,6 +412,12 @@ class BaseProvider(ABC):
         drive the transition. Full-screen TUIs that can remain visually
         unchanged just after submission opt in so callers cannot observe the
         previous turn's cached COMPLETED state as the new turn's result.
+
+        The published PROCESSING is an optimistic latch, NOT provider evidence.
+        It carries no observation stamp, so it is not "this turn has been seen
+        working": the mid-burst processing probe keeps running until the work is
+        actually seen on screen (#814), and the stale-PROCESSING capture gate,
+        for providers that opt into that recovery, does not accept it either.
         """
         return False
 

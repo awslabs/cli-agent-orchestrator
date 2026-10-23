@@ -88,10 +88,19 @@ def _no_real_network(request, monkeypatch):
     monkeypatch.setattr(bap.urllib.request, "urlopen", refuse)
 
 
+@pytest.fixture
+def steady(monkeypatch):
+    """``pyproject.toml`` at the version of the committed packages."""
+    committed = bap.committed_package_version()
+    assert committed is not None, "the committed packages must declare a version"
+    monkeypatch.setattr(bap, "package_version", lambda: committed)
+    return committed
+
+
 class TestTheCheckIsConditional:
     """Item 8's constraint that a plain rebuild must keep working."""
 
-    def test_an_unchanged_pin_asks_nothing(self, monkeypatch):
+    def test_an_unchanged_pin_asks_nothing(self, steady, monkeypatch):
         """The predicate the reviewer's fix must not break.
 
         A contributor who edits a skill and reruns the build has expressed no
@@ -106,10 +115,9 @@ class TestTheCheckIsConditional:
         )
 
         committed = bap.package_version()
-        assert bap.pin_changed(committed) is False, (
-            "the committed pin must equal the rendered pin in a clean tree; if this "
-            "fails the tree is mid-bump, not the check"
-        )
+        assert (
+            bap.pin_changed(committed) is False
+        ), "the committed pin must equal the rendered pin in the steady-state fixture"
         assert bap.should_check_boundedness(committed, require=False) is False
 
     def test_a_changed_pin_asks(self):
@@ -427,7 +435,7 @@ class TestABumpedVersionDoesNotRedenMain:
         assert bap.main(["--check"]) == 0
         assert bap.main(["--check", "--require-current-pin"]) == 1
 
-    def test_a_clean_tree_is_green_either_way(self):
+    def test_a_clean_tree_is_green_either_way(self, steady):
         """No bump: the steady state must satisfy the strict form too."""
         assert bap.run_check() == 0
         assert bap.run_check(require_current_pin=True) == 0

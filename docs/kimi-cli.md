@@ -596,6 +596,22 @@ connecting to mcp servers is only a phrase   <- must survive
 Final line                                   <- must survive
 ```
 
+Boot-message punctuation/whitespace suffixes are separate from arbitrary
+detail fields. Where a detail field accepts a trailing-newline suffix, the
+newline boundary prevents the two fields from repeatedly matching the same
+whitespace. MCP count digits and optional collapsed-output bullets likewise
+avoid overlapping repetitions. Existing punctuation, Unicode whitespace,
+trailing-newline behavior, and both bullet glyphs remain accepted; this does
+not add a transcript-length limit or change the distinction between answer
+content and chrome.
+
+Footer tips are checked within individual escape-delimited segments carrying
+the footer colour; a later colour or reset cannot lend its text to an earlier
+segment. Native swarm status parsing matches the existing glyph/state prefix
+and reads its detail separately, without overlapping whitespace repetitions.
+It rejects embedded newlines at the row boundary while preserving the panel,
+colour, and quoted-content checks.
+
 ### Terminal Output Format (v1.20.0+, legacy)
 
 ```

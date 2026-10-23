@@ -340,7 +340,9 @@ async def test_create_and_add_window_share_identity_even_after_failure(monkeypat
     ids = iter(["first001", "second01"])
     monkeypatch.setattr(ts, "generate_terminal_id", lambda: next(ids))
     monkeypatch.setattr(
-        ts, "load_agent_profile", lambda _: AgentProfile(name="developer", description="Developer")
+        ts.agent_profiles,
+        "load_agent_profile",
+        lambda _: AgentProfile(name="developer", description="Developer"),
     )
     monkeypatch.setattr(ts, "get_herdr_inbox_service", lambda: None)
     provider_manager = MagicMock()

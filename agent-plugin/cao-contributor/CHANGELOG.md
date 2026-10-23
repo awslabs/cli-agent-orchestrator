@@ -4,7 +4,7 @@ This file is **generated** by `scripts/build_agent_plugin.py`. Edit the package
 configuration in that script, not this file; `make check-agent-plugin` fails on
 any hand edit.
 
-## 2.5.0
+## 2.5.3
 
 Targets the [Agent Plugins 1.0.0](https://agent-plugins.org/specification)
 specification. Version is synced from CAO's own package metadata, so the plugin

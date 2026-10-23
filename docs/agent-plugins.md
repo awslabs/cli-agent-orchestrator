@@ -114,6 +114,14 @@ plugin is not loadable.
 
 ### Accepted git source spellings
 
+Source-kind inference is syntactic; it does not probe the filesystem. Paths
+beginning with `./`, `../`, `/`, or `~` are local, even when their names end in
+`.git` or contain `@` and `:`. Prefix an ambiguous local name such as
+`user@host:plugin` with `./`; without that prefix it is an SSH-style source
+regardless of whether a same-named directory exists. The HTTP API also accepts
+an explicit `kind: "path"`. Filesystem checks belong to local-source resolution,
+not to choosing the source kind.
+
 A git source is cloned only over **`https://` or `ssh://`** (URL or `scp`-style
 `git@host:owner/repo.git`) and only from an **allowed host**: `github.com` by
 default. Set `CAO_PLUGIN_ALLOWED_HOSTS` to a comma-separated list of hostnames
@@ -306,6 +314,11 @@ Validation never reaches the network. CAO validates against schema bytes
 committed to its own repository, because the specification forbids retrieving a
 schema while loading a plugin — which also means a compromised schema host
 cannot change what CAO considers valid.
+
+The schema-pin checks compare the recorded source URL and each schema URL/ID
+against their exact canonical values, separately from checking that the pin's
+policy is documented. A hostname mentioned in policy prose is not a URL
+validation rule.
 
 ## MCP servers
 

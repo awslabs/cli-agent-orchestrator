@@ -17,6 +17,12 @@ from cli_agent_orchestrator.utils.agent_profiles import (
 class TestLoadAgentProfile:
     """Tests for load_agent_profile function."""
 
+    @pytest.fixture(autouse=True)
+    def no_managed_env(self, monkeypatch):
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.resolve_env_vars", lambda text: text
+        )
+
     def test_load_agent_profile_from_local_store(self, tmp_path, monkeypatch):
         """Test loading agent profile from the local store."""
         local_store = tmp_path / "agent-store"

@@ -30,6 +30,7 @@ from cli_agent_orchestrator.backends.base import TerminalBackend, TerminalCleanu
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     delete_terminals_by_ids,
+    get_pending_inbox_counts,
     get_session_incarnation,
     get_session_incarnations,
     list_terminals_by_session,
@@ -59,6 +60,9 @@ from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 logger = logging.getLogger(__name__)
 
 
+_DESCRIPTION_UNSET = object()
+
+
 async def create_session(
     provider: str | None,
     agent_profile: str,
@@ -73,9 +77,11 @@ async def create_session(
     model: str | None = None,
     use_worktree: bool = False,
     idempotency_key: str | None = None,
+    caller_ceiling: list[str] | None = None,
     resume_session_id: str | None = None,
     group: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    description: Any = _DESCRIPTION_UNSET,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
@@ -116,6 +122,9 @@ async def create_session(
     else:
         resolved_provider = provider
 
+    if description is _DESCRIPTION_UNSET:
+        description = session_name or None
+
     terminal = await create_terminal(
         provider=resolved_provider,
         agent_profile=agent_profile,
@@ -135,6 +144,8 @@ async def create_session(
         resume_session_id=resume_session_id,
         group=group,
         metadata=metadata,
+        description=description,
+        caller_ceiling=caller_ceiling,
     )
     dispatch_plugin_event(
         registry,
@@ -498,8 +509,11 @@ def get_session(session_name: str) -> Dict:
         # single source of truth and is backend-aware (tmux push vs herdr
         # native), so derive it here rather than persisting a stale column.
         from cli_agent_orchestrator.services.status_monitor import status_monitor
+        from cli_agent_orchestrator.services.terminal_service import reported_status
 
+        pending_counts = get_pending_inbox_counts([terminal["id"] for terminal in terminals])
         for terminal in terminals:
+            terminal["pending_inbox_count"] = pending_counts.get(terminal["id"], 0)
             failure = failures.get(str(terminal["id"]))
             if failure is not None:
                 terminal["deferred_init_failure"] = failure
@@ -507,7 +521,13 @@ def get_session(session_name: str) -> Dict:
             elif not backend_exists:
                 terminal["status"] = "unknown"
             else:
-                terminal["status"] = status_monitor.get_status(terminal["id"]).value
+                # reported_status keeps this in step with GET /terminals/{id}: a
+                # terminal whose accepted initial message has not been dispatched
+                # yet must not read IDLE/COMPLETED anywhere a client can see it
+                # (#566).
+                terminal["status"] = reported_status(
+                    terminal["id"], status_monitor.get_status(terminal["id"])
+                ).value
         return {"session": session_data, "terminals": terminals}
 
     except Exception as e:
@@ -787,7 +807,12 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
             # loop already cleared them. Deferred ids are excluded: their rows
             # are the retry handle for cleanup that has NOT happened yet.
             try:
-                delete_terminals_by_ids([i for i in incarnation_ids if i not in deferred_ids])
+                sweep_ids = [i for i in incarnation_ids if i not in deferred_ids]
+                if delete_terminals_by_ids(sweep_ids):
+                    from cli_agent_orchestrator.services import ephemeral_service
+
+                    for terminal_id in sweep_ids:
+                        ephemeral_service.release(terminal_id, "terminal_gone")
             except Exception as e:
                 logger.warning(f"Failed to sweep registry rows for {session_name}: {e}")
                 result["errors"].append(

@@ -28,6 +28,8 @@ class TestListSessions:
             "id": "abc12345",
             "agent_profile": "dev",
             "provider": "kiro_cli",
+            "model": "model-x",
+            "model_honored": True,
             "status": "idle",
         }
         mock_get.side_effect = [sessions_resp, terminals_resp, terminal_resp]
@@ -119,6 +121,8 @@ class TestStatus:
             "id": "abc12345",
             "agent_profile": "dev",
             "provider": "kiro_cli",
+            "model": "model-x",
+            "model_honored": True,
             "status": "completed",
         }
         output_resp = MagicMock(status_code=200)
@@ -130,7 +134,33 @@ class TestStatus:
         assert result.exit_code == 0
         assert "abc12345" in result.output
         assert "completed" in result.output
+        assert "Model:    model-x" in result.output
+        assert "Honored:  yes" in result.output
         assert "Hello world" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
+    def test_status_renders_unknown_for_legacy_launch_model(self, mock_get, runner):
+        terminals_resp = MagicMock(status_code=200)
+        terminals_resp.json.return_value = [{"id": "abc12345"}]
+        terminal_resp = MagicMock(status_code=200)
+        terminal_resp.json.return_value = {
+            "id": "abc12345",
+            "agent_profile": "dev",
+            "provider": "kiro_cli",
+            "model": None,
+            "model_honored": None,
+            "status": "idle",
+        }
+        output_resp = MagicMock(status_code=200)
+        output_resp.json.return_value = {"output": None}
+        mock_get.side_effect = [terminals_resp, terminal_resp, output_resp]
+
+        result = runner.invoke(session, ["status", "cao-test"])
+
+        assert result.exit_code == 0
+        assert "Model:    unknown" in result.output
+        assert "Honored:  unknown" in result.output
+        assert "provider default" not in result.output
 
     @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
     def test_status_json(self, mock_get, runner):
@@ -141,6 +171,8 @@ class TestStatus:
             "id": "abc12345",
             "agent_profile": "dev",
             "provider": "kiro_cli",
+            "model": "model-x",
+            "model_honored": True,
             "status": "idle",
         }
         output_resp = MagicMock(status_code=200)
@@ -150,7 +182,10 @@ class TestStatus:
         result = runner.invoke(session, ["status", "cao-test", "--json"])
 
         assert result.exit_code == 0
-        assert '"status": "idle"' in result.output
+        payload = json.loads(result.output)
+        assert payload["conductor"]["status"] == "idle"
+        assert payload["conductor"]["model"] == "model-x"
+        assert payload["conductor"]["model_honored"] is True
 
     @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
     def test_status_specific_terminal(self, mock_get, runner):
@@ -159,6 +194,8 @@ class TestStatus:
             "id": "xyz99999",
             "agent_profile": "dev",
             "provider": "kiro_cli",
+            "model": None,
+            "model_honored": None,
             "status": "idle",
         }
         output_resp = MagicMock(status_code=200)
@@ -189,6 +226,8 @@ class TestStatus:
         assert result.exit_code == 0
         data = __import__("json").loads(result.output)
         assert data["conductor"]["id"] == "xyz99999"
+        assert data["conductor"]["model"] is None
+        assert data["conductor"]["model_honored"] is None
         assert "workers" not in data
 
     @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
@@ -217,12 +256,51 @@ class TestStatus:
         }
         output_resp = MagicMock(status_code=200)
         output_resp.json.return_value = {"output": None}
-        mock_get.side_effect = [terminals_resp, terminal_resp, output_resp]
+        worker_resp = MagicMock(status_code=200)
+        worker_resp.json.return_value = terminals_resp.json.return_value[1]
+        mock_get.side_effect = [terminals_resp, terminal_resp, worker_resp, output_resp]
 
         result = runner.invoke(session, ["status", "cao-test", "--workers"])
 
         assert result.exit_code == 0
         assert "work5678" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
+    def test_status_workers_render_unknown_for_legacy_launch_model(self, mock_get, runner):
+        terminals_resp = MagicMock(status_code=200)
+        terminals_resp.json.return_value = [
+            {
+                "id": "cond1234",
+                "agent_profile": "conductor",
+                "provider": "kiro_cli",
+                "model": "model-x",
+                "model_honored": True,
+                "status": "idle",
+            },
+            {
+                "id": "work5678",
+                "agent_profile": "dev",
+                "provider": "kiro_cli",
+                "model": None,
+                "model_honored": None,
+                "status": "processing",
+            },
+        ]
+        terminal_resp = MagicMock(status_code=200)
+        terminal_resp.json.return_value = terminals_resp.json.return_value[0]
+        output_resp = MagicMock(status_code=200)
+        output_resp.json.return_value = {"output": None}
+        worker_resp = MagicMock(status_code=200)
+        worker_resp.json.return_value = terminals_resp.json.return_value[1]
+        mock_get.side_effect = [terminals_resp, terminal_resp, worker_resp, output_resp]
+
+        result = runner.invoke(session, ["status", "cao-test", "--workers"])
+
+        assert result.exit_code == 0
+        worker_row = next(line for line in result.output.splitlines() if "work5678" in line)
+        assert "unknown" in worker_row
+        assert "provider default" not in worker_row
+        assert "None" not in worker_row
 
     @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
     def test_status_resolves_the_conductor_from_index_zero(self, mock_get, runner):
@@ -304,7 +382,9 @@ class TestStatus:
         }
         output_resp = MagicMock(status_code=200)
         output_resp.json.return_value = {"output": None}
-        mock_get.side_effect = [terminals_resp, terminal_resp, output_resp]
+        worker_resp = MagicMock(status_code=200)
+        worker_resp.json.return_value = terminals_resp.json.return_value[1]
+        mock_get.side_effect = [terminals_resp, terminal_resp, worker_resp, output_resp]
 
         result = runner.invoke(session, ["status", "cao-test", "--workers", "--json"])
 
@@ -312,6 +392,24 @@ class TestStatus:
         data = __import__("json").loads(result.output)
         assert "workers" in data
         assert data["workers"][0]["id"] == "work5678"
+
+    @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
+    @pytest.mark.parametrize("status_code", [404, 503])
+    def test_status_worker_detail_error(self, mock_get, runner, status_code):
+        """Missing/unavailable worker details must not look like a successful read."""
+        terminals_resp = MagicMock()
+        terminals_resp.json.return_value = [{"id": "cond1234"}, {"id": "work5678"}]
+        conductor_resp = MagicMock()
+        conductor_resp.json.return_value = {"id": "cond1234", "status": "idle"}
+        worker_resp = MagicMock()
+        worker_resp.raise_for_status.side_effect = requests.exceptions.HTTPError(str(status_code))
+        mock_get.side_effect = [terminals_resp, conductor_resp, worker_resp]
+
+        result = runner.invoke(session, ["status", "cao-test", "--workers", "--json"])
+
+        assert result.exit_code != 0
+        assert str(status_code) in result.output
+        assert '"workers"' not in result.output
 
     @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
     def test_status_no_workers(self, mock_get, runner):
@@ -548,15 +646,19 @@ class TestSendSync:
     @patch("cli_agent_orchestrator.cli.commands.session.api_http.post")
     @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
     def test_send_sync_poll_request_exception(self, mock_get, mock_post, mock_time, runner):
-        """Poll failure raises ClickException."""
+        """A poll failure that will not clear on retry (a 4xx) raises ClickException.
+
+        A connection error or a 5xx is retried instead (#1016), see
+        test/cli/commands/test_poll_failures.py.
+        """
         resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
         pre_send_status_resp = MagicMock(status_code=200)
         pre_send_status_resp.json.return_value = {"status": "idle"}
-        mock_get.side_effect = [
-            resolve_resp,
-            pre_send_status_resp,
-            requests.exceptions.ConnectionError("refused"),
-        ]
+        gone_resp = MagicMock(status_code=404)
+        gone_resp.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            "404 Not Found", response=MagicMock(status_code=404)
+        )
+        mock_get.side_effect = [resolve_resp, pre_send_status_resp, gone_resp]
         mock_post.return_value = MagicMock(status_code=200)
         mock_time.time.return_value = 0
         mock_time.sleep = MagicMock()
@@ -617,3 +719,92 @@ class TestSendSync:
         runner.invoke(session, ["send", "cao-test", "question"])
 
         mock_exit.assert_any_call(130)
+
+
+class TestSendDispatchBoundary:
+    """#735: `send` must keep the dispatch boundary and forward it as evidence."""
+
+    @patch("cli_agent_orchestrator.cli.commands.session.poll_until_done")
+    @patch("cli_agent_orchestrator.cli.commands.session.time")
+    @patch("cli_agent_orchestrator.cli.commands.session.api_http.post")
+    @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
+    def test_send_forwards_dispatch_boundary_and_skips_sleep(
+        self, mock_get, mock_post, mock_time, mock_poll, runner
+    ):
+        """A named boundary is parsed from the POST body, passed to
+        ``poll_until_done`` as ``min_generation``, and the flat 3s grace sleep
+        is skipped -- the server already named the turn."""
+        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        pre_send_status_resp = MagicMock(status_code=200)
+        pre_send_status_resp.json.return_value = {"status": "idle"}
+        output_resp = MagicMock(status_code=200)
+        output_resp.json.return_value = {"output": "done"}
+        mock_get.side_effect = [resolve_resp, pre_send_status_resp, output_resp]
+        post_resp = MagicMock(status_code=200)
+        post_resp.json.return_value = {"success": True, "dispatch_boundary": 42}
+        mock_post.return_value = post_resp
+        mock_time.sleep = MagicMock()
+
+        result = runner.invoke(session, ["send", "cao-test", "question"])
+
+        assert result.exit_code == 0
+        mock_poll.assert_called_once()
+        _, kwargs = mock_poll.call_args
+        assert kwargs["min_generation"] == 42
+        mock_time.sleep.assert_not_called()
+
+    @patch("cli_agent_orchestrator.cli.commands.session.poll_until_done")
+    @patch("cli_agent_orchestrator.cli.commands.session.time")
+    @patch("cli_agent_orchestrator.cli.commands.session.api_http.post")
+    @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
+    def test_send_sleeps_and_forwards_none_when_no_boundary_named(
+        self, mock_get, mock_post, mock_time, mock_poll, runner
+    ):
+        """An older cao-server (or herdr) answers with no ``dispatch_boundary``:
+        `send` must fall back to the flat 3s sleep and pass no generation."""
+        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        pre_send_status_resp = MagicMock(status_code=200)
+        pre_send_status_resp.json.return_value = {"status": "idle"}
+        output_resp = MagicMock(status_code=200)
+        output_resp.json.return_value = {"output": "done"}
+        mock_get.side_effect = [resolve_resp, pre_send_status_resp, output_resp]
+        post_resp = MagicMock(status_code=200)
+        post_resp.json.return_value = {"success": True}
+        mock_post.return_value = post_resp
+        mock_time.sleep = MagicMock()
+
+        result = runner.invoke(session, ["send", "cao-test", "question"])
+
+        assert result.exit_code == 0
+        mock_poll.assert_called_once()
+        _, kwargs = mock_poll.call_args
+        assert kwargs["min_generation"] is None
+        mock_time.sleep.assert_called_once_with(3)
+
+    @patch("cli_agent_orchestrator.cli.commands.session.poll_until_done")
+    @patch("cli_agent_orchestrator.cli.commands.session.time")
+    @patch("cli_agent_orchestrator.cli.commands.session.api_http.post")
+    @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
+    def test_send_handles_a_non_dict_json_body(
+        self, mock_get, mock_post, mock_time, mock_poll, runner
+    ):
+        """A malformed (non-dict) JSON body from the POST response must not
+        crash with a raw AttributeError from ``.get()`` on a list/scalar --
+        it should be treated as naming no boundary, same as an older server."""
+        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        pre_send_status_resp = MagicMock(status_code=200)
+        pre_send_status_resp.json.return_value = {"status": "idle"}
+        output_resp = MagicMock(status_code=200)
+        output_resp.json.return_value = {"output": "done"}
+        mock_get.side_effect = [resolve_resp, pre_send_status_resp, output_resp]
+        post_resp = MagicMock(status_code=200, json=lambda: [1, 2, 3])
+        mock_post.return_value = post_resp
+        mock_time.sleep = MagicMock()
+
+        result = runner.invoke(session, ["send", "cao-test", "question"])
+
+        assert result.exit_code == 0
+        mock_poll.assert_called_once()
+        _, kwargs = mock_poll.call_args
+        assert kwargs["min_generation"] is None
+        mock_time.sleep.assert_called_once_with(3)

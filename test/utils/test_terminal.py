@@ -663,3 +663,310 @@ class TestPollUntilDone:
             g.return_value = self._resp("error")
             with pytest.raises(click.ClickException):
                 poll_until_done("abcd1234", timeout=60, polling_interval=0)
+
+
+class TestWaitForInitialDelivery:
+    """PR #566 round 9: the CLI waits on the server's durable delivery verdict."""
+
+    @staticmethod
+    def _resp(payload):
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = payload
+        return resp
+
+    def test_returns_the_payload_once_delivered(self):
+        from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
+
+        delivered = {"status": "processing", "initial_delivery": {"state": "delivered"}}
+        with patch(
+            "cli_agent_orchestrator.utils.terminal.api_http.get",
+            return_value=self._resp(delivered),
+        ) as mock_get:
+            payload = wait_for_initial_delivery("t1", timeout=5)
+        assert payload == delivered
+        assert mock_get.call_args.args[0].endswith("/terminals/t1")
+        assert mock_get.call_args.kwargs["timeout"] == 5.0
+
+    @patch("cli_agent_orchestrator.utils.terminal.time.sleep")
+    def test_keeps_polling_through_pending_and_status_noise(self, mock_sleep):
+        """Neither a pending row nor any status sample (IDLE, COMPLETED, UNKNOWN) counts."""
+        from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
+
+        sequence = [
+            self._resp({"status": "unknown", "initial_delivery": {"state": "pending"}}),
+            self._resp({"status": "idle", "initial_delivery": {"state": "pending"}}),
+            self._resp({"status": "completed", "initial_delivery": {"state": "pending"}}),
+            self._resp({"status": "processing", "initial_delivery": {"state": "delivered"}}),
+        ]
+        with patch("cli_agent_orchestrator.utils.terminal.api_http.get", side_effect=sequence) as g:
+            wait_for_initial_delivery("t1", timeout=60, polling_interval=0.5)
+        assert g.call_count == 4
+        assert mock_sleep.call_count == 3
+        mock_sleep.assert_called_with(0.5)
+
+    def test_failed_delivery_raises_with_kind_and_message(self):
+        import click
+
+        from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
+
+        failed = {
+            "status": "waiting_user_answer",
+            "initial_delivery": {
+                "state": "failed",
+                "kind": "waiting_user_answer",
+                "message": "parked on a prompt",
+            },
+        }
+        with patch(
+            "cli_agent_orchestrator.utils.terminal.api_http.get", return_value=self._resp(failed)
+        ):
+            with pytest.raises(click.ClickException) as excinfo:
+                wait_for_initial_delivery("t1", timeout=5)
+        assert "waiting_user_answer" in str(excinfo.value)
+        assert "parked on a prompt" in str(excinfo.value)
+
+    def test_error_status_before_a_verdict_raises_with_the_failure_detail(self):
+        import click
+
+        from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
+
+        errored = {
+            "status": "error",
+            "initial_delivery": {"state": "pending"},
+            "deferred_init_failure": {"kind": "provider_init_error", "message": "no binary"},
+        }
+        with patch(
+            "cli_agent_orchestrator.utils.terminal.api_http.get", return_value=self._resp(errored)
+        ):
+            with pytest.raises(click.ClickException) as excinfo:
+                wait_for_initial_delivery("t1", timeout=5)
+        assert "ERROR" in str(excinfo.value)
+        assert "no binary" in str(excinfo.value)
+
+    @patch("cli_agent_orchestrator.utils.terminal.time.sleep")
+    def test_times_out_with_a_message_naming_the_terminal(self, mock_sleep):
+        import click
+
+        from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
+
+        pending = self._resp({"status": "unknown", "initial_delivery": {"state": "pending"}})
+        clock = iter([0.0, 0.0, 0.5, 1.5, 2.5])
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.api_http.get", return_value=pending),
+            patch("cli_agent_orchestrator.utils.terminal.time.time", side_effect=clock),
+        ):
+            with pytest.raises(click.ClickException) as excinfo:
+                wait_for_initial_delivery("t1", timeout=2)
+        assert "t1" in str(excinfo.value)
+        assert "Timed out" in str(excinfo.value)
+
+    @staticmethod
+    def _http_error(status_code):
+        import requests
+
+        response = MagicMock(status_code=status_code)
+        return requests.exceptions.HTTPError(f"{status_code} from server", response=response)
+
+    @pytest.mark.parametrize(
+        "transient",
+        ["connection_error", "read_timeout", "server_error"],
+    )
+    @patch("cli_agent_orchestrator.utils.terminal.time.sleep")
+    def test_keeps_polling_through_a_transient_transport_failure(self, mock_sleep, transient):
+        """#882: the server is still initializing and delivering, so one failed poll is not a verdict."""
+        import requests
+
+        from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
+
+        failure = {
+            "connection_error": requests.exceptions.ConnectionError("refused"),
+            "read_timeout": requests.exceptions.ReadTimeout("read timed out"),
+            "server_error": None,
+        }[transient]
+        if failure is None:
+            first = MagicMock()
+            first.raise_for_status.side_effect = self._http_error(503)
+        else:
+            first = failure
+        delivered = {"status": "processing", "initial_delivery": {"state": "delivered"}}
+        with patch(
+            "cli_agent_orchestrator.utils.terminal.api_http.get",
+            side_effect=[first, self._resp(delivered)],
+        ) as g:
+            payload = wait_for_initial_delivery("t1", timeout=60)
+        assert payload == delivered
+        assert g.call_count == 2
+
+    @pytest.mark.parametrize("status_code", [404, 401])
+    def test_client_error_fails_fast(self, status_code):
+        """A 4xx will not change on retry: a deleted terminal (404) or a missing credential (401)."""
+        import click
+
+        from cli_agent_orchestrator.utils.api_http import AuthNotConfiguredError
+        from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
+
+        if status_code == 401:
+            side_effect = AuthNotConfiguredError("no token", response=MagicMock(status_code=401))
+        else:
+            resp = MagicMock()
+            resp.raise_for_status.side_effect = self._http_error(status_code)
+            side_effect = [resp]
+        with patch(
+            "cli_agent_orchestrator.utils.terminal.api_http.get", side_effect=side_effect
+        ) as g:
+            with pytest.raises(click.ClickException) as excinfo:
+                wait_for_initial_delivery("t1", timeout=60)
+        assert g.call_count == 1
+        assert "Failed to poll terminal delivery state" in str(excinfo.value)
+
+    def test_persistent_transport_failure_times_out_naming_the_last_error(self):
+        import click
+        import requests
+
+        from cli_agent_orchestrator.utils.terminal import wait_for_initial_delivery
+
+        # Patch the module's `time` name, not `time.time` itself: the retry logs at
+        # DEBUG, and a LogRecord reads the global clock, which would eat a value.
+        with (
+            patch(
+                "cli_agent_orchestrator.utils.terminal.api_http.get",
+                side_effect=requests.exceptions.ConnectionError("boom"),
+            ) as g,
+            patch("cli_agent_orchestrator.utils.terminal.time") as t,
+        ):
+            t.time.side_effect = iter([0.0, 0.0, 1.0, 2.5])
+            with pytest.raises(click.ClickException) as excinfo:
+                wait_for_initial_delivery("t1", timeout=2)
+        assert g.call_count == 2
+        message = str(excinfo.value)
+        assert "Timed out" in message
+        assert "boom" in message
+        assert "may already have been delivered" in message
+
+
+class TestWaitUntilStatusOnPoll:
+    """``on_poll`` lets a caller abandon the wait for a reason the status cannot express (#1018)."""
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_hook_is_awaited_after_every_poll(self, mock_monitor):
+        mock_monitor.get_status.side_effect = [
+            TerminalStatus.PROCESSING,
+            TerminalStatus.PROCESSING,
+            TerminalStatus.IDLE,
+        ]
+        polls = []
+
+        async def on_poll():
+            polls.append(mock_monitor.get_status.call_count)
+
+        result = await wait_until_status(
+            "test-terminal",
+            TerminalStatus.IDLE,
+            timeout=2.0,
+            polling_interval=0.01,
+            on_poll=on_poll,
+        )
+
+        assert result is True
+        # Once per status read, each time AFTER that read.
+        assert polls == [1, 2, 3]
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_hook_raising_on_a_ready_status_vetoes_it(self, mock_monitor):
+        """A ready status read from a pane the hook rejects must not be returned as True.
+
+        This is the ordering #1018 needs: the exit check runs before the ready
+        verdict is acted on, so a bare shell whose leftover text reads as an idle
+        composer cannot satisfy a provider's readiness wait.
+        """
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        class Exited(RuntimeError):
+            pass
+
+        async def on_poll():
+            raise Exited("pane is back at the shell")
+
+        with pytest.raises(Exited):
+            await wait_until_status(
+                "test-terminal", TerminalStatus.IDLE, timeout=2.0, on_poll=on_poll
+            )
+
+        assert mock_monitor.get_status.call_count == 1
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_without_a_hook_behaviour_is_unchanged(self, mock_monitor):
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        assert await wait_until_status("test-terminal", TerminalStatus.IDLE, timeout=1.0) is True
+
+
+class TestOnPollIsNotATransientPollFailure:
+    """Merge of #1018 with #1037: the two policies in this module must stay apart.
+
+    #1037 retries transient poll failures in the synchronous ``poll_until_done``
+    and ``wait_for_initial_delivery`` through ``_is_transient_poll_error``. #1018
+    adds ``on_poll`` to the asynchronous ``wait_until_status``, whose hook aborts
+    by raising. Nothing in ``wait_until_status`` may classify or retry what the
+    hook raises: an exit-to-shell found by the hook has to end the wait on that
+    very poll, however the retry classifier would have read the exception.
+    """
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_hook_exception_ends_the_wait_even_though_the_classifier_calls_it_transient(
+        self, mock_monitor
+    ):
+        from cli_agent_orchestrator.providers.base import ProviderExitedError
+        from cli_agent_orchestrator.utils.terminal import _is_transient_poll_error
+
+        mock_monitor.get_status.return_value = TerminalStatus.PROCESSING
+        exited = ProviderExitedError("pane is back at the shell")
+
+        async def on_poll():
+            raise exited
+
+        # The retry classifier has no status code to read, so it would say "retry".
+        assert _is_transient_poll_error(exited) is True  # type: ignore[arg-type]
+
+        with pytest.raises(ProviderExitedError):
+            await wait_until_status(
+                "test-terminal",
+                TerminalStatus.IDLE,
+                timeout=5.0,
+                polling_interval=0.01,
+                on_poll=on_poll,
+            )
+
+        # One poll, one hook call, no retry, no second read.
+        assert mock_monitor.get_status.call_count == 1
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_hook_runs_on_a_poll_whose_status_is_ready_before_the_wait_returns(
+        self, mock_monitor
+    ):
+        """The hook sees the ready poll too: a ready verdict from a bare shell is still vetoed."""
+        from cli_agent_orchestrator.providers.base import ProviderExitedError
+
+        mock_monitor.get_status.side_effect = [TerminalStatus.PROCESSING, TerminalStatus.IDLE]
+        pane_is_shell = iter([False, True])
+
+        async def on_poll():
+            if next(pane_is_shell):
+                raise ProviderExitedError("pane is back at the shell")
+
+        with pytest.raises(ProviderExitedError):
+            await wait_until_status(
+                "test-terminal",
+                TerminalStatus.IDLE,
+                timeout=5.0,
+                polling_interval=0.01,
+                on_poll=on_poll,
+            )
+
+        assert mock_monitor.get_status.call_count == 2

@@ -80,6 +80,8 @@ _UNQUALIFIED_PLUGIN = re.compile(r"(?<![\w-])(?<!agent )(?<!event )plugins?\b", 
 #: vocabulary backlog, brought in line: every occurrence was an event-plugin
 #: reference and now says so.
 _UNSCOPED_DOCS = [
+    # #801 ephemeral agents: one agent-plugin reference, in the honesty statement.
+    "ephemeral-agents.md",
     "skills.md",
     "control-planes.md",
     "codex-cli.md",
@@ -103,6 +105,9 @@ _UNSCOPED_DOCS = [
     "kiro-cli.md",
     "claude-code.md",
     "copilot-cli.md",
+    # PR #1000 (#827): "What an approval does not cover" names agent-plugin MCP
+    # delivery as a launch input outside plan_id. CAO's own noun, qualified.
+    "workflows.md",
 ]
 
 #: Docs whose H1 scopes the noun ("# Event Plugins", "# Agent Plugins"), so bare

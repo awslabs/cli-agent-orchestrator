@@ -25,6 +25,7 @@ import shlex
 from typing import List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
@@ -58,6 +59,15 @@ class MockCliProvider(BaseProvider):
     ``test/providers/fixtures/bin/mock_cli`` and must be on PATH (the
     repo's ``test/conftest.py`` prepends it for the pytest session).
     """
+
+    @classmethod
+    def honors_model(
+        cls,
+        agent_profile: Optional[str],
+        profile: Optional["AgentProfile"],
+        requested_model: Optional[str],
+    ) -> bool:
+        return False
 
     BINARY_NAME = "mock_cli"
 

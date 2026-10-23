@@ -1,26 +1,44 @@
 """Elastic worker provisioning and acknowledged completion tests."""
 
 import asyncio
+import threading
 import time
 from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
 
 from cli_agent_orchestrator.mcp_server import server
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.utils import orchestration
 
+# Remote placement probes the target's /health for ``delegation_ceiling`` and
+# reads this terminal's own recorded ceiling before posting (fail closed on an
+# older node). The shared fixture answers both so these tests stay about elastic
+# provisioning; the probe itself is covered in test_delegation_remote.py.
+pytestmark = pytest.mark.usefixtures("remote_ceiling_ready")
+
 
 def test_assign_elastic_provisions_then_assigns(monkeypatch):
     monkeypatch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker:9890")
     monkeypatch.setenv("CAO_ELASTIC_BROKER_TOKEN", "broker-token")
-    response = Mock()
-    response.raise_for_status.return_value = None
-    response.json.return_value = {
+    monkeypatch.setenv("CAO_ELASTIC_CALLBACK_URL", "http://broker:9890")
+    lease_response = Mock()
+    lease_response.raise_for_status.return_value = None
+    lease_response.json.return_value = {
         "worker_id": "deadbeef",
         "target_host": "cao-worker-deadbeef.ns.svc.cluster.local",
         "working_directory": "/home/cao/workspace/workers/deadbeef",
         "session_name": "cao-worker-deadbeef",
         "release_token": "release-token",
+    }
+    create_response = Mock(status_code=200)
+    create_response.raise_for_status.return_value = None
+    create_response.json.return_value = {
+        "id": "def67890",
+        "session_name": "cao-worker-deadbeef",
+        "model": "model-x",
+        "model_honored": True,
     }
     with (
         patch.object(server, "_current_terminal_id", return_value="abc12345"),
@@ -28,22 +46,36 @@ def test_assign_elastic_provisions_then_assigns(monkeypatch):
         # resolve the caller through THAT module's name. server.py still has its
         # own imported reference, so both need patching.
         patch.object(orchestration, "_current_terminal_id", return_value="abc12345"),
-        patch.object(server.requests, "post", return_value=response),
+        patch.object(server, "_elastic_ready_wait", return_value=0),
         patch.object(
-            server,
-            "_assign_impl",
-            return_value={"success": True, "terminal_id": "def67890"},
-        ) as assign,
+            server.requests,
+            "post",
+            side_effect=[lease_response, create_response],
+        ) as mock_post,
     ):
         result = asyncio.run(server.assign_elastic("developer", "Implement it"))
 
+    assert set(result) == {
+        "success",
+        "terminal_id",
+        "target_host",
+        "message",
+        "session_name",
+        "delete_url",
+        "worker_id",
+        "elastic",
+    }
     assert result["success"] is True
     assert result["worker_id"] == "deadbeef"
     assert result["elastic"] is True
-    assert assign.call_args.args[2].endswith("/deadbeef")
-    assert assign.call_args.kwargs["target_host"].startswith("cao-worker-deadbeef")
-    assert assign.call_args.kwargs["remote_session_name"] == "cao-worker-deadbeef"
-    assert "complete_assignment" in assign.call_args.args[1]
+    assert "model" not in result
+    assert "model_honored" not in result
+    assert result["target_host"].startswith("cao-worker-deadbeef")
+    assert result["session_name"] == "cao-worker-deadbeef"
+    remote_create = mock_post.call_args_list[1]
+    assert remote_create.args[0].endswith("/sessions")
+    assert remote_create.kwargs["params"]["working_directory"].endswith("/deadbeef")
+    assert "complete_assignment" in remote_create.kwargs["json"]["initial_message"]
 
 
 def test_assign_elastic_deferred_failure_reports_terminal_ended(monkeypatch):
@@ -178,10 +210,11 @@ def test_assign_elastic_omits_provider_so_the_broker_default_wins(monkeypatch):
         # own imported reference, so both need patching.
         patch.object(orchestration, "_current_terminal_id", return_value="abc12345"),
         patch.object(server.requests, "post", return_value=_lease_response()) as post,
-        patch.object(server, "_assign_impl", return_value={"success": True}),
+        patch.object(server, "_assign_impl", return_value={"success": True}) as assign,
     ):
-        asyncio.run(server.assign_elastic("developer", "Implement it"))
+        asyncio.run(server.assign_elastic("developer", "Implement it", description="Review code"))
 
+    assert assign.call_args.kwargs["description"] == "Review code"
     assert post.call_args.kwargs["json"] == {
         "agent_profile": "developer",
         "callback_terminal_id": "abc12345",
@@ -441,15 +474,28 @@ def test_assign_elastic_calls_overlap_instead_of_serialising(monkeypatch):
     """Fan-out is the whole point of an elastic fleet.
 
     Both blocking legs (the broker POST and the assignment itself) run off the
-    event loop, so N delegations cost roughly one placement rather than N. With
-    either leg back on the loop this takes ~3x as long, which is what a
-    supervisor delegating five tasks used to pay.
+    event loop via `asyncio.to_thread`. This test guards the longer leg: three
+    concurrent delegations must all be in flight inside `_assign_impl` at once.
+    A three-party barrier proves that directly: it only releases once all three
+    callers have arrived, so a hang
+    (caught by its timeout, below) means the calls serialised instead of
+    overlapping. This replaces an earlier wall-clock assertion
+    (`elapsed < 0.8`) that flaked four times in one day on unrelated PRs
+    (#1003 twice, #999, #1012) at 0.90-0.98s on shared CI runners and passed on
+    every retry -- a timer can't distinguish a slow runner from real
+    serialisation, but a barrier can.
     """
     monkeypatch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker:9890")
     monkeypatch.setenv("CAO_ELASTIC_BROKER_TOKEN", "broker-token")
 
+    barrier = threading.Barrier(3, timeout=5.0)
+    broken = []
+
     def slow_assign(*args, **kwargs):
-        time.sleep(0.3)
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            broken.append(True)
         return {"success": True}
 
     def slow_post(*args, **kwargs):
@@ -470,9 +516,9 @@ def test_assign_elastic_calls_overlap_instead_of_serialising(monkeypatch):
         patch.object(server.requests, "post", side_effect=slow_post),
         patch.object(server, "_assign_impl", side_effect=slow_assign),
     ):
-        started = time.monotonic()
         results = asyncio.run(three())
-        elapsed = time.monotonic() - started
 
     assert all(r["success"] for r in results)
-    assert elapsed < 0.8, f"three delegations took {elapsed:.2f}s; expected ~0.4s"
+    assert (
+        not broken
+    ), "the three delegations did not overlap: _assign_impl was never in flight for all three at once"

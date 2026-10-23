@@ -30,6 +30,63 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------------------
+  # Runs FIRST, in seconds, before either build job spends ~80 minutes compiling wheels.
+  #
+  # WHY: three of the last four release-event runs (v2.5.1, v2.5.2, v2.5.4) failed at the
+  # TestPyPI upload with `400 File already exists`. In every case the tag had been placed on
+  # a commit whose pyproject.toml still carried the PREVIOUS version, so the matrix built
+  # artifacts that were already published and twine named the artifact, not the tag.
+  # `release.yml` (bump, commit, tag) cannot push to `main` under the branch rulesets, so
+  # releases are cut by hand as a `chore: release vX.Y.Z` PR plus a GitHub Release; this job
+  # is what catches the second step happening without the first.
+  #
+  # `GITHUB_REF_NAME` is read from the ENVIRONMENT, not interpolated with `${{ }}` into the
+  # script, so the ref can never be executed as shell (zizmor template-injection). On a
+  # `workflow_dispatch` from a branch there is no tag to compare, so only the
+  # tree-consistency and already-on-the-target-index halves run.
+  # `test/scripts/test_assert_release_version.py` asserts the job exists, that both build
+  # jobs wait on it, which index each step asks, and that the guard FAILS on the v2.5.4 shape.
+  # ---------------------------------------------------------------------------------------
+  verify-release-version:
+    name: Tag matches the packaged version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      # A release uploads to TestPyPI FIRST (publish-testpypi) and PyPI second, and the two
+      # indexes diverge in both directions (2.1.0 and 2.2.0 exist only on TestPyPI, 2.4.1 only
+      # on PyPI), so the question is asked of BOTH: a version on either one is a guaranteed
+      # `400 File already exists` ~80 minutes from now. (Review on PR #947.)
+      - name: Refuse a release tag whose version the tree does not carry, or that an index already has
+        if: github.event_name == 'release'
+        run: >-
+          python scripts/assert_release_version.py --tag "$GITHUB_REF_NAME"
+          --index https://test.pypi.org --index https://pypi.org
+
+      # A manual dispatch uploads to exactly one index, chosen by `inputs.environment`, so
+      # only THAT index is asked: a testpypi dispatch must not be refused on pypi.org state,
+      # and a pypi dispatch must not be passed on test.pypi.org state. The index is selected
+      # in `env:` and read from the environment; nothing from the event reaches `run:`.
+      #
+      # The `pypi` environment is restricted to `v*` tags, so the PyPI escape hatch always
+      # runs on a tag ref; when it does, the tag gets the same comparison a release does.
+      - name: Manual dispatch; check the tree agrees with itself and the target index lacks the version
+        if: github.event_name != 'release'
+        env:
+          TARGET_INDEX: ${{ inputs.environment == 'testpypi' && 'https://test.pypi.org' || 'https://pypi.org' }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            python scripts/assert_release_version.py --tag "$GITHUB_REF_NAME" --index "$TARGET_INDEX"
+          else
+            python scripts/assert_release_version.py --index "$TARGET_INDEX"
+          fi
+
+  # ---------------------------------------------------------------------------------------
   # Per-platform wheels (issue #321, unit `wheel-matrix`). THIS JOB ADDS THIS REPO'S FIRST
   # NON-LINUX RUNNERS — measured before this change: 25 of 25 `runs-on:` were ubuntu-latest.
   #
@@ -42,6 +99,7 @@ jobs:
   # ---------------------------------------------------------------------------------------
   build-wheels:
     name: Wheel (${{ matrix.label }})
+    needs: verify-release-version
     runs-on: ${{ matrix.os }}
     # No job in this repo carried a timeout before (measured: zero `timeout-minutes` across
     # all 8 workflow files). These jobs compile Rust and, on Linux, run a container build —
@@ -145,7 +203,7 @@ jobs:
 
       # The Web UI is built here too so each platform wheel carries it. Without this the
       # web_ui/** artifacts glob resolves empty and hatchling silently omits it (defect D1).
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: '20'
           cache: 'npm'
@@ -188,7 +246,7 @@ jobs:
       # (`[tool.cibuildwheel] test-command`) installs the wheel and RUNS `cao tui`, so a
       # wheel whose binary is missing, non-executable, or built for the wrong architecture
       # fails HERE rather than on an operator's machine (SR-1).
-      - uses: pypa/cibuildwheel@e090b81e30c4d855ea63bf4b6e59204c09a101ae  # v4.2.1
+      - uses: pypa/cibuildwheel@b3395e271a35f73dad77f21802abe9b986dfe299  # v4.3.1
         env:
           CIBW_ARCHS: ${{ matrix.archs }}
           # See `macos-target` in the matrix: this is what keeps delocate from rejecting a
@@ -214,7 +272,7 @@ jobs:
             python scripts/build_tui.py check --wheel "$w" --max-binary-bytes 10485760
           done
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           # Per-platform artifact names, merged by the publish jobs via `pattern:` +
           # `merge-multiple:`. A shared name would make the legs race each other.
@@ -227,12 +285,13 @@ jobs:
   # inside one would be both wrong and unusable on any other platform.
   build-sdist:
     name: Build sdist
+    needs: verify-release-version
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: '20'
           cache: 'npm'
@@ -244,12 +303,12 @@ jobs:
           npm ci
           npm run build
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
 
       - name: Build sdist
         run: uv build --sdist
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: dist-sdist
           path: dist/*.tar.gz
@@ -277,7 +336,7 @@ jobs:
       # UNCHECKED. Worst on `publish-pypi`: a PyPI filename cannot be re-uploaded.
       # Found by the §12a reviewer for `wheel-matrix`. (#321)
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           pattern: dist-*
           merge-multiple: true
@@ -405,7 +464,7 @@ jobs:
       # UNCHECKED. Worst on `publish-pypi`: a PyPI filename cannot be re-uploaded.
       # Found by the §12a reviewer for `wheel-matrix`. (#321)
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           pattern: dist-*
           merge-multiple: true
@@ -457,7 +516,7 @@ jobs:
           fetch-depth: 0
           ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
 
       - name: Install the project
         run: uv sync --locked --all-extras --dev

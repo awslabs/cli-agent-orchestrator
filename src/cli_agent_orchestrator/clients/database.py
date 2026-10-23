@@ -19,10 +19,12 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    func,
     literal_column,
     text,
 )
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
+from sqlalchemy.types import TypeDecorator
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.flow import Flow
@@ -31,6 +33,33 @@ from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 logger = logging.getLogger(__name__)
 
 Base: Any = declarative_base()
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def as_utc(value: Optional[datetime]) -> Optional[datetime]:
+    """Normalize a datetime to UTC, treating naive values as UTC."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+class UTCDateTime(TypeDecorator):
+    """Store naive UTC in SQLite and return aware UTC datetimes."""
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value: Optional[datetime], dialect: Any) -> Optional[datetime]:
+        utc = as_utc(value)
+        return None if utc is None else utc.replace(tzinfo=None)
+
+    def process_result_value(self, value: Optional[datetime], dialect: Any) -> Optional[datetime]:
+        return as_utc(value)
 
 
 class SessionIncarnationModel(Base):
@@ -47,18 +76,101 @@ class SessionIncarnationModel(Base):
     incarnation_id = Column(String, nullable=False)
 
 
+class EphemeralAgentModel(Base):
+    """Server-owned ephemeral registry with guarded lifecycle transitions."""
+
+    __tablename__ = "ephemeral_agents"
+
+    name = Column(String, primary_key=True)
+    owner_kind = Column(String, nullable=False)
+    owner_id = Column(String, nullable=False)
+    session_name = Column(String, nullable=False)
+    state = Column(String, nullable=False)
+    claim_id = Column(String, nullable=True)
+    idempotency_key = Column(String, nullable=True)
+    claim_expires_at = Column(UTCDateTime, nullable=True)
+    launched_terminal_id = Column(String, nullable=True, index=True)
+    bound_at = Column(UTCDateTime, nullable=True)
+    model_tier = Column(String, nullable=True)
+    effort = Column(String, nullable=True)
+    provider = Column(String, nullable=False)
+    effective_tools = Column(Text, nullable=False)
+    created_at = Column(UTCDateTime, nullable=False)
+    expires_at = Column(UTCDateTime, nullable=False)
+    gc_reason = Column(String, nullable=True)
+    spec_sha256 = Column(String, nullable=False)
+    profile_sha256 = Column(String, nullable=False)
+    audit_path = Column(String, nullable=False)
+
+
+def get_ephemeral_agent(name: str) -> Optional[Dict[str, Any]]:
+    """Read registry facts without creating, claiming or modifying a row."""
+    with SessionLocal() as db:
+        row = db.query(EphemeralAgentModel).filter(EphemeralAgentModel.name == name).first()
+        if row is None:
+            return None
+        result = {
+            column.name: getattr(row, column.name)
+            for column in EphemeralAgentModel.__table__.columns
+        }
+        result["effective_tools"] = _json.loads(result["effective_tools"])
+        return result
+
+
+def _is_ephemeral_terminal(db: Any, terminal_id: str) -> bool:
+    """Check registry membership using the caller's existing session."""
+    return (
+        db.query(
+            db.query(EphemeralAgentModel)
+            .filter(EphemeralAgentModel.launched_terminal_id == terminal_id)
+            .exists()
+        ).scalar()
+        is True
+    )
+
+
+def is_ephemeral_terminal(terminal_id: str) -> bool:
+    """Registry membership in ANY state, including gc; lookup errors propagate."""
+    with SessionLocal() as db:
+        return _is_ephemeral_terminal(db, terminal_id)
+
+
+def _ephemeral_terminal_ids(db: Any, terminal_query: Any) -> set[str]:
+    """Batch membership for a terminal selection, without one lookup per row.
+
+    The subquery also avoids SQLite's parameter limit for large terminal lists.
+    State is deliberately unrestricted: a gc row still marks a surviving terminal.
+    """
+    selected_ids = terminal_query.with_entities(TerminalModel.id).order_by(None)
+    return {
+        row[0]
+        for row in db.query(EphemeralAgentModel.launched_terminal_id)
+        .filter(EphemeralAgentModel.launched_terminal_id.in_(selected_ids))
+        .all()
+    }
+
+
 class TerminalModel(Base):
     """SQLAlchemy model for terminal metadata only."""
 
     __tablename__ = "terminals"
 
     id = Column(String, primary_key=True)  # "abc123ef"
+    description = Column(Text, nullable=True)
     tmux_session = Column(String, nullable=False)  # "cao-session-name"
     tmux_window = Column(String, nullable=False)  # a window name, or a pane mark
     provider = Column(String, nullable=False)  # "kiro_cli", "claude_code"
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
+    model = Column(String, nullable=True)  # resolved per-launch model; NULL = provider default
+    model_honored = Column(Boolean, nullable=True)  # NULL = unknown for pre-migration rows
     working_directory = Column(String, nullable=True)  # launch-time cwd (optional)
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
+    # JSON-encoded delegation ceiling: the most this terminal may grant to the
+    # children it creates (utils/delegation.py). Capped by the creator's own
+    # ceiling at creation time and read from THIS ROW when it creates children,
+    # never re-derived from its profile. NULL = pre-migration row, which is
+    # bounded by its own allowed_tools until relaunched.
+    delegate_tools = Column(Text, nullable=True)
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
     engine = Column(String, nullable=True)  # resolved Kiro engine; NULL for legacy/non-Kiro rows
@@ -80,6 +192,12 @@ class TerminalModel(Base):
     # Server-owned durable deferred-init failure. Kept separate from consumer
     # metadata so PATCH /metadata cannot erase or forge lifecycle truth.
     deferred_init_failure_json = Column("deferred_init_failure", Text, nullable=True)
+    # Server-owned durable outcome of the INITIAL message a deferred-init terminal
+    # was created with (PR #566): JSON ``{"state": "pending"|"delivered"|"failed",
+    # "kind": ..., "message": ...}``. Written at creation, settled by the deferred
+    # task, and swept to ``failed``/``interrupted`` on restart so a client that
+    # polls for the outcome is never left waiting on a task that no longer exists.
+    initial_delivery_json = Column("initial_delivery", Text, nullable=True)
     # Creation-time lifecycle ownership for deferred initialization.  True
     # means an external observer (rather than CAO itself) owns final failure
     # settlement, so runtime/lifecycle cleanup may dismantle provider resources
@@ -99,7 +217,7 @@ class TerminalModel(Base):
     # distinguish the old rows from failures that belong to the CURRENT live
     # session. NULL is reserved for rows created before this column existed.
     session_incarnation_id = Column(String, nullable=True)
-    last_active = Column(DateTime, default=datetime.now)
+    last_active = Column(UTCDateTime, default=_utcnow)
 
     # ORDERING CONTRACT: the two session-scoped reads -- ``list_terminals_by_session``
     # and ``list_terminals_in_sessions`` -- order by SQLite's implicit ``rowid``,
@@ -165,11 +283,49 @@ class InboxModel(Base):
     receiver_id = Column(String, nullable=False)
     message = Column(String, nullable=False)
     status = Column(String, nullable=False)  # MessageStatus enum value
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(UTCDateTime, default=_utcnow)
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+class DecisionRecordModel(Base):
+    """Content-free decision records retained independently of terminals."""
+
+    __tablename__ = "decision_records"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
+    contract_version = Column(Integer, default=1, nullable=False)
+    point = Column(String, nullable=False)
+    state = Column(String, nullable=False)
+    decider = Column(String, nullable=True)
+    decider_version = Column(String, nullable=True)
+    kind = Column(String, nullable=False)
+    provider = Column(String, nullable=False)
+    agent_profile = Column(String, nullable=True)
+    fallback_value = Column(String, nullable=True)
+    fallback_source = Column(String, nullable=False)
+    answer = Column(String, nullable=True)
+    probabilities = Column(Text, nullable=True)
+    confidence = Column(Float, nullable=True)
+    candidate_value = Column(String, nullable=True)
+    candidate_model = Column(String, nullable=True)
+    applied_value = Column(String, nullable=True)
+    outcome = Column(String, nullable=False)
+    reason = Column(String, nullable=True)
+    launched_model = Column(String, nullable=True)
+    model_honored = Column(Boolean, nullable=True)
+    latency_ms = Column(Float, nullable=True)
+    decision_status = Column(String, default="done", nullable=False)
+    launch_status = Column(String, default="pending", nullable=False)
+    terminal_id = Column(String, nullable=True)
+    message_hash = Column(String, nullable=True)
+    hash_key_id = Column(String, nullable=True)
+    message_bytes = Column(Integer, nullable=True)
+    __table_args__ = (
+        Index("ix_decision_records_created_at", "created_at"),
+        Index("ix_decision_records_terminal_id", "terminal_id"),
+        Index("ix_decision_records_point_created_at", "point", "created_at"),
+        {"sqlite_autoincrement": True},
+    )
 
 
 class MemoryMetadataModel(Base):
@@ -583,7 +739,7 @@ class IdempotencyKeyModel(Base):
     # from an earlier revision of this branch, whose fix is deleting the file.
     # It is compared like any other value and simply mismatches, loudly.
     request_fingerprint = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(UTCDateTime, default=_utcnow)
 
 
 def _ensure_db_dir() -> None:
@@ -1481,6 +1637,9 @@ def _migrate_workflow_run() -> None:
 
     Issue #753 additively appends nullable ``error`` for the redacted, bounded
     script-level failure diagnostic. Existing and non-script rows remain NULL.
+
+    PR #849 review additively appends nullable ``kind`` for the run-level terminal
+    verdict.  Existing rows keep NULL so cold reads retain the step-derived fallback.
     """
     import sqlite3
 
@@ -1517,6 +1676,15 @@ def _migrate_workflow_run() -> None:
             if "error" not in columns:
                 conn.execute("ALTER TABLE workflow_run ADD COLUMN error TEXT DEFAULT NULL")
                 logger.info("Migration: added error column to workflow_run")
+            if "kind" not in columns:
+                conn.execute("ALTER TABLE workflow_run ADD COLUMN kind TEXT DEFAULT NULL")
+                logger.info("Migration: added kind column to workflow_run")
+            if "caller_id" not in columns:
+                # The terminal that started the run; lets a resumed or recovered
+                # run re-bind to the ORIGINAL caller's delegation ceiling. NULL
+                # for operator-started runs and every pre-existing row.
+                conn.execute("ALTER TABLE workflow_run ADD COLUMN caller_id TEXT DEFAULT NULL")
+                logger.info("Migration: added caller_id column to workflow_run")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run migration skipped: {e}")
 
@@ -1789,6 +1957,10 @@ def _migrate_terminals_schema() -> None:
         conn = sqlite3.connect(str(DATABASE_FILE))
         cursor = conn.execute("PRAGMA table_info(terminals)")
         columns = {row[1] for row in cursor.fetchall()}
+        if "description" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN description TEXT")
+            conn.commit()
+            logger.info("Migration: added description column to terminals table")
         if "allowed_tools" not in columns:
             conn.execute("ALTER TABLE terminals ADD COLUMN allowed_tools TEXT")
             conn.commit()
@@ -1827,6 +1999,10 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN deferred_init_failure TEXT")
             conn.commit()
             logger.info("Migration: added deferred_init_failure column to terminals table")
+        if "initial_delivery" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN initial_delivery TEXT")
+            conn.commit()
+            logger.info("Migration: added initial_delivery column to terminals table")
         if "deferred_init_external_owner" not in columns:
             conn.execute(
                 "ALTER TABLE terminals ADD COLUMN deferred_init_external_owner "
@@ -1847,6 +2023,21 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN session_incarnation_id TEXT")
             conn.commit()
             logger.info("Migration: added session_incarnation_id column to terminals table")
+        if "model" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN model TEXT")
+            conn.commit()
+            logger.info("Migration: added model column to terminals table")
+        if "model_honored" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN model_honored BOOLEAN")
+            conn.commit()
+            logger.info("Migration: added model_honored column to terminals table")
+        if "delegate_tools" not in columns:
+            # Nullable on purpose: rows from before the column have no recorded
+            # ceiling and read back as None, which create_terminal treats as
+            # "bounded by its own allowed_tools" (utils/delegation.ceiling_from_row).
+            conn.execute("ALTER TABLE terminals ADD COLUMN delegate_tools TEXT")
+            conn.commit()
+            logger.info("Migration: added delegate_tools column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -1871,8 +2062,17 @@ def create_terminal(
     idempotency_key: Optional[str] = None,
     request_fingerprint: Optional[str] = None,
     new_session_incarnation: bool = False,
+    model: Optional[str] = None,
+    model_honored: Optional[bool] = None,
+    initial_delivery: Optional[Dict[str, Any]] = None,
+    description: Optional[str] = None,
+    delegate_tools: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
+
+    ``delegate_tools`` is the terminal's delegation ceiling as resolved and
+    capped by ``terminal_service.create_terminal``; it is persisted so children
+    of this terminal are bounded by the stored value rather than by a profile.
 
     ``idempotency_key``, when given, is persisted in the SAME ``SessionLocal``
     session as the terminal row -- one ``commit()``, so SQLite's single-writer
@@ -1912,11 +2112,15 @@ def create_terminal(
             tmux_window=tmux_window,
             provider=provider,
             agent_profile=agent_profile,
+            description=description,
+            model=model,
+            model_honored=model_honored,
             working_directory=working_directory,
             # ``[]`` is an explicit deny-all and must round-trip as ``[]``: a
             # falsiness test stores it as SQL NULL, and every reader treats
             # NULL as "nothing resolved", which is unrestricted.
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools is not None else None,
+            delegate_tools=_json.dumps(delegate_tools) if delegate_tools is not None else None,
             shell_command=shell_command,
             caller_id=caller_id,
             engine=engine,
@@ -1925,6 +2129,7 @@ def create_terminal(
             metadata_json=_json.dumps(metadata) if metadata else None,
             deferred_init_external_owner=bool(deferred_init_external_owner),
             session_incarnation_id=session_incarnation_id,
+            initial_delivery_json=_json.dumps(initial_delivery) if initial_delivery else None,
         )
         db.add(terminal)
         if idempotency_key:
@@ -1948,8 +2153,13 @@ def create_terminal(
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "description": terminal.description,
+            "model": terminal.model,
+            "model_honored": terminal.model_honored,
+            "ephemeral": _is_ephemeral_terminal(db, str(terminal.id)),
             "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
+            "delegate_tools": delegate_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
             "engine": terminal.engine,
@@ -1963,6 +2173,7 @@ def create_terminal(
             "group": group if group else None,
             "metadata": metadata if metadata else None,
             "deferred_init_external_owner": bool(deferred_init_external_owner),
+            "initial_delivery": initial_delivery if initial_delivery else None,
             "deferred_init_runtime_reclaimed": False,
             "session_incarnation_id": session_incarnation_id,
         }
@@ -2048,11 +2259,19 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             f"Retrieved terminal metadata for {terminal_id}: provider={terminal.provider}, session={terminal.tmux_session}"
         )
         allowed_tools = _json.loads(terminal.allowed_tools) if terminal.allowed_tools else None
+        raw_delegate_tools = getattr(terminal, "delegate_tools", None)
+        delegate_tools = (
+            _json.loads(raw_delegate_tools) if isinstance(raw_delegate_tools, str) else None
+        )
         group = _json.loads(terminal.group) if terminal.group else None
         metadata = _json.loads(terminal.metadata_json) if terminal.metadata_json else None
         raw_deferred_failure = getattr(terminal, "deferred_init_failure_json", None)
         deferred_init_failure = (
             _json.loads(raw_deferred_failure) if isinstance(raw_deferred_failure, str) else None
+        )
+        raw_initial_delivery = getattr(terminal, "initial_delivery_json", None)
+        initial_delivery = (
+            _json.loads(raw_initial_delivery) if isinstance(raw_initial_delivery, str) else None
         )
         return {
             "id": terminal.id,
@@ -2060,8 +2279,13 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "description": terminal.description,
+            "model": terminal.model,
+            "model_honored": terminal.model_honored,
+            "ephemeral": _is_ephemeral_terminal(db, str(terminal.id)),
             "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
+            "delegate_tools": delegate_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
             "engine": terminal.engine or ("v2" if terminal.provider == "kiro_cli" else None),
@@ -2069,6 +2293,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "group": group,
             "metadata": metadata,
             "deferred_init_failure": deferred_init_failure,
+            "initial_delivery": initial_delivery,
             "deferred_init_external_owner": bool(
                 getattr(terminal, "deferred_init_external_owner", False)
             ),
@@ -2078,6 +2303,18 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "session_incarnation_id": getattr(terminal, "session_incarnation_id", None),
             "last_active": terminal.last_active,
         }
+
+
+def update_terminal_description(terminal_id: str, description: Optional[str]) -> bool:
+    """Update only the description; clearing it still returns True for an existing row."""
+    with SessionLocal() as db:
+        count = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.id == terminal_id)
+            .update({TerminalModel.description: description})
+        )
+        db.commit()
+        return bool(count)
 
 
 def update_terminal_group(terminal_id: str, group: Optional[List[str]]) -> bool:
@@ -2120,6 +2357,63 @@ def update_terminal_deferred_init_failure(
         terminal.deferred_init_failure_json = _json.dumps(failure) if failure else None
         db.commit()
         return True
+
+
+def update_terminal_initial_delivery(
+    terminal_id: str,
+    delivery: Optional[Dict[str, Any]],
+    *,
+    only_if_pending: bool = False,
+) -> bool:
+    """Replace the server-owned initial-delivery outcome for one terminal.
+
+    ``only_if_pending`` makes the write conditional on the row still reading
+    ``pending`` -- a failure recorded after the task was already confirmed
+    delivered must not rewrite history, and a terminal created without an
+    initial message has nothing to settle. Returns False when the row is gone
+    or the condition did not hold.
+    """
+
+    import json as _json
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return False
+        if only_if_pending:
+            raw = getattr(terminal, "initial_delivery_json", None)
+            current = _json.loads(raw) if isinstance(raw, str) else None
+            if not isinstance(current, dict) or current.get("state") != "pending":
+                return False
+        terminal.initial_delivery_json = _json.dumps(delivery) if delivery else None
+        db.commit()
+        return True
+
+
+def list_pending_initial_delivery_terminal_ids() -> List[str]:
+    """Terminals whose initial message was accepted but never settled.
+
+    After a cao-server restart the deferred task that owned the delivery is
+    gone, so these rows can only be settled by the restart sweep.
+    """
+
+    import json as _json
+
+    with SessionLocal() as db:
+        rows = (
+            db.query(TerminalModel.id, TerminalModel.initial_delivery_json)
+            .filter(TerminalModel.initial_delivery_json.isnot(None))
+            .all()
+        )
+    pending: List[str] = []
+    for terminal_id, raw in rows:
+        try:
+            delivery = _json.loads(raw) if isinstance(raw, str) else None
+        except ValueError:
+            continue
+        if isinstance(delivery, dict) and delivery.get("state") == "pending":
+            pending.append(str(terminal_id))
+    return pending
 
 
 def update_terminal_deferred_init_external_owner(terminal_id: str, owned: bool) -> bool:
@@ -2400,12 +2694,13 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
     cannot quietly change which terminal is the conductor.
     """
     with SessionLocal() as db:
-        terminals = (
+        terminal_query = (
             db.query(TerminalModel)
             .filter(TerminalModel.tmux_session == tmux_session)
             .order_by(literal_column("terminals.rowid"))
-            .all()
         )
+        terminals = terminal_query.all()
+        ephemeral_ids = _ephemeral_terminal_ids(db, terminal_query)
         return [
             {
                 "id": t.id,
@@ -2413,6 +2708,10 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "description": t.description,
+                "model": t.model,
+                "model_honored": t.model_honored,
+                "ephemeral": str(t.id) in ephemeral_ids,
                 "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                 "deferred_init_failure": (
@@ -2435,7 +2734,7 @@ def update_last_active(terminal_id: str) -> bool:
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal:
-            terminal.last_active = datetime.now()
+            terminal.last_active = _utcnow()
             db.commit()
             return True
         return False
@@ -2501,12 +2800,13 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
     if not tmux_sessions:
         return []
     with SessionLocal() as db:
-        terminals = (
+        terminal_query = (
             db.query(TerminalModel)
             .filter(TerminalModel.tmux_session.in_(tmux_sessions))
             .order_by(literal_column("terminals.rowid"))
-            .all()
         )
+        terminals = terminal_query.all()
+        ephemeral_ids = _ephemeral_terminal_ids(db, terminal_query)
         return [
             {
                 "id": t.id,
@@ -2514,6 +2814,10 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "description": t.description,
+                "model": t.model,
+                "model_honored": t.model_honored,
+                "ephemeral": str(t.id) in ephemeral_ids,
                 "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                 "deferred_init_failure": (
@@ -2534,7 +2838,9 @@ def list_terminals_in_sessions(tmux_sessions: List[str]) -> List[Dict[str, Any]]
 def list_all_terminals() -> List[Dict[str, Any]]:
     """List all terminals."""
     with SessionLocal() as db:
-        terminals = db.query(TerminalModel).all()
+        terminal_query = db.query(TerminalModel)
+        terminals = terminal_query.all()
+        ephemeral_ids = _ephemeral_terminal_ids(db, terminal_query)
         return [
             {
                 "id": t.id,
@@ -2542,6 +2848,10 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "description": t.description,
+                "model": t.model,
+                "model_honored": t.model_honored,
+                "ephemeral": str(t.id) in ephemeral_ids,
                 "working_directory": t.working_directory,
                 "engine": t.engine or ("v2" if t.provider == "kiro_cli" else None),
                 "deferred_init_failure": (
@@ -2586,11 +2896,9 @@ def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
     The join on ``terminals`` drops messages whose receiver terminal no longer
     exists, so the sweep does not keep retrying deliveries to deleted agents.
 
-    ``created_at`` is stored local-naive (``InboxModel.created_at`` defaults to
-    ``datetime.now``), so the cutoff uses ``datetime.now()`` to match — the same
-    convention as the retention query in ``cleanup_service.cleanup_old_data``.
+    ``created_at`` is stored in UTC, so the cutoff uses the same clock.
     """
-    cutoff = datetime.now() - timedelta(seconds=min_age_seconds)
+    cutoff = _utcnow() - timedelta(seconds=min_age_seconds)
     with SessionLocal() as db:
         rows = (
             db.query(InboxModel.receiver_id)
@@ -2603,6 +2911,46 @@ def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
             .all()
         )
         return [row[0] for row in rows]
+
+
+def fail_orphaned_pending_messages(min_age_seconds: int) -> List[str]:
+    """Fail PENDING messages whose receiver terminal row is gone (#708).
+
+    The counterpart to the join in ``list_pending_receiver_ids_older_than``:
+    that join drops these rows so the sweep does not retry deliveries to
+    deleted agents, which leaves them claiming PENDING forever with no log
+    line, no state change, and nothing to tell them apart from a message that
+    is about to be delivered. They are not pending -- they are undeliverable,
+    and this says so.
+
+    ``create_inbox_message`` rejects an unknown receiver, and delivery requires
+    a row that ``list_pending_receiver_ids_older_than`` can join to, so a
+    missing receiver row makes the message undeliverable by every path
+    regardless of why the row is gone -- this does not depend on row deletion
+    being race-free. The same ``min_age_seconds`` grace window as the sweep
+    still applies.
+
+    Returns the ids of the messages that were failed, for logging.
+    """
+    cutoff = _utcnow() - timedelta(seconds=min_age_seconds)
+    with SessionLocal() as db:
+        orphaned = (
+            db.query(InboxModel)
+            .outerjoin(TerminalModel, TerminalModel.id == InboxModel.receiver_id)
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.created_at < cutoff,
+                TerminalModel.id.is_(None),
+            )
+            .all()
+        )
+        failed_ids = []
+        for message in orphaned:
+            message.status = MessageStatus.FAILED.value
+            failed_ids.append(str(message.id))
+        if failed_ids:
+            db.commit()
+        return failed_ids
 
 
 def delete_terminal(terminal_id: str) -> bool:
@@ -2672,23 +3020,52 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
         )
 
 
+def get_pending_inbox_counts(receiver_ids: List[str]) -> Dict[str, int]:
+    """Count pending messages grouped by the requested receivers."""
+    if not receiver_ids:
+        return {}
+
+    with SessionLocal() as db:
+        counts = (
+            db.query(InboxModel.receiver_id, func.count(InboxModel.id))
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.receiver_id.in_(receiver_ids),
+            )
+            .group_by(InboxModel.receiver_id)
+            .all()
+        )
+        return {receiver_id: int(count) for receiver_id, count in counts}
+
+
 def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]:
     """Get pending messages ordered by created_at ASC (oldest first)."""
     return get_inbox_messages(receiver_id, limit=limit, status=MessageStatus.PENDING)
 
 
 def get_inbox_messages(
-    receiver_id: str, limit: int = 10, status: Optional[MessageStatus] = None
+    receiver_id: str,
+    limit: int = 10,
+    status: Optional[MessageStatus] = None,
+    sender_id: Optional[str] = None,
+    newest_first: bool = False,
 ) -> List[InboxMessage]:
-    """Get inbox messages with optional status filter ordered by created_at ASC (oldest first).
+    """Get inbox messages with optional status and sender filters.
+
+    Ordered by created_at ascending (oldest first) unless ``newest_first`` is set.
+    ``limit`` is applied after ordering. The defaults match historical callers,
+    including ``get_pending_messages``.
 
     Args:
         receiver_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10)
         status: Optional filter by message status (None = all statuses)
+        sender_id: Optional filter by sender id (None = all senders)
+        newest_first: When True, order by created_at descending so ``limit``
+            keeps the newest messages. Defaults to False.
 
     Returns:
-        List of inbox messages ordered by creation time (oldest first)
+        List of inbox messages ordered by creation time
     """
     with SessionLocal() as db:
         query = db.query(InboxModel).filter(InboxModel.receiver_id == receiver_id)
@@ -2696,7 +3073,13 @@ def get_inbox_messages(
         if status is not None:
             query = query.filter(InboxModel.status == status.value)
 
-        messages = query.order_by(InboxModel.created_at.asc()).limit(limit).all()
+        if sender_id is not None:
+            query = query.filter(InboxModel.sender_id == sender_id)
+
+        created_at_order = (
+            InboxModel.created_at.desc() if newest_first else InboxModel.created_at.asc()
+        )
+        messages = query.order_by(created_at_order).limit(limit).all()
 
         return [
             InboxMessage(

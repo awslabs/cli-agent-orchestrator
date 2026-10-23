@@ -11,6 +11,8 @@ CAO now has two distinct ways for agents to reach each other:
 
 These are genuinely different capabilities with different risk profiles. A profile that should be able to orchestrate workers (topology 1) is not automatically a profile that should be able to see and message arbitrary peers (topology 2), and vice versa. That's the premise behind keeping them separately grantable.
 
+**How the two topologies meet in `send_message`.** The terminal-targeting MCP tools are bound to the caller's place in the assign/handoff tree: a terminal identified by `CAO_TERMINAL_ID` may `delete_terminal` / `answer_user_prompt` itself or a terminal it created, and `send_message` with an explicit `receiver_id` may additionally name the caller's own creator. The peer flow stays available through the `discovery` grant: when the caller's resolved `allowedTools` carries `discovery` (or is unrestricted), `send_message` also accepts any receiver that `GET /terminals/{own}/siblings` returns for the caller, with the widest scope the caller may see (full own group, `cross_session=true`). The check is exact membership at send time, so a terminal that is not a sibling, or has since left the group, is refused. A profile with `@cao-mcp-server` but without `discovery` cannot message peers it cannot discover, which is the separation this document argues for.
+
 ## The opt-in marker
 
 `list_siblings` and `update_metadata` require a new CAO tool-vocabulary token, `discovery`, in the calling terminal's resolved `allowedTools` (or `*`/unrestricted). This is **layered under**, not instead of, the existing `@cao-mcp-server` MCP-server-level gate:

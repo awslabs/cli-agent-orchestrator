@@ -275,3 +275,20 @@ def test_auth_disabled_returns_200(client, monkeypatch, url):
             svc.get_output.return_value = "hello"
             resp = client.get(url)
     assert resp.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "scope,expected", [("cao:read", 403), ("cao:write", 404), ("cao:admin", 404)]
+)
+def test_description_patch_requires_write_scope(client, monkeypatch, rsa_key, scope, expected):
+    _enable_auth(monkeypatch, rsa_key)
+    token = _make_token(rsa_key, _base_claims({"scope": scope}))
+    with patch(
+        "cli_agent_orchestrator.api.main.terminal_service.update_description", return_value=False
+    ):
+        response = client.patch(
+            "/terminals/ffffffff/description",
+            json={"description": None},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert response.status_code == expected

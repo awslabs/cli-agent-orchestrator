@@ -59,6 +59,7 @@ from cli_agent_orchestrator.services.ui_state_service import (
     build_agent_detail_snapshot,
     build_dashboard_snapshot,
 )
+from cli_agent_orchestrator.utils.init_allowance import synchronous_create_timeout
 from cli_agent_orchestrator.utils.orchestration import _mcp_timeout
 
 logger = logging.getLogger(__name__)
@@ -141,19 +142,29 @@ def _extract_error_detail(response: "requests.Response", fallback: str) -> str:
     return detail if isinstance(detail, str) and detail else fallback
 
 
-def _post_json(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+def _post_json(
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    timeout: Optional[Any] = None,
+) -> Any:
     """POST ``{API_BASE_URL}{path}`` with query params and return parsed JSON.
 
     The Backplane mutation endpoints (``/sessions``, ``/terminals/*/input``,
     ``/terminals/*/key``, ``/terminals/*/inbox/messages``) take their arguments as
     query parameters, mirroring how ``mcp_server/server.py`` already calls them.
+
+    ``timeout``: ``None`` (default) uses ``_mcp_timeout()``, right for every
+    mutation the server answers immediately. ``POST /sessions`` is the exception
+    -- it does not answer until ``provider.initialize()`` returns -- and passes
+    ``synchronous_create_timeout`` instead (issue #710).
     """
 
     response = requests.post(
         f"{API_BASE_URL}{path}",
         params={k: v for k, v in (params or {}).items() if v is not None} or None,
         headers=_auth_headers() or None,
-        timeout=_mcp_timeout(),
+        timeout=_mcp_timeout() if timeout is None else timeout,
     )
     response.raise_for_status()
     try:
@@ -402,7 +413,18 @@ def _route_command(kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                 "working_directory": payload.get("working_directory"),
                 "allowed_tools": payload.get("allowed_tools"),
             }
-            result = _post_json("/sessions", params)
+            # This gesture carries no ``initial_message``, and ``POST /sessions``
+            # only defers initialization when one is present -- so the server
+            # holds the response until ``provider.initialize()`` returns. On
+            # ``_mcp_timeout()`` (30s by default, against a 60s-and-up init
+            # budget) a perfectly successful create came back as a transport
+            # timeout while cao-server went on to finish the session, so the
+            # operator saw a failure for a session that exists (issue #710).
+            result = _post_json(
+                "/sessions",
+                params,
+                timeout=synchronous_create_timeout(payload.get("agent_profile")),
+            )
             return {
                 "success": True,
                 "kind": kind,
@@ -491,6 +513,33 @@ def _route_command(kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 # registration
 
 
+def _hide_app_only_tools(mcp: Any, names: frozenset[str]) -> None:
+    """Keep app-only tools out of ``tools/list`` and ``tools/call``.
+
+    FastMCP 3 did this itself. FastMCP 4 lists app-only tools and leaves the
+    filter to the host, but the agent CLIs that load cao-mcp-server do not
+    filter by ``visibility``.
+    """
+
+    add_middleware = getattr(mcp, "add_middleware", None)
+    if not names or not callable(add_middleware):
+        return
+
+    from fastmcp.exceptions import NotFoundError
+    from fastmcp.server.middleware import Middleware
+
+    class _AppOnlyToolFilter(Middleware):
+        async def on_list_tools(self, context: Any, call_next: Any) -> Any:
+            return [tool for tool in await call_next(context) if tool.name not in names]
+
+        async def on_call_tool(self, context: Any, call_next: Any) -> Any:
+            if context.message.name in names:
+                raise NotFoundError(f"Unknown tool: {context.message.name!r}")
+            return await call_next(context)
+
+    add_middleware(_AppOnlyToolFilter())
+
+
 def register_app_tools(mcp: Any) -> bool:
     """Register the five MCP App tools on the FastMCP server.
 
@@ -514,6 +563,8 @@ def register_app_tools(mcp: Any) -> bool:
         logger.info("FastMCP build has no @mcp.tool decorator; skipping app tool registration")
         return False
 
+    app_only: set[str] = set()
+
     def _register(
         fn: Any,
         name: str,
@@ -521,6 +572,8 @@ def register_app_tools(mcp: Any) -> bool:
         resource_uri: Optional[str],
         required_scopes: Optional[List[str]],
     ) -> bool:
+        if "model" not in visibility:
+            app_only.add(name)
         # SEP-1865 shape: visibility + resourceUri live *under* _meta.ui (per the
         # authoritative SEP-1865 spec; see docs/mcp-apps.md).
         meta = ui_meta(
@@ -588,6 +641,7 @@ def register_app_tools(mcp: Any) -> bool:
         render_graph_view, "render_graph_view", ["model", "app"], GRAPH_RESOURCE_URI, None
     )
     ok &= _register(submit_command, "submit_command", ["app"], None, [SCOPE_WRITE, SCOPE_ADMIN])
+    _hide_app_only_tools(mcp, frozenset(app_only))
 
     # Mount the ui://cao/* resources too (best-effort; independent of tool result).
     try:

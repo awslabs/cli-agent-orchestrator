@@ -86,7 +86,7 @@ class TestThePinIsSelfDescribing:
 
         assert recorded == on_disk
 
-    def test_the_pin_states_its_own_policy(self) -> None:
+    def test_the_pin_states_its_own_policy(self, pin: dict) -> None:
         """A pin nobody knows the rules for is a number, not a policy.
 
         The rule this repository follows — pin to the commit
@@ -95,10 +95,13 @@ class TestThePinIsSelfDescribing:
         person to see a drift failure cannot tell whether the correct response is
         to update the pin or to investigate.
         """
-        text = PIN_PATH.read_text(encoding="utf-8")
+        policy = pin["pin_policy"]
 
-        assert "pin_policy" in text
-        assert "agent-plugins.org" in json.loads(text)["pin_policy"]
+        assert isinstance(policy, str)
+        assert policy.strip()
+
+    def test_the_pin_records_the_canonical_schema_source(self, pin: dict) -> None:
+        assert pin["source_base_url"] == f"https://agent-plugins.org/schemas/{pin['version']}/"
 
 
 class TestTheArtifactsAgreeWithEachOther:
@@ -133,9 +136,8 @@ class TestTheArtifactsAgreeWithEachOther:
     ) -> None:
         entry = pin["files"][filename]
 
-        assert entry["url"].endswith(filename)
-        assert entry["schema_id"].endswith(filename)
-        assert entry["url"].startswith(pin["source_base_url"])
+        assert entry["url"] == pin["source_base_url"] + filename
+        assert entry["schema_id"] == entry["url"]
 
     def test_the_vendoring_script_targets_the_directory_the_validator_reads(self) -> None:
         """Script and runtime must mean the same directory.

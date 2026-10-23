@@ -1,18 +1,20 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
 import { useStore } from '../store'
-import { api, TerminalMeta } from '../api'
+import { api, TerminalMeta, sessionDescriptionRevision } from '../api'
 import { Bot, Zap, Package, Monitor, Terminal as TermIcon, Trash2, Mail, FileText, LogOut, Send, ChevronRight, ChevronDown, Users, Filter, ArrowDownUp } from 'lucide-react'
 import { TerminalView } from './TerminalView'
 import { ConfirmModal } from './ConfirmModal'
 import { InboxPanel } from './InboxPanel'
 import { StatusBadge, STATUS_CONFIG } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
+import { AgentDescription } from './AgentDescription'
+import { parseServerTime } from '../time'
 
 const STATUS_ORDER = ['PROCESSING', 'IDLE', 'WAITING_USER_ANSWER', 'ERROR', 'COMPLETED', 'UNKNOWN']
 
 function fmtRel(dateStr: string | null | undefined): string | null {
   if (!dateStr) return null
-  const d = new Date(dateStr)
+  const d = parseServerTime(dateStr)
   if (isNaN(d.getTime())) return null
   const diff = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000))
   if (diff < 60) return 'just now'
@@ -28,7 +30,7 @@ function fmtRel(dateStr: string | null | undefined): string | null {
 
 function fmtAbs(dateStr: string | null | undefined): string | null {
   if (!dateStr) return null
-  const d = new Date(dateStr)
+  const d = parseServerTime(dateStr)
   if (isNaN(d.getTime())) return null
   return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
 }
@@ -74,6 +76,8 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
   const { sessions, terminalStatuses, setTerminalStatus, clearTerminalStatuses, showSnackbar, deleteSession } = useStore()
   const [profileCount, setProfileCount] = useState(0)
   const [sessionData, setSessionData] = useState<SessionWithTerminals[]>([])
+  const sessionDataRef = useRef(sessionData)
+  sessionDataRef.current = sessionData
   const [expandedSessions, setExpandedSessions] = useState<Set<string>>(new Set())
   const [liveTerminal, setLiveTerminal] = useState<{ id: string; provider?: string; agentProfile?: string | null } | null>(null)
   const [pendingClose, setPendingClose] = useState<TerminalMeta | null>(null)
@@ -109,8 +113,8 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
       })
     )
     return filtered.sort((a, b) => {
-      const latestA = Math.max(...a.terminals.map(t => t.last_active ? new Date(t.last_active).getTime() : 0))
-      const latestB = Math.max(...b.terminals.map(t => t.last_active ? new Date(t.last_active).getTime() : 0))
+      const latestA = Math.max(...a.terminals.map(t => t.last_active ? parseServerTime(t.last_active).getTime() : 0))
+      const latestB = Math.max(...b.terminals.map(t => t.last_active ? parseServerTime(t.last_active).getTime() : 0))
       return sortOrder === 'desc' ? latestB - latestA : latestA - latestB
     })
   }, [sessionData, agentTypeFilter, statusFilter, sortOrder, terminalStatuses])
@@ -128,16 +132,18 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
   useEffect(() => {
     const fetchAll = async () => {
       try {
+        const revision = sessionDescriptionRevision
         const sessionDetails = await Promise.all(
           sessions.map(async s => {
             try {
               const detail = await api.getSession(s.name)
               return { name: s.name, status: s.status, terminals: detail.terminals || [] }
             } catch {
-              return { name: s.name, status: s.status, terminals: [] }
+              return sessionDataRef.current.find(session => session.name === s.name) || { name: s.name, status: s.status, terminals: [] }
             }
           })
         )
+        if (revision !== sessionDescriptionRevision) { void fetchAll(); return }
         setSessionData(sessionDetails)
         // Auto-expand only newly seen sessions
         const newNames = sessionDetails.map(s => s.name).filter(n => !seenSessionsRef.current.has(n))
@@ -358,8 +364,8 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
             })
             const statusCounts = getStatusCounts(session.terminals)
             const sortedTerminals = [...visibleTerminals].sort((a, b) => {
-              const ta = a.last_active ? new Date(a.last_active).getTime() : 0
-              const tb = b.last_active ? new Date(b.last_active).getTime() : 0
+              const ta = a.last_active ? parseServerTime(a.last_active).getTime() : 0
+              const tb = b.last_active ? parseServerTime(b.last_active).getTime() : 0
               return sortOrder === 'desc' ? tb - ta : ta - tb
             })
             const grouped: Record<string, TerminalMeta[]> = {}
@@ -377,12 +383,12 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
             const sessionStart = session.terminals.reduce<string | null>((earliest, t) => {
               if (!t.created_at) return earliest
               if (!earliest) return t.created_at
-              return new Date(t.created_at) < new Date(earliest) ? t.created_at : earliest
+              return parseServerTime(t.created_at) < parseServerTime(earliest) ? t.created_at : earliest
             }, null)
             const sessionLastActive = session.terminals.reduce<string | null>((latest, t) => {
               if (!t.last_active) return latest
               if (!latest) return t.last_active
-              return new Date(t.last_active) > new Date(latest) ? t.last_active : latest
+              return parseServerTime(t.last_active) > parseServerTime(latest) ? t.last_active : latest
             }, null)
 
             return (
@@ -433,6 +439,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                             const relCreated = fmtRel(t.created_at)
                             const relActive = fmtRel(t.last_active)
                             const showActive = relActive && relActive !== relCreated
+                            const pendingInboxCount = t.pending_inbox_count ?? 0
                             return (
                               <div key={t.id} className="bg-gray-900/50 border border-gray-700/30 rounded-lg px-3 py-2 space-y-1.5">
                                 <div className="flex items-center justify-between">
@@ -444,13 +451,39 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
                                     <span className="text-[10px] text-gray-600">{t.provider}</span>
                                   </div>
                                   <div className="flex items-center gap-1 shrink-0">
-                                    <button onClick={() => setInboxTerminalId(t.id)} className="p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Inbox"><Mail size={12} /></button>
+                                    <button
+                                      onClick={() => setInboxTerminalId(t.id)}
+                                      className="relative p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors"
+                                      title="Inbox"
+                                      aria-label={pendingInboxCount > 1 ? `Inbox: ${pendingInboxCount} pending messages` : 'Inbox'}
+                                    >
+                                      <Mail size={12} />
+                                      {pendingInboxCount > 1 && (
+                                        <span aria-hidden="true" className="pointer-events-none absolute -top-2.5 -right-1 flex h-4 min-w-4 items-center justify-center whitespace-nowrap rounded-full bg-red-600 px-1 text-[10px] font-semibold leading-none text-white">
+                                          {pendingInboxCount}
+                                        </span>
+                                      )}
+                                    </button>
                                     <button onClick={() => setOutputTerminalId(t.id)} className="p-1 text-gray-500 hover:text-white bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Output"><FileText size={12} /></button>
                                     <button onClick={() => setLiveTerminal({ id: t.id, provider: t.provider, agentProfile: t.agent_profile })} className="flex items-center gap-1 px-2 py-1 bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-medium rounded transition-colors"><Monitor size={12} />Terminal</button>
                                     <button onClick={() => setPendingExit(t)} disabled={exitingTerminal === t.id} className="p-1 text-gray-500 hover:text-amber-400 bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Graceful Exit"><LogOut size={12} /></button>
                                     <button onClick={() => setPendingClose(t)} disabled={closingTerminal === t.id} className="p-1 text-gray-500 hover:text-red-400 bg-gray-800 hover:bg-gray-700 rounded transition-colors" title="Close"><Trash2 size={12} /></button>
                                   </div>
                                 </div>
+                                <AgentDescription id={t.id} description={t.description} onSaved={description => {
+                                  setSessionData(current => current.map(session => ({ ...session,
+                                    terminals: session.terminals.map(terminal => terminal.id === t.id ? { ...terminal, description } : terminal),
+                                  })))
+                                  useStore.setState(state => ({ activeSessionDetail: state.activeSessionDetail ? {
+                                    ...state.activeSessionDetail,
+                                    terminals: state.activeSessionDetail.terminals.map(terminal => terminal.id === t.id ? { ...terminal, description } : terminal),
+                                  } : null }))
+                                  const revision = sessionDescriptionRevision
+                                  void api.getSession(t.tmux_session).then(detail => {
+                                    if (revision !== sessionDescriptionRevision) return
+                                    setSessionData(current => current.map(session => session.name === t.tmux_session ? { ...session, terminals: detail.terminals } : session))
+                                  }).catch(() => {})
+                                }} />
                                 {/* Timestamps */}
                                 <div className="flex items-center gap-3 text-[10px] text-gray-600">
                                   {relCreated && <span title={fmtAbs(t.created_at) || ''}>{relCreated}</span>}
