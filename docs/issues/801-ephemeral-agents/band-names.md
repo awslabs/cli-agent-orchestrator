@@ -4,8 +4,9 @@
 **Related:** [design.md](design.md)
 
 This list supplies the `<Band>` segment of the `<Band>-<purpose>-<hex4>` naming
-format defined in ADR-8 of [design.md](design.md). It replaces the earlier neutral-wordlist
-decision recorded in section 9 (Q6).
+format defined in ADR-8 of [design.md](design.md). It records the shipped E1 list; the proposal in
+[section 9, Q6](design.md#9-proposed-decisions-awaiting-maintainer-confirmation)
+awaits maintainer confirmation. It does not assert maintainer approval.
 
 ## Selection rules
 
@@ -35,14 +36,36 @@ decision recorded in section 9 (Q6).
    - Normalized names are unique case-insensitively.
    - No normalized name equals, case-insensitively, a built-in CAO profile
      name. Checked read-only against:
-     - `git ls-tree --name-only origin/main src/cli_agent_orchestrator/agent_store/` (run against a local clone of the CAO repo)
+     - `git ls-tree --name-only origin/main src/cli_agent_orchestrator/agent_store/` (run against a local clone of the
+       CAO repo)
 4. **Log-safety exclusions.**
-   - Excludes names that read as violence, weapons, disease, drugs, sexual
-     content, or security/malware terms (for example Anthrax, Slayer,
+   - This is a curated judgment rule, not a semantic or malware denylist. It
+     excludes names whose prominent literal reading denotes violence, weapons,
+     disease, drugs or sexual content, or is readily confused with a security alert (for example Anthrax, Slayer,
      Megadeth, Poison, Venom), because these names appear in logs, dashboards
      and alerts, where they can alarm people or trip security tooling.
    - Each exclusion is recorded in the Excluded table below with the rule it
      broke.
+
+### Rule 4: recorded exceptions
+
+The as-built 94-name table is retained to match E1. The following judgment calls
+are explicit exceptions to rule 4, proposed for maintainer confirmation. This
+rule does not promise that no name has any alarming association; changing the
+shipped list belongs in a separate data change with parity tests.
+
+| Included name | Rationale for the recorded exception |
+|---|---|
+| IronMaiden | Established band label despite the torture-device literal reading. |
+| Loverboy | Band label here; acknowledge sexual/trafficking associations rather than claim none. |
+| QuietRiot | Band label with a figurative disturbance term, rather than a direct violent action. |
+| Scorpions | Animal/band label; indirect weapon or security associations do not trigger a universal ban. |
+| Whitesnake | Band label; resemblance to named malware is acknowledged, not silently treated as safe. |
+| TenThousandManiacs | Band label with mental-health/violence adjacency, retained as an explicit exception. |
+
+Excluded Slayer/Megadeth/W.A.S.P./Faster Pussycat/Soft Cell/Suicidal Tendencies
+remain the original curation choices. The difference is editorial judgment, not
+an objective classifier. These exceptions make that limitation reviewable.
 
 ## Included (94 names)
 
@@ -85,7 +108,7 @@ decision recorded in section 9 (Q6).
 | 35 | DuranDuran | Duran Duran | Rio (1982) |
 | 36 | DepecheMode | Depeche Mode | Violator (1990) |
 | 37 | NewOrder | New Order | Power, Corruption & Lies (1983) |
-| 38 | Eurythmics | Eurythmics | Sweet Dreams Are Made of This (1983) |
+| 38 | Eurythmics | Eurythmics | Sweet Dreams (Are Made of This) (1983) |
 | 39 | SimpleMinds | Simple Minds | Once Upon a Time (1985) |
 | 40 | TearsForFears | Tears for Fears | Songs from the Big Chair (1985) |
 | 41 | Yazoo | Yazoo | Upstairs at Eric's (1982) |
@@ -191,6 +214,13 @@ decision recorded in section 9 (Q6).
 
 ## Validation
 
+The manual transcripts below are historical. At the design's 69909e98 pin,
+BAND_NAMES matches all 94 included entries. Existing E1 tests cover count,
+case-insensitive uniqueness, reserved-name composition and collision retry.
+A committed direct band-regex/built-in-clash/document-parity test remains an E3
+follow-up; manual validation here is not CI coverage.
+
+
 Commands run against the included table's normalized-name column (94 rows),
 from a scratch file under a single `mktemp -d` directory (removed after use).
 
@@ -210,7 +240,8 @@ $ cut -f1 candidates.tsv | sort -f | uniq -di
 (no output)
 ```
 
-**3. No clash with built-in profile names** (checked case-insensitively against `src/cli_agent_orchestrator/agent_store/`; no output means no clash):
+**3. No clash with built-in profile names** (checked case-insensitively against
+`src/cli_agent_orchestrator/agent_store/` ; no output means no clash):
 
 ```
 $ git ls-tree --name-only origin/main src/cli_agent_orchestrator/agent_store/
