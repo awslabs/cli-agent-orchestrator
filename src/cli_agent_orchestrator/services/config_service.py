@@ -62,8 +62,15 @@ class ServerConfig(BaseModel):
     startup_prompt_handler_timeout: int = 20
 
 
+class LifecycleConfig(BaseModel):
+    enabled: bool = False
+
+
 class MemoryConfig(BaseModel):
     enabled: bool = True
+    explain_enabled: bool = True
+    non_accessing_inspection: bool = False
+    lifecycle: LifecycleConfig = Field(default_factory=LifecycleConfig)
     compile_mode: str = "llm"
     flush_threshold: float = 0.85
     compile_timeout_s: float = 120.0
@@ -194,6 +201,9 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_WS_ALLOWED_CLIENTS": ("network.ws_allowed_clients", "list", []),
     "CAO_WS_ALLOWED_ORIGINS": ("network.ws_allowed_origins", "list", []),
     "CAO_MEMORY_ENABLED": ("memory.enabled", "bool", True),
+    "CAO_MEMORY_EXPLAIN_ENABLED": ("memory.explain_enabled", "bool", True),
+    "CAO_MEMORY_NON_ACCESSING_INSPECTION": ("memory.non_accessing_inspection", "bool", False),
+    "CAO_MEMORY_LIFECYCLE_ENABLED": ("memory.lifecycle.enabled", "bool", False),
     "CAO_MEMORY_LINT_ENABLED": ("memory.lint_enabled", "bool", True),
     "CAO_MEMORY_COMPILE_MODE": ("memory.compile_mode", "str", "llm"),
     "CAO_MEMORY_FLUSH_THRESHOLD": ("memory.flush_threshold", "float", 0.85),
@@ -433,6 +443,8 @@ def _get_owned_section(path: str, default: Any) -> Any:
     if section == "server":
         return settings_service.get_server_settings().get(key, default)
     if section == "memory":
+        if key == "lifecycle.enabled":
+            return settings_service.is_memory_lifecycle_enabled()
         if key == "enabled":
             return settings_service.is_memory_enabled()
         if key == "lint_enabled":
@@ -458,6 +470,20 @@ def _get_value(path: str, default: Any = None, override: Optional[Any] = None) -
     """
     if override is not None:
         return override
+
+    if path in {
+        "memory.explain_enabled",
+        "memory.non_accessing_inspection",
+        "memory.lifecycle.enabled",
+    }:
+        from cli_agent_orchestrator.services import settings_service
+
+        helpers = {
+            "memory.explain_enabled": settings_service.is_memory_explain_enabled,
+            "memory.non_accessing_inspection": settings_service.is_non_accessing_inspection_enabled,
+            "memory.lifecycle.enabled": settings_service.is_memory_lifecycle_enabled,
+        }
+        return helpers[path]()
 
     if path == "memory.lint_enabled":
         from cli_agent_orchestrator.services import settings_service
@@ -618,6 +644,8 @@ class ConfigService:
     @staticmethod
     def get_config() -> CAOConfig:
         """Assemble and validate the full typed config from resolved values."""
+        from cli_agent_orchestrator.services import settings_service
+
         return CAOConfig(
             agents=AgentsConfig(
                 dirs=_get_value("agents.dirs", default={}),
@@ -638,6 +666,9 @@ class ConfigService:
             ),
             memory=MemoryConfig(
                 enabled=_get_value("memory.enabled", default=True),
+                explain_enabled=settings_service.is_memory_explain_enabled(),
+                non_accessing_inspection=settings_service.is_non_accessing_inspection_enabled(),
+                lifecycle=LifecycleConfig(enabled=settings_service.is_memory_lifecycle_enabled()),
                 lint_enabled=_get_value("memory.lint_enabled", default=True),
                 compile_mode=_get_value("memory.compile_mode", default="llm"),
                 flush_threshold=_get_value("memory.flush_threshold", default=0.85),

@@ -70,6 +70,7 @@ from cli_agent_orchestrator.constants import (
     CORS_ORIGINS,
     DEFAULT_PROVIDER,
     HANDOFF_RESULTS_ROUTE,
+    INBOX_IMMEDIATE_DELIVERY_WAIT,
     INBOX_POLLING_INTERVAL,
     INBOX_RECONCILE_INTERVAL,
     MODEL_ID_MAX_LEN,
@@ -1817,6 +1818,8 @@ async def health_check():
     def _probe(binary: str) -> str:
         return "ok" if shutil.which(binary) else "unavailable"
 
+    from cli_agent_orchestrator.services.settings_service import get_server_settings
+
     backend = get_backend()
     backend_name = "herdr" if isinstance(backend, HerdrBackend) else "tmux"
 
@@ -1824,6 +1827,11 @@ async def health_check():
         "status": "ok",
         "service": "cli-agent-orchestrator",
         "terminal_backend": backend_name,
+        # The init budget THIS server applies (issue #710). Clients size their
+        # wait for a synchronous create from their own settings, so an operator
+        # can compare the two here when the client runs with a different
+        # environment or on another host.
+        "provider_init_timeout": int(get_server_settings()["provider_init_timeout"]),
         "components": {
             "cao": "ok",
             "herdr": _probe("herdr"),
@@ -8042,15 +8050,48 @@ async def create_inbox_message_endpoint(
 
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.
-    try:
-        # deliver_pending reads status_monitor.get_status() (which can fork a tmux
-        # capture-pane via the stale-PROCESSING fallback) and, on delivery, paste-bombs
-        # the pane — blocking I/O either way, so keep it off the event loop.
-        await asyncio.to_thread(
-            inbox_service.deliver_pending, receiver_id, registry=get_plugin_registry(request)
+    #
+    # deliver_pending reads status_monitor.get_status() (which can fork a tmux
+    # capture-pane via the stale-PROCESSING fallback), paste-bombs the pane on
+    # delivery, and then waits for the receiver to confirm the submit (#78) --
+    # blocking I/O throughout, so it runs on a worker thread. The response does
+    # NOT wait for that confirmation: the message is stored, so a reply of
+    # success is already true, and a sender held past its own HTTP timeout
+    # (30s default) would be tempted to send the message again (PR #1004
+    # review, P2-2). We wait only until the paste has reached the pane, and
+    # only up to INBOX_IMMEDIATE_DELIVERY_WAIT; the attempt itself keeps running
+    # in the background either way.
+    loop = asyncio.get_running_loop()
+    dispatched = asyncio.Event()
+
+    def _mark_dispatched() -> None:
+        loop.call_soon_threadsafe(dispatched.set)
+
+    delivery = asyncio.create_task(
+        asyncio.to_thread(
+            inbox_service.deliver_pending,
+            receiver_id,
+            registry=get_plugin_registry(request),
+            after_dispatch=_mark_dispatched,
         )
-    except Exception as e:
-        logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
+    )
+
+    def _log_outcome(task: "asyncio.Task[None]") -> None:
+        if not task.cancelled() and task.exception() is not None:
+            logger.warning(
+                f"Immediate delivery attempt failed for {receiver_id}: {task.exception()}"
+            )
+
+    delivery.add_done_callback(_log_outcome)
+    try:
+        await asyncio.wait_for(dispatched.wait(), timeout=INBOX_IMMEDIATE_DELIVERY_WAIT)
+    except asyncio.TimeoutError:
+        logger.debug(
+            "Immediate delivery attempt for %s still waiting after %ss; answering "
+            "while it continues in the background",
+            receiver_id,
+            INBOX_IMMEDIATE_DELIVERY_WAIT,
+        )
 
     return {
         "success": True,
@@ -8068,6 +8109,13 @@ async def get_inbox_messages_endpoint(
     status_param: Optional[str] = Query(
         default=None, alias="status", description="Filter by message status"
     ),
+    order: str = Query(
+        default="asc",
+        description="Order by created_at: asc (oldest first) or desc (newest first)",
+    ),
+    sender_id: Optional[str] = Query(
+        default=None, description="Return only messages from this sender"
+    ),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[Dict]:
     """Get inbox messages for a terminal.
@@ -8076,6 +8124,8 @@ async def get_inbox_messages_endpoint(
         terminal_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10, max: 100)
         status_param: Optional filter by message status ('pending', 'delivered', 'failed')
+        order: Sort by created_at, 'asc' (default, oldest first) or 'desc' (newest first)
+        sender_id: Optional filter returning only messages from this sender
 
     Returns:
         List of inbox messages with sender_id, message, created_at, status
@@ -8092,8 +8142,21 @@ async def get_inbox_messages_endpoint(
                     detail=f"Invalid status: {status_param}. Valid values: pending, delivered, failed",
                 )
 
-        # Get messages using existing database function
-        messages = get_inbox_messages(terminal_id, limit=limit, status=status_filter)
+        if order not in ("asc", "desc"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid order: {order}. Valid values: asc, desc",
+            )
+
+        # Get messages using existing database function. ``limit`` applies after
+        # ordering, so ``order=desc`` with a small limit returns the newest rows.
+        messages = get_inbox_messages(
+            terminal_id,
+            limit=limit,
+            status=status_filter,
+            sender_id=sender_id,
+            newest_first=order == "desc",
+        )
 
         # Convert to response format
         result = []
@@ -8672,7 +8735,19 @@ async def internal_memory_recall(
         sort_by=body.sort_by,
         include_related=body.include_related,
     )
-    return {"memories": [memory.model_dump(mode="json") for memory in memories]}
+    return {
+        "memories": [
+            {
+                **memory.model_dump(mode="json"),
+                **(
+                    {"lifecycle_status": memory.lifecycle_status}
+                    if memory.lifecycle_status is not None
+                    else {}
+                ),
+            }
+            for memory in memories
+        ]
+    }
 
 
 @app.post("/internal/memory/forget")
@@ -8809,6 +8884,8 @@ async def list_memories_endpoint(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[MemorySummary]:
     """List stored memories across all projects (mirrors `cao memory list --all`)."""
+    from cli_agent_orchestrator.services.settings_service import is_non_accessing_inspection_enabled
+
     _require_memory_enabled()
     svc = _get_memory_service()
     try:
@@ -8821,6 +8898,7 @@ async def list_memories_endpoint(
             limit=1000,
             scan_all=True,
             search_mode="metadata",
+            record_access=not is_non_accessing_inspection_enabled(),
         )
         if scope_id is not None:
             memories = [m for m in memories if _memory_matches_scope_id(m, scope_id, svc.base_dir)]
@@ -9100,6 +9178,8 @@ async def get_memory_endpoint(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> MemoryDetail:
     """Show a memory by key (mirrors `cao memory show`; first match wins)."""
+    from cli_agent_orchestrator.services.settings_service import is_non_accessing_inspection_enabled
+
     _require_memory_enabled()
     svc = _get_memory_service()
     try:
@@ -9109,6 +9189,7 @@ async def get_memory_endpoint(
             limit=1000,
             scan_all=True,
             search_mode="metadata",
+            record_access=not is_non_accessing_inspection_enabled(),
         )
         for mem in memories:
             if mem.key != key:
