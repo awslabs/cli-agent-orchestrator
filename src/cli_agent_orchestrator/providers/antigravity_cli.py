@@ -79,6 +79,16 @@ logger = logging.getLogger(__name__)
 # registered (or unregistered) server.
 _MCP_CONFIG_WRITE_LOCK = threading.Lock()
 
+# The successful-init shape of ``initialize``: a shell wait of
+# ``SHELL_WAIT_TIMEOUT_S``, then a startup-dialog phase and a readiness phase
+# each capped at ``max(READY_TIMEOUT_FLOOR_S, provider_init_timeout)``. A
+# CLIENT prices its wait for a synchronous create from these
+# (``utils.init_allowance``, issue #710), so they are module constants here,
+# next to the code that spends them, rather than a copy over there that a
+# change here would silently leave short.
+SHELL_WAIT_TIMEOUT_S = 10.0
+READY_TIMEOUT_FLOOR_S = 180.0
+
 # Field CAO adds to every entry it manages in agy's shared mcp_config.json:
 # the terminal ids currently using that entry. One entry serves every
 # terminal whose profile declares the same server config, so it is removed
