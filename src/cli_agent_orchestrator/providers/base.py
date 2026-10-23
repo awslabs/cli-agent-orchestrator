@@ -243,6 +243,19 @@ class BaseProvider(ABC):
     # this False — their COMPLETED/IDLE split is not screen-detectable.
     supports_direct_status_probe: bool = False
 
+    # Whether the direct probe's COMPLETED verdict identifies WHICH turn
+    # completed. A rendered pane keeps the previous turn's completion marker on
+    # screen, so a probe that only pattern-matches the marker reports COMPLETED
+    # for a receiver that never accepted the new paste. The deferred-init path
+    # never hits this (a fresh worker has no earlier turn on screen); the inbox
+    # path always can, so it treats a probe COMPLETED as evidence only when the
+    # provider sets this True -- i.e. its detector binds the completion to the
+    # dispatched turn (minimax_code: completion identity + buffer epoch). With
+    # it False the inbox path accepts only live verdicts (PROCESSING,
+    # WAITING_USER_ANSWER) from the probe. Meaningless unless
+    # ``supports_direct_status_probe`` is also True.
+    direct_status_probe_has_turn_identity: bool = False
+
     # Opt-in only for StatusMonitor's quiet stale-PROCESSING capture-pane
     # recovery. This is intentionally distinct from
     # ``supports_direct_status_probe``: the latter also certifies deferred-init
