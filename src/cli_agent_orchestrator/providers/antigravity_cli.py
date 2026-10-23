@@ -778,8 +778,10 @@ class AntigravityCliProvider(BaseProvider):
         (see its docstring): so nothing in initialize() blocks the shared
         event loop under concurrent session creation.
         """
-        if not await wait_for_shell(self.terminal_id, timeout=10.0):
-            raise TimeoutError("Shell initialization timed out after 10 seconds")
+        if not await wait_for_shell(self.terminal_id, timeout=SHELL_WAIT_TIMEOUT_S):
+            raise TimeoutError(
+                f"Shell initialization timed out after {SHELL_WAIT_TIMEOUT_S:g} seconds"
+            )
 
         command = await asyncio.to_thread(self._build_agy_command)
 
@@ -800,7 +802,7 @@ class AntigravityCliProvider(BaseProvider):
         # _build_agy_command above already raised its own ProviderError on a
         # genuine load failure before this point.
         init_timeout = self.get_init_timeout(self._try_load_profile())
-        default_ready_timeout = 180.0
+        default_ready_timeout = READY_TIMEOUT_FLOOR_S
 
         # Accept the workspace-trust dialog if agy shows one (first launch in an
         # untrusted cwd). Unanswered it blocks init — the picker never reads IDLE.

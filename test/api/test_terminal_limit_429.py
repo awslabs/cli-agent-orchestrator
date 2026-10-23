@@ -23,7 +23,11 @@ class TestTerminalLimitMapsTo429:
             mock_svc.create_session = AsyncMock(side_effect=_LIMIT_ERROR)
             response = client.post(
                 "/sessions",
-                params={"provider": "kiro_cli", "agent_profile": "developer"},
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "caller_id": "dcba8765",
+                },
             )
         assert response.status_code == 429
         assert "Terminal limit reached" in response.json()["detail"]
@@ -33,7 +37,11 @@ class TestTerminalLimitMapsTo429:
             mock_svc.create_terminal = AsyncMock(side_effect=_LIMIT_ERROR)
             response = client.post(
                 "/sessions/cao-test/terminals",
-                params={"provider": "kiro_cli", "agent_profile": "developer"},
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "caller_id": "dcba8765",
+                },
             )
         assert response.status_code == 429
         assert "Terminal limit reached" in response.json()["detail"]

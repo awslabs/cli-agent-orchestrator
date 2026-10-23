@@ -44,6 +44,22 @@ from cli_agent_orchestrator.constants import (
 from cli_agent_orchestrator.utils import api_http
 from cli_agent_orchestrator.utils.workflow_events import SseFrame, parse_sse_frames
 
+
+def _attach_terminal_caller(payload: dict) -> None:
+    """Name the calling terminal on a workflow request when the CLI runs inside one.
+
+    An agent may run ``cao workflow run`` from its shell instead of the MCP tool;
+    with ``CAO_TERMINAL_ID`` set the server bounds every step the run creates by
+    that terminal's recorded delegation ceiling (``RunRecord.caller_id``,
+    ``utils/delegation.py``), the same as the MCP ``workflow_run`` tool. An
+    operator shell (no id) sends nothing and the request is byte-identical to
+    before.
+    """
+    caller = os.environ.get("CAO_TERMINAL_ID")
+    if caller:
+        payload["caller_id"] = caller
+
+
 # Whole-run states that end the follow/poll loop (mirror ``RunState``'s terminal
 # members without importing the engine model — C-2 keeps this a thin HTTP client).
 _TERMINAL_RUN_STATES = frozenset({"completed", "failed", "cancelled"})
@@ -983,6 +999,7 @@ def run_cmd(name_or_path, inputs, run_id, working_directory, detach, wait, as_js
     }
     if run_id is not None:
         payload["run_id"] = run_id
+    _attach_terminal_caller(payload)
 
     # --- --wait: the retained blocking path (VR-2, FR-4.5). ------------------
     # ``--wait`` blocks on the server inline until the whole workflow finishes, so
@@ -1313,9 +1330,11 @@ def resume_cmd(run_id, decide, as_json):
         # worst-case-covering run timeout, not the flat MCP_REQUEST_TIMEOUT.
         # ``json=None`` sends NO body, so a decision-free resume is byte-identical to
         # the pre-#583 request.
+        resume_body = {"decisions": decisions} if decisions else {}
+        _attach_terminal_caller(resume_body)
         response = api_http.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/resume",
-            json={"decisions": decisions} if decisions else None,
+            json=resume_body or None,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
         )
     except api_http.AuthNotConfiguredError as exc:
@@ -1435,6 +1454,7 @@ def step_cmd(run_id, step_id, prompt_file, prompt_override, as_json):
     payload = {}
     if prompt_override is not None:
         payload["prompt_override"] = prompt_override
+    _attach_terminal_caller(payload)
 
     try:
         # A single step still runs an agent inline on the server, so this is a

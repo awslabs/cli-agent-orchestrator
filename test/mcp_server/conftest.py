@@ -13,14 +13,61 @@ applies to the response. It also records every request, so a test can assert on
 what did NOT travel — no cwd, no scope_id, no forged identity.
 
 Generalized from the single-endpoint pattern in ``test_handoff_equivalence.py``.
+
+``remote_ceiling_ready`` is the other shared seam: every remote placement first
+proves the target node enforces delegation ceilings, so any test that places
+work with ``target_host`` has to say what that probe answers.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+from unittest.mock import patch
 
 import pytest
+
+_ORCHESTRATION = "cli_agent_orchestrator.utils.orchestration"
+
+
+@pytest.fixture
+def remote_ceiling_ready():
+    """The remote node enforces delegation ceilings and this terminal's is ``*``.
+
+    Remote placement refuses to post unless it can confirm the target advertises
+    the ``delegation_ceiling`` feature on ``/health``, and it needs this
+    terminal's own recorded ceiling to send as ``caller_ceiling``. Both reads are
+    HTTP, so a test about placement, provisioning or message text would otherwise
+    fail closed against the real network on an unresolvable test hostname.
+
+    Use it wherever the ceiling is not the subject:
+    ``pytestmark = pytest.mark.usefixtures("remote_ceiling_ready")``. The probe
+    and the fail-closed refusals it raises are covered on their own in
+    ``test_delegation_remote.py``.
+
+    The third patch is the guard that keeps the first two honest. Stubbing a
+    named seam only suppresses the network while that seam is still the one
+    doing the GET; if production later renames it, inlines it, or grows a second
+    probe, the stubs become silent no-ops and these tests go back to the wire.
+    So the underlying ``requests.get`` is made to raise instead of being left
+    live. A test that means to serve a GET patches it itself, which takes
+    precedence over this fixture for the duration of that test.
+    """
+    with (
+        patch(f"{_ORCHESTRATION}._require_remote_delegation_ceiling", return_value=None),
+        patch(f"{_ORCHESTRATION}._own_delegation_ceiling", return_value=["*"]),
+        patch(
+            f"{_ORCHESTRATION}.requests.get",
+            side_effect=AssertionError(
+                "remote_ceiling_ready: orchestration made an unstubbed requests.get "
+                "call. The delegation-ceiling probe is meant to be stubbed out "
+                "here; a real GET means the production path no longer goes through "
+                "_require_remote_delegation_ceiling / _own_delegation_ceiling, or "
+                "this test needs to patch requests.get itself."
+            ),
+        ),
+    ):
+        yield
 
 
 @dataclass
