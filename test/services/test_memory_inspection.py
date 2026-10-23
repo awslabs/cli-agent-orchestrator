@@ -1,12 +1,13 @@
 """Operator inspection leaves reinforcement/promotion counters alone when opted in."""
 
 from datetime import datetime, timedelta, timezone
-from test.services.test_scoring import (  # noqa: F401  # pytest fixtures, injected by name
+
+from test.services.test_scoring import (  # isort: skip  (per-name noqa below; see the comment)
     _ctx,
     _row,
     _run,
-    db_engine,
-    svc,
+    db_engine,  # noqa: F401  # pytest fixture, injected by name
+    svc,  # noqa: F401  # pytest fixture, injected by name
 )
 
 import pytest
