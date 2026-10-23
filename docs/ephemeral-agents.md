@@ -162,7 +162,7 @@ marked ephemeral and the existing delegation denial stays effective.
 > 1. **Enforcement on every provider.** On Claude Code the native-tool ceiling is Hard. On Codex, an operator opt-in, `tools` is advisory: the child runs `--yolo` with a shell, and the MCP servers in the user's `~/.codex/config.toml` load. Kiro is unsupported until the deferred Kiro slice lands.
 > 2. **Per-tool MCP limits.** `@cao-mcp-server` is a server-level grant. A child can still message, answer or delete other terminals, and use every CAO tool that is not a delegation (#671).
 > 3. **A privilege boundary.** A child with `execute_bash` or `fs_write` runs as the same OS user. It can call the local HTTP API directly with a `caller_id` it supplies itself, edit `settings.json`, or read `ephemeral/live/`.
-> 4. **Intersection for installed profiles** (#671).
+> 4. **Per-tool MCP enforcement for installed profiles** (#671). Installed profiles ARE now bounded by their creator's recorded delegation ceiling through the same comparison (see [tool-restrictions.md](tool-restrictions.md#cross-provider-inheritance)); the remaining gap is the server-level `@cao-mcp-server` grant above.
 
 These guarantees apply to creator-owned launches through `assign`, `handoff`, and the
 HTTP API. Ephemeral creation by an ephemeral caller always refuses.

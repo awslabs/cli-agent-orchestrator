@@ -105,6 +105,9 @@ _UNSCOPED_DOCS = [
     "kiro-cli.md",
     "claude-code.md",
     "copilot-cli.md",
+    # PR #1000 (#827): "What an approval does not cover" names agent-plugin MCP
+    # delivery as a launch input outside plan_id. CAO's own noun, qualified.
+    "workflows.md",
 ]
 
 #: Docs whose H1 scopes the noun ("# Event Plugins", "# Agent Plugins"), so bare

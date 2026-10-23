@@ -47,6 +47,30 @@ async def test_provider_start_failure_binds_launch_failed(terminal_path):
 
 
 @pytest.mark.asyncio
+async def test_ceiling_refusal_binds_not_launched(terminal_path):
+    """A #948 refusal is decided but never launched, so it is not a launch failure."""
+    from cli_agent_orchestrator.constants import CALLBACK_TERMINAL_ID_ENV
+    from cli_agent_orchestrator.utils.delegation import DelegationCeilingError
+
+    service, engine, req, provider, backend, providers, store, events = terminal_path
+    plan = await engine.prepare_launch(req)
+    # A remote-placement marker without caller_ceiling is refused in Step 0c, before any lookup.
+    with pytest.raises(DelegationCeilingError):
+        await service.create_terminal(
+            "codex",
+            "developer",
+            new_session=True,
+            launch_plan=plan,
+            env_vars={CALLBACK_TERMINAL_ID_ENV: "0000feed"},
+        )
+    row = store.list()[0]
+    assert row["launch_status"] == "not_launched" and row["terminal_id"] is None
+    providers.create_provider.assert_not_called()
+    engine.bind_launch(plan, launch_status="launch_failed")  # a later bind cannot rewrite it
+    assert store.list()[0]["launch_status"] == "not_launched" and len(events) == 1
+
+
+@pytest.mark.asyncio
 async def test_deferred_failure_updates_bound_record_once(terminal_path, monkeypatch):
     service, engine, req, provider, backend, providers, store, events = terminal_path
     plan = await engine.prepare_launch(req)

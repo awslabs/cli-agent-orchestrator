@@ -169,6 +169,7 @@ def test_default_runtime_guard_detects_swallowed_store_access(tmp_path):
                 "env_vars",
                 "group",
                 "metadata",
+                "caller_ceiling",
             ],
         ),
         (
@@ -185,6 +186,7 @@ def test_default_runtime_guard_detects_swallowed_store_access(tmp_path):
                 "working_directory",
                 "caller_id",
                 "allowed_tools",
+                "caller_ceiling",
                 "use_worktree",
                 "env_vars",
                 "model",

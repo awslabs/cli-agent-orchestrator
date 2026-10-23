@@ -178,7 +178,9 @@ def test_loader_keeps_warnings_and_env_gate_after_canonicalisation(tmp_path, mon
     config = settings_service.get_vault_config()
 
     assert config.enabled is False
-    assert config.warnings == ("mapping 'Projects' has secret_gate='warn' with inject=true",)
+    # The warn+inject load warning retired with #644: the loader still surfaces
+    # ``warnings`` as a channel after canonicalisation, and it is empty here.
+    assert config.warnings == ()
     assert config.vaults[0].mappings[1].scope_id == "canonical-project"
 
 

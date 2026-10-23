@@ -37,7 +37,7 @@ GOLDEN_RESULTS = {
     },
 }
 
-# Agent tool definitions captured from main 11f164da (#942 descriptions);
+# Agent tool definitions captured from pinned main 69909e98;
 # Output models include main's optional ephemeral refusal rule (#905).
-TOOL_DEFINITIONS_SHA256 = "4e6c7593f8fb6f83a7e636e57966a6b98928276611e445dcc794ee67cf439501"
+TOOL_DEFINITIONS_SHA256 = "c0ef6340499283a7adb76c07be3ab29b608670a65f8ade65b3db16b0975d94ea"
 TOOL_MODELS_SHA256 = "c2611fc69ad1a6835369af9c43f6c40289561ec53c39f9cfea369e9f12973a73"

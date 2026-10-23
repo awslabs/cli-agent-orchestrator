@@ -28,7 +28,7 @@ import re
 import time
 import uuid
 from collections.abc import Mapping
-from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple, Union
 
 import requests
 
@@ -50,7 +50,15 @@ from cli_agent_orchestrator.services.elastic_worker_gateway import (
 )
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
+from cli_agent_orchestrator.utils.delegation import (
+    REMOTE_FEATURE,
+    DelegationCeilingError,
+    ceiling_from_row,
+    describe_rejection,
+    tools_exceeding,
+)
 from cli_agent_orchestrator.utils.description import normalize_description
+from cli_agent_orchestrator.utils.init_allowance import synchronous_create_timeout
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_session_name_for_key,
@@ -120,18 +128,94 @@ def _auth_headers_for(base_url: str) -> Dict[str, str]:
 # supervisor LLM remembering to hand-write its terminal ID into the message.
 ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "true").lower() == "true"
 
+# The two sender-ID suffixes. They are composed ONLY through
+# ``append_sender_suffix`` so the structured-prompt guard below applies to
+# every call site (test_sender_suffix_structured_prompt.py enforces this).
+ASSIGN_SUFFIX_TEMPLATE = (
+    "[Assigned by terminal {terminal_id}. "
+    "When done, send results back to terminal {terminal_id} using send_message]"
+)
+MESSAGE_SUFFIX_TEMPLATE = (
+    "[Message from terminal {terminal_id}. Use send_message MCP tool for any follow-up work.]"
+)
+
+# Providers whose CLI dispatches an input whose first character is ``@`` as a
+# structured prompt invocation rather than prose. This is a property of the
+# RECEIVING terminal's CLI, not of the text: Claude Code, Codex, Gemini,
+# Copilot CLI and OpenCode read a leading ``@path`` as a file mention inside
+# ordinary prose and need the callback suffix exactly as much as any other
+# task (review on PR #1028). Only kiro-cli has the no-terminator grammar
+# described in ``is_structured_prompt_invocation``.
+STRUCTURED_PROMPT_PROVIDERS = frozenset({ProviderType.KIRO_CLI.value})
+
+# A deferred provider lookup. The receiver's provider often costs an HTTP GET
+# (the worker row, the remote profile store); passing a resolver instead of a
+# string lets ``append_sender_suffix`` pay that only for ``@``-leading
+# messages, which is the only case where the answer changes anything.
+ProviderResolver = Callable[[], Optional[str]]
+
+
+def _leads_with_at(message: str) -> bool:
+    """True when the first non-blank character of ``message`` is ``@``."""
+    return message.lstrip().startswith("@")
+
+
+def is_structured_prompt_invocation(message: str, provider: Optional[str]) -> bool:
+    """True when ``provider``'s CLI will read ``message`` as ``@<prompt> [args]``.
+
+    kiro-cli dispatches any input whose first character is ``@`` as an MCP
+    prompt call (e.g. ``@agent-sop:code-analysis query="..."``): it strips the
+    ``@``, shlex-splits the ENTIRE remaining input (newlines included), takes
+    the first token as the prompt name and zips every further token
+    positionally onto the prompt's declared arguments. The grammar has no
+    terminator, so text appended anywhere after the invocation is read as
+    parameter values -- a trailing sender-ID suffix landed in the SOP's
+    optional ``thoroughness`` parameter as ``[Assigned`` (issue #70).
+
+    Two conditions, both required:
+
+    * ``provider`` is in ``STRUCTURED_PROMPT_PROVIDERS``. Every other provider
+      treats a leading ``@path`` as a file mention in prose, where the suffix
+      is both safe and needed. An unknown provider (``None``) is treated as
+      prose so the worker keeps its callback instruction, which is what every
+      provider received before issue #70 was fixed.
+    * the first non-blank character of ``message`` is ``@``. An ``@``-mention
+      inside prose (``Review @src/main.py``) is never an invocation.
+    """
+    return provider in STRUCTURED_PROMPT_PROVIDERS and _leads_with_at(message)
+
+
+def append_sender_suffix(
+    message: str,
+    template: str,
+    terminal_id: str,
+    *,
+    provider: Optional[Union[str, ProviderResolver]],
+) -> str:
+    """Append the sender-ID suffix as its own paragraph, unless the RECEIVING
+    provider would absorb it as a prompt parameter.
+
+    ``provider`` is the provider of the terminal that will read the message:
+    a string when the caller already knows it, or a zero-argument resolver
+    that is called only when ``message`` leads with ``@`` (ordinary prose
+    never pays for the lookup). ``None`` means unknown and keeps the suffix.
+    The argument is keyword-only and has no default so a new call site cannot
+    forget to say which provider it is sending to.
+
+    Suppressing the suffix loses only the in-message reminder: callback
+    routing is structural since issue #284 (``caller_id`` on the worker row,
+    ``send_message`` without ``receiver_id`` routes to the recorded caller).
+    """
+    if _leads_with_at(message):
+        resolved = provider() if callable(provider) else provider
+        if is_structured_prompt_invocation(message, resolved):
+            return message
+    return message + "\n\n" + template.format(terminal_id=terminal_id)
+
+
 # Terminal count threshold for cleanup nudge
 TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
 
-# Generous client-side timeout for a SYNCHRONOUS (non-deferred) terminal create
-# call, used by handoff's early-terminal-id path (review on PR #634, issue #616).
-# Provider init (shell warm-up + CLI startup + MCP registration + auth) can
-# legitimately take up to ~45s server-side -- well past _mcp_timeout()'s 30s
-# default. That default was never a problem before because nothing called
-# _create_terminal non-deferred in production (assign always uses
-# defer_init=True); this is the first caller of that path, so it gets its own
-# padded timeout rather than silently inheriting one sized for something else.
-_HANDOFF_CREATE_TIMEOUT_S = 150.0
 _TERMINAL_ID_PATTERN = re.compile(r"^[a-f0-9]{8}$")
 
 
@@ -536,16 +620,28 @@ def _cleanup_remote_terminal(base_url: str, terminal_id: str) -> bool:
 
 
 def _resolve_child_allowed_tools(
-    parent_allowed_tools: Optional[list], child_profile_name: str
+    parent_allowed_tools: Optional[list],
+    child_profile_name: str,
+    parent_ceiling: Optional[list] = None,
+    parent_id: Optional[str] = None,
+    parent_profile: Optional[str] = None,
 ) -> Optional[str]:
-    """Resolve allowed_tools for a child terminal via intersection.
+    """Resolve the child's allowed_tools and precheck them against the parent's ceiling.
 
-    The child gets at most the union of: what the parent allows + what the
-    child profile specifies. If the parent is unrestricted ("*"), the child
-    profile's allowedTools are used as-is.
+    The child's list is its OWN profile resolution (role default or
+    ``allowedTools``), never widened; a child with no profile inherits the
+    parent's list. It is then checked against ``parent_ceiling`` -- the
+    parent's RECORDED ``delegate_tools``, or for a pre-migration row its own
+    allowlist -- and a child whose list exceeds that ceiling raises
+    ``DelegationCeilingError`` with the same text the server produces, so the
+    agent sees the refusal before the HTTP round trip. The server re-checks
+    against the stored row and stays authoritative (``utils/delegation.py``).
+    A parent with no identity and no recorded list (``None``) is the operator,
+    whose ceiling is ``*``; an identified parent recording neither is refused.
 
     Returns:
-        Comma-separated string of allowed tools, or None for unrestricted.
+        Comma-separated string of the child's allowed tools, or None for an
+        unrestricted child under an unrestricted parent.
     """
     from cli_agent_orchestrator.agent_plugins.mcp_delivery import grantable_server_names
     from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -560,23 +656,55 @@ def _resolve_child_allowed_tools(
     except FileNotFoundError:
         child_allowed = None
 
-    # If parent is unrestricted or has no restrictions, use child's tools
-    if parent_allowed_tools is None or "*" in parent_allowed_tools:
-        if child_allowed:
-            return ",".join(child_allowed)
-        return None
+    # The ceiling the child must fit inside: the parent's RECORDED
+    # delegate_tools, or, for a row written before that column existed, the
+    # parent's own allowlist (the strict reading; see
+    # utils/delegation.ceiling_from_row). None = an unrestricted parent.
+    ceiling = parent_ceiling if parent_ceiling is not None else parent_allowed_tools
+    if ceiling is None:
+        if parent_id is not None:
+            # An identified parent whose row records neither a ceiling nor an
+            # allowlist (pre-migration, launched with no resolvable profile) has
+            # no immutable authority to delegate from; the server refuses the
+            # same way (utils/delegation.ceiling_from_row). Never fall back to
+            # the profile on disk, which can be edited after the fact.
+            raise DelegationCeilingError(
+                f"Delegation refused: terminal {parent_id}"
+                + (f" (profile '{parent_profile}')" if parent_profile else "")
+                + f" records neither a delegation ceiling nor an allowlist, so it cannot "
+                f"launch '{child_profile_name}'. Relaunch it so its ceiling is recorded.",
+                parent_id=parent_id,
+                child_profile=child_profile_name,
+            )
+        ceiling = ["*"]
 
-    # If child has no opinion (None), inherit parent's restrictions
+    # A child with no profile of its own inherits the parent's restrictions,
+    # which by construction fit inside the ceiling.
     if child_allowed is None:
-        return ",".join(parent_allowed_tools)
+        if "*" in ceiling and parent_allowed_tools is None:
+            return None
+        return ",".join(parent_allowed_tools if parent_allowed_tools is not None else ceiling)
 
-    # If child explicitly requests unrestricted ("*"), honor it
+    # Precheck (the server is authoritative; this gives the early error). An
+    # explicit child ["*"] is honoured only within the parent's ceiling (#141
+    # as bounded here): under a supervisor it stays unrestricted, under a
+    # restricted parent it is refused with the tools named.
+    excess = tools_exceeding(child_allowed, ceiling)
+    if excess:
+        raise DelegationCeilingError(
+            describe_rejection(
+                parent_id=parent_id,
+                parent_profile=parent_profile,
+                child_profile=child_profile_name,
+                excess=excess,
+                ceiling=ceiling,
+            ),
+            excess=excess,
+            parent_id=parent_id,
+            child_profile=child_profile_name,
+        )
     if "*" in child_allowed:
         return None
-
-    # Both have restrictions: child gets its own profile tools
-    # (the child profile defines what it needs; parent's restrictions
-    # are enforced by the parent not delegating unauthorized work)
     return ",".join(child_allowed)
 
 
@@ -595,6 +723,81 @@ def _remote_ephemeral_refusal(name: str, target_host: Optional[str]) -> Optional
         )
         return f"remote_placement_not_allowed: ephemeral agent '{name}' can only launch on the node that created it; omit target_host"
     return None
+
+
+def _require_remote_delegation_ceiling(base_url: str, target_host: str) -> None:
+    """Refuse a remote placement unless the target node evaluates delegation ceilings.
+
+    The ceiling travels as ``caller_ceiling`` in the request body. A node from
+    before that field existed accepts the body and IGNORES the field, so the
+    worker would launch unbounded with no error anywhere -- the version-skew
+    case this probe exists to close. ``/health`` advertises
+    ``features: ["delegation_ceiling"]`` once a node enforces it.
+
+    Raises:
+        ValueError: the node is unreachable, or does not advertise the feature.
+    """
+    try:
+        # Same form as the remote-health wait above: ``_auth_headers_for`` is
+        # empty for any host but this one, so no bearer reaches the remote node,
+        # and the bearer census (#991) can see the call is routed through it.
+        response = requests.get(
+            f"{base_url}/health",
+            headers=_auth_headers_for(base_url) or None,
+            timeout=(REMOTE_CONNECT_TIMEOUT, 5.0),
+        )
+        features = response.json().get("features") if response.status_code == 200 else None
+    except (requests.RequestException, ValueError) as exc:
+        raise ValueError(
+            f"cannot verify that remote CAO node {target_host} enforces delegation "
+            f"ceilings ({exc}); refusing to place work there"
+        )
+    if not isinstance(features, list) or REMOTE_FEATURE not in features:
+        raise ValueError(
+            f"remote CAO node {target_host} does not enforce delegation ceilings "
+            f"(its /health lacks the '{REMOTE_FEATURE}' feature, so it would launch the "
+            f"worker unbounded by this terminal's allowlist). Upgrade cao on that node, "
+            f"or omit target_host."
+        )
+
+
+def _own_delegation_ceiling() -> list:
+    """The calling terminal's recorded delegation ceiling, read from its own row.
+
+    For remote placement, where the target has no row for this terminal. Uses
+    the stored ``delegate_tools`` and falls back to the terminal's own effective
+    allowlist for a row written before that column existed (the same strict
+    reading the server applies, ``utils/delegation.ceiling_from_row``).
+
+    Raises:
+        ValueError: no ``CAO_TERMINAL_ID``, or the row/ceiling cannot be read.
+    """
+    current_terminal_id = _current_terminal_id()
+    if not current_terminal_id:
+        raise ValueError(
+            "remote placement needs CAO_TERMINAL_ID so this terminal's delegation "
+            "ceiling can be sent to the target node"
+        )
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/terminals/{current_terminal_id}",
+            headers=_auth_headers() or None,
+            timeout=_mcp_timeout(),
+        )
+        response.raise_for_status()
+        row = response.json()
+        ceiling = ceiling_from_row(row)
+    except Exception as exc:  # noqa: BLE001  (an unknown ceiling must not place work)
+        raise ValueError(
+            f"the delegation ceiling of terminal {current_terminal_id} could not be "
+            f"read ({exc}); refusing remote placement"
+        )
+    if ceiling is None:
+        raise ValueError(
+            f"the delegation ceiling of terminal {current_terminal_id} could not be "
+            f"resolved; relaunch it so the ceiling is recorded"
+        )
+    return ceiling
 
 
 class EphemeralClaim(NamedTuple):
@@ -713,7 +916,7 @@ def _create_terminal(
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
     model: Optional[str] = None,
     use_worktree: bool = False,
-    create_timeout: Optional[float] = None,
+    create_timeout: Optional[Union[float, Tuple[float, float]]] = None,
     idempotency_key: Optional[str] = None,
     claim: Optional[EphemeralClaim] = None,
     description: Optional[str] = None,
@@ -742,9 +945,11 @@ def _create_terminal(
             ``None`` (default) keeps today's behavior (``_mcp_timeout()``,
             30s), which is fine for ``defer_init=True`` (assign's path:
             returns in <2s by design) but too short for a SYNCHRONOUS create
-            that waits out ``provider.initialize()`` (up to ~45s) -- pass an
-            explicit, larger value for that case (see
-            ``_HANDOFF_CREATE_TIMEOUT_S``).
+            that waits out ``provider.initialize()`` -- pass
+            ``synchronous_create_timeout(agent_profile)`` from
+            ``utils.init_allowance`` for that case (issue #710), as handoff
+            does. A ``(connect, read)`` tuple is accepted as ``requests`` takes
+            it, so only the read half is widened.
         defer_init: If True, tell
             cao-server to skip the ``provider.initialize()`` wait and return
             as soon as the tmux window and DB record exist. Provider init
@@ -829,11 +1034,20 @@ def _create_terminal(
                     f"Error fetching conductor's working directory: {e}, will use server default"
                 )
 
-        # Resolve child's allowed_tools via inheritance
+        # Resolve the child's allowed_tools and precheck them against the
+        # caller's recorded delegation ceiling (the server re-checks from the
+        # caller's row and is authoritative; this surfaces the error early). A
+        # claimed ephemeral target already carries its policy-bounded tools.
         child_allowed_tools = (
             ",".join(claim.effective_tools)
             if claim is not None
-            else _resolve_child_allowed_tools(parent_allowed_tools, agent_profile)
+            else _resolve_child_allowed_tools(
+                parent_allowed_tools,
+                agent_profile,
+                parent_ceiling=terminal_metadata.get("delegate_tools"),
+                parent_id=current_terminal_id,
+                parent_profile=terminal_metadata.get("agent_profile"),
+            )
         )
 
         # Create new terminal in existing session - always pass working_directory
@@ -1058,6 +1272,11 @@ class HandoffContext(NamedTuple):
     caller_id: Optional[str]
     allowed_tools: Optional[list]
     claim_id: Optional[str] = None
+    # Remote placement only: the supervisor's recorded delegation ceiling,
+    # asserted to the target node (which has no row for the supervisor) so the
+    # worker it creates is bounded by it. None on every local path, where the
+    # server reads the ceiling from the caller_id row itself.
+    caller_ceiling: Optional[list] = None
 
 
 def _resolve_handoff_provider(
@@ -1108,7 +1327,13 @@ def _resolve_handoff_provider(
     # used; _resolve_child_allowed_tools returns a comma-separated string (or
     # None for unrestricted), which we split into the list the payload expects.
     parent_allowed_tools = terminal_metadata.get("allowed_tools")
-    child_allowed_tools = _resolve_child_allowed_tools(parent_allowed_tools, agent_profile)
+    child_allowed_tools = _resolve_child_allowed_tools(
+        parent_allowed_tools,
+        agent_profile,
+        parent_ceiling=terminal_metadata.get("delegate_tools"),
+        parent_id=current_terminal_id,
+        parent_profile=terminal_metadata.get("agent_profile"),
+    )
     allowed_tools_list = child_allowed_tools.split(",") if child_allowed_tools else None
     return HandoffContext(
         provider=provider,
@@ -1157,6 +1382,45 @@ def _parse_run_step_error(
         return None, detail, _terminal_id_from_detail(detail), None
     fallback = f"status {response.status_code}"
     return None, fallback, None, None
+
+
+def _receiver_provider(receiver_id: str) -> Optional[str]:
+    """Provider of the terminal a ``send_message`` payload is addressed to.
+
+    Reads the receiver's row from the node ``_send_to_inbox`` will post to:
+    the callback node when the receiver is the recorded cross-node supervisor,
+    otherwise this node, with the same one-shot retry against the callback
+    node for an ID this node does not know. Returns ``None`` when no row can
+    be read: the sender suffix is then kept, which is what every provider
+    received before issue #70 was fixed, and the inbox POST that follows
+    reports the real delivery error itself. The lookup is advisory and never
+    turns a deliverable message into a failure.
+    """
+    callback_url, callback_terminal_id = _callback_route()
+    if callback_url and receiver_id == callback_terminal_id:
+        bases = [callback_url]
+    elif callback_url:
+        bases = [API_BASE_URL, callback_url]
+    else:
+        bases = [API_BASE_URL]
+
+    for base in bases:
+        try:
+            response = requests.get(
+                f"{base}/terminals/{receiver_id}",
+                headers={**_auth_headers_for(base), **elastic_worker_gateway_headers()} or None,
+                timeout=_mcp_timeout(),
+            )
+            if response.status_code == 404:
+                continue
+            response.raise_for_status()
+            row = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            logger.debug("Receiver provider lookup for %s failed: %s", receiver_id, exc)
+            return None
+        provider = row.get("provider") if isinstance(row, dict) else None
+        return str(provider) if provider else None
+    return None
 
 
 def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
@@ -1637,11 +1901,16 @@ async def _handoff_impl(
             # (the remote DB has no row for the supervisor's terminal); the
             # provider comes from the remote node's own profile store.
             base_url = _resolve_target_base_url(target_host)
+            # The one piece of supervisor state that DOES travel: its recorded
+            # delegation ceiling, so the remote node bounds the worker by it.
+            # Refuses (fail closed) when the target cannot evaluate it.
+            _require_remote_delegation_ceiling(base_url, target_host)
             ctx = HandoffContext(
                 provider=_resolve_remote_provider(base_url, agent_profile),
                 session_name=None,
                 caller_id=None,
                 allowed_tools=None,
+                caller_ceiling=_own_delegation_ceiling(),
             )
         else:
             # Resolve the supervisor context WITHOUT creating a terminal, so the
@@ -1706,6 +1975,8 @@ async def _handoff_impl(
                 payload["claim_id"] = ctx.claim_id
             if ctx.allowed_tools or ctx.claim_id is not None:
                 payload["allowed_tools"] = ctx.allowed_tools
+            if ctx.caller_ceiling is not None:
+                payload["caller_ceiling"] = ctx.caller_ceiling
             if working_directory:
                 payload["working_directory"] = working_directory
             if provider == ProviderType.KIRO_CLI.value and engine is not None:
@@ -1738,6 +2009,12 @@ async def _handoff_impl(
         # GET); reassigning ``provider`` to its return value uses whatever it
         # actually persisted on the terminal as the source of truth for the
         # reuse call below, rather than assuming the two resolutions agree.
+        # This create is SYNCHRONOUS (no defer_init), so cao-server does not
+        # answer until ``provider.initialize()`` returns; the client budget has
+        # to be derived from the ``provider_init_timeout`` the server is itself
+        # waiting out, not written down a second time (issue #710). It used to
+        # be a flat 150s (#634), which was below a successful Claude init at
+        # 3T=180s, let alone Kimi's 300s or Antigravity's 370s.
         claim_kwargs: Dict[str, Any] = {"claim": claim} if claim is not None else {}
         terminal_id, provider = _create_terminal(
             agent_profile,
@@ -1745,7 +2022,7 @@ async def _handoff_impl(
             engine=engine,
             model=model,
             use_worktree=use_worktree,
-            create_timeout=_HANDOFF_CREATE_TIMEOUT_S,
+            create_timeout=synchronous_create_timeout(agent_profile),
             idempotency_key=idempotency_key,
             description=description,
             delegation_message=message,
@@ -1870,6 +2147,7 @@ def _assign_remote(
     agent_profile: str,
     worker_message: str,
     current_terminal_id: str,
+    inject_sender_suffix: bool = False,
     target_host: str,
     working_directory: Optional[str],
     engine: Optional[str],
@@ -1888,6 +2166,13 @@ def _assign_remote(
     node) and the task is delivered once the remote provider initializes. The
     remote node resolves the provider from its OWN installed profile store
     (``provider`` is deliberately omitted from the request).
+
+    ``inject_sender_suffix``: append the callback-instructions suffix to
+    ``worker_message`` here rather than in the caller, because the receiving
+    provider that decides whether the suffix is safe (issue #70) lives in the
+    remote node's profile store and is read only after the ready wait below,
+    and only for an ``@``-leading task. ``False`` (the default) delivers
+    ``worker_message`` as given.
 
     Callback routing: assign is non-blocking, so results come back via the
     worker's ``send_message``. The worker's node has no DB row for this
@@ -1935,6 +2220,27 @@ def _assign_remote(
     base_url = _resolve_target_base_url(target_host)
     if ready_wait_seconds > 0:
         _wait_remote_ready(base_url, ready_wait_seconds)
+    # The supervisor's recorded delegation ceiling travels with the request so
+    # the remote node bounds the worker by it; refuse (fail closed) when the
+    # target does not advertise that it evaluates ceilings, because an older
+    # node would silently ignore the field and launch the worker unbounded.
+    try:
+        _require_remote_delegation_ceiling(base_url, target_host)
+        caller_ceiling = _own_delegation_ceiling()
+    except ValueError as exc:
+        return {
+            "success": False,
+            "terminal_id": None,
+            "target_host": target_host,
+            "message": f"Assignment failed: {exc}",
+        }
+    if inject_sender_suffix:
+        worker_message = append_sender_suffix(
+            worker_message,
+            ASSIGN_SUFFIX_TEMPLATE,
+            current_terminal_id,
+            provider=lambda: _resolve_remote_provider(base_url, agent_profile),
+        )
     params: Dict[str, Any] = {"agent_profile": agent_profile}
     if remote_session_name:
         params["session_name"] = remote_session_name
@@ -1957,6 +2263,7 @@ def _assign_remote(
             CALLBACK_URL_ENV: advertised_url.rstrip("/"),
             CALLBACK_TERMINAL_ID_ENV: current_terminal_id,
         },
+        "caller_ceiling": caller_ceiling,
     }
     if delegation_message is not None:
         payload["delegation_message"] = delegation_message
@@ -2026,6 +2333,21 @@ def _assign_remote(
 
 
 # Implementation function for assign
+def _assign_worker_provider(agent_profile: str, claim: Optional[EphemeralClaim]) -> str:
+    """Provider the local assign worker will run, resolved BEFORE it exists.
+
+    The same resolution ``_create_terminal`` applies a moment later: an
+    ephemeral claim pins the provider; otherwise the profile's own provider,
+    falling back to the supervisor's (``_resolve_handoff_provider``, one GET on
+    the supervisor row). Only consulted to decide whether the sender suffix is
+    safe for the worker's CLI, so ``append_sender_suffix`` calls it only for
+    ``@``-leading tasks.
+    """
+    if claim is not None:
+        return claim.provider
+    return _resolve_handoff_provider(agent_profile).provider
+
+
 def _assign_impl(
     agent_profile: str,
     message: str,
@@ -2091,24 +2413,14 @@ def _assign_impl(
                 ),
             }
 
-        # Compose the message the worker will see once it is ready. We do
-        # this here (not on the server) because the callback-instructions
-        # suffix depends on ``CAO_TERMINAL_ID``, which lives in the calling
-        # process's env (the supervisor-owned MCP subprocess, or a ``cao
-        # agent assign`` shell), not on the cao-server side.
-        if ENABLE_SENDER_ID_INJECTION:
-            worker_message = (
-                message
-                + f"\n\n[Assigned by terminal {current_terminal_id}. "
-                + f"When done, send results back to terminal {current_terminal_id} using send_message]"
-            )
-        else:
-            worker_message = message
-
         if target_host:
+            # The remote node resolves the worker's provider from its own
+            # profile store, so the callback suffix is composed there, once
+            # the node is known to be up (see ``_assign_remote``).
             return _assign_remote(
                 agent_profile=agent_profile,
-                worker_message=worker_message,
+                worker_message=message,
+                inject_sender_suffix=ENABLE_SENDER_ID_INJECTION,
                 current_terminal_id=current_terminal_id,
                 target_host=target_host,
                 working_directory=working_directory,
@@ -2121,6 +2433,23 @@ def _assign_impl(
                 description=description,
                 delegation_message=canonical_message,
             )
+
+        # Compose the message the worker will see once it is ready. We do
+        # this here (not on the server) because the callback-instructions
+        # suffix depends on ``CAO_TERMINAL_ID``, which lives in the calling
+        # process's env (the supervisor-owned MCP subprocess, or a ``cao
+        # agent assign`` shell), not on the cao-server side. The helper leaves
+        # a kiro-cli ``@<prompt> [args]`` invocation untouched (issue #70) and
+        # looks the worker's provider up only when the task leads with ``@``.
+        if ENABLE_SENDER_ID_INJECTION:
+            worker_message = append_sender_suffix(
+                message,
+                ASSIGN_SUFFIX_TEMPLATE,
+                current_terminal_id,
+                provider=lambda: _assign_worker_provider(agent_profile, claim),
+            )
+        else:
+            worker_message = message
 
         # Create terminal in DEFERRED-INIT mode: cao-server returns as soon
         # as the tmux window is up and the DB row is written; the actual
@@ -2267,14 +2596,19 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
         # Auto-inject sender terminal ID suffix when enabled. Skipped when
         # CAO_TERMINAL_ID is unset — never inject 'unknown' as a routable
         # address (issue #284); _send_to_inbox raises a clear error for that
-        # case anyway.
+        # case anyway. The helper leaves a kiro-cli ``@<prompt> [args]``
+        # invocation untouched (issue #70) and reads the RECEIVER's provider
+        # only when the message leads with ``@``.
+        receiver: str = receiver_id
         if ENABLE_SENDER_ID_INJECTION and own_terminal_id:
-            message += (
-                f"\n\n[Message from terminal {own_terminal_id}. "
-                "Use send_message MCP tool for any follow-up work.]"
+            message = append_sender_suffix(
+                message,
+                MESSAGE_SUFFIX_TEMPLATE,
+                own_terminal_id,
+                provider=lambda: _receiver_provider(receiver),
             )
 
-        return _send_to_inbox(receiver_id, message)
+        return _send_to_inbox(receiver, message)
     except requests.HTTPError as exc:
         # e.g. the receiver terminal (a recorded caller included) was deleted
         # before this reply — surface the API detail instead of a raw

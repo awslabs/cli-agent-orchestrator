@@ -57,6 +57,18 @@ class TestHealthCheck:
         data = response.json()
         assert data["terminal_backend"] == "tmux"
 
+    def test_health_reports_the_servers_provider_init_timeout(self, client):
+        """Issue #710 (review on PR #1002, P3-1): clients size their wait for a
+        synchronous create from THEIR settings, so the server publishes the value
+        it applies for an operator to compare against."""
+        with patch(
+            "cli_agent_orchestrator.services.settings_service.get_server_settings",
+            return_value={"provider_init_timeout": 180},
+        ):
+            response = client.get("/health")
+        assert response.status_code == 200
+        assert response.json()["provider_init_timeout"] == 180
+
     def test_health_reports_terminal_backend_herdr(self, client):
         """GET /health reports terminal_backend='herdr' when server uses HerdrBackend."""
         from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
@@ -358,6 +370,7 @@ class TestCreateSession:
             resume_session_id=None,
             group=None,
             metadata=None,
+            caller_ceiling=None,
         )
 
     def test_create_session_forwards_use_worktree_true(self, client):
@@ -939,7 +952,11 @@ class TestCreateSession:
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             response = client.post(
                 f"/sessions/{bad_name}/terminals",
-                params={"provider": "kiro_cli", "agent_profile": "developer"},
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                },
             )
 
         assert response.status_code == 400
@@ -1154,6 +1171,7 @@ class TestCreateTerminalInSession:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "claude_code",
                     "agent_profile": "reviewer",
                 },
@@ -1177,6 +1195,7 @@ class TestCreateTerminalInSession:
             response = client.post(
                 "/sessions/nonexistent/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "developer",
                 },
@@ -1193,6 +1212,7 @@ class TestCreateTerminalInSession:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "developer",
                 },
@@ -1221,6 +1241,7 @@ class TestCreateTerminalInSession:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "developer",
                     "idempotency_key": "job-1",
@@ -1246,7 +1267,11 @@ class TestCreateTerminalInSession:
 
             response = client.post(
                 "/sessions/test-session/terminals",
-                params={"provider": "kiro_cli", "agent_profile": "developer"},
+                params={
+                    "caller_id": "dcba8765",
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                },
             )
 
         assert response.status_code == 404
@@ -1270,6 +1295,7 @@ class TestCreateTerminalInSession:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
+                    "caller_id": "dcba8765",
                     "provider": "kiro_cli",
                     "agent_profile": "developer",
                     "idempotency_key": "job-1",
@@ -1470,9 +1496,9 @@ class TestSendTerminalInput:
     """Tests for POST /terminals/{terminal_id}/input endpoint."""
 
     def test_send_input_success(self, client):
-        """POST /terminals/{id}/input sends message successfully."""
+        """POST /terminals/{id}/input sends the message and names the turn it started."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.send_input.return_value = True
+            mock_svc.dispatch_input.return_value = 11
 
             response = client.post(
                 "/terminals/abcd1234/input",
@@ -1482,7 +1508,10 @@ class TestSendTerminalInput:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        mock_svc.send_input.assert_called_once_with(
+        # The dispatch boundary lets the caller tell a status earned for THIS send
+        # from the previous turn's, which is still on screen (#735).
+        assert data["dispatch_boundary"] == 11
+        mock_svc.dispatch_input.assert_called_once_with(
             "abcd1234",
             "hello world",
             registry=ANY,
@@ -1493,7 +1522,7 @@ class TestSendTerminalInput:
     def test_send_input_with_orchestration_context(self, client):
         """POST /terminals/{id}/input forwards registry and orchestration metadata when provided."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.send_input.return_value = True
+            mock_svc.dispatch_input.return_value = 0
 
             response = client.post(
                 "/terminals/abcd1234/input",
@@ -1505,7 +1534,10 @@ class TestSendTerminalInput:
             )
 
         assert response.status_code == 200
-        mock_svc.send_input.assert_called_once_with(
+        # A first-ever dispatch has boundary 0; it must still be reported, and
+        # success must not be derived from it.
+        assert response.json() == {"success": True, "dispatch_boundary": 0}
+        mock_svc.dispatch_input.assert_called_once_with(
             "abcd1234",
             "hello world",
             registry=ANY,
@@ -1513,10 +1545,33 @@ class TestSendTerminalInput:
             orchestration_type="assign",
         )
 
+    def test_send_input_reports_no_boundary_for_event_inbox_backends(self, client):
+        """An event-inbox backend (herdr) never advances the output generation,
+        so ``dispatch_input`` always returns the meaningless int 0. Naming it
+        would make `cao session send` skip its 3-second grace sleep while the
+        GET-side gate stays inert for herdr (status_generation is None there)
+        -- the pre-#735 stale window, widened. The endpoint must report no
+        boundary at all so the CLI falls back to the flat sleep (#735 synthesis
+        item 2)."""
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch("cli_agent_orchestrator.api.main.get_backend") as mock_get_backend,
+        ):
+            mock_svc.dispatch_input.return_value = 0
+            mock_get_backend.return_value.supports_event_inbox.return_value = True
+
+            response = client.post(
+                "/terminals/abcd1234/input",
+                params={"message": "hello world"},
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {"success": True, "dispatch_boundary": None}
+
     def test_send_input_terminal_not_found(self, client):
         """POST /terminals/{id}/input returns 404 for nonexistent terminal."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.send_input.side_effect = ValueError("Terminal not found")
+            mock_svc.dispatch_input.side_effect = ValueError("Terminal not found")
 
             response = client.post(
                 "/terminals/deadbeef/input",
@@ -1532,7 +1587,7 @@ class TestSendTerminalInput:
 
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             mock_svc.TerminalInputBlockedError = TerminalInputBlockedError
-            mock_svc.send_input.side_effect = TerminalInputBlockedError(
+            mock_svc.dispatch_input.side_effect = TerminalInputBlockedError(
                 "Terminal abcd1234 is waiting for a user answer"
             )
 
@@ -1547,7 +1602,7 @@ class TestSendTerminalInput:
     def test_send_input_server_error(self, client):
         """POST /terminals/{id}/input returns 500 on error."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.send_input.side_effect = Exception("TMux send failed")
+            mock_svc.dispatch_input.side_effect = Exception("TMux send failed")
 
             response = client.post(
                 "/terminals/abcd1234/input",
