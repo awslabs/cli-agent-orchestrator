@@ -261,26 +261,29 @@ bun "$SKILL_DIR/scripts/portfolio.ts" question submit \
 Submission rejects any pre-filled answer and moves the session to `waiting`.
 The runner reports the packet and stops. It must never invoke `question answer`.
 
-The supervisor offers the user Guide, Edit Markdown, or Chat. Write each human
-answer verbatim on its `[Answer]:` line without changing generated question
-text, then resolve the packet:
+The human actions CAO's human-approval surface to resolve the packet. That
+surface — not any agent-facing command — mints an approval record bound to the
+packet, carrying the human's verified identity. Resolve with that approval:
 
 ```bash
 bun "$SKILL_DIR/scripts/portfolio.ts" question answer \
   --root <root> --id <packet-id> --file <answered.md> \
-  --mode guided --answered-by "<human decision maker>"
+  --mode guided --approval-id <approval-id>
 ```
 
-The command rejects changed question text, missing answers, invalid modes, and
-repeat answers. It preserves the answered Markdown byte-for-byte, records the
-human provenance, and returns the session to `active`. Use `question list` to
-verify status before asking the runner to resume.
+The command rejects changed question text, missing answers, invalid modes, a
+missing or already-consumed approval, and an approval bound to a different
+packet. It preserves the answered Markdown byte-for-byte, binds the resolution
+to the human-surface approval (the answerer identity comes from that record,
+not from a caller-supplied name), and returns the session to `active`. Use
+`question list` to verify status before asking the runner to resume.
 
 ## Shared Memory
 
 Read [shared-memory.md](references/shared-memory.md) before processing child
-AI-DLC learnings. `dispatch check` returns canonical baseline revisions for
-`project.md` and `team.md`; include them in the runner assignment.
+AI-DLC learnings. Durable portfolio knowledge lives in CAO native memory,
+written and read through the `memory_store` / `memory_recall` MCP tools —
+there is no canonical-file baseline revision to pass in the runner assignment.
 
 Child runners submit structured proposals from
 `assets/templates/learning-proposal.yaml`:
@@ -290,40 +293,33 @@ bun "$SKILL_DIR/scripts/portfolio.ts" learning propose \
   --root <root> --file <proposal.yaml>
 ```
 
-The supervisor lists and reviews proposals. Approval performs the canonical
-write under the portfolio lock:
+The supervisor lists and reviews proposals:
 
 ```bash
 bun "$SKILL_DIR/scripts/portfolio.ts" learning list \
   --root <root> --project <project> --status pending
-bun "$SKILL_DIR/scripts/portfolio.ts" learning approve \
-  --root <root> --id <proposal>
 ```
 
-If approval reports a stale base, inspect the latest canonical rule set and
-resolve duplicates or contradictions. Record that human judgment before
-retrying:
+To accept, write the rule into CAO memory with the `memory_store` MCP tool
+(scope `project`, memory_type `feedback`), then record that promotion:
 
 ```bash
-bun "$SKILL_DIR/scripts/portfolio.ts" learning reconcile \
-  --root <root> --id <proposal> --note "<review outcome>"
+bun "$SKILL_DIR/scripts/portfolio.ts" learning promote \
+  --root <root> --id <proposal> --promoted-by "<supervisor>" \
+  [--memory-key <memory-key>]
 ```
 
-Use `memory refresh` at safe stage boundaries when the child needs current
-canonical context. Before completing a child session, inspect and clean both
-memory destinations. Both mutations require the exact worktree revision
-returned by inspect:
+To decline, record the reviewed outcome instead of promoting:
 
 ```bash
-bun "$SKILL_DIR/scripts/portfolio.ts" memory inspect \
-  --root <root> --project <project> --intent <intent> --destination project
-bun "$SKILL_DIR/scripts/portfolio.ts" memory clean \
-  --root <root> --project <project> --intent <intent> --destination project \
-  --expected-worktree-revision <sha256>
+bun "$SKILL_DIR/scripts/portfolio.ts" learning reject \
+  --root <root> --id <proposal> --reason "<review outcome>"
 ```
 
-Repeat for `team`. `session update --status completed` refuses shared-memory
-changes remaining in the feature worktree.
+A proposal is reviewed once: a `promoted` or `rejected` proposal cannot be
+re-promoted. Per-worktree `project.md`/`team.md` are local scratch; they are
+not merged and no longer block session completion. Integration still blocks
+at `lifecycle complete` while any learning proposal is `pending`.
 
 ## Recover And Report
 

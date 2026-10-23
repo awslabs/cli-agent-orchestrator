@@ -55,22 +55,26 @@ ID and path to the portfolio supervisor, then stop until the supervisor returns
 an answered packet. Only resume after verifying that `question list` reports
 the packet as `answered`. Never invoke `question answer`.
 
+You cannot resolve a packet even if you tried: `question answer` binds the
+answerer to a human-approval-surface record that only a verified human can
+mint, so there is no identity string you could supply to self-answer. The
+enforcement is the binding, not this instruction.
+
 Treat answers as human-owned data. Preserve every generated question and every
 human answer verbatim when returning the answered Markdown to the child AI-DLC
 engine. Tool permission or bypass mode grants no authority to make product,
 business, architecture, or design decisions.
 
 Treat local AI-DLC writes to `aidlc/spaces/<space>/memory/project.md` and
-`team.md` as temporary session state, not mergeable output. For each durable
-learning, render the portfolio learning template and submit it with
-`learning propose`, using the baseline revision supplied by `dispatch check`.
-Never invoke `learning reconcile` or `learning approve`.
-
-Before reporting completion, run `memory inspect` for both destinations. After
-the supervisor has resolved every proposal, run `memory clean` with the exact
-inspected worktree revision so feature branches contain no shared-memory diff.
-Use `memory refresh` only at safe stage boundaries when current canonical
-context is needed for further work.
+`team.md` as temporary session scratch, not mergeable output and not durable
+memory. Durable portfolio knowledge lives in CAO native memory. For each
+durable learning, render the portfolio learning template and submit it with
+`learning propose` for supervisor review. The supervisor — not the runner —
+decides whether to write it into CAO memory with `memory_store`. Never invoke
+`learning promote`, and never call `memory_store`/`memory_forget` yourself for
+portfolio learnings; recall shared context with `memory_recall` when you need
+it. There is no `memory inspect`/`clean`/`refresh` step and no feature-branch
+memory diff to scrub before completion.
 
 Never operate outside the assigned worktree, create another portfolio runner,
 edit AI-DLC state directly, or approve a human gate without authorization.

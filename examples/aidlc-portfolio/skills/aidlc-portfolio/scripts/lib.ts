@@ -17,7 +17,7 @@ import { verifyHarness } from "./harness.ts";
 
 export type DocumentKind = "project" | "dependency" | "intent";
 export type MemoryDestination = "project" | "team";
-export type LearningStatus = "pending" | "applied" | "rejected";
+export type LearningStatus = "pending" | "promoted" | "rejected";
 export type QuestionAnswerMode = "guided" | "markdown" | "chat";
 export type PortfolioPhase =
   | "bootstrap"
@@ -172,6 +172,26 @@ interface QuestionPacket {
   answeredAt?: string;
   answerMode?: QuestionAnswerMode;
   answeredBy?: string;
+  approvalId?: string;
+}
+
+// A human-decision approval minted by CAO's human-approval surface (an AG-UI
+// approval card the user actioned, a workflow resume a verified human posted).
+// `source` is stamped by that surface and MUST be "human-surface": an agent
+// cannot forge it, because the agent-facing CLI exposes no command that writes
+// an approval record. `answeredBy` is the identity the surface verified; it is
+// NOT a free-text argument an agent supplies to `question answer`.
+type ApprovalSource = "human-surface";
+
+interface HumanApprovalRecord {
+  schemaVersion: 1;
+  id: string;
+  packet: string;
+  answeredBy: string;
+  source: ApprovalSource;
+  recordedAt: string;
+  consumed?: boolean;
+  consumedAt?: string;
 }
 
 interface LoadedWorkspace {
@@ -194,32 +214,18 @@ interface LearningProposal {
   rule: string;
   evidence: string[];
   source: { stage: string };
-  baseRevision: string;
   status?: LearningStatus;
   createdAt?: string;
   updatedAt?: string;
-  appliedAt?: string;
+  promotedAt?: string;
+  promotedBy?: string;
+  memory?: {
+    scope: string;
+    memoryType: string;
+    key?: string;
+  };
   rejectedAt?: string;
   rejectionReason?: string;
-  reconciliations?: Array<{
-    note: string;
-    reconciledAt: string;
-    previousRevision: string;
-  }>;
-}
-
-export interface MemorySnapshot {
-  project: string;
-  intent: string;
-  space: string;
-  destination: MemoryDestination;
-  canonicalPath: string;
-  worktreePath: string;
-  canonicalRevision: string;
-  worktreeRevision: string;
-  inSync: boolean;
-  headRevision: string | null;
-  mergeClean: boolean | null;
 }
 
 interface DispatchReadiness {
@@ -227,7 +233,6 @@ interface DispatchReadiness {
   branch: string;
   aidlcIntent: string;
   aidlcSpace: string;
-  memory: Record<MemoryDestination, { revision: string; path: string }>;
 }
 
 interface PortfolioLockOwner {
@@ -250,6 +255,7 @@ const REQUIRED_DIRECTORIES = [
   "portfolio/intents",
   "portfolio/learnings",
   "portfolio/questions",
+  "portfolio/approvals",
   "portfolio/results",
   "portfolio/convergence-decisions",
   "repositories",
@@ -302,6 +308,7 @@ export function workspacePaths(rootInput: string) {
     intents: join(root, "portfolio", "intents"),
     learnings: join(root, "portfolio", "learnings"),
     questions: join(root, "portfolio", "questions"),
+    approvals: join(root, "portfolio", "approvals"),
     results: join(root, "portfolio", "results"),
     convergenceDecisions: join(
       root,
@@ -479,11 +486,10 @@ export async function validateWorkspace(rootInput: string): Promise<ValidationRe
     const learnings = await readLearningProposals(root);
     for (const proposal of learnings) {
       try {
-        resolveMemoryPaths(
+        assertLearningTarget(
           loaded,
           proposal.project,
           proposal.intent,
-          proposal.destination,
           proposal.space,
         );
       } catch (error) {
@@ -532,7 +538,7 @@ export async function portfolioStatus(rootInput: string) {
       intents: loaded.intents.length,
       learnings: {
         pending: learnings.filter((item) => item.status === "pending").length,
-        applied: learnings.filter((item) => item.status === "applied").length,
+        promoted: learnings.filter((item) => item.status === "promoted").length,
         rejected: learnings.filter((item) => item.status === "rejected").length,
       },
       questions: {
@@ -826,14 +832,12 @@ export async function answerQuestionPacket(
   id: string,
   sourceFile: string,
   mode: QuestionAnswerMode,
-  answeredBy: string,
-): Promise<{ path: string; status: "active" }> {
+  approvalId: string,
+): Promise<{ path: string; status: "active"; answeredBy: string }> {
   assertId(id, "question packet id");
+  assertId(approvalId, "approval id");
   if (!["guided", "markdown", "chat"].includes(mode)) {
     throw new PortfolioError(`invalid question answer mode: ${mode}`);
-  }
-  if (!answeredBy.trim()) {
-    throw new PortfolioError("answered-by must identify the human decision maker");
   }
   const root = resolve(rootInput);
   const content = await readFile(resolve(sourceFile), "utf8");
@@ -856,6 +860,32 @@ export async function answerQuestionPacket(
       throw new PortfolioError("every generated question requires a human answer");
     }
 
+    // The answerer is NOT a free-text argument. It is bound to a human-surface
+    // approval record that only CAO's human-approval surface can mint. The
+    // agent-facing CLI exposes no command that writes one, so an agent cannot
+    // fabricate an answerer or forge a self-approval: without a matching
+    // human-surface approval, `question answer` is refused outright.
+    const approval = await readHumanApproval(root, approvalId);
+    if (approval.source !== "human-surface") {
+      throw new PortfolioError(
+        `approval ${approvalId} is not backed by a human-approval surface`,
+      );
+    }
+    if (approval.packet !== id) {
+      throw new PortfolioError(
+        `approval ${approvalId} authorizes packet ${approval.packet}, not ${id}`,
+      );
+    }
+    if (approval.consumed) {
+      throw new PortfolioError(`approval ${approvalId} has already been used`);
+    }
+    const answeredBy = approval.answeredBy.trim();
+    if (!answeredBy) {
+      throw new PortfolioError(
+        `approval ${approvalId} carries no verified human identity`,
+      );
+    }
+
     const loaded = await loadWorkspace(root);
     requireIntentProject(loaded, packet.intent, packet.project);
     requireSessionStatus(loaded, packet.intent, packet.project, "waiting");
@@ -865,16 +895,78 @@ export async function answerQuestionPacket(
       status: "answered",
       answeredAt: now,
       answerMode: mode,
-      answeredBy: answeredBy.trim(),
+      answeredBy,
+      approvalId,
     };
     await atomicWrite(questionDocumentPath(root, id), content);
     await atomicWrite(
       questionMetadataPath(root, id),
       `${JSON.stringify(answered, null, 2)}\n`,
     );
+    await atomicWrite(
+      approvalPath(root, approvalId),
+      `${JSON.stringify({ ...approval, consumed: true, consumedAt: now }, null, 2)}\n`,
+    );
     await setSessionStatus(loaded, packet.intent, packet.project, "active");
-    return { path: questionDocumentPath(root, id), status: "active" };
+    return { path: questionDocumentPath(root, id), status: "active", answeredBy };
   });
+}
+
+// HUMAN-SURFACE WRITE PATH. This stands in for CAO's human-approval surface
+// (an AG-UI approval card the user actioned, or a verified-human workflow
+// resume). It is deliberately NOT wired to any agent CLI subcommand: the agent
+// cannot call it, so it cannot mint an approval for itself. In a live
+// deployment the identity and token come from the verified human session that
+// drove the surface; here the record carries that verified identity so the
+// `question answer` binding has something real to match against.
+export async function recordHumanApproval(
+  rootInput: string,
+  approvalId: string,
+  packetId: string,
+  answeredBy: string,
+): Promise<{ id: string; packet: string; answeredBy: string }> {
+  assertId(approvalId, "approval id");
+  assertId(packetId, "question packet id");
+  if (!answeredBy.trim()) {
+    throw new PortfolioError(
+      "a human-surface approval must carry the verified human identity",
+    );
+  }
+  const root = resolve(rootInput);
+  return withLock(root, async () => {
+    const path = approvalPath(root, approvalId);
+    if (await pathExists(path)) {
+      throw new PortfolioError(`approval already exists: ${approvalId}`);
+    }
+    const record: HumanApprovalRecord = {
+      schemaVersion: 1,
+      id: approvalId,
+      packet: packetId,
+      answeredBy: answeredBy.trim(),
+      source: "human-surface",
+      recordedAt: new Date().toISOString(),
+    };
+    await atomicWrite(path, `${JSON.stringify(record, null, 2)}\n`);
+    return { id: approvalId, packet: packetId, answeredBy: record.answeredBy };
+  });
+}
+
+function approvalPath(root: string, approvalId: string): string {
+  assertId(approvalId, "approval id");
+  return join(workspacePaths(root).approvals, `${approvalId}.json`);
+}
+
+async function readHumanApproval(
+  root: string,
+  approvalId: string,
+): Promise<HumanApprovalRecord> {
+  const path = approvalPath(root, approvalId);
+  if (!(await pathExists(path))) {
+    throw new PortfolioError(
+      `no human-surface approval found for ${approvalId}; a human must action the approval surface before the packet can be resolved`,
+    );
+  }
+  return readJson<HumanApprovalRecord>(path);
 }
 
 export async function listQuestionPackets(
@@ -931,26 +1023,6 @@ export async function updateSession(
             .map((packet) => packet.id)
             .join(", ")}`,
         );
-      }
-    }
-    if (status === "completed") {
-      for (const destination of ["project", "team"] as const) {
-        const { canonicalPath, relativeMemory, worktreePath } = resolveMemoryPaths(
-          loaded,
-          projectId,
-          intentId,
-          destination,
-          mapping.aidlcSpace ?? "default",
-        );
-        const canonical = contentRevision((await optionalRead(canonicalPath)) ?? "");
-        const worktree = contentRevision((await optionalRead(worktreePath)) ?? "");
-        const head = await readHeadMemory(dirnameFromRelative(worktreePath, relativeMemory), relativeMemory);
-        const mergeClean = head ? contentRevision(head.content) === worktree : null;
-        if (mergeClean === false || (mergeClean === null && canonical !== worktree)) {
-          throw new PortfolioError(
-            `${destination}.md contains worktree changes; submit proposals and clean memory before completing the session`,
-          );
-        }
       }
     }
 
@@ -1130,192 +1202,12 @@ async function assertDispatchable(
   }
 
   const aidlcSpace = mapping.aidlcSpace ?? "default";
-  const projectMemory = await memorySnapshot(
-    root,
-    projectId,
-    intentId,
-    "project",
-    aidlcSpace,
-  );
-  const teamMemory = await memorySnapshot(
-    root,
-    projectId,
-    intentId,
-    "team",
-    aidlcSpace,
-  );
-  if (!projectMemory.inSync || !teamMemory.inSync) {
-    throw new PortfolioError(
-      `worktree memory is stale for AI-DLC space ${aidlcSpace}; inspect and refresh project and team memory before dispatch`,
-    );
-  }
   return {
     worktree,
     branch: mapping.branch,
     aidlcIntent: mapping.aidlcIntent,
     aidlcSpace,
-    memory: {
-      project: {
-        revision: projectMemory.canonicalRevision,
-        path: projectMemory.canonicalPath,
-      },
-      team: {
-        revision: teamMemory.canonicalRevision,
-        path: teamMemory.canonicalPath,
-      },
-    },
   };
-}
-
-export async function memorySnapshot(
-  rootInput: string,
-  projectId: string,
-  intentId: string,
-  destination: MemoryDestination,
-  space = "default",
-): Promise<MemorySnapshot> {
-  assertId(space, "space");
-  const root = resolve(rootInput);
-  const loaded = await loadWorkspace(root);
-  const { canonicalPath, relativeMemory, worktreePath } = resolveMemoryPaths(
-    loaded,
-    projectId,
-    intentId,
-    destination,
-    space,
-  );
-  const canonicalContent = (await optionalRead(canonicalPath)) ?? "";
-  const worktreeContent = (await optionalRead(worktreePath)) ?? "";
-  const canonicalRevision = contentRevision(canonicalContent);
-  const worktreeRevision = contentRevision(worktreeContent);
-  const head = await readHeadMemory(
-    dirnameFromRelative(worktreePath, relativeMemory),
-    relativeMemory,
-  );
-  const headRevision = head ? contentRevision(head.content) : null;
-  return {
-    project: projectId,
-    intent: intentId,
-    space,
-    destination,
-    canonicalPath,
-    worktreePath,
-    canonicalRevision,
-    worktreeRevision,
-    inSync: canonicalRevision === worktreeRevision,
-    headRevision,
-    mergeClean: headRevision === null ? null : headRevision === worktreeRevision,
-  };
-}
-
-export async function refreshWorktreeMemory(
-  rootInput: string,
-  projectId: string,
-  intentId: string,
-  destination: MemoryDestination,
-  expectedWorktreeRevision: string,
-  space = "default",
-): Promise<MemorySnapshot> {
-  if (!/^[a-f0-9]{64}$/.test(expectedWorktreeRevision)) {
-    throw new PortfolioError("expected worktree revision must be a SHA-256 hash");
-  }
-  assertId(space, "space");
-  const root = resolve(rootInput);
-  return withLock(root, async () => {
-    const loaded = await loadWorkspace(root);
-    const { canonicalPath, relativeMemory, worktreePath } = resolveMemoryPaths(
-      loaded,
-      projectId,
-      intentId,
-      destination,
-      space,
-    );
-    const canonicalContent = (await optionalRead(canonicalPath)) ?? "";
-    const worktreeContent = (await optionalRead(worktreePath)) ?? "";
-    const currentWorktreeRevision = contentRevision(worktreeContent);
-    if (currentWorktreeRevision !== expectedWorktreeRevision) {
-      throw new PortfolioError(
-        `worktree memory changed after inspection: expected ${expectedWorktreeRevision}, current ${currentWorktreeRevision}`,
-      );
-    }
-    await atomicWrite(worktreePath, canonicalContent);
-    const canonicalRevision = contentRevision(canonicalContent);
-    const head = await readHeadMemory(
-      dirnameFromRelative(worktreePath, relativeMemory),
-      relativeMemory,
-    );
-    const headRevision = head ? contentRevision(head.content) : null;
-    return {
-      project: projectId,
-      intent: intentId,
-      space,
-      destination,
-      canonicalPath,
-      worktreePath,
-      canonicalRevision,
-      worktreeRevision: canonicalRevision,
-      inSync: true,
-      headRevision,
-      mergeClean: headRevision === null ? null : headRevision === canonicalRevision,
-    };
-  });
-}
-
-export async function cleanWorktreeMemory(
-  rootInput: string,
-  projectId: string,
-  intentId: string,
-  destination: MemoryDestination,
-  expectedWorktreeRevision: string,
-  space = "default",
-): Promise<MemorySnapshot> {
-  if (!/^[a-f0-9]{64}$/.test(expectedWorktreeRevision)) {
-    throw new PortfolioError("expected worktree revision must be a SHA-256 hash");
-  }
-  assertId(space, "space");
-  const root = resolve(rootInput);
-  return withLock(root, async () => {
-    const loaded = await loadWorkspace(root);
-    const { canonicalPath, relativeMemory, worktreePath } = resolveMemoryPaths(
-      loaded,
-      projectId,
-      intentId,
-      destination,
-      space,
-    );
-    const worktreeContent = (await optionalRead(worktreePath)) ?? "";
-    const currentWorktreeRevision = contentRevision(worktreeContent);
-    if (currentWorktreeRevision !== expectedWorktreeRevision) {
-      throw new PortfolioError(
-        `worktree memory changed after inspection: expected ${expectedWorktreeRevision}, current ${currentWorktreeRevision}`,
-      );
-    }
-    const worktree = dirnameFromRelative(worktreePath, relativeMemory);
-    const head = await readHeadMemory(worktree, relativeMemory);
-    if (!head) {
-      throw new PortfolioError(`worktree is not a Git checkout: ${worktree}`);
-    }
-    if (head.exists) {
-      await atomicWrite(worktreePath, head.content);
-    } else {
-      await rm(worktreePath, { force: true });
-    }
-    const canonicalContent = (await optionalRead(canonicalPath)) ?? "";
-    const cleanedContent = head.exists ? head.content : "";
-    return {
-      project: projectId,
-      intent: intentId,
-      space,
-      destination,
-      canonicalPath,
-      worktreePath,
-      canonicalRevision: contentRevision(canonicalContent),
-      worktreeRevision: contentRevision(cleanedContent),
-      inSync: canonicalContent === cleanedContent,
-      headRevision: contentRevision(cleanedContent),
-      mergeClean: true,
-    };
-  });
 }
 
 export async function registerLearningProposal(
@@ -1331,13 +1223,7 @@ export async function registerLearningProposal(
 
   return withLock(root, async () => {
     const loaded = await loadWorkspace(root);
-    resolveMemoryPaths(
-      loaded,
-      input.project,
-      input.intent,
-      input.destination,
-      input.space,
-    );
+    assertLearningTarget(loaded, input.project, input.intent, input.space);
     const target = learningPath(root, input.id);
     if (await pathExists(target)) {
       throw new PortfolioError(`learning proposal already exists: ${input.id}`);
@@ -1367,86 +1253,47 @@ export async function listLearningProposals(
   );
 }
 
-export async function reconcileLearningProposal(
+export async function promoteLearningProposal(
   rootInput: string,
   id: string,
-  note: string,
-): Promise<{ id: string; baseRevision: string }> {
-  if (!note.trim()) {
-    throw new PortfolioError("reconciliation note must not be empty");
+  promotedBy: string,
+  memoryKey?: string,
+): Promise<{ id: string; outcome: "promoted"; scope: string; memoryType: string }> {
+  if (!promotedBy.trim()) {
+    throw new PortfolioError(
+      "promoted-by must identify the supervisor who reviewed the learning",
+    );
   }
   const root = resolve(rootInput);
   return withLock(root, async () => {
     const proposal = await readLearningProposal(root, id);
     requirePending(proposal);
     const loaded = await loadWorkspace(root);
-    const { canonicalPath } = resolveMemoryPaths(
-      loaded,
-      proposal.project,
-      proposal.intent,
-      proposal.destination,
-      proposal.space,
-    );
-    const revision = contentRevision((await optionalRead(canonicalPath)) ?? "");
+    assertLearningTarget(loaded, proposal.project, proposal.intent, proposal.space);
+    // Durable learnings live in CAO native memory. The supervisor performs the
+    // actual write with the memory_store MCP tool (scope project, memory_type
+    // feedback); this utility only records that the review happened and which
+    // CAO memory entry the proposal was promoted into. There is no canonical
+    // file write and no compare-and-swap: CAO memory owns durability.
+    // scope/memoryType are fixed here: every promoted learning lands at
+    // project scope as feedback. proposal.destination ("project" | "team")
+    // is informational only at this point -- it records what the runner
+    // believed the learning was about, but does not change where or how
+    // promotion stores it.
+    const scope = "project";
+    const memoryType = "feedback";
     const now = new Date().toISOString();
-    proposal.reconciliations = [
-      ...(proposal.reconciliations ?? []),
-      {
-        note: note.trim(),
-        reconciledAt: now,
-        previousRevision: proposal.baseRevision,
-      },
-    ];
-    proposal.baseRevision = revision;
-    proposal.updatedAt = now;
-    await atomicWrite(learningPath(root, id), stringify(proposal));
-    return { id, baseRevision: revision };
-  });
-}
-
-export async function approveLearningProposal(
-  rootInput: string,
-  id: string,
-): Promise<{ id: string; outcome: "applied" | "already-present"; path: string }> {
-  const root = resolve(rootInput);
-  return withLock(root, async () => {
-    const proposal = await readLearningProposal(root, id);
-    requirePending(proposal);
-    const loaded = await loadWorkspace(root);
-    const { canonicalPath } = resolveMemoryPaths(
-      loaded,
-      proposal.project,
-      proposal.intent,
-      proposal.destination,
-      proposal.space,
-    );
-    const content = (await optionalRead(canonicalPath)) ?? "";
-    const marker = `<!-- portfolio-learning:${proposal.id} -->`;
-    const alreadyPresent =
-      content.includes(marker) || containsEquivalentRule(content, proposal.rule);
-    const currentRevision = contentRevision(content);
-    if (!alreadyPresent && currentRevision !== proposal.baseRevision) {
-      throw new PortfolioError(
-        `learning proposal ${id} is stale: base ${proposal.baseRevision}, current ${currentRevision}; reconcile it before approval`,
-      );
-    }
-
-    if (!alreadyPresent) {
-      await atomicWrite(
-        canonicalPath,
-        appendRule(content, proposal.heading, proposal.rule, marker),
-      );
-    }
-    const now = new Date().toISOString();
-    proposal.status = "applied";
-    proposal.appliedAt = now;
-    proposal.updatedAt = now;
-    await atomicWrite(learningPath(root, id), stringify(proposal));
-    return {
-      id,
-      outcome: alreadyPresent ? "already-present" : "applied",
-      path: canonicalPath,
+    proposal.status = "promoted";
+    proposal.promotedAt = now;
+    proposal.promotedBy = promotedBy.trim();
+    proposal.memory = {
+      scope,
+      memoryType,
+      ...(memoryKey?.trim() ? { key: memoryKey.trim() } : {}),
     };
+    proposal.updatedAt = now;
+    await atomicWrite(learningPath(root, id), stringify(proposal));
+    return { id, outcome: "promoted", scope, memoryType };
   });
 }
 
@@ -1781,13 +1628,12 @@ async function hasAidlcHarness(worktree: string): Promise<boolean> {
   return false;
 }
 
-function resolveMemoryPaths(
+function assertLearningTarget(
   loaded: LoadedWorkspace,
   projectId: string,
   intentId: string,
-  destination: MemoryDestination,
   space: string,
-): { canonicalPath: string; worktreePath: string; relativeMemory: string } {
+): void {
   const project = loaded.projects.find((item) => item.id === projectId);
   const intent = loaded.intents.find((item) => item.id === intentId);
   const mapping = intent?.projects.find((item) => item.project === projectId);
@@ -1800,22 +1646,6 @@ function resolveMemoryPaths(
       `intent ${intentId} project ${projectId} uses AI-DLC space ${assignedSpace}, not ${space}`,
     );
   }
-  const relativeMemory = join("aidlc", "spaces", space, "memory", `${destination}.md`);
-  const repository = resolveInside(
-    loaded.root,
-    project.repository,
-    workspacePaths(loaded.root).repositories,
-  );
-  const worktree = resolveInside(
-    loaded.root,
-    mapping.worktree,
-    workspacePaths(loaded.root).worktrees,
-  );
-  return {
-    canonicalPath: join(repository, relativeMemory),
-    worktreePath: join(worktree, relativeMemory),
-    relativeMemory,
-  };
 }
 
 async function validateLearningProposal(proposal: LearningProposal): Promise<void> {
@@ -2321,50 +2151,6 @@ function contentRevision(content: string): string {
   return createHash("sha256").update(content).digest("hex");
 }
 
-function containsEquivalentRule(content: string, rule: string): boolean {
-  const expected = normalizeRule(rule);
-  return content
-    .split(/\r?\n/)
-    .filter((line) => line.trimStart().startsWith("- "))
-    .some((line) => normalizeRule(line) === expected);
-}
-
-function normalizeRule(rule: string): string {
-  return rule
-    .replace(/^\s*-\s*/, "")
-    .replace(/\s*<!--[\s\S]*?-->\s*$/, "")
-    .replace(/\s+\(learned \d{4}-\d{2}-\d{2}\)\s*$/, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLocaleLowerCase();
-}
-
-function appendRule(
-  content: string,
-  heading: string,
-  rule: string,
-  marker: string,
-): string {
-  const normalized = content.replace(/\s+$/, "");
-  const section = `## ${heading}`;
-  const entry = `- ${rule.trim()} ${marker}`;
-  if (!normalized) {
-    return `${section}\n\n${entry}\n`;
-  }
-
-  const lines = normalized.split(/\r?\n/);
-  const sectionIndex = lines.findIndex((line) => line.trim() === section);
-  if (sectionIndex === -1) {
-    return `${normalized}\n\n${section}\n\n${entry}\n`;
-  }
-  const nextSection = lines.findIndex(
-    (line, index) => index > sectionIndex && line.startsWith("## "),
-  );
-  const insertionIndex = nextSection === -1 ? lines.length : nextSection;
-  lines.splice(insertionIndex, 0, entry, "");
-  return `${lines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd()}\n`;
-}
-
 function resolveInside(root: string, value: string, boundary: string): string {
   const resolved = resolve(root, value);
   const boundaryResolved = resolve(boundary);
@@ -2530,56 +2316,6 @@ async function runCommand(command: string[]): Promise<void> {
       `${command.join(" ")} failed (${exitCode}): ${stderr.trim() || stdout.trim()}`,
     );
   }
-}
-
-async function readHeadMemory(
-  worktree: string,
-  relativeMemory: string,
-): Promise<{ exists: boolean; content: string } | null> {
-  if (!(await pathExists(join(worktree, ".git")))) return null;
-  const gitPath = relativeMemory.split(sep).join("/");
-  await runGitForMemory(worktree, ["rev-parse", "--verify", "HEAD^{commit}"]);
-  const treeEntry = await runGitForMemory(worktree, [
-    "ls-tree",
-    "--name-only",
-    "HEAD",
-    "--",
-    gitPath,
-  ]);
-  if (!treeEntry.trim()) return { exists: false, content: "" };
-  const content = await runGitForMemory(worktree, ["show", `HEAD:${gitPath}`]);
-  return { exists: true, content };
-}
-
-async function runGitForMemory(
-  worktree: string,
-  args: string[],
-): Promise<string> {
-  const child = Bun.spawn(["git", "-C", worktree, ...args], {
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ]);
-  if (exitCode !== 0) {
-    throw new PortfolioError(
-      `cannot inspect worktree memory with git ${args.join(" ")}: ${
-        stderr.trim() || stdout.trim()
-      }`,
-    );
-  }
-  return stdout;
-}
-
-function dirnameFromRelative(file: string, relativePath: string): string {
-  let root = file;
-  for (const _part of relativePath.split(sep)) {
-    root = dirname(root);
-  }
-  return root;
 }
 
 export function errorMessage(error: unknown): string {

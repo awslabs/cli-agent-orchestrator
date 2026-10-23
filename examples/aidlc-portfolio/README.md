@@ -95,8 +95,10 @@ The deterministic utility provides:
   eight dependency types;
 - revision-bound human confirmation before dispatch;
 - one Git worktree and child session record per project/intent pair;
-- unanswered Markdown question packets for child design decisions;
-- a single-writer proposal model for shared AI-DLC memory;
+- unanswered Markdown question packets for child design decisions, resolved
+  only through an approval bound to CAO's human-approval surface;
+- a reviewed proposal flow that promotes durable learnings into CAO's native
+  memory (`memory_store`/`memory_recall`) instead of a hand-built file;
 - structured child completion results and cycle-safe upstream/downstream
   convergence checks.
 
@@ -214,13 +216,13 @@ The supervisor should:
 ```text
 Coordinate issues 321 and 510 in the same repository as independent AI-DLC
 intents. Use a separate branch, worktree, and child session for each. Identify
-shared components and integration dependencies before dispatch. Treat project
-and team memory as single-writer shared state.
+shared components and integration dependencies before dispatch.
 ```
 
-The two children have isolated files and AI-DLC state. They submit durable
-project or team learnings as proposals; only the supervisor can serialize an
-approved update into canonical memory.
+The two children have isolated files and AI-DLC state. Each treats its
+worktree-local `project.md`/`team.md` as scratch and submits durable learnings
+as proposals; only the supervisor reviews a proposal and promotes it into CAO's
+native memory.
 
 ## Human Control Points
 
@@ -233,8 +235,8 @@ keeps the human involved at four boundaries:
    unchanged Markdown packet.
 3. **Convergence**: accept or resolve revision-bound breaking, deferred, or
    unknown integration risks.
-4. **Shared memory**: review project/team learning proposals before the utility
-   performs the canonical write.
+4. **Shared memory**: review project/team learning proposals before the
+   supervisor promotes one into CAO's native memory.
 
 Missing child results and incomplete dependency ordering cannot be accepted;
 they must be remediated.

@@ -152,8 +152,6 @@ describe("portfolio lifecycle", () => {
       rule: "Keep integration decisions explicit.",
       evidence: ["Observed during integration."],
       source: { stage: "build-and-test" },
-      baseRevision:
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     });
     await registerLearningProposal(root, proposal);
     await expect(advanceLifecycle(root, "learn")).rejects.toThrow(

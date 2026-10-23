@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,8 +10,7 @@ import {
 import {
   advanceLifecycle,
   answerQuestionPacket,
-  approveLearningProposal,
-  cleanWorktreeMemory,
+  promoteLearningProposal,
   confirmDiscovery,
   PortfolioError,
   checkDispatch,
@@ -21,15 +19,14 @@ import {
   initializeWorkspace,
   listLearningProposals,
   listQuestionPackets,
-  memorySnapshot,
-  pathExists,
-  reconcileLearningProposal,
-  refreshWorktreeMemory,
+  recordHumanApproval,
   registerDocument,
   registerLearningProposal,
+  rejectLearningProposal,
   submitQuestionPacket,
   updateSession,
   validateWorkspace,
+  pathExists,
 } from "../skills/aidlc-portfolio/scripts/lib.ts";
 
 const temporaryRoots: string[] = [];
@@ -320,28 +317,21 @@ describe("portfolio workspace", () => {
     expect(await pathExists(join(worktree, ".git"))).toBe(true);
     expect(await readFile(join(worktree, "README.md"), "utf8")).toBe("# API\n");
 
+    // Per-space worktree memory is now LOCAL scratch, not a merge barrier:
+    // durable learnings live in CAO memory, so a worktree project.md no longer
+    // blocks session completion.
     const localMemory = join(
       worktree,
       "aidlc/spaces/default/memory/project.md",
     );
     await mkdir(join(localMemory, ".."), { recursive: true });
     await writeFile(localMemory, "## Corrections\n\n- Temporary child learning.\n");
-    await expect(updateSession(root, "feature", "api", "completed")).rejects.toThrow(
-      "contains worktree changes",
-    );
-    const snapshot = await memorySnapshot(root, "api", "feature", "project");
-    expect(snapshot.mergeClean).toBe(false);
-    await cleanWorktreeMemory(
-      root,
-      "api",
-      "feature",
-      "project",
-      snapshot.worktreeRevision,
-    );
-    expect(await pathExists(localMemory)).toBe(false);
     await expect(
       updateSession(root, "feature", "api", "completed"),
     ).resolves.toBeUndefined();
+    expect(await readFile(localMemory, "utf8")).toBe(
+      "## Corrections\n\n- Temporary child learning.\n",
+    );
   });
 
   test("blocks dispatch until portfolio discovery is explicitly accepted", async () => {
@@ -439,6 +429,35 @@ describe("portfolio workspace", () => {
       updateSession(root, "feature", "api", "active"),
     ).rejects.toThrow("has unanswered human questions");
 
+    const answered = join(root, "human-answers.md");
+    const answeredText = questionText.replace(
+      "[Answer]:",
+      "[Answer]: A. SQL, because transactional consistency is required.",
+    );
+    await writeFile(answered, answeredText);
+
+    // MECHANISM: the answerer is not a free-text argument. An id with no
+    // matching, unconsumed approval record is refused outright — the agent
+    // cannot resolve the packet by asserting an identity through this flag.
+    // (This is a protocol-shape guarantee, not a write-access guarantee: see
+    // recordHumanApproval below and coordination-rules.md §Human Questions.)
+    await expect(
+      answerQuestionPacket(root, "feature-storage", answered, "guided", "forged-approval"),
+    ).rejects.toThrow("no human-surface approval found");
+
+    // recordHumanApproval stands in for CAO's real human-approval surface.
+    // In this sample it is a JSON file under the agent's own write reach, so
+    // the no-agent-CLI-subcommand-mints-this property holds, but a real
+    // write-access boundary needs the record to live outside the agent's
+    // reach or be signed with a key it doesn't hold.
+    await recordHumanApproval(
+      root,
+      "feature-storage-approval",
+      "feature-storage",
+      "Portfolio owner",
+    );
+
+    // An altered question body is still rejected even with a valid approval.
     const altered = join(root, "altered-answers.md");
     await writeFile(
       altered,
@@ -447,22 +466,52 @@ describe("portfolio workspace", () => {
         .replace("[Answer]:", "[Answer]: A. SQL"),
     );
     await expect(
-      answerQuestionPacket(root, "feature-storage", altered, "chat", "Portfolio owner"),
+      answerQuestionPacket(
+        root,
+        "feature-storage",
+        altered,
+        "chat",
+        "feature-storage-approval",
+      ),
     ).rejects.toThrow("changed generated question text");
 
-    const answered = join(root, "human-answers.md");
-    const answeredText = questionText.replace(
-      "[Answer]:",
-      "[Answer]: A. SQL, because transactional consistency is required.",
+    // An approval minted for a DIFFERENT packet cannot resolve this one.
+    await recordHumanApproval(
+      root,
+      "other-packet-approval",
+      "other-packet",
+      "Portfolio owner",
     );
-    await writeFile(answered, answeredText);
-    await answerQuestionPacket(
+    await expect(
+      answerQuestionPacket(
+        root,
+        "feature-storage",
+        answered,
+        "guided",
+        "other-packet-approval",
+      ),
+    ).rejects.toThrow("authorizes packet other-packet");
+
+    const resolved = await answerQuestionPacket(
       root,
       "feature-storage",
       answered,
       "guided",
-      "Portfolio owner",
+      "feature-storage-approval",
     );
+    // The identity is derived from the verified approval record, never the caller.
+    expect(resolved.answeredBy).toBe("Portfolio owner");
+
+    // The approval is single-use: it cannot be replayed to resolve again.
+    await expect(
+      answerQuestionPacket(
+        root,
+        "feature-storage",
+        answered,
+        "guided",
+        "feature-storage-approval",
+      ),
+    ).rejects.toThrow("already answered");
 
     expect(
       await readFile(
@@ -470,6 +519,14 @@ describe("portfolio workspace", () => {
         "utf8",
       ),
     ).toBe(answeredText);
+    const packetMeta = JSON.parse(
+      await readFile(
+        join(root, "portfolio/questions/feature-storage.json"),
+        "utf8",
+      ),
+    );
+    expect(packetMeta.answeredBy).toBe("Portfolio owner");
+    expect(packetMeta.approvalId).toBe("feature-storage-approval");
     const stateActive = JSON.parse(
       await readFile(join(root, "portfolio/state.json"), "utf8"),
     );
@@ -479,40 +536,6 @@ describe("portfolio workspace", () => {
       await readFile(join(root, "portfolio/state.json"), "utf8"),
     );
     expect(stateCompleted.activeIntent).toBeNull();
-  });
-
-  test("preserves worktree memory when HEAD cannot be inspected", async () => {
-    const root = await temporaryRoot();
-    await initializeWorkspace(root, "sample-portfolio", "Sample Portfolio");
-    await registerProject(root, "api");
-    await registerIntent(root, {
-      id: "feature",
-      projects: [
-        {
-          project: "api",
-          aidlcIntent: "feature-api",
-          branch: "feat/feature-api",
-          worktree: "worktrees/api/feature",
-          dependsOn: [],
-        },
-      ],
-    });
-    const worktree = join(root, "worktrees/api/feature");
-    await mkdir(worktree, { recursive: true });
-    await runGit(worktree, ["init", "-b", "feat/feature-api"]);
-    const memory = join(
-      worktree,
-      "aidlc/spaces/default/memory/project.md",
-    );
-    const content = "## Corrections\n\n- Keep this child learning.\n";
-    await mkdir(join(memory, ".."), { recursive: true });
-    await writeFile(memory, content);
-    const revision = createHash("sha256").update(content).digest("hex");
-
-    await expect(
-      cleanWorktreeMemory(root, "api", "feature", "project", revision),
-    ).rejects.toThrow("cannot inspect worktree memory");
-    expect(await readFile(memory, "utf8")).toBe(content);
   });
 
   test("rejects question packets that a runner has already answered", async () => {
@@ -546,7 +569,7 @@ describe("portfolio workspace", () => {
     ).rejects.toThrow("must not contain answers");
   });
 
-  test("serializes parallel learning proposals against canonical memory", async () => {
+  test("reviews durable learnings before promoting them into CAO memory", async () => {
     const root = await temporaryRoot();
     await initializeWorkspace(root, "sample-portfolio", "Sample Portfolio");
     await registerProject(root, "api");
@@ -562,86 +585,53 @@ describe("portfolio workspace", () => {
         },
       ],
     });
-    const canonical = join(
-      root,
-      "repositories/api/aidlc/spaces/default/memory/project.md",
-    );
-    const worktree = join(
-      root,
-      "worktrees/api/feature/aidlc/spaces/default/memory/project.md",
-    );
-    await mkdir(join(canonical, ".."), { recursive: true });
-    await mkdir(join(worktree, ".."), { recursive: true });
-    const initial = "# Project Memory\n\n## Corrections\n";
-    await writeFile(canonical, initial);
-    await writeFile(worktree, initial);
-    const snapshot = await memorySnapshot(root, "api", "feature", "project");
 
-    const first = await learningFile(root, "first-rule", snapshot.canonicalRevision, {
+    // Durable learnings no longer go through a canonical-file CAS. The runner
+    // PROPOSES; the supervisor REVIEWS, then either promotes (recording that it
+    // wrote the learning into CAO memory via memory_store) or rejects.
+    const first = await learningFile(root, "first-rule", {
       rule: "Construct service clients lazily inside request handlers.",
     });
-    const second = await learningFile(
-      root,
-      "second-rule",
-      snapshot.canonicalRevision,
-      {
-        rule: "Require a focused test for each new request handler.",
-      },
-    );
+    const second = await learningFile(root, "second-rule", {
+      rule: "Require a focused test for each new request handler.",
+    });
     await registerLearningProposal(root, first);
     await registerLearningProposal(root, second);
 
-    await expect(approveLearningProposal(root, "first-rule")).resolves.toMatchObject({
-      outcome: "applied",
-    });
-    await expect(approveLearningProposal(root, "second-rule")).rejects.toThrow(
-      "is stale",
-    );
-
-    await reconcileLearningProposal(
+    const promoted = await promoteLearningProposal(
       root,
-      "second-rule",
-      "Reviewed against the newly applied client-lifecycle rule; no conflict.",
+      "first-rule",
+      "Portfolio supervisor",
     );
-    await expect(approveLearningProposal(root, "second-rule")).resolves.toMatchObject({
-      outcome: "applied",
+    expect(promoted).toMatchObject({
+      outcome: "promoted",
+      scope: "project",
+      memoryType: "feedback",
     });
+    await rejectLearningProposal(root, "second-rule", "Not durable.");
 
-    const content = await readFile(canonical, "utf8");
-    expect(content).toContain("portfolio-learning:first-rule");
-    expect(content).toContain("portfolio-learning:second-rule");
-    const proposals = await listLearningProposals(root, "api");
-    expect(proposals.map((proposal) => proposal.status)).toEqual([
-      "applied",
-      "applied",
-    ]);
-
-    await expect(updateSession(root, "feature", "api", "completed")).rejects.toThrow(
-      "contains worktree changes",
-    );
-    const staleWorktree = await memorySnapshot(root, "api", "feature", "project");
+    // Promotion is single-use review: a decided proposal cannot be re-promoted.
     await expect(
-      refreshWorktreeMemory(
-        root,
-        "api",
-        "feature",
-        "project",
-        "0000000000000000000000000000000000000000000000000000000000000000",
-      ),
-    ).rejects.toThrow("changed after inspection");
-    await refreshWorktreeMemory(
-      root,
-      "api",
-      "feature",
-      "project",
-      staleWorktree.worktreeRevision,
-    );
+      promoteLearningProposal(root, "first-rule", "Portfolio supervisor"),
+    ).rejects.toThrow("is promoted");
+
+    const proposals = await listLearningProposals(root, "api");
+    const byId = Object.fromEntries(proposals.map((p) => [p.id, p]));
+    expect(byId["first-rule"]?.status).toBe("promoted");
+    expect(byId["first-rule"]?.promotedBy).toBe("Portfolio supervisor");
+    expect(byId["first-rule"]?.memory).toMatchObject({
+      scope: "project",
+      memoryType: "feedback",
+    });
+    expect(byId["second-rule"]?.status).toBe("rejected");
+
+    // A worktree project.md is local scratch and never blocks completion.
     await expect(
       updateSession(root, "feature", "api", "completed"),
     ).resolves.toBeUndefined();
   });
 
-  test("treats an equivalent canonical rule as an idempotent approval", async () => {
+  test("refuses to promote a learning that is not reviewed by a named supervisor", async () => {
     const root = await temporaryRoot();
     await initializeWorkspace(root, "sample-portfolio", "Sample Portfolio");
     await registerProject(root, "api");
@@ -657,30 +647,25 @@ describe("portfolio workspace", () => {
         },
       ],
     });
-    const canonical = join(
-      root,
-      "repositories/api/aidlc/spaces/default/memory/project.md",
-    );
-    await mkdir(join(canonical, ".."), { recursive: true });
-    await writeFile(
-      canonical,
-      "## Testing Posture\n\n- Require pytest coverage for every handler.\n",
-    );
-    const proposal = await learningFile(
-      root,
-      "duplicate-rule",
-      "0000000000000000000000000000000000000000000000000000000000000000",
-      {
-        heading: "Testing Posture",
-        rule: "Require pytest coverage for every handler.",
-      },
-    );
+    const proposal = await learningFile(root, "needs-review", {
+      heading: "Testing Posture",
+      rule: "Require pytest coverage for every handler.",
+    });
     await registerLearningProposal(root, proposal);
 
-    const result = await approveLearningProposal(root, "duplicate-rule");
-    const content = await readFile(canonical, "utf8");
-    expect(result.outcome).toBe("already-present");
-    expect(content.match(/Require pytest coverage/g)?.length).toBe(1);
+    await expect(
+      promoteLearningProposal(root, "needs-review", "   "),
+    ).rejects.toThrow("promoted-by must identify the supervisor");
+
+    const result = await promoteLearningProposal(
+      root,
+      "needs-review",
+      "Portfolio supervisor",
+      "api/testing-posture",
+    );
+    expect(result.outcome).toBe("promoted");
+    const [stored] = await listLearningProposals(root, "api", "promoted");
+    expect(stored?.memory?.key).toBe("api/testing-posture");
   });
 
   test("rejects malformed and wrong-space learning proposals", async () => {
@@ -712,7 +697,6 @@ describe("portfolio workspace", () => {
     const wrongSpace = await learningFile(
       root,
       "wrong-space",
-      "0000000000000000000000000000000000000000000000000000000000000000",
       { rule: "This proposal targets the wrong space." },
     );
     await expect(registerLearningProposal(root, wrongSpace)).rejects.toThrow(
@@ -850,7 +834,6 @@ async function discoveryFile(
 async function learningFile(
   root: string,
   id: string,
-  baseRevision: string,
   overrides: { heading?: string; rule: string },
 ): Promise<string> {
   return writeYaml(root, `${id}.yaml`, {
@@ -864,7 +847,6 @@ async function learningFile(
     rule: overrides.rule,
     evidence: ["Observed while running the child AI-DLC intent."],
     source: { stage: "build-and-test" },
-    baseRevision,
   });
 }
 
