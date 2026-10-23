@@ -883,7 +883,7 @@ class TestHandoffEarlyTerminalId:
         mock_create.assert_not_called()
 
 
-class TestHandoffCreateTimeoutCoversProviderFloors:
+class TestHandoffSlowCreateSurfacesTerminalId:
     """A slow but successful create must surface its terminal_id. The single
     attempt's budget comes from ``synchronous_create_timeout`` (issue #710);
     starts slower than that are covered by the keyed retry and the lookup in
@@ -1311,6 +1311,59 @@ class TestHandoffCreateTimeoutRecovery:
         assert exc_info.value is refusal
         assert mock_create.call_count == 2
         assert not any(c.kwargs.get("lookup_only") for c in mock_create.call_args_list)
+
+    def test_claim_424_through_the_real_create_keeps_its_status(self, monkeypatch):
+        """Both halves of the 424 rule with a claim: ``_create_terminal`` puts the
+        HTTP status on its generic refusal, and ``_create_handoff_terminal`` reads
+        it. Only the HTTP calls are test doubles here."""
+        import requests
+
+        from cli_agent_orchestrator.utils import orchestration
+        from cli_agent_orchestrator.utils.orchestration import (
+            EphemeralClaim,
+            _ClaimRefused,
+            _create_handoff_terminal,
+        )
+
+        failed = MagicMock(status_code=424)
+        failed.json.return_value = {"detail": "terminal 'dev-failed' failed to initialize"}
+        calls = []
+
+        def post(url, **kwargs):
+            calls.append(kwargs.get("params") or {})
+            if len(calls) == 1:
+                raise requests.exceptions.ReadTimeout("read timed out")
+            return failed
+
+        def get(url, **_kwargs):
+            # An ephemeral handoff always runs from a supervisor terminal.
+            response = MagicMock(status_code=200)
+            if url.endswith("/working-directory"):
+                response.json.return_value = {"working_directory": "/work"}
+            else:
+                response.json.return_value = {"provider": "claude_code", "session_name": "cao-s"}
+            return response
+
+        monkeypatch.setattr(orchestration, "_current_terminal_id", lambda: "sup-1")
+        monkeypatch.setattr(orchestration.requests, "get", get)
+        monkeypatch.setattr(orchestration.requests, "post", post)
+        monkeypatch.setattr(orchestration, "synchronous_create_timeout", lambda *_a, **_k: 1.0)
+
+        with pytest.raises(_ClaimRefused) as exc_info:
+            _create_handoff_terminal(
+                "dev",
+                None,
+                engine=None,
+                model=None,
+                use_worktree=False,
+                idempotency_key="k",
+                claim=EphemeralClaim("claude_code", [], "claim-1"),
+            )
+
+        assert exc_info.value.status_code == 424
+        assert exc_info.value.rule == "unexpected_failure"
+        assert len(calls) == 2
+        assert not any(params.get("lookup_only") for params in calls)
 
     @patch("cli_agent_orchestrator.utils.orchestration._create_terminal")
     def test_claim_refusal_on_the_first_attempt_is_raised(self, mock_create):
