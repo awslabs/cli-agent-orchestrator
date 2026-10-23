@@ -79,8 +79,8 @@ SETTLED_LINES = [
 # parenthetical is the spinner's own status shape, so these rows are
 # byte-for-byte a live spinner with a non-gerund message (#908, #956). No
 # regex can reject them without also rejecting that spinner; what makes them
-# settled is their POSITION: the end-of-turn summary is the newest row above
-# the input box, not the response. They are therefore guarded through the
+# settled is their POSITION: the end-of-turn summary is the newest
+# conversation row above the input box, not the response. They are therefore guarded through the
 # public status paths in the finished-turn frame (TestSettledFrameNeverPins
 # Processing), not against each pattern in isolation.
 SETTLED_STATUS_ROWS = [
@@ -91,7 +91,7 @@ SETTLED_STATUS_ROWS = [
     "● Refactoring complete… (3m 12s)",
 ]
 ALL_SETTLED_LINES = SETTLED_LINES + SETTLED_STATUS_ROWS
-# The newest row above the box once a turn has finished (GH #865).
+# The newest conversation row above the box once a turn has finished (GH #865).
 END_OF_TURN_SUMMARY = "✻ Worked for 3m 12s"
 
 # Live spinner lines, for the opposite direction: narrowing a busy pattern must
@@ -213,7 +213,7 @@ def test_busy_pattern_rejects_settled_output(qualname, pattern):
         f"pattern that matches finished output pins PROCESSING wherever it is "
         f"applied to rows that have settled (GH #974). Anchor the match on "
         f"something only the spinner prints, or scope the call site to the row "
-        f"the spinner can occupy (the newest row above the input box) and add "
+        f"the spinner can occupy (the newest conversation row above the input box, see _newest_conversation_row) and add "
         f"{qualname} to KNOWN_LOOSE naming that scope."
     )
 
@@ -227,7 +227,8 @@ def test_known_loose_entries_are_still_real_and_still_loose(qualname):
     ), f"{qualname} is tight now; drop it from KNOWN_LOOSE so it is guarded"
 
 
-# The two patterns claude_code applies to the newest row above the input box,
+# The two patterns claude_code applies to the newest conversation row above
+# the input box (_newest_conversation_row),
 # in get_status()'s input-box walk and in get_status_from_screen(). A live
 # spinner that neither matches reads COMPLETED there, the #908 failure.
 BOX_ROW_PATTERNS = (
