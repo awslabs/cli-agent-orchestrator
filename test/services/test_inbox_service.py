@@ -2008,3 +2008,184 @@ class TestInboxRecoveryCoverageByProvider:
     def test_the_issue_78_reporters_have_a_composer_reader(self):
         assert "claude_code" not in self.NO_RECOVERY
         assert "kiro_cli" not in self.NO_RECOVERY
+
+
+class TestDialogGuardCoversSubmitRecovery:
+    """#896's dialog guard must hold on #1004's recovery path too.
+
+    The merge of #1004 into this branch put a second machine-originated submit
+    into the delivery path: ``redeliver_dropped_message_with_boundary``'s bare
+    Enter, which submits whatever is already in the composer and therefore never
+    reaches ``dispatch_input`` -- where #896's guard lives. An Enter into an open
+    choice widget is worse than a paste: it submits the highlighted option, so an
+    inbox message's recovery would answer a question reserved for a human, with
+    no text involved at all.
+
+    These tests drive both features on one delivery: #1004's swallowed-Enter
+    recovery against a receiver that #896 says must not be written to.
+    """
+
+    MESSAGE = "MSG1: refactor module A so the retry policy lives in one place"
+
+    #: The providers where the two features can meet at all: they block
+    #: orchestrated input while waiting on a user answer (so #896 applies) AND
+    #: they can read their own composer (so #1004's bare-Enter branch is
+    #: reachable). Pinned because the guard below only matters for this set, and
+    #: a provider joining it should come with that fact in view.
+    OVERLAP = {"claude_code", "codex"}
+
+    def test_overlap_set_is_still_these_two_providers(self):
+        """Enumerated, not assumed: which providers both features apply to."""
+        from cli_agent_orchestrator.providers.base import BaseProvider
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+
+        overlap = set()
+        for provider_type in ProviderType:
+            cls = ProviderManager.provider_class(provider_type.value)
+            provider = TestInboxRecoveryNeverDuplicates._make_provider(cls)
+            reads_composer = (
+                cls.extract_current_composer is not BaseProvider.extract_current_composer
+            )
+            if provider.blocks_orchestrated_input_while_waiting_user_answer and reads_composer:
+                overlap.add(provider_type.value)
+        assert overlap == self.OVERLAP, (
+            "The set of providers that both block dialogs and read their composer "
+            "changed. A provider joining it becomes subject to the bare-Enter dialog "
+            "guard below; confirm that is what you want, then update OVERLAP."
+        )
+
+    @pytest.mark.parametrize("provider_type", sorted(OVERLAP))
+    def test_real_dialog_captures_hide_the_composer(self, provider_type):
+        """Why this is latent rather than live today.
+
+        On every real dialog capture in test/providers/fixtures the prompt
+        replaces the composer box, so ``extract_current_composer`` returns None
+        and the inbox path (``full_resend_requires_composer_evidence=True``)
+        sends nothing at all. That is what keeps the unguarded bare Enter out of
+        reach -- a property of these two extractors, not an invariant, which is
+        exactly why the guard is checked explicitly rather than inherited.
+        """
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+
+        provider = TestInboxRecoveryNeverDuplicates._make_provider(
+            ProviderManager.provider_class(provider_type)
+        )
+        fixtures = sorted(TestInboxRecoveryNeverDuplicates.FIXTURES.glob(f"{provider_type}*"))
+        dialogs = [
+            path
+            for path in fixtures
+            if provider.get_status(path.read_text()) == TerminalStatus.WAITING_USER_ANSWER
+        ]
+        if not dialogs:
+            pytest.skip(f"no WAITING_USER_ANSWER capture for {provider_type}")
+        for path in dialogs:
+            assert provider.extract_current_composer(path.read_text()) is None, (
+                f"{path.name} now exposes a composer while a dialog is open; the "
+                "bare-Enter guard in redeliver_dropped_message_with_boundary is what "
+                "keeps that from answering the dialog"
+            )
+
+    def _deliver_with_dialog_open(self, blocks_dialog, composer_text):
+        """One inbox delivery whose Enter was swallowed, with a dialog now open.
+
+        The receiver reads IDLE when the paste is dispatched (so #896's guard in
+        ``dispatch_input`` lets the delivery through) and WAITING_USER_ANSWER
+        afterwards, with a composer that still shows the message -- the
+        forward-looking shape the real extractors do not produce today. That is
+        #1004's bare-Enter case landing on #896's forbidden state.
+        """
+        from cli_agent_orchestrator.services import terminal_service as ts
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+        statuses = [TerminalStatus.IDLE]
+        enters: list[str] = []
+        pastes: list[str] = []
+
+        provider = MagicMock()
+        provider.blocks_orchestrated_input_while_waiting_user_answer = blocks_dialog
+        provider.supports_direct_status_probe = False
+        provider.execution_evidence_ambiguous = False
+        provider.paste_enter_count = 1
+        provider.extract_current_composer.return_value = composer_text
+
+        sm = MagicMock()
+        sm.get_status.side_effect = lambda _tid: statuses[-1]
+        sm.output_generation.return_value = 7
+        # Never post-boundary: the delivery is never confirmed, so the recovery
+        # always runs. The dialog opens as soon as the paste lands.
+        sm.status_observation.side_effect = lambda _tid: StatusObservation(statuses[-1], 7)
+
+        def fake_send_keys(*_a, **_k):
+            pastes.append("paste")
+            # The dialog is up from the moment the paste lands: the Enter was
+            # swallowed, so nothing of ours was submitted.
+            statuses.append(TerminalStatus.WAITING_USER_ANSWER)
+
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        backend.send_keys.side_effect = fake_send_keys
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRM_TIMEOUT", 0.0
+            ),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+                return_value=[_make_message(message=self.MESSAGE)],
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.update_message_status"),
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", sm),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_backend",
+                return_value=backend,
+            ),
+            patch.object(ts, "get_backend", return_value=backend),
+            patch.object(ts, "status_monitor", sm),
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={
+                    "tmux_session": "s",
+                    "tmux_window": "w",
+                    "provider": "claude_code",
+                },
+            ),
+            patch.object(ts.provider_manager, "get_provider", return_value=provider),
+            patch.object(ts, "inject_memory_context", side_effect=lambda m, *a: m),
+            patch.object(ts, "update_last_active"),
+            patch.object(ts, "send_special_key", side_effect=lambda _tid, key: enters.append(key)),
+            patch.object(ts, "_capture_current_composer_region", return_value=composer_text),
+        ):
+            InboxService().deliver_pending("term-1")
+        return pastes, enters
+
+    def test_bare_enter_recovery_never_answers_an_open_dialog(self):
+        """The guard: dialog-blocking provider + open dialog -> no Enter at all.
+
+        Without the check in ``redeliver_dropped_message_with_boundary`` the
+        recovery reads the message in the composer, sends a bare Enter, and that
+        Enter submits whichever option the dialog has highlighted -- #896's harm,
+        reached through #1004's recovery instead of through the original paste.
+        """
+        pastes, enters = self._deliver_with_dialog_open(
+            blocks_dialog=True, composer_text=self.MESSAGE
+        )
+
+        assert pastes == ["paste"], "the original delivery still goes out while IDLE"
+        assert enters == [], "no Enter may be sent into an open dialog"
+
+    def test_bare_enter_recovery_still_runs_for_a_non_blocking_provider(self):
+        """The guard is the provider's capability, not a ban on the state.
+
+        A provider that does not declare
+        ``blocks_orchestrated_input_while_waiting_user_answer`` keeps #1004's
+        recovery in WAITING_USER_ANSWER: its TUI has a live input box beside the
+        prompt, so the Enter submits the message rather than the dialog. Pins
+        that the fix did not disable the recovery wholesale.
+        """
+        pastes, enters = self._deliver_with_dialog_open(
+            blocks_dialog=False, composer_text=self.MESSAGE
+        )
+
+        assert pastes == ["paste"]
+        assert enters, "a non-blocking provider must still get its swallowed Enter re-sent"

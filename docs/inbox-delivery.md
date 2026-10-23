@@ -32,6 +32,8 @@ After each paste the inbox therefore waits for evidence that the receiver began 
 
 A full re-send is never attempted when the composer cannot be read: it would paste a second copy on top of the first and submit both.
 
+Neither recovery may answer an open dialog. The full re-send goes back through `dispatch_input`, so it inherits the WAITING_USER_ANSWER guard below. The bare Enter does not — it submits what is already in the composer — so it checks that guard itself and sends nothing when the receiver is parked on a prompt and its provider sets `blocks_orchestrated_input_while_waiting_user_answer`. Otherwise the one recovery that submits without pasting would be the one that can pick a highlighted option on a human's behalf (issue #896). Today every real dialog capture hides the composer box, so the bare-Enter branch is already out of reach there; the check makes that an invariant rather than a property of two providers' composer readers.
+
 Cost: a healthy delivery pays one or two status reads. A dropped one holds **that terminal's** delivery lock for the first wait plus one more wait per recovery actually sent (up to 24s with the defaults). Other terminals are not affected: each delivery runs on its own worker thread, and the sweeps fan out. `POST /terminals/{id}/inbox/messages` answers once the paste has reached the pane (bounded by `INBOX_IMMEDIATE_DELIVERY_WAIT`, 5s), not after the confirmation.
 
 Set `CAO_INBOX_SUBMIT_CONFIRMATION=false` before starting `cao-server` to turn the confirmation off; deliveries then behave as before #78 (paste, Enter, done). Event-inbox backends (herdr) skip it regardless.

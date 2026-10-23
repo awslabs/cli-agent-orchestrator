@@ -217,9 +217,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   WAITING_USER_ANSWER was pasted into the AskUserQuestion dialog, marked DELIVERED, and the
   trailing Enter answered the question. Eager delivery now holds the message while a provider
   that declares `blocks_orchestrated_input_while_waiting_user_answer` shows a dialog, and
-  `send_input`'s dialog guard covers every `OrchestrationType` (including `send_message`), not
-  a hand-written subset. A refusal caused by an open dialog keeps the message PENDING for the
-  next IDLE/COMPLETED event or reconcile sweep instead of marking it FAILED.
+  `dispatch_input`'s dialog guard covers every `OrchestrationType` (including `send_message`),
+  not a hand-written subset. A refusal caused by an open dialog keeps the message PENDING for
+  the next IDLE/COMPLETED event or reconcile sweep instead of marking it FAILED. The guard also
+  covers the swallowed-Enter recovery from #78: a bare Enter submits what is already in the
+  composer without going through `dispatch_input`, so it checks the same predicate itself rather
+  than relying on a dialog happening to hide the composer box.
 - Vault scan now re-reads a note whose size, mtime or ctime changed across the read window up to
   three times with a short backoff, as ADR-006 specifies, instead of skipping it on the first
   torn read. A note saved by Obsidian during a reconcile is indexed from the clean re-read; a
