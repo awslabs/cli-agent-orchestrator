@@ -169,7 +169,11 @@ def test_launch_routes_map_ephemeral_policy_refusals(stores, monkeypatch, route,
     if route == "session":
         response = client.post("/sessions", params=params)
     elif route == "terminal":
-        response = client.post("/sessions/cao-session/terminals", params=params)
+        # An in-session create names its creating terminal; the ephemeral
+        # refusal fires before that caller's row is consulted.
+        response = client.post(
+            "/sessions/cao-session/terminals", params={**params, "caller_id": "0000beef"}
+        )
     else:
         response = client.post(
             "/terminals/run-step",

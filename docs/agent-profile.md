@@ -35,6 +35,11 @@ portable and make profile listings useful.
   `reviewer`, or `workflow_scout`.
 - `allowedTools` (array of strings): explicit CAO tool allowlist; when present,
   it overrides the role defaults.
+- `delegateTools` (array of strings): delegation ceiling, the most this agent may
+  grant to workers it creates through `assign`, `handoff` or a workflow step.
+  Defaults to `["*"]` for `role: supervisor` and to the agent's own
+  `allowedTools` otherwise. See
+  [tool-restrictions.md](tool-restrictions.md#cross-provider-inheritance).
 - `capabilities` (array of strings): profile-discovery statements, with at most
   32 strings and 128 characters per string.
 - `tags` (array of strings): profile-discovery keywords, with at most 32 values;

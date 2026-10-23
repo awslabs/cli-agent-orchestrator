@@ -1,4 +1,4 @@
-"""Three call-site lint rules built on ``test/_support/callsite_lint.py`` (#1005).
+"""Call-site lint rules built on ``test/_support/callsite_lint.py`` (#1005).
 
 Each rule closes one half of a defect class the repo has already paid for:
 
@@ -16,8 +16,13 @@ Each rule closes one half of a defect class the repo has already paid for:
 * **Rule 3 (staleness gate, #735)** -- a poll that accepts whatever frame is on
   screen can report "done" for a turn that had not started. The fix is a
   generation/sequence floor at every call site.
+* **Rule 4 (admission snapshot, #827 / PR #1000 P3-3)** -- ``launch_guard.capture``
+  records the profile set a run is admitted under. Called without the snapshot
+  the freeze already read, it re-reads the store AFTER the approval gate, so a
+  profile edited in that window is recorded as the approved state. Every
+  production call must pass ``profile_set=frozen.profile_set``.
 
-All three rules are **ratchets**. A new unexplained call site fails; so does a
+All four rules are **ratchets**. A new unexplained call site fails; so does a
 site beyond its row's reviewed occurrence count (a key collision does not
 grant unlimited headroom); so does an allowlist row that no longer matches
 anything, so the tables can only shrink. The failure message names
@@ -202,15 +207,10 @@ ENUM_SUBSET_ALLOWLIST = {
         "TerminalCleanupOutcome",
         "ABSENT, DELETED",
     ): "the two outcomes that mean the terminal is gone",
-    # #896's own site. Left as a row rather than fixed here: deriving it from a
-    # property is #896's job, and the #896 branch owns that change. When it
-    # lands, this row goes stale and the rule says so.
-    (
-        "cli_agent_orchestrator/services/terminal_service.py",
-        "OrchestrationType",
-        "ASSIGN, HANDOFF",
-    ): "#896: hand-enumerated and known wrong; SEND_MESSAGE belongs here too. "
-    "Being fixed on the #896 branch by deriving from a property.",
+    # #896's own site (services/terminal_service.py, OrchestrationType) has no
+    # row: the guard now derives its set from the enum
+    # (``_ORCHESTRATED_INPUT_VALUES``), so there is no literal left to explain.
+    # A return to a hand-written subset is an unexplained site and fails here.
 }
 
 ENUM_SUBSET_REMEDY = (
@@ -228,15 +228,8 @@ def test_enum_subset_literals_are_deliberate() -> None:
     """Every partial-Enum membership literal under ``src/`` is explained (#896)."""
     sources = cl.parse_sources()
     sites = cl.enum_subset_sites(sources)
-    marked = {}
-    unmarked = []
-    for site in sites:
-        module = next(m for m in sources if m.relpath == site.relpath)
-        reason = cl.inline_marker(module, site.line, "subset-ok")
-        if reason is not None:
-            marked[site.key] = reason
-        else:
-            unmarked.append(site)
+    marked = cl.marked_sites(sites, "subset-ok", sources)
+    unmarked = [site for site in sites if (site.key, site.line) not in marked]
 
     cl.check_against_allowlist(
         rule="enum-subset",
@@ -326,10 +319,9 @@ BARE_TIMEOUT_ALLOWLIST = {
         "post(timeout=5)",
     ): "elastic-broker release notify; best-effort and already in try/except",
     # ---- provider launch readiness ----
-    (
-        "cli_agent_orchestrator/providers/antigravity_cli.py",
-        "wait_for_shell(timeout=10)",
-    ): "shell-prompt wait before the launch command is typed",
+    # antigravity_cli's wait_for_shell(timeout=10) row was deleted when #710
+    # made that literal the module constant SHELL_WAIT_TIMEOUT_S, which
+    # utils.init_allowance reads to size the client wait.
     (
         "cli_agent_orchestrator/providers/mock_cli.py",
         "wait_for_shell(timeout=10)",
@@ -431,16 +423,21 @@ def test_suspect_timeout_rows_are_named_not_buried() -> None:
 
 STALENESS_FUNC = "poll_until_done"
 STALENESS_KWARG = "min_generation"
+#: Inline opt-out for a ``poll_until_done`` call that cannot pass the floor. Same
+#: shape as rule 1's ``subset-ok``: ``# staleness-ok: <reason>`` on the call's
+#: line or the two above it (``cl.inline_marker``). This is the ONE opt-out
+#: mechanism for the staleness gate; PR #999 briefly carried its own
+#: ``turn-boundary: ungated`` marker read by a second lint, which was retired in
+#: favour of this rule so that a reviewer finds one convention.
+STALENESS_MARKER = "staleness-ok"
 
-#: Call sites that may legitimately poll without a generation floor once the
-#: parameter exists. Empty on purpose: no site has been reviewed for an opt-out
-#: yet, because the parameter does not exist on main (see the test below).
+#: Table form of the opt-out, for an idiom that repeats inside one module. Empty
+#: on purpose: every reviewed opt-out today is a one-off and carries the inline
+#: marker at the site instead (``cli/commands/launch.py`` headless wait after a
+#: server-confirmed initial delivery; ``cli/commands/worker.py`` ``send`` and
+#: ``attach``, whose broker status route carries no generation).
 STALENESS_OPT_OUT: dict = {}
 
-#: The complete census of ``poll_until_done`` call sites as of this commit.
-#: This half of the rule bites *today*: a new caller fails the test and the
-#: author is told, at the moment they add it, that this poll has a staleness
-#: obligation. Without it rule 3 would be dormant until #812 merges.
 STALENESS_CALL_SITES = {
     ("cli_agent_orchestrator/cli/commands/launch.py", STALENESS_FUNC): (
         "initial-delivery wait after launch"
@@ -460,9 +457,11 @@ STALENESS_REMEDY = (
     "`poll_until_done` decides 'the agent is done' from whatever the terminal "
     "shows now. Without a floor on which turn that frame belongs to, a frame "
     "from before your input was sent reads as a finished turn (#735). Pass "
-    f"`{STALENESS_KWARG}=` the generation you are waiting past, or add this "
-    "site to STALENESS_OPT_OUT with a reason why a stale frame is acceptable "
-    "here."
+    f"`{STALENESS_KWARG}=` the generation you are waiting past (the "
+    "`dispatch_boundary` that POST /terminals/{id}/input returned for the send). "
+    f"If this site genuinely cannot derive one, put `# {STALENESS_MARKER}: <reason>` "
+    "on the call or the line above it, or for a repeating idiom add a row to "
+    "STALENESS_OPT_OUT, saying why a stale frame is acceptable here."
 )
 
 
@@ -487,33 +486,121 @@ def test_poll_until_done_call_site_census_is_complete() -> None:
 
 
 def test_every_poll_until_done_passes_a_generation_floor() -> None:
-    """Once ``min_generation`` exists, every call site must pass it (#735).
+    """Every ``poll_until_done`` call site passes ``min_generation`` or opts out (#735).
 
-    Deliberately conditional. ``min_generation`` does not exist anywhere on
-    main: ``poll_until_done`` at ``utils/terminal.py`` declares
-    ``(terminal_id, timeout, polling_interval, idle_stable_polls, read_status)``
-    and ``grep -r min_generation src test`` is empty. The generation concept
-    arrives with PR #812 (``joeguo/735-turn-sequence``), which is still open.
-
-    Asserting the kwarg today would fail all four call sites for a parameter
-    that cannot be passed, so the test skips while the contract is absent and
-    starts enforcing it the moment #812 adds the parameter -- which is exactly
-    when a call site could forget it. The census test above keeps the rule from
-    being dormant in the meantime.
+    The parameter landed with PR #999 (``POST /terminals/{id}/input`` returns the
+    turn's ``dispatch_boundary``; ``cao session send`` passes it here), so this
+    rule is ARMED: it used to skip while the contract was absent, and now fails
+    outright if the parameter ever disappears again, because the call sites
+    that pass it would then be broken rather than merely ungated. A site that
+    cannot derive a floor says why at the site with ``# staleness-ok: <reason>``
+    (or, for a repeating idiom, a row in ``STALENESS_OPT_OUT``).
     """
     declared = cl.declared_parameters(STALENESS_FUNC)
     if not declared:
         pytest.fail(f"{STALENESS_FUNC} is no longer defined under src/; update this rule.")
-    if STALENESS_KWARG not in declared:
-        pytest.skip(
-            f"{STALENESS_FUNC} has no {STALENESS_KWARG} parameter on this tree "
-            f"(declares {sorted(declared)}). The #735 staleness contract arrives "
-            "with PR #812; this rule activates automatically when it does."
-        )
+    assert STALENESS_KWARG in declared, (
+        f"{STALENESS_FUNC} lost its {STALENESS_KWARG} parameter (declares "
+        f"{sorted(declared)}); the #735 staleness contract from PR #999 has regressed."
+    )
 
+    sources = cl.parse_sources()
+    sites = cl.missing_kwarg_sites(STALENESS_FUNC, STALENESS_KWARG, sources)
     cl.check_against_allowlist(
         rule="staleness-gate",
-        sites=cl.missing_kwarg_sites(STALENESS_FUNC, STALENESS_KWARG),
+        sites=sites,
         allowlist=STALENESS_OPT_OUT,
+        marked=cl.marked_sites(sites, STALENESS_MARKER, sources),
         remedy=STALENESS_REMEDY,
+    )
+
+
+# ===========================================================================
+# Rule 4: launch_guard.capture is built from the freeze's own profile-set read (#827, PR #1000 P3-3)
+# ===========================================================================
+
+ADMISSION_FUNC = "capture"
+ADMISSION_KWARG = "profile_set"
+
+#: The complete census of ``launch_guard.capture`` call sites. A new start path
+#: that admits a script run has to be reviewed for the same obligation, so a
+#: new caller fails here first.
+ADMISSION_CALL_SITES = {
+    ("cli_agent_orchestrator/services/script_runner.py", ADMISSION_FUNC): (
+        "blocking script-run start (Step 0b): guard built from frozen.profile_set"
+    ),
+    ("cli_agent_orchestrator/api/main.py", ADMISSION_FUNC): (
+        "async script-run submit (Step 4b): guard built from frozen.profile_set"
+    ),
+}
+
+#: Call sites allowed to let ``capture`` read the store itself. Empty on
+#: purpose: a production admission path never has a reason to.
+ADMISSION_OPT_OUT: dict = {}
+
+ADMISSION_REMEDY = (
+    "`launch_guard.capture` records the launch state a run is admitted under. "
+    "Without the snapshot `manifest_freeze.freeze_manifest` already read, it "
+    "re-reads the profile store AFTER the approval gate, so a profile edited in "
+    f"that window is recorded as the approved state (PR #1000 P3-3). Pass "
+    f"`{ADMISSION_KWARG}=frozen.{ADMISSION_KWARG}`."
+)
+
+
+def _capture_passed_as_a_value() -> list:
+    """``launch_guard.capture`` referenced anywhere except as the callee of a call.
+
+    Rules 4a and 4b see ``ast.Call`` nodes whose callee is ``capture``. The pre-fix shape was
+    ``asyncio.to_thread(launch_guard.capture)`` -- the function passed as a VALUE, so neither rule
+    sees it and both pass vacuously. This closes that door: the only legal reference is a direct call.
+    """
+    import ast
+
+    flagged = []
+    for module in cl.parse_sources():
+        callees = {id(node.func) for node in ast.walk(module.tree) if isinstance(node, ast.Call)}
+        for node in ast.walk(module.tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr == ADMISSION_FUNC
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "launch_guard"
+                and id(node) not in callees
+            ):
+                flagged.append(f"{module.relpath}:{node.lineno}")
+    return flagged
+
+
+def test_launch_guard_capture_is_only_ever_called_directly() -> None:
+    assert not _capture_passed_as_a_value(), (
+        "launch_guard.capture is passed as a value here, which hides its keyword arguments from "
+        "rules 4a/4b. Call it directly (inside a lambda for asyncio.to_thread): "
+        + ", ".join(_capture_passed_as_a_value())
+    )
+
+
+def test_launch_guard_capture_call_site_census_is_complete() -> None:
+    cl.check_against_allowlist(
+        rule="admission-snapshot-census",
+        sites=cl.call_sites(ADMISSION_FUNC),
+        allowlist=ADMISSION_CALL_SITES,
+        remedy=(
+            "You added a `capture` call site. If it is `launch_guard.capture`, it admits a "
+            "script run and must pass the freeze's snapshot; add a row to ADMISSION_CALL_SITES "
+            "in this file. " + ADMISSION_REMEDY
+        ),
+    )
+
+
+def test_every_launch_guard_capture_passes_the_freeze_snapshot() -> None:
+    declared = cl.declared_parameters(ADMISSION_FUNC)
+    assert ADMISSION_KWARG in declared, (
+        f"launch_guard.capture no longer declares {ADMISSION_KWARG}; the admission snapshot "
+        "contract (PR #1000 P3-3) has been removed, update or delete this rule deliberately"
+    )
+    cl.check_against_allowlist(
+        rule="admission-snapshot",
+        sites=cl.missing_kwarg_sites(ADMISSION_FUNC, ADMISSION_KWARG),
+        allowlist=ADMISSION_OPT_OUT,
+        remedy=ADMISSION_REMEDY,
     )

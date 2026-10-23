@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Inbox deliveries confirm the submit and recover a swallowed Enter** (#78). A delivery is
+  paste, delay, Enter; when the TUI swallows the Enter the message sat unsubmitted while the
+  terminal still read IDLE, so the sender waited forever and the next message was pasted on top
+  of the first. The inbox now waits for a post-dispatch started status and, when it does not come,
+  sends a bare Enter if the provider can read its composer (`codex`, `claude_code`, `kiro_cli`),
+  re-sends in full only when the composer is known to be empty and the provider has a direct
+  probe, and otherwise logs the drop. A dropped delivery holds that one terminal's inbox for up
+  to 24s; other terminals, the sweeps and the inbox POST are not held. New env var
+  `CAO_INBOX_SUBMIT_CONFIRMATION` (default `true`) turns the confirmation off.
+
 - **The MCP server sent no bearer on 14 of its calls to the local API** (#990). Ten
   `requests` calls in `mcp_server/server.py` reached scope-guarded routes with no
   `Authorization` header, so on an auth-enabled server each one got `401`. Two were
@@ -20,19 +30,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an operator runs `cao workflow approve <plan_id>`; operators choosing the previous behaviour set
   `workflow.require_approval: false` in `settings.json`. Script runs journaled before this upgrade
   cannot launch further agent steps while approval enforcement is on; start a new run. With
-  approval enforcement off, those runs continue. Plan identifiers keep the `plan-v1:` scheme.
+  approval enforcement off, those runs continue. Plan identifiers used the `plan-v1:` scheme; see the
+  `plan-v2` entry below.
 
 - **Breaking / migration:** a fresh script run now executes a private copy of the approved source.
   Modules beside the spec are not importable and `__file__` names the copy; this matches resume.
 - **Breaking / migration:** reserved ephemeral names are refused as fresh script-run agent steps
-  while approval is enforced: they have no installed definition for the launch guard to digest.
+  while approval is enforced: they have no installed definition for the launch guard to digest. The
+  ephemeral namespace is also outside the `plan-v2` profile-set digest by design: those profiles are
+  created by the run after admission and are bound on their own path.
 - **Breaking / migration:** non-Git roots now bind the directory's canonical path into `plan_id`.
   Moving or renaming such a directory requires a new approval; Git-repository plan identifiers are
   unchanged.
-- **Breaking / migration:** plan approval binds the script source, its resolved inputs and the working
-  directory's state (the Git commit and worktree, or the canonical path of a non-Git directory). It
-  does not bind the content of agent profiles or memory: a later run of an approved plan uses their
-  current content (#827, #828).
+- **Breaking / migration:** plan approval binds the script source, its resolved inputs, the working
+  directory's state (the Git commit and worktree, or the canonical path of a non-Git directory) and,
+  since `plan-v2`, the installed agent profile set. It does not bind memory content (#828), the
+  managed `.env` values a profile references, installed skills, agent-plugin MCP servers for the
+  providers that receive them at launch (`with_plugin_mcp`; for Kiro and OpenCode `cao install`
+  writes them into files that are bound, so an agent-plugin change moves `plan_id` there), the Kiro
+  `resources` files and global `mcp.json`, or a same-name profile shadowed in a lower-priority
+  directory: a later run of an approved plan uses their current content.
+- **Breaking / migration:** script-run plan identifiers move from `plan-v1:` to `plan-v2:` and now
+  bind the installed agent profile set — every installed profile's source text plus the files
+  `cao install` wrote for it (the Kiro agent JSON, the Copilot and OpenCode agent files, the shared
+  OpenCode `opencode.json`, the installed context copy) — because a step's system prompt and tool
+  policy come from those files, not from the script (#827, first acceptance criterion). Every stored
+  `plan-v1` approval stops matching: the first new run of each plan is refused with its `plan-v2`
+  identifier until an operator approves it again. A run frozen and approved before the upgrade still
+  resumes on its stored `plan-v1` identifier, and its launch guard record (which has no scheme
+  marker) keeps checking each agent launch under the rule it was admitted with, the profile text
+  alone; new runs record `launch-guard-v2`.
+  Editing or installing any profile, and a CAO upgrade that changes a bundled profile, moves every
+  `plan_id`. An entry the launch path cannot serve (a symlink leaving the store, a `..` name) is
+  digested by name only; a profile store CAO cannot read refuses the run as `profiles_unreadable`.
+  Binding the project root by device and inode (#827, second criterion) is not part of this change.
 
 ### Added
 
@@ -44,6 +75,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CAO_AUTH_LOCAL_TOKEN` when API authentication is enabled. The Python workflow SDK's
   run-step transport does not yet receive that credential; subprocess credential delivery
   remains a separate security-boundary decision.
+
+- Opt-in non-accessing inspection for CLI memory list/show and HTTP GET
+  memory views. Agent recall still reinforces access counts; repeated
+  operator views cannot make lessons promotion-eligible. Part of #861.
+
+- Opt-in `memory.lifecycle.enabled` excludes active supersedes targets from
+  injection and adds transient recall labels/demotion. Defaults and canonical
+  Markdown remain unchanged; score/relevance demotion is always on. Ordering
+  and labels share one supersedes snapshot, including related targets. Part of #861.
+
+- Batch lifecycle eligibility seam for native, vault, related and curator
+  injection paths, with lazy checks before caps and per-source fail-open
+  diagnostics. The registry contains only the built-in supersedes source,
+  disabled by default; ordinary explicit recall remains unfiltered.
+  Part of #861. Refs #867.
+
+- On-demand `cao memory list --query Q --explain` compares default/relevance
+  ranks without recording access or exposing memory content, tags or paths.
+  Both pools share one supersedes snapshot for consistent ranks and labels;
+  source failures are visible and errors omit paths and keys. `lexical_degenerate`
+  reports all-zero lexical batches without changing ranking.
+  Table/JSON output is bounded; `memory.explain_enabled` defaults to true and
+  supports `CAO_MEMORY_EXPLAIN_ENABLED`. Part of #861.
+
+- Opt-in memory recall `sort_by="relevance"` over the widened candidate pool,
+  with all-term tiers and bounded age influence for native project rows.
+  Missing, empty and whitespace-only queries follow the exact recency path,
+  including source selection and access effects; defaults are unchanged. Part of #861.
 
 - `assign` and `handoff` now launch ephemeral agents (#801) from their creator terminal: Claude Code by default, Codex when an operator allows it.
 - Ephemeral agents (#801) can now be claimed and launched by their creator through the HTTP API, under a short lease, with the policy re-checked at claim and release on delete or retention cleanup. `ephemeral.enabled` stays off by default.
@@ -163,6 +222,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Every client call that creates a session or terminal synchronously (`cao launch` without
+  `--headless`, `cao agent handoff`, the `launch_agent` app gesture and the `cao-ops`
+  `launch_session` tool without a message) now sizes its wait from `provider_init_timeout`
+  and the profile's override of it, through one shared derivation, instead of from
+  `mcp_request_timeout` or a per-site literal (30s, 150s, 300s). A successful but slow
+  provider init was being reported to the caller as a transport failure while cao-server went
+  on building the worker, so a retry collided with a session that already existed. Only the
+  read half of the request timeout widens; an unreachable server still reports in 5s. A guard
+  test enumerates every create call site and fails on one that neither defers init nor derives
+  its budget. `GET /health` now reports the server's `provider_init_timeout` so an operator can
+  check that a client on another host sees the same value (#710).
+- Inbox delivery no longer types a queued message into an open user-answer dialog (#896). With
+  `CAO_EAGER_INBOX_DELIVERY=true`, a message for a Claude Code terminal sitting in
+  WAITING_USER_ANSWER was pasted into the AskUserQuestion dialog, marked DELIVERED, and the
+  trailing Enter answered the question. Eager delivery now holds the message while a provider
+  that declares `blocks_orchestrated_input_while_waiting_user_answer` shows a dialog, and
+  `dispatch_input`'s dialog guard covers every `OrchestrationType` (including `send_message`),
+  not a hand-written subset. A refusal caused by an open dialog keeps the message PENDING for
+  the next IDLE/COMPLETED event or reconcile sweep instead of marking it FAILED. The guard also
+  covers the swallowed-Enter recovery from #78: a bare Enter submits what is already in the
+  composer without going through `dispatch_input`, so it checks the same predicate itself rather
+  than relying on a dialog happening to hide the composer box.
+- Workflow scripts over 131,072 characters (128 KiB) now fail `validate`, `create`, `update`,
+  `run` and `submit` with a `syntax` finding that names the size and the limit, instead of being
+  parsed. On CPython 3.10 `ast.parse` segfaults the interpreter on deeply nested source and no
+  exception can catch it, so the linter and the `INPUTS` extractor each refuse oversize source
+  before parsing. A script between 128 KiB and the 256 KiB spec budget that ran before this
+  release must be split (#969).
 - Vault scan now re-reads a note whose size, mtime or ctime changed across the read window up to
   three times with a short backoff, as ADR-006 specifies, instead of skipping it on the first
   torn read. A note saved by Obsidian during a reconcile is indexed from the clean re-read; a
@@ -192,6 +279,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and logs a warning, whether enforcement is on or off. Its launch guard also
   refuses fresh agent launches while approval is enforced.
 - Kiro CLI agent specs installed by CAO now carry `includeMcpJson`, the name Kiro CLI documents, instead of the retired `useLegacyMcpJson` alias, which Kiro rejected as a duplicate field whenever another writer added the canonical key (#1026). The profile field keeps its `useLegacyMcpJson` spelling and is now actually forwarded into the spec; previously it was accepted and ignored.
+- `cao session send` no longer prints the previous turn's answer, and no longer
+  waits out its timeout on a turn that finished (#735). `POST /terminals/{id}/input`
+  now returns the `dispatch_boundary` of the turn it started, and
+  `GET /terminals/{id}` reports `status_generation` (the output generation the
+  status was earned at) and `output_generation` (the current counter). The CLI
+  refuses a status earned at or before the boundary; once output has landed
+  without the status being re-earned it gives the stamp 8 s to move, then warns
+  on stderr and finishes on the frame as before. A cao-server restart during the
+  wait is detected and warned about instead of waiting out the timeout. Both
+  fields are additive: `success` is unchanged, and an older server gets the
+  previous behaviour.
+- **Security:** a task's text could be executed by the worker's login shell. If `codex`
+  exited during startup (for example on a network timeout while reading the account),
+  its `› Error: ...` line read as an idle composer, the exit-to-shell check was switched
+  off until initialization had completed, and the assigned task was pasted into bash,
+  which ran every line of it including backtick and `$(...)` substitutions. Codex
+  startup now reads the pane's foreground process on every readiness poll and once more
+  before declaring ready, a ready verdict from a pane that is back at the shell is ERROR
+  whether or not initialization has finished, and the shared delivery path re-checks the
+  status and the pane's foreground process immediately before typing, for every provider
+  that records a shell baseline. `assign` and `handoff` now tear down a worker whose
+  provider is in ERROR or has exited to the shell by delivery time and report
+  `provider_exited` (or `provider_exited_after_dispatch` when a resubmit was refused after
+  the task had been typed once); previously the dead worker was kept and reported as
+  waiting on a prompt (#1018).
 - Corrective workflow re-prompts now reuse the attempt's rendered prompt, so
   workflow inputs and earlier step outputs stay filled in when structured output
   is missing or invalid (#966).
@@ -791,6 +903,121 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Vault `secret_gate: "warn"` no longer forwards raw secret matches to a model** (#644 AC10).
+  Under `warn` a secret-bearing note is still indexed and recallable, but every match is replaced by
+  `[REDACTED:<pattern_name>]` at the single vault read chokepoint, so automatic injection, explicit
+  recall, related-key expansion and BM25 ranking all see the marker, never the bytes. Raw bytes pass
+  only when the note's frontmatter carries a per-finding acceptance bound to the pattern name and the
+  SHA-256 of the matched span (`cao.secret_ok: [{pattern, sha256}]`); a boolean or pattern-only entry
+  quarantines the note. `cao memory vault scan --fingerprints` prints the values an acceptance needs;
+  `cao memory vault status` reports honoured acceptances (`secret_acceptances`, `secret_accepted`) and
+  inert ones (`secret_acceptance_unmatched`). Fingerprints come from one acceptance-free pass, so
+  they never change with what is accepted; a credential two patterns match, such as
+  `NAME_TOKEN=value`, prints two fingerprints and needs both accepted before the value is served
+  raw. The config-load warning for `warn` with `inject: true` is retired because the pairing no
+  longer carries exposure. Redaction runs over the body exactly as the scan read it, leading
+  `# Heading` included, and the heading is dropped only afterwards for display; because
+  `bearer_token` and `secret_assignment` match across a line break, a heading ending in a key word
+  with the value beneath it is one match, and where the marker replaces that line break the rest of
+  the value's line goes with the heading, so recall can show less of the note than it holds.
+  `reject` is unchanged.
+  **Migration:** operators who relied on `warn` passing raw bytes to agents must add a per-finding
+  acceptance to each note for each span they want served raw; until then those spans are redacted.
+
+- **Child allowlists are bounded by the creator's delegation ceiling.** A
+  terminal's `allowedTools` limited what it could call, not what it could
+  create: a restricted agent could `assign` or `handoff` to a profile holding
+  tools it lacked (for example a read-only reviewer launching a developer with
+  `execute_bash`), and the in-session create endpoint stored whatever
+  `allowed_tools` string the client sent. `create_terminal` now refuses a child
+  whose resolved tools exceed the creator's **delegation ceiling**, recorded on
+  the new `terminals.delegate_tools` column at creation (migration runs at
+  server start), read from the creator's stored row, and never re-derived from
+  a profile, so an intermediate `role: supervisor` profile cannot widen a
+  restricted tree. One comparator (`utils/delegation.py`) serves installed
+  profiles and the ephemeral path, which already enforced the rule.
+  - **Where it is enforced.** Every creation path: `assign`/`handoff` (the MCP
+    layer prechecks and the server re-checks), `POST /sessions/{name}/terminals`
+    with a client `allowed_tools` string (403), `/terminals/run-step`, workflow
+    steps on both tiers (YAML steps and the run-step calls a `.py` script
+    dispatches), which inherit the ceiling of the terminal that started or
+    resumed the run (the MCP workflow tools and `cao workflow` from inside a
+    terminal send `caller_id`), the `memory_manager` sidecar (bounded by its
+    primary's recorded ceiling) and remote placement (`caller_ceiling`). A
+    refused step settles FAILED with the refusal text instead of escaping the
+    engine.
+  - **Declaring a ceiling.** Profiles declare it with `delegateTools`; the
+    built-in `supervisor` role defaults to `*` and every other role to its own
+    list, so the documented supervisor → developer pattern and every shipped
+    example keep working. `cao launch` prints the ceiling as `Delegates:`;
+    `Terminal` responses carry `delegate_tools`; `/health` advertises
+    `features: ["delegation_ceiling"]`.
+  - **Install-time providers.** A delegated Kiro CLI or OpenCode CLI launch
+    whose installed agent file grants more than the bounded allowlist is
+    refused with the reinstall remedy, because those providers run the
+    installed file, not the request. A bounded Kiro or OpenCode launch whose
+    agent file is missing, unreadable or unparseable is refused the same way
+    (fail closed) rather than skipping the comparison; operator launches keep
+    the launch-time warning.
+  - **Vocabulary.** MCP references are compared with the resolver's selector
+    semantics (`@plugin-*` covers `@plugin-search`, `@server` covers
+    `@server/tool`; a pattern-shaped child entry is covered only by an identical
+    or bare-`*` grant). The issue #141 behaviour (a child `allowedTools: ["*"]`
+    is not collapsed to the parent's list) is kept within the parent's ceiling.
+  - **Durability.** The starting terminal is journaled on the run row
+    (`workflow_run.caller_id`, migration at server start) so a resumed run
+    re-binds to the original caller, and a script-tier run-step whose run has
+    no live record after a restart is refused. The idempotency fingerprint
+    hashes `caller_ceiling` and `delegating_terminal_id` when supplied, so two
+    keyed creates that differ only in the bounding terminal collide (409)
+    instead of resolving to the first one's terminal.
+  - **Operator form of the in-session create.** `POST
+    /sessions/{name}/terminals:operator` adds a terminal to an existing session
+    as the operator (the Web UI's Add Agent button uses it): a distinct sub-path
+    that records the profile's declared ceiling like `POST /sessions` and
+    answers 400 when the request also names a caller (`caller_id`,
+    `caller_ceiling`, `delegating_terminal_id` or a callback environment).
+  - **Memory sidecar visibility.** Under a primary whose ceiling does not cover
+    the sidecar's `@cao-mcp-server, fs_read, fs_list` (for example
+    `workflow_scout`), `POST /sessions?memory_manager=true` reports
+    `memory_manager: {"state": "refused", "detail"}` on the response and
+    `cao launch --memory` prints the refusal as a warning; before, the launch
+    reported success and the sidecar silently never existed.
+  - **Guards against the class recurring.** `test/test_launch_path_invariant.py`
+    enumerates every terminal-launch path from the source and fails on one whose
+    launch call or HTTP payload does not carry a ceiling key and is not a
+    classified operator path; `test/services/test_delegation_forwarding_invariant.py`
+    checks on every run that the ceiling arguments reach `create_terminal` and
+    cause the refusal; `test/api/test_web_client_contract.py` posts the shipped
+    Web UI's request shapes (read from `web/src/api.ts`) at the real routes, so a
+    route tightening that breaks a first-party UI action fails CI.
+  - **Breaking changes.**
+    1. A user-authored restricted role or profile that launches wider children
+       is now refused with a message naming the parent, the child, the exceeding
+       tools and the remedy (add `delegateTools` to the parent profile and
+       relaunch it).
+    2. Terminals created before the upgrade have no recorded ceiling and are
+       bounded by their own recorded `allowedTools` until relaunched; a
+       pre-upgrade row with neither column recorded cannot delegate until
+       relaunched (the profile on disk is never consulted for an existing
+       terminal).
+    3. `assign`/`handoff` with `target_host` send the caller's ceiling as
+       `caller_ceiling` and refuse to place work on a node whose `/health` lacks
+       the feature, and the receiving node refuses a remote-shaped create
+       (callback env present) that omits the ceiling, so mixed-version fleets
+       must upgrade the worker nodes first.
+    4. Workflow steps started from inside a CAO terminal inherit that terminal's
+       ceiling rather than running unbounded.
+    5. `POST /sessions/{name}/terminals` requires `caller_id`; operators use
+       `POST /sessions` for a new session or `POST
+       /sessions/{name}/terminals:operator` for an existing one. Web UI builds
+       older than this release cannot add an agent to a session against a server
+       with this change (upgrade both together).
+  - **Residual.** `caller_id` and `caller_ceiling` remain client assertions
+    under the shared bearer, and "bounded" means bounded at the level the
+    provider enforces (soft-enforcement providers such as Codex and Antigravity
+    CLI restrict by prompt only). Binding caller identity to an authenticated
+    terminal is tracked in #965.
 - A profile's `tools:` allowlist is now enforced for every CAO MCP tool, not
   just the delegation tools (`assign`, `handoff`, `assign_elastic`,
   `create_ephemeral_agent`, `workflow_run`/`resume`/`start`) that #769/#811

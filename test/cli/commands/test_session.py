@@ -719,3 +719,92 @@ class TestSendSync:
         runner.invoke(session, ["send", "cao-test", "question"])
 
         mock_exit.assert_any_call(130)
+
+
+class TestSendDispatchBoundary:
+    """#735: `send` must keep the dispatch boundary and forward it as evidence."""
+
+    @patch("cli_agent_orchestrator.cli.commands.session.poll_until_done")
+    @patch("cli_agent_orchestrator.cli.commands.session.time")
+    @patch("cli_agent_orchestrator.cli.commands.session.api_http.post")
+    @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
+    def test_send_forwards_dispatch_boundary_and_skips_sleep(
+        self, mock_get, mock_post, mock_time, mock_poll, runner
+    ):
+        """A named boundary is parsed from the POST body, passed to
+        ``poll_until_done`` as ``min_generation``, and the flat 3s grace sleep
+        is skipped -- the server already named the turn."""
+        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        pre_send_status_resp = MagicMock(status_code=200)
+        pre_send_status_resp.json.return_value = {"status": "idle"}
+        output_resp = MagicMock(status_code=200)
+        output_resp.json.return_value = {"output": "done"}
+        mock_get.side_effect = [resolve_resp, pre_send_status_resp, output_resp]
+        post_resp = MagicMock(status_code=200)
+        post_resp.json.return_value = {"success": True, "dispatch_boundary": 42}
+        mock_post.return_value = post_resp
+        mock_time.sleep = MagicMock()
+
+        result = runner.invoke(session, ["send", "cao-test", "question"])
+
+        assert result.exit_code == 0
+        mock_poll.assert_called_once()
+        _, kwargs = mock_poll.call_args
+        assert kwargs["min_generation"] == 42
+        mock_time.sleep.assert_not_called()
+
+    @patch("cli_agent_orchestrator.cli.commands.session.poll_until_done")
+    @patch("cli_agent_orchestrator.cli.commands.session.time")
+    @patch("cli_agent_orchestrator.cli.commands.session.api_http.post")
+    @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
+    def test_send_sleeps_and_forwards_none_when_no_boundary_named(
+        self, mock_get, mock_post, mock_time, mock_poll, runner
+    ):
+        """An older cao-server (or herdr) answers with no ``dispatch_boundary``:
+        `send` must fall back to the flat 3s sleep and pass no generation."""
+        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        pre_send_status_resp = MagicMock(status_code=200)
+        pre_send_status_resp.json.return_value = {"status": "idle"}
+        output_resp = MagicMock(status_code=200)
+        output_resp.json.return_value = {"output": "done"}
+        mock_get.side_effect = [resolve_resp, pre_send_status_resp, output_resp]
+        post_resp = MagicMock(status_code=200)
+        post_resp.json.return_value = {"success": True}
+        mock_post.return_value = post_resp
+        mock_time.sleep = MagicMock()
+
+        result = runner.invoke(session, ["send", "cao-test", "question"])
+
+        assert result.exit_code == 0
+        mock_poll.assert_called_once()
+        _, kwargs = mock_poll.call_args
+        assert kwargs["min_generation"] is None
+        mock_time.sleep.assert_called_once_with(3)
+
+    @patch("cli_agent_orchestrator.cli.commands.session.poll_until_done")
+    @patch("cli_agent_orchestrator.cli.commands.session.time")
+    @patch("cli_agent_orchestrator.cli.commands.session.api_http.post")
+    @patch("cli_agent_orchestrator.cli.commands.session.api_http.get")
+    def test_send_handles_a_non_dict_json_body(
+        self, mock_get, mock_post, mock_time, mock_poll, runner
+    ):
+        """A malformed (non-dict) JSON body from the POST response must not
+        crash with a raw AttributeError from ``.get()`` on a list/scalar --
+        it should be treated as naming no boundary, same as an older server."""
+        resolve_resp = MagicMock(status_code=200, json=lambda: [{"id": "abc12345"}])
+        pre_send_status_resp = MagicMock(status_code=200)
+        pre_send_status_resp.json.return_value = {"status": "idle"}
+        output_resp = MagicMock(status_code=200)
+        output_resp.json.return_value = {"output": "done"}
+        mock_get.side_effect = [resolve_resp, pre_send_status_resp, output_resp]
+        post_resp = MagicMock(status_code=200, json=lambda: [1, 2, 3])
+        mock_post.return_value = post_resp
+        mock_time.sleep = MagicMock()
+
+        result = runner.invoke(session, ["send", "cao-test", "question"])
+
+        assert result.exit_code == 0
+        mock_poll.assert_called_once()
+        _, kwargs = mock_poll.call_args
+        assert kwargs["min_generation"] is None
+        mock_time.sleep.assert_called_once_with(3)
