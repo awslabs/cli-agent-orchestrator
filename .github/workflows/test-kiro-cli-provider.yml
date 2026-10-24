@@ -20,7 +20,11 @@ on:
     branches: [ main, develop ]
     paths:
       - 'src/cli_agent_orchestrator/providers/kiro_cli.py'
-      - 'test/providers/test_kiro_cli_unit.py'
+      # Globbed, not a per-file list: a single hardcoded filename meant every
+      # Kiro CLI test outside test_kiro_cli_unit.py was invisible to this
+      # workflow, and so was any file a future fix adds. The run step below
+      # expands the same glob.
+      - 'test/providers/test_kiro_cli_*.py'
       - 'test/providers/fixtures/kiro_cli_*.txt'
       - 'pyproject.toml'
       - '.github/workflows/test-kiro-cli-provider.yml'
@@ -28,7 +32,11 @@ on:
     branches: [ main, develop ]
     paths:
       - 'src/cli_agent_orchestrator/providers/kiro_cli.py'
-      - 'test/providers/test_kiro_cli_unit.py'
+      # Globbed, not a per-file list: a single hardcoded filename meant every
+      # Kiro CLI test outside test_kiro_cli_unit.py was invisible to this
+      # workflow, and so was any file a future fix adds. The run step below
+      # expands the same glob.
+      - 'test/providers/test_kiro_cli_*.py'
       - 'test/providers/fixtures/kiro_cli_*.txt'
       - 'pyproject.toml'
       - '.github/workflows/test-kiro-cli-provider.yml'
@@ -59,7 +67,7 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
-          uv run pytest test/providers/test_kiro_cli_unit.py \
+          uv run pytest test/providers/test_kiro_cli_*.py \
             --cov=src/cli_agent_orchestrator/providers/kiro_cli.py \
             --cov-report=xml \
             --cov-report=term-missing \

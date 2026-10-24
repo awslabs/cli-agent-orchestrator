@@ -44,7 +44,7 @@ from __future__ import annotations
 import ast
 import re
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
+from typing import Dict, Optional, Set, Tuple
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 PACKAGES = (SRC / "cli_agent_orchestrator", SRC / "cao_workflow")

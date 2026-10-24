@@ -11,8 +11,6 @@ Guard matrix:
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
-
 import pytest
 from fastapi.testclient import TestClient
 
@@ -21,7 +19,6 @@ from cli_agent_orchestrator.services.agui.approval_bridge import ApprovalBridge
 from cli_agent_orchestrator.services.agui.base import RecordingUiEmitter
 from cli_agent_orchestrator.services.agui.handoff_approval import (
     AgentHandoffWithApproval,
-    ApprovalDecision,
 )
 
 # Host in ALLOWED_HOSTS so TrustedHostMiddleware admits the request.
