@@ -240,6 +240,10 @@ descriptions and purposes before every call; redaction removes common credential
 shapes using patterns and is not a guarantee. Decision records hold no task content.
 Review the package's disclosure to learn exactly what it sends and where it sends it.
 
+CAO asks a decider once per eligible delegation request, before the server's own launch checks. A
+request the server then refuses, for example because it exceeds the creator's delegation ceiling,
+has still been sent; its records read `not_launched`.
+
 External deciders must send only while holding
 `cli_agent_orchestrator.decisions.egress.egress_permit(point, decider)`:
 
