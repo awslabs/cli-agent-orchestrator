@@ -3,7 +3,9 @@
 import asyncio
 from dataclasses import replace
 from datetime import datetime
-from test.decisions.test_engine import setup_engine
+from test.decisions.test_engine import (  # noqa: F401  # pytest fixture, injected by name into the tests below
+    setup_engine,
+)
 from unittest.mock import AsyncMock
 
 import pytest
@@ -92,7 +94,6 @@ def post_delegation(client, path, *, model=None, fields=None):
 @pytest.mark.parametrize("path", ["session", "terminal", "step"])
 def test_handlers_route_and_bind_before_note(handler_path, path, monkeypatch):
     api, client, engine, decider, store, events, calls = handler_path
-    from cli_agent_orchestrator.decisions.engine import prepare_launch
     from cli_agent_orchestrator.decisions.policy import IDENTITY_POLICY
     from cli_agent_orchestrator.decisions.targets import TargetKind
 

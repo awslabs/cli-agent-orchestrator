@@ -1,7 +1,6 @@
 """Conformance and unchanged results through the real delegation entry points."""
 
 import json
-from dataclasses import replace
 from test.fixtures.decision_conformance import ConfidentDecider, conformance_cases, run_case
 from test.fixtures.delegation_conformance import DelegationAdapter
 from test.fixtures.delegation_goldens import GOLDEN_RESULTS

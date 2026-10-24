@@ -1,8 +1,16 @@
 """Preserve request documentation and best-effort delegation behavior."""
 
-from test.decisions.test_engine import setup_engine
-from test.decisions.test_launch_binding import terminal_path
-from test.decisions.test_wiring import handler_path, post_delegation
+from test.decisions.test_engine import (  # noqa: F401  # pytest fixture, injected by name into the tests below
+    setup_engine,
+)
+from test.decisions.test_launch_binding import (  # noqa: F401  # pytest fixture, injected by name into the tests below
+    terminal_path,
+)
+
+from test.decisions.test_wiring import (  # isort: skip  (per-name noqa below; see the comment)
+    handler_path,  # noqa: F401  # pytest fixture, injected by name
+    post_delegation,
+)
 from unittest.mock import Mock
 
 import pytest

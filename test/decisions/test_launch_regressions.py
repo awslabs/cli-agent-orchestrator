@@ -2,9 +2,15 @@
 
 import asyncio
 from dataclasses import replace
-from test.decisions.test_engine import setup_engine
-from test.decisions.test_launch_binding import terminal_path
-from test.decisions.test_wiring import handler_path
+from test.decisions.test_engine import (  # noqa: F401  # pytest fixture, injected by name into the tests below
+    setup_engine,
+)
+from test.decisions.test_launch_binding import (  # noqa: F401  # pytest fixture, injected by name into the tests below
+    terminal_path,
+)
+from test.decisions.test_wiring import (  # noqa: F401  # pytest fixture, injected by name into the tests below
+    handler_path,
+)
 from unittest.mock import AsyncMock, Mock
 
 import pytest
