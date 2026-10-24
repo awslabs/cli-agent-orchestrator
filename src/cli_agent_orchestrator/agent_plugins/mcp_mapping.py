@@ -82,8 +82,8 @@ _PLACEHOLDER_RE = re.compile(r"\$\{(PLUGIN_ROOT|PLUGIN_DATA)\}")
 #:   ``.env`` / ``.env_vars`` TOML overrides and has no ``url`` branch at all. A
 #:   ``streamable-http`` entry produces a server name carrying only ``env_vars``,
 #:   which cannot start.
-#: * ``antigravity_cli`` — ``_register_mcp_servers`` always writes
-#:   ``{"command": ..., "args": ..., "env": ...}`` into ``mcp_config.json``, so a
+#: * ``antigravity_cli`` — ``_register_mcp_servers`` writes ``command`` and
+#:   ``args`` (and ``env`` or ``cwd`` when set) into ``mcp_config.json``, so a
 #:   url-based entry lands with an empty command.
 #: * ``claude_code``, ``kimi_cli``, ``cursor_cli`` — these pass the whole entry
 #:   through (``resolve_mcp_server_config`` returns a command-less url entry
