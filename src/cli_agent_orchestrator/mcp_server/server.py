@@ -817,9 +817,9 @@ async def assign_elastic(
     denied = await asyncio.to_thread(_tool_denied_reason, "assign_elastic")
     if denied:
         return {"success": False, "terminal_id": None, "elastic": True, "message": denied}
-    from cli_agent_orchestrator.utils import agent_profiles
+    from cli_agent_orchestrator.utils.ephemeral_names import routes_to_ephemeral_store
 
-    if agent_profiles.routes_to_ephemeral_store(agent_profile):
+    if routes_to_ephemeral_store(agent_profile):
         from cli_agent_orchestrator.services.ephemeral_service import log_refusal
 
         text = f"remote_placement_not_allowed: ephemeral agent '{agent_profile}' can only launch on the node that created it; use assign or handoff"

@@ -397,3 +397,20 @@ def test_loader_parses_verified_snapshot_without_second_read(stores, monkeypatch
 
     monkeypatch.setattr(database, "get_ephemeral_agent", lookup)
     assert profiles.load_launch_profile(NAME)[0].system_prompt == "Task."
+
+
+def test_namespace_matcher_imports_without_state_clients():
+    """MCP name routing must be usable without importing state clients."""
+    import subprocess
+    import sys
+
+    script = """
+import sys
+from cli_agent_orchestrator.utils.ephemeral_names import routes_to_ephemeral_store
+assert routes_to_ephemeral_store('Ramones-log_triage-3f9a')
+assert not routes_to_ephemeral_store('ordinary')
+assert not any(name.startswith(('cli_agent_orchestrator.clients.database',
+                                'cli_agent_orchestrator.clients.tmux'))
+               for name in sys.modules)
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True)
