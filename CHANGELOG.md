@@ -67,6 +67,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `examples/decision-model-host`: hosts the open-weight JevK5-4B decision model behind
+  a loopback-only `/v1/systemone` API. Locally, it uses llama.cpp, with Metal or the CPU.
+  On AWS, a CDK stack creates a single GPU instance with no IAM resources. Its services
+  bind to loopback and are reached by SSH tunnel, and it stops itself when idle. The CDK
+  tests pin those properties (#952)
 - Conversational workflow authoring: `cao workflow create` / `update` and the `workflow_create`,
   `workflow_update`, `workflow_get` and `workflow_validate` MCP tools (#583 Bolt 3) (#699). Spec writes
   are atomic and serialized per workflow, so two concurrent creates cannot both succeed and an update

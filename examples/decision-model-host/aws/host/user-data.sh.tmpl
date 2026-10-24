@@ -1,0 +1,124 @@
+#!/bin/bash
+# Bootstrap a JevK5-family decision model host on the Deep Learning Base OSS NVIDIA AMI (Ubuntu 22.04).
+# llama-server and the /v1/systemone shim listen on 127.0.0.1 only; reach them through an SSH tunnel.
+set -euxo pipefail
+exec > >(tee -a /var/log/decision-host-setup.log) 2>&1
+
+MODEL_REPO="@MODEL_REPO@"
+MODEL_FILE="@MODEL_FILE@"
+MODEL_SHA256="@MODEL_SHA256@"
+MODEL_NAME="@MODEL_NAME@"
+MODEL_TEMP="@MODEL_TEMP@"
+LLAMA_TAG="@LLAMA_TAG@"
+JEVK5_TAG="@JEVK5_TAG@"
+IDLE_MINUTES="@IDLE_MINUTES@"
+CUDA_ARCH="@CUDA_ARCH@"
+ROOT=/opt/decision
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y cmake build-essential git curl python3 libcurl4-openssl-dev libssl-dev
+
+id decision >/dev/null 2>&1 || useradd --system --home "$ROOT" --shell /usr/sbin/nologin decision
+mkdir -p "$ROOT"/models "$ROOT"/src "$ROOT"/bin /var/lib/decision
+
+# llama.cpp, the same build as the operator's Mac, compiled for this GPU.
+if [ ! -x "$ROOT/bin/llama-server" ]; then
+  git clone --depth 1 --branch "$LLAMA_TAG" https://github.com/ggml-org/llama.cpp "$ROOT/src/llama.cpp"
+  CUDA_HOME=$(ls -d /usr/local/cuda-* | sort -V | tail -1)
+  export PATH="$CUDA_HOME/bin:$PATH"
+  cmake -S "$ROOT/src/llama.cpp" -B "$ROOT/src/llama.cpp/build" -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH"
+  cmake --build "$ROOT/src/llama.cpp/build" -j"$(nproc)" --target llama-server
+  install -m 0755 "$ROOT/src/llama.cpp/build/bin/llama-server" "$ROOT/bin/llama-server"
+  # llama-server links the ggml shared libraries from its build tree.
+  cp -a "$ROOT"/src/llama.cpp/build/bin/*.so* "$ROOT/bin/" 2>/dev/null || true
+fi
+
+# The model, verified against its published SHA-256 before use.
+if [ ! -f "$ROOT/models/$MODEL_FILE" ]; then
+  curl -fL --retry 3 -o "$ROOT/models/$MODEL_FILE.part" \
+    "https://huggingface.co/$MODEL_REPO/resolve/main/$MODEL_FILE"
+  echo "$MODEL_SHA256  $ROOT/models/$MODEL_FILE.part" | sha256sum -c -
+  mv "$ROOT/models/$MODEL_FILE.part" "$ROOT/models/$MODEL_FILE"
+fi
+
+# jevk5 at a reviewed tag; its GGUF client is standard-library only, so no packages are installed.
+[ -d "$ROOT/src/jevk5" ] || git clone --depth 1 --branch "$JEVK5_TAG" https://github.com/allebee/jevk5 "$ROOT/src/jevk5"
+
+base64 -d > "$ROOT/bin/serve_gguf.py" <<'SHIM'
+@SHIM_B64@
+SHIM
+
+cat > "$ROOT/bin/idle-stop.sh" <<IDLE
+#!/bin/bash
+# Stop the instance after $IDLE_MINUTES idle minutes (no decision request, no interactive login).
+last=\$(stat -c %Y /var/lib/decision/last-request 2>/dev/null || echo 0)
+boot=\$(date -d "\$(uptime -s)" +%s)
+ref=\$(( last > boot ? last : boot ))
+if [ \$(( \$(date +%s) - ref )) -gt $(( IDLE_MINUTES * 60 )) ] && [ -z "\$(who)" ]; then
+  logger -t idle-stop "idle for over $IDLE_MINUTES minutes; stopping"
+  /sbin/shutdown -h now
+fi
+IDLE
+chmod 0755 "$ROOT/bin/idle-stop.sh"
+chown -R decision:decision "$ROOT" /var/lib/decision
+
+cat > /etc/systemd/system/llama-server.service <<UNIT
+[Unit]
+Description=llama-server for $MODEL_NAME (loopback only)
+After=network-online.target
+
+[Service]
+User=decision
+Environment=LD_LIBRARY_PATH=$ROOT/bin
+ExecStart=$ROOT/bin/llama-server -m $ROOT/models/$MODEL_FILE -c 8192 -ngl 99 --host 127.0.0.1 --port 8080
+Restart=on-failure
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat > /etc/systemd/system/decision-shim.service <<UNIT
+[Unit]
+Description=/v1/systemone decision shim for $MODEL_NAME (loopback only)
+After=llama-server.service
+Requires=llama-server.service
+
+[Service]
+User=decision
+Environment=PYTHONPATH=$ROOT/src/jevk5
+ExecStartPre=/bin/bash -c 'for i in \$(seq 1 120); do curl -sf 127.0.0.1:8080/health && exit 0; sleep 2; done; exit 1'
+ExecStart=/usr/bin/python3 $ROOT/bin/serve_gguf.py --name $MODEL_NAME --temperature $MODEL_TEMP --port 8090 --activity-file /var/lib/decision/last-request
+Restart=on-failure
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat > /etc/systemd/system/idle-stop.service <<UNIT
+[Unit]
+Description=Stop the instance when the decision host is idle
+
+[Service]
+Type=oneshot
+ExecStart=$ROOT/bin/idle-stop.sh
+UNIT
+
+cat > /etc/systemd/system/idle-stop.timer <<UNIT
+[Unit]
+Description=Check decision host idleness every 10 minutes
+
+[Timer]
+OnBootSec=30min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now llama-server.service decision-shim.service idle-stop.timer
+echo "decision host ready: $MODEL_NAME"

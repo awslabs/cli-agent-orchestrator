@@ -1,0 +1,21 @@
+{
+  "name": "cao-decision-host-cdk",
+  "version": "0.1.0",
+  "private": true,
+  "bin": { "decision-host": "bin/app.js" },
+  "scripts": {
+    "build": "tsc",
+    "synth": "cdk synth",
+    "test": "node --test --import tsx test/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "aws-cdk": "^2.1118.4",
+    "tsx": "^4",
+    "typescript": "^5.6"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.200.0",
+    "constructs": "^10.4.2"
+  }
+}
