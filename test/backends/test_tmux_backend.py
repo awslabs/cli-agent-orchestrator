@@ -131,8 +131,13 @@ class TestTmuxBackendDelegation:
             strip_escapes=False,
             full_history=False,
             visible_only=False,
+            join_wrapped=False,
         )
         assert result == "output text"
+
+    def test_get_history_delegates_join_wrapped(self, backend, mock_client):
+        backend.get_history("cao-test", "window-0", join_wrapped=True)
+        assert mock_client.get_history.call_args.kwargs["join_wrapped"] is True
 
     def test_get_history_delegates_visible_only(self, backend, mock_client):
         mock_client.get_history.return_value = "viewport text"
@@ -144,6 +149,7 @@ class TestTmuxBackendDelegation:
             strip_escapes=False,
             full_history=False,
             visible_only=True,
+            join_wrapped=False,
         )
         assert result == "viewport text"
 

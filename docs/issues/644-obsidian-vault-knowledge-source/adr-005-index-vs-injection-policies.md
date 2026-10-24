@@ -1,7 +1,7 @@
 # ADR-005: Index eligibility and injection eligibility are two policies
 
 **Issue:** [#644](https://github.com/awslabs/cli-agent-orchestrator/issues/644)
-**Status:** Proposed. **Revision 3** — the secrets position is reversed by ruling R5, its mode settled by ruling R14, and the curator's single-input property is now stated as the reason R1 is total. Revision 2 changed the enforcement placement; see [Revision 2 correction](#revision-2-correction).
+**Status:** Proposed. **Revision 3, amended 2026-10-21** (#644 AC10: `warn` redacts every model-bound read; per-finding acceptances) — the secrets position is reversed by ruling R5, its mode settled by ruling R14, and the curator's single-input property is now stated as the reason R1 is total. Revision 2 changed the enforcement placement; see [Revision 2 correction](#revision-2-correction).
 **Decision owner:** the issue's risk "Index eligibility and automatic context injection must be separate, explicit policies"; enforcement placement settled by human ruling R1
 **Related:** [design.md](design.md), [adr-003-read-and-write-surface.md](adr-003-read-and-write-surface.md), [adr-007-configuration-surface.md](adr-007-configuration-surface.md)
 
@@ -285,7 +285,8 @@ converts a caller-optional flag into an enforced invariant.
   confidentiality decision: `reject` by default keeps the AC10 exposure fix as the
   out-of-the-box posture, while a vault owner who knows their own corpus gets a documented,
   per-mapping way to say *these are examples, not credentials*. That escape hatch is
-  necessary rather than indulgent precisely because one of the six patterns is
+  necessary rather than indulgent precisely because one of the twelve patterns (six when
+  this was written) is
   `(?i)(?:password|passwd|secret|pwd)\s*[:=]\s*\S{6,}`, and notes **about** credential
   handling — runbooks, design notes, incident write-ups — are ordinary content in a
   knowledge vault.
@@ -306,7 +307,7 @@ converts a caller-optional flag into an enforced invariant.
   AC10 was flagged — the insecure posture must not be the default. **A per-pattern
   confidence policy** — quarantine on `aws_access_key`/`pem_private_key`, warn on the loose
   `password:` regex — is the most precise answer and the natural future refinement, deferred
-  because classifying six patterns by confidence makes that classification its own
+  because classifying the patterns by confidence makes that classification its own
   security-relevant review surface, better done with evidence about which patterns actually
   misfire.
   The injection policy remains a separate and stricter layer: even under `warn`, a
@@ -323,6 +324,14 @@ converts a caller-optional flag into an enforced invariant.
   this design draws is between refusing an *incoherent* configuration and refusing a
   *risky* one; the second is the operator's call to make, and CAO's job is to make sure they
   cannot make it by accident.
+
+  **Amendment 2026-10-21 (maintainer ruling, #644 AC10).** R14 judged whether the configuration was *coherent*, not whether the data flow was *safe*: under `warn` the raw match left the machine and persisted in a model provider's request logs for the retention window, a shape no surveyed secret scanner offers (each blocks by default and overrides **per finding**, with the override recorded). `warn` now means **redact-and-inject**: the note is indexed and recallable, but every match is replaced by `[REDACTED:<pattern_name>]` at the single read chokepoint, `services/vault/reader.py::load_candidate`, which every model-bound path (automatic injection, explicit recall, related-key expansion, BM25 ranking) goes through. Raw bytes pass only when the note's own frontmatter carries a per-finding acceptance bound to the pattern name **and** the SHA-256 of the matched span, `cao.secret_ok: [{pattern, sha256}]`; a boolean or pattern-only entry is an invalid `cao` block and quarantines the note. Acceptances are reported as `secret_accepted` findings and in `cao memory vault status` (`secret_acceptances`); an acceptance matching nothing, or on a `reject` mapping, is `secret_acceptance_unmatched`. `cao memory vault scan --fingerprints` prints the pattern and hash an operator needs, to the terminal only. `reject` is unchanged. The pattern table is twelve, not six: `aws_access_key`, `aws_secret_access_key`, `pem_private_key`, `anthropic_api_key`, `openai_api_key`, `github_fine_grained_pat`, `github_pat`, `gitlab_pat`, `slack_token`, `jwt`, `bearer_token`, `secret_assignment`.
+  The layering paragraph above still holds, with one correction: `inject: false` was never
+  the control that kept the bytes off the wire, because explicit recall is also
+  model-bound; redaction at the read chokepoint is. The `warn` + `inject: true` pairing is
+  therefore no longer the maximal-exposure configuration and no longer warns at load
+  (ADR-007 rule 20, retired); the acceptance, not the mapping, is the exposure, and the
+  acceptance is what status reports.
 - **Forward risk.** A frozen-memory injection arm designed elsewhere deliberately
   bypasses `MemoryService` for determinism. It must route through the chokepoint with
   `require_injectable=True` and must not skip `_is_memory_enabled()`. Recorded so the

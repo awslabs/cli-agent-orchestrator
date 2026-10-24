@@ -54,6 +54,8 @@ def test_every_non_secret_finding_has_its_adr_severity():
         FindingCode.HARDLINK_REFUSED: "warn",
         FindingCode.PATH_ESCAPES_ROOT: "warn",
         FindingCode.NOTE_NOT_UTF8: "error",
+        FindingCode.SECRET_ACCEPTED: "info",
+        FindingCode.SECRET_ACCEPTANCE_UNMATCHED: "warn",
         FindingCode.UNSTABLE_SKIPPED: "warn",
         FindingCode.LINK_LIMIT_EXCEEDED: "warn",
         FindingCode.LINK_TARGET_INVALID: "warn",

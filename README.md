@@ -132,6 +132,8 @@ provider override while keeping the same sequence.
   multi-step pipelines.
 - [Launch decisions](docs/decisions.md): local routing settings and content-free records.
 - [Skills](docs/skills.md): install, scope, and author reusable agent guidance.
+- [Skills lifecycle example](examples/skills/README.md): install, discover,
+  load, apply, update, and remove a reusable skill in an isolated home.
 - [Memory](docs/memory.md) and [self-learning](docs/self-learning.md):
   persistent cross-session memory, and the opt-in loop that turns workflow
   outcomes into lessons and promoted instructions.
@@ -139,6 +141,8 @@ provider override while keeping the same sequence.
   parallel AI-DLC intents across repositories and isolated worktrees.
 - [Cross-zone robot transport](examples/robotics/cross-zone-transport/README.md):
   coordinate simulated transport, measured custody handoffs, and independent checks.
+- [Self-hosted decision model](examples/decision-model-host/README.md): run the open
+  JevK5-4B decision model locally or on AWS (CDK), behind a loopback-only `/v1/systemone` API.
 - [Tool restrictions](docs/tool-restrictions.md): roles, allowlists, and
   provider enforcement.
 - [Kubernetes deployment](examples/cao-clusters/kubernetes/eks/README.md): run a supervisor and worker fleet on

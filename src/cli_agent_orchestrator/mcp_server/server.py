@@ -15,7 +15,6 @@ from fastmcp.tools import Tool, ToolResult
 from pydantic import Field, WithJsonSchema
 
 from cli_agent_orchestrator.constants import (
-    ADVERTISED_URL_ENV,
     API_BASE_URL,
     DISCOVERY_TOOL_MARKER,
     ELASTIC_CALLBACK_URL_ENV,
@@ -30,12 +29,9 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.mcp_server import utils as mcp_utils
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
-from cli_agent_orchestrator.mcp_server.utils import _auth_headers, _auth_headers_for
+from cli_agent_orchestrator.mcp_server.utils import _auth_headers_for
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck, parse_decision
-from cli_agent_orchestrator.services.elastic_worker_gateway import (
-    elastic_worker_gateway_headers,
-)
 from cli_agent_orchestrator.services.memory_service import (
     MEMORY_DISABLED_MESSAGE,
     MemoryDisabledError,
@@ -905,6 +901,7 @@ async def assign_elastic(
             callback_url=os.environ.get(ELASTIC_CALLBACK_URL_ENV) or None,
             remote_session_name=str(lease["session_name"]),
             description=description,
+            delegation_message=message,
         )
         result["worker_id"] = worker_id
         result["elastic"] = True
@@ -1545,6 +1542,30 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
 
 CAO_MCP_SERVER_SELECTOR = "@cao-mcp-server"
 
+#: ``list_siblings``/``update_metadata`` are gated by their own live
+#: ``discovery`` check (``_require_discovery_marker`` above), not by
+#: ``@cao-mcp-server`` -- docs/tool-restrictions.md: "A profile with
+#: @cao-mcp-server does not automatically get sibling discovery, and vice
+#: versa." Letting the two tools in this set through on ``discovery`` alone
+#: (in addition to ``*``/``@cao-mcp-server``) keeps that documented,
+#: independently-grantable surface reachable; ``_require_discovery_marker``
+#: still does the real enforcement when the tool actually runs.
+DISCOVERY_GATED_TOOLS = frozenset({"list_siblings", "update_metadata"})
+
+
+def _attach_workflow_caller(payload: Dict[str, Any]) -> None:
+    """Add the calling terminal to a workflow request so its steps inherit the ceiling.
+
+    The server bounds every agent step a run creates by the ``caller_id``
+    terminal's RECORDED delegation ceiling (``RunRecord.caller_id``,
+    ``utils/delegation.py``). ``_tool_denied_reason`` has already established
+    that ``CAO_TERMINAL_ID`` names a resolvable terminal by the time this runs;
+    an operator shell (no id) sends nothing and stays unbounded, as before.
+    """
+    caller = os.environ.get("CAO_TERMINAL_ID")
+    if caller:
+        payload["caller_id"] = caller
+
 
 def _tool_denied_reason(tool_name: str) -> Optional[str]:
     """Reason the calling terminal's allowlist bars ``tool_name``, or None to allow.
@@ -1564,6 +1585,9 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
     profile resolution that ``None`` stands for, and these operations are
     granted by the documented ``@cao-mcp-server`` server selector or by ``*``.
     Bare tool names are provider-native vocabulary and never name an MCP tool.
+    ``DISCOVERY_GATED_TOOLS`` is the one exception: those two tools also pass
+    on the ``discovery`` grant alone, because that grant is documented as
+    independent of ``@cao-mcp-server``.
 
     Fails closed. An unset ``CAO_TERMINAL_ID`` is the supported operator
     context (``cao assign`` and ``cao handoff`` run with no caller identity)
@@ -1627,10 +1651,94 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
     if "*" in allowed or CAO_MCP_SERVER_SELECTOR in allowed:
         return None
 
+    if tool_name in DISCOVERY_GATED_TOOLS and has_discovery_grant(allowed):
+        return None
+
     return (
         f"'{tool_name}' is not permitted: the calling terminal's allowed tools do not "
         f"include '{CAO_MCP_SERVER_SELECTOR}'"
     )
+
+
+#: CAO MCP tools a bound terminal must reach whatever its allowlist says.
+#:
+#: These are the callback protocol, not capabilities. ``skills/cao-worker-protocols``
+#: tells an ASSIGNED worker to report its result with ``send_message`` and no
+#: ``receiver_id`` ("The requesting terminal depends on ``send_message`` to receive
+#: the result"), and ``_resolve_child_allowed_tools`` gives a child whose profile
+#: declares ``tools: [fs_read]`` exactly ``["fs_read"]``. Gating these on
+#: ``@cao-mcp-server`` would therefore leave a restricted worker unable to report
+#: and its supervisor waiting forever — CAO would deadlock its own orchestration to
+#: enforce a restriction the operator asked for on the worker's *capabilities*.
+#:
+#: Each entry answers upward to the terminal that created the caller, carries no
+#: authority over any other identity, and cannot mint one. Keep this set this small:
+#: a tool belongs here only if a worker CANNOT COMPLETE ITS OWN ASSIGNED WORK
+#: without it. "It would be convenient" is what produced #671.
+CALLBACK_EXEMPT_TOOLS = frozenset(
+    {
+        "send_message",
+        "complete_assignment",
+        "workflow_return",
+        "answer_user_prompt",
+    }
+)
+
+
+def _install_allowlist_middleware(server: Any) -> None:
+    """Gate every CAO MCP tool on the caller's allowlist (#671).
+
+    #769 and #811 put ``_tool_denied_reason`` on the tools that mint a new agent
+    identity. That closed the escalation path and left the rest of the surface
+    open: a bound terminal whose effective allowlist omits ``@cao-mcp-server``
+    could still call ``memory_store``, ``memory_forget``, ``delete_terminal``,
+    ``update_metadata``, ``workflow_cancel`` and the rest, because the only other
+    enforcement mechanism — the provider-native deny flags built by
+    ``utils/tool_mapping`` — cannot name an MCP tool at all:
+    ``get_disallowed_tools`` skips every ``@``-prefixed entry, so it emits no
+    ``mcp__`` name on any provider.
+
+    One rule, applied here rather than at 26 more call sites, because per-site
+    guards are exactly how the surface drifted in the first place and a tool added
+    tomorrow would be ungated by default. The policy is unchanged:
+    ``_tool_denied_reason`` is the single source of it, so an operator context
+    (no ``CAO_TERMINAL_ID``) still allows, ``*`` or ``@cao-mcp-server`` still
+    grants, and every failure to resolve a claimed identity still denies.
+
+    Registered AFTER the MCP Apps surface so an app-only tool is reported as
+    unknown by its own filter rather than as unauthorized by this one — the
+    existence of a hidden tool is not something to leak through an authz error.
+
+    The inline ``_tool_denied_reason`` calls in the delegation tools are left in
+    place. They are redundant with this middleware over MCP but are NOT dead:
+    they return a structured ``{"success": False, "error": ...}`` envelope that
+    agents handle better than a protocol error, and they keep working for any
+    caller that reaches those functions without passing through FastMCP dispatch.
+    """
+    add_middleware = getattr(server, "add_middleware", None)
+    if not callable(add_middleware):
+        # Fail closed: a FastMCP build that cannot install this gate must not
+        # start ungated and silent. Raising here aborts module import (the
+        # call site below is module-level), the loudest failure available.
+        raise RuntimeError(
+            "FastMCP build has no add_middleware; cannot install the CAO MCP "
+            "tool allowlist gate (#671)"
+        )
+
+    from fastmcp.exceptions import ToolError
+    from fastmcp.server.middleware import Middleware
+
+    class _AllowlistGate(Middleware):
+        async def on_call_tool(self, context: Any, call_next: Any) -> Any:
+            tool_name = context.message.name
+            if tool_name in CALLBACK_EXEMPT_TOOLS:
+                return await call_next(context)
+            denied = await asyncio.to_thread(_tool_denied_reason, tool_name)
+            if denied:
+                raise ToolError(denied)
+            return await call_next(context)
+
+    add_middleware(_AllowlistGate())
 
 
 async def create_ephemeral_agent(
@@ -1921,7 +2029,7 @@ async def memory_recall(
     search_mode: str = "hybrid",
     sort_by: str = Field(
         default="recency",
-        description='Ranking: "recency" (default), "score" (BM25+recency+usage), or "usage".',
+        description='Ranking: "recency" (default), "score" (BM25+recency+usage), "usage", or "relevance" (lexical relevance over a widened pool; needs query, else behaves as recency).',
     ),
     include_related: bool = Field(
         default=False,
@@ -1983,6 +2091,11 @@ async def memory_recall(
             "success": True,
             "memories": [
                 {
+                    **(
+                        {"lifecycle_status": m.lifecycle_status}
+                        if m.lifecycle_status is not None
+                        else {}
+                    ),
                     "key": m.key,
                     "content": m.content,
                     "memory_type": m.memory_type,
@@ -2505,6 +2618,7 @@ async def workflow_run(
     if root is not None:
         payload["working_directory"] = root
     auth_headers = mcp_utils._auth_headers() or None
+    _attach_workflow_caller(payload)
     try:
         # The server awaits the WHOLE run inline (Q1=A), so this blocks for the full
         # run duration — use the worst-case-covering run timeout, NOT the short
@@ -2601,11 +2715,15 @@ async def workflow_resume(
     try:
         # Resume re-drives the WHOLE run inline, so block for the full run duration
         # using the worst-case run timeout, NOT the short per-call _mcp_timeout().
-        # ``json=None`` sends NO body, so a decision-free resume is byte-identical to
-        # the pre-#583 request.
+        # ``json=None`` sends NO body, so a decision-free resume from an operator
+        # shell is byte-identical to the pre-#583 request. Inside a CAO terminal
+        # the body carries the caller so the re-run steps are bounded by its
+        # delegation ceiling.
+        resume_body: Dict[str, Any] = {"decisions": dict(supplied)} if supplied else {}
+        _attach_workflow_caller(resume_body)
         response = requests.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/resume",
-            json={"decisions": dict(supplied)} if supplied else None,
+            json=resume_body or None,
             headers=mcp_utils._auth_headers() or None,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
         )
@@ -2720,6 +2838,7 @@ async def workflow_start(
     if root is not None:
         payload["working_directory"] = root
     auth_headers = mcp_utils._auth_headers() or None
+    _attach_workflow_caller(payload)
     try:
         # Async submit — the normal per-call timeout, NOT the long blocking one (TR-1).
         response = requests.post(
@@ -3509,6 +3628,10 @@ async def workflow_validate(
 from cli_agent_orchestrator.plugins.registry import register_mcp_server_surfaces  # noqa: E402
 
 register_mcp_server_surfaces(mcp)
+
+# Last, so it wraps every tool registered above — CAO's own 33 and anything a
+# plugin's on_mcp_server hook added (#671).
+_install_allowlist_middleware(mcp)
 
 
 def main():

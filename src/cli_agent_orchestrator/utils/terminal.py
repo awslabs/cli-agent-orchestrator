@@ -6,11 +6,27 @@ import logging
 import re
 import time
 import uuid
-from typing import Callable, Optional, Union
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional, Union
 
-from cli_agent_orchestrator.constants import API_BASE_URL, SESSION_PREFIX
+from cli_agent_orchestrator.constants import (
+    API_BASE_URL,
+    SESSION_PREFIX,
+    TURN_START_CONFIRM_SECONDS,
+)
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.utils import api_http
+
+# How long ``poll_until_done`` keeps refusing a ready status whose stamp never
+# moved past the dispatch boundary AFTER output has landed since the send, before
+# it concludes the turn finished without a sampled PROCESSING and degrades to the
+# frame-based wait. Same budget the server gives a worker to show its first
+# PROCESSING before it resubmits (``terminal_service._DEFERRED_SUBMIT_CONFIRM_TIMEOUT``);
+# the two gates read the same stamp and answer the same question, "has this turn
+# been seen yet", so one shared constant describes both.
+STAMP_GRACE_SECONDS = TURN_START_CONFIRM_SECONDS
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.utils.fleet import BrokerRequestError
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +197,8 @@ async def wait_until_status(
     target_status: "TerminalStatus | set[TerminalStatus]",
     timeout: float = 30.0,
     polling_interval: float = 1.0,
+    *,
+    on_poll: Optional[Callable[[], Awaitable[None]]] = None,
 ) -> bool:
     """Wait until terminal reaches target status by polling status_monitor.
 
@@ -194,6 +212,14 @@ async def wait_until_status(
     status_monitor.py), and on herdr it shells out to the herdr CLI. Offload each poll via
     asyncio.to_thread so that blocking I/O can't fork/exec on the shared event loop —
     matches the pattern GET /terminals/{id} (api/main.py) uses for the identical hazard.
+
+    ``on_poll`` is awaited after every status read and BEFORE the read is acted
+    on. It is how a caller abandons the wait for a reason the status cannot
+    express: a provider's ``initialize()`` passes its exit-to-shell check so a
+    CLI that dies during startup ends the wait with that fact instead of
+    burning the whole timeout (#1018) -- and so a ready status read from a pane
+    that is a bare shell is vetoed before this function can return True on it.
+    The hook aborts by raising; whatever it raises propagates unchanged.
     """
     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
@@ -205,6 +231,8 @@ async def wait_until_status(
     start = time.time()
     while time.time() - start < timeout:
         current = await asyncio.to_thread(status_monitor.get_status, terminal_id)
+        if on_poll is not None:
+            await on_poll()
         if current in targets:
             logger.info(f"wait_until_status [{terminal_id}]: reached {current.value}")
             return True
@@ -239,12 +267,35 @@ def sync_backend_from_server() -> None:
         logger.debug(f"sync_backend_from_server: could not reach server: {e}")
 
 
+def _is_transient_poll_error(
+    exc: Union[api_http.exceptions.RequestException, "BrokerRequestError"],
+) -> bool:
+    """Whether a failed status poll is worth retrying before the caller's timeout.
+
+    A 4xx will not change on retry (a deleted terminal, a missing credential), so
+    it is final. A 5xx, a connection error, a read timeout or a reply that is not
+    JSON can clear while the server or broker catches up (#882, #1016). Every loop
+    that waits on a terminal's status classifies its failures here, so a local
+    terminal and a ``cao worker`` behind the fleet broker get the same policy.
+    """
+    from cli_agent_orchestrator.utils.fleet import BrokerRequestError
+
+    if isinstance(exc, BrokerRequestError):
+        status_code = exc.status_code
+    else:
+        response = getattr(exc, "response", None)
+        status_code = response.status_code if response is not None else None
+    return status_code is None or not 400 <= status_code < 500
+
+
 def poll_until_done(
     terminal_id: str,
     timeout: float,
     polling_interval: float = 1.0,
     idle_stable_polls: int = 3,
     read_status: Optional[Callable[[str], Optional[str]]] = None,
+    min_generation: Optional[int] = None,
+    stamp_grace: float = STAMP_GRACE_SECONDS,
 ) -> None:
     """Poll terminal status until the agent is done, errored, or timeout.
 
@@ -263,8 +314,45 @@ def poll_until_done(
       after a send before it has begun processing. Gating the IDLE path on
       "has started" prevents returning early with empty/partial output when the
       agent simply hasn't picked up the task yet; the stable-window then guards
-      against a momentary idle flap mid-turn. The COMPLETED path is byte-for-byte
-      unchanged.
+      against a momentary idle flap mid-turn.
+
+    ``min_generation`` is the dispatch boundary ``POST /terminals/{id}/input``
+    returned for the send this call is waiting on. Supplied, NO reading is treated
+    as evidence — not COMPLETED, not IDLE, not "started working" — unless the
+    ``status_generation`` reported alongside it is strictly greater, i.e. the
+    status was earned from output that landed after the send. This is what makes
+    "done" mean the turn that was sent rather than the frame on screen: for the
+    whole window between a dispatch and the new turn's first applied PROCESSING,
+    the server correctly reports the PREVIOUS turn's COMPLETED (``notify_input_sent``
+    deliberately leaves ``_last_status`` alone), and a bare COMPLETED returned
+    immediately with the previous turn's answer (#735, #407).
+
+    The refusal is BOUNDED, because the latch does not stamp every turn: an
+    unchanged COMPLETED -> COMPLETED re-detection and the COMPLETED -> IDLE ->
+    COMPLETED round trip both keep the previous turn's stamp by design
+    (``StatusMonitor._apply_detection_locked``), so a fast turn whose spinner and
+    answer land in one chunk, sent from the COMPLETED a previous send left, ends
+    with ``status_generation`` still at or below the boundary. The server cannot
+    tell that from a repaint of the previous frame; its own gate resubmits after
+    a deadline, which a CLI must never do. So this wait also reads the terminal's
+    CURRENT ``output_generation`` and, once output has landed since the send
+    (counter above the boundary) with the stamp still not past it, gives the stamp
+    ``stamp_grace`` seconds to move. If it does not, the wait prints a warning on
+    stderr, stops refusing readings and finishes on the frame-based rules above:
+    the answer printed may then be the previous turn's, and the warning says so.
+    While NOTHING has landed since the send (counter equal to the boundary) the
+    refusal has no bound -- there is no turn to be done yet, and finishing on the
+    previous frame there is exactly #735. A counter BELOW the boundary cannot
+    happen within one cao-server lifetime (the boundary was sampled from it), so
+    it means the server restarted and its stamps no longer share the boundary's
+    timeline; the wait warns and degrades at once instead of refusing every
+    reading until the timeout.
+
+    Omitted — or when the server reports no ``status_generation``, which is the
+    case for an older cao-server and for event-inbox backends (herdr) whose status
+    is derived on demand — the wait degrades to the frame-based behaviour above
+    rather than hanging. ERROR is honoured regardless of generation: a dead
+    provider is not a stale frame.
 
     ``read_status`` overrides only WHERE the status is read from, returning the
     same string ``GET /terminals/{id}`` puts in its ``status`` field. It exists so
@@ -273,9 +361,17 @@ def poll_until_done(
     IDLE-versus-COMPLETED reasoning above is provider behaviour, not transport
     behaviour, so it must not be duplicated per transport.
 
-    Raises click.ClickException on error, timeout, or request failure.
+    A failed poll is retried until ``timeout`` unless it is a 4xx (see
+    ``_is_transient_poll_error``); the agent keeps working while the server or
+    broker is briefly unavailable, and giving up on one 503 made ``cao session
+    send`` drop a reply that was on its way (#1016).
+
+    Raises click.ClickException on ERROR status, on a 4xx, or on timeout, which
+    names the last failed poll if the final ones failed.
     """
     import click
+
+    from cli_agent_orchestrator.utils.fleet import BrokerRequestError
 
     if idle_stable_polls < 1:
         raise click.ClickException(f"idle_stable_polls must be >= 1, got {idle_stable_polls}")
@@ -283,53 +379,140 @@ def poll_until_done(
     start = time.time()
     consecutive_idle = 0
     observed_working = False
+    # The turn-identity gate; switched off for the rest of this wait (with a
+    # warning) when the stamp provably cannot or did not move -- see docstring.
+    gate_engaged = min_generation is not None
+    stamp_grace_started: Optional[float] = None
+    # Why the most recent reading was refused by the gate, for the timeout
+    # message: an operator who waited 300 s deserves to know the status never
+    # moved past the previous turn, not just that time ran out.
+    last_refusal: Optional[str] = None
+    last_error: Optional[str] = None
     while True:
         elapsed = time.time() - start
         if elapsed > timeout:
-            raise click.ClickException(
-                f"Timed out after {int(elapsed)}s waiting for terminal {terminal_id}"
-            )
+            message = f"Timed out after {int(elapsed)}s waiting for terminal {terminal_id}"
+            if last_error is not None:
+                message += f"; the last poll failed: {last_error}"
+            elif last_refusal is not None:
+                message += f"; {last_refusal}"
+            raise click.ClickException(message)
         try:
+            generation: Optional[int] = None
+            current_generation: Optional[int] = None
             if read_status is not None:
+                # A transport override reports a status only; it cannot carry the
+                # generation, so such a caller degrades to the frame-based wait.
                 status = read_status(terminal_id)
             else:
                 # Per-request timeout so a stalled server/network can't block past
                 # the outer timeout budget (matches wait_until_terminal_status).
                 resp = api_http.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
                 resp.raise_for_status()
-                status = resp.json().get("status")
-            if status == TerminalStatus.COMPLETED.value:
-                return
-            if status == TerminalStatus.ERROR.value:
-                raise click.ClickException("Terminal reached ERROR status")
-            if status == TerminalStatus.IDLE.value:
-                # Only count IDLE as progress toward "done" once we've seen the
-                # agent actually start working — otherwise the idle-before-
-                # processing window right after a send would return early with
-                # empty output.
-                if observed_working:
-                    consecutive_idle += 1
-                    if consecutive_idle >= idle_stable_polls:
-                        return
-            elif status in (
-                TerminalStatus.PROCESSING.value,
-                TerminalStatus.WAITING_USER_ANSWER.value,
-            ):
-                # The agent is actively working (or blocked on a prompt after
-                # starting). Mark that it started and reset the idle streak so a
-                # mid-turn idle flap can't accumulate. UNKNOWN is deliberately
-                # NOT treated as "started": a terminal can report UNKNOWN before
-                # it begins (no output yet / provider not registered / deferred
-                # init), and counting it would let a subsequent stable idle
-                # satisfy the gate and return early with empty output.
-                observed_working = True
-                consecutive_idle = 0
+                payload = resp.json()
+                payload = payload if isinstance(payload, dict) else {}
+                status = payload.get("status")
+                raw_generation = payload.get("status_generation")
+                generation = raw_generation if isinstance(raw_generation, int) else None
+                raw_current = payload.get("output_generation")
+                current_generation = raw_current if isinstance(raw_current, int) else None
+        except (api_http.exceptions.RequestException, BrokerRequestError) as e:
+            if not _is_transient_poll_error(e):
+                raise click.ClickException(f"Failed to poll terminal status: {e}")
+            last_error = str(e)
+            logger.debug(f"poll_until_done [{terminal_id}]: poll failed, retrying: {e}")
+            time.sleep(polling_interval)
+            continue
+        last_error = None
+        if (
+            gate_engaged
+            and min_generation is not None
+            and generation is not None
+            and generation <= min_generation
+            and status != TerminalStatus.ERROR.value
+        ):
+            # Earned at or before the send's dispatch boundary: this describes
+            # the frame the previous turn left, not the turn being waited on.
+            # Not "done", and not evidence that this turn started either.
+            if current_generation is not None and current_generation < min_generation:
+                # The counter the boundary was sampled from has gone backwards:
+                # the server restarted, and no stamp it issues from now on is
+                # comparable with this boundary. Refusing on would wait out the
+                # whole timeout for a turn that may well be finished.
+                click.echo(
+                    f"Warning: cao-server's output generation for terminal {terminal_id} "
+                    f"is below this send's dispatch boundary (server restarted?); "
+                    "cannot tell this turn's status from the previous one, waiting "
+                    "on the frame instead.",
+                    err=True,
+                )
+                gate_engaged = False
+            elif current_generation is not None and current_generation > min_generation:
+                # Output has landed since the send but the status was not
+                # re-earned: a turn too fast for its PROCESSING to be sampled,
+                # or a repaint of the previous frame while the worker starts.
+                # Give the stamp ``stamp_grace`` to move, then stop refusing.
+                now = time.time()
+                if stamp_grace_started is None:
+                    stamp_grace_started = now
+                if now - stamp_grace_started < stamp_grace:
+                    last_refusal = (
+                        "output landed after the send but the status was not re-earned "
+                        "for this turn"
+                    )
+                    consecutive_idle = 0
+                    time.sleep(polling_interval)
+                    continue
+                click.echo(
+                    f"Warning: terminal {terminal_id} produced output after the send "
+                    f"but its status was not re-earned within {stamp_grace:g}s; "
+                    "finishing on the current frame, which may still be the "
+                    "previous turn's answer.",
+                    err=True,
+                )
+                gate_engaged = False
             else:
-                # UNKNOWN or any other non-ready status: not evidence of work.
-                # Reset the idle streak but do not flip observed_working.
+                # Nothing has landed since the send (or the server does not say):
+                # there is no turn to be done yet. Unbounded by design -- ending
+                # here on the previous frame is #735 itself.
+                last_refusal = (
+                    "no output has landed since the send, so the status still "
+                    "describes the previous turn"
+                )
                 consecutive_idle = 0
-        except api_http.exceptions.RequestException as e:
-            raise click.ClickException(f"Failed to poll terminal status: {e}")
+                time.sleep(polling_interval)
+                continue
+        last_refusal = None
+        if status == TerminalStatus.COMPLETED.value:
+            return
+        if status == TerminalStatus.ERROR.value:
+            raise click.ClickException("Terminal reached ERROR status")
+        if status == TerminalStatus.IDLE.value:
+            # Only count IDLE as progress toward "done" once we've seen the
+            # agent actually start working — otherwise the idle-before-
+            # processing window right after a send would return early with
+            # empty output.
+            if observed_working:
+                consecutive_idle += 1
+                if consecutive_idle >= idle_stable_polls:
+                    return
+        elif status in (
+            TerminalStatus.PROCESSING.value,
+            TerminalStatus.WAITING_USER_ANSWER.value,
+        ):
+            # The agent is actively working (or blocked on a prompt after
+            # starting). Mark that it started and reset the idle streak so a
+            # mid-turn idle flap can't accumulate. UNKNOWN is deliberately
+            # NOT treated as "started": a terminal can report UNKNOWN before
+            # it begins (no output yet / provider not registered / deferred
+            # init), and counting it would let a subsequent stable idle
+            # satisfy the gate and return early with empty output.
+            observed_working = True
+            consecutive_idle = 0
+        else:
+            # UNKNOWN or any other non-ready status: not evidence of work.
+            # Reset the idle streak but do not flip observed_working.
+            consecutive_idle = 0
         time.sleep(polling_interval)
 
 
@@ -384,8 +567,7 @@ def wait_for_initial_delivery(
             resp.raise_for_status()
             payload = resp.json()
         except api_http.exceptions.RequestException as e:
-            response = getattr(e, "response", None)
-            if response is not None and 400 <= response.status_code < 500:
+            if not _is_transient_poll_error(e):
                 raise click.ClickException(f"Failed to poll terminal delivery state: {e}")
             last_error = str(e)
             logger.debug(f"wait_for_initial_delivery [{terminal_id}]: poll failed, retrying: {e}")

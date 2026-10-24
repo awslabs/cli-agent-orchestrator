@@ -21,7 +21,7 @@ from a database error so the gate can report the appropriate remedy. ``is_approv
 boolean contract: both absence and an unreadable store return False.
 
 ``plan_id`` IS OPAQUE: stored and compared verbatim, never parsed, never normalised. A normalisation is how two
-distinct plans could come to share one approval, and ``plan-v1:``'s versioned prefix exists precisely so a
+distinct plans could come to share one approval, and ``plan_id``'s versioned ``plan-v<n>:`` prefix exists precisely so a
 future scheme is DISTINGUISHABLE rather than silently comparable.
 
 ONE CONSEQUENCE AN OPERATOR WILL MEET, so it is written down. ``plan_id`` does not exist until
