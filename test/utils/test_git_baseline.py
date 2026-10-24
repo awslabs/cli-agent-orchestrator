@@ -263,6 +263,7 @@ def test_records_absence_outside_a_repository(tmp_path):
         "available": True,
         "repository": False,
         "root": os.path.realpath(tmp_path),
+        "root_identity": git_baseline.root_identity(str(tmp_path)),
     }
 
 
@@ -279,6 +280,7 @@ def test_plain_directory_proof_does_not_depend_on_git_stderr(monkeypatch, tmp_pa
         "available": True,
         "repository": False,
         "root": os.path.realpath(tmp_path),
+        "root_identity": git_baseline.root_identity(str(tmp_path)),
     }
 
 
@@ -435,6 +437,131 @@ def test_non_git_roots_and_aliases_have_directory_identity(tmp_path):
     assert [value["root"] for value in results] == [os.path.realpath(path) for path in [a, b, sub]]
     assert len({value["root"] for value in results}) == 3
     assert git_baseline.derive_baseline(str(alias)) == results[0]
+
+
+# ---------------------------------------------------------------------------
+# A non-Git root is identified by device and inode, not only by its path
+# (issue #827 criterion 2)
+# ---------------------------------------------------------------------------
+
+
+def test_a_non_git_root_replaced_at_the_same_path_is_a_different_baseline(tmp_path):
+    """THE DEFECT. A path is not an identity, and the baseline used to record only the path.
+
+    Move the approved directory away, put a different one at the same path, and every value the
+    baseline carried before this fix is identical -- so a plan frozen against the first directory
+    describes the second one just as well.
+    """
+    root = tmp_path / "work"
+    root.mkdir()
+    before = git_baseline.derive_baseline(str(root))
+
+    root.rename(tmp_path / "moved-away")
+    (tmp_path / "work").mkdir()
+    after = git_baseline.derive_baseline(str(root))
+
+    assert before["root"] == after["root"], "fixture assumption broken: the path must be unchanged"
+    assert before != after, (
+        "a directory moved away and replaced at the same path produced the same baseline, so its "
+        "plan_id and therefore its approval are reused for a directory nobody reviewed (#827)"
+    )
+    assert before["root_identity"]["bound"] and after["root_identity"]["bound"]
+    assert before["root_identity"] != after["root_identity"]
+
+
+def test_root_identity_is_stable_across_reads_and_follows_the_resolved_root(tmp_path):
+    """The binding must not cost a re-approval on every run of an unchanged directory."""
+    root = tmp_path / "work"
+    root.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(root, target_is_directory=True)
+
+    identity = git_baseline.root_identity(str(root))
+    assert identity["bound"] is True
+    assert identity == git_baseline.root_identity(str(root))
+    # ``os.stat``, not ``os.lstat``: the run executes in the target, so a symlinked root is the same
+    # directory and must be the same plan (see the alias case above).
+    assert identity == git_baseline.root_identity(str(alias))
+    assert identity["device"].isdigit() and identity["inode"].isdigit()
+
+
+def test_a_git_root_records_no_device_or_inode(tmp_path):
+    """The asymmetry is deliberate, and this is the test that would fail if it were "tidied up".
+
+    A Git root's identity is its commit and worktree digest -- content, not location -- so two
+    checkouts in the same state are ONE plan on one machine or two. Device and inode are per-machine
+    and per-copy, so recording them for a Git root would force a re-approval for every fresh clone or
+    worktree while adding nothing: a different directory at the same path already has a different
+    commit or a different worktree digest.
+    """
+    _initialise_repository(tmp_path)
+    baseline = git_baseline.derive_baseline(str(tmp_path))
+    assert "root_identity" not in baseline
+    identity = git_baseline.root_identity(str(tmp_path))
+    assert identity["inode"] not in str(baseline)
+
+
+def test_a_filesystem_with_no_usable_inode_falls_back_with_a_recorded_reason(monkeypatch, tmp_path):
+    """Network mounts, some container overlays and Windows volumes without a file index report 0.
+
+    Zero is shared by every directory, so comparing it would prove nothing while reading as a
+    successful binding. The fallback is today's path-only identity, and it is RECORDED: the unbound
+    marker sits in the baseline, so it reaches ``plan_id`` and the manifest rather than vanishing.
+    """
+    real_stat = os.stat
+
+    def zero_inode(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        return SimpleNamespace(st_dev=result.st_dev, st_ino=0, st_mode=result.st_mode)
+
+    monkeypatch.setattr(os, "stat", zero_inode)
+    assert git_baseline.root_identity(str(tmp_path)) == {
+        "bound": False,
+        "reason": "root_identity_unsupported",
+    }
+
+
+def test_an_unstattable_root_falls_back_with_its_own_recorded_reason():
+    assert git_baseline.root_identity("/nonexistent/path/for/test") == {
+        "bound": False,
+        "reason": "root_identity_unreadable",
+    }
+
+
+def test_the_unbound_reasons_are_closed_and_are_not_refusal_reasons():
+    """An unbindable root must not make a run unapprovable.
+
+    ``UNAVAILABLE_REASONS`` is the vocabulary ``approval_gate`` turns into a 503 that refuses the run.
+    Putting these two reasons in it would make every script run on a filesystem with no usable inode
+    permanently unrunnable, which is strictly worse than the path-only identity those runs have today.
+    """
+    assert git_baseline.ROOT_IDENTITY_UNBOUND_REASONS == frozenset(
+        {"root_identity_unsupported", "root_identity_unreadable"}
+    )
+    assert not (git_baseline.ROOT_IDENTITY_UNBOUND_REASONS & git_baseline.UNAVAILABLE_REASONS)
+
+
+def test_an_unbound_root_identity_still_yields_an_available_baseline(monkeypatch, tmp_path):
+    monkeypatch.setattr(git_baseline, "root_identity", lambda path: {"bound": False, "reason": "x"})
+    baseline = git_baseline.derive_baseline(str(tmp_path))
+    assert baseline["available"] is True
+    assert baseline["root_identity"] == {"bound": False, "reason": "x"}
+
+
+def test_derive_baseline_binds_the_identity_it_is_handed_rather_than_taking_a_second_stat(tmp_path):
+    """The P3-3 seam, for the root. One stat behind the identifier and the guard, not two.
+
+    ``manifest_freeze`` takes the stat once and threads it through both consumers, so a root replaced
+    between the freeze and the launch-guard capture cannot be recorded as the approved one.
+    """
+    root = tmp_path / "work"
+    root.mkdir()
+    handed = {"bound": True, "device": "7", "inode": "11"}
+
+    baseline = git_baseline.derive_baseline(str(root), identity=handed)
+
+    assert baseline["root_identity"] == handed
+    assert baseline["root_identity"] != git_baseline.root_identity(str(root))
 
 
 @pytest.mark.parametrize(

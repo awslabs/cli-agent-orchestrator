@@ -454,7 +454,7 @@ there is no agent-side tool that grants approval.
 **Nothing in this section applies to YAML workflows.** Script-tier approval enforcement is active by
 default.
 
-For a working directory outside any Git repository, the plan identifier records the directory's canonical path and nothing about its contents.
+For a working directory outside any Git repository, the plan identifier records the directory's canonical path and the filesystem's own identity for that directory (its device and inode), and nothing about its contents.
 
 A script-tier run freezes an **execution manifest** at run start — the workflow's source hash, its
 resolved inputs, the repository/worktree baseline, and a digest of the installed agent profile set —
@@ -475,6 +475,34 @@ and discarded; it is never written to the manifest as its own value.
 > the next run of each plan is refused until re-approved. The packaged built-in profiles are in the set
 > too, so a CAO upgrade that changes a bundled profile also moves every `plan_id`.
 
+> **A working directory outside Git is bound by its identity, not by its path.** A path is not an
+> identity: a directory moved away and replaced by a different directory at the same path keeps the
+> path. So for a non-Git root the identifier records the directory's device and inode (`st_dev`,
+> `st_ino`) alongside its canonical path, and the launch guard re-checks the pair at every agent launch
+> in the run. Replace the directory and the next run gets a new `plan_id` and is refused until
+> re-approved; replace it while a run is in flight and that run's next agent step is refused with
+> `plan_inputs_changed`. A **Git** root is deliberately not bound this way — its identity is the commit
+> plus the worktree digest, which is content rather than location, so a different directory at the same
+> path already produces a different `plan_id` and two checkouts in the same state keep sharing one
+> approval, on one machine or two.
+>
+> The pair identifies a directory on this machine, so a non-Git plan's identifier is machine-local by
+> construction, and anything that renumbers the directory without changing it — a restore from backup,
+> an `rsync` into a fresh directory, a remount that assigns a different device number — costs one
+> re-approval. That is the price of the binding, and it is the direction to prefer: a spurious
+> re-approval is a prompt, while a reused approval is a directory nobody reviewed.
+>
+> **Where the filesystem supplies no usable identity, CAO falls back and says so.** Some network
+> mounts, container overlays and Windows volumes report no inode for a directory. CAO does not refuse
+> those runs — that would make every script run on such a filesystem unapprovable — and it does not
+> skip the binding silently either. The manifest records
+> `repo_baseline.root_identity: {"bound": false, "reason": "root_identity_unsupported"}` (or
+> `root_identity_unreadable` if the directory could not be read at all), the server logs a warning
+> carrying that reason and no path, and the unbound marker is itself part of the `plan_id` — so a plan
+> whose root identity could not be bound has a different identifier from one where it was, and you can
+> see which you are approving. On such a filesystem the non-Git root falls back to path-only identity,
+> which is what every non-Git root had before this change.
+
 > **Migration: new runs move to `plan-v2`; approved `plan-v1` resumes still pass.** A `plan_id` computed after
 > upgrading always uses the new `plan-v2:` scheme, so the first NEW run of every plan is refused until
 > re-approved under its `plan-v2:` identifier — a `plan-v1` approval attested to a plan whose agent
@@ -485,6 +513,14 @@ and discarded; it is never written to the manifest as its own value.
 > agent launches is still checked under the rule it was admitted with (the profile text alone, without
 > the installed files); new runs record `launch-guard-v2` and are checked under the full rule.
 > Re-approve each plan once it is run fresh.
+>
+> The root-identity binding above does **not** bump the scheme — `plan-v2` names the field set, and the
+> root identity is new content in an existing field rather than a new field. It does change the
+> identifier of every plan whose working directory is outside Git, so those plans are refused once and
+> re-approved under their new `plan-v2:` identifier. Plans in a Git working directory keep their
+> existing identifiers. A run already admitted and left resumable keeps launching its steps: its
+> `launch-guard-v2` record carries no root identity, and a record written before the binding existed is
+> checked without it rather than refused.
 
 ### It is on by default
 
@@ -534,7 +570,7 @@ The refusal causes are deliberately distinct, because the operator's next action
 | Status | Meaning | What to do |
 |---|---|---|
 | `403` | The plan's `plan_id` has no approval. | `cao workflow approve <plan_id>`, then run again. |
-| `409` | `plan_inputs_changed`: while approval enforcement is on, the run's recorded agent profile or memory setting changed, its launch state is unreadable, approval enforcement was turned on after this run started, or approval settings could not be read. This surfaces from an agent step's `POST /terminals/run-step`, not the initial run attempt. | Start a new run for changed inputs, unreadable launch state, or newly enabled enforcement. If approval settings could not be read, repair `settings.json`, then resume. |
+| `409` | `plan_inputs_changed`: while approval enforcement is on, the run's recorded agent profile or memory setting changed, the directory at its working-directory path was replaced by a different directory, its launch state is unreadable, approval enforcement was turned on after this run started, or approval settings could not be read. This surfaces from an agent step's `POST /terminals/run-step`, not the initial run attempt. | Start a new run for changed inputs, a replaced working directory, unreadable launch state, or newly enabled enforcement. If approval settings could not be read, repair `settings.json`, then resume. |
 | `503` | CAO could not compute a plan identifier: untracked files exceed 64 MiB or contain unsupported entries, Git is unavailable/unreadable/timed out, files changed during the snapshot, profiles are unreadable, the freeze failed, or an older run has no recorded identity. | Follow the message; retry only when it says the cause was transient. No approval will help. |
 | `503` | The approval store could not be read, so CAO cannot determine whether the plan is approved. | Restore database access, then retry. The run remains refused. |
 
@@ -635,7 +671,9 @@ source text plus the files `cao install` wrote for it, including the shared Open
 which is bound whole because OpenCode reads the whole file, so an edit to your own key in it also moves
 every `plan_id`). For a Git repository the directory state is
 the commit and the worktree changes, not the path, so two checkouts in the same state share one
-approval. For a directory outside any Git repository it is only the directory's canonical path.
+approval. For a directory outside any Git repository it is the directory's canonical path plus its
+device and inode, so the path cannot be pointed at a different directory under an existing approval —
+but still nothing about the files inside it.
 
 Everything else is read when a step runs, so a new run of an approved plan can do something different
 from what was reviewed and still match the same `plan_id`:
@@ -648,9 +686,16 @@ from what was reviewed and still match the same `plan_id`:
   `plan_id`. Memory added or edited after approval, including through the `memory_store` tool, reaches
   the next run's steps under the original `plan_id`. Only the memory-enabled setting is checked, and
   only within a run. Tracked in #828.
-- **Files in a non-Git working directory.** The `plan_id` records the directory's path, not its
-  contents. Files added, changed or removed there after approval are used by the next run under the
-  original `plan_id`.
+- **Files in a non-Git working directory.** The `plan_id` records which directory it is — its path and
+  its device and inode — not what is inside it. Files added, changed or removed there after approval
+  are used by the next run under the original `plan_id`. Replacing the *directory* is caught;
+  rewriting its *contents* is not.
+- **A non-Git root on a filesystem with no usable inode.** Where the filesystem reports no inode for
+  the directory, the root falls back to path-only identity and the manifest records
+  `root_identity.bound: false` with its reason. Such a plan is approvable, and on that filesystem a
+  directory replaced at the same path does reuse the approval, exactly as every non-Git root did before
+  the device/inode binding. The unbound marker is part of the `plan_id`, so the weaker binding is
+  visible in the identifier you approve rather than silent.
 - **Managed `.env` values a profile references.** A profile's `${VAR}` placeholders are resolved from
   the CAO-managed `.env` file (`cao env set`) when the step launches. The placeholder text is bound; the
   value is not, because that file is where credentials live and a digest of the substituted text would
@@ -686,9 +731,10 @@ whether an operator's agent-plugin or skill change should invalidate every appro
   in an approved script run still refuse reserved ephemeral profiles until their definitions are bound.
 
 With API authentication off, which is the default, any process running as you can change these inputs,
-and can also run `cao workflow approve`. The gate makes sure that a changed script, changed inputs or
-changed repository state can't run unnoticed under an approval granted for something else. It doesn't
-detect changes to the inputs listed above.
+and can also run `cao workflow approve`. The gate makes sure that a changed script, changed inputs,
+changed repository state, or a working directory that is no longer the same directory can't run
+unnoticed under an approval granted for something else. It doesn't detect changes to the inputs listed
+above.
 
 1. **Six manifest fields are omitted rather than recorded** — provider, model, profile, permissions,
    limits and retry policy. Script-tier steps are discovered by executing the Python, so those values

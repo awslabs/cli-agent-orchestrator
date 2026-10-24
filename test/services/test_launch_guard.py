@@ -598,3 +598,138 @@ def test_the_current_scheme_pins_the_per_entry_digest_formula():
         agent_profiles.profile_entry_digest(entry)
         == "sha256:779be670ec657ac5af019997a7bb101e5f1298b7074350b32ed2ecd89407bac6"
     )
+
+
+# ---------------------------------------------------------------------------
+# The run's working directory is bound by device and inode, not by its path
+# (issue #827 criterion 2)
+# ---------------------------------------------------------------------------
+
+
+def _non_git_root(tmp_path):
+    """A working-directory root that is determinately outside any Git repository.
+
+    ``tmp_path`` itself is usually outside a repository already, but "usually" is not a fixture: a
+    developer whose temp directory sits inside a checkout would silently exercise the Git branch, where
+    no device/inode is recorded, and these tests would pass without testing anything.
+    """
+    from cli_agent_orchestrator.utils import git_baseline
+
+    root = tmp_path / "work"
+    root.mkdir()
+    baseline = git_baseline.derive_baseline(str(root))
+    assert baseline.get("repository") is False, (
+        "fixture assumption broken: this root must be outside Git for its identity to be path-only "
+        f"(baseline={baseline})"
+    )
+    return root
+
+
+def _admit_with_root(monkeypatch, guard: dict, root) -> None:
+    """Admit a run whose snapshot carries the working directory, as both start paths write it."""
+    row = _script_row(json.dumps({"launch_guard": guard, "working_directory": str(root)}))
+    monkeypatch.setattr(
+        launch_guard.settings_service, "resolve_workflow_approval_posture", lambda: _posture(True)
+    )
+    monkeypatch.setattr(launch_guard.workflow_journal, "get_run", lambda run_id: row)
+
+
+def test_a_root_replaced_at_the_same_path_is_refused(tmp_path, monkeypatch):
+    """THE DEFECT, through the guard. The path is unchanged; the directory is not the approved one."""
+    from cli_agent_orchestrator.services import manifest_freeze
+
+    _pinned_store(tmp_path, monkeypatch)
+    root = _non_git_root(tmp_path)
+    frozen = manifest_freeze.freeze_manifest(source_hash="h", inputs={}, cwd=str(root))
+    assert frozen.root_identity is not None and frozen.root_identity["bound"] is True
+    guard = launch_guard.capture(profile_set=frozen.profile_set, root_identity=frozen.root_identity)
+    _admit_with_root(monkeypatch, guard, root)
+    launch_guard.check("run-1", "worker")  # the approved directory: passes
+
+    root.rename(tmp_path / "moved-away")
+    (tmp_path / "work").mkdir()
+
+    with pytest.raises(launch_guard.PlanInputsChangedError, match="path is unchanged"):
+        launch_guard.check("run-1", "worker")
+
+
+def test_a_root_that_can_no_longer_be_identified_is_refused(tmp_path, monkeypatch):
+    """Fail closed: a bound identity the guard cannot re-verify is not a pass."""
+    _pinned_store(tmp_path, monkeypatch)
+    root = _non_git_root(tmp_path)
+    guard = launch_guard.capture(root_identity={"bound": True, "device": "1", "inode": "2"})
+    _admit_with_root(monkeypatch, guard, root)
+    with pytest.raises(launch_guard.PlanInputsChangedError, match="path is unchanged"):
+        launch_guard.check("run-1", "worker")
+
+    guard_without_a_path = launch_guard.capture(
+        root_identity={"bound": True, "device": "1", "inode": "2"}
+    )
+    row = _script_row(json.dumps({"launch_guard": guard_without_a_path}))
+    monkeypatch.setattr(launch_guard.workflow_journal, "get_run", lambda run_id: row)
+    with pytest.raises(launch_guard.PlanInputsChangedError, match="unreadable"):
+        launch_guard.check("run-1", "worker")
+
+
+@pytest.mark.parametrize(
+    "recorded,why",
+    [
+        (None, "a Git root: identified by commit and worktree digest, so nothing to compare"),
+        (
+            {"bound": False, "reason": "root_identity_unsupported"},
+            "no usable inode on this filesystem; the unbound marker is already in plan_id",
+        ),
+        (
+            {"bound": False, "reason": "root_identity_unreadable"},
+            "the root could not be stat'd at freeze; the unbound marker is already in plan_id",
+        ),
+    ],
+)
+def test_records_with_nothing_to_compare_do_not_refuse(tmp_path, monkeypatch, recorded, why):
+    _pinned_store(tmp_path, monkeypatch)
+    root = _non_git_root(tmp_path)
+    guard = launch_guard.capture(root_identity=recorded)
+    assert guard["root_identity"] == recorded, why
+    _admit_with_root(monkeypatch, guard, root)
+    root.rename(tmp_path / "moved-away")
+    (tmp_path / "work").mkdir()
+    launch_guard.check("run-1", "worker")
+
+
+def test_a_record_written_before_the_root_binding_still_launches(tmp_path, monkeypatch):
+    """PR #1000's P3-1 regression, for the new field.
+
+    A ``launch-guard-v2`` record frozen before this change has no ``root_identity`` key at all. Its run
+    is resumable -- resume reuses the frozen ``plan_id`` -- so refusing it for a field it could not have
+    carried would stop every in-flight run at its next agent step.
+    """
+    _pinned_store(tmp_path, monkeypatch)
+    root = _non_git_root(tmp_path)
+    guard = launch_guard.capture()
+    del guard["root_identity"]
+    _admit_with_root(monkeypatch, guard, root)
+    root.rename(tmp_path / "moved-away")
+    (tmp_path / "work").mkdir()
+    launch_guard.check("run-1", "worker")
+
+
+def test_capture_records_the_identity_it_is_given_without_stating_the_root_itself(
+    tmp_path, monkeypatch
+):
+    """``capture`` is not told the root path, so it must never invent one.
+
+    Deriving a root from ``os.getcwd()`` here would bind whatever directory the server process happens
+    to sit in rather than the one the identifier was computed for -- a guard that passes while the run
+    executes somewhere else entirely. Every route to an identity runs through ``root_identity``, so
+    failing that function is enough to prove no root was invented; patching ``os.getcwd`` itself is
+    not, because pytest's own failure reporting calls it.
+    """
+    _pinned_store(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        launch_guard.git_baseline,
+        "root_identity",
+        lambda path: pytest.fail("capture must not stat a root it was not given"),
+    )
+    assert launch_guard.capture()["root_identity"] is None
+    handed = {"bound": True, "device": "3", "inode": "9"}
+    assert launch_guard.capture(root_identity=handed)["root_identity"] == handed

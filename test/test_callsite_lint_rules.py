@@ -17,10 +17,14 @@ Each rule closes one half of a defect class the repo has already paid for:
   screen can report "done" for a turn that had not started. The fix is a
   generation/sequence floor at every call site.
 * **Rule 4 (admission snapshot, #827 / PR #1000 P3-3)** -- ``launch_guard.capture``
-  records the profile set a run is admitted under. Called without the snapshot
-  the freeze already read, it re-reads the store AFTER the approval gate, so a
-  profile edited in that window is recorded as the approved state. Every
-  production call must pass ``profile_set=frozen.profile_set``.
+  records the launch inputs a run is admitted under. Called without the
+  snapshots the freeze already read, it re-derives them AFTER the approval gate,
+  so an input edited in that window is recorded as the approved state. Every
+  production call must pass every snapshot keyword the freeze exposes
+  (``profile_set=frozen.profile_set``,
+  ``root_identity=frozen.root_identity``) -- the list is derived from
+  ``FrozenManifest``'s own fields, so a new seam added to the freeze fails here
+  until every admission path threads it.
 
 All four rules are **ratchets**. A new unexplained call site fails; so does a
 site beyond its row's reviewed occurrence count (a key collision does not
@@ -520,7 +524,32 @@ def test_every_poll_until_done_passes_a_generation_floor() -> None:
 # ===========================================================================
 
 ADMISSION_FUNC = "capture"
-ADMISSION_KWARG = "profile_set"
+
+
+def _admission_kwargs() -> tuple:
+    """The snapshot keywords every admission path must thread, DERIVED rather than listed.
+
+    A "snapshot seam" is a value the freeze reads once and the guard must record verbatim, so it is
+    exactly a name that is both a field of ``FrozenManifest`` and a parameter of
+    ``launch_guard.capture``. Intersecting the two sides is what makes this a ratchet: issue #827's
+    ``root_identity`` became required here the moment it was added to both, with no edit to this
+    file, and the next seam will do the same. Listing the names instead would leave the newest seam
+    unguarded until someone remembered this rule existed -- which is the shape of the defect the rule
+    is for.
+
+    ``manifest_json`` and ``unavailable_reason`` are fields of ``FrozenManifest`` but not parameters of
+    ``capture``: they are the gate's inputs, not the guard's, so the intersection excludes them
+    without an exception list.
+    """
+    from dataclasses import fields
+
+    from cli_agent_orchestrator.services.manifest_freeze import FrozenManifest
+
+    frozen_fields = {field.name for field in fields(FrozenManifest)}
+    return tuple(sorted(frozen_fields & cl.declared_parameters(ADMISSION_FUNC)))
+
+
+ADMISSION_KWARGS = _admission_kwargs()
 
 #: The complete census of ``launch_guard.capture`` call sites. A new start path
 #: that admits a script run has to be reviewed for the same obligation, so a
@@ -540,10 +569,10 @@ ADMISSION_OPT_OUT: dict = {}
 
 ADMISSION_REMEDY = (
     "`launch_guard.capture` records the launch state a run is admitted under. "
-    "Without the snapshot `manifest_freeze.freeze_manifest` already read, it "
-    "re-reads the profile store AFTER the approval gate, so a profile edited in "
-    f"that window is recorded as the approved state (PR #1000 P3-3). Pass "
-    f"`{ADMISSION_KWARG}=frozen.{ADMISSION_KWARG}`."
+    "Without the snapshots `manifest_freeze.freeze_manifest` already read, it "
+    "re-derives them AFTER the approval gate, so an input edited in that window "
+    "is recorded as the approved state (PR #1000 P3-3; issue #827 for the root "
+    "identity). Pass " + ", ".join(f"`{kwarg}=frozen.{kwarg}`" for kwarg in ADMISSION_KWARGS) + "."
 )
 
 
@@ -592,15 +621,26 @@ def test_launch_guard_capture_call_site_census_is_complete() -> None:
     )
 
 
-def test_every_launch_guard_capture_passes_the_freeze_snapshot() -> None:
-    declared = cl.declared_parameters(ADMISSION_FUNC)
-    assert ADMISSION_KWARG in declared, (
-        f"launch_guard.capture no longer declares {ADMISSION_KWARG}; the admission snapshot "
-        "contract (PR #1000 P3-3) has been removed, update or delete this rule deliberately"
+def test_the_admission_snapshot_seams_are_still_declared() -> None:
+    """The derivation must not silently become empty.
+
+    ``_admission_kwargs`` intersects two sets, so deleting the contract on either side -- renaming
+    ``capture``'s parameters, or dropping the fields from ``FrozenManifest`` -- would leave an empty
+    tuple and make the rule below pass vacuously for every call site. Pinning the known seams is what
+    turns that into a deliberate edit of this file.
+    """
+    assert set(ADMISSION_KWARGS) >= {"profile_set", "root_identity"}, (
+        "launch_guard.capture and FrozenManifest no longer share the admission snapshot seams "
+        f"(derived: {ADMISSION_KWARGS}); the contract (PR #1000 P3-3, issue #827) has been removed, "
+        "so update or delete this rule deliberately"
     )
+
+
+@pytest.mark.parametrize("kwarg", ADMISSION_KWARGS)
+def test_every_launch_guard_capture_passes_the_freeze_snapshot(kwarg: str) -> None:
     cl.check_against_allowlist(
-        rule="admission-snapshot",
-        sites=cl.missing_kwarg_sites(ADMISSION_FUNC, ADMISSION_KWARG),
+        rule=f"admission-snapshot:{kwarg}",
+        sites=cl.missing_kwarg_sites(ADMISSION_FUNC, kwarg),
         allowlist=ADMISSION_OPT_OUT,
         remedy=ADMISSION_REMEDY,
     )

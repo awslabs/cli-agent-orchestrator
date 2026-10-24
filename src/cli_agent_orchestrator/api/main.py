@@ -6445,7 +6445,10 @@ async def submit_workflow_run_endpoint(
                 # Called inside the lambda, not passed to to_thread as a value, so the
                 # call-site lint (test_callsite_lint_rules rule 4) can see the keyword.
                 guard = await asyncio.to_thread(
-                    lambda: launch_guard.capture(profile_set=frozen.profile_set)
+                    lambda: launch_guard.capture(
+                        profile_set=frozen.profile_set,
+                        root_identity=frozen.root_identity,
+                    )
                 )
             except approval_gate.PlanIdentityUnavailableError as exc:
                 capture_error = exc
