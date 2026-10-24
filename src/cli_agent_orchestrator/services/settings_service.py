@@ -426,6 +426,67 @@ def set_disabled_agent_dirs(dirs: List[str]) -> List[str]:
     return cleaned
 
 
+# Longest label accepted for a session alias. Long enough for a sentence-style
+# run name, short enough to stay on one line in any listing.
+SESSION_LABEL_MAX_LENGTH = 60
+
+
+def get_session_labels() -> Dict[str, str]:
+    """Operator-assigned friendly names for sessions (session_name -> label)."""
+    settings = _load()
+    labels = settings.get("session_labels", {})
+    return labels if isinstance(labels, dict) else {}
+
+
+def set_session_label(session_name: str, label: str) -> Dict[str, str]:
+    """Set, or clear with an empty/blank label, a session's friendly name.
+
+    Stored separately from the tmux session name so nothing that references
+    the real name (terminals, DB rows, the backend) is disturbed: a pure
+    display alias. Whitespace is trimmed, the label is capped at
+    ``SESSION_LABEL_MAX_LENGTH`` and must be printable (``str.isprintable``):
+    a control character or line break is a ``ValueError``. Returns the full
+    label map after the update.
+
+    Setting OR clearing a label over a settings.json that exists but cannot be
+    read raises :class:`SettingsUnreadableError` and leaves the file untouched;
+    the two callers decide what that means. The HTTP endpoint reports it (a
+    200 for a clear that changed nothing would hide a broken file and let the
+    old label reappear once it is repaired). Session teardown logs it and
+    completes: nothing was written, nothing was lost, and the teardown itself
+    succeeded (haofeif / plauzy, #724 review).
+    """
+    clean = label.strip()[:SESSION_LABEL_MAX_LENGTH]
+    if not clean.isprintable():
+        # "ok\x1b[2J\nrm -rf /" was stored and echoed verbatim: the comment
+        # above promises one line in any listing, and a CLI that prints
+        # labels must not become an ANSI-escape injection sink (plauzy, #724).
+        # Validated before the lock, like every other writer's input.
+        raise ValueError("label must be printable: no control characters or line breaks")
+
+    def update(settings: Dict[str, Any]) -> bool:
+        labels = settings.get("session_labels", {})
+        if not isinstance(labels, dict):
+            labels = {}
+        if clean:
+            if labels.get(session_name) == clean:
+                return False
+            labels[session_name] = clean
+        elif session_name in labels:
+            del labels[session_name]
+        else:
+            # Nothing to clear: do not rewrite settings.json for a no-op.
+            # Session teardown clears unconditionally, so this is the common
+            # case.
+            return False
+        settings["session_labels"] = labels
+        return True
+
+    settings = _mutate(update)
+    labels = settings.get("session_labels", {})
+    return labels if isinstance(labels, dict) else {}
+
+
 # Default server tuning values
 _SERVER_DEFAULTS = {
     "mcp_request_timeout": 30,

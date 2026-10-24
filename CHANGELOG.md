@@ -220,6 +220,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the mode on: the `cao` CLI and the bundled Web UI send no bearer yet, and the
   token is inherited by every agent pane's environment.
 
+- Operator ergonomics on the HTTP API: `working_directory` on `POST /sessions`
+  and `POST /sessions/{name}/terminals` accepts the spellings an operator
+  pastes from a browser on WSL (quoted, `~`, Windows drive paths mapped to the
+  `/mnt` interop mount) and creates a missing folder under the same path
+  policy as the MCP tools, at the point of use after every check that can
+  refuse the request; `GET /fs/dirs` lists server-side subdirectories
+  for a folder picker; `POST /sessions/{name}/label` gives a session a display
+  alias surfaced on the session listings; every handled response carries an
+  `X-Server-Time` header, exposed through CORS, so a browser can correct for
+  clock skew
+
 - Profiles tab in the Web UI: browse, search, create (from template with live
   preview, or from scratch via a schema-driven form), edit, clone, and delete
   agent profiles over the profile management APIs, with validate-before-save
@@ -654,6 +665,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the runtime status path; and the post-readiness check re-reads a mid-redraw
   frame a few times instead of failing an otherwise-valid login start on a
   single capture (#731)
+
+- **a settings write over an unreadable `settings.json` deleted every other
+  setting (#737, fixed in #997).** Each writer loaded the file leniently, so one
+  that existed but did not parse loaded as `{}`, and the write then persisted
+  that empty fallback with only the section being written. The `settings_service`
+  writers (`POST /settings/*`, the session label endpoint) and the
+  `config_service` writers behind `cao config set` now share one locked,
+  atomically published read-modify-write that refuses to run when the file is
+  present but cannot be read or parsed (`500` over HTTP, file untouched); two
+  concurrent writers can no longer lose each other's update either.
 
 - **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
   The `/internal/memory/store` and `/forget` routes validated the wire `key` as

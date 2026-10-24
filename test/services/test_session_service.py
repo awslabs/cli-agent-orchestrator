@@ -235,6 +235,28 @@ class TestListSessions:
         assert all("working_directory" in s for s in result)
         assert all("agent_profile" in s for s in result)
 
+    @patch("cli_agent_orchestrator.services.session_service.get_session_labels")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_in_sessions")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_attaches_display_label(
+        self, mock_get_backend, mock_list_in_sessions, mock_labels
+    ):
+        """Every listed session carries ``label``: the operator alias, or None."""
+        mock_get_backend.return_value.list_sessions.return_value = [
+            {"id": "cao-session1", "name": "Session 1"},
+            {"id": "cao-session2", "name": "Session 2"},
+        ]
+        mock_list_in_sessions.return_value = []
+        mock_labels.return_value = {"cao-session1": "Nightly triage"}
+
+        result = list_sessions()
+
+        by_id = {s["id"]: s for s in result}
+        assert by_id["cao-session1"]["label"] == "Nightly triage"
+        assert by_id["cao-session2"]["label"] is None
+        # One settings read for the whole listing, not one per session.
+        mock_labels.assert_called_once()
+
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_list_sessions_empty(self, mock_get_backend):
         """Test listing sessions when none exist."""
@@ -297,6 +319,7 @@ class TestListSessions:
                 "status": "detached",
                 "agent_profile": "developer",
                 "working_directory": "/launch/project",
+                "label": None,
             }
         ]
         assert fake_client.cwd_calls == []
@@ -436,6 +459,7 @@ class TestListSessions:
                 "name": "Good",
                 "working_directory": None,
                 "agent_profile": None,
+                "label": None,
             }
         ]
 
@@ -939,6 +963,22 @@ class TestGetSession:
         assert len(result["terminals"]) == 1
         mock_get_backend.return_value.session_exists.assert_called_once_with("cao-test")
 
+    @patch("cli_agent_orchestrator.services.session_service.get_session_labels")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_attaches_display_label(
+        self, mock_get_backend, mock_list_terminals, mock_labels
+    ):
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.list_sessions.return_value = [{"id": "cao-test"}]
+        mock_list_terminals.return_value = []
+        mock_labels.return_value = {"cao-test": "Nightly triage"}
+
+        assert get_session("cao-test")["session"]["label"] == "Nightly triage"
+
+        mock_labels.return_value = {}
+        assert get_session("cao-test")["session"]["label"] is None
+
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
@@ -1190,6 +1230,7 @@ class TestGetSession:
             "id": "cao-gone",
             "name": "cao-gone",
             "status": "terminated",
+            "label": None,
         }
         assert result["terminals"][0]["status"] == "error"
         assert result["terminals"][0]["deferred_init_failure"] == failure
@@ -1404,6 +1445,76 @@ class TestDeleteSession:
             "current-failed",
         ]
         mock_delete_terminals_by_ids.assert_called_once_with(["current-live", "current-failed"])
+
+    @patch("cli_agent_orchestrator.services.session_service.set_session_label")
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_delete_session_clears_display_label(
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_capture,
+        mock_dismantle,
+        mock_delete_row,
+        mock_delete_terminals_by_ids,
+        mock_set_label,
+    ):
+        """A later same-name session must not inherit the alias; and a settings
+        write failure is reported in ``errors``, never raised over the completed
+        teardown."""
+        mock_get_backend.return_value.session_exists_strict.return_value = True
+        mock_get_backend.return_value.kill_session.return_value = True
+        mock_list_terminals.return_value = [{"id": "terminal1"}]
+
+        result = delete_session("cao-test")
+
+        assert result == {"deleted": ["cao-test"], "errors": []}
+        mock_set_label.assert_called_once_with("cao-test", "")
+
+        mock_set_label.side_effect = OSError("disk full")
+        result = delete_session("cao-test")
+        assert result["deleted"] == ["cao-test"]
+        assert [e["step"] for e in result["errors"]] == ["clear_session_label"]
+
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_delete_session_completes_cleanly_over_an_unreadable_settings_file(
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_capture,
+        mock_dismantle,
+        mock_delete_row,
+        mock_delete_terminals_by_ids,
+        caplog,
+    ):
+        """plauzy, #724 review, item 4: with settings.json as a directory the
+        label clear raised a bare IsADirectoryError, ``delete_session`` filed it
+        under ``errors[]``, and ``DELETE /sessions/{name}`` answered 409
+        "cleanup deferred ... retry after residual Grok processes exit" for a
+        fully completed teardown, on every retry. An unreadable settings file
+        is a warning here: nothing was written, nothing was lost."""
+        from cli_agent_orchestrator.services import settings_service
+
+        settings_service.SETTINGS_FILE.mkdir()  # the autouse fixture points this at tmp_path
+        mock_get_backend.return_value.session_exists_strict.return_value = True
+        mock_get_backend.return_value.kill_session.return_value = True
+        mock_list_terminals.return_value = [{"id": "terminal1"}]
+
+        with caplog.at_level(logging.WARNING):
+            result = delete_session("cao-test")
+
+        assert result == {"deleted": ["cao-test"], "errors": []}
+        assert "Not clearing label for cao-test" in caplog.text
+        assert settings_service.SETTINGS_FILE.is_dir()
 
     @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
