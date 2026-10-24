@@ -27,7 +27,6 @@ import os
 import re
 import time
 import uuid
-from collections.abc import Mapping
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple, Union
 
 import requests

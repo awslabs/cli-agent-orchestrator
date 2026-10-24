@@ -653,7 +653,7 @@ class TestWorkerIsStartedDirect:
                     "tmux_window": "w1",
                 },
             ),
-            patch.object(ts, "get_backend") as mock_be,
+            patch.object(ts, "get_backend") as _mock_be,
         ):
             assert ts._worker_is_started_direct("t1", provider) is False
 
@@ -671,7 +671,7 @@ class TestWorkerIsStartedDirect:
                     "tmux_window": "w1",
                 },
             ),
-            patch.object(ts, "get_backend") as mock_be,
+            patch.object(ts, "get_backend") as _mock_be,
         ):
             assert ts._worker_is_started_direct("t1", provider) is True
 
@@ -689,7 +689,7 @@ class TestWorkerIsStartedDirect:
                     "tmux_window": "w1",
                 },
             ),
-            patch.object(ts, "get_backend") as mock_be,
+            patch.object(ts, "get_backend") as _mock_be,
         ):
             assert ts._worker_is_started_direct("t1", provider) is False
 
@@ -752,7 +752,6 @@ async def test_kimi_confirmation_requires_execution_even_when_cached_status_says
     from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider, KimiDialect
 
     fixtures = Path(__file__).parents[1] / "providers" / "fixtures"
-    idle = (fixtures / "kimi_code_0431_01_fresh_startup_idle.txt").read_text()
     completed = (fixtures / "kimi_code_0431_04_post_answer_idle.txt").read_text()
     provider = KimiCliProvider("t1", "s1", "w1")
     provider._dialect = KimiDialect.CODE

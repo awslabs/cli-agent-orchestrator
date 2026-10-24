@@ -890,9 +890,6 @@ class TestBuildCommand:
         # written to a file. The provider's _write_system_prompt_file
         # helper is preserved (for the day Cursor ships a fixed
         # v2026.x) but no longer wired into the launch command.
-        from cli_agent_orchestrator.providers.cursor_cli import (
-            CursorCliProvider,
-        )
 
         profile = MagicMock()
         profile.model = None

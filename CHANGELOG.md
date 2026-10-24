@@ -71,6 +71,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `lookup_only=true` with an `idempotency_key`: the request returns the terminal
   that key already committed, without waiting for it to initialize and without
   creating anything (404 when nothing is committed, 400 without a key) (#773).
+- `examples/decision-model-host`: hosts the open-weight JevK5-4B decision model behind
+  a loopback-only `/v1/systemone` API. Locally, it uses llama.cpp, with Metal or the CPU.
+  On AWS, a CDK stack creates a single GPU instance with no IAM resources. Its services
+  bind to loopback and are reached by SSH tunnel, and it stops itself when idle. The CDK
+  tests pin those properties (#952)
 - Conversational workflow authoring: `cao workflow create` / `update` and the `workflow_create`,
   `workflow_update`, `workflow_get` and `workflow_validate` MCP tools (#583 Bolt 3) (#699). Spec writes
   are atomic and serialized per workflow, so two concurrent creates cannot both succeed and an update
@@ -258,6 +263,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   covers the swallowed-Enter recovery from #78: a bare Enter submits what is already in the
   composer without going through `dispatch_input`, so it checks the same predicate itself rather
   than relying on a dialog happening to hide the composer box.
+- Web UI: the three create calls in the browser client (start a session, add a terminal to a
+  session, run a flow on demand) now size their budget from the server's `provider_init_timeout`
+  as well, instead of the fixed 90s they carried. 90s is below a successful Antigravity init at
+  stock settings, which the same change sizes at 430s, so the browser gave up and showed a
+  failure while cao-server went on building the worker. The budget comes from one exported
+  `createBudgetMs()` helper, which reads `provider_init_timeout` from `GET /health` once per page
+  load and applies the same arithmetic as the Python helper, so both clients derive the same
+  number. An unreachable server, or one old enough not to report the field, falls back to the
+  previous 90s. Deadlines on reads, cancels and the profile authoring round-trips are not
+  init-bound and are unchanged. A guard test enumerates the create call sites, fails on a fixed
+  timeout literal or a create that bypasses the helper, and fails if a new create call is added
+  without being registered; it also reads the Python constants so the two derivations cannot
+  drift apart. The UI still sizes from the server's global value only, because `GET /health` does
+  not report a profile-level override (#710, #1002).
 - Workflow scripts over 131,072 characters (128 KiB) now fail `validate`, `create`, `update`,
   `run` and `submit` with a `syntax` finding that names the size and the limit, instead of being
   parsed. On CPython 3.10 `ast.parse` segfaults the interpreter on deeply nested source and no

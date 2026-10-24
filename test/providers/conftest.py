@@ -12,10 +12,7 @@ from unittest.mock import patch
 import pytest
 import pytest_asyncio
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
-from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.event_bus import bus
-from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
 

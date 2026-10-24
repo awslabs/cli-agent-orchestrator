@@ -48,6 +48,7 @@ uv sync --all-extras --dev          # install (mirrors what CI does)
 uv run pytest test/path/to/test_x.py   # run targeted tests while iterating
 uv run black src/ test/             # format (CI checks --check)
 uv run isort src/ test/             # import order (CI checks --check-only)
+uv run ruff check src/ test/ examples/   # dead code -- BLOCKING, and green on main
 uv run python scripts/mypy_ratchet.py  # type check -- the gate CI runs (see note below)
 uv run mypy src/                    # the raw mypy output, if you want to read it
 ```
@@ -71,7 +72,7 @@ noise. `test/test_cao_contributing_skill_accuracy.py` fails if this table drifts
 |-----|------|-----------|
 | **Unit Tests** (3.10 / 3.11 / 3.12) | `uv run pytest test/ examples/workflow/tests/ --ignore=test/providers/test_kiro_cli_integration.py --ignore=test/e2e -m "not e2e" --cov=src/cli_agent_orchestrator --cov-report=term-missing` | **Yes** |
 | ↳ step: **Validate Markdown links** | `uv run python scripts/validate_markdown_links.py` — every relative link in every tracked `.md`, including `skills/` | **Yes** |
-| **Code Quality** | black `--check`, isort `--check-only`, then `uv run python scripts/mypy_ratchet.py` | **Yes** (all three; the mypy step's `continue-on-error` was removed in issue #1005) |
+| **Code Quality** | black `--check`, isort `--check-only`, `uv run ruff check src/ test/ examples/`, then `uv run python scripts/mypy_ratchet.py` | **Yes** (all four; the mypy step's `continue-on-error` was removed in issue #1005) |
 | **AG-UI demo (shift-left recording)** | boots a `CAO_AGUI_ENABLED` server, drives the viewer, records a GIF artifact | **Yes** |
 | **AG-UI construct demos (shift-left recordings)** | same pattern for the L2 construct library | **Yes** |
 | **AG-UI stock-client live (AC3)** | drives a real third-party AG-UI client against the surface | **Yes** |
@@ -101,9 +102,12 @@ check does not exempt an open HIGH/CRITICAL advisory. See
 failure states, and the required-status rollout after the workflow lands.
 
 > **The `-m "not e2e"` on the CI command replaces your local `addopts` — it does not
-> compose with it.** So a local run that *also* deselects `integration` is a strict subset
-> of CI's selection and can be green while CI is red. Compare deselected counts, not just
-> pass counts.
+> compose with it.** Since #1005 the two agree: `addopts` is `-m 'not e2e'`, so a default
+> local run uses the same marker expression CI does — the path differences below are what
+> still separates the two populations. Before that change, `addopts` read
+> `-m 'not e2e and not integration'`, a strictly narrower marker than CI's, and a local
+> run could be green while CI was red. If you override `-m` yourself, compare deselected
+> counts, not just pass counts.
 >
 > **CI's selection is narrower than the marker alone implies.** The same command passes
 > `--ignore=test/providers/test_kiro_cli_integration.py` and `--ignore=test/e2e`, and
@@ -143,10 +147,10 @@ pins this table to the workflow files.
 |----------|------------------|---------|-----------|
 | **Secret Scan** (`secret-scan.yml`) | `gitleaks`, `gitleaks config tests` | every PR to `main` | **Yes** — the config tests run locally as `uv run pytest test/test_gitleaks_config.py`; the scan itself is `gitleaks detect --config .gitleaks.toml` over the PR's commits |
 | **cargo-deny** (`cargo-deny.yml`) | `cargo-deny (advisories, licenses, bans, sources)` | every PR to `main` | **Yes** — locally, `cargo deny --manifest-path tui/Cargo.toml --locked check` (global flags before the subcommand, as the action passes them) |
-| **Test Antigravity CLI Provider** (`test-antigravity-cli-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test or fixtures, `pyproject.toml`, or the workflow | **Yes** |
-| **Test Claude Code Provider** (`test-claude-code-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test, `pyproject.toml`, or the workflow | **Yes** |
-| **Test Codex CLI Provider** (`test-codex-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test or fixtures, `pyproject.toml`, or the workflow | **Yes** |
-| **Test Kiro CLI Provider** (`test-kiro-cli-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, its unit test or fixtures, `pyproject.toml`, or the workflow | **Yes** |
+| **Test Antigravity CLI Provider** (`test-antigravity-cli-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, **any** of its `test/providers/test_<provider>_*.py` tests (globbed since #1005 — it used to be one hardcoded filename) or fixtures, `pyproject.toml`, or the workflow | **Yes** |
+| **Test Claude Code Provider** (`test-claude-code-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, **any** of its `test/providers/test_<provider>_*.py` tests (globbed since #1005 — it used to be one hardcoded filename), `pyproject.toml`, or the workflow | **Yes** |
+| **Test Codex CLI Provider** (`test-codex-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, **any** of its `test/providers/test_<provider>_*.py` tests (globbed since #1005 — it used to be one hardcoded filename) or fixtures, `pyproject.toml`, or the workflow | **Yes** |
+| **Test Kiro CLI Provider** (`test-kiro-cli-provider.yml`) | `Unit Tests`, `Code Quality` | only PRs touching that provider, **any** of its `test/providers/test_<provider>_*.py` tests (globbed since #1005 — it used to be one hardcoded filename) or fixtures, `pyproject.toml`, or the workflow | **Yes** |
 | **Robotics transport example** (`robotics-transport.yml`) | `Transport simulator` | only PRs touching the cross-zone transport example, agent-profile schema, CAO provider list, or the workflow | **Yes** — real MuJoCo and authenticated MCP tests; locally, `uv --directory examples/robotics/cross-zone-transport run --locked pytest` |
 | **Docs site** (`gh-pages.yml`) | `build` | only PRs touching `docusaurus/**`, `patches/**`, `vendor/**`, `scripts/test-braces-security.cjs`, `examples/robotics/cross-zone-transport/images/**`, or the workflow | **Yes** — `deploy` is push-only and never runs on a PR |
 | **Actions Security** (`zizmor.yml`) | `zizmor` | every PR to `main` | **Yes** — zizmor 1.30.1 over `.github/` at Medium or higher; locally, `uvx zizmor==1.30.1 --collect=all --min-severity medium --offline --config .github/zizmor.yml .github/`. Accepted findings and their reasons live in `.github/zizmor.yml`; fix the workflow or add a reasoned entry there, never an inline ignore |
@@ -209,18 +213,24 @@ pins this table to the workflow files.
 ## Pre-PR checklist
 
 1. `uv run black src/ test/ && uv run isort src/ test/` (or `--check` to verify).
-2. `uv run python scripts/mypy_ratchet.py` — must print `PASS`. This is the blocking gate;
+2. `uv run ruff check src/ test/ examples/` — must be **clean**. Blocking, like the mypy
+   ratchet, but with no tolerated backlog at all, so any finding is yours. Do not reach for
+   `--fix` on a pytest fixture re-import: ruff cannot see that pytest injects the name,
+   and removing it breaks collection (it turned `test/decisions` into 113 errors once).
+   Use `# noqa: F401  # <reason>` there. Selected rules and the deferred ones (F811, ARG,
+   B) are documented in `pyproject.toml`.
+3. `uv run python scripts/mypy_ratchet.py` — must print `PASS`. This is the blocking gate;
    pre-existing errors are fine, new ones are not. If it reports improvements, run it again
    with `--update` and commit `mypy-baseline.json`.
-3. `uv run pytest <targeted files>` green; add/keep tests for changed behavior.
-4. If you touched **any** `.md`, run `uv run python scripts/validate_markdown_links.py` —
+4. `uv run pytest <targeted files>` green; add/keep tests for changed behavior.
+5. If you touched **any** `.md`, run `uv run python scripts/validate_markdown_links.py` —
    a dead relative link fails the Unit Tests job, and `skills/` is in scope. CAO has no
    root `AGENTS.md`; the contributor map is `CODEBASE.md`.
-5. If you touched `skills/`, run `uv run python scripts/sync_skills.py` so the packaged mirror
+6. If you touched `skills/`, run `uv run python scripts/sync_skills.py` so the packaged mirror
    stays in lockstep (`test/test_skill_packaging_parity.py` enforces it).
-6. **Commits:** only when asked; sign if the repo expects it; keep the subject concise and
+7. **Commits:** only when asked; sign if the repo expects it; keep the subject concise and
    Conventional-Commits style; never force-push to `main`.
-7. **Open the PR, then watch its CI run to completion** and fix any red gate before calling
+8. **Open the PR, then watch its CI run to completion** and fix any red gate before calling
    it done (rule #2 and #4). Use `gh pr create` / `gh pr checks`.
 
 ## Not what you want?
