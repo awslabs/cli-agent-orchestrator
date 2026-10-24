@@ -5,8 +5,6 @@ and the workspace-trust handling in _handle_startup_prompts (including the
 regression where the echoed launch command false-matched the idle prompt).
 """
 
-import re
-import time
 from unittest.mock import MagicMock, patch
 
 import pytest

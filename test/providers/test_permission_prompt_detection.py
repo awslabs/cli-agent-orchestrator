@@ -27,8 +27,6 @@ Non-permission cases (N1-N9):
 
 from pathlib import Path
 
-import pytest
-
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 

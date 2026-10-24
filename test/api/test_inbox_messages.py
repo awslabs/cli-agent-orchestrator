@@ -1,12 +1,10 @@
 """Tests for the new inbox messages GET endpoint."""
 
 import asyncio
-import json
 from datetime import datetime
 from unittest.mock import Mock, patch
 
 import pytest
-from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus

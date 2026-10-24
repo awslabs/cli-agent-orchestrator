@@ -12,10 +12,8 @@ Covers:
 
 from __future__ import annotations
 
-import asyncio
 import json
 from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -23,7 +21,6 @@ from cli_agent_orchestrator.services.agui.base import RecordingUiEmitter
 from cli_agent_orchestrator.services.agui.handoff_approval import (
     AgentHandoffWithApproval,
     ApprovalDecision,
-    Interrupt,
 )
 
 # ---------------------------------------------------------------------------
@@ -375,7 +372,7 @@ async def test_run_plane_resume_cancelled_maps_to_deny():
             approval_construct=construct,
         )
     )
-    parsed = _parse_frames(frames)
+    _parsed = _parse_frames(frames)
 
     assert construct.get_interrupt(interrupt.id).resolved
     assert construct.get_interrupt(interrupt.id).outcome == "deny"
