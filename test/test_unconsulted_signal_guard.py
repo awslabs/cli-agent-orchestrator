@@ -3,10 +3,13 @@
 GH#752 was two bugs with one cause: ``get_status()`` computed
 ``placeholder_in_tail`` and never read it, so the only plan-independent
 readiness marker was silently dropped and the processing indicator was left
-unanchored. Nothing in the gate can see that shape -- the Code Quality job runs
-black, isort and mypy only (``.github/workflows/ci.yml:277-288``), and mypy has
-no unused-local check at any strictness, so an assigned-but-never-read local
-survives review and CI indefinitely.
+unanchored. When this guard landed nothing in the gate could see that shape:
+the Code Quality job ran black, isort and mypy only, and mypy has no
+unused-local check at any strictness, so an assigned-but-never-read local
+survived review and CI indefinitely. #1005 then added ``ruff check`` with F841
+selected (``pyproject.toml`` ``[tool.ruff.lint]``), which reports the same
+function-local shape as check 1 below; check 2, the module-level constant scan,
+has no ruff equivalent and remains this file's own.
 
 Two checks lock the class:
 

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 from typing import Any, Dict, List
-from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -75,7 +74,7 @@ class _FakeBus:
     async def drain(self, queue):
         # Yield nothing so the stream finishes immediately.
         return
-        yield  # noqa: make it an async generator
+        yield  # unreachable, but it is what makes this an async generator
 
 
 # ---------------------------------------------------------------------------
