@@ -49,3 +49,7 @@ agent
 The `@ag-ui/client` version is pinned in `package.json`; `run.sh` installs it on
 first run. Because the client is solely `@ag-ui/*` packages, a passing run proves
 the run plane is stock-AG-UI-protocol compliant.
+
+`package.json` also overrides `zod` to `^4.6.6`. The pinned `@ag-ui/*` packages
+ask for zod 3, and zod 3 has no fix for CVE-2023-54404. The `@ag-ui/*` code does
+not change, and the client still parses every frame with the SDK event schemas.
