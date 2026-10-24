@@ -46,6 +46,42 @@ pytest_plugins = (
 )
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _cao_home_schema() -> None:
+    """Make the configured home's DB schema exist before any test runs.
+
+    ``clients/database.py`` binds ``SessionLocal`` to a module-global engine at
+    import, but only ``init_db()`` creates the tables, and ``_hermetic_cao_env``
+    below deliberately leaves ``CAO_HOME_DIR`` pointing at the real configured
+    home. So an isolated run against a throwaway home --
+    ``CAO_HOME_DIR=$(mktemp -d) uv run pytest test/services/vault`` -- had tables
+    only if some earlier test in the same process happened to call ``init_db()``
+    itself. That made a test's database depend on which tests ran before it: the
+    vault suite reported 50 failures alone and 0 inside a warm home, and
+    ``test_session_service.py`` 29 and 0, all of them
+    ``no such table: project_aliases`` surfacing through the fail-closed path as
+    ``ProjectAliasLookupUnavailableError`` / ``VaultConfigUnavailableError`` --
+    false security refusals on a harness artefact.
+
+    Conditional on the *whole* schema being absent, not on one table. An
+    un-initialized home gets the full ``init_db()``; a home that already holds
+    any CAO table is left exactly as it is. Calling ``init_db()`` unconditionally
+    would re-run all of its migrators -- several of which rebuild tables -- over
+    a developer's live home on every pytest invocation, and would silently
+    repair a half-migrated home mid-session, masking the migration gaps that
+    ``test/clients/test_*_migration.py`` exists to catch. A stale home should
+    still fail loudly and be fixed with ``cao init``.
+    """
+    from sqlalchemy import inspect as sa_inspect
+
+    from cli_agent_orchestrator.clients import database
+
+    present = set(sa_inspect(database.engine).get_table_names())
+    if present & set(database.Base.metadata.tables):
+        return
+    database.init_db()
+
+
 _AUTH_TEST_DOMAIN = "test.local"
 _AUTH_TEST_AUDIENCE = "cao://test"
 
