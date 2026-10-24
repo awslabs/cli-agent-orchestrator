@@ -22,11 +22,8 @@ from cli_agent_orchestrator.agent_plugins.mcp_delivery import (
     apply_plugin_mcp_servers,
     grantable_server_names,
     log_delivery_findings,
-    merge_plugin_mcp_servers,
     opencode_config_collision_finding,
 )
-from cli_agent_orchestrator.agent_plugins.mcp_mapping import is_pre_expanded as is_plugin_mcp_entry
-from cli_agent_orchestrator.agent_plugins.mcp_mapping import strip_marker as strip_plugin_mcp_marker
 from cli_agent_orchestrator.agent_plugins.models import Finding
 from cli_agent_orchestrator.agent_plugins.store import InstalledPluginStore
 from cli_agent_orchestrator.constants import (
@@ -49,7 +46,6 @@ from cli_agent_orchestrator.utils.agent_profiles import (
     parse_agent_profile_text,
 )
 from cli_agent_orchestrator.utils.env import load_env_vars, set_env_var
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.opencode_config import (
     OpenCodeAgentIdCollisionError,
     disable_mcp_server,

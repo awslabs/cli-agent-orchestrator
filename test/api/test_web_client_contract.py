@@ -61,10 +61,16 @@ def _template_literal(src: str, start: int) -> Tuple[str, int]:
 
 
 def client_request(name: str) -> Tuple[str, str]:
-    """``(method, url_template)`` for the ``api.<name>`` client function."""
+    """``(method, url_template)`` for the ``api.<name>`` client function.
+
+    The create calls are ``async`` since they await ``createBudgetMs()`` for
+    their deadline (#1047), so the arrow may carry that keyword.
+    """
     src = API_TS.read_text(encoding="utf-8")
     head = re.search(
-        rf"^\s*{re.escape(name)}:\s*\(.*?\)\s*=>\s*fetchJSON<[^>]*>\(\s*", src, re.M | re.S
+        rf"^\s*{re.escape(name)}:\s*(?:async\s+)?\(.*?\)\s*=>\s*fetchJSON<[^>]*>\(\s*",
+        src,
+        re.M | re.S,
     )
     assert head, f"api.{name} not found in {API_TS.name}; update this parser with the client"
     template, end = _template_literal(src, head.end())

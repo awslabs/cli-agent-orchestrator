@@ -6,7 +6,6 @@ flow_daemon, lifespan, and the main() entry point.
 """
 
 import asyncio
-from datetime import datetime
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock, call, patch
 
 import pytest
@@ -95,7 +94,7 @@ class TestAgentProfiles:
         with patch(
             "cli_agent_orchestrator.api.main.list_agent_profiles",
             create=True,
-        ) as mock_fn:
+        ) as _mock_fn:
             # The endpoint does a lazy import, so we need to patch at the import target
             with patch(
                 "cli_agent_orchestrator.utils.agent_profiles.list_agent_profiles",

@@ -479,7 +479,7 @@ async def test_crash_nonzero_exit_failed_kind_error(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(script_runner, "_reconcile_orphans", _fake_sweep)
     proc = _FakeProcess(exit_rc=1, stderr=f"Traceback: boom with {aws_key}\n".encode())
-    captured = _install_fake_spawn(monkeypatch, proc)
+    _captured = _install_fake_spawn(monkeypatch, proc)
 
     result = await run_script_workflow(_FakeScriptSpec(), {}, "run-crash")
     assert result.state == RunState.FAILED

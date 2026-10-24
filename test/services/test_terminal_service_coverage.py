@@ -370,7 +370,7 @@ class TestCreateTerminalCleanup:
         mock_pm.create_provider.return_value = mock_provider
         mock_log_dir.__truediv__ = MagicMock(return_value=MagicMock())
 
-        result = await create_terminal(
+        _result = await create_terminal(
             provider="kiro_cli",
             agent_profile="dev",
             session_name="myses",

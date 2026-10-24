@@ -82,10 +82,14 @@ The Vite dev server proxies API calls to the backend at `localhost:9889`. Make s
 
 ### Unit Tests
 
-Unit tests are fast and use mocked dependencies:
+Most tests mock external dependencies, but the default invocation is not unit-only: its
+marker filter matches CI's (`-m "not e2e"`), so it also collects every `integration`-marked
+test, including ones that spawn a real `cao-server` subprocess or drive real tmux. See
+[Integration Tests](#integration-tests) below.
 
 ```bash
-# Run all unit tests (excludes E2E and integration tests)
+# Run the default suite (same marker filter CI uses — see "What CI runs" for the
+# path differences that remain)
 uv run pytest -v
 
 # Run with coverage report
@@ -96,26 +100,32 @@ uv run pytest test/providers/test_claude_code_unit.py -v
 
 # Run specific test class
 uv run pytest test/providers/test_codex_provider_unit.py::TestCodexBuildCommand -v
+
+# Fast inner loop: mocked-only, skips both e2e and integration tests
+uv run pytest -m "not e2e and not integration" -v
 ```
 
 ### Integration Tests
 
-Integration tests require the provider CLI to be installed and authenticated:
+Integration tests require the provider CLI to be installed and authenticated. They are
+collected by the default invocation (its marker filter only excludes `e2e`), but each
+provider-specific module also carries its own `skipif` on an environment/CLI check, so
+without that CLI present it collects-and-skips rather than failing:
 
 ```bash
 # Run integration tests for a specific provider (example: Kiro CLI)
 uv run pytest test/providers/test_kiro_cli_integration.py -m integration -v
 
-# Skip integration tests
-uv run pytest test/providers/ -v
+# Exclude integration tests too (the fast, mocked-only inner loop)
+uv run pytest test/providers/ -m "not e2e and not integration" -v
 ```
 
-The default pytest configuration is the contributor unit-suite entry point and owns
-the marker selection. A regression test keeps integration tests and the 15 e2e-marked
-tests outside `test/e2e/` out of that suite. A command-line `-m` replaces the configured
-marker rather than composing with it, so use plain `uv run pytest` for this suite.
-For the same reason, running an integration suite requires opting back into its
-excluded marker explicitly with `-m integration`.
+The default pytest configuration is the contributor unit-suite entry point, and its marker
+selection now matches CI's: `-m 'not e2e'` excludes only the e2e-marked tests outside
+`test/e2e/`. `test/test_suite_selection.py` pins this — it asserts that a plain contributor
+run DOES collect an `integration`-marked test. A command-line `-m` replaces the configured
+marker rather than composing with it, so append `and not integration` explicitly (as above)
+if you want the narrower, mocked-only loop.
 
 ### E2E Tests
 
@@ -144,8 +154,12 @@ uv run pytest -n auto
 
 ### What CI runs on your pull request
 
-Run this before opening a PR — it is the exact command in `.github/workflows/ci.yml`,
-and it is a strictly larger set than the unit-test command above:
+Run this before opening a PR — it is the exact command in `.github/workflows/ci.yml`. It
+uses the same `-m "not e2e"` marker filter as the default unit-test command above, but is
+not a superset of it: it additionally `--ignore`s the two paths below (needing an
+authenticated external CLI, or live providers), so over `test/` it collects a slightly
+*smaller* population, with coverage scoped to `src/cli_agent_orchestrator` instead of all
+of `src`:
 
 ```bash
 uv run pytest test/ \
@@ -214,12 +228,18 @@ uv run mypy src/
 ### Run All Quality Checks
 
 ```bash
-# Format, sort imports, type check, and run tests
+# Format, sort imports, lint for dead code, type check, and run tests
 uv run black src/ test/
 uv run isort src/ test/
+uv run ruff check src/ test/ examples/
 uv run python scripts/mypy_ratchet.py
 uv run pytest -v
 ```
+
+A ruff F841 (local assigned but never read) is not always dead code to delete. It can be
+a value the code was supposed to read: issue #752 was exactly that, a computed readiness
+marker that nothing consulted, and the fix (#992) was to read it, not remove it. Before
+deleting the assignment, ask what should have been reading it.
 
 ### Validate Markdown Links
 
@@ -248,7 +268,7 @@ Add or update tests in `test/`
 ### 4. Run Tests Locally
 
 ```bash
-# Run unit tests (fast, excludes E2E and integration)
+# Run the default suite (matches CI's marker filter; excludes E2E, includes integration)
 uv run pytest -v
 
 # Run the larger CI suite with coverage (see the exact command above)
@@ -262,6 +282,7 @@ uv run pytest test/ --ignore=test/providers/test_kiro_cli_integration.py \
 ```bash
 uv run black src/ test/
 uv run isort src/ test/
+uv run ruff check src/ test/ examples/
 uv run python scripts/mypy_ratchet.py
 ```
 
@@ -283,7 +304,7 @@ Create a pull request on GitHub. CI will automatically run tests and code qualit
 
 Runs on all pushes to `main` and all PRs targeting `main`:
 - **Unit tests**: Python 3.10, 3.11, 3.12 matrix with coverage
-- **Code quality**: black, isort, mypy
+- **Code quality**: black, isort, ruff, mypy — all blocking; mypy via a per-file ratchet (see [SKILL.md](skills/cao-contributing/SKILL.md))
 - **Security scan**: Trivy filesystem scan — fails on a finding of **any** severity (see [SECURITY.md](SECURITY.md#running-security-scans-locally) for why the workflow's `CRITICAL,HIGH` input is ignored)
 - **Dependency Security**: Full locked npm, Bun, uv, and Cargo graphs, including dev dependencies and unfixed advisories; every HIGH/CRITICAL finding or scan error blocks. Also verifies the installed dependency mitigations. The Python 3.12 unit job runs a real-Trivy dev-inventory regression; see [SECURITY.md](SECURITY.md#full-dependency-gate).
 - **Dependency review**: License and vulnerability checks on PRs

@@ -1170,7 +1170,6 @@ class HerdrInboxService:
         from cli_agent_orchestrator.backends.registry import get_backend
         from cli_agent_orchestrator.clients.database import (
             get_terminal_metadata,
-            list_terminals_by_session,
         )
         from cli_agent_orchestrator.services.terminal_service import (
             delete_terminal as teardown_terminal,
