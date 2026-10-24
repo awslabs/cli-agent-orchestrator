@@ -67,6 +67,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `examples/decision-model-host`: hosts the open-weight JevK5-4B decision model behind
+  a loopback-only `/v1/systemone` API. Locally, it uses llama.cpp, with Metal or the CPU.
+  On AWS, a CDK stack creates a single GPU instance with no IAM resources. Its services
+  bind to loopback and are reached by SSH tunnel, and it stops itself when idle. The CDK
+  tests pin those properties (#952)
 - Conversational workflow authoring: `cao workflow create` / `update` and the `workflow_create`,
   `workflow_update`, `workflow_get` and `workflow_validate` MCP tools (#583 Bolt 3) (#699). Spec writes
   are atomic and serialized per workflow, so two concurrent creates cannot both succeed and an update
@@ -167,7 +172,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cao session status`, and the ops MCP `get_terminal_status` and
   `get_session_info` return both fields; `list_siblings` and the delegation
   tool results are unchanged (#810)
-- launch-decision platform, not yet wired: `model.route` (`small`/`medium`/
+- launch-decision platform: `model.route` (`small`/`medium`/
   `large`) and `effort.route` (`low`/`medium`/`high`), each `off`, `shadow` or
   `on`, all off by default. Deciders register under the `cao.deciders`
   entry-point group; the built-in `fixed_table` looks a tier up by profile,
@@ -176,7 +181,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table (a keyed message hash, never the task text), kept 90 days. Operators
   control it through `cao decisions`, `cao-server --decision`, the
   `CAO_DECISION_*` variables and the ops MCP decision tools; the agent-facing
-  MCP server has none. No delegation calls it yet, so launches are unchanged.
+  MCP server has none. Assign, handoff, elastic assign and CLI handoff that
+  omit a model ask `model.route`; an explicit model always wins. In on mode
+  their result notes the model that ran, carried in the optional
+  `X-CAO-Decision` response header, and agent tool definitions are unchanged.
+  With every point off, launches are unchanged. See `docs/decisions.md` (#810)
+- `cao decisions off` turns every decision point off, including a running
+  server's environment and startup-flag overrides, and waits up to the shadow
+  timeout plus five seconds for in-flight external decider requests to finish;
+  if they don't, it exits non-zero and the halt stays. An installed external
+  decider must send only while holding `decisions.egress.egress_permit`, which
+  refuses during the halt. `cao decisions enable|disable|show <name>` run the
+  decider package's own consent, revoke and status commands, and `cao
+  decisions status` shows the halt and each installed decider's version and
+  kind without importing it. Ops MCP gains `decisions_off` and cannot grant
+  consent. Core still bundles only `fixed_table` and makes no external call.
   See `docs/decisions.md` (#810)
 - pane-mode windows caption each pane with the terminal running in it.
   `pane_window` gets `pane-border-status` and a border format reading the

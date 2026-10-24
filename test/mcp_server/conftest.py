@@ -22,6 +22,7 @@ work with ``target_host`` has to say what that probe answers.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from test.fixtures.decision_runtime import default_decision_runtime  # noqa: F401
 from typing import Any, Dict, List, Optional
 from unittest.mock import patch
 

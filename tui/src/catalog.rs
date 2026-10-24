@@ -1,6 +1,6 @@
 //! The static run-policy table: what the TUI offers, and how (issue #321).
 //!
-//! One row per leaf command of the CAO Click tree — **105 of them** — each classified `InApp`,
+//! One row per leaf command of the CAO Click tree — **109 of them** — each classified `InApp`,
 //! `Handoff`, or `Hidden`. Three infallible lookups read that table and nothing else.
 //!
 //! # No I/O, and that is the security property (SR-1)
@@ -64,7 +64,7 @@ use std::vec::Vec;
 
 /// The number of leaf commands in the CAO Click tree.
 ///
-/// **105 as of this merged branch.** Successive changes brought relationship, workflow, approval,
+/// **109 as of this merged branch.** Successive changes brought relationship, workflow, approval,
 /// agent-orchestration, vault-maintenance, fleet, and worker leaves that this table did not know
 /// about. They were caught by `test/test_command_catalog_matches_click.py` rather than by review,
 /// several only in CI,
@@ -116,8 +116,8 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-// Local launch-decision controls add eight hidden commands.
-const COMMAND_COUNT: usize = 105;
+// Local launch-decision controls add twelve hidden commands.
+const COMMAND_COUNT: usize = 109;
 
 /// What the TUI does with a command.
 ///
@@ -214,7 +214,7 @@ pub struct Command {
 ///
 /// `pub(crate)` since Bolt 3: `server-client`'s route-table tests walk it to assert that every
 /// IN-APP command has a route and that no HANDOFF or HIDE command does. Deriving that set any
-/// other way would mean re-listing 105 commands in a second place, which is a worse trade than
+/// other way would mean re-listing 109 commands in a second place, which is a worse trade than
 /// widening the visibility of a compile-time constant. Still crate-private — no consumer outside
 /// this crate exists, and the table is not a public API. (#321)
 pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
@@ -236,10 +236,14 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::ConfigList,
     CommandId::ConfigPath,
     CommandId::ConfigSet,
+    CommandId::DecisionsDisable,
+    CommandId::DecisionsEnable,
     CommandId::DecisionsExclude,
     CommandId::DecisionsList,
+    CommandId::DecisionsOff,
     CommandId::DecisionsPurge,
     CommandId::DecisionsSet,
+    CommandId::DecisionsShow,
     CommandId::DecisionsStatus,
     CommandId::DecisionsTable,
     CommandId::DecisionsTier,
@@ -325,7 +329,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::WorkflowValidate,
 ];
 
-/// One variant per leaf command — **all 105**, the same figure [`COMMAND_COUNT`] pins.
+/// One variant per leaf command — **all 109**, the same figure [`COMMAND_COUNT`] pins.
 ///
 /// Why an enum rather than a `String` key is the subject of this module's own docs: it is what
 /// makes an unclassified command a **compile error** instead of a runtime `None` (FR-4.2).
@@ -335,6 +339,10 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
 /// the crate is built. (#321)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CommandId {
+    DecisionsOff,
+    DecisionsEnable,
+    DecisionsDisable,
+    DecisionsShow,
     DecisionsStatus,
     DecisionsSet,
     DecisionsTier,
@@ -1015,6 +1023,42 @@ fn entry(id: CommandId) -> Command {
             handoff_reason: Some(
                 "no HTTP route: wiki_lint.run_lint is in-process (memory.py:286); OQ-6",
             ),
+        },
+        CommandId::DecisionsOff => Command {
+            id: CommandId::DecisionsOff,
+            parent: Some("decisions"),
+            leaf_name: "off",
+            summary: "Halt all points and wait for external requests to finish.",
+            policy: Policy::Hidden, // Local operator controls have no HTTP route.
+            params: &[],
+            handoff_reason: None,
+        },
+        CommandId::DecisionsEnable => Command {
+            id: CommandId::DecisionsEnable,
+            parent: Some("decisions"),
+            leaf_name: "enable",
+            summary: "Run an installed decider's consent command.",
+            policy: Policy::Hidden, // Local operator controls have no HTTP route.
+            params: &[],
+            handoff_reason: None,
+        },
+        CommandId::DecisionsDisable => Command {
+            id: CommandId::DecisionsDisable,
+            parent: Some("decisions"),
+            leaf_name: "disable",
+            summary: "Run an installed decider's revoke command.",
+            policy: Policy::Hidden, // Local operator controls have no HTTP route.
+            params: &[],
+            handoff_reason: None,
+        },
+        CommandId::DecisionsShow => Command {
+            id: CommandId::DecisionsShow,
+            parent: Some("decisions"),
+            leaf_name: "show",
+            summary: "Run an installed decider's status command.",
+            policy: Policy::Hidden, // Local operator controls have no HTTP route.
+            params: &[],
+            handoff_reason: None,
         },
         CommandId::DecisionsStatus => Command {
             id: CommandId::DecisionsStatus,
@@ -1865,7 +1909,7 @@ mod tests {
     ///
     /// Returns `(in_app, handoff, hidden)`. The counts are *derived*; every number they are
     /// compared against is a hard-coded literal in the test body. That direction matters — see
-    /// [`the_policy_distribution_is_twentyfour_eighteen_sixtythree`].
+    /// [`the_policy_distribution_is_twentyfour_eighteen_sixtyseven`].
     fn distribution() -> (usize, usize, usize) {
         let mut counts = (0, 0, 0);
         for id in DISPLAY_ORDER {
@@ -1878,7 +1922,7 @@ mod tests {
         counts
     }
 
-    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 63 HIDE, totalling 105.**
+    /// Test 1 — **the policy distribution is 24 IN-APP / 18 HANDOFF / 67 HIDE, totalling 109.**
     ///
     /// Every number here is a **hard-coded literal**, and that is the entire design of the test.
     /// Deriving any of them from the table — `assert_eq!(in_app, TABLE.iter().filter(..).count())`
@@ -1887,7 +1931,7 @@ mod tests {
     /// would look like if it had it.
     ///
     /// **Four assertions rather than one summed check**, also deliberately: a single
-    /// `in_app + handoff + hidden == 105` stays green when a command moves from IN-APP to HIDE,
+    /// `in_app + handoff + hidden == 109` stays green when a command moves from IN-APP to HIDE,
     /// because the total is conserved. Reclassification is exactly the change most likely to
     /// happen by accident, so each policy is pinned separately and the failure names *which* one
     /// moved.
@@ -1940,31 +1984,30 @@ mod tests {
     /// row is offered in navigation and drives the terminal, so it ships the surface — and
     /// only HIDE is "not offered at all" (FR-4.3). When the gate opens these become HANDOFF,
     /// not IN-APP, because `remove` needs a warn-then-confirm exchange that a captured
-    /// one-shot request cannot carry. The eight `cao decisions` leaves are also HIDE because
-    /// they are local operator controls. PR #699 adds hidden workflow create/update leaves,
-    /// giving **24/18/63 = 105**.
+    /// one-shot request cannot carry. The twelve `cao decisions` leaves are also HIDE because
+    /// they are local operator controls. With these additions, the distribution is **24/18/67 = 109**.
     #[test]
-    fn the_policy_distribution_is_twentyfour_eighteen_sixtythree() {
+    fn the_policy_distribution_is_twentyfour_eighteen_sixtyseven() {
         let (in_app, handoff, hidden) = distribution();
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 18, "expected 18 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 63, "expected 63 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 67, "expected 67 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            105,
-            "the three policy counts must account for all 105 leaf commands of the Click tree"
+            109,
+            "the three policy counts must account for all 109 leaf commands of the Click tree"
         );
 
-        // The three counts summing to 105 does not prove 105 *distinct* commands were counted: a
+        // The three counts summing to 109 does not prove 109 *distinct* commands were counted: a
         // duplicated entry in DISPLAY_ORDER would inflate one policy while a real command went
         // uncounted, and the arithmetic above would still close. DISPLAY_ORDER is generated, so
         // this is a live hazard rather than a theoretical one.
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            105,
-            "DISPLAY_ORDER must list 105 DISTINCT commands; a duplicate would let one command go \
+            109,
+            "DISPLAY_ORDER must list 109 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
@@ -1984,9 +2027,9 @@ mod tests {
     /// production. "The compiler has my back" is exactly where a contributor stops checking, so
     /// the uncovered case needs a test rather than a caveat in a doc comment.
     ///
-    /// Neither existing guard catches it. [`the_policy_distribution_is_twentyfour_eighteen_sixtythree`]
+    /// Neither existing guard catches it. [`the_policy_distribution_is_twentyfour_eighteen_sixtyseven`]
     /// counts what `DISPLAY_ORDER` *contains*, so a variant missing from it is simply never
-    /// counted; and its `distinct.len() == 105` assertion detects a **duplicate**, which is the
+    /// counted; and its `distinct.len() == 109` assertion detects a **duplicate**, which is the
     /// opposite direction. [`COMMAND_COUNT`] pins the array's *length*, never its membership.
     ///
     /// # Why an exhaustive match and NOT a discriminant trick
@@ -2031,6 +2074,10 @@ mod tests {
             #[allow(clippy::needless_match)]
             fn identity(id: CommandId) -> CommandId {
                 match id {
+                    CommandId::DecisionsOff => CommandId::DecisionsOff,
+                    CommandId::DecisionsEnable => CommandId::DecisionsEnable,
+                    CommandId::DecisionsDisable => CommandId::DecisionsDisable,
+                    CommandId::DecisionsShow => CommandId::DecisionsShow,
                     CommandId::DecisionsStatus => CommandId::DecisionsStatus,
                     CommandId::DecisionsSet => CommandId::DecisionsSet,
                     CommandId::DecisionsTier => CommandId::DecisionsTier,
@@ -2142,6 +2189,10 @@ mod tests {
 
             // Every variant, each passed through the exhaustive map above.
             [
+                CommandId::DecisionsOff,
+                CommandId::DecisionsEnable,
+                CommandId::DecisionsDisable,
+                CommandId::DecisionsShow,
                 CommandId::DecisionsStatus,
                 CommandId::DecisionsSet,
                 CommandId::DecisionsTier,

@@ -12,6 +12,7 @@ import pytest
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
 from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS
+from cli_agent_orchestrator.decisions.types import LaunchPlan
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.services.terminal_service import create_terminal
 from cli_agent_orchestrator.utils.delegation import DelegationCeilingError
@@ -836,3 +837,14 @@ def test_fingerprint_hashes_the_delegating_terminal():
     assert bound_a != bound_b
     assert bound_a != unbound
     assert unbound == _request_fingerprint(**base, delegating_terminal_id=None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["model-small", "model-large", None])
+async def test_decision_routed_launch_keeps_the_stored_ceiling(launch, model):
+    """A #954 model decision cannot widen #948's recorded tool authority."""
+    _seed("0000beef", "reviewer", REVIEWER, REVIEWER)
+    with pytest.raises(DelegationCeilingError) as excinfo:
+        await launch("developer", caller_id="0000beef", launch_plan=LaunchPlan(model=model))
+    assert "execute_bash" in excinfo.value.excess
+    assert get_terminal_metadata("a0000000") is None
