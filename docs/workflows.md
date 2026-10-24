@@ -25,8 +25,9 @@ For the shim-contract deep-dive (`run_step`/`emit_output`, retry/determinism, th
 
 ## Quick start
 
-Write a small script as a **draft file anywhere you like**, validate it, install it with
-`cao workflow create`, and run it. You never write into the workflows directory yourself:
+Write a small script as a **draft file anywhere you like**, install it with
+`cao workflow create` (which validates it before writing), and run it. You never write into
+the workflows directory yourself:
 `create` sends the draft's **text** to the server, which decides where the spec lands
 through the guarded write path described in [The lifecycle](#the-lifecycle).
 
@@ -44,10 +45,7 @@ emit_output({"note": note.output, "review": review.output})
 ```
 
 ```bash
-# validate is mandatory — fix every finding before creating
-cao workflow validate ./hello.py
-
-# create installs the draft under the name you give it and prints the content_hash
+# create validates the draft, installs it under the name you give it, and prints the content_hash
 cao workflow create hello --from-file ./hello.py
 
 # run it by its stem, with a pre-announced run-id
@@ -98,8 +96,11 @@ Every workflow follows the same path. No step is optional.
    containment, no size cap, no pre-write validation or lint gate, no atomic publication
    (a reader can see the half-written file), and no tier-collision pre-check. It remains
    possible because the directory is yours; it is not the recommended path.
-2. **Validate (mandatory gate)** — `cao workflow validate <draft>`. Findings are
-   **load-bearing**, not style nits:
+2. **Validate (mandatory gate)** — `create` and `update` validate the draft source
+   server-side before writing. They refuse to write a spec with a blocking error. For a spec
+   already installed in the workflows directory, `cao workflow validate <path>` runs the same
+   linter; a relative `<path>` is resolved against that directory. Findings are **load-bearing**,
+   not style nits:
    - **`import cli_agent_orchestrator` is banned.** The script runs in a separate
      subprocess and must reach CAO only over HTTP through the `cao_workflow` shim.
      Importing the server package breaks that boundary and fails validation.
@@ -117,15 +118,12 @@ Every workflow follows the same path. No step is optional.
      mid-run rather than up front). See the authoring guide's recovery-policy section — a
      policy is a *declaration*, never a permission.
 
-   `create` and `update` run this same gate server-side and **refuse to write** a spec
-   with a blocking error, so validating the draft first saves a round trip rather than
-   replacing a check.
 3. **Run** — with an explicit, pre-announced `--run-id` so it can be cancelled.
    **Workflows are NEVER auto-run by an agent.** The user approves each run.
 4. **Status / cancel / resume** — `cao workflow status <run-id>`,
    `cao workflow cancel <run-id>`, `cao workflow resume <run-id>`.
 
-A validate that reports `valid` (status `pass` or `pass_reserved`) exits 0; a failing
+A validation that reports `valid` (status `pass` or `pass_reserved`) exits 0; a failing
 spec exits 1 and lists each error.
 
 ## Parameterized workflows (inputs)
@@ -161,7 +159,6 @@ emit_output({"summary": review.output})
 Install the draft and run it with `--input key=value` (repeatable):
 
 ```bash
-cao workflow validate ./summarize.py
 cao workflow create summarize --from-file ./summarize.py
 cao workflow run summarize --run-id sum-1 \
   --input target_file=/abs/path/to/report.md \
@@ -407,7 +404,7 @@ All sixteen verbs live under `cao workflow`.
 
 | Verb | Flags | Description |
 | --- | --- | --- |
-| `validate <file>` | `--json` | Validate a spec file without running it. Exit 0 valid, 1 invalid. |
+| `validate <file>` | `--json` | Validate an installed spec without running it. The path is resolved against the workflows directory. Exit 0 valid, 1 invalid. Use `create` or `update` to validate and install a draft. |
 | `create <name>` | `--from-file <path>` (required), `--json` | Create a **new** Python spec named `<name>` from a source file. Refuses to overwrite an existing spec — use `update`. Python only; a YAML-tier name is refused with a message naming the restriction. The source is sent as text and the **server** decides where it lands (validation, lint gate, path containment, atomic write, index update all happen server-side). Prints the new `content_hash`, which is what `update` wants next. Exit 0 created, 1 refused/errored. |
 | `update <name>` | `--from-file <path>` (required), `--expected-hash <hash>` (required), `--json` | Replace an **existing** spec's source, refusing a stale update. Refuses to create — use `create`. `--expected-hash` is required and is never computed for you: it is your assertion about what you believe you are replacing, and a hash derived from the file about to be overwritten would always match. There is no `--force`. Get the current hash from `get <name>` (the `Hash:` line). |
 | `list` | `--dir <path>`, `--json` | List indexed workflows (rebuilt from spec files on disk). Script-tier rows show `-` for step count. |
@@ -457,7 +454,7 @@ before assuming a verb and a tool with similar names do the same thing:
 | Create a spec | `create --from-file <path>` | `workflow_create` (source **text**) |
 | Update a spec | `update --from-file <path> --expected-hash` | `workflow_update` (source **text**) |
 | Read a spec | `get <name>` | `workflow_get` |
-| Validate a draft | `validate <file>` | `workflow_validate` (source **text**) |
+| Validate | `validate <file>` (installed spec) | `workflow_validate` (source **text**, including drafts) |
 | List workflow **specs** | `list` | *(none — MCP has no spec-listing tool)* |
 | List workflow **runs** | `runs` | `workflow_list` |
 | Submit asynchronously | `run` (the default) | `workflow_start` |
@@ -465,11 +462,12 @@ before assuming a verb and a tool with similar names do the same thing:
 | **Grant** a plan approval | `approve <plan_id>` | *(none — deliberately)* |
 | **Report** a plan's approval | *(none)* | `workflow_plan_approval` |
 
-> **The four authoring pairs line up by name but not by input.** `create`, `update` and `validate`
-> take a **file path** on the CLI and **source text** over MCP. That is deliberate — an agent holds a
-> draft in context and has nowhere to put a file, whereas a person already has one on disk — but it
-> means the CLI flag and the tool argument are not interchangeable. In both directions the server does
-> the validating, containment-checking and writing; neither surface writes to the spec directory itself.
+> **The four authoring pairs line up by name but not by input.** `create` and `update` take a
+> **draft file path** on the CLI, while `validate` takes a path to a spec already in the workflows
+> directory; all three take **source text** over MCP. That is deliberate — an agent holds a draft in
+> context and has nowhere to put a file, whereas a person already has one on disk — but it means the
+> CLI flag and the tool argument are not interchangeable. In both directions the server does the
+> validating, containment-checking and writing; neither surface writes to the spec directory itself.
 >
 > **`list` and `workflow_list` are false friends.** The CLI's `list` lists **specs**; the
 > MCP `workflow_list` lists **runs**. An agent reaching for "the list tool" expecting specs
@@ -602,10 +600,10 @@ cao workflow approve plan-v1:<digest>
 cao workflow run my-script          # starts
 ```
 
-Bolt 3 ships the conversational authoring sequence around this loop: create or update the script,
-validate it, present it for review, make the plan-discovery run above, and surface the refused run's
-`plan_id` for a human to approve before retrying. The discovery run remains necessary because the
-`plan_id` does not exist before run admission computes it.
+Bolt 3 ships the conversational authoring sequence around this loop: create or update the script
+(which validates it before writing), present it for review, make the plan-discovery run above, and
+surface the refused run's `plan_id` for a human to approve before retrying. The discovery run remains
+necessary because the `plan_id` does not exist before run admission computes it.
 
 ### What approval is, and is not
 
