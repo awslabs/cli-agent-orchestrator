@@ -67,6 +67,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `POST /sessions` and `POST /sessions/{session_name}/terminals` accept
+  `lookup_only=true` with an `idempotency_key`: the request returns the terminal
+  that key already committed, without waiting for it to initialize and without
+  creating anything (404 when nothing is committed, 400 without a key) (#773).
 - `examples/decision-model-host`: hosts the open-weight JevK5-4B decision model behind
   a loopback-only `/v1/systemone` API. Locally, it uses llama.cpp, with Metal or the CPU.
   On AWS, a CDK stack creates a single GPU instance with no IAM resources. Its services
@@ -238,6 +242,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   test enumerates every create call site and fails on one that neither defers init nor derives
   its budget. `GET /health` now reports the server's `provider_init_timeout` so an operator can
   check that a client on another host sees the same value (#710).
+- `cao agent handoff` no longer loses the worker when provider startup
+  outlasts the client's create timeout. The create is retried under one
+  idempotency key with the full timeout each time (sized per profile by #710),
+  and cao-server holds a replay until the original initialization finishes, so
+  input is sent only to a ready worker. If startup outlasts every attempt, the
+  handoff fails but reports the worker's terminal ID and sends it no input; if
+  the original startup failed, that cause is reported and no second worker is
+  started. A keyed replay of a create whose initialization failed answers 424
+  with the cause, and a keyed replay no longer publishes `post_create_session`
+  again (#773).
 - Inbox delivery no longer types a queued message into an open user-answer dialog (#896). With
   `CAO_EAGER_INBOX_DELIVERY=true`, a message for a Claude Code terminal sitting in
   WAITING_USER_ANSWER was pasted into the AskUserQuestion dialog, marked DELIVERED, and the
