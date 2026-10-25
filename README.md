@@ -141,6 +141,8 @@ provider override while keeping the same sequence.
   parallel AI-DLC intents across repositories and isolated worktrees.
 - [Cross-zone robot transport](examples/robotics/cross-zone-transport/README.md):
   coordinate simulated transport, measured custody handoffs, and independent checks.
+- [Self-hosted decision model](examples/decision-model-host/README.md): run the open
+  JevK5-4B decision model locally or on AWS (CDK), behind a loopback-only `/v1/systemone` API.
 - [Tool restrictions](docs/tool-restrictions.md): roles, allowlists, and
   provider enforcement.
 - [Kubernetes deployment](examples/cao-clusters/kubernetes/eks/README.md): run a supervisor and worker fleet on

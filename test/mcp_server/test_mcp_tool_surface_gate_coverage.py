@@ -71,6 +71,7 @@ UNGATED_SURFACES = {
     "cao-ops-mcp-server": frozenset(
         {
             "decisions_list",
+            "decisions_off",  # #955: the kill switch; argument-free, off-only (the default)
             "decisions_purge",
             "decisions_set_exclusions",
             "decisions_set_point",
@@ -205,4 +206,17 @@ def test_the_ungated_ops_surface_has_not_grown():
         "cao-ops-mcp-server's tool surface changed while it is still ungated. A "
         "bound terminal whose profile lists this server reaches these tools with "
         "its 'tools:' allowlist unconsulted (see UNGATED_SURFACES)."
+    )
+
+
+def test_the_ungated_decisions_off_stays_argument_free():
+    """Its UNGATED_SURFACES entry rests on it only ever turning points off (#955).
+
+    The pin above is by name. A parameter added later (a state, a point) would widen
+    an ungated tool without failing it, so its input schema is pinned here.
+    """
+    tools = {tool.name: tool for tool in asyncio.run(ops_server.mcp._list_tools())}
+    assert not tools["decisions_off"].parameters.get("properties"), (
+        "decisions_off gained parameters while cao-ops-mcp-server is ungated; "
+        "re-justify its UNGATED_SURFACES entry."
     )

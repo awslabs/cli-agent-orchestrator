@@ -21,13 +21,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import platform
 import re
-import stat
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Optional
 
 import pytest
 
@@ -38,8 +36,6 @@ from cli_agent_orchestrator.services.audit_log import (
     AUDIT_FILE_MODE,
     LOG_FILENAME_RE,
     NOWAIT_AUDIT_EVENTS,
-    PER_FIELD_CAP_BYTES,
-    SUMMARY_MAX_CHARS,
     SYNC_AUDIT_EVENTS,
     _open_audit_fd,
     _render_line,
@@ -49,7 +45,6 @@ from cli_agent_orchestrator.services.audit_log import (
     read_audit_log,
     sweep_old_audit_logs,
     write_audit,
-    write_audit_nowait,
 )
 
 # ---------------------------------------------------------------------------

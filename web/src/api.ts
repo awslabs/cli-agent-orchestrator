@@ -102,6 +102,145 @@ async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: numb
   }
 }
 
+/** Shape of `GET /health`. Only the fields this client reads are declared. */
+export interface HealthInfo {
+  status: string
+  service?: string
+  terminal_backend?: string
+  /** The init budget the SERVER applies, in seconds (#1002 P3-1). Absent on an older server. */
+  provider_init_timeout?: number
+  components?: Record<string, string>
+}
+
+// ── Create budgets, sized from the server's provider_init_timeout ───────────
+// Issues #710, #1002.
+//
+// `POST /sessions` (without `initial_message`), `POST /sessions/{name}/terminals`
+// and `POST /flows/{name}/run` are answered only AFTER the server finishes
+// `provider.initialize()`. The budget such a call needs is a function of the
+// value the server is itself waiting out — `server.provider_init_timeout` — and
+// of nothing else. These three carried a flat 90 s, which is below a SUCCESSFUL
+// Antigravity init at stock settings (430 s, see below): the browser aborted and
+// showed a failure while the server went on building the worker, the same defect
+// #710 reported for the CLI.
+//
+// #1002 fixed the Python clients by routing every create through
+// `utils/init_allowance.synchronous_create_timeout`, and added an AST lint
+// (`test/test_synchronous_create_timeout_boundary.py`) that fails any new fixed
+// literal on a create call. That lint cannot see TypeScript, so
+// `web/src/test/create-budget.test.ts` is its web-side equivalent: it enumerates
+// the create call sites by name, requires each to reach its budget through
+// `createBudgetMs()`, and fails on a `timeoutMs` literal.
+
+/**
+ * Budget used when `GET /health` cannot be read, or reports no
+ * `provider_init_timeout` because the server predates #1002.
+ *
+ * 90_000 is the fixed literal these three calls carried before the budget
+ * became derived, kept exactly so an unreachable or older server leaves the UI
+ * behaving as it did rather than changing two things at once.
+ */
+export const FALLBACK_CREATE_BUDGET_MS = 90000
+
+/**
+ * Budget for the `/health` read itself. Deliberately well under the 10 s
+ * default: it sits in front of every create, and a server that cannot answer a
+ * trivial localhost GET promptly is not one whose init budget is worth waiting
+ * for — the create falls back and proceeds.
+ */
+const HEALTH_READ_BUDGET_MS = 5000
+
+// The constants below mirror `cli_agent_orchestrator/utils/init_allowance.py`
+// and the two provider modules it reads, so this client and the Python clients
+// derive the SAME number from the same `provider_init_timeout`. They are
+// duplicated because the browser cannot import Python; the drift guard is
+// `create-budget.test.ts`, which reads all three Python sources and fails if any
+// of these values stops matching.
+//
+// `_INIT_PHASES`: a successful init legitimately spans several T-bounded phases;
+// the longest linear shape is ~3T, and the fourth T is margin.
+const INIT_PHASES = 4
+// `_DELIVERY_CONFIRM_ALLOWANCE`: the server's confirm-and-resubmit loop after a
+// send, with headroom for pre-dispatch work and polling.
+const DELIVERY_CONFIRM_ALLOWANCE_S = 60
+// `antigravity_cli.SHELL_WAIT_TIMEOUT_S` / `READY_TIMEOUT_FLOOR_S`.
+const ANTIGRAVITY_SHELL_WAIT_S = 10
+const ANTIGRAVITY_READY_FLOOR_S = 180
+// `kimi_cli.READY_TIMEOUT_FLOOR_S`.
+const KIMI_READY_FLOOR_S = 120
+
+/**
+ * Milliseconds a client should allow for server-side init plus delivery
+ * confirmation, given the server's `provider_init_timeout` in seconds.
+ *
+ * The port of `init_allowance.init_allowance`: the largest of the linear
+ * `INIT_PHASES * T` bound and the two fixed-floor provider shapes, so a
+ * successful init on any known shape of provider stays inside the budget, then
+ * the delivery-confirmation headroom on top. Both floor shapes exceed the
+ * linear bound at stock settings — at T=60 Antigravity needs
+ * `10 + 2*180 = 370 s` against a linear 240 s — which is precisely why a flat
+ * literal could not be right.
+ *
+ * `Math.trunc` rather than `Math.round`, matching the Python `int(bound)`.
+ */
+export function initAllowanceMs(providerInitTimeoutS: number): number {
+  const t = providerInitTimeoutS
+  const bound = Math.max(
+    INIT_PHASES * t,
+    ANTIGRAVITY_SHELL_WAIT_S + 2 * Math.max(ANTIGRAVITY_READY_FLOOR_S, t),
+    t + 2 * Math.max(KIMI_READY_FLOOR_S, t),
+  )
+  return (Math.trunc(bound) + DELIVERY_CONFIRM_ALLOWANCE_S) * 1000
+}
+
+/**
+ * Cached derived budget. `provider_init_timeout` is server configuration, so one
+ * read per page load is enough; a reload picks up a change.
+ *
+ * Only a SUCCESSFUL read is cached. Caching a failure would pin the 90 s
+ * fallback for the lifetime of the page over one transient blip, and the cost of
+ * retrying is a 5 s GET in front of an operation that takes minutes.
+ */
+let cachedCreateBudgetMs: number | null = null
+let inFlightHealthRead: Promise<number> | null = null
+
+/**
+ * Client deadline (ms) for a create the server answers only after init.
+ *
+ * Every create call site in this module takes its budget from here. Never write
+ * a literal on one: raising `provider_init_timeout` has to move the client
+ * deadline with it, which is the whole defect in #710.
+ *
+ * Known limit: the Python helper also honours a PROFILE-level
+ * `provider_init_timeout` override, which `GET /health` does not report — the UI
+ * sizes from the server's global value only. A profile that overrides it ABOVE
+ * the global is therefore still under-budgeted here, which is the pre-existing
+ * behaviour and not a regression.
+ */
+export async function createBudgetMs(): Promise<number> {
+  if (cachedCreateBudgetMs !== null) return cachedCreateBudgetMs
+  if (inFlightHealthRead !== null) return inFlightHealthRead
+
+  const read = (async (): Promise<number> => {
+    try {
+      const health = await fetchJSON<HealthInfo>('/health', { timeoutMs: HEALTH_READ_BUDGET_MS })
+      const timeout = health?.provider_init_timeout
+      if (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout <= 0) {
+        return FALLBACK_CREATE_BUDGET_MS
+      }
+      cachedCreateBudgetMs = initAllowanceMs(timeout)
+      return cachedCreateBudgetMs
+    } catch {
+      // Sizing a wait must never fail the call it is sizing.
+      return FALLBACK_CREATE_BUDGET_MS
+    } finally {
+      inFlightHealthRead = null
+    }
+  })()
+  inFlightHealthRead = read
+  return read
+}
+
 export interface Session {
   id: string
   name: string
@@ -674,8 +813,11 @@ export const api = {
     }
     throw new Error('Session descriptions kept changing; retry on the next poll')
   },
-  createSession: (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string) =>
-    fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: 90000 }),
+  // Synchronous create: no `initial_message`, so the server holds the response
+  // until provider.initialize() returns. Budget from createBudgetMs(), never a
+  // literal (#710, #1002).
+  createSession: async (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string) =>
+    fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: await createBudgetMs() }),
   deleteSession: async (name: string) => {
     const result = await fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${name}`, { method: 'DELETE' })
     if (!result?.success || (result.errors && result.errors.length > 0)) {
@@ -717,14 +859,16 @@ export const api = {
   },
   getWorkingDirectory: (id: string) =>
     fetchJSON<{ working_directory: string | null }>(`/terminals/${id}/working-directory`),
+  // Synchronous create: no `defer_init`, so the server holds the response until
+  // provider.initialize() returns. Budget from createBudgetMs() (#710, #1002).
   // The operator form of the in-session create. `POST /sessions/{name}/terminals`
   // is the agents' route and requires caller_id (403 without it); the UI has no
   // delegating terminal, so it uses the distinct `:operator` sub-path, which the
   // server records like a `POST /sessions` launch. test/api/test_web_client_contract.py
   // posts this exact shape at the real route, so a server-side tightening that
   // breaks this button fails CI instead of the browser.
-  addTerminalToSession: (sessionName: string, provider: string, agentProfile: string, workingDirectory?: string) =>
-    fetchJSON<Terminal>(`/sessions/${sessionName}/terminals:operator?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: 90000 }),
+  addTerminalToSession: async (sessionName: string, provider: string, agentProfile: string, workingDirectory?: string) =>
+    fetchJSON<Terminal>(`/sessions/${sessionName}/terminals:operator?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: await createBudgetMs() }),
 
   // Inbox
   getInboxMessages: (terminalId: string, limit?: number, status?: string) =>
@@ -744,7 +888,11 @@ export const api = {
   deleteFlow: (name: string) => fetchJSON<{ success: boolean }>(`/flows/${name}`, { method: 'DELETE' }),
   enableFlow: (name: string) => fetchJSON<{ success: boolean }>(`/flows/${name}/enable`, { method: 'POST' }),
   disableFlow: (name: string) => fetchJSON<{ success: boolean }>(`/flows/${name}/disable`, { method: 'POST' }),
-  runFlow: (name: string) => fetchJSON<{ executed: boolean }>(`/flows/${name}/run`, { method: 'POST', timeoutMs: 90000 }),
+  // An on-demand flow run launches a session behind this one POST, so it waits
+  // out the same provider init as a create. Budget from createBudgetMs()
+  // (#710, #1002). `createFlow` above only writes the flow file and keeps its
+  // own literal.
+  runFlow: async (name: string) => fetchJSON<{ executed: boolean }>(`/flows/${name}/run`, { method: 'POST', timeoutMs: await createBudgetMs() }),
 
   // Memory
   getMemoryStatus: () => fetchJSON<MemoryStatus>('/settings/memory'),

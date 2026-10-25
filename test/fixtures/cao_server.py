@@ -179,9 +179,12 @@ def _subprocess_env(
 
     Starts from a copy of the parent env, deletes any leaked Auth0 vars (so a
     developer's exported ``AUTH0_DOMAIN`` doesn't accidentally enable auth in
-    the no-auth variant), then applies the standard test overrides plus any
-    ``extra`` knobs. ``base_env`` instead forwards an explicit allowlist unchanged,
-    for isolated ephemeral-agent evidence.
+    the no-auth variant) and any inherited CAO/HERDR runtime identity (so a
+    developer's CAO-managed shell -- exported ``CAO_HOME_DIR``, a live
+    ``CAO_TERMINAL_*``/``CAO_SESSION_NAME``, workflow spawn-env keys, or a herdr
+    backend -- never reaches the subprocess), then applies the standard test
+    overrides plus any ``extra`` knobs. ``base_env`` instead forwards an explicit
+    allowlist unchanged, for isolated ephemeral-agent evidence.
     """
     # A B4 caller supplies its exact env -i allowlist; never inherit parent state.
     if base_env is not None:
@@ -189,8 +192,19 @@ def _subprocess_env(
             raise ValueError("explicit environment cannot be combined with extra overrides")
         return dict(base_env)
     env = os.environ.copy()
-    for leaked in ("AUTH0_DOMAIN", "AUTH0_AUDIENCE", "CAO_AUTH_JWKS_URI"):
+    for leaked in (
+        "AUTH0_DOMAIN",
+        "AUTH0_AUDIENCE",
+        "CAO_AUTH_JWKS_URI",
+        "CAO_HOME_DIR",
+        "CAO_TERMINAL_BACKEND",
+        "CAO_TERMINAL_ID",
+        "CAO_SESSION_NAME",
+    ):
         env.pop(leaked, None)
+    for key in list(env):
+        if key.startswith("CAO_WORKFLOW_") or key.startswith("HERDR_"):
+            env.pop(key, None)
 
     env.update(
         {

@@ -401,15 +401,44 @@ def askable_decisions(launch_http, tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("path", ["assign", "default"])
-async def test_ephemeral_launch_does_not_ask_decider(launch_http, askable_decisions, path):
-    # No launch path on main calls the decision module, so this holds trivially
-    # today. The positive control proves the recorder works; this becomes a real
-    # guard when #954's delegation sites land. Observe both handler and portal threads.
+@pytest.mark.parametrize("path", ["assign", "default", "nowait", "early"])
+async def test_ephemeral_launch_does_not_ask_decider(
+    launch_http, askable_decisions, path, monkeypatch
+):
+    from cli_agent_orchestrator.api import main
+
+    guard_calls, launches = [], []
+    original_guard = main._claimed_ephemeral
+    original_launch = terminal_service._create_terminal_unguarded
+
+    def observe_guard(agent_profile, claim_id):
+        result = original_guard(agent_profile, claim_id)
+        guard_calls.append((agent_profile, claim_id, result))
+        return result
+
+    async def observe_launch(**kwargs):
+        assert "launch_plan" in kwargs
+        launches.append((kwargs["claim_id"], kwargs["launch_plan"]))
+        return await original_launch(**kwargs)
+
+    monkeypatch.setattr(main, "_claimed_ephemeral", observe_guard)
+    monkeypatch.setattr(terminal_service, "_create_terminal_unguarded", observe_launch)
+    name = launch_http[0][1]
+    # The real HTTP decision guard must run with a claim, not be bypassed by
+    # accidentally dropping delegation metadata. Observe the actual decider too.
     with record_decision_calls() as calls:
-        result = await invoke(path, launch_http[0][1])
+        result = await invoke(path, name)
     assert result["success"], result
     assert calls == [], calls
+    assert len(guard_calls) == len(launches) == 1
+    assert guard_calls[0][0] == name and guard_calls[0][2] is True
+    assert guard_calls[0][1] and launches[0] == (guard_calls[0][1], None)
+    fresh = next(
+        kwargs
+        for method, url, kwargs in launch_http[2]
+        if method == "post" and not url.endswith("/claim")
+    )
+    assert fresh["json"]["delegation_message"] == "inspect"
 
 
 @pytest.mark.asyncio
