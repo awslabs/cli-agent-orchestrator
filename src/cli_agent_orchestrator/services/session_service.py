@@ -871,10 +871,18 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                     {"session": session_name, "step": "clear_session_env", "error": str(e)}
                 )
 
-            # Drop the session's display alias so a later same-name session does
-            # not inherit it. Same guard shape as the env cleanup above: a
-            # settings write failure is reported, never allowed to misreport the
-            # completed teardown.
+            # Drop the session's display alias. This is the tidy half of the
+            # guarantee, not the whole of it: plenty of ways to end a session
+            # never reach this function (delete_terminal killing the last
+            # window, a flow run recycling its session, the herdr reconcile, a
+            # tmux server or host restart), so a later same-name session is
+            # kept from inheriting a label by ``_clear_stale_session_state`` in
+            # the locked create branch (haofeif, PR #1036 review, P3-2).
+            # Clearing here as well keeps settings.json from accumulating
+            # entries for names nothing will ever create again.
+            # Same guard shape as the env cleanup above: a settings write
+            # failure is reported, never allowed to misreport the completed
+            # teardown.
             try:
                 set_session_label(session_name, "")
             except SettingsUnreadableError as e:

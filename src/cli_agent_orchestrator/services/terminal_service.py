@@ -133,7 +133,11 @@ from cli_agent_orchestrator.services.session_env import (
     set_session_env,
 )
 from cli_agent_orchestrator.services.session_lock import session_lifecycle_lock
-from cli_agent_orchestrator.services.settings_service import get_max_terminals
+from cli_agent_orchestrator.services.settings_service import (
+    SettingsUnreadableError,
+    get_max_terminals,
+    set_session_label,
+)
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.utils import agent_profiles, delegation
@@ -595,6 +599,44 @@ def _roll_back_backend_create_locked(
                 )
         except Exception:
             logger.exception(f"Rollback: failed to kill window {session_name}:{window_name}")
+
+
+def _clear_stale_session_state(session_name: str) -> None:
+    """Drop every piece of name-keyed state a prior incarnation may have left behind.
+
+    Called from the locked ``new_session`` branch of the create, once the
+    duplicate-session check has proved the name is free. tmux session names are
+    reusable labels, and CAO keeps state outside tmux keyed by exactly that
+    label, so anything not wiped here is silently inherited by the new session.
+
+    Two stores today:
+
+    - the forwarded-env mapping (issue #248), so a no-env relaunch cannot
+      inherit a prior ``cao launch --env``;
+    - the display label (#724; haofeif, PR #1036 review, P3-2). Only
+      ``delete_session`` and an explicit ``POST /sessions/{name}/label`` with an
+      empty label used to remove it, and plenty of ways to end a session skip
+      ``delete_session`` entirely: ``delete_terminal`` killing the last window,
+      a flow run recycling its session, the herdr reconcile killing an empty
+      workspace, or the tmux server / host restarting. The label then sat in
+      settings.json and the next same-name session showed it in the dashboard
+      and in ``GET /sessions``.
+
+    Deliberately one function rather than two call sites: the defect was that a
+    name-keyed store got added without this branch learning about it, so the
+    next one goes here and is cleared for free.
+
+    An unreadable settings.json is a warning, not a failed create: nothing was
+    written, nothing was lost (the label is inside the file nobody can read),
+    and refusing to launch a session over it would be a worse outcome than
+    showing a stale alias. Same judgement ``delete_session`` makes (plauzy,
+    #724 review, item 4).
+    """
+    clear_session_env(session_name)
+    try:
+        set_session_label(session_name, "")
+    except SettingsUnreadableError as e:
+        logger.warning(f"Not clearing a stale label for {session_name}: {e}")
 
 
 def _still_owns_incarnation(session_name: str, terminal_id: Optional[str]) -> bool:
@@ -2143,10 +2185,7 @@ async def _create_terminal_unguarded(
                     if get_backend().session_exists(session_name):
                         raise ValueError(f"Session '{session_name}' already exists")
 
-                    # Wipe any stale mapping a prior aborted lifecycle for this
-                    # name may have left behind, so a no-env relaunch can't
-                    # inherit them.
-                    clear_session_env(session_name)
+                    _clear_stale_session_state(session_name)
 
                     session_incarnation_id = uuid.uuid4().hex
 

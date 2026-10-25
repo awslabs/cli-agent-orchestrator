@@ -719,6 +719,129 @@ class TestListSessions:
         assert _swallowed_log(caplog, "Failed to list sessions").exc_info
 
 
+class TestStaleLabelIsNotInheritedByANewSession:
+    """haofeif, PR #1036 review, P3-2 (+1 plauzy): labels are keyed by session
+    NAME in settings.json and outlive the server, but only ``delete_session``
+    and an explicit empty-label POST removed one. A session that ends any other
+    way -- ``delete_terminal`` killing the last window, a flow run recycling its
+    session, the herdr reconcile, a tmux or host restart -- left its label
+    behind, and the next session created with that name showed it.
+
+    The locked ``new_session`` branch of ``create_terminal`` already wiped the
+    name's stale forwarded-env mapping; it now wipes the label in the same
+    place, through ``_clear_stale_session_state``.
+    """
+
+    @pytest.fixture
+    def create_harness(self):
+        """``create_terminal`` with a mocked backend, stopped at the tmux create.
+
+        The clear runs before the backend is asked for anything, so raising
+        there proves the clear happened without standing up tmux or a provider.
+        Same seams as ``test_working_directory_point_of_use.py``.
+        """
+        from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+        ts = "cli_agent_orchestrator.services.terminal_service"
+        with (
+            patch(f"{ts}.db_delete_terminal"),
+            patch("cli_agent_orchestrator.backends.registry._backend") as backend,
+            patch(f"{ts}.generate_window_name", return_value="developer-abcd"),
+            patch(f"{ts}.generate_terminal_id", return_value="test1234"),
+            patch(f"{ts}.agent_profiles.load_agent_profile") as load_profile,
+        ):
+            load_profile.return_value = AgentProfile(name="developer", description="Developer")
+            backend.session_exists.return_value = False
+            backend.create_session.side_effect = RuntimeError("stop at the tmux create")
+            yield backend
+
+    @pytest.mark.asyncio
+    async def test_a_label_left_by_a_session_that_died_is_cleared_at_create(
+        self, create_harness, real_session_db
+    ):
+        from cli_agent_orchestrator.services.settings_service import (
+            get_session_labels,
+            set_session_label,
+        )
+
+        # An operator labels cao-review, then the host restarts: tmux loses the
+        # session, delete_session never runs, and the label stays on disk.
+        set_session_label("cao-review", "Nightly triage")
+        assert get_session_labels() == {"cao-review": "Nightly triage"}
+
+        with pytest.raises(RuntimeError, match="stop at the tmux create"):
+            await terminal_service.create_terminal(
+                "kiro_cli",
+                "developer",
+                session_name="cao-review",
+                new_session=True,
+            )
+
+        assert get_session_labels() == {}
+        # ...so the listing an operator actually reads shows no label. GET
+        # /sessions is this function plus serialization.
+        with (
+            patch("cli_agent_orchestrator.services.session_service.get_backend") as get_backend,
+            patch(
+                "cli_agent_orchestrator.services.session_service.list_terminals_in_sessions",
+                return_value=[],
+            ),
+        ):
+            get_backend.return_value.list_sessions.return_value = [
+                {"id": "cao-review", "name": "cao-review"}
+            ]
+            listed = list_sessions()
+        assert [s["label"] for s in listed] == [None]
+
+    @pytest.mark.asyncio
+    async def test_joining_an_existing_session_keeps_its_label(
+        self, create_harness, real_session_db
+    ):
+        """The clear belongs to the new-session branch only: adding a window to
+        a live session must not wipe the label its operator set."""
+        from cli_agent_orchestrator.services.settings_service import (
+            get_session_labels,
+            set_session_label,
+        )
+
+        set_session_label("cao-review", "Nightly triage")
+        create_harness.session_exists.return_value = True
+        create_harness.create_window.side_effect = RuntimeError("stop at the tmux create")
+
+        with pytest.raises(RuntimeError, match="stop at the tmux create"):
+            await terminal_service.create_terminal(
+                "kiro_cli",
+                "developer",
+                session_name="cao-review",
+                new_session=False,
+            )
+
+        assert get_session_labels() == {"cao-review": "Nightly triage"}
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_settings_file_is_a_warning_not_a_failed_create(
+        self, create_harness, real_session_db, caplog
+    ):
+        """Teardown's judgement, applied here (plauzy, #724 review, item 4):
+        nothing was written and nothing was lost, so refusing to launch the
+        session over it would be the worse outcome."""
+        from cli_agent_orchestrator.services import settings_service
+
+        settings_service.SETTINGS_FILE.mkdir()  # the autouse fixture points this at tmp_path
+
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(RuntimeError, match="stop at the tmux create"):
+                await terminal_service.create_terminal(
+                    "kiro_cli",
+                    "developer",
+                    session_name="cao-review",
+                    new_session=True,
+                )
+
+        assert "Not clearing a stale label for cao-review" in caplog.text
+        assert settings_service.SETTINGS_FILE.is_dir()
+
+
 @pytest.fixture
 def real_session_db(tmp_path, monkeypatch):
     """Route terminal metadata to a per-test real SQLite database."""
