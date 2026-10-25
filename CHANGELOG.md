@@ -81,6 +81,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run-step transport does not yet receive that credential; subprocess credential delivery
   remains a separate security-boundary decision.
 
+### Changed
+
+- `examples/aidlc-portfolio`: `question answer` now requires a packet-bound, single-use
+  `--approval-id` instead of `--answered-by`; removed `learning approve` / `learning reconcile`
+  and `memory refresh` / `inspect` / `clean` in favor of `learning propose` / `list` /
+  `promote` / `reject`, with promotion recorded against a CAO memory entry. `dispatch check`
+  no longer returns memory baseline revisions, and learning proposals now record promotion
+  metadata instead of `baseRevision` (#936).
+
 - Opt-in non-accessing inspection for CLI memory list/show and HTTP GET
   memory views. Agent recall still reinforces access counts; repeated
   operator views cannot make lessons promotion-eligible. Part of #861.

@@ -79,7 +79,7 @@ give flat files the behavior a memory system is supposed to provide.
 CAO owns a memory layer that every agent uses through the same tools. It stores distilled
 conclusions, not raw transcripts. Agents write and read it with `memory_store` and `memory_recall`,
 not by hand-editing files. It is shared across sessions, and across intents, by construction. The
-[first post in this series](/blog) covers how that layer works.
+[first post in this series](../2026-10-08-cao-memory-design/index.md) covers how that layer works.
 
 Pointed at AI-DLC, it works two ways:
 
@@ -120,14 +120,15 @@ relay for those questions. It must never answer one itself. The example states t
 runner never calls `question answer`, but a relay enforced by prompt alone is one drift away from a
 fabricated, human-attributed approval.
 
-So enforce it by mechanism, not just prompt. The example's `question answer` now takes a
+So model that boundary in the protocol, not just in a prompt. The example's `question answer` now takes a
 `--approval-id`, bound to a single-use approval record for that exact packet, instead of a free-text
 `--answered-by` string. The answerer identity comes from that record, and no CLI subcommand in the
 example lets an agent mint one. That's a real step up from a self-asserted name, and it's a shape worth
 copying: route the question onto CAO's human-approval surface and bind the resolution to who actually
-responded there. A full guarantee still needs that approval record to live outside the agent's own
-write reach, which is exactly what CAO's real human-approval surface gives you. Memory and parallelism
-both assume the human decisions were real, so getting this binding right is what keeps the rest honest.
+responded there. The sample's approval is still a writable file, so it only models that shape; a real
+guarantee needs the record outside the agent's write reach or signed with a key the agent lacks.
+CAO's human-approval surface provides that boundary. Memory and parallelism both assume the human
+decisions were real, so getting this binding right is what keeps the rest honest.
 
 ## Summary
 
@@ -136,7 +137,8 @@ layer lets what one intent learns reach the next one and survive a restart, thro
 `memory_store` and `memory_recall` every CAO agent uses. CAO's orchestration runs several intents at
 once, each in its own worktree, coordinated and watched from one surface. The one rule to carry
 across: wherever CAO sits between AI-DLC and you, keep the orchestrator a relay for AI-DLC's human
-gates, enforced by mechanism rather than by prompt.
+gates. Bind answers to a human approval record, and put that record outside the agent's write reach
+when you need the boundary to be structural.
 
 For the portfolio example itself, see
 [`examples/aidlc-portfolio`](https://github.com/awslabs/cli-agent-orchestrator/tree/main/examples/aidlc-portfolio).
