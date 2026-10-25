@@ -54,7 +54,7 @@
     "@vitejs/plugin-react": "^6.1.2",
     "@vitest/coverage-v8": "^5.0.4",
     "fast-check": "^4.10.2",
-    "happy-dom": "^21.0.1",
+    "happy-dom": "^21.0.4",
     "husky": "^9.1.6",
     "lint-staged": "^17.6.0",
     "prettier": "^3.9.10",

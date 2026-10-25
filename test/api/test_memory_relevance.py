@@ -1,6 +1,10 @@
 """The internal recall route forwards the opt-in sort preference unchanged."""
 
-from test.services.test_scoring import db_engine, hybrid_starvation_corpus, svc
+from test.services.test_scoring import (  # noqa: F401  # pytest fixtures, injected by name
+    db_engine,
+    hybrid_starvation_corpus,
+    svc,
+)
 from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient

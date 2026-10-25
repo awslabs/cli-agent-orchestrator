@@ -10,9 +10,8 @@ from __future__ import annotations
 
 import copy
 import json
-from typing import Any, Dict, List
 
-from hypothesis import assume, given, settings
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from cli_agent_orchestrator.services.agui.base import RecordingUiEmitter
@@ -32,7 +31,6 @@ from cli_agent_orchestrator.services.agui_stream import (
     AGUI_STEP_STARTED,
     AGUI_TEXT_MESSAGE_CONTENT,
     AGUI_TOOL_CALL_END,
-    AGUI_TOOL_CALL_RESULT,
     AGUI_TOOL_CALL_START,
 )
 from cli_agent_orchestrator.services.ui_state_service import (
@@ -241,7 +239,7 @@ class TestP5ProjectionPrivacy:
         )
 
         proj = timeline.projection()
-        serialized = json.dumps(proj)
+        _serialized = json.dumps(proj)
         # The body text must not appear in the projection unless it happens
         # to be identical to a metadata field (sender/receiver).
         # We check none of the entries have a "delta" or "content" field.
@@ -257,7 +255,7 @@ class TestP5ProjectionPrivacy:
         dashboard.handle_frame(AGUI_STATE_SNAPSHOT, {"snapshot": snapshot}, event_id=None)
 
         proj = dashboard.projection()
-        serialized = json.dumps(proj)
+        _serialized = json.dumps(proj)
         # No body-field keys at the top level of the projection.
         for field in _BODY_INDICATORS:
             assert field not in proj

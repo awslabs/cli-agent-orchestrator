@@ -20,7 +20,13 @@ on:
     branches: [ main, develop ]
     paths:
       - 'src/cli_agent_orchestrator/providers/claude_code.py'
-      - 'test/providers/test_claude_code_unit.py'
+      # Globbed, not a per-file list: a single hardcoded filename meant every
+      # Claude Code test outside test_claude_code_unit.py was invisible to this
+      # workflow, and so was any file a future fix adds. The run step below
+      # expands the same glob.
+      - 'test/providers/test_claude_code_*.py'
+      # Named in full because it sits outside the glob above: the busy-pattern
+      # guard is provider-agnostic by name, so it cannot be test_claude_code_*.
       - 'test/providers/test_busy_pattern_settled_output_guard.py'
       - 'pyproject.toml'
       - '.github/workflows/test-claude-code-provider.yml'
@@ -28,7 +34,13 @@ on:
     branches: [ main, develop ]
     paths:
       - 'src/cli_agent_orchestrator/providers/claude_code.py'
-      - 'test/providers/test_claude_code_unit.py'
+      # Globbed, not a per-file list: a single hardcoded filename meant every
+      # Claude Code test outside test_claude_code_unit.py was invisible to this
+      # workflow, and so was any file a future fix adds. The run step below
+      # expands the same glob.
+      - 'test/providers/test_claude_code_*.py'
+      # Named in full because it sits outside the glob above: the busy-pattern
+      # guard is provider-agnostic by name, so it cannot be test_claude_code_*.
       - 'test/providers/test_busy_pattern_settled_output_guard.py'
       - 'pyproject.toml'
       - '.github/workflows/test-claude-code-provider.yml'
@@ -61,8 +73,9 @@ jobs:
         run: |
           # The busy-pattern guard (GH #974) runs here too: this gate fires on a
           # claude_code.py-only change, which is exactly when a spinner pattern
-          # can be widened back onto settled output.
-          uv run pytest test/providers/test_claude_code_unit.py \
+          # can be widened back onto settled output. It is named in full because
+          # it sits outside the test_claude_code_* glob.
+          uv run pytest test/providers/test_claude_code_*.py \
             test/providers/test_busy_pattern_settled_output_guard.py \
             --cov=src/cli_agent_orchestrator/providers/claude_code.py \
             --cov-report=xml \

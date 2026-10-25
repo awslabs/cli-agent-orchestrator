@@ -5,7 +5,7 @@ and the GET /handoff-results/{job_id} retrieval endpoint works correctly.
 """
 
 import logging
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 

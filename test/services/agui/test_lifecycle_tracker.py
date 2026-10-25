@@ -7,14 +7,11 @@ mappings, and replay determinism.
 
 from __future__ import annotations
 
-import pytest
-
 from cli_agent_orchestrator.services.agui.lifecycle_tracker import (
     ToolCallLifecycleTracker,
 )
 from cli_agent_orchestrator.services.agui_stream import (
     AGUI_STEP_FINISHED,
-    AGUI_STEP_STARTED,
     AGUI_TEXT_MESSAGE_CONTENT,
     AGUI_TOOL_CALL_END,
     AGUI_TOOL_CALL_RESULT,
@@ -520,7 +517,7 @@ class TestSameReceiverCollision:
             detail={"sender": "s1", "receiver": "r1", "orchestration_type": "handoff"},
             rid="open-1",
         )
-        frames1 = tracker.feed(open1, to_agui_event(open1))
+        _frames1 = tracker.feed(open1, to_agui_event(open1))
         assert tracker.open_count == 1
 
         # Second open (supersedes first)

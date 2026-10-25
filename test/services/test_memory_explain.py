@@ -1,11 +1,12 @@
 """Explain uses recall's pools/ranking but never records operator access."""
 
 import json
-from test.services.test_scoring import (
+
+from test.services.test_scoring import (  # isort: skip  (per-name noqa below; see the comment)
     _run,
-    db_engine,
-    hybrid_starvation_corpus,
-    svc,
+    db_engine,  # noqa: F401  # pytest fixture, injected by name
+    hybrid_starvation_corpus,  # noqa: F401  # pytest fixture, injected by name
+    svc,  # noqa: F401  # pytest fixture, injected by name
 )
 
 import pytest
