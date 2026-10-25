@@ -4,10 +4,8 @@ folder listing, per-session display labels, and the ``X-Server-Time`` header.
 """
 
 import asyncio
-import json
 import os
 import threading
-import uuid
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
