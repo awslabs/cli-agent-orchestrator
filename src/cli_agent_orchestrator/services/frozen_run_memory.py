@@ -73,11 +73,9 @@ def _resolve_live(terminal_id: str, task_description: str) -> str:
     resolution means. A separate resolution path here would make a replayed run's context differ from
     a live one for reasons unrelated to freezing.
     """
-    from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.memory_gateway import memory_context_for_terminal
 
-    return MemoryService().get_curated_memory_context(
-        terminal_id, task_description=task_description[:200]
-    )
+    return memory_context_for_terminal(terminal_id, task_description=task_description[:200])
 
 
 def frozen_memory_for(
@@ -87,9 +85,9 @@ def frozen_memory_for(
 
     ``None`` means the caller should pass nothing to ``send_input`` and let today's live path run —
     which is the correct answer for a non-workflow terminal, for a YAML run, or for a run with no
-    readable manifest. ``""`` means a known script run has lost its row, or a manifest existed but
-    its memory block could not be persisted; the caller must supply that empty block to prevent
-    the terminal's live-memory fallback.
+    readable manifest. ``""`` means a known script run has lost its row or its journal read failed,
+    or a manifest existed but its memory block could not be persisted; the caller must supply that
+    empty block to prevent the terminal's live-memory fallback.
 
     TOTAL: never raises. A workflow step must not fail because a memory block could not be frozen;
     the worst outcome here is a run that proceeds without memory, which is visible in the manifest.
@@ -101,6 +99,11 @@ def frozen_memory_for(
     try:
         row = workflow_journal.get_run(run_id)
     except Exception as e:  # noqa: BLE001 — a journal fault must not fail the step
+        from cli_agent_orchestrator.services.workflow_service import run_registry
+
+        if getattr(run_registry.get(run_id), "tier", None) == "script":
+            logger.warning("frozen memory: could not read run '%s'; memory withheld: %s", run_id, e)
+            return ""
         logger.warning("frozen memory: could not read run '%s' (resolving live): %s", run_id, e)
         return None
 
