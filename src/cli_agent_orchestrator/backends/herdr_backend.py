@@ -26,7 +26,10 @@ from cli_agent_orchestrator.backends.base import (
     TerminalCleanupResult,
     TerminalNotFoundError,
 )
-from cli_agent_orchestrator.constants import BRACKETED_PASTE_INCOMPATIBLE_SHELLS
+from cli_agent_orchestrator.constants import (
+    BRACKETED_PASTE_INCOMPATIBLE_SHELLS,
+    HERDR_PANE_READ_MAX_LINES,
+)
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 logger = logging.getLogger(__name__)
@@ -718,6 +721,14 @@ class HerdrBackend(TerminalBackend):
 
     # --- Output ---
 
+    @property
+    def max_history_lines(self) -> int:
+        # herdr clamps every ``pane read`` to 1000 lines server-side, whatever
+        # ``--lines`` asks for (see the constant). Reporting the real ceiling
+        # lets get_output skip its 5000-line rung here and classify an
+        # exhausted ladder against 1000, not 5000 (#728).
+        return HERDR_PANE_READ_MAX_LINES
+
     def get_history(
         self,
         session_name: str,
@@ -726,8 +737,15 @@ class HerdrBackend(TerminalBackend):
         strip_escapes: bool = False,
         full_history: bool = False,
         visible_only: bool = False,
+        join_wrapped: bool = False,
     ) -> str:
-        """Read pane output via herdr pane read."""
+        """Read pane output via herdr pane read.
+
+        ``join_wrapped`` is accepted for contract parity and ignored: ``herdr
+        pane read`` has no rejoin flag, so a caller gets whatever line shape
+        herdr returns. Callers that need a wrapped line intact must not rely
+        on it here (codex._find_config_rejection reassembles as context only).
+        """
         pane_id = self._resolve_pane_id_from_window(session_name, window_name)
 
         args = ["pane", "read", pane_id]
@@ -739,7 +757,14 @@ class HerdrBackend(TerminalBackend):
             # get_status() before that fallback is reached.
             args.extend(["--source", "recent", "--lines", "50"])
         elif full_history:
-            pass  # no flags — returns full scrollback
+            # Ask for herdr's read ceiling explicitly. A flagless `pane read`
+            # was assumed to mean "full scrollback", but herdr defaults
+            # ``--lines`` to 80, so on the get_output ladder this rung returned
+            # 80 lines right after the 5000-line rung returned 604 (#728). And
+            # herdr clamps every read to HERDR_PANE_READ_MAX_LINES, so asking
+            # for more than that would only make the argv look deeper than the
+            # reply can be. This is the deepest read herdr offers.
+            args.extend(["--source", "recent", "--lines", str(HERDR_PANE_READ_MAX_LINES)])
         elif tail_lines:
             args.extend(["--source", "recent", "--lines", str(tail_lines)])
         else:

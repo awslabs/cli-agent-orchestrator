@@ -31,7 +31,7 @@ handle (wrong token, wrong scopes, expired).
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import requests
 from requests import Response, exceptions  # noqa: F401  (re-exported for the commands)
@@ -50,6 +50,7 @@ __all__ = [
     "get",
     "is_local_api",
     "post",
+    "put",
 ]
 
 
@@ -127,3 +128,7 @@ def post(url: str, **kwargs: Any) -> Response:
 
 def delete(url: str, **kwargs: Any) -> Response:
     return _send("DELETE", url, **kwargs)
+
+
+def put(url: str, **kwargs: Any) -> Response:
+    return _send("PUT", url, **kwargs)

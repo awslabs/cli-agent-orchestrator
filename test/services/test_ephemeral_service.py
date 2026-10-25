@@ -2,15 +2,14 @@
 
 import hashlib
 import json
-import os
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock
 
 import frontmatter
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -84,7 +83,6 @@ def test_create_files_hashes_and_response(create_store):
     assert result["notes"] == [
         "model: provider default (tier omitted, no default_tier)",
         "effort: provider default (effort omitted, no default_effort)",
-        "launch: not available through assign or handoff in this server version",
     ]
     row = database.get_ephemeral_agent(result["name"])
     assert row["owner_kind"] == "terminal" and row["owner_id"] == CALLER
@@ -832,7 +830,6 @@ def test_ignored_notes_split_keys_without_values(
     assert result["notes"] == [
         model_note,
         effort_note,
-        "launch: not available through assign or handoff in this server version",
     ]
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert warnings == ["ephemeral create " + result["name"] + ": " + notice]

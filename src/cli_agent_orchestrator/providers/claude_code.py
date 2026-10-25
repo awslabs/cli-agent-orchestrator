@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 from cli_agent_orchestrator.agent_plugins.mcp_delivery import with_plugin_mcp as _with_plugin_mcp
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
-from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError, TerminalStatus
+from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils import agent_profiles
@@ -279,6 +279,28 @@ NEW_TUI_SPINNER_PATTERN = r"[✶✢✽✻✳·*][^\n]*ing…"
 # ("* Remember to deploy…") or the version footer ("· latest: … update…")
 # sitting directly above the box from being misread as a live spinner.
 NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+\w*ing\b.*…")
+# Live spinner under Claude Code's prefersReducedMotion setting (GH #908): the
+# animated glyph is replaced by a static "●", e.g. "● Leavening… (running
+# UserPromptSubmit hook)" or "● Sublimating… (12s · ↓ 300 tokens)". "●" is also
+# the response marker, so the glyph alone proves nothing, and the message before
+# the ellipsis can be anything: a default verb ("Dilly-dallying", "Beboppin'"),
+# a custom spinnerVerbs entry, or the in-progress task's activeForm ("Running
+# the test suite"). Anchor on the status in the parentheses instead, which only
+# the spinner prints: it opens with the hook suffix ("running … hook"), the
+# elapsed time ("12s", "1m 3s"), the token count ("↓ 300 tokens"), "thinking" /
+# "thought for Ns", or the older "esc to interrupt". A response like
+# "● Analyzing… the diff is fine" and the tool-call line
+# "● Calling cao-mcp-server… (ctrl+o to expand)" do not match.
+_REDUCED_MOTION_STATUS = (
+    r"(?:running[ \t][^)\n]*\bhooks?\b"
+    r"|\d+(?:\.\d+)?[smhd]\b"
+    r"|(?:[↓↑][ \t]*)?[\d.,]+[kmb]?[ \t]+tokens\b"
+    r"|thinking\b|thought[ \t]+for\b"
+    r"|esc[ \t]+to[ \t]+interrupt\b)"
+)
+REDUCED_MOTION_SPINNER_PATTERN = re.compile(
+    r"^[ \t]*●[ \t]+[^\n]*…[ \t]+\(" + _REDUCED_MOTION_STATUS, re.MULTILINE
+)
 
 
 class ClaudeCodeProvider(BaseProvider):
@@ -1060,14 +1082,19 @@ class ClaudeCodeProvider(BaseProvider):
             # summary. Treating that tail as completed mis-reports an active
             # MCP call as COMPLETED (and the StatusMonitor ready-latch then
             # pins it until the next input).
-            if _last_summary is not None and not re.search(
-                r"[✶✢✽✻✳·*][ \t]+\w*ing\b[^\n]*…", _tail[_last_summary.end() :]
+            _after_summary = _tail[_last_summary.end() :] if _last_summary else ""
+            if (
+                _last_summary is not None
+                and not re.search(r"[✶✢✽✻✳·*][ \t]+\w*ing\b[^\n]*…", _after_summary)
+                and not REDUCED_MOTION_SPINNER_PATTERN.search(_after_summary)
             ):
                 _boxless_completion_tail = True
         if _sep_positions and not _boxless_completion_tail:
             pre_sep_lines = output[: _sep_positions[-1]].rstrip("\n").split("\n")
             for line in reversed(pre_sep_lines):
-                if re.search(r"[✶✢✽✻✳·][^\n]*\u2026", line):
+                if re.search(
+                    r"[✶✢✽✻✳·][^\n]*\u2026", line
+                ) or REDUCED_MOTION_SPINNER_PATTERN.search(line):
                     return TerminalStatus.PROCESSING  # spinner before another separator
                 if _sep_re.search(line):
                     break  # hit another separator first -- spinner is from a completed task
@@ -1191,7 +1218,9 @@ class ClaudeCodeProvider(BaseProvider):
                     or EFFORT_FOOTER_LINE_PATTERN.match(line)
                 ):
                     continue
-                if NEW_TUI_BOX_SPINNER_PATTERN.search(line):
+                if NEW_TUI_BOX_SPINNER_PATTERN.search(
+                    line
+                ) or REDUCED_MOTION_SPINNER_PATTERN.search(line):
                     return TerminalStatus.PROCESSING
                 break
             # No spinner is drawn while text streams; see NEW_TUI_BOX_SUMMARY_PATTERN.
@@ -1366,7 +1395,10 @@ class ClaudeCodeProvider(BaseProvider):
         # then latches and starves InboxService (delivers only on IDLE/COMPLETED).
         # The raw get_status() path already switched to the tight pattern for the
         # same reason; the screen path must match.
-        if any(NEW_TUI_BOX_SPINNER_PATTERN.search(ln) for ln in bottom):
+        if any(
+            NEW_TUI_BOX_SPINNER_PATTERN.search(ln) or REDUCED_MOTION_SPINNER_PATTERN.search(ln)
+            for ln in bottom
+        ):
             return TerminalStatus.PROCESSING
 
         bottom_joined = "\n".join(bottom)
@@ -1489,6 +1521,53 @@ class ClaudeCodeProvider(BaseProvider):
     # (after optional ANSI codes).  Mid-line ">" in Java generics, git diffs, HTML
     # etc. must NOT trigger the stop condition.
     _SOL_IDLE_RE = re.compile(r"^\s*(?:\x1b\[[0-9;]*m)*[>❯](?:\x1b\[[0-9;]*m)*[\s\xa0]")
+
+    # The boxed input prompt's rail (the "────" lines above and below ❯).
+    _COMPOSER_RAIL_RE = re.compile(r"─{8,}")
+    # The prompt row inside the box: the glyph, then a space / NBSP (the TUI
+    # renders "❯\xa0"), then the first row of the text; or the bare glyph.
+    _COMPOSER_PROMPT_RE = re.compile(r"^[ \t]*[>❯](?:[ \t\xa0]+(.*)|[ \t\xa0]*)$")
+    # Placeholder the empty box shows: ❯ Try "fix typecheck errors"
+    _COMPOSER_PLACEHOLDER_RE = re.compile(r'^Try "[^"]*"$')
+
+    def extract_current_composer(self, rendered_pane: str) -> Optional[str]:
+        """Return the text sitting unsubmitted in the boxed ❯ prompt, if the box is on screen.
+
+        Issue #78 (PR #1004 review, P2-1): the inbox recovery can only send the
+        bare Enter that submits a paste whose Enter was swallowed when the
+        provider can read its own composer; without this method claude_code
+        had no recovery at all and the next inbox message was pasted on top of
+        the first ({MSG1}{MSG2}).
+
+        The composer is everything between the box's two rails: the ❯ row
+        (minus the glyph) plus the indented continuation rows a wrapped or
+        multi-line paste occupies (real captures: fixtures/COMPOSER_FIXTURES.md).
+        Transcript echoes of earlier prompts sit ABOVE the top rail and are
+        never included. Returns "" for an empty box (bare ❯ or the
+        ``Try "..."`` placeholder) and None when no box is on screen -- a
+        mid-turn frame has no composer to read, and guessing one from
+        transcript text is exactly what ``_message_visible_in_box`` forbids.
+        """
+        rows = rendered_pane.splitlines()
+        rails = [index for index, row in enumerate(rows) if self._COMPOSER_RAIL_RE.search(row)]
+        if len(rails) < 2:
+            return None
+        top, bottom = rails[-2], rails[-1]
+        body = rows[top + 1 : bottom]
+        prompt_index = next((index for index, row in enumerate(body) if row.strip()), None)
+        # The ❯ row must sit right under the top rail (one blank row tolerated,
+        # as in NEW_TUI_BOX_PATTERN); anything else between two rails is not
+        # the input box.
+        if prompt_index is None or prompt_index > 1:
+            return None
+        match = self._COMPOSER_PROMPT_RE.match(body[prompt_index])
+        if match is None:
+            return None
+        first = (match.group(1) or "").strip()
+        if self._COMPOSER_PLACEHOLDER_RE.match(first):
+            first = ""
+        continuation = [row.strip() for row in body[prompt_index + 1 :] if row.strip()]
+        return "\n".join([first] + continuation).strip()
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Claude's final response message using the ⏺/● response marker."""

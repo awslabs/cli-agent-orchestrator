@@ -17,7 +17,8 @@ produce a run row whose ``manifest_json`` is NULL, INDISTINGUISHABLE from a YAML
 freeze, so nothing could tell a crashed freeze from a benign absence. Eliminating the interval eliminates the
 state.
 
-BEST-EFFORT AND TOTAL: every failure returns ``None`` after a ``warning``, and the run continues. This
+BEST-EFFORT AND TOTAL: freeze_manifest returns a JSON value or a closed unavailable reason; the
+build_manifest_json compatibility wrapper returns None on failure. The approval gate decides admission. This
 matches ``_journal_insert_run``'s stated posture ("journal write is best-effort; in-memory floor still serves
 live reads") and INV-4 — a journal concern must never reach into a running step. It is safe because the
 failure direction is FAIL-CLOSED: a ``None`` becomes a NULL manifest, which the Bolt 2 approval gate reads as
@@ -50,17 +51,25 @@ the YAML tier at all.
 
 import logging
 import os
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Mapping, Optional
 
 from cli_agent_orchestrator.services import execution_manifest, plan_identifier
-from cli_agent_orchestrator.utils.git_baseline import derive_baseline
+from cli_agent_orchestrator.utils.agent_profiles import (
+    ProfileEntry,
+    profile_set_digest,
+    read_profile_set,
+)
+from cli_agent_orchestrator.utils.git_baseline import derive_baseline, normalize_unavailable_reason
 
 logger = logging.getLogger(__name__)
 
 OMITTED_FIELDS_NOTE = (
     "provider, model, profile, permissions, limits and retry_policy are omitted: they have no "
     "run-level source in the script tier (each is a per-step argument to step()). They are covered "
-    "transitively by source_hash, because the script's own source chooses them."
+    "transitively by source_hash, because the script's own source chooses them. The profile NAME is "
+    "covered that way; the profile's CONTENT is not, and is covered instead by the profile_set digest "
+    "folded into plan_id under scheme plan-v2 (issue #827)."
 )
 """Recorded IN the envelope, not only in the design documents.
 
@@ -70,29 +79,62 @@ most likely misread as missing data.
 """
 
 
-def build_manifest_json(
+@dataclass(frozen=True)
+class FrozenManifest:
+    manifest_json: Optional[str]
+    unavailable_reason: Optional[str] = None
+    profile_set: Optional[Mapping[str, ProfileEntry]] = None
+    """The ONE read of the installed profile set the ``plan_id`` in ``manifest_json`` was computed from.
+
+    The start paths hand this to ``launch_guard.capture(profile_set=...)`` so the per-run guard record
+    describes the same snapshot the approval was checked against. Before that, the guard re-read the
+    store after the gate, and a profile edited in that window was recorded as the approved state and
+    accepted by ``launch_guard.check`` for the rest of the run (PR #1000, P3-3). It also removes the
+    second full scan of the profile set from the start path. ``None`` when the freeze did not get as
+    far as reading the set.
+    """
+
+
+def freeze_manifest(
     *,
     source_hash: str,
     inputs: Any,
     cwd: Optional[str] = None,
-) -> Optional[str]:
-    """Freeze the manifest for a script-tier run and return the value to store, or ``None``.
+) -> FrozenManifest:
+    """Freeze the manifest and retain a closed, path-free reason when identity is unavailable.
 
     Called ONCE per run, at run-row creation, before any step executes — ``plan_id`` must exist before
     execution for an approval to be checked against it, so a manifest assembled later could only describe
     what already ran.
 
     TOTAL: raises nothing. Any failure logs a ``warning`` and returns ``None``, which the caller passes to
-    ``insert_run`` as a NULL manifest. The exception text is logged; NO FIELD VALUE IS, because ``inputs``
+    ``insert_run`` as a NULL manifest. Only the closed reason is logged; no exception text or field value, because ``inputs``
     is exactly where a credential appears in practice.
     """
     try:
         baseline: Dict[str, Any] = derive_baseline(cwd or os.getcwd())
         if not baseline.get("available"):
-            logger.warning(
-                "manifest freeze unavailable repository baseline (run continues, manifest absent)"
-            )
-            return None
+            reason = normalize_unavailable_reason(baseline.get("reason"))
+            logger.warning("manifest freeze unavailable repository baseline: reason=%s", reason)
+            return FrozenManifest(None, reason)
+
+        # issue #827: the ONE thing neither the source hash nor the repository baseline can cover. A
+        # step's behaviour and tool policy come from its agent profile's CONTENT, resolved from a file
+        # outside the script at launch time, so the transitive-coverage argument below does not reach
+        # it: rewriting a profile changed no byte of the script and therefore no byte of the plan_id.
+        #
+        # An entry the launch path REFUSES (a symlink escaping the store, a ``..`` name, a directory
+        # without ``agent.md``) is digested as a sentinel, not raised: it is a classification the reader
+        # itself made, and a persistent stray entry must not refuse every script run. An entry that
+        # cannot be READ (``PermissionError`` and kin) is a different thing — CAO cannot know what the
+        # set is — and fails closed under its own closed reason so the operator is told to look at the
+        # profile store rather than to retry a CAO-side failure (PR #1000, P2-1).
+        try:
+            profile_snapshot = read_profile_set()
+        except OSError:
+            logger.warning("manifest freeze unavailable profile set: reason=profiles_unreadable")
+            return FrozenManifest(None, "profiles_unreadable")
+        profile_set = profile_set_digest(profile_snapshot)
 
         # Six of FR-8's nine fields are None here because they have no run-level source in this tier
         # (see the module docstring). ``plan_identifier`` renders a None scalar as a distinct
@@ -107,6 +149,7 @@ def build_manifest_json(
             permissions=None,
             limits=None,
             retry_policy=None,
+            profile_set=profile_set,
         )
         plan_id = plan_identifier.compute(fields)
 
@@ -135,9 +178,14 @@ def build_manifest_json(
             memory_content="",
             memory_source="",
         )
-        return execution_manifest.serialise(envelope)
-    except (
-        Exception
-    ) as e:  # noqa: BLE001 — best-effort; the run must not fail because of the manifest
-        logger.warning("manifest freeze failed (run continues, manifest absent): %s", e)
-        return None
+        return FrozenManifest(execution_manifest.serialise(envelope), profile_set=profile_snapshot)
+    except Exception:  # noqa: BLE001 - freeze failure refuses admission, never exposes inputs
+        logger.warning("manifest freeze failed: reason=internal")
+        return FrozenManifest(None, "internal")
+
+
+def build_manifest_json(
+    *, source_hash: str, inputs: Any, cwd: Optional[str] = None
+) -> Optional[str]:
+    """Compatibility wrapper for callers that only need the frozen JSON value."""
+    return freeze_manifest(source_hash=source_hash, inputs=inputs, cwd=cwd).manifest_json

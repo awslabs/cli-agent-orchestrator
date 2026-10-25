@@ -25,15 +25,16 @@ it to an ``HTTPException``.
 import asyncio
 import logging
 import time
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from cli_agent_orchestrator.clients.database import upsert_handoff_result
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine, parse_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
+from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
-from cli_agent_orchestrator.services import frozen_run_memory, terminal_service
+from cli_agent_orchestrator.services import frozen_run_memory, launch_guard, terminal_service
 from cli_agent_orchestrator.services.provider_error_classifier import (
     classify_provider_error,
 )
@@ -41,6 +42,10 @@ from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
 from cli_agent_orchestrator.services.terminal_service import OutputMode
 from cli_agent_orchestrator.utils.terminal import wait_until_status
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.decisions.types import LaunchPlan
+
 
 logger = logging.getLogger(__name__)
 
@@ -451,8 +456,17 @@ async def run_agent_step(
     job_id: Optional[str] = None,
     claim_id: Optional[str] = None,
     description: Optional[str] = None,
+    launch_plan: "LaunchPlan | None" = None,
+    delegating_terminal_id: Optional[str] = None,
+    caller_ceiling: Optional[list[str]] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
+
+    ``delegating_terminal_id`` and ``caller_ceiling`` are forwarded to
+    ``create_terminal`` unchanged; see its docstring. Workflow steps pass the
+    first (the terminal that started the run bounds every step's tools);
+    remote handoff passes the second (the supervisor's ceiling asserted from
+    another node). Both are ignored when a terminal is reused.
 
     Sequence:
       1. Create a terminal (or reuse ``reuse_terminal_id``).
@@ -588,6 +602,11 @@ async def run_agent_step(
     terminal_id = reuse_terminal_id
 
     if created_here:
+        await asyncio.to_thread(
+            launch_guard.check,
+            (env_vars or {}).get("CAO_WORKFLOW_RUN_ID"),
+            agent,
+        )
         # Inherit working directory from supervisor when not explicitly set.
         # Without this, a handoff worker starts in the cao-server process CWD
         # instead of the supervisor's project directory. Best-effort: if
@@ -680,6 +699,9 @@ async def run_agent_step(
 
         # create_terminal already runs provider.initialize() (which waits for
         # IDLE); a failure raises (ValueError/TimeoutError) and propagates.
+        launch_options: dict[str, Any] = (
+            {"launch_plan": launch_plan} if launch_plan is not None else {}
+        )
         terminal = await terminal_service.create_terminal(
             provider,
             agent,
@@ -694,6 +716,9 @@ async def run_agent_step(
             use_worktree=use_worktree,
             claim_id=claim_id,
             description=description,
+            **launch_options,
+            delegating_terminal_id=delegating_terminal_id,
+            caller_ceiling=caller_ceiling,
         )
         terminal_id = terminal.id
 
@@ -779,6 +804,13 @@ async def run_agent_step(
     # gets the task re-delivered before the budget burns down. Raises
     # StepExecutionError on timeout/ERROR, or StepCancelledError if cancellation
     # fires mid-wait.
+    #
+    # LIVE SIBLING of #735, not fixed here (no lint reads this comment):
+    # _wait_for_completion polls status_monitor.get_status() and returns on the
+    # first COMPLETED after send_input discarded the boundary, so a step that
+    # reuses an existing terminal can settle on the previous turn's completion.
+    # Filed separately; gating it means threading dispatch_input's boundary
+    # through run_agent_step.
     try:
         await _wait_for_completion(terminal_id, timeout, cancel_event, prompt=prompt)
     except StepCancelledError:
@@ -800,9 +832,12 @@ async def run_agent_step(
         last_message = await asyncio.to_thread(
             terminal_service.get_output, terminal_id, OutputMode.LAST
         )
-    except BaseException:
+    except BaseException as exc:
         if teardown and created_here:
             await _best_effort_teardown(terminal_id, registry)
+        if isinstance(exc, OutputExtractionError):
+            # Keep rejection subtypes distinct: the prefix is context, not a retry.
+            raise type(exc)(f"terminal {terminal_id}: {exc}") from exc
         raise
 
     # In-band provider-error classification (issue #638). The transport succeeded
