@@ -247,6 +247,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reloads. `workflow_cancel` now requires `ephemeral.child_may_delegate` for ephemeral callers;
   the guide also reflects terminal-target binding for MCP messaging, answers and deletion (#801).
 
+- Antigravity CLI workers no longer report under another worker's terminal id.
+  Every `agy` process starts every server in the shared
+  `~/.gemini/config/mcp_config.json`, and each worker's entry pinned its
+  `CAO_TERMINAL_ID`. So a reviewer assigned while its developer was alive also
+  ran the developer's `cao-mcp-server`, and its `send_message` could reach the
+  supervisor labelled with the developer's id. Entries now carry no identity:
+  `cao-mcp-server` takes `CAO_TERMINAL_ID` from the `agy` process environment,
+  workers with the same server config share one entry (owners listed under
+  `caoTerminalIds`), and leftover per-terminal entries are removed at the next
+  launch (#940).
 - Every client call that creates a session or terminal synchronously (`cao launch` without
   `--headless`, `cao agent handoff`, the `launch_agent` app gesture and the `cao-ops`
   `launch_session` tool without a message) now sizes its wait from `provider_init_timeout`
