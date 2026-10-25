@@ -6,6 +6,7 @@ folder listing, per-session display labels, and the ``X-Server-Time`` header.
 import asyncio
 import os
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -199,6 +200,94 @@ class TestFsDirs:
         assert resp.status_code == 400, resp.json()
         assert "not allowed" in resp.json()["detail"]
         iterdir.assert_not_called()
+
+
+class TestFsDirsStaysOffTheEventLoop:
+    """haofeif, PR #1036 review, P2-1 (+1 plauzy): ``GET /fs/dirs`` is an
+    ``async def`` that ran every one of its filesystem calls inline on the
+    event loop -- the ``realpath`` inside ``resolve_listable_path``,
+    ``exists()``, ``is_dir()``, ``iterdir()`` and one stat per entry. A large
+    directory on a slow mount then froze every other request for the whole
+    listing (7.6 s for ``/mnt/c/Windows/System32`` on the reviewer's WSL host,
+    with a concurrent ``/health`` waiting 7.3 s). This PR itself translates
+    ``C:\\...`` spellings for WSL operators, so a slow mount is an expected
+    input.
+
+    Driven over ASGI directly, like ``TestSettingsWritersStayOffTheEventLoop``
+    below and for the same reason: the sync ``TestClient`` runs the app on its
+    own portal thread, so it cannot observe the request's loop at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_listing_runs_on_a_worker_thread_not_the_loop(self, tmp_path):
+        """Pinned at the filesystem primitives rather than at the helper, so it
+        still fails if a later change moves a stat back out into the handler."""
+        from cli_agent_orchestrator.api import main as api_main
+        from cli_agent_orchestrator.api.main import app
+
+        (tmp_path / "child").mkdir()
+        loop_thread = threading.get_ident()
+        idents: dict[str, int] = {}
+
+        real_iterdir = Path.iterdir
+        real_resolve = api_main.resolve_listable_path
+
+        def recording_iterdir(self):
+            idents["iterdir"] = threading.get_ident()
+            return real_iterdir(self)
+
+        def recording_resolve(*args, **kwargs):
+            idents["resolve_listable_path"] = threading.get_ident()
+            return real_resolve(*args, **kwargs)
+
+        with (
+            patch("cli_agent_orchestrator.api.main.Path.iterdir", recording_iterdir),
+            patch("cli_agent_orchestrator.api.main.resolve_listable_path", recording_resolve),
+        ):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://localhost"
+            ) as client:
+                resp = await client.get("/fs/dirs", params={"path": str(tmp_path)})
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["dirs"] == ["child"]
+        assert set(idents) == {"iterdir", "resolve_listable_path"}
+        for call, ident in idents.items():
+            assert ident != loop_thread, f"{call} ran on the event-loop thread"
+
+    @pytest.mark.asyncio
+    async def test_a_slow_listing_does_not_freeze_the_loop(self, tmp_path):
+        """The property the thread identity exists to buy: the reviewer's
+        concurrent-``/health`` observation, as a heartbeat on the request's own
+        loop."""
+        from cli_agent_orchestrator.api.main import app
+
+        (tmp_path / "child").mkdir()
+        real_iterdir = Path.iterdir
+
+        def slow_iterdir(self):
+            time.sleep(0.5)
+            return real_iterdir(self)
+
+        ticks = 0
+
+        async def heartbeat() -> None:
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        pulse = asyncio.create_task(heartbeat())
+        try:
+            with patch("cli_agent_orchestrator.api.main.Path.iterdir", slow_iterdir):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://localhost"
+                ) as client:
+                    resp = await client.get("/fs/dirs", params={"path": str(tmp_path)})
+        finally:
+            pulse.cancel()
+        assert resp.status_code == 200, resp.text
+        assert ticks >= 20, f"the loop ticked {ticks} times while the listing ran"
 
 
 class TestSessionLabelEndpoint:

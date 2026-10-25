@@ -3407,36 +3407,23 @@ async def list_directories(
     read-scope token can walk the allowed tree. Confining it to a configurable
     root is the obvious further hardening if that ever becomes the deployment
     shape.
+
+    Off the event loop (haofeif, PR #1036 review, P2-1; +1 plauzy): every
+    filesystem call this endpoint makes -- the ``realpath`` inside
+    ``resolve_listable_path``, ``exists()``, ``is_dir()``, ``iterdir()`` and
+    one stat per entry -- used to run inline on this ``async def``. A large
+    directory on a slow mount then froze every other request for the whole
+    listing (measured by the reviewer on a WSL host: 7.6 s for
+    ``/mnt/c/Windows/System32``, with a concurrent ``/health`` waiting 7.3 s;
+    42 s for ``WinSxS``). This PR translates ``C:\\...`` spellings for WSL
+    operators, so a slow mount is an expected input, not a corner case.
+    ``asyncio.to_thread``, exactly as ``POST /sessions/{name}/label`` and the
+    ``/settings/*`` writers below already do for the same hazard (#382). The
+    helper raises the same exceptions it always did, so the ``except`` arms
+    are unchanged.
     """
     try:
-        # ``normalize_working_directory`` returns None for a blank or
-        # quotes-only value, which must fall back to the documented home
-        # default -- ``Path("")`` would silently resolve to the server's CWD.
-        # Only the policy helper's canonical output reaches a filesystem call
-        # below (realpath + containment + blocked-subtree check; CodeQL
-        # py/path-injection): the normalized request string never does.
-        normalized = normalize_working_directory(path) if path else None
-        if normalized is None:
-            resolved = Path.home().resolve()
-        else:
-            resolved = Path(resolve_listable_path(normalized, description="Folder"))
-        # Both probes sit inside the try: a component over NAME_MAX makes
-        # exists()/is_dir() raise OSError, which the arm below turns into a 400.
-        if not resolved.exists():
-            raise ValueError(f"Folder does not exist: {resolved}")
-        if not resolved.is_dir():
-            raise ValueError(f"{str(resolved)!r} is not a folder")
-        visible: List[str] = []
-        hidden: List[str] = []
-        for entry in sorted(resolved.iterdir(), key=lambda e: e.name.lower()):
-            try:
-                if not entry.is_dir():
-                    continue
-            except OSError:
-                continue  # unreadable entry (dangling symlink, EACCES): skip, not fail
-            (hidden if entry.name.startswith(".") else visible).append(entry.name)
-        parent = str(resolved.parent) if resolved.parent != resolved else None
-        return {"path": str(resolved), "parent": parent, "dirs": visible + hidden}
+        return await asyncio.to_thread(_list_directories_blocking, path)
     except PermissionError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -3451,6 +3438,44 @@ async def list_directories(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Could not read that folder: {e}",
         )
+
+
+def _list_directories_blocking(path: Optional[str]) -> Dict[str, Any]:
+    """Worker-thread half of ``GET /fs/dirs``: resolve the folder and read its child names.
+
+    Raises what the endpoint's ``except`` arms already handle -- ``ValueError``
+    from the path policy and from the two probes, ``PermissionError`` and
+    ``OSError`` from the reads -- so moving this body off the event loop did
+    not change a single response.
+    """
+    # ``normalize_working_directory`` returns None for a blank or
+    # quotes-only value, which must fall back to the documented home
+    # default -- ``Path("")`` would silently resolve to the server's CWD.
+    # Only the policy helper's canonical output reaches a filesystem call
+    # below (realpath + containment + blocked-subtree check; CodeQL
+    # py/path-injection): the normalized request string never does.
+    normalized = normalize_working_directory(path) if path else None
+    if normalized is None:
+        resolved = Path.home().resolve()
+    else:
+        resolved = Path(resolve_listable_path(normalized, description="Folder"))
+    # Both probes raise for the caller's try: a component over NAME_MAX makes
+    # exists()/is_dir() raise OSError, which the endpoint turns into a 400.
+    if not resolved.exists():
+        raise ValueError(f"Folder does not exist: {resolved}")
+    if not resolved.is_dir():
+        raise ValueError(f"{str(resolved)!r} is not a folder")
+    visible: List[str] = []
+    hidden: List[str] = []
+    for entry in sorted(resolved.iterdir(), key=lambda e: e.name.lower()):
+        try:
+            if not entry.is_dir():
+                continue
+        except OSError:
+            continue  # unreadable entry (dangling symlink, EACCES): skip, not fail
+        (hidden if entry.name.startswith(".") else visible).append(entry.name)
+    parent = str(resolved.parent) if resolved.parent != resolved else None
+    return {"path": str(resolved), "parent": parent, "dirs": visible + hidden}
 
 
 class AgentDirsUpdate(BaseModel):
