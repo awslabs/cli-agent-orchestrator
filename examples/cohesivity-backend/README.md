@@ -1,8 +1,8 @@
 # Cohesivity backend worker example
 
 This profile connects a CAO worker to the remote
-[Cohesivity](https://cohesivity.ai?ref=gh-cli-agent-orchestrator) MCP server. A
-supervisor can delegate backend setup while other workers build the application.
+[Cohesivity](https://cohesivity.ai) MCP server. A supervisor can delegate
+backend setup while other workers build the application.
 
 Cohesivity provisions databases, storage, hosting, and APIs. No account or API
 keys are required to start. Unclaimed tenants and their resources expire after
@@ -23,10 +23,22 @@ mcpServers:
     url: https://cohesivity.ai/mcp
 ```
 
-`cao-mcp-server` handles delegation and callbacks. `cohesivity` provides tenant,
-resource, status, claim, documentation, and feedback tools. Claude Code supports
-remote HTTP MCP servers. Resource provisioning requires confirmation in the
-worker terminal.
+`cao-mcp-server` handles worker callbacks to the supervisor. `cohesivity`
+provides tenant, resource, status, claim, documentation, and feedback tools.
+Claude Code supports remote HTTP MCP servers.
+
+The profile sets `allowedTools` to the reviewer defaults plus file writes. The
+worker can read files and write `.cohesivity` and `.gitignore`. It has no
+shell and no web fetch, so setup does not run or download any package.
+
+## Permissions
+
+The profile sets no `permissionMode`, so CAO launches Claude Code with
+`--dangerously-skip-permissions` (see [Claude Code](../../docs/claude-code.md)).
+Tenant creation, provisioning, and file writes can run without a prompt once
+you ask for a backend. To approve each call yourself, add `permissionMode: default`
+to the frontmatter and answer the prompts in the worker terminal. Delegated
+workers wait at those prompts until you do.
 
 ## Run the worker
 
@@ -42,14 +54,15 @@ Create a temporary backend for a photo-sharing app with PostgreSQL and object
 storage. Verify both resources and tell me exactly when they expire.
 ```
 
-When the workspace has no `.cohesivity` file, the worker runs:
+## What setup does
 
-```bash
-npx @cohesivity/init --no-plugin --attribution gh-cli-agent-orchestrator
-```
+When the workspace has no `.cohesivity` file, the worker:
 
-The installer retains automatic harness detection and adds the repository
-attribution. The worker saves credentials in `.cohesivity`, provisions the
+1. Calls the `create_tenant` MCP tool once.
+2. Writes the returned credentials to `.cohesivity` in the working directory.
+3. Adds `.cohesivity` to `.gitignore`.
+
+It changes no other files and installs nothing. It then provisions the
 requested resources, checks their status, and reports the expiry. It creates a
 claim URL only when asked.
 
@@ -65,10 +78,15 @@ for this app. Have it verify the resources and report the exact tenant expiry.
 
 ## Data and credentials
 
-Cohesivity receives the tenant ID, resource configuration, and feedback sent by
-the worker. The worker keeps returned keys in a gitignored `.cohesivity` file
-with mode `0600`. Claude Code records MCP arguments and responses in its local
-project transcript, so keep that transcript private.
+Cohesivity receives the MCP client name that Claude Code sends when it
+connects, the tool calls the worker makes (tenant creation, resource
+configuration, status checks, claims), and any feedback. The profile adds no
+tracking ID.
 
-See the [resource catalog](https://cohesivity.ai/offerings?ref=gh-cli-agent-orchestrator)
-and [Cohesivity documentation](https://cohesivity.ai/docs?ref=gh-cli-agent-orchestrator).
+`.cohesivity` holds the tenant's keys. Claude Code's file write uses your
+default file mode, so run `chmod 600 .cohesivity` on a shared machine. Claude
+Code also records MCP arguments and responses in its local project
+transcript, so keep that transcript private.
+
+This example is maintained by Cohesivity. See the
+[Cohesivity documentation](https://cohesivity.ai/docs).
