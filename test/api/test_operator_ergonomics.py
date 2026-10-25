@@ -569,14 +569,39 @@ class TestCreationIsPerRequest:
     @pytest.fixture
     def real_create(self):
         from cli_agent_orchestrator.models.agent_profile import AgentProfile
+        from cli_agent_orchestrator.providers.kiro_capabilities import KiroCapabilities
 
         ts = "cli_agent_orchestrator.services.terminal_service"
+        # The Kiro capability probe runs BEFORE the working-directory resolve
+        # (refusal order: cap, Kiro, ceiling, plugin policy, then the path), and
+        # it shells out to ``kiro-cli``. test/services/conftest.py stubs it for
+        # every service test; test/api has no such autouse fixture, so without
+        # this stub these tests pass on a machine with Kiro installed and fail
+        # on the CI runner with "'kiro-cli' was not found" before the path code
+        # is ever reached (round 5 of PR #1036 went red exactly that way).
+        kiro_probe = patch(
+            f"{ts}.probe_kiro_capabilities",
+            return_value=KiroCapabilities(
+                version="2.13.0",
+                flags=frozenset(
+                    {
+                        "--agent-engine",
+                        "--v3",
+                        "--agent",
+                        "--model",
+                        "--legacy-ui",
+                        "--trust-all-tools",
+                    }
+                ),
+            ),
+        )
         with (
             patch(f"{ts}.db_delete_terminal"),
             patch("cli_agent_orchestrator.backends.registry._backend") as backend,
             patch(f"{ts}.generate_window_name", return_value="developer-abcd"),
             patch(f"{ts}.generate_terminal_id", return_value="test1234"),
             patch(f"{ts}.agent_profiles.load_agent_profile") as load_profile,
+            kiro_probe,
         ):
             load_profile.return_value = AgentProfile(name="developer", description="Developer")
             backend.session_exists.return_value = False
