@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any, List, Tuple
-from unittest.mock import MagicMock
 
 import pytest
 from hypothesis import given, settings
@@ -15,12 +14,10 @@ from hypothesis import strategies as st
 from cli_agent_orchestrator.services.agui.base import RecordingUiEmitter
 from cli_agent_orchestrator.services.agui.handoff_approval import (
     _REGISTRY_CAP,
-    _RESOLVED_TTL_SECONDS,
     AgentHandoffWithApproval,
     ApprovalDecision,
     Interrupt,
     _translate_decision,
-    classify_reason,
 )
 
 # ---------------------------------------------------------------------------
@@ -216,7 +213,7 @@ class TestIdempotentResume:
     @pytest.mark.asyncio
     async def test_second_resume_returns_recorded_outcome(self, construct, delivery):
         interrupt = construct.on_provider_waiting("t-1", "claude_code", "\u2191/\u2193 to navigate")
-        first = await construct.resume(interrupt.id, ApprovalDecision.APPROVE)
+        _first = await construct.resume(interrupt.id, ApprovalDecision.APPROVE)
         # Clear delivery history
         delivery.calls.clear()
         second = await construct.resume(interrupt.id, ApprovalDecision.DENY)
@@ -340,7 +337,7 @@ class TestExpire:
         assert emitter.intents[1]["props"]["outcome"] == "expired"
 
     def test_expire_already_resolved_returns_none(self, construct):
-        interrupt = construct.on_provider_waiting("t-1", "claude_code", "text")
+        _interrupt = construct.on_provider_waiting("t-1", "claude_code", "text")
         construct.expire("t-1")
         # Second expire for same terminal should return None
         result = construct.expire("t-1")
@@ -360,7 +357,7 @@ class TestRegistryBounds:
         construct = AgentHandoffWithApproval(emitter=emitter, answer_delivery=delivery)
         # Create and resolve _REGISTRY_CAP interrupts
         for i in range(_REGISTRY_CAP):
-            it = construct.on_provider_waiting(f"t-{i}", "codex", "Approve? (y/n)")
+            _it = construct.on_provider_waiting(f"t-{i}", "codex", "Approve? (y/n)")
             construct.expire(f"t-{i}")
 
         # Now create one more -- should trigger eviction
@@ -706,8 +703,6 @@ class TestDeliveryFailureRetryable:
         for the 'retryable contract vs concurrent expiry' race."""
         import threading
 
-        from cli_agent_orchestrator.services.agui.handoff_approval import DeliveryError
-
         construct = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=None)
         interrupt = construct.on_provider_waiting("t-x", "codex", "Approve execution? (y/n)")
 
@@ -1025,7 +1020,6 @@ class TestInFlightWatchdog:
         worker completes — not just the post-hoc duration warning."""
         import logging
         import threading
-        import time as _time
 
         from cli_agent_orchestrator.services.agui import handoff_approval as _mod
 
@@ -1223,7 +1217,6 @@ class TestDeliveryLockCleanup:
         (flawed cleanup popped the entry here), C arrives while B delivers.
         With ref-counting, C must join the SAME entry and serialize behind B."""
         import threading
-        from typing import List
 
         order: List[str] = []
         first_in, release_first = threading.Event(), threading.Event()

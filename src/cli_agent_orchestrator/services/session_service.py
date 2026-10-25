@@ -24,7 +24,7 @@ lock in ``services/session_lock.py`` — see ``delete_session`` for why.
 
 import logging
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.backends.base import TerminalBackend, TerminalCleanupOutcome
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -62,6 +62,10 @@ from cli_agent_orchestrator.services.terminal_service import (
 )
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.decisions.types import LaunchPlan
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -88,6 +92,7 @@ async def create_session(
     metadata: Optional[Dict[str, Any]] = None,
     description: Any = _DESCRIPTION_UNSET,
     create_working_directory: bool = False,
+    launch_plan: "LaunchPlan | None" = None,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
@@ -135,6 +140,7 @@ async def create_session(
     if description is _DESCRIPTION_UNSET:
         description = session_name or None
 
+    launch_options: dict[str, Any] = {"launch_plan": launch_plan} if launch_plan is not None else {}
     terminal = await create_terminal(
         provider=resolved_provider,
         agent_profile=agent_profile,
@@ -156,6 +162,7 @@ async def create_session(
         metadata=metadata,
         description=description,
         create_working_directory=create_working_directory,
+        **launch_options,
         caller_ceiling=caller_ceiling,
     )
     dispatch_plugin_event(

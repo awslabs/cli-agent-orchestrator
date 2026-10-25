@@ -16,7 +16,6 @@ import json
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 from test.conftest import mint_test_token
 from test.fixtures.cao_server import (

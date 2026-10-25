@@ -10,8 +10,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cli_agent_orchestrator.models.agent_profile import AgentProfile
-
 
 class TestScanDirectory:
     """Test _scan_directory for .md files and subdirectories."""

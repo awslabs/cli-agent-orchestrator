@@ -481,7 +481,6 @@ class CursorCliProvider(BaseProvider):
             Absolute path to the file. Pass this to
             ``--system-prompt <path>``.
         """
-        import os
 
         prompt_path = self._cao_tmp_dir() / f"{self.terminal_id}-system-prompt.md"
         prompt_path.write_text(system_prompt, encoding="utf-8")
