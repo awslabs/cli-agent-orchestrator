@@ -207,15 +207,10 @@ ENUM_SUBSET_ALLOWLIST = {
         "TerminalCleanupOutcome",
         "ABSENT, DELETED",
     ): "the two outcomes that mean the terminal is gone",
-    # #896's own site. Left as a row rather than fixed here: deriving it from a
-    # property is #896's job, and the #896 branch owns that change. When it
-    # lands, this row goes stale and the rule says so.
-    (
-        "cli_agent_orchestrator/services/terminal_service.py",
-        "OrchestrationType",
-        "ASSIGN, HANDOFF",
-    ): "#896: hand-enumerated and known wrong; SEND_MESSAGE belongs here too. "
-    "Being fixed on the #896 branch by deriving from a property.",
+    # #896's own site (services/terminal_service.py, OrchestrationType) has no
+    # row: the guard now derives its set from the enum
+    # (``_ORCHESTRATED_INPUT_VALUES``), so there is no literal left to explain.
+    # A return to a hand-written subset is an unexplained site and fails here.
 }
 
 ENUM_SUBSET_REMEDY = (

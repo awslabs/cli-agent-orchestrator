@@ -15,7 +15,6 @@ from fastmcp.tools import Tool, ToolResult
 from pydantic import Field, WithJsonSchema
 
 from cli_agent_orchestrator.constants import (
-    ADVERTISED_URL_ENV,
     API_BASE_URL,
     DISCOVERY_TOOL_MARKER,
     ELASTIC_CALLBACK_URL_ENV,
@@ -30,12 +29,9 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.mcp_server import utils as mcp_utils
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
-from cli_agent_orchestrator.mcp_server.utils import _auth_headers, _auth_headers_for
+from cli_agent_orchestrator.mcp_server.utils import _auth_headers_for
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.workflow_runtime import ReturnAck, parse_decision
-from cli_agent_orchestrator.services.elastic_worker_gateway import (
-    elastic_worker_gateway_headers,
-)
 from cli_agent_orchestrator.services.memory_service import (
     MEMORY_DISABLED_MESSAGE,
     MemoryDisabledError,
@@ -905,6 +901,7 @@ async def assign_elastic(
             callback_url=os.environ.get(ELASTIC_CALLBACK_URL_ENV) or None,
             remote_session_name=str(lease["session_name"]),
             description=description,
+            delegation_message=message,
         )
         result["worker_id"] = worker_id
         result["elastic"] = True
@@ -1554,6 +1551,20 @@ CAO_MCP_SERVER_SELECTOR = "@cao-mcp-server"
 #: independently-grantable surface reachable; ``_require_discovery_marker``
 #: still does the real enforcement when the tool actually runs.
 DISCOVERY_GATED_TOOLS = frozenset({"list_siblings", "update_metadata"})
+
+
+def _attach_workflow_caller(payload: Dict[str, Any]) -> None:
+    """Add the calling terminal to a workflow request so its steps inherit the ceiling.
+
+    The server bounds every agent step a run creates by the ``caller_id``
+    terminal's RECORDED delegation ceiling (``RunRecord.caller_id``,
+    ``utils/delegation.py``). ``_tool_denied_reason`` has already established
+    that ``CAO_TERMINAL_ID`` names a resolvable terminal by the time this runs;
+    an operator shell (no id) sends nothing and stays unbounded, as before.
+    """
+    caller = os.environ.get("CAO_TERMINAL_ID")
+    if caller:
+        payload["caller_id"] = caller
 
 
 def _tool_denied_reason(tool_name: str) -> Optional[str]:
@@ -2607,6 +2618,7 @@ async def workflow_run(
     if root is not None:
         payload["working_directory"] = root
     auth_headers = mcp_utils._auth_headers() or None
+    _attach_workflow_caller(payload)
     try:
         # The server awaits the WHOLE run inline (Q1=A), so this blocks for the full
         # run duration — use the worst-case-covering run timeout, NOT the short
@@ -2703,11 +2715,15 @@ async def workflow_resume(
     try:
         # Resume re-drives the WHOLE run inline, so block for the full run duration
         # using the worst-case run timeout, NOT the short per-call _mcp_timeout().
-        # ``json=None`` sends NO body, so a decision-free resume is byte-identical to
-        # the pre-#583 request.
+        # ``json=None`` sends NO body, so a decision-free resume from an operator
+        # shell is byte-identical to the pre-#583 request. Inside a CAO terminal
+        # the body carries the caller so the re-run steps are bounded by its
+        # delegation ceiling.
+        resume_body: Dict[str, Any] = {"decisions": dict(supplied)} if supplied else {}
+        _attach_workflow_caller(resume_body)
         response = requests.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/resume",
-            json={"decisions": dict(supplied)} if supplied else None,
+            json=resume_body or None,
             headers=mcp_utils._auth_headers() or None,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
         )
@@ -2822,6 +2838,7 @@ async def workflow_start(
     if root is not None:
         payload["working_directory"] = root
     auth_headers = mcp_utils._auth_headers() or None
+    _attach_workflow_caller(payload)
     try:
         # Async submit — the normal per-call timeout, NOT the long blocking one (TR-1).
         response = requests.post(

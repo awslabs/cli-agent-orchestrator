@@ -13,7 +13,6 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients import database as db_mod
 from cli_agent_orchestrator.clients.database import (
     Base,
-    HandoffResultModel,
     delete_old_handoff_results,
     get_handoff_result,
     upsert_handoff_result,

@@ -22,11 +22,8 @@ from cli_agent_orchestrator.agent_plugins.mcp_delivery import (
     apply_plugin_mcp_servers,
     grantable_server_names,
     log_delivery_findings,
-    merge_plugin_mcp_servers,
     opencode_config_collision_finding,
 )
-from cli_agent_orchestrator.agent_plugins.mcp_mapping import is_pre_expanded as is_plugin_mcp_entry
-from cli_agent_orchestrator.agent_plugins.mcp_mapping import strip_marker as strip_plugin_mcp_marker
 from cli_agent_orchestrator.agent_plugins.models import Finding
 from cli_agent_orchestrator.agent_plugins.store import InstalledPluginStore
 from cli_agent_orchestrator.constants import (
@@ -49,7 +46,6 @@ from cli_agent_orchestrator.utils.agent_profiles import (
     parse_agent_profile_text,
 )
 from cli_agent_orchestrator.utils.env import load_env_vars, set_env_var
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.opencode_config import (
     OpenCodeAgentIdCollisionError,
     disable_mcp_server,
@@ -1681,6 +1677,38 @@ def installed_kiro_tools(profile_name: str) -> Optional[List[str]]:
     if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
         return None
     return tools
+
+
+def installed_opencode_permission(
+    profile_name: str, agents_dir: Optional[Path] = None
+) -> Optional[Dict[str, str]]:
+    """The ``permission:`` block in the OpenCode agent file ``cao install`` wrote.
+
+    OpenCode enforces that installed block at launch, not the allowlist a
+    create request resolved, so the server compares the two before a bounded
+    launch (``terminal_service.create_terminal``, Step 0d), mirroring
+    :func:`installed_kiro_tools`. ``agents_dir`` defaults to
+    ``OPENCODE_AGENTS_DIR``; the launch path passes the directory the provider
+    will actually point OpenCode at. ``None`` when no agent file exists, its
+    front matter does not parse, or it carries no dict-valued ``permission``.
+
+    Every way the file can fail to yield a policy maps to ``None`` so the
+    bounded-launch gate refuses with the ``cao install`` remedy; an exception
+    escaping here would surface as a 500 instead. ``frontmatter.load`` raises
+    ``yaml.YAMLError`` subclasses (parser, scanner, composer) for bad YAML,
+    which are not ``ValueError``; ``UnicodeDecodeError`` is.
+    """
+    base = Path(agents_dir) if agents_dir is not None else OPENCODE_AGENTS_DIR
+    agent_file = base / f"{to_opencode_agent_id(profile_name)}.md"
+    try:
+        permission = frontmatter.load(agent_file).metadata.get("permission")
+    except (OSError, ValueError, yaml.YAMLError):
+        return None
+    if not isinstance(permission, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in permission.items()
+    ):
+        return None
+    return dict(permission)
 
 
 def kiro_install_predates_native_enforcement(

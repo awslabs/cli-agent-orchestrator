@@ -46,7 +46,6 @@ import uuid
 from pathlib import Path
 from test.e2e.conftest import (
     cleanup_terminal,
-    create_terminal,
     extract_output,
     get_terminal_status,
     wait_for_status,

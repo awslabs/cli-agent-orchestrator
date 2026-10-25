@@ -1,7 +1,6 @@
 """Tests for the database client."""
 
 import sqlite3
-import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -14,7 +13,6 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients import database as db_mod
 from cli_agent_orchestrator.clients.database import (
     Base,
-    FlowModel,
     IdempotencyKeyModel,
     InboxModel,
     MemoryMetadataModel,
@@ -1594,8 +1592,6 @@ class TestFlowOperations:
 
         mock_session.refresh.side_effect = mock_refresh
 
-        from cli_agent_orchestrator.clients.database import get_flows_to_run
-
         next_run = datetime.now()
         result = create_flow(
             name="test-flow",
@@ -1960,9 +1956,13 @@ class TestTerminalsSchemaMigration:
         assert "deferred_init_runtime_reclaimed" in columns
         assert "session_incarnation_id" in columns
         assert {"model", "model_honored"} <= columns
+        assert "delegate_tools" in columns
         assert rows == [
             ("abc12345", None, None, None, None)
         ], "existing rows must get NULL launch-model values"
+        with sqlite3.connect(str(db_file)) as conn:
+            ceilings = conn.execute("SELECT delegate_tools FROM terminals").fetchall()
+        assert ceilings == [(None,)], "pre-migration rows have no recorded ceiling"
 
     def test_migration_is_idempotent(self, tmp_path, monkeypatch):
         """Running the migration twice must not fail or duplicate columns."""
@@ -1996,6 +1996,7 @@ class TestTerminalsSchemaMigration:
         assert columns.count("deferred_init_failure") == 1
         assert columns.count("deferred_init_external_owner") == 1
         assert columns.count("deferred_init_runtime_reclaimed") == 1
+        assert columns.count("delegate_tools") == 1
         assert columns.count("session_incarnation_id") == 1
         assert columns.count("model") == 1
         assert columns.count("model_honored") == 1

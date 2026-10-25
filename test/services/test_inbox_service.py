@@ -10,9 +10,13 @@ import pytest
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS, INBOX_RECONCILE_INTERVAL
-from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
+from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.terminal import (
+    TerminalInputBlockedError,
+    TerminalInputBlockedReason,
+    TerminalStatus,
+)
 from cli_agent_orchestrator.services.event_bus import EventBus
 from cli_agent_orchestrator.services.inbox_service import InboxService
 from cli_agent_orchestrator.services.status_monitor import (
@@ -84,7 +88,7 @@ class TestCopilotQuietInboxRecovery:
             # generation, so confirmation would always burn the full timeout.
             patch("cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRMATION", False),
         ):
-            send.side_effect = lambda *args: loop.call_soon_threadsafe(delivered.set)
+            send.side_effect = lambda *args, **kwargs: loop.call_soon_threadsafe(delivered.set)
             svc = InboxService()
             subscriber = asyncio.create_task(svc.run())
             try:
@@ -95,7 +99,9 @@ class TestCopilotQuietInboxRecovery:
                 clock["now"] = sm._pending_stale_capture["term-1"][1] + delay
                 confirm(*args)
                 await asyncio.wait_for(delivered.wait(), timeout=2)
-                send.assert_called_once_with("term-1", "hello")
+                send.assert_called_once_with(
+                    "term-1", "hello", orchestration_type=OrchestrationType.SEND_MESSAGE
+                )
                 update.assert_called_once_with(1, MessageStatus.DELIVERED)
             finally:
                 subscriber.cancel()
@@ -225,7 +231,9 @@ class TestCopilotQuietInboxRecovery:
                 assert sm._last_status["term-1"] == TerminalStatus.IDLE
                 publish.assert_called_with("terminal.term-1.status", {"status": "idle"})
                 svc.deliver_pending("term-1")
-                send.assert_called_once_with("term-1", "hello")
+                send.assert_called_once_with(
+                    "term-1", "hello", orchestration_type=OrchestrationType.SEND_MESSAGE
+                )
                 update.assert_called_once_with(1, MessageStatus.DELIVERED)
             else:
                 assert sm._last_status.get("term-1") != TerminalStatus.IDLE
@@ -560,7 +568,7 @@ class TestCodexEmptyTurnInboxIntegration:
         backend = MagicMock()
         backend.get_history.side_effect = lambda *args, **kwargs: current_capture["text"]
 
-        def dispatch_input(_terminal_id, message):
+        def dispatch_input(_terminal_id, message, **_kwargs):
             delivered_texts.append(message)
             status_monitor.notify_input_sent("term-1")
             provider.notify_status_buffer_reset(len(delivered_texts))
@@ -662,7 +670,9 @@ class TestDeliverPending:
         svc = InboxService()
         svc.deliver_pending("term-1")
 
-        mock_term_svc.dispatch_input.assert_called_once_with("term-1", "hello")
+        mock_term_svc.dispatch_input.assert_called_once_with(
+            "term-1", "hello", orchestration_type=OrchestrationType.SEND_MESSAGE
+        )
         mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
@@ -678,7 +688,9 @@ class TestDeliverPending:
         svc = InboxService()
         svc.deliver_pending("term-1")
 
-        mock_term_svc.dispatch_input.assert_called_once_with("term-1", "hello")
+        mock_term_svc.dispatch_input.assert_called_once_with(
+            "term-1", "hello", orchestration_type=OrchestrationType.SEND_MESSAGE
+        )
         mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
@@ -739,7 +751,9 @@ class TestDeliverPending:
         svc.deliver_pending("term-1", num_messages=2)
 
         mock_get.assert_called_once_with("term-1", limit=2)
-        mock_term_svc.dispatch_input.assert_called_once_with("term-1", "hello\nworld")
+        mock_term_svc.dispatch_input.assert_called_once_with(
+            "term-1", "hello\nworld", orchestration_type=OrchestrationType.SEND_MESSAGE
+        )
         assert mock_update.call_count == 2
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
@@ -757,7 +771,9 @@ class TestDeliverPending:
         svc.deliver_pending("term-1", num_messages=0)
 
         mock_get.assert_called_once_with("term-1", limit=100)
-        mock_term_svc.dispatch_input.assert_called_once_with("term-1", "msg0\nmsg1\nmsg2")
+        mock_term_svc.dispatch_input.assert_called_once_with(
+            "term-1", "msg0\nmsg1\nmsg2", orchestration_type=OrchestrationType.SEND_MESSAGE
+        )
         assert mock_update.call_count == 3
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
@@ -1018,18 +1034,84 @@ class TestEagerInboxDelivery:
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_delivery_waiting_user_answer_with_eager_enabled_and_capable_provider(
+    def test_delivery_waiting_user_answer_holds_for_dialog_blocking_provider(
         self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
     ):
-        """WAITING_USER_ANSWER + eager ON + capable provider -> delivers."""
+        """WAITING_USER_ANSWER + eager ON + dialog-blocking provider -> holds (#896).
+
+        Claude Code's WAITING_USER_ANSWER means an AskUserQuestion/approval
+        dialog is open; its Ink Select widget consumes pasted text as the answer
+        and the trailing Enter submits the highlighted option. Eagerly
+        delivering there loses the message AND answers a question a human was
+        supposed to answer, so the message must stay PENDING for the IDLE /
+        COMPLETED consumer (or the reconcile sweep) to pick up later.
+        """
         mock_get.return_value = [_make_message()]
         mock_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
         provider = MagicMock()
         provider.accepts_input_while_processing = True
+        provider.blocks_orchestrated_input_while_waiting_user_answer = True
         mock_pm.get_provider.return_value = provider
 
         with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True):
             svc = InboxService()
+            svc.deliver_pending("t1")
+
+        mock_term_svc.dispatch_input.assert_not_called()
+        # Held, not consumed: the optimistic DELIVERED mark must not be written.
+        mock_update.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_delivery_waiting_user_answer_delivers_for_non_blocking_provider(
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
+    ):
+        """WAITING_USER_ANSWER + eager ON + provider that does NOT block -> delivers.
+
+        The gate is the provider's own
+        ``blocks_orchestrated_input_while_waiting_user_answer`` capability, not a
+        blanket ban: a TUI that keeps a separate input box alive next to its
+        prompt can still take the message mid-dialog.
+        """
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+        provider = MagicMock()
+        provider.accepts_input_while_processing = True
+        provider.blocks_orchestrated_input_while_waiting_user_answer = False
+        mock_pm.get_provider.return_value = provider
+
+        with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True):
+            svc = InboxService()
+            svc.deliver_pending("t1")
+
+        mock_term_svc.dispatch_input.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_held_dialog_message_delivers_once_the_terminal_is_idle(
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
+    ):
+        """A message held during WAITING_USER_ANSWER is delivered on the next attempt."""
+        mock_get.return_value = [_make_message()]
+        provider = MagicMock()
+        provider.accepts_input_while_processing = True
+        provider.blocks_orchestrated_input_while_waiting_user_answer = True
+        mock_pm.get_provider.return_value = provider
+
+        with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True):
+            svc = InboxService()
+            mock_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+            svc.deliver_pending("t1")
+            mock_term_svc.dispatch_input.assert_not_called()
+
+            # Human answered the dialog; the terminal finished its turn.
+            mock_monitor.get_status.return_value = TerminalStatus.IDLE
             svc.deliver_pending("t1")
 
         mock_term_svc.dispatch_input.assert_called_once()
@@ -1054,6 +1136,61 @@ class TestEagerInboxDelivery:
             svc.deliver_pending("t1")
 
         mock_term_svc.dispatch_input.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_dispatch_input_blocked_dialog_refusal_stays_pending_without_resampling_status(
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
+    ):
+        """dispatch_input's dialog guard refuses mid-send -> PENDING, decided from
+        the exception's own reason rather than a second status read (#896).
+
+        At the merge base there was no dedicated handler at all: the generic
+        ``except Exception`` marked the batch FAILED. An intermediate revision of
+        this fix added a handler that re-sampled status_monitor.get_status() to
+        decide PENDING vs FAILED. On herdr that call shells out to the herdr CLI
+        and returns UNKNOWN on any error, which would misclassify this exact,
+        provably-transient refusal as FAILED and strand the message permanently
+        -- the outcome the handler exists to prevent. Call count asserted at 1
+        proves the decision does not depend on a second, unreliable read.
+        """
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_term_svc.dispatch_input.side_effect = TerminalInputBlockedError(
+            "Terminal t1 is waiting for a user answer.",
+            reason=TerminalInputBlockedReason.WAITING_USER_ANSWER,
+        )
+
+        svc = InboxService()
+        svc.deliver_pending("t1")
+
+        assert mock_monitor.get_status.call_count == 1
+        mock_update.assert_called_with(1, MessageStatus.PENDING)
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_dispatch_input_blocked_provider_error_refusal_still_fails(
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
+    ):
+        """dispatch_input's dead-provider guard refuses mid-send -> FAILED (terminal,
+        no sweep can ever deliver it), decided from the exception's reason."""
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_term_svc.dispatch_input.side_effect = TerminalInputBlockedError(
+            "Terminal t1 provider is in ERROR state.",
+            reason=TerminalInputBlockedReason.PROVIDER_ERROR,
+        )
+
+        svc = InboxService()
+        svc.deliver_pending("t1")
+
+        mock_update.assert_called_with(1, MessageStatus.FAILED)
 
 
 class TestPollOpenCodePendingMessages:
@@ -1871,3 +2008,184 @@ class TestInboxRecoveryCoverageByProvider:
     def test_the_issue_78_reporters_have_a_composer_reader(self):
         assert "claude_code" not in self.NO_RECOVERY
         assert "kiro_cli" not in self.NO_RECOVERY
+
+
+class TestDialogGuardCoversSubmitRecovery:
+    """#896's dialog guard must hold on #1004's recovery path too.
+
+    The merge of #1004 into this branch put a second machine-originated submit
+    into the delivery path: ``redeliver_dropped_message_with_boundary``'s bare
+    Enter, which submits whatever is already in the composer and therefore never
+    reaches ``dispatch_input`` -- where #896's guard lives. An Enter into an open
+    choice widget is worse than a paste: it submits the highlighted option, so an
+    inbox message's recovery would answer a question reserved for a human, with
+    no text involved at all.
+
+    These tests drive both features on one delivery: #1004's swallowed-Enter
+    recovery against a receiver that #896 says must not be written to.
+    """
+
+    MESSAGE = "MSG1: refactor module A so the retry policy lives in one place"
+
+    #: The providers where the two features can meet at all: they block
+    #: orchestrated input while waiting on a user answer (so #896 applies) AND
+    #: they can read their own composer (so #1004's bare-Enter branch is
+    #: reachable). Pinned because the guard below only matters for this set, and
+    #: a provider joining it should come with that fact in view.
+    OVERLAP = {"claude_code", "codex"}
+
+    def test_overlap_set_is_still_these_two_providers(self):
+        """Enumerated, not assumed: which providers both features apply to."""
+        from cli_agent_orchestrator.providers.base import BaseProvider
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+
+        overlap = set()
+        for provider_type in ProviderType:
+            cls = ProviderManager.provider_class(provider_type.value)
+            provider = TestInboxRecoveryNeverDuplicates._make_provider(cls)
+            reads_composer = (
+                cls.extract_current_composer is not BaseProvider.extract_current_composer
+            )
+            if provider.blocks_orchestrated_input_while_waiting_user_answer and reads_composer:
+                overlap.add(provider_type.value)
+        assert overlap == self.OVERLAP, (
+            "The set of providers that both block dialogs and read their composer "
+            "changed. A provider joining it becomes subject to the bare-Enter dialog "
+            "guard below; confirm that is what you want, then update OVERLAP."
+        )
+
+    @pytest.mark.parametrize("provider_type", sorted(OVERLAP))
+    def test_real_dialog_captures_hide_the_composer(self, provider_type):
+        """Why this is latent rather than live today.
+
+        On every real dialog capture in test/providers/fixtures the prompt
+        replaces the composer box, so ``extract_current_composer`` returns None
+        and the inbox path (``full_resend_requires_composer_evidence=True``)
+        sends nothing at all. That is what keeps the unguarded bare Enter out of
+        reach -- a property of these two extractors, not an invariant, which is
+        exactly why the guard is checked explicitly rather than inherited.
+        """
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+
+        provider = TestInboxRecoveryNeverDuplicates._make_provider(
+            ProviderManager.provider_class(provider_type)
+        )
+        fixtures = sorted(TestInboxRecoveryNeverDuplicates.FIXTURES.glob(f"{provider_type}*"))
+        dialogs = [
+            path
+            for path in fixtures
+            if provider.get_status(path.read_text()) == TerminalStatus.WAITING_USER_ANSWER
+        ]
+        if not dialogs:
+            pytest.skip(f"no WAITING_USER_ANSWER capture for {provider_type}")
+        for path in dialogs:
+            assert provider.extract_current_composer(path.read_text()) is None, (
+                f"{path.name} now exposes a composer while a dialog is open; the "
+                "bare-Enter guard in redeliver_dropped_message_with_boundary is what "
+                "keeps that from answering the dialog"
+            )
+
+    def _deliver_with_dialog_open(self, blocks_dialog, composer_text):
+        """One inbox delivery whose Enter was swallowed, with a dialog now open.
+
+        The receiver reads IDLE when the paste is dispatched (so #896's guard in
+        ``dispatch_input`` lets the delivery through) and WAITING_USER_ANSWER
+        afterwards, with a composer that still shows the message -- the
+        forward-looking shape the real extractors do not produce today. That is
+        #1004's bare-Enter case landing on #896's forbidden state.
+        """
+        from cli_agent_orchestrator.services import terminal_service as ts
+        from cli_agent_orchestrator.services.status_monitor import StatusObservation
+
+        statuses = [TerminalStatus.IDLE]
+        enters: list[str] = []
+        pastes: list[str] = []
+
+        provider = MagicMock()
+        provider.blocks_orchestrated_input_while_waiting_user_answer = blocks_dialog
+        provider.supports_direct_status_probe = False
+        provider.execution_evidence_ambiguous = False
+        provider.paste_enter_count = 1
+        provider.extract_current_composer.return_value = composer_text
+
+        sm = MagicMock()
+        sm.get_status.side_effect = lambda _tid: statuses[-1]
+        sm.output_generation.return_value = 7
+        # Never post-boundary: the delivery is never confirmed, so the recovery
+        # always runs. The dialog opens as soon as the paste lands.
+        sm.status_observation.side_effect = lambda _tid: StatusObservation(statuses[-1], 7)
+
+        def fake_send_keys(*_a, **_k):
+            pastes.append("paste")
+            # The dialog is up from the moment the paste lands: the Enter was
+            # swallowed, so nothing of ours was submitted.
+            statuses.append(TerminalStatus.WAITING_USER_ANSWER)
+
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = False
+        backend.send_keys.side_effect = fake_send_keys
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.INBOX_SUBMIT_CONFIRM_TIMEOUT", 0.0
+            ),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+                return_value=[_make_message(message=self.MESSAGE)],
+            ),
+            patch("cli_agent_orchestrator.services.inbox_service.update_message_status"),
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor", sm),
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.get_backend",
+                return_value=backend,
+            ),
+            patch.object(ts, "get_backend", return_value=backend),
+            patch.object(ts, "status_monitor", sm),
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={
+                    "tmux_session": "s",
+                    "tmux_window": "w",
+                    "provider": "claude_code",
+                },
+            ),
+            patch.object(ts.provider_manager, "get_provider", return_value=provider),
+            patch.object(ts, "inject_memory_context", side_effect=lambda m, *a: m),
+            patch.object(ts, "update_last_active"),
+            patch.object(ts, "send_special_key", side_effect=lambda _tid, key: enters.append(key)),
+            patch.object(ts, "_capture_current_composer_region", return_value=composer_text),
+        ):
+            InboxService().deliver_pending("term-1")
+        return pastes, enters
+
+    def test_bare_enter_recovery_never_answers_an_open_dialog(self):
+        """The guard: dialog-blocking provider + open dialog -> no Enter at all.
+
+        Without the check in ``redeliver_dropped_message_with_boundary`` the
+        recovery reads the message in the composer, sends a bare Enter, and that
+        Enter submits whichever option the dialog has highlighted -- #896's harm,
+        reached through #1004's recovery instead of through the original paste.
+        """
+        pastes, enters = self._deliver_with_dialog_open(
+            blocks_dialog=True, composer_text=self.MESSAGE
+        )
+
+        assert pastes == ["paste"], "the original delivery still goes out while IDLE"
+        assert enters == [], "no Enter may be sent into an open dialog"
+
+    def test_bare_enter_recovery_still_runs_for_a_non_blocking_provider(self):
+        """The guard is the provider's capability, not a ban on the state.
+
+        A provider that does not declare
+        ``blocks_orchestrated_input_while_waiting_user_answer`` keeps #1004's
+        recovery in WAITING_USER_ANSWER: its TUI has a live input box beside the
+        prompt, so the Enter submits the message rather than the dialog. Pins
+        that the fix did not disable the recovery wholesale.
+        """
+        pastes, enters = self._deliver_with_dialog_open(
+            blocks_dialog=False, composer_text=self.MESSAGE
+        )
+
+        assert pastes == ["paste"]
+        assert enters, "a non-blocking provider must still get its swallowed Enter re-sent"

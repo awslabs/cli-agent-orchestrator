@@ -5,10 +5,19 @@ import threading
 import time
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+
+from cli_agent_orchestrator.constants import ADVERTISED_URL_ENV
 from cli_agent_orchestrator.mcp_server import server
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.utils import orchestration
+
+# Remote placement probes the target's /health for ``delegation_ceiling`` and
+# reads this terminal's own recorded ceiling before posting (fail closed on an
+# older node). The shared fixture answers both so these tests stay about elastic
+# provisioning; the probe itself is covered in test_delegation_remote.py.
+pytestmark = pytest.mark.usefixtures("remote_ceiling_ready")
 
 
 def test_assign_elastic_provisions_then_assigns(monkeypatch):
@@ -74,7 +83,7 @@ def test_assign_elastic_deferred_failure_reports_terminal_ended(monkeypatch):
     """Exercise the real elastic placement and deferred-session failure path."""
     monkeypatch.setenv("CAO_ELASTIC_BROKER_URL", "http://broker:9890")
     monkeypatch.setenv("CAO_ELASTIC_BROKER_TOKEN", "broker-token")
-    monkeypatch.setenv(server.ADVERTISED_URL_ENV, "http://cao-supervisor:9889")
+    monkeypatch.setenv(ADVERTISED_URL_ENV, "http://cao-supervisor:9889")
     monkeypatch.setenv("CAO_ELASTIC_CALLBACK_URL", "http://broker:9890")
 
     lease = Mock(status_code=200)
@@ -385,7 +394,7 @@ def test_assign_remote_does_not_wait_by_default(monkeypatch):
     A target_host naming a static pod is either up or genuinely broken, so a
     caller that did not just create it should still fail in seconds.
     """
-    monkeypatch.setenv(server.ADVERTISED_URL_ENV, "http://cao-supervisor:9889")
+    monkeypatch.setenv(ADVERTISED_URL_ENV, "http://cao-supervisor:9889")
     with (
         patch.object(server.requests, "post", return_value=_remote_session_response()),
         patch.object(orchestration, "_wait_remote_ready") as wait,
@@ -407,7 +416,7 @@ def test_assign_remote_does_not_wait_by_default(monkeypatch):
 
 def test_assign_remote_waits_before_it_posts_the_task(monkeypatch):
     """Order matters: POST /sessions is not idempotent, so it gets one shot."""
-    monkeypatch.setenv(server.ADVERTISED_URL_ENV, "http://cao-supervisor:9889")
+    monkeypatch.setenv(ADVERTISED_URL_ENV, "http://cao-supervisor:9889")
     calls = []
     with (
         patch.object(

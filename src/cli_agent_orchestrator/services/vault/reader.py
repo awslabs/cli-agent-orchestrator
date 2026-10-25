@@ -21,6 +21,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.models.memory import Memory
 from cli_agent_orchestrator.services.memory_format import normalize_memory_tags
+from cli_agent_orchestrator.services.secret_gate import fingerprint_secrets
 from cli_agent_orchestrator.services.vault.binding import VaultBinding
 from cli_agent_orchestrator.services.vault.boundary import (
     is_excluded_relpath,
@@ -28,7 +29,12 @@ from cli_agent_orchestrator.services.vault.boundary import (
     relpath_within_folder,
 )
 from cli_agent_orchestrator.services.vault.config import MAX_FRONTMATTER_BYTES_LIMIT
-from cli_agent_orchestrator.services.vault.parser import split_frontmatter
+from cli_agent_orchestrator.services.vault.parser import (
+    parse_note,
+    secret_acceptances,
+    secret_scan_text,
+    split_frontmatter,
+)
 
 _TRUNCATION_MARKER = "\n\n[Content truncated for recall]"
 _MAX_UTF8_BYTES_PER_CHAR = 4
@@ -308,6 +314,16 @@ def load_candidate(
     built memory rather than a path so callers cannot accidentally bypass its
     confinement check. Stale notes are served with ``index_freshness="stale"``
     in ordinary recall; release one has no watcher or implicit reconcile.
+
+    It is also the secret-redaction chokepoint (#644 AC10). Every byte of a
+    vault note that reaches an agent, by automatic injection, explicit recall,
+    related-key expansion or BM25 ranking, leaves through this function, so
+    credential-shaped spans are replaced here with ``[REDACTED:<pattern>]`` via
+    :func:`_redact_for_model`, once, rather than at each consumer. A span passes
+    raw only when the mapping is ``secret_gate: "warn"`` and the note's own
+    frontmatter carries ``cao.secret_ok: [{pattern, sha256}]`` for that exact
+    match. Under ``reject`` a secret-bearing note is quarantined at reconcile;
+    one that drifted after reconcile is redacted here regardless of acceptances.
     """
     binding = candidate.binding
     if not binding.index or (require_injectable and not binding.inject):
@@ -374,7 +390,12 @@ def load_candidate(
         region = split_frontmatter(text, MAX_FRONTMATTER_BYTES_LIMIT)
     except ValueError:
         return None
-    body = _strip_leading_h1(region.body)
+    # Redact the text the scanner fingerprinted, THEN present it. A pattern may
+    # match across a line break, so stripping the H1 first left the reader
+    # looking at a different text than the scan hashed and a match that began on
+    # the heading line reached the agent raw (#644 AC10).
+    body, redacted_patterns = _redact_for_model(candidate, text, secret_scan_text(region))
+    body = _strip_leading_h1(body)
     truncated = byte_truncated or len(body) > max_body_chars
     if truncated:
         body = body[: max(0, max_body_chars - len(_TRUNCATION_MARKER))] + _TRUNCATION_MARKER
@@ -410,7 +431,66 @@ def load_candidate(
         index_freshness=freshness,
         content_truncated=truncated,
         token_estimate=len(body) // 4,
+        redacted_patterns=list(redacted_patterns),
     )
+
+
+def _redact_for_model(
+    candidate: VaultCandidate, text: str, body: str
+) -> tuple[str, tuple[str, ...]]:
+    """Redact credential-shaped spans before note text leaves the read boundary.
+
+    ``body`` must be :func:`secret_scan_text` of the note's region, the same
+    bytes the scan classified and ``vault scan --fingerprints`` hashed, because
+    ``bearer_token`` and ``secret_assignment`` match across a line break: a
+    heading ending in a key word and a value on the next line are one match, and
+    a caller that trimmed the heading first would hand this function a text no
+    pattern matches. Presentation transforms belong on the result, so
+    :func:`_strip_leading_h1` runs on what this returns.
+
+    One intended side effect of that order: when a match begins on the leading
+    H1 line, the marker stands where the line break was, so the rest of the
+    value's line is now part of the H1 line and the strip removes both. The
+    agent is served less than the note holds rather than the credential, which
+    is the direction to fail in; accepting the printed fingerprint puts the line
+    break back and only the heading line goes.
+
+    Returns the redacted body and the deduplicated, pattern-order names of the
+    patterns whose spans did not reach the output raw. The cascade is run once
+    with no allowlist, so the fingerprints it checks are the ones
+    ``vault scan --fingerprints`` printed; acceptances are then applied to that
+    recorded result. They are read from the note's current frontmatter, never
+    from the index, so an acceptance is honoured only while it is still written
+    in the note, and only on a ``warn`` mapping. A span passes raw only when its
+    own pair and every enclosing match's pair are accepted. The frontmatter is
+    parsed only when the body has a match, so a clean note costs one cascade.
+    Counters are content-free and count spans actually served raw.
+    """
+    cascade = fingerprint_secrets(body)
+    if not cascade:
+        return body, ()
+    accepted: tuple[tuple[str, str], ...] = ()
+    if candidate.binding.mapping.secret_gate == "warn":
+        parsed = parse_note(
+            text,
+            max_frontmatter_bytes=MAX_FRONTMATTER_BYTES_LIMIT,
+            secret_gate=candidate.binding.mapping.secret_gate,
+        )
+        accepted = secret_acceptances(parsed.cao) if parsed.finding_code is None else ()
+    redacted, matches = cascade.render(accepted)
+    redacted_names = tuple(dict.fromkeys(m.pattern for m in matches if not m.passed))
+    passed = sum(1 for m in matches if m.passed)
+    vault_id = candidate.binding.vault_id
+    if redacted_names:
+        increment_counter(vault_id, "secret_redaction.memories_redacted", 1)
+        increment_counter(
+            vault_id,
+            "secret_redaction.pattern_matches",
+            sum(1 for m in matches if not m.passed),
+        )
+    if passed:
+        increment_counter(vault_id, "secret_acceptance.spans_passed", passed)
+    return redacted, redacted_names
 
 
 def increment_counter(vault_id: str, counter_name: str, amount: int) -> None:
@@ -434,8 +514,16 @@ def increment_counter(vault_id: str, counter_name: str, amount: int) -> None:
 
 
 def _strip_leading_h1(body: str) -> str:
-    """Remove one ordinary Markdown H1 without imposing native wiki syntax."""
-    lines = body.lstrip("\n").splitlines()
+    """Remove one ordinary Markdown H1 without imposing native wiki syntax.
+
+    Presentation only, and it runs on the redacted text, never before it. Lines
+    are split on LF alone: ``splitlines()`` also breaks on U+2028/9, the
+    vertical tab, the form feed and NEL, and rejoining turned each of those into
+    an LF, rewriting body bytes the scanner had fingerprinted. The patterns
+    match across those characters, so the one transform this function is for is
+    dropping a leading heading line, not normalising separators.
+    """
+    lines = body.lstrip("\n").split("\n")
     if lines and lines[0].startswith("# ") and not lines[0].startswith("## "):
         return "\n".join(lines[1:]).lstrip("\n")
     return body

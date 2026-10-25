@@ -392,6 +392,7 @@ dev = [
     # Tests import httpx directly; fastmcp 4 / mcp 2 use httpx2 and no longer
     # pull httpx in transitively.
     "httpx>=0.28.1",
+    "ruff>=0.17.1",
 ]
 
 [tool.black]
@@ -401,6 +402,84 @@ target-version = ['py310']
 [tool.isort]
 profile = "black"
 line_length = 100
+
+# ---------------------------------------------------------------------------------------
+# ruff — the dead-code gate black, isort and mypy all miss (#1005).
+#
+# WHY: issue #752's root cause was a computed status value that nothing ever read. black
+# and isort only reformat, and mypy does not report unread locals under any setting. So
+# an assignment whose result is dropped had NO gate in this repo at all.
+#
+# SELECTION IS DELIBERATELY NARROW. Measured on this tree at ruff 0.17.1 over
+# src/ test/ examples/:
+#
+#     F401 unused import        165      selected  (165 of them autofixable)
+#     F841 unused local          27      selected  (the #752 class exactly)
+#     F821 undefined name         0      selected  (same-file half of F401's inverse -- see below)
+#     F822 undefined in __all__   0      selected  (reaches 13 of the 26 src/ __all__ lists)
+#     F811 redefinition         104      NOT selected -- see below, and see #1005
+#     ARG  unused argument     3718      NOT selected
+#     B    flake8-bugbear        609      NOT selected (B904 346, B008 204, B905 23 ...)
+#
+# ARG and B are follow-ups, not noise to be waved through: 3718 and 609 findings cannot be
+# triaged honestly in the change that introduces the gate, and a gate that lands with
+# thousands of blanket noqa comments is worse than no gate. Enabling either is its own PR
+# with its own triage, and B904/B008 in particular are worth it.
+#
+# F811 IS NOT MERELY NOISY -- IT IS THE MOST VALUABLE RULE HERE AND IT IS STILL OFF.
+# 104 findings in 15 files. The large majority are a known ruff/pytest interaction: a
+# module does `from conftest import setup_engine` and then writes
+# `def test_x(setup_engine)`, and ruff reads the fixture PARAMETER as a redefinition of
+# the import. Those are false positives.
+#
+# But six are real, and each one is a test that silently never runs, because Python keeps
+# only the second definition and pytest collects only what Python kept:
+#
+#   test/utils/test_opencode_config.py:27 vs :56   class TestToOpencodeAgentId
+#       -- the shadowed copy is the GHSA-6m35-gcf5-xm75 path-traversal regression
+#          (5 parametrized hostile names). VERIFIED not collected before #1005.
+#   test/providers/test_kiro_cli_unit.py:758/772/792/808 shadowed by :830/844/864/880
+#   test/services/agui/test_edit_sanitization.py:47 shadowed by :67
+#
+# Turning F811 on means (a) suppressing the fixture-parameter pattern in those 15 files
+# via per-file-ignores and (b) un-shadowing six tests that have never executed and may
+# well fail. Both belong in a change that can take the failures seriously rather than
+# riding along with a tooling PR. Tracked on #1005.
+# ---------------------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# F821 (undefined name) and F822 (undefined name in __all__) are the inverse of F401.
+# F401's autofix REMOVES an import; these two report a use of the removed name IN THE SAME
+# FILE, including quoted and `from __future__ import annotations` annotations, and -- with
+# the one exception below -- in the file's own `__all__`.
+#
+# F822'S EXCEPTION: stable ruff does not apply it to `__init__.py` files. `ruff rule F822`
+# says "In preview, this rule will flag undefined names in `__init__.py` file", and preview
+# is off here (turning it on would change F401, F841 and the rest of the selection too,
+# which is not a ride-along). 13 of the 26 `__all__` lists under src/ are in an
+# `__init__.py` -- telemetry/, backends/, services/agui/ and 10 others -- so for those,
+# ruff says nothing and a stale entry surfaces only as AttributeError at the first
+# `from pkg import *`. test/test_package_imports.py closes that half: its import walk also
+# resolves every name in every module's own `__all__`, all 26 lists, one hasattr per name
+# on a module it has already imported (haofeif, #1006 review at a4db1db7, P3-1).
+#
+# Without F821/F822 the gate is one-sided: haofeif's review of #1006 found
+# that merging main re-introduced a use of `Optional` in utils/agent_profiles.py after this
+# PR had deleted the import, the module raised NameError at import, 132 test modules failed
+# collection, and `ruff check` was green. F821 reports that break at the exact line, in the
+# same step. Both rules have 0 findings on this tree.
+#
+# SCOPE, so a green step is not read as more than it is: ruff checks one file at a time.
+# A use of a removed name from ANOTHER module (`from a import X`, `a.X`, a `mock.patch`
+# target string) is invisible to F821/F822. test/test_package_imports.py covers the
+# module-level `from a import X` shape by importing every .py file under src/ in a fresh
+# interpreter, and the `__all__` shape that F822 cannot see in an `__init__.py`;
+# function-scope imports, attribute access and patch strings are caught only
+# by the unit tests that execute them. That test also pins F821 and F822 as selected.
+select = ["F401", "F821", "F822", "F841"]
 
 [tool.mypy]
 python_version = "3.10"
@@ -421,7 +500,21 @@ testpaths = ["test"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
-addopts = "--cov=src --cov-branch --cov-report=term-missing -m 'not e2e and not integration'"
+# Aligned with the marker expression CI actually runs (`-m "not e2e"` in
+# ci.yml's unit-test step), NOT a stricter local default. Before #1005 this read
+# `-m 'not e2e and not integration'`; because a command-line `-m` overrides the
+# one in addopts, integration-marked tests ran ONLY in CI and were deselected
+# everywhere an author or a reviewer looks. The new expression's marker matches
+# CI's; the old one additionally deselected every integration-marked test, all
+# of which used to run only in CI. (Collection counts aren't pinned here --
+# they drift with every test added.)
+#
+# The integration tests that need a real external CLI carry their own
+# `pytest.mark.skipif` on an env gate as well as the marker (the module-level
+# `pytestmark` block in test/providers/test_kiro_cli_integration.py), so
+# selecting them locally collects-and-skips rather than trying to drive an
+# unauthenticated binary.
+addopts = "--cov=src --cov-branch --cov-report=term-missing -m 'not e2e'"
 
 # `--cov-branch` is COLLECTION ONLY, never a gate here (issue #1005). It makes
 # partially-taken branches visible in `term-missing` as `123->exit` / `123->130`,
@@ -439,11 +532,12 @@ addopts = "--cov=src --cov-branch --cov-report=term-missing -m 'not e2e and not 
 # reports roughly 24% coverage of the whole package. A `fail_under = 80` here
 # would therefore fail ordinary focused test runs.
 #
-# The default marker expression above also excludes integration tests, while
-# the coverage figure is measured over CI's explicitly selected `-m "not e2e"`
-# suite across `test/` and `examples/workflow/tests/`. The two invocations do
-# not measure the same test population, so a pyproject floor would enforce the
-# CI threshold against a different suite even on a full default local run.
+# The default marker expression above now matches CI's `-m "not e2e"`, but the
+# coverage figure is still measured over CI's `testpaths` -- `test/` AND
+# `examples/workflow/tests/` -- while a local default run only collects
+# `test/` (see `testpaths` above). The two invocations do not measure the
+# same test population, so a pyproject floor would enforce the CI threshold
+# against a different suite even on a full default local run.
 #
 # The blended floor is enforced instead by `--cov-fail-under=80` on that
 # explicit CI invocation in `.github/workflows/ci.yml`; the line-only floor is

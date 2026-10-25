@@ -6,12 +6,9 @@ disposition, cap eviction boundary, delta never stored, seen_set_dedup.
 
 from __future__ import annotations
 
-import pytest
-
 from cli_agent_orchestrator.services.agui.base import RecordingUiEmitter
 from cli_agent_orchestrator.services.agui.session_timeline import (
     MultiAgentSessionTimeline,
-    TimelineEntry,
 )
 from cli_agent_orchestrator.services.agui_stream import (
     AGUI_TEXT_MESSAGE_CONTENT,

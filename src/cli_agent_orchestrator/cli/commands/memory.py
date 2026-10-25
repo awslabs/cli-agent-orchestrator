@@ -213,6 +213,7 @@ def vault_status(out_format):
             "finding_counts",
             "recall_counters",
             "migration_receipts",
+            "secret_acceptances",
         ):
             counts = payload[name]
             click.echo(f"{name}: " + (", ".join(f"{key}={value}" for key, value in counts) or "-"))
@@ -244,20 +245,53 @@ def vault_status(out_format):
 
 @vault.command(name="scan")
 @click.option(
+    "--fingerprints",
+    is_flag=True,
+    default=False,
+    help=(
+        "Print pattern name and SHA-256 of every credential-shaped span in each "
+        "scanned note, the values a cao.secret_ok acceptance needs. Terminal only; "
+        "nothing is persisted."
+    ),
+)
+@click.option(
     "--dry-run",
     is_flag=True,
     default=False,
     help="Accepted for explicit review workflows; scan is always read-only.",
 )
-def vault_scan(dry_run):
+def vault_scan(fingerprints, dry_run):
     """Scan vault notes (read-only).
 
     Scans the configured vault notes without changing files or derived rows.
+    With --fingerprints, each credential-shaped span is listed as its pattern
+    name and SHA-256, the two values a per-finding cao.secret_ok acceptance in
+    that note's frontmatter needs. A span marked inside=<pattern> sits within
+    another match, as the value does in NAME_TOKEN=value; both fingerprints
+    must be accepted for it to be served raw. Fingerprints are shown only here,
+    never stored.
     """
+    from cli_agent_orchestrator.services.secret_gate import redact_secrets_with_acceptances
+    from cli_agent_orchestrator.services.vault.parser import secret_scan_text
     from cli_agent_orchestrator.services.vault.scan import scan_vault
 
     _config, configured_vault = _configured_vault()
     report = scan_vault(configured_vault)
+    if fingerprints:
+        for note in report.notes:
+            if note.parsed is None:
+                continue
+            _text, matches = redact_secrets_with_acceptances(
+                secret_scan_text(note.parsed.region), ()
+            )
+            for match in matches:
+                # A span inside another match (the value inside NAME_TOKEN=value)
+                # passes raw only when both fingerprints are accepted.
+                inside = f" inside={match.enclosed_by}" if match.enclosed_by else ""
+                click.echo(
+                    f"fingerprint: {note.vault_relpath} pattern={match.pattern} "
+                    f"sha256={match.sha256}{inside}"
+                )
     click.echo(
         f"Scanned {len(report.notes)} note(s); {report.total_bytes_scanned} bytes "
         f"(limit {report.max_total_bytes})."
