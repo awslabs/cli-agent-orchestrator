@@ -369,7 +369,9 @@ class TestCreateSession:
             resume_session_id=None,
             group=None,
             metadata=None,
-            create_working_directory=True,
+            # Off unless the request asks (#724, contract ruled on PR #1036).
+            # This request does not, so it gets the must-exist behavior.
+            create_working_directory=False,
             caller_ceiling=None,
         )
 
