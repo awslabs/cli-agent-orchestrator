@@ -9,5 +9,8 @@
   },
   "dependencies": {
     "@ag-ui/client": "0.0.57"
+  },
+  "overrides": {
+    "zod": "^4.6.6"
   }
 }
