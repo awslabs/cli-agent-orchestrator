@@ -337,6 +337,24 @@ class TestSessionLabelEndpoint:
         at_cap = "y" * settings_service.SESSION_LABEL_MAX_LENGTH
         assert client.post("/sessions/cao-demo/label", json={"label": at_cap}).status_code == 200
 
+    def test_the_cap_is_measured_after_the_surrounding_spaces_come_off(
+        self, client, settings_file, backend
+    ):
+        """haofeif, PR #1036 review, label-length note: the cap used to be
+        checked on the raw body, so a label that FITS once trimmed -- which is
+        exactly what gets stored -- was a 422. An operator pasting a name with
+        trailing spaces saw "too long" for a 58-character label."""
+        padded = "  " + "z" * (settings_service.SESSION_LABEL_MAX_LENGTH - 2) + "  "
+        assert len(padded) > settings_service.SESSION_LABEL_MAX_LENGTH
+        resp = client.post("/sessions/cao-demo/label", json={"label": padded})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["label"] == padded.strip()
+        assert settings_service.get_session_labels() == {"cao-demo": padded.strip()}
+        # Still a 422 when the stripped value itself is over the cap: the
+        # trimming makes the cap honest, it does not widen it.
+        over = "  " + "z" * (settings_service.SESSION_LABEL_MAX_LENGTH + 1) + "  "
+        assert client.post("/sessions/cao-demo/label", json={"label": over}).status_code == 422
+
     def test_control_characters_are_a_400_and_store_nothing(self, client, settings_file, backend):
         """``"ok\\x1b[2J\\nrm -rf /"`` was stored and echoed verbatim: an
         ANSI-escape injection into any CLI listing that prints labels."""

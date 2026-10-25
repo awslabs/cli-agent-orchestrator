@@ -4186,6 +4186,14 @@ async def list_sessions(
 
 
 class SessionLabelUpdate(BaseModel):
+    # Strip BEFORE the cap is applied (haofeif, PR #1036 review, label-length
+    # note): pydantic's str core schema strips first and length-checks the
+    # stripped value, so a 58-character label pasted with a trailing newline's
+    # worth of spaces is accepted and stored, instead of a 422 for a value that
+    # fits. ``set_session_label`` strips too -- it is the guard for non-HTTP
+    # callers -- and the two now agree on what counts as 60 characters.
+    model_config = ConfigDict(str_strip_whitespace=True)
+
     # One cap, shared with the service: a longer label is a 422 here rather
     # than a silent truncation to 60 on the way to disk (#724 review, twice).
     label: str = Field(..., max_length=SESSION_LABEL_MAX_LENGTH)
