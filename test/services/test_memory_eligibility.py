@@ -1,14 +1,6 @@
 """Lifecycle eligibility across native, vault, related and curator paths."""
 
 from datetime import datetime, timedelta, timezone
-
-from test.services.test_scoring import (  # isort: skip  (per-name noqa below; see the comment)
-    _ctx,
-    _run,
-    _stamp_updated_at,
-    db_engine,  # noqa: F401  # pytest fixture, injected by name
-    svc,  # noqa: F401  # pytest fixture, injected by name
-)
 from test.services.vault.test_vault_injection_renderer import _counter_values, _injectable_renderer
 
 import pytest
@@ -17,6 +9,14 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.clients.database import MemoryMetadataModel
 from cli_agent_orchestrator.services import memory_relationship_service
+
+from test.services.test_scoring import (  # isort: skip  (per-name noqa below; see the comment)
+    _ctx,
+    _run,
+    _stamp_updated_at,
+    db_engine,  # noqa: F401  # pytest fixture, injected by name
+    svc,  # noqa: F401  # pytest fixture, injected by name
+)
 
 
 class FixtureSource:

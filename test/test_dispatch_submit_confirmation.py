@@ -72,6 +72,11 @@ ALLOWED_UNCONFIRMED: Dict[Tuple[str, str], str] = {
         "shape). Confirming inline would block the API worker, so the fix is the "
         "inbox path's shape: answer after the paste, confirm in the background."
     ),
+    ("runtime_channel/bridge.py", "execute"): (
+        "The remote half of POST /terminals/{id}/input (#745): cao-bridge runs "
+        "send_input beside a remote pane for that route, so it shares that "
+        "route's KNOWN GAP above, and its fix, rather than adding a second one."
+    ),
     ("services/agui/handoff_approval.py", "send_input"): (
         "KNOWN GAP, tracked separately: the AnswerDelivery adapter sends the "
         "approval answer fire-and-forget. If the Enter is swallowed the interrupt is "
