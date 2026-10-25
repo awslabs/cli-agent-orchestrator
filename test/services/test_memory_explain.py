@@ -2,18 +2,18 @@
 
 import json
 
+import pytest
+from sqlalchemy.orm import sessionmaker
+
+from cli_agent_orchestrator.clients.database import MemoryMetadataModel
+from cli_agent_orchestrator.services import settings_service
+
 from test.services.test_scoring import (  # isort: skip  (per-name noqa below; see the comment)
     _run,
     db_engine,  # noqa: F401  # pytest fixture, injected by name
     hybrid_starvation_corpus,  # noqa: F401  # pytest fixture, injected by name
     svc,  # noqa: F401  # pytest fixture, injected by name
 )
-
-import pytest
-from sqlalchemy.orm import sessionmaker
-
-from cli_agent_orchestrator.clients.database import MemoryMetadataModel
-from cli_agent_orchestrator.services import settings_service
 
 
 @pytest.fixture

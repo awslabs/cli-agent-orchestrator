@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import pytest
 
+from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
     read_output_range,
@@ -34,6 +35,16 @@ def log_dir(monkeypatch, tmp_path):
         d,
     )
     return d
+
+
+@pytest.fixture(autouse=True)
+def local_terminal(monkeypatch):
+    """These terminals run on this server; a remote one is refused (#745)."""
+    monkeypatch.setattr(
+        terminal_service,
+        "get_terminal_metadata",
+        lambda terminal_id: {"id": terminal_id, "runtime_id": None},
+    )
 
 
 def _write_log(log_dir, terminal_id: str, data: bytes) -> None:

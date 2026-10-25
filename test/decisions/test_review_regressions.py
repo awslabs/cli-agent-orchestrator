@@ -6,14 +6,14 @@ from test.decisions.test_engine import (  # noqa: F401  # pytest fixture, inject
 from test.decisions.test_launch_binding import (  # noqa: F401  # pytest fixture, injected by name into the tests below
     terminal_path,
 )
+from unittest.mock import Mock
+
+import pytest
 
 from test.decisions.test_wiring import (  # isort: skip  (per-name noqa below; see the comment)
     handler_path,  # noqa: F401  # pytest fixture, injected by name
     post_delegation,
 )
-from unittest.mock import Mock
-
-import pytest
 
 
 def test_request_descriptions_match_original_openapi():

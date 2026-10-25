@@ -34,6 +34,7 @@ to use.
 | `src/cli_agent_orchestrator/decisions/` | Launch-decision platform: points, policy, settings, deciders, records, shadow runner, telemetry, and operator access ([docs](docs/decisions.md)) |
 | `src/cli_agent_orchestrator/backends/` | Terminal-backend abstraction and tmux/herdr implementations |
 | `src/cli_agent_orchestrator/clients/` | SQLite and tmux clients used by services and backends |
+| `src/cli_agent_orchestrator/runtime_channel/` | Execution-runtime channel: the server's `/runtime/channel` endpoint and runtime registry, and the `cao-bridge` process ([execution runtimes](docs/execution-runtimes.md)) |
 | `src/cli_agent_orchestrator/providers/` | Provider adapters for interactive agent CLIs |
 | `src/cli_agent_orchestrator/models/` | Pydantic domain and API models |
 | `src/cli_agent_orchestrator/schemas/` | Shipped schemas, including agent-profile validation |

@@ -108,6 +108,9 @@ _UNSCOPED_DOCS = [
     # PR #1000 (#827): "What an approval does not cover" names agent-plugin MCP
     # delivery as a launch input outside plan_id. CAO's own noun, qualified.
     "workflows.md",
+    # Gained an event-plugin note on #834 (#745): which hooks the server emits
+    # for a terminal in an execution runtime. CAO's own noun throughout.
+    "execution-runtimes.md",
 ]
 
 #: Docs whose H1 scopes the noun ("# Event Plugins", "# Agent Plugins"), so bare

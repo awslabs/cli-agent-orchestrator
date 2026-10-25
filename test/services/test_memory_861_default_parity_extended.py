@@ -9,14 +9,6 @@ import json
 import os
 import re
 from datetime import timedelta
-
-from test.services.test_memory_861_default_parity import (  # isort: skip  (per-name noqa below; see the comment)
-    CTX,
-    STAMP,
-    _guard_distinct_bm25_matches,
-    corpus,  # noqa: F401  # pytest fixture, injected by name
-    defaults,  # noqa: F401  # pytest fixture, injected by name
-)
 from test.services.test_scoring import _row, _stamp_updated_at
 from test.services.vault.test_vault_injection_renderer import _injectable_renderer
 
@@ -26,6 +18,14 @@ from fastapi.testclient import TestClient
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.clients.database import MemoryMetadataModel, MemoryRelationshipModel
 from cli_agent_orchestrator.services import memory_relationship_service
+
+from test.services.test_memory_861_default_parity import (  # isort: skip  (per-name noqa below; see the comment)
+    CTX,
+    STAMP,
+    _guard_distinct_bm25_matches,
+    corpus,  # noqa: F401  # pytest fixture, injected by name
+    defaults,  # noqa: F401  # pytest fixture, injected by name
+)
 
 
 @pytest.fixture

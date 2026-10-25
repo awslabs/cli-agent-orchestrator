@@ -197,6 +197,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kind without importing it. Ops MCP gains `decisions_off` and cannot grant
   consent. Core still bundles only `fixed_table` and makes no external call.
   See `docs/decisions.md` (#810)
+- execution runtimes, first slice: agents run in separate runtime processes or
+  pods behind one `cao-server` that runs none itself. A runtime runs the new
+  `cao-bridge` console script, which dials `WS /runtime/channel` with a shared
+  token (`CAO_RUNTIME_TOKEN_FILE` or `CAO_RUNTIME_TOKEN`). New routes:
+  `GET /runtimes` and `POST /runtimes/{runtime_id}/terminals`. The terminal
+  routes and `DELETE /sessions/{session_name}` pass a remote terminal's
+  operations to its runtime, answering `503`, `504` or `502` when the runtime
+  cannot. Terminal rows gain a nullable `runtime_id` column, added
+  idempotently. A runtime's hello lists the terminals it runs, and the server
+  drops the record of one it no longer runs (a replaced pod's, for instance).
+  Status events (`terminal.{id}.status`) report `unknown` for a runtime's
+  terminals when its channel goes, and for a record a hello drops or cannot
+  drop; an accepted hello publishes each status it restores. A remote
+  launch records the working directory its runtime resolved. A record
+  dropped before a newer connection of the same runtime id registers stays
+  dropped, and that connection's hello then deletes the terminal as
+  unrecorded: under a shared token a duplicate runtime id can tear down
+  another runtime's agents. A
+  `cao-bridge` that cannot remove its readiness file exits rather than stay
+  Ready while disconnected. Commands for a terminal name its session, so a
+  command that outlived its terminal never reaches a newer one reusing the id,
+  and a hello lists at most 1024 terminals. A launch that would take a
+  runtime past that many answers `429`, counting launches in flight. The
+  image installs `tini`, which the runtime pod runs as PID 1 to reap the
+  processes agents leave. `cao-bridge` logs at INFO to stderr, so
+  `kubectl logs` shows its connects and reconnects, and the warnings every
+  launch and delete used to log (a status for a terminal placed nowhere yet,
+  a row expected to be missing) are gone. `cao-bridge` reads again, every
+  3 s, the status of a terminal it last reported as processing, so a turn
+  that ends without the output the status monitor recognises (#558)
+  recovers on a runtime too, where nothing else polls it. The image checks the kiro-cli
+  archive's published sha256 before running its installer.
+  `CAO_LOCAL_EXECUTION=0` stops the server starting agents
+  itself, and `CAO_RUNTIME_LAUNCH_TIMEOUT` bounds a launch. An EKS example is
+  in `examples/cao-clusters/kubernetes/remote-runtime/`. See
+  [Execution runtimes](docs/execution-runtimes.md) for the limits of this
+  slice (#745)
 - pane-mode windows caption each pane with the terminal running in it.
   `pane_window` gets `pane-border-status` and a border format reading the
   `@cao_terminal` mark, so the caption survives an agent whose TUI sets its own
@@ -387,6 +424,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   send timeout, a 4xx fails at once, and a timeout after failed polls names the
   last error. Broker errors from `FleetClient` now keep their HTTP status, so a
   worker's 404 still fails at once.
+- The EKS example image (`examples/cao-clusters/kubernetes/eks/Dockerfile`)
+  ships a Wolfi runtime base (`cgr.dev/chainguard/wolfi-base`, pinned by
+  digest) instead of `python:3.12-slim`, which now only builds CAO's wheel in
+  a stage that does not ship. Amazon Inspector reported two critical and five high
+  findings on the Debian 13 image (curl, expat, zlib, gnupg2), none with a
+  fixed build in Debian; the Wolfi image scanned with none. Node and npm come
+  from the distribution rather than NodeSource, so no gnupg is installed, and
+  pip is current. A Debian-family `BASE_PROVIDER_IMAGE` still builds.
+
 - Audit all tracked npm, Bun, uv, and Cargo dependency graphs in every CI run
   and weekly, including development dependencies and unfixed advisories. Block
   every HIGH/CRITICAL finding and scan error, and publish complete inventory and
