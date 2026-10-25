@@ -1,0 +1,36 @@
+# The API requires a bearer token (CAO_AUTH_LOCAL_TOKEN in server.yaml). As a
+# second fence, only the runtime may reach the server: other pods are refused;
+# `kubectl port-forward`, as used in the README, still works. The runtime pod
+# serves nothing, so it accepts no ingress at all.
+#
+# Enforced only by a CNI that implements NetworkPolicy (on EKS: the VPC CNI with
+# network policy enabled).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cao-server-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cao-server
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cao-runtime
+      ports:
+        - port: 9889
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cao-runtime-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cao-runtime
+  policyTypes:
+    - Ingress

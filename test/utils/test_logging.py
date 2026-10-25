@@ -1,8 +1,11 @@
 """Tests for logging utility."""
 
+import logging
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from cli_agent_orchestrator.utils.logging import setup_logging
 
@@ -118,3 +121,31 @@ class TestSetupLogging:
             assert "%(asctime)s" in call_kwargs["format"]
             assert "%(name)s" in call_kwargs["format"]
             assert "%(levelname)s" in call_kwargs["format"]
+
+
+class TestConsoleLevel:
+    @staticmethod
+    def _stderr_handler(mock_basic_config):
+        (handler,) = [
+            h
+            for h in mock_basic_config.call_args[1]["handlers"]
+            if not isinstance(h, logging.FileHandler)
+        ]
+        return handler
+
+    @pytest.mark.parametrize("console_level", [None, logging.INFO])
+    @patch("cli_agent_orchestrator.utils.logging.LOG_DIR")
+    @patch("cli_agent_orchestrator.utils.logging.logging.basicConfig")
+    def test_stderr_gets_warnings_unless_told_otherwise(
+        self, mock_basic_config, mock_log_dir, console_level
+    ):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mock_log_dir.__truediv__ = lambda self, x: Path(tmpdir) / x
+            mock_log_dir.mkdir = MagicMock()
+            with patch("builtins.print"):
+                if console_level is None:
+                    setup_logging()
+                else:
+                    setup_logging(console_level=console_level)
+        expected = logging.WARNING if console_level is None else console_level
+        assert self._stderr_handler(mock_basic_config).level == expected

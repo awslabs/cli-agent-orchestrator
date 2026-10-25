@@ -69,6 +69,11 @@ NOT_A_LAUNCHER = re.compile(r"(backend|client|tmux|database|db|server)$", re.IGN
 #: Key = ``<path under src/>::<enclosing function>``. Keep the justification to
 #: one line; the test asserts every key is still a real launch site.
 OPERATOR_PATHS: Dict[str, str] = {
+    "cli_agent_orchestrator/runtime_channel/bridge.py::_launch": (
+        "cao-bridge's half of POST /runtimes/{id}/terminals (#745), an operator "
+        "route that takes no caller; no MCP tool reaches it, and a runtime has no "
+        "API credential"
+    ),
     "cli_agent_orchestrator/services/flow_service.py::execute_flow": (
         "scheduled flows are operator-authored and started only through /flows "
         "(HTTP or cron); no MCP tool reaches them"
