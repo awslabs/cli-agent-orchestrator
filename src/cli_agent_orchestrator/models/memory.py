@@ -171,10 +171,26 @@ class Memory(BaseModel):
     token_estimate: Optional[int] = Field(
         default=None, description="Approximate recall token count"
     )
+    redacted_patterns: list[str] = Field(
+        default_factory=list,
+        exclude=True,
+        description=(
+            "Names of secret patterns whose matches were replaced by "
+            "[REDACTED:<pattern>] before this content left the vault read "
+            "boundary (#644). Pattern names only; never the matched bytes. "
+            "An in-process receipt from the vault reader to the injection "
+            "renderer, which turns it into the injection_redaction counters; "
+            "no recall surface consumes it. Never persisted or serialised."
+        ),
+    )
     action: Optional[str] = Field(
         default=None,
         exclude=True,
-        description="Set by store() to 'created' or 'updated'; not persisted on disk.",
+        description=(
+            "Set by store() to 'created' or 'updated'; not persisted on disk. "
+            "Never persisted or serialised; memory_gateway re-attaches it "
+            "out-of-band after model_validate."
+        ),
     )
     timestamp_clamped: bool = Field(
         default=False,

@@ -36,7 +36,8 @@ from cli_agent_orchestrator.services.terminal_service import (
     send_input,
 )
 
-# Skip integration tests by default (deselected in pyproject.toml addopts).
+# Collected by default (pyproject.toml addopts only deselects e2e); the
+# skipif below, not the marker, is what keeps this skipped by default.
 # Run with: CAO_RUN_LIVE_PROVIDER_TESTS=1 pytest test/providers/test_kiro_cli_integration.py
 pytestmark = [
     pytest.mark.integration,

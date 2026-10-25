@@ -22,6 +22,18 @@ class TerminalStatus(str, Enum):
     ERROR = "error"
 
 
+class TerminalInputBlockedReason(str, Enum):
+    """Machine-readable cause of a ``TerminalInputBlockedError``.
+
+    Lets a catcher like inbox_service's delivery loop decide PENDING-vs-FAILED from the raise
+    site's own classification instead of taking a second, possibly stale or unreliable (e.g.
+    herdr's CLI-backed ``get_status`` returning UNKNOWN on any error) status read (#896).
+    """
+
+    PROVIDER_ERROR = "provider_error"
+    WAITING_USER_ANSWER = "waiting_user_answer"
+
+
 class TerminalInputBlockedError(Exception):
     """Raised when a terminal is alive but blocked on an interactive prompt that needs a human
     (or an explicit answer_user_prompt call) to proceed -- never auto-answered.
@@ -34,27 +46,35 @@ class TerminalInputBlockedError(Exception):
     unchanged so every existing `from cli_agent_orchestrator.services.terminal_service import
     TerminalInputBlockedError` caller keeps working without edits.
 
-    Three distinct raise sites share this one exception:
-    1. services/terminal_service.py's send_input(): the terminal's provider process has exited
-       (status ERROR) -- refuse to type into what is now a bare shell, since queued input would
-       execute as arbitrary commands.
-    2. services/terminal_service.py's send_input(), separately: an orchestrated (assign/handoff)
-       message would answer a prompt still showing WAITING_USER_ANSWER -- refuse, since only a
-       real answer_user_prompt call (or the operator themselves) should resolve it. This guard
-       only actually fires for a given provider once that provider's own
+    Two raise sites share this one exception, both in services/terminal_service.py's
+    send_input(), and each sets ``reason`` so the catcher can tell them apart:
+    1. The terminal's provider process has exited (status ERROR) -- refuse to type into what is
+       now a bare shell, since queued input would execute as arbitrary commands. Raised with
+       ``reason=TerminalInputBlockedReason.PROVIDER_ERROR``. Permanent: no later sweep can
+       deliver into a bare shell, so inbox_service marks the batch FAILED.
+    2. An orchestrated message -- any ``OrchestrationType`` (assign, handoff, send_message, and
+       any member added later; the set is derived from the enum, see #896) -- would answer a
+       prompt still showing WAITING_USER_ANSWER -- refuse, since only a real answer_user_prompt
+       call (or the operator themselves) should resolve it. This guard only actually fires for a
+       given provider once that provider's own
        ``blocks_orchestrated_input_while_waiting_user_answer`` property opts in (see
        providers/base.py) -- claude_code did not opt in until PR #539's round-2 fix, so before
        that an orchestrated message reaching a claude_code terminal parked on
        WAITING_USER_ANSWER was NOT refused here; it was pasted straight into the live prompt.
-    3. providers/*.py's own initialize(): the CLI reached a real, alive, interactive state that
-       isn't {IDLE, COMPLETED} but IS a recognized "something is asking a question" signal
-       (WAITING_USER_ANSWER) -- or, for the outermost fallback, genuinely never resolved within
-       the init timeout despite the terminal staying alive and producing output the whole time.
-    All three are "this terminal needs a human, not a teardown" -- see terminal_service.py's own
+       Raised with ``reason=TerminalInputBlockedReason.WAITING_USER_ANSWER``. Transient: the
+       dialog will close, so inbox_service keeps the batch PENDING for the next sweep.
+    No provider raises this from initialize() today (providers/claude_code.py's init timeout
+    raises a bare TimeoutError on purpose); ``reason`` defaults to ``None`` only so a caller
+    outside this tree can still construct the exception without classifying it.
+    Both sites are "this terminal needs a human, not a teardown" -- see terminal_service.py's own
     _schedule_deferred_init, which catches this exception specifically to leave the terminal
     running instead of tearing it down the way any other exception from initialize() (or from the
     send_input it triggers on the deferred-init path) would.
     """
+
+    def __init__(self, message: str, reason: Optional[TerminalInputBlockedReason] = None) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class ProviderExitedInputBlockedError(TerminalInputBlockedError):
@@ -121,6 +141,15 @@ class Terminal(BaseModel):
         ),
     )
     allowed_tools: Optional[List[str]] = Field(None, description="Allowed CAO tools")
+    delegate_tools: Optional[List[str]] = Field(
+        None,
+        description=(
+            "Delegation ceiling: the most this terminal may grant to children it "
+            "creates via assign/handoff/workflow steps. Resolved from the profile's "
+            "delegateTools (or the role default) and capped by the creator's own "
+            "ceiling at creation time. None for rows written before the column existed."
+        ),
+    )
     engine: Optional[KiroEngine] = Field(None, description="Resolved Kiro engine")
     shell_command: Optional[str] = Field(
         None, description="Shell process name captured before kiro launch"
@@ -144,6 +173,16 @@ class Terminal(BaseModel):
         description=(
             "CAO-owned durable deferred-initialization failure metadata. "
             "Separate from consumer metadata so clients cannot overwrite lifecycle truth."
+        ),
+    )
+    memory_manager: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Outcome of the memory_manager sidecar a POST /sessions request asked for "
+            "(memory_manager=true): {state: 'scheduled' | 'refused', detail}. 'refused' "
+            "means the sidecar's tools exceed this primary's recorded delegation ceiling "
+            "and it was not launched; detail carries the refusal text. Response-only, "
+            "never persisted; None when no sidecar was requested."
         ),
     )
     initial_delivery: Optional[Dict[str, Any]] = Field(

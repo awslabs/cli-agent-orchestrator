@@ -35,6 +35,8 @@ class FindingCode(str, Enum):
     PATH_ESCAPES_ROOT = "path_escapes_root"
     NOTE_NOT_UTF8 = "note_not_utf8"
     SECRET_DETECTED = "secret_detected"
+    SECRET_ACCEPTED = "secret_accepted"
+    SECRET_ACCEPTANCE_UNMATCHED = "secret_acceptance_unmatched"
     UNSTABLE_SKIPPED = "unstable_skipped"
     LINK_LIMIT_EXCEEDED = "link_limit_exceeded"
     LINK_TARGET_INVALID = "link_target_invalid"
@@ -84,6 +86,8 @@ FINDING_SEVERITIES: Mapping[FindingCode, Severity] = MappingProxyType(
         FindingCode.HARDLINK_REFUSED: "warn",
         FindingCode.PATH_ESCAPES_ROOT: "warn",
         FindingCode.NOTE_NOT_UTF8: "error",
+        FindingCode.SECRET_ACCEPTED: "info",
+        FindingCode.SECRET_ACCEPTANCE_UNMATCHED: "warn",
         FindingCode.UNSTABLE_SKIPPED: "warn",
         FindingCode.LINK_LIMIT_EXCEEDED: "warn",
         FindingCode.LINK_TARGET_INVALID: "warn",
@@ -183,8 +187,20 @@ SUPPORTED_BOUNDARY: tuple[BoundaryRule, ...] = (
     BoundaryRule(
         "secret-bearing note",
         "configuration-dependent",
-        "reported in both modes",
+        "reported in both modes; under warn every model-bound read is redacted",
         FindingCode.SECRET_DETECTED,
+    ),
+    BoundaryRule(
+        "cao.secret_ok entry matching a current span under warn",
+        "supported",
+        "that span passes raw to agents; reported per span",
+        FindingCode.SECRET_ACCEPTED,
+    ),
+    BoundaryRule(
+        "cao.secret_ok entry matching no current span, or on a reject mapping",
+        "degraded",
+        "acceptance inert; reported so it is removed or the mapping changed",
+        FindingCode.SECRET_ACCEPTANCE_UNMATCHED,
     ),
     BoundaryRule("derived-key collision", "refused", "both quarantined", FindingCode.KEY_COLLISION),
     BoundaryRule("unstable note", "deferred", "skipped this run", FindingCode.UNSTABLE_SKIPPED),

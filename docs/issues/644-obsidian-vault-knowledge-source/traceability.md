@@ -2,7 +2,7 @@
 
 **Issue:** [#644](https://github.com/awslabs/cli-agent-orchestrator/issues/644)
 **Status:** Planning record.
-**Revision:** 3, amended — AC10 marked **Conditional** after N1, R5 and R14; AC9's condition made explicit. Amended after the supervisor corrected the test-baseline premise: **CI on `main` at `6c890ca` is GREEN**.
+**Revision:** 3, amended 2026-10-21 — AC10 marked **Satisfied** after the #644 redact-and-inject ruling (was Conditional after N1, R5 and R14); AC9's condition made explicit. Amended after the supervisor corrected the test-baseline premise: **CI on `main` at `6c890ca` is GREEN**.
 **Related:** [design.md](design.md), [implementation-boundaries.md](implementation-boundaries.md), [test-strategy.md](test-strategy.md)
 
 ---
@@ -79,7 +79,7 @@ stated; none of the three was affected by this round.
 | 7 | `memory_store` creates and updates normal Markdown notes only in the managed folder | **U8** | Satisfied | **Satisfied** | `test_managed_write.py`, including a crafted traversal key |
 | 8 | Normal memory operations never modify an unmanaged vault note | **U8**; U4 and U6 by construction | Satisfied | **Satisfied** | `test_unmanaged_never_written.py`, `test_forget_contract.py` |
 | 9 | CAO's derived SQLite/BM25/graph state can be deleted and deterministically rebuilt from the vault | **U5**; U2 | Satisfied (proof unconstructable) | **Satisfied, with a proof boundary** — [note 9](#note-9-the-proof-boundary) | `test_rebuild_determinism.py`, three assertions, two column groups |
-| 10 | Existing scope, authorization, secret scanning, path traversal, symlink, audit, and concurrent-write protections apply at the vault boundary | **Cross-cutting**: U3/U4 for secrets, U4, U6, U7, U8; U5 for audit and the four maintenance guards | Partial (rev 2) | **Conditional** — Satisfied under the shipped default `secret_gate: "reject"`; Partial under an operator-elected `"warn"`. [note 10](#note-10-secret-scanning-after-ruling-r5) | `test_scan_symlinks.py`, `test_recall_scope_isolation.py`, `test_managed_write.py`, `test_concurrent_edits.py`, `test_reconcile.py`, `test_curator_recall_gate.py`, `test_native_maintenance_guards.py`, `test_secret_gate_index_time.py`, `test_promotion_service_native_only.py`, plus twenty teeth tests |
+| 10 | Existing scope, authorization, secret scanning, path traversal, symlink, audit, and concurrent-write protections apply at the vault boundary | **Cross-cutting**: U3/U4 for secrets, U4, U6, U7, U8; U5 for audit and the four maintenance guards | Partial (rev 2), Conditional (rev 3) | **Satisfied** (2026-10-21) — `reject` quarantines at reconcile; `warn` indexes but every model-bound read is redacted at `load_candidate`, raw bytes pass only through per-finding `cao.secret_ok` acceptances, which status reports. [note 10](#note-10-secret-scanning-after-ruling-r5) | `test_secret_gate_redact_and_inject.py` (twelve-pattern redaction on recall and injection, acceptance pass/fail shapes, status, structural chokepoint guard), `test_scan_symlinks.py`, `test_recall_scope_isolation.py`, `test_managed_write.py`, `test_concurrent_edits.py`, `test_reconcile.py`, `test_curator_recall_gate.py`, `test_native_maintenance_guards.py`, `test_secret_gate_index_time.py`, `test_promotion_service_native_only.py`, plus twenty teeth tests |
 | 11 | The workflow operates while the Obsidian application is closed | **Structural**, asserted by U11 | Partial | **Partial** — [note 11](#note-11-obsidian-closed-versus-obsidian-open) | `test_obsidian_closed.py` |
 | 12 | An explicit migration can move selected native CAO memory into the managed folder, preserving representable metadata and reporting lossy fields | **U10** | Partial | **Partial** — [note 12](#note-12-seven-fields-are-not-representable) | `test_migrate_lossy.py` |
 | 13 | Focused tests cover malformed YAML, duplicate note names, excluded paths, dangling links, symlinks, partial files, concurrent edits, and rebuilds | **U3, U4, U5, U8** through the fixture vault | Satisfied (unrepresentative corpus) | **Satisfied** | Eight named conditions, each with a fixture case and an asserting test; corpus now carries real-world names |
@@ -206,7 +206,7 @@ was false. With the `source_kind = 'native'` predicate in place it is true as wr
 **Two residuals, named rather than hidden.** Neither is a gap in whether the protection
 applies; both bound its coverage.
 
-1. **The gate is a heuristic deny-list.** One of its six patterns is
+1. **The gate is a heuristic deny-list.** One of its twelve patterns (six when this was written) is
    `(?i)(?:password|passwd|secret|pwd)\s*[:=]\s*\S{6,}`, which matches ordinary vault
    prose — a runbook quoting `password: hunter2` as an example, a design note about
    credential handling. Under `reject` such a note becomes unrecallable. `secret_gate:
@@ -237,6 +237,37 @@ the gate identified as credential-shaped becomes part of the recall corpus. Redu
 a bare `Satisfied` would require the reader to already know about a setting the word does not
 mention, which is precisely the overstatement revision 2 was corrected for. `Conditional`
 costs one extra word and carries the whole truth.
+
+### Amendment 2026-10-21: Satisfied, by redact-and-inject (#644 AC10 ruling)
+
+The argument above was right about the mark and wrong about the remedy: it treated `warn`
+as a relaxation to be labelled, when the actual defect was that `warn` forwarded raw
+credential bytes to a third-party model whose request logs retain them. The maintainer
+ruled for redact-and-inject with a per-finding allowlist, the shape every surveyed scanner
+uses (block by default, override per finding, override recorded). Under `warn` the note is
+indexed and recallable, but every match becomes `[REDACTED:<pattern_name>]` at the one read
+chokepoint, `services/vault/reader.py::load_candidate`, which automatic injection, explicit
+recall, related-key expansion and BM25 ranking all pass through. Raw bytes pass only when
+the note's frontmatter carries `cao.secret_ok: [{pattern, sha256}]` for that exact span;
+a boolean or pattern-only acceptance quarantines the note. Both residuals above shrink:
+the false-positive answer is now a per-finding acceptance rather than a per-folder mode,
+and a secret added after reconcile is redacted on read, so the reconcile-time window
+exposes a `stale` label and not bytes.
+
+**Evidence.** `test/services/vault/test_secret_gate_redact_and_inject.py`: parametrised
+redaction over all twelve patterns on both recall and injection; acceptance with the right
+pattern and hash passes raw bytes; wrong hash, wrong pattern, boolean, bare name, non-hex and
+unknown-pattern shapes do not; acceptances inert on `reject`; status lists acceptances; a
+structural test asserts `load_candidate` binds body through the redactor, that a vault
+`Memory` is built nowhere else that reads vault bytes, and that the agent-facing consumers
+of `load_candidate` are an enumerated set. Mutation: disabling the chokepoint failed the
+recall and injection tests; weakening the acceptance check to pattern-only failed the
+wrong-hash test.
+
+**How this slipped through.** R14 judged the coherence of a configuration, not the safety
+of the data flow it permitted; and the pattern table doubled from six to twelve after the
+ADRs were written without any ADR noticing, so the false-positive surface R14 reasoned about
+was stale by the time it was implemented.
 
 Two things keep `Conditional` from being a hedge. The direction is stated (`reject`
 Satisfied, `warn` Partial), so a reviewer can decide for their own configuration rather than
@@ -347,8 +378,10 @@ reviewed rather than discovered.
    way to state it, since the premise that it was broken proved false.
 4. **A credential-bearing vault note is quarantined at reconcile by default** (ruling R5),
    so a note that was recallable under revision 2's design is not under revision 3's. An
-   operator can elect `secret_gate: "warn"` per mapping. Both the quarantine and the
-   election are visible in `cao memory vault status`.
+   operator can elect `secret_gate: "warn"` per mapping, which since 2026-10-21 (#644) means
+   indexed-but-redacted on every model-bound read, with raw bytes only through per-finding
+   `cao.secret_ok` acceptances. The quarantine, the findings and the acceptances are visible
+   in `cao memory vault status`.
 5. **`promotion_service` will never promote a vault-backed lesson** (N1). If
    vault-authored agent lessons are ever wanted, they must arrive through
    `resolve_candidates(require_injectable=True)` like every other vault read — a deliberate

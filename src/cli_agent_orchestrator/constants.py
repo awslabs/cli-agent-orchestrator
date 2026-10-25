@@ -883,6 +883,19 @@ ROLE_TOOL_DEFAULTS = {
     "workflow_scout": ["@builtin", "fs_read", "execute_bash", "@cao-mcp-server"],
 }
 
+# Delegation ceiling defaults, keyed by ROLE NAME. The ceiling is the most a
+# terminal may grant to the children it creates through assign, handoff and
+# workflow steps; a child's allowedTools must fit inside it, and the child's own
+# ceiling is capped by it. A profile declares its own with ``delegateTools``.
+# Only ``supervisor`` widens by default: its job is to launch workers that hold
+# tools it does not. Every other role, built-in or custom, defaults to its own
+# allowedTools (it can hand down what it holds, nothing more). A custom role
+# named ``supervisor`` in settings.json keeps this entry: the table is keyed by
+# the name, not by the built-in list. See docs/tool-restrictions.md.
+ROLE_DELEGATE_DEFAULTS = {
+    "supervisor": ["*"],
+}
+
 # Issue #432 design discussion (tedswinyar + klabulan, 2026-07-17/18): sibling
 # discovery (list_siblings/update_metadata) is a distinct capability from the
 # existing handoff/assign/send_message orchestration trio, and must be an
@@ -1223,3 +1236,6 @@ WORKFLOW_SCRIPT_SCRATCH_DIR = CAO_HOME_DIR / "workflow-script-scratch"  # 0o700 
 TERMINAL_METADATA_MAX_BYTES = 16 * 1024  # encoded (json.dumps) size cap
 TERMINAL_GROUP_MAX_ELEMENTS = 16
 TERMINAL_GROUP_ELEMENT_MAX_LEN = 128
+
+# Optional launch evidence carried in delegation responses.
+DECISION_RESPONSE_HEADER = "X-CAO-Decision"

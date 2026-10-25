@@ -70,6 +70,7 @@ from cli_agent_orchestrator.services.workflow_service import (
     StepRunState,
     _active_drives,
     _is_resumable_for_tier,
+    bound_caller,
     run_registry,
 )
 
@@ -137,6 +138,15 @@ class ScriptRunRecord:
     finished_at: Optional[str]
     tier: str = "script"
     working_directory: Optional[str] = None
+    # The terminal that started (or resumed) this run, when an agent did
+    # (``WorkflowRunRequest.caller_id``). The run-step handler reads it from THIS
+    # record for every step the script dispatches and passes it to
+    # ``run_agent_step`` as ``delegating_terminal_id``, so script-tier workers are
+    # bounded by that terminal's recorded delegation ceiling exactly like YAML
+    # steps (utils/delegation.py). The script subprocess asserts nothing: the
+    # record, keyed by the generation-fenced run id, is the source. None for an
+    # operator-started run.
+    caller_id: Optional[str] = None
 
 
 def run_root_for(env: Optional[Dict[str, str]]) -> Optional[str]:
@@ -162,6 +172,62 @@ def build_script_snapshot(
             "launch_guard": launch_guard,
         }
     )
+
+
+def step_delegating_terminal_id(env_vars: Optional[Dict[str, str]]) -> Optional[str]:
+    """The terminal whose delegation ceiling bounds a script-tier run-step call.
+
+    Same guard as ``make_step_terminal_recorder``: returns ``None`` (operator
+    path, unchanged) unless the call names a live ``ScriptRunRecord`` through
+    ``CAO_WORKFLOW_RUN_ID``; then it is that record's ``caller_id``. The
+    generation fence has already run by the time the handler calls this, so a
+    stale or forged run id never reaches the lookup.
+    """
+    if not env_vars:
+        return None
+    run_id = env_vars.get("CAO_WORKFLOW_RUN_ID")
+    if not run_id:
+        return None
+    record = run_registry.get(run_id)
+    if not isinstance(record, ScriptRunRecord):
+        return None
+    return record.caller_id
+
+
+class OrphanedScriptRunError(Exception):
+    """A script-tier run-step call names a journaled script run with no live record.
+
+    The in-memory ``ScriptRunRecord`` carries the run's caller binding; after a
+    server restart it is gone while the script subprocess may still be running
+    and its generation still matches the journal. Launching such a step would
+    bound it by nothing. Refused at the route (403); ``cao workflow resume``
+    rebuilds the record from the journal, including the original caller.
+    """
+
+
+def require_live_script_run(run_id: Optional[str]) -> None:
+    """Refuse a script-tier run-step whose run is journaled but not live.
+
+    No-op when ``run_id`` is None, names a live ``ScriptRunRecord``, or names a
+    run the journal does not know as ``tier='script'`` (YAML and handoff callers
+    never reach here with a script row). Only the orphan shape raises.
+    """
+    if not run_id:
+        return
+    if isinstance(run_registry.get(run_id), ScriptRunRecord):
+        return
+    try:
+        row = workflow_journal.get_run(run_id)
+    except Exception:  # noqa: BLE001 — an unreadable journal cannot prove liveness
+        row = None
+    if row is not None and row.tier == "script":
+        raise OrphanedScriptRunError(
+            f"run '{run_id}' is a script-tier run with no live record on this server "
+            f"(the server restarted since it started, or it was never started here), so "
+            f"its caller binding and delegation ceiling cannot be evaluated; the step is "
+            f"refused rather than launched unbounded. Resume the run with "
+            f"`cao workflow resume {run_id}` to rebuild it from the journal."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1291,10 +1357,15 @@ async def run_script_workflow(
     spec: Any,
     inputs: Dict[str, Any],
     run_id: str,
+    caller_id: Optional[str] = None,
     *,
     working_directory: Optional[str] = None,
 ) -> WorkflowRunResult:
     """Run a script workflow to completion, awaited inline (A1, S1, US-B1/B4/B5).
+
+    ``caller_id`` is the terminal starting the run, if an agent did; it is kept on
+    the ``ScriptRunRecord`` so every step the script dispatches is bounded by that
+    terminal's delegation ceiling (see ``ScriptRunRecord.caller_id``).
 
     ``spec`` is the resolved ``ScriptSpec`` (U5/C4) — duck-typed here (U5 owns the
     concrete model): it exposes ``.source`` (script text), ``.path`` (display path
@@ -1373,6 +1444,7 @@ async def run_script_workflow(
         finished_at=None,
         tier="script",
         working_directory=root,
+        caller_id=caller_id,
     )
     # M3 (traceability): a registered record lives for the process lifetime — it is
     # NOT evicted on finalize, mirroring the base YAML registry, so a bounded
@@ -1410,6 +1482,7 @@ async def run_script_workflow(
             # ``approval-gate`` (Bolt 2 unit 7) built this value at Step 0b and has already gated on
             # it; reusing it rather than rebuilding is what makes checked-equals-stored true.
             manifest_json,
+            **({"caller_id": caller_id} if caller_id else {}),
         )
     except sqlite3.IntegrityError:
         # Remove only our publication; a replacement belongs to the winner.
@@ -1494,7 +1567,9 @@ async def run_script_workflow_prepared(
 # A2 — resume_script_run (S2 flow, M3, US-C1/C2)
 # ---------------------------------------------------------------------------
 async def resume_script_run(
-    run_id: str, decisions: Optional[Mapping[str, str]] = None
+    run_id: str,
+    decisions: Optional[Mapping[str, str]] = None,
+    caller_id: Optional[str] = None,
 ) -> WorkflowRunResult:
     """Resume a crashed/failed/cancelled script run from its journal (A2, S2).
 
@@ -1677,6 +1752,10 @@ async def resume_script_run(
             finished_at=None,
             tier="script",
             working_directory=working_directory,
+            # The ORIGINAL starter (journaled) keeps bounding the re-run steps; a
+            # resume by a different actor must not widen them. Only a run started
+            # with no caller takes the resumer's bound.
+            caller_id=bound_caller(row.caller_id, caller_id),
         )
 
         # --- Execution: bump + PERSIST generation BEFORE spawn (INV-6, load-bearing) ---
