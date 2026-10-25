@@ -139,12 +139,21 @@ def ensure_cao_home_schema() -> None:
     # ``_ensure_db_dir()`` has in fact just created it, but the lock must not
     # depend on an import side effect staying where it is.
     DB_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with open(DB_DIR / SCHEMA_INIT_LOCK_NAME, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    # 0o600 and O_CLOEXEC, as ``acquire_server_lock`` opens server.lock: DB_DIR is
+    # owner-only by design (``database._ensure_db_dir``) and a plain ``open(...,
+    # "w")`` would drop a 0o644 file into it under the usual umask. O_CLOEXEC so
+    # a subprocess a test spawns cannot inherit the descriptor and hold the lock
+    # past the session. Never unlinked: unlinking a lock file while another
+    # process is about to open it leaves two holders locking two different inodes.
+    fd = os.open(DB_DIR / SCHEMA_INIT_LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
         present = set(sa_inspect(database.engine).get_table_names())
         if present & set(database.Base.metadata.tables):
             return
         database.init_db()
+    finally:
+        os.close(fd)
 
 
 @pytest.fixture(scope="session", autouse=True)
