@@ -13,6 +13,7 @@ Also exposes shared security fixtures (RSA keys, JWKS stub,
 that need to exercise the Auth0 paths.
 """
 
+import fcntl
 import logging
 import os
 import pathlib
@@ -92,6 +93,60 @@ def pytest_sessionfinish(session, exitstatus):
             )
 
 
+# The cross-process mutex for the one-time schema build below. Lives beside the
+# database it guards, so it is scoped to exactly what it protects: one
+# ``CAO_HOME_DIR``. Named with a leading dot and a ``.lock`` suffix to read as
+# harness state, not as a database file, to anyone who lists the directory.
+SCHEMA_INIT_LOCK_NAME = ".test-schema-init.lock"
+
+
+def ensure_cao_home_schema() -> None:
+    """Build the configured home's ORM schema if, and only if, it has none.
+
+    Factored out of the fixture so the concurrency guard in
+    ``test_isolated_home_has_schema.py`` can run *this* function in several
+    processes at once rather than a copy of it -- a copy would keep passing
+    after someone dropped the lock from the real body.
+
+    The check and ``init_db()`` both happen under an exclusive ``flock`` on
+    ``$CAO_HOME_DIR/db/.test-schema-init.lock``, and THE CHECK IS INSIDE THE
+    LOCK, not before it. Each pytest-xdist worker is its own process with its
+    own session, so each one runs this. Read the table names outside the lock
+    and every worker on a home with no schema sees no tables, every worker
+    calls ``init_db()``, and ``Base.metadata.create_all()`` -- which checks for
+    each table and then creates it -- lets the losers fail with
+    ``table session_incarnations already exists``. Because the fixture that
+    calls this is session-scoped and autouse, that is a setup error for every
+    test on every losing worker, not just the database tests:
+    ``pytest -n 4 test/services/vault`` on a fresh home reported 336-448 errors
+    (haofeif, #1049 review at 10587987). ``DEVELOPMENT.md`` documents
+    ``uv run pytest -n auto``, and a machine that has never run CAO reaches the
+    same state with the default home.
+
+    ``flock`` rather than a marker file for the same reasons as
+    ``utils/server_lock.py``: the kernel drops it however the holder dies, so
+    there is no stale-lock recovery path, and it needs no PID bookkeeping. It
+    blocks rather than failing fast (``LOCK_EX``, no ``LOCK_NB``) because the
+    waiter's whole purpose is to observe the winner's finished schema; the wait
+    is one ``init_db()`` long and happens at most once per home.
+    """
+    from sqlalchemy import inspect as sa_inspect
+
+    from cli_agent_orchestrator.clients import database
+    from cli_agent_orchestrator.constants import DB_DIR
+
+    # A never-initialized home has no db/ yet. ``database``'s import-time
+    # ``_ensure_db_dir()`` has in fact just created it, but the lock must not
+    # depend on an import side effect staying where it is.
+    DB_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(DB_DIR / SCHEMA_INIT_LOCK_NAME, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        present = set(sa_inspect(database.engine).get_table_names())
+        if present & set(database.Base.metadata.tables):
+            return
+        database.init_db()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _cao_home_schema() -> None:
     """Make the configured home's DB schema exist before any test runs.
@@ -117,15 +172,12 @@ def _cao_home_schema() -> None:
     repair a half-migrated home mid-session, masking the migration gaps that
     ``test/clients/test_*_migration.py`` exists to catch. A stale home should
     still fail loudly and be fixed with ``cao init``.
+
+    Runs once per pytest session, which under ``pytest -n`` means once in each
+    xdist worker process. ``ensure_cao_home_schema()`` takes a cross-process
+    lock so that is safe; see its docstring.
     """
-    from sqlalchemy import inspect as sa_inspect
-
-    from cli_agent_orchestrator.clients import database
-
-    present = set(sa_inspect(database.engine).get_table_names())
-    if present & set(database.Base.metadata.tables):
-        return
-    database.init_db()
+    ensure_cao_home_schema()
 
 
 _AUTH_TEST_DOMAIN = "test.local"
