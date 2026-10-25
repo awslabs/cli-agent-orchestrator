@@ -21,6 +21,22 @@ async def test_delegation_conformance(case, entrypoint, tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", (*ENTRYPOINTS, *NEW_SESSION_HANDOFFS))
+async def test_empty_task_launches_with_points_off(entrypoint, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CAO_HOME_DIR", str(tmp_path / "cao"))
+    adapter = DelegationAdapter(tmp_path, monkeypatch, entrypoint)
+    adapter.configure(
+        states={"model.route": "off"},
+        deciders={"model.route": ConfidentDecider("small", 0.91)},
+        model_tiers={"codex": {"small": "model-x"}},
+    )
+    observed = await adapter.delegate(message="")
+    assert observed.launched, observed.error
+    await adapter.engine.runner.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "entrypoint,key", [("assign", "assign"), ("handoff", "handoff"), ("elastic", "assign_elastic")]
 )

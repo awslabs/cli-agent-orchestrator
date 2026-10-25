@@ -25,10 +25,14 @@ For the shim-contract deep-dive (`run_step`/`emit_output`, retry/determinism, th
 
 ## Quick start
 
-Write a small script to the workflows directory, validate it, and run it.
+Write a small script as a **draft file anywhere you like**, install it with
+`cao workflow create` (which validates it before writing), and run it. You never write into
+the workflows directory yourself:
+`create` sends the draft's **text** to the server, which decides where the spec lands
+through the guarded write path described in [The lifecycle](#the-lifecycle).
 
 ```python
-# ~/.aws/cli-agent-orchestrator/workflows/hello.py
+# ./hello.py — a draft; its own path and name are yours and are not kept
 from cao_workflow import run_step, emit_output
 
 # Step 1 — a developer writes a note.
@@ -41,24 +45,62 @@ emit_output({"note": note.output, "review": review.output})
 ```
 
 ```bash
-# validate is mandatory — fix every finding before running
-cao workflow validate ~/.aws/cli-agent-orchestrator/workflows/hello.py
+# create validates the draft, installs it under the name you give it, and prints the content_hash
+cao workflow create hello --from-file ./hello.py
 
 # run it by its stem, with a pre-announced run-id
 cao workflow run hello --run-id hello-1
+# -> refused: 403 approval_required, carrying the plan_id. This is by design — a plan
+#    identifier does not exist until a run computes it. Present the plan_id to the user
+#    and stop; approval is a human act (see Plan approval below).
+
+# the USER approves at their terminal, then you run again
+cao workflow approve plan-v1:<digest-from-the-refusal>
+cao workflow run hello --run-id hello-1
 ```
 
-The workflow is run **by its stem** (`hello`), so the filename must be a bare name with
-no path separators, and you must not create a same-stem `hello.yaml` sibling — it would
-collide on the run surface.
+The workflow is run **by its stem** (`hello`), so the name you pass to `create` must be a
+bare name with no path separators — the draft file's own name is irrelevant. A same-stem
+cross-tier collision (a `hello.yaml` beside the `hello.py` this creates) is refused by
+`create` **before anything is written**. Writing the file into the workflows directory
+yourself remains possible and is an explicitly acknowledged alternative with real costs —
+see step 1 of [The lifecycle](#the-lifecycle) before choosing it.
 
 ## The lifecycle
 
 Every workflow follows the same path. No step is optional.
 
-1. **Author** — write the `.py` file to `~/.aws/cli-agent-orchestrator/workflows/<name>.py`.
-2. **Validate (mandatory gate)** — `cao workflow validate <path>`. Findings are
-   **load-bearing**, not style nits:
+1. **Author** — write the script as a **draft anywhere you like**, then install it through
+   the guarded write path: `cao workflow create <name> --from-file <draft>` (to replace an
+   existing spec: `cao workflow update <name> --from-file <draft> --expected-hash <hash>`,
+   with the hash from `get <name>`). The draft's **text** is sent to the server and the
+   **server** decides where the spec lands. Every protection lives on that path, and every
+   check precedes any write, so a refusal leaves the filesystem byte-identical:
+   - **path containment** — the write cannot land outside the spec directory, whatever the
+     request asks for;
+   - **a source size cap** — enforced before any file is created;
+   - **validation + lint before the file exists** — CAO never writes a spec it would refuse
+     to run, so a failed `create` wrote nothing;
+   - **atomic publication** — `create` publishes a fully written temp inode with an atomic
+     link and `update` atomically replaces, so a concurrent reader never sees a partial spec;
+   - **a same-stem cross-tier pre-check** — creating `<name>.py` beside an existing
+     `<name>.yaml` is refused up front; a raw write would succeed and leave a spec that
+     every later `get`/`run` of `<name>` fails to reach with `TierCollisionError` — a file
+     unreachable the moment it lands.
+
+   `create` refuses to overwrite an existing spec (use `update`) and prints the new
+   `content_hash`, which a later `update` requires.
+
+   Writing the file into `~/.aws/cli-agent-orchestrator/workflows/` yourself is an
+   explicitly acknowledged alternative, and it gives up every layer above: no path
+   containment, no size cap, no pre-write validation or lint gate, no atomic publication
+   (a reader can see the half-written file), and no tier-collision pre-check. It remains
+   possible because the directory is yours; it is not the recommended path.
+2. **Validate (mandatory gate)** — `create` and `update` validate the draft source
+   server-side before writing. They refuse to write a spec with a blocking error. For a spec
+   already installed in the workflows directory, `cao workflow validate <path>` runs the same
+   linter; a relative `<path>` is resolved against that directory. Findings are **load-bearing**,
+   not style nits:
    - **`import cli_agent_orchestrator` is banned.** The script runs in a separate
      subprocess and must reach CAO only over HTTP through the `cao_workflow` shim.
      Importing the server package breaks that boundary and fails validation.
@@ -84,7 +126,7 @@ Every workflow follows the same path. No step is optional.
 4. **Status / cancel / resume** — `cao workflow status <run-id>`,
    `cao workflow cancel <run-id>`, `cao workflow resume <run-id>`.
 
-A validate that reports `valid` (status `pass` or `pass_reserved`) exits 0; a failing
+A validation that reports `valid` (status `pass` or `pass_reserved`) exits 0; a failing
 spec exits 1 and lists each error.
 
 ## Parameterized workflows (inputs)
@@ -97,7 +139,7 @@ A workflow declares a **module-level `INPUTS` dict** and reads the resolved valu
 runtime with `get_inputs()`:
 
 ```python
-# ~/.aws/cli-agent-orchestrator/workflows/summarize.py
+# ./summarize.py — a draft; `cao workflow create` decides where the spec lands
 from cao_workflow import run_step, emit_output, get_inputs
 
 INPUTS = {
@@ -117,10 +159,10 @@ review = run_step(
 emit_output({"summary": review.output})
 ```
 
-Run it with `--input key=value` (repeatable):
+Install the draft and run it with `--input key=value` (repeatable):
 
 ```bash
-cao workflow validate ~/.aws/cli-agent-orchestrator/workflows/summarize.py
+cao workflow create summarize --from-file ./summarize.py
 cao workflow run summarize --run-id sum-1 \
   --input target_file=/abs/path/to/report.md \
   --input max_points=5 \
@@ -365,7 +407,7 @@ All sixteen verbs live under `cao workflow`.
 
 | Verb | Flags | Description |
 | --- | --- | --- |
-| `validate <file>` | `--json` | Validate a spec file without running it. Exit 0 valid, 1 invalid. |
+| `validate <file>` | `--json` | Validate an installed spec without running it. The path is resolved against the workflows directory. Exit 0 valid, 1 invalid. Use `create` or `update` to validate and install a draft. |
 | `create <name>` | `--from-file <path>` (required), `--json` | Create a **new** Python spec named `<name>` from a source file. Refuses to overwrite an existing spec — use `update`. Python only; a YAML-tier name is refused with a message naming the restriction. The source is sent as text and the **server** decides where it lands (validation, lint gate, path containment, atomic write, index update all happen server-side). Prints the new `content_hash`, which is what `update` wants next. Exit 0 created, 1 refused/errored. |
 | `update <name>` | `--from-file <path>` (required), `--expected-hash <hash>` (required), `--json` | Replace an **existing** spec's source, refusing a stale update. Refuses to create — use `create`. `--expected-hash` is required and is never computed for you: it is your assertion about what you believe you are replacing, and a hash derived from the file about to be overwritten would always match. There is no `--force`. Get the current hash from `get <name>` (the `Hash:` line). |
 | `list` | `--dir <path>`, `--json` | List indexed workflows (rebuilt from spec files on disk). Script-tier rows show `-` for step count. |
@@ -415,7 +457,7 @@ before assuming a verb and a tool with similar names do the same thing:
 | Create a spec | `create --from-file <path>` | `workflow_create` (source **text**) |
 | Update a spec | `update --from-file <path> --expected-hash` | `workflow_update` (source **text**) |
 | Read a spec | `get <name>` | `workflow_get` |
-| Validate a draft | `validate <file>` | `workflow_validate` (source **text**) |
+| Validate | `validate <file>` (installed spec) | `workflow_validate` (source **text**, including drafts) |
 | List workflow **specs** | `list` | *(none — MCP has no spec-listing tool)* |
 | List workflow **runs** | `runs` | `workflow_list` |
 | Submit asynchronously | `run` (the default) | `workflow_start` |
@@ -423,11 +465,12 @@ before assuming a verb and a tool with similar names do the same thing:
 | **Grant** a plan approval | `approve <plan_id>` | *(none — deliberately)* |
 | **Report** a plan's approval | *(none)* | `workflow_plan_approval` |
 
-> **The four authoring pairs line up by name but not by input.** `create`, `update` and `validate`
-> take a **file path** on the CLI and **source text** over MCP. That is deliberate — an agent holds a
-> draft in context and has nowhere to put a file, whereas a person already has one on disk — but it
-> means the CLI flag and the tool argument are not interchangeable. In both directions the server does
-> the validating, containment-checking and writing; neither surface writes to the spec directory itself.
+> **The four authoring pairs line up by name but not by input.** `create` and `update` take a
+> **draft file path** on the CLI, while `validate` takes a path to a spec already in the workflows
+> directory; all three take **source text** over MCP. That is deliberate — an agent holds a draft in
+> context and has nowhere to put a file, whereas a person already has one on disk — but it means the
+> CLI flag and the tool argument are not interchangeable. In both directions the server does the
+> validating, containment-checking and writing; neither surface writes to the spec directory itself.
 >
 > **`list` and `workflow_list` are false friends.** The CLI's `list` lists **specs**; the
 > MCP `workflow_list` lists **runs**. An agent reaching for "the list tool" expecting specs
@@ -585,10 +628,10 @@ cao workflow approve plan-v2:<digest>
 cao workflow run my-script          # starts
 ```
 
-Bolt 3 ships the conversational authoring sequence around this loop: create or update the script,
-validate it, present it for review, make the plan-discovery run above, and surface the refused run's
-`plan_id` for a human to approve before retrying. The discovery run remains necessary because the
-`plan_id` does not exist before run admission computes it.
+Bolt 3 ships the conversational authoring sequence around this loop: create or update the script
+(which validates it before writing), present it for review, make the plan-discovery run above, and
+surface the refused run's `plan_id` for a human to approve before retrying. The discovery run remains
+necessary because the `plan_id` does not exist before run admission computes it.
 
 ### What approval is, and is not
 
