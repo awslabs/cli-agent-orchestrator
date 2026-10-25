@@ -3901,6 +3901,7 @@ async def create_session(
     use_worktree: bool = False,
     idempotency_key: Optional[str] = None,
     resume_session_id: Optional[str] = None,
+    create_working_directory: bool = False,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -3955,6 +3956,20 @@ async def create_session(
     **409 CONFLICT** rather than that other request's terminal. A key whose
     terminal has since been torn down is stale, not conflicting, and simply
     creates fresh.
+
+    ``create_working_directory`` (#724, contract ruled by @plauzy and
+    @call-me-ram on PR #1036): opt in to CREATING ``working_directory`` when it
+    does not exist yet. Default false, which is the must-exist behavior every
+    caller has always had, so the fail-fast contract the MCP ``handoff`` and
+    ``assign`` tools document ("must exist and be accessible") stays true for
+    them: they send nothing and a typo'd path is still a correctable error
+    rather than an empty tree the worker silently starts in. The Web UI sends
+    true, because an operator typing a path into a folder field is asking for
+    it. Creation is not a bypass of the path policy: a missing target is still
+    judged under #345 D5 by its nearest existing ancestor, and the ``mkdir``
+    happens at the point of use inside ``create_terminal``'s locked section,
+    after every check that can refuse the request, so a refused create leaves
+    nothing on disk.
     """
     initial_message = body.initial_message if body else None
     initial_message_orchestration_type = None
@@ -4045,7 +4060,7 @@ async def create_session(
             resume_session_id=resume_session_id,
             group=body.group if body else None,
             metadata=body.metadata if body else None,
-            create_working_directory=True,
+            create_working_directory=create_working_directory,
             **description_options,
             **_launch_options(launch_plan),
             caller_ceiling=body.caller_ceiling if body else None,
@@ -4346,6 +4361,7 @@ async def create_terminal_in_session(
     use_worktree: bool = False,
     idempotency_key: Optional[str] = None,
     claim_id: Optional[str] = Query(default=None, pattern=r"^[0-9a-f]{32}$"),
+    create_working_directory: bool = False,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -4391,6 +4407,14 @@ async def create_terminal_in_session(
     **409 CONFLICT** rather than that other request's terminal. A key whose
     terminal has since been torn down is stale, not conflicting, and simply
     creates fresh.
+
+    ``create_working_directory`` (#724, contract ruled by @plauzy and
+    @call-me-ram on PR #1036): opt in to CREATING ``working_directory`` when it
+    does not exist yet. Default false, so the fail-fast contract the MCP
+    ``handoff`` and ``assign`` tools document ("must exist and be accessible")
+    stays true -- they reach this route and send nothing, and a typo'd path
+    remains a correctable error instead of an empty tree the worker silently
+    starts in. See ``POST /sessions`` for the policy and point-of-use details.
     """
     launch_plan: LaunchPlan | None = None
     try:
@@ -4506,7 +4530,7 @@ async def create_terminal_in_session(
             use_worktree=use_worktree,
             idempotency_key=idempotency_key,
             claim_id=claim_id,
-            create_working_directory=True,
+            create_working_directory=create_working_directory,
             **_launch_options(launch_plan),
         )
         _set_launch_note(response, launch_plan)
@@ -4579,6 +4603,7 @@ async def create_terminal_in_session_as_operator(
     model: Optional[str] = None,
     use_worktree: bool = False,
     idempotency_key: Optional[str] = None,
+    create_working_directory: bool = False,
     body: Optional[OperatorTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -4609,6 +4634,10 @@ async def create_terminal_in_session_as_operator(
     and cannot know"); binding caller identity to an authenticated terminal is
     the tracked follow-up. Synchronous only: no ``defer_init``, no initial
     message; a message is sent to the created terminal afterwards.
+
+    ``create_working_directory`` (#724, contract ruled by @plauzy and
+    @call-me-ram on PR #1036): as on ``POST /sessions``. The Web UI's "Add
+    Agent" sends true; the default is the must-exist behavior.
     """
     try:
         validate_tmux_name(session_name, "session_name")
@@ -4634,6 +4663,16 @@ async def create_terminal_in_session_as_operator(
             resolved_provider = provider
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
+        # Same operator-typed spellings the sibling route and POST /sessions
+        # accept (see there); lexical only. This route IS the Web UI's "Add
+        # Agent", so it is an operator-facing create and gets the operator path
+        # handling: a typed ``~/src/app`` or ``"C:\\src\\app"`` would otherwise
+        # reach the backend verbatim.
+        try:
+            working_directory = normalize_working_directory(working_directory)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
         # No caller_id, delegating_terminal_id or caller_ceiling: the operator
         # branch of create_terminal, which records the profile's declared
         # ceiling (test_launch_path_invariant.py classifies this site).
@@ -4650,12 +4689,19 @@ async def create_terminal_in_session_as_operator(
             model=model,
             use_worktree=use_worktree,
             idempotency_key=idempotency_key,
+            create_working_directory=create_working_directory,
         )
     except HTTPException:
         raise
     except IdempotencyKeyConflict as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except (KiroPhase0KASError, KiroCapabilityError, KiroAgentPathError) as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except WorkingDirectoryError as e:
+        # A ValueError subclass, so it must precede the generic arm below, whose
+        # 404 means "session not found": a directory the policy refuses or the
+        # OS cannot create at the point of use (#724) is a bad request. Same
+        # ordering as the sibling route.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except TerminalLimitError as e:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))

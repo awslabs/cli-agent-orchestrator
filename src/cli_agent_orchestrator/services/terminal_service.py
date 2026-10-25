@@ -2035,7 +2035,14 @@ async def _create_terminal_unguarded(
         try:
             # The must-exist resolution every caller has always had, and the
             # one seam test harnesses stub (release_runtime maps a fictional
-            # /workspace onto a tmp dir here). The MCP tools never get past it.
+            # /workspace onto a tmp dir here).
+            #
+            # Who gets past a refusal here, exactly: only a caller that asked
+            # for creation. ``create_working_directory`` is false by default
+            # and false for every caller that does not set it, which includes
+            # the MCP ``handoff`` and ``assign`` tools -- they POST to the two
+            # create routes without the flag, so a path with a typo is still
+            # refused here and the agent can correct it. The Web UI sets it.
             resolved_working_directory = _resolve_working_directory(working_directory)
         except ValueError:
             if not (create_working_directory and working_directory is not None):

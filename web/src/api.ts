@@ -816,8 +816,13 @@ export const api = {
   // Synchronous create: no `initial_message`, so the server holds the response
   // until provider.initialize() returns. Budget from createBudgetMs(), never a
   // literal (#710, #1002).
+  // `create_working_directory=true` rides along with a typed path (#724): the
+  // operator picked a folder in the launch form, so a folder that does not
+  // exist yet is a request to create it, not a mistake to report. The server
+  // defaults the flag to false, which is what keeps the MCP tools' fail-fast
+  // contract intact -- they send nothing.
   createSession: async (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string) =>
-    fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: await createBudgetMs() }),
+    fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}&create_working_directory=true` : ''}`, { method: 'POST', timeoutMs: await createBudgetMs() }),
   deleteSession: async (name: string) => {
     const result = await fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${name}`, { method: 'DELETE' })
     if (!result?.success || (result.errors && result.errors.length > 0)) {
@@ -867,8 +872,9 @@ export const api = {
   // server records like a `POST /sessions` launch. test/api/test_web_client_contract.py
   // posts this exact shape at the real route, so a server-side tightening that
   // breaks this button fails CI instead of the browser.
+  // `create_working_directory=true` as in createSession above (#724).
   addTerminalToSession: async (sessionName: string, provider: string, agentProfile: string, workingDirectory?: string) =>
-    fetchJSON<Terminal>(`/sessions/${sessionName}/terminals:operator?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: await createBudgetMs() }),
+    fetchJSON<Terminal>(`/sessions/${sessionName}/terminals:operator?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}&create_working_directory=true` : ''}`, { method: 'POST', timeoutMs: await createBudgetMs() }),
 
   // Inbox
   getInboxMessages: (terminalId: string, limit?: number, status?: string) =>

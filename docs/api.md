@@ -242,23 +242,29 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   commits — commit and merge/push results before the terminal is deleted if
   they need to be kept. See the MCP `handoff`/`assign` tool descriptions for
   the full behavior.
-- `working_directory` on `POST /sessions` and
-  `POST /sessions/{session_name}/terminals` is normalized at the boundary
-  the way an operator types it into a browser field: surrounding quotes
-  (Explorer's "Copy as path") are stripped, `~` is expanded, and on WSL a
-  Windows drive path (`C:\x\y` or `C:/x/y`) is translated to the interop
+- `working_directory` on `POST /sessions`,
+  `POST /sessions/{session_name}/terminals` and
+  `POST /sessions/{session_name}/terminals:operator` is normalized at the
+  boundary the way an operator types it into a browser field: surrounding
+  quotes (Explorer's "Copy as path") are stripped, `~` is expanded, and on WSL
+  a Windows drive path (`C:\x\y` or `C:/x/y`) is translated to the interop
   mount (`/mnt/c/x/y`) when that drive is mounted. The normalization itself
   touches nothing on disk. The result is checked against the same path policy
   as the MCP tools (a missing target is judged by its nearest existing
-  ancestor, so `/tmp/new` and `/etc/new` are refused), and a missing directory
-  is created only once the session or terminal is actually being created,
-  after the duplicate-session, session-not-found and terminal-cap checks, so a
-  request that is rejected at any point leaves nothing behind. A relative
+  ancestor, so `/tmp/new` and `/etc/new` are refused). A relative
   path, an existing non-directory, an unmounted drive, a Windows path that
   walks out of its drive, a folder name over the 255-byte limit, or a
   directory the OS refuses to create is a `400` with a plain-language
   `detail` instead of a `500` from tmux. See
   [Working directory](working-directory.md).
+- `create_working_directory` (default `false`) on those same three routes opts
+  the request in to CREATING a missing `working_directory`. Default off, so the
+  directory must exist -- which is the contract the MCP `handoff`/`assign` tool
+  descriptions state, and they send nothing. The dashboard sends `true`
+  whenever the operator typed a path. When a request does opt in, the directory
+  is created only once the session or terminal is actually being created, after
+  the duplicate-session, session-not-found, terminal-cap and delegation-ceiling
+  checks, so a request rejected at any point leaves nothing behind.
 - `GET /sessions/{session_name}`, `DELETE /sessions/{session_name}` and
   `POST /sessions/{session_name}/label` prefix-normalize their name the same
   way `POST /sessions` does, so `demo` and `cao-demo` address one session on

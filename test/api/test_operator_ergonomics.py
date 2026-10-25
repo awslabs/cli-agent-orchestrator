@@ -530,6 +530,97 @@ class TestSettingsWritersStayOffTheEventLoop:
         assert settings_service.get_session_labels() == {"cao-demo": "Run"}
 
 
+class TestCreationIsPerRequest:
+    """The contract ruled by @plauzy and @call-me-ram on PR #1036, end to end.
+
+    haofeif's P3-1: both create endpoints used to pass
+    ``create_working_directory=True`` unconditionally, so the MCP ``handoff``
+    and ``assign`` tools -- which POST to those endpoints and whose descriptions
+    say the directory "must exist and be accessible" -- silently started getting
+    creation. An agent sending a typo'd path under an allowed parent got an
+    empty tree, a worker started in it, and the tool response claimed success.
+    The ruling: creation is per request, default off. The three tool
+    descriptions are true again and were left alone.
+
+    Driven through the REAL terminal_service with only the backend mocked, so
+    the assertion is about what happens on disk rather than about a forwarded
+    kwarg (``TestWorkingDirectoryNormalizationAtTheBoundary`` covers the
+    forwarding).
+    """
+
+    @pytest.fixture
+    def real_create(self):
+        from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+        ts = "cli_agent_orchestrator.services.terminal_service"
+        with (
+            patch(f"{ts}.db_delete_terminal"),
+            patch("cli_agent_orchestrator.backends.registry._backend") as backend,
+            patch(f"{ts}.generate_window_name", return_value="developer-abcd"),
+            patch(f"{ts}.generate_terminal_id", return_value="test1234"),
+            patch(f"{ts}.agent_profiles.load_agent_profile") as load_profile,
+        ):
+            load_profile.return_value = AgentProfile(name="developer", description="Developer")
+            backend.session_exists.return_value = False
+            backend.create_session.side_effect = RuntimeError("stop at the tmux create")
+            yield backend
+
+    def test_without_the_field_a_missing_directory_is_still_the_fail_fast_error(
+        self, client, real_create, tmp_path
+    ):
+        """What the MCP tools send: no field. The must-exist refusal they
+        document, and nothing created."""
+        target = tmp_path / "typo" / "project"
+        resp = client.post(
+            "/sessions",
+            params={
+                "provider": "kiro_cli",
+                "agent_profile": "developer",
+                "session_name": "cao-ff",
+                "working_directory": str(target),
+            },
+        )
+        assert resp.status_code == 400, resp.text
+        assert "does not exist" in resp.json()["detail"]
+        assert not target.exists()
+        real_create.create_session.assert_not_called()
+
+    def test_with_the_field_true_the_directory_is_created(self, client, real_create, tmp_path):
+        """What the dashboard sends. The mkdir happens at the point of use, so
+        the directory is there by the time tmux is asked to start in it."""
+        target = tmp_path / "new" / "project"
+        resp = client.post(
+            "/sessions",
+            params={
+                "provider": "kiro_cli",
+                "agent_profile": "developer",
+                "session_name": "cao-create",
+                "working_directory": str(target),
+                "create_working_directory": "true",
+            },
+        )
+        # The mocked backend raises at the tmux create, which is the point: the
+        # directory had to exist for that call to be reached at all.
+        assert resp.status_code == 500, resp.text
+        assert target.is_dir(), "create_working_directory=true did not create the folder"
+        assert real_create.create_session.call_args.args[3] == str(target.resolve())
+
+    def test_the_field_is_the_last_query_parameter_on_both_create_routes(self, client):
+        """haofeif reads the generated OpenAPI: appending keeps every existing
+        property index stable, so a client generated from the old schema still
+        lines up."""
+        schema = client.get("/openapi.json").json()
+        for path, method in (
+            ("/sessions", "post"),
+            ("/sessions/{session_name}/terminals", "post"),
+            ("/sessions/{session_name}/terminals:operator", "post"),
+        ):
+            names = [
+                p["name"] for p in schema["paths"][path][method]["parameters"] if p["in"] == "query"
+            ]
+            assert names[-1] == "create_working_directory", (path, names)
+
+
 class TestWorkingDirectoryNormalizationAtTheBoundary:
     """Both creation endpoints accept operator-typed spellings and reject an
     unusable path with a clear 400 before any service is reached."""
@@ -613,8 +704,9 @@ class TestWorkingDirectoryNormalizationAtTheBoundary:
 
     def test_create_session_asks_the_service_to_create_a_missing_folder(self, client, tmp_path):
         """The boundary creates NOTHING (plauzy, #724 review): it forwards the
-        normalized path and the create flag, and terminal_service makes the
-        directory at the point of use, after the checks that can 404/409/429."""
+        normalized path and the caller's create flag, and terminal_service makes
+        the directory at the point of use, after the checks that can
+        404/409/429."""
         target = tmp_path / "new" / "project"
         with patch("cli_agent_orchestrator.api.main.session_service") as svc:
             svc.create_session = AsyncMock(return_value=self._terminal())
@@ -624,6 +716,7 @@ class TestWorkingDirectoryNormalizationAtTheBoundary:
                     "provider": "kiro_cli",
                     "agent_profile": "developer",
                     "working_directory": str(target),
+                    "create_working_directory": "true",
                 },
             )
         assert resp.status_code == 201
@@ -739,6 +832,7 @@ class TestWorkingDirectoryNormalizationAtTheBoundary:
                     "provider": "kiro_cli",
                     "agent_profile": "developer",
                     "working_directory": f'"{tmp_path}"',
+                    "create_working_directory": "true",
                 },
             )
         assert resp.status_code == 201, resp.json()
