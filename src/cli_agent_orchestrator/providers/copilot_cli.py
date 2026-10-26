@@ -250,14 +250,14 @@ class CopilotCliProvider(BaseProvider):
         # resolver. This config is rebuilt fresh at every launch (persisted=False),
         # so the bundled server always learns the CAO that is about to start it.
         merged_servers: dict = {
+            # forward_terminal_identity injects this terminal's own
+            # CAO_TERMINAL_ID (the key is deliberately NOT hand-written in the
+            # literal below -- the forwarder is the one writer of it), and
+            # resolve_mcp_server_config adds the launching CAO's coordinates for
+            # the bundled server (#1066).
             "cao-mcp-server": forward_terminal_identity(
                 resolve_mcp_server_config(
-                    {
-                        "command": "cao-mcp-server",
-                        "args": [],
-                        "disabled": False,
-                        "env": {"CAO_TERMINAL_ID": self.terminal_id},
-                    }
+                    {"command": "cao-mcp-server", "args": [], "disabled": False}
                 ),
                 self.terminal_id,
                 server_name="cao-mcp-server",
