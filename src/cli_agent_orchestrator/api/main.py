@@ -10148,6 +10148,19 @@ def main():
 
     host = args.host or SERVER_HOST
     port = args.port or SERVER_PORT
+    # Mirror --agents-dir above: export the resolved values so cao_server_env()
+    # (read by the MCP-env forwarding in utils/mcp_resolution.py) sees this
+    # launch's actual address, not whatever CAO_API_HOST/PORT happened to be
+    # set to (or left at the 9889 default) before these flags were applied.
+    # An IPv4 wildcard bind is not a usable client address, so agents are
+    # pointed at loopback instead. "::" is left unmapped: asyncio binds an
+    # IPv6-only listener for it, loopback (127.0.0.1) can't reach that
+    # listener, and CAO_API_BASE_URL can't express an IPv6 host either, so
+    # there is no address this code could forward that would actually work.
+    if args.host:
+        os.environ["CAO_API_HOST"] = "127.0.0.1" if args.host == "0.0.0.0" else args.host
+    if args.port:
+        os.environ["CAO_API_PORT"] = str(port)
     # The lifespan records this port in the server lock's diagnostics (#406).
     app.state.server_port = port
     # Extend the CORS allowlist so a custom --host/--port still permits
