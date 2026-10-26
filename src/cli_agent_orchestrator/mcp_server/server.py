@@ -818,9 +818,9 @@ async def assign_elastic(
     denied = await asyncio.to_thread(_tool_denied_reason, "assign_elastic")
     if denied:
         return {"success": False, "terminal_id": None, "elastic": True, "message": denied}
-    from cli_agent_orchestrator.utils import agent_profiles
+    from cli_agent_orchestrator.utils.ephemeral_names import routes_to_ephemeral_store
 
-    if agent_profiles.routes_to_ephemeral_store(agent_profile):
+    if routes_to_ephemeral_store(agent_profile):
         from cli_agent_orchestrator.services.ephemeral_service import log_refusal
 
         text = f"remote_placement_not_allowed: ephemeral agent '{agent_profile}' can only launch on the node that created it; use assign or handoff"
@@ -1628,6 +1628,7 @@ def _tool_denied_reason(tool_name: str) -> Optional[str]:
         "workflow_run",
         "workflow_resume",
         "workflow_start",
+        "workflow_cancel",
     }:
         try:
             from cli_agent_orchestrator.services.settings_service import child_may_delegate
@@ -2730,6 +2731,10 @@ async def workflow_cancel(
     cancel is cooperative: the in-flight step runs to natural completion before the
     run settles to CANCELLED.
     """
+    denied = await asyncio.to_thread(_tool_denied_reason, "workflow_cancel")
+    if denied:
+        return {"ok": False, "error": denied}
+
     try:
         response = requests.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/cancel",

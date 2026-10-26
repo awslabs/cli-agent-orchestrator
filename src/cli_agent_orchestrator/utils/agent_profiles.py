@@ -16,14 +16,12 @@ import frontmatter
 from cli_agent_orchestrator.constants import CAO_HOME_DIR, LOCAL_AGENT_STORE_DIR, PROVIDERS
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.utils.env import resolve_env_vars
+from cli_agent_orchestrator.utils.ephemeral_names import routes_to_ephemeral_store
 from cli_agent_orchestrator.utils.paths import normalized_path
 
 logger = logging.getLogger(__name__)
 
 EPHEMERAL_LIVE_DIR = CAO_HOME_DIR / "ephemeral" / "live"
-_RESERVED_EPHEMERAL_PATTERN = re.compile(
-    r"^[A-Z][A-Za-z0-9]{1,23}-[a-z][a-z0-9_]{2,31}-[0-9a-f]{4}$"
-)
 
 
 class ProfileSource(str, Enum):
@@ -37,15 +35,12 @@ class EphemeralProfileUnavailable(ValueError):
     """A reserved name cannot be served by the ephemeral live store."""
 
 
-def routes_to_ephemeral_store(name: str) -> bool:
-    """Route reserved names exclusively to the server-owned live store."""
-    return _RESERVED_EPHEMERAL_PATTERN.fullmatch(name) is not None
-
-
 def load_launch_profile(name: str) -> tuple[AgentProfile, ProfileSource]:
     """Load a launch profile; reserved names never fall back to installed stores."""
     if not routes_to_ephemeral_store(name):
         return load_agent_profile(name), ProfileSource.INSTALLED
+    from cli_agent_orchestrator.clients import database
+
     try:
         path = _safe_join(EPHEMERAL_LIVE_DIR, f"{name}.md")
         if path is None:
@@ -58,7 +53,12 @@ def load_launch_profile(name: str) -> tuple[AgentProfile, ProfileSource]:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise OSError("ephemeral store file is unsafe")
             with os.fdopen(fd, "rb", closefd=False) as stream:
-                profile = parse_agent_profile_text(stream.read().decode("utf-8"), name)
+                payload = stream.read()
+            row = database.get_ephemeral_agent(name)
+            if row is None or hashlib.sha256(payload).hexdigest() != row.get("profile_sha256"):
+                raise ValueError("live profile integrity check failed")
+            # Parse exactly the bytes verified above, never a second file read.
+            profile = parse_agent_profile_text(payload.decode("utf-8"), name)
         finally:
             os.close(fd)
     except Exception as exc:

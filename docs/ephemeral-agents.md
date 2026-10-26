@@ -151,6 +151,15 @@ extraction failure tear down terminals owned by that call.
 | 422 | `invalid_request` for the claim body; invalid launch claim identifiers or claim-plus-reuse requests |
 | 500 | `unexpected_failure` |
 
+Every ephemeral live-profile load verifies the exact bytes parsed against the registry's
+`profile_sha256`, including claim-less launches and provider reloads. Missing rows or hashes
+and modified files fail closed. Finalize replaces the profile before updating its hash; a
+concurrent load can temporarily refuse the mismatched pair. Claim-less launches do not
+re-render profiles; pending names receive the empty skill catalog on their next claimed launch.
+A pending name created before this change and launched without a claim keeps its old
+profile, including the inherited skill catalog; that launch consumes the name. Only
+a claimed launch re-renders the pending profile with `skills: []`.
+
 Policy errors carry `{kind: "ephemeral_policy", rule, message}` and never echo creator text.
 Archives record claimed, finalized, bound and released events, plus refusal counts. Archive updates
 are best-effort. Released rows keep their terminal identity, so a surviving terminal remains
@@ -158,9 +167,9 @@ marked ephemeral and the existing delegation denial stays effective.
 
 ## Honesty statement
 
-> An ephemeral child's CAO-recorded allowlist is a subset of its creator's effective allowlist at creation time. Its profile cannot declare MCP servers, hooks, skills or native agents; installed agent plugins' MCP servers are not added at launch; and CAO will not launch it with a wider list. An ephemeral child cannot delegate, create ephemerals or start workflows through CAO's MCP tools unless the operator sets `child_may_delegate`. That is all this guarantees. It does not guarantee:
+> An ephemeral child's CAO-recorded allowlist is a subset of its creator's effective allowlist at creation time. Its generated profile declares only the CAO MCP server, no hooks or native agents, and `skills: []` so no skill catalog is inherited; named skills remain callable through `load_skill`; installed agent plugins' MCP servers are not added at launch; and CAO will not launch it with a wider list. An ephemeral child cannot create ephemerals. It cannot delegate or start or cancel workflows through CAO's MCP tools unless the operator sets `child_may_delegate`. That is all this guarantees. It does not guarantee:
 > 1. **Enforcement on every provider.** On Claude Code the native-tool ceiling is Hard. On Codex, an operator opt-in, `tools` is advisory: the child runs `--yolo` with a shell, and the MCP servers in the user's `~/.codex/config.toml` load. Kiro is unsupported until the deferred Kiro slice lands.
-> 2. **Per-tool MCP limits.** `@cao-mcp-server` is a server-level grant. A child can still message, answer or delete other terminals, and use every CAO tool that is not a delegation (#671).
+> 2. **Per-tool MCP limits.** `@cao-mcp-server` is a server-level grant. MCP `send_message`, `answer_user_prompt` and `delete_terminal` bind targets to the caller's permitted terminal tree (#912). State-changing memory and metadata tools and workflow authoring (`workflow_create`/`workflow_update`; a changed spec needs a new plan approval, on by default) still use the coarse server grant (#671). With `child_may_delegate=true`, workflow cancellation also uses that grant, without run ownership binding.
 > 3. **A privilege boundary.** A child with `execute_bash` or `fs_write` runs as the same OS user. It can call the local HTTP API directly with a `caller_id` it supplies itself, edit `settings.json`, or read `ephemeral/live/`.
 > 4. **Per-tool MCP enforcement for installed profiles** (#671). Installed profiles ARE now bounded by their creator's recorded delegation ceiling through the same comparison (see [tool-restrictions.md](tool-restrictions.md#cross-provider-inheritance)); the remaining gap is the server-level `@cao-mcp-server` grant above.
 

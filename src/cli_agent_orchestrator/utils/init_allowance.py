@@ -28,6 +28,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
 
+from cli_agent_orchestrator.utils.ephemeral_names import routes_to_ephemeral_store
+
 # Provider init is not one wait of ``provider_init_timeout`` (T). A successful
 # path legitimately spans several T-bounded phases. The longest that scales
 # with T is about 3T: Claude's shell wait + startup-prompt handler outer cap +
@@ -60,12 +62,12 @@ def resolve_init_timeout(
 
     The global value comes from this process's server settings (``settings``
     when given, else ``get_server_settings()``). A profile override is resolved
-    through ``load_launch_profile``, the same loader the server uses
-    (``terminal_service.py``, ``claude_code.py``, ``codex.py``) -- a reserved
-    ephemeral name is served exclusively from the server-owned live store, and
-    ``load_agent_profile`` alone cannot see it. A profile that cannot be loaded
-    here falls back to the global value rather than failing the caller -- the
-    server resolves the real profile itself; this only sizes a wait.
+    through ``load_launch_profile`` for installed profiles. Reserved ephemeral
+    names use the global value without loading: generated profiles have no init
+    override, and their server-owned loader verifies the state registry. MCP
+    clients must not open that registry merely to size a wait. The server loads
+    and verifies the real profile itself. An installed profile that cannot be
+    loaded here also falls back to the global value rather than failing the call.
 
     The result is ``max(global, override)``, not the override alone.
     ``BaseProvider.get_init_timeout`` prefers the override, but six providers
@@ -86,7 +88,7 @@ def resolve_init_timeout(
         settings = get_server_settings()
     base = int(settings["provider_init_timeout"])
 
-    if not agent_profile:
+    if not agent_profile or routes_to_ephemeral_store(agent_profile):
         return base
 
     from cli_agent_orchestrator.utils.agent_profiles import load_launch_profile
