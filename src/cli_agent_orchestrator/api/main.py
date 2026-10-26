@@ -76,6 +76,8 @@ from cli_agent_orchestrator.constants import (
     CORS_ORIGINS,
     DECISION_RESPONSE_HEADER,
     DEFAULT_PROVIDER,
+    DEFAULT_SERVER_HOST,
+    DEFAULT_SERVER_PORT,
     HANDOFF_RESULTS_ROUTE,
     INBOX_IMMEDIATE_DELIVERY_WAIT,
     INBOX_POLLING_INTERVAL,
@@ -10139,6 +10141,27 @@ def main():
 
     host = args.host or SERVER_HOST
     port = args.port or SERVER_PORT
+    # Publish the EFFECTIVE coordinates into the environment, before the
+    # lifespan can start and before any terminal can be created.
+    #
+    # ``server_coordinate_env()`` -- the single source for what a launched
+    # agent's bundled cao-mcp-server is told -- reads the ENVIRONMENT, while
+    # ``--host``/``--port`` previously reached only uvicorn. A server started
+    # with ``--port 9777`` and no ``CAO_API_PORT`` therefore handed its
+    # children nothing, and their assign/handoff/send_message calls went to
+    # 127.0.0.1:9889 (#1066). Writing the resolved values here makes what the
+    # children are told identical to what uvicorn binds, whichever way the
+    # operator expressed it.
+    #
+    # Only NON-DEFAULT values are published: a default ``cao-server`` leaves
+    # its environment untouched, so every launch command and MCP config it
+    # builds stays byte-identical. An env var that is already set and matches
+    # the default is left alone too -- it is still the operator's, and
+    # ``server_coordinate_env()`` already reports it.
+    if host != DEFAULT_SERVER_HOST:
+        os.environ["CAO_API_HOST"] = host
+    if port != DEFAULT_SERVER_PORT:
+        os.environ["CAO_API_PORT"] = str(port)
     # The lifespan records this port in the server lock's diagnostics (#406).
     app.state.server_port = port
     # Extend the CORS allowlist so a custom --host/--port still permits

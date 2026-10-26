@@ -475,9 +475,14 @@ DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
 # =============================================================================
 # Server Configuration
 # =============================================================================
-# FastAPI server settings for the CAO API
-SERVER_HOST = os.environ.get("CAO_API_HOST", "127.0.0.1")
-SERVER_PORT = int(os.environ.get("CAO_API_PORT", "9889"))
+# FastAPI server settings for the CAO API. The defaults are named because
+# ``cao-server`` compares its EFFECTIVE host/port against them to decide
+# whether it has coordinates worth handing to the agents it launches (#1066) --
+# a comparison against a re-spelled literal would drift.
+DEFAULT_SERVER_HOST = "127.0.0.1"
+DEFAULT_SERVER_PORT = 9889
+SERVER_HOST = os.environ.get("CAO_API_HOST", DEFAULT_SERVER_HOST)
+SERVER_PORT = int(os.environ.get("CAO_API_PORT", str(DEFAULT_SERVER_PORT)))
 SERVER_VERSION = "0.1.0"
 
 
