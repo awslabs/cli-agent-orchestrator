@@ -688,6 +688,67 @@ def test_a_root_that_can_no_longer_be_identified_is_refused(tmp_path, monkeypatc
         launch_guard.check("run-1", "worker")
 
 
+def test_only_the_device_changing_is_refused(tmp_path, monkeypatch):
+    """fanhongy's P3-3 on PR #1051: a different FILESYSTEM mounted at the recorded path.
+
+    The production comparison is dict-equality and is correct today, but every other replacement test
+    renames and re-``mkdir``s on ONE filesystem, where the inode always differs. fanhongy mutated the
+    comparison to ``...get("inode") != recorded.get("inode")`` and all 422 focused tests still passed.
+    A regression to an inode-only comparison would therefore ship green and silently lose the
+    mount-point case -- the one that matters most, because a different filesystem mounted at the
+    working-directory path has the SAME root inode (2 on ext4) and differs only in ``st_dev``.
+
+    The device is changed by patching ``os.stat``'s result rather than by mounting a second
+    filesystem: a mount needs privileges CI does not have, and what is under test is the comparison,
+    not the kernel. The patch is narrowed to this root's path so pytest's own machinery keeps stat'ing
+    normally.
+    """
+    import os
+
+    _pinned_store(tmp_path, monkeypatch)
+    root = _non_git_root(tmp_path)
+    recorded = launch_guard.git_baseline.root_identity(str(root))
+    assert recorded["bound"] is True
+    guard = launch_guard.capture(root_identity=recorded)
+    _admit_with_root(monkeypatch, guard, root)
+    launch_guard.check("run-1", "worker")  # unpatched: the same device and inode, so it passes
+
+    real_stat = os.stat
+    resolved = os.path.realpath(str(root))
+
+    class _RemountedDevice:
+        """``os.stat``'s result for this one path, with ONLY ``st_dev`` different."""
+
+        def __init__(self, info):
+            self._info = info
+
+        @property
+        def st_dev(self):
+            return self._info.st_dev + 1
+
+        def __getattr__(self, name):
+            return getattr(self._info, name)
+
+    def stat_with_a_new_device(path, *args, **kwargs):
+        info = real_stat(path, *args, **kwargs)
+        if isinstance(path, (str, bytes, os.PathLike)) and os.fspath(path) in (
+            str(root),
+            resolved,
+        ):
+            return _RemountedDevice(info)
+        return info
+
+    monkeypatch.setattr(os, "stat", stat_with_a_new_device)
+    live = launch_guard.git_baseline.root_identity(str(root))
+    assert live["inode"] == recorded["inode"] and live["device"] != recorded["device"], (
+        "fixture assumption broken: this test must change the device half and ONLY the device half "
+        f"(recorded={recorded}, live={live})"
+    )
+
+    with pytest.raises(launch_guard.PlanInputsChangedError, match="path is unchanged"):
+        launch_guard.check("run-1", "worker")
+
+
 def test_a_git_root_replaced_at_the_same_path_is_refused_at_the_next_launch(tmp_path, monkeypatch):
     """PIN 3 of fanhongy's ask 2 on PR #1051. This is fanhongy's probe, as a test.
 
