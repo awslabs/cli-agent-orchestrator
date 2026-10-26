@@ -337,6 +337,9 @@ bun "$SKILL_DIR/scripts/portfolio.ts" learning list \
   --root <root> --project <project> --status pending
 ```
 
+Check `destination`: a `team` learning is delivered to every project's
+runners; reject and ask for a `project` proposal if it is project-specific.
+
 To accept, write the rule into CAO memory with the `memory_store` MCP tool
 (scope `project`, memory_type `feedback`), then record that promotion with
 the `key` that `memory_store` returned:

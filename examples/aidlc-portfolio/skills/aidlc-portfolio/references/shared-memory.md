@@ -30,7 +30,9 @@ before it becomes canonical — the review is the supervisor deciding whether to
    space, destination, a target heading, one normalized rule, evidence, and the
    source stage. It carries no baseline revision.
 2. The supervisor reviews the proposal with `learning list` for duplication,
-   contradiction, and scope.
+   contradiction, and scope. Check `destination`: a `team` learning is
+   delivered to every project's runners; reject and ask for a `project`
+   proposal if it is project-specific.
 3. To accept, the supervisor writes the rule into CAO memory with the
    `memory_store` MCP tool — scope `project`, memory_type `feedback` — then
    records that promotion with `learning promote --promoted-by <supervisor>
