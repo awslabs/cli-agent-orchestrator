@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Decision points say when a decider keeps failing, and records carry their target kind**
+  (#1067). The server logs one warning when a decider starts failing at a point (`timeout`,
+  `error`, `invalid_answer`, `no_answer` or `decider_unavailable`), at most once a minute for
+  each decider, point and reason, and one line when it answers again. These lines name only
+  the decider, point and reason. The server also logs its resolved threshold, timeouts, point
+  states and deciders at startup and when they change. `cao decisions status` adds
+  `decider_status`: each decider's last outcome, reason and time, and its counts by reason over
+  the last 24 hours, read from the database read-only. `decision_records` gains a nullable
+  `target_kind` column (`installed`, `ephemeral` or `workflow`); existing rows stay null.
+
 - **Inbox deliveries confirm the submit and recover a swallowed Enter** (#78). A delivery is
   paste, delay, Enter; when the TUI swallows the Enter the message sat unsubmitted while the
   terminal still read IDLE, so the sender waited forever and the next message was pasted on top

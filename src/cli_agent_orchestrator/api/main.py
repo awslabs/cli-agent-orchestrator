@@ -1657,9 +1657,9 @@ async def lifespan(app: FastAPI):
         decision_runner,
         settings_loader=decision_settings_loader,
     )
-    logger.info(
-        "Decision states: %s", {p: v.state.value for p, v in decision_settings.points.items()}
-    )
+    # Logs the resolved threshold, timeouts, point states and deciders, then each change.
+    app.state.decision_engine.log_settings(decision_settings)
+    decision_settings_task = asyncio.create_task(app.state.decision_engine.watch_settings())
     _seed_default_skills_at_startup()
     _reconcile_memory_at_startup()
     registry = PluginRegistry()
@@ -1804,6 +1804,8 @@ async def lifespan(app: FastAPI):
     # asyncio.gather with the tasks above.
     fifo_manager.stop_watchdog()
 
+    decision_settings_task.cancel()
+    await asyncio.gather(decision_settings_task, return_exceptions=True)
     await decision_runner.close()
     await decision_registry.close()
     await registry.teardown()
