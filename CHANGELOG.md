@@ -183,13 +183,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Ephemeral agents accept `model_tier: "auto"` (#1068). At launch, after the claim and before the bind, `assign` and both `handoff` paths ask `model.route` for that name only; explicit and omitted tiers never ask. Off and shadow launch on `ephemeral.default_tier`; on applies a confident answer capped into `[min_tier, max_tier]`, and falls back on any unusable answer. `auto` needs both `ephemeral.min_tier` and `ephemeral.max_tier` (`auto_requires_bounds`) and a `claim_lease_seconds` of at least `decisions.on_timeout_ms / 1000 + 30`. The ephemeral archive records the decision record ids. `effort: "auto"` still refuses.
+
 - Decision policy bounds take an optional model tier floor (#1068, #810): an explicit tier below it is refused as `below_floor`, a decider answer below it is capped up to it, and mappings are required from the floor to the ceiling. A delegation to an ephemeral target can carry the creator's description, redacted, in `profile_description`.
 
 - Ephemeral agents (#801) accept an optional `ephemeral.min_tier` floor. An explicit tier below it refuses with `tier_below_policy`, and a stored tier or provider default below a floor raised since create refuses at claim with `policy_changed_since_create:tier_below_policy`. Unknown `ephemeral.*` keys now log one warning per server process naming the keys, never their values.
 
 - Ephemeral agents (#801) accept an explicit `effort` and apply `ephemeral.default_effort` and `ephemeral.max_effort` (Claude Code `--effort`, Codex `model_reasoning_effort`).
 
-- Ephemeral agents (#801) accept an explicit `model_tier` and apply `ephemeral.default_tier`, `ephemeral.max_tier` and the top-level `model_tiers` table at create, and again at claim. `auto` still refuses.
+- Ephemeral agents (#801) accept an explicit `model_tier` and apply `ephemeral.default_tier`, `ephemeral.max_tier` and the top-level `model_tiers` table at create, and again at claim.
 
 - `examples/decision-model-host`: hosts the open-weight JevK5-4B decision model behind
   a loopback-only `/v1/systemone` API. Locally, it uses llama.cpp, with Metal or the CPU.
@@ -290,7 +292,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retained. There is no background sweep, so keep the feature disabled outside testing.
   The live files and archive can be deleted by exact path while no ephemeral
   terminal exists. Reserved names also refuse remote placement with
-  `remote_placement_not_allowed`. `auto` still requires the decision platform.
+  `remote_placement_not_allowed`. `effort: "auto"` still requires the decision platform.
 - Advanced CodeQL analysis for same-repository and fork pull requests, with
   Python, JavaScript/TypeScript, GitHub Actions, and Rust coverage, plus `main`,
   weekly, and manual scans. CI workflow definitions and their `CODEOWNERS`

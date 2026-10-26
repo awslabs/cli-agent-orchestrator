@@ -134,6 +134,8 @@ def get_ephemeral_settings() -> Dict[str, Any]:
         block = {}
     result = {**EPHEMERAL_DEFAULTS, **block}
     result["_model_tiers"] = load_model_tiers(settings)
+    # #1068 A15: an auto spec's lease floor reads the on-mode timeout from this same snapshot.
+    result["_decisions"] = settings.get("decisions")
     # child_may_delegate() reads its own key from the same block.
     result["_unknown_keys"] = sorted(set(block) - set(EPHEMERAL_DEFAULTS) - {"child_may_delegate"})
     return result

@@ -60,14 +60,15 @@ lock file can't be created, as on a read-only home — every create is refused w
 
 ## Model tier and effort
 
-`model_tier` accepts `small`, `medium`, or `large`; `effort` accepts `low`, `medium`,
-or `high`. Either can be omitted. `auto` in either field still refuses with
+`model_tier` accepts `small`, `medium`, `large` or `auto`; `effort` accepts `low`,
+`medium`, or `high`. Either can be omitted. `auto` asks a decider at launch (see
+[Model tier `auto`](#model-tier-auto)); `effort: "auto"` still refuses with
 `auto_requires_decision_platform`.
 
 Tier and effort resolve once at create: the explicit value, else
 `ephemeral.default_tier` or `ephemeral.default_effort`, else none. The registry row and response hold that resolved
 value; the stored spec keeps what was requested. Changing a default later never
-changes a pending name. No decider is asked for an ephemeral agent in any field state.
+changes a pending name. An explicit or omitted tier never asks a decider.
 
 Configure the top-level tier table with model ids for each allowed provider:
 
@@ -103,6 +104,56 @@ Effort becomes Claude Code's `claudeConfig.effort` (`--effort`) or Codex's
 `codexConfig.model_reasoning_effort`. Values pass through verbatim. A CLI rejection
 for a particular model is a launch failure, not a policy refusal. With effort omitted
 and no default, no provider config or effort flag is emitted.
+
+### Model tier `auto`
+
+With `model_tier: "auto"`, the `model.route` decision point sizes the child at launch
+(see [Launch decisions](decisions.md)). Only this literal value asks. A decider never
+chooses tools, the provider, or whether to spawn a child at all.
+
+`auto` needs both `ephemeral.min_tier` and `ephemeral.max_tier`; without them create
+refuses with `auto_requires_bounds`. It also needs `claim_lease_seconds` of at least
+`decisions.on_timeout_ms / 1000 + 30`, counting a `CAO_DECISION_ON_TIMEOUT_MS` override,
+so that a slow answer cannot outlive the claim; otherwise create refuses with
+`policy_config_error:claim_lease_seconds`. An `auto` name stores `default_tier` as its
+fallback: the row, response and live profile hold that tier, and the stored spec keeps
+`auto`.
+
+The decision runs in the server after the claim and before the bind, for `assign`, the
+early `handoff` path and the default `handoff`:
+
+- **off**, or after `cao decisions off`: nothing is asked or recorded, and the child runs on the fallback.
+- **shadow**: one decision record names the ephemeral agent. The child launches on the fallback without waiting; the answer is recorded and never applied.
+- **on**: the server waits up to `decisions.on_timeout_ms`. A confident answer is capped into `[min_tier, max_tier]` and the child runs on that tier's mapped model. An `unsure`, low-confidence, timed-out, failed or out-of-set answer runs the fallback, and the record names the reason. A decider failure never fails the launch.
+
+The decided model applies to that launch only, through its launch plan. The live profile
+and the archive keep the fallback, and the archive gains a `decided` event that holds
+only the decision record ids. A launch without a claim identifier asks nothing and runs
+the live profile. A keyed retry of a launched name reattaches without a second decision.
+
+The decider receives the redacted task message, the purpose and the creator-written
+description, but never the brief or a profile name. Shadow sends the same data as on. A
+decider package whose consent binds the fields it receives needs fresh operator consent
+before it sees an ephemeral description. The built-in `fixed_table` answers only by
+profile or role, which ephemeral agents lack, so it always falls back for them.
+
+At claim, an `auto` name whose bounds or lease no longer qualify refuses with
+`policy_config_error:<key>` and returns to `pending`. Just before the decision, the
+server rechecks the stored policy with the claim's usual rules: a tightened policy gives
+`policy_changed_since_create:<rule>` and collects the name, and a broken block gives
+`policy_config_error:<key>` and returns it to `pending`. A refusal from the decision
+engine maps onto the same rules, and an unknown one gives `unexpected_failure` and
+returns the name to `pending`. Just before the bind, whatever the decision's outcome, the
+server rechecks once more against a fresh snapshot, so a policy change made while the
+decider ran still applies. The stored policy is checked as above, so a fallback tier that is
+now outside `[min_tier, max_tier]` collects the name. An applied answer whose tier is now
+outside the bounds gives `policy_changed_since_create:<rule>` and collects the name. A remap
+of the launched tier to a new model id changes no bound: the child runs on the tier's current
+model. An answer applies even when its decision record can't be written, the same as for
+installed targets: the recheck reverse-maps the launched model through the current table to
+recover its tier. The store's own warning is the signal that a record went unwritten. A
+decision that outlives the claim lease cannot bind: the launch refuses with `claim_expired`,
+and no terminal is created.
 
 **Upgrade note:** earlier releases ignored the tier and effort keys and table with a warning,
 whatever their values. All four tier and effort keys are now validated. A previously accepted block, such as a
@@ -261,7 +312,7 @@ extraction failure tear down terminals owned by that call.
 | 500 | `unexpected_failure` |
 
 Create also refuses with `tier_unmapped`, `tier_exceeds_policy`, `tier_below_policy`,
-`effort_exceeds_policy` and `policy_config_error:<key>`, all HTTP 400.
+`effort_exceeds_policy`, `auto_requires_bounds` and `policy_config_error:<key>`, all HTTP 400.
 
 Every ephemeral live-profile load verifies the exact bytes parsed against the registry's
 `profile_sha256`, including claim-less launches and provider reloads. Missing rows or hashes
@@ -275,7 +326,7 @@ profile, including the inherited skill catalog; that launch consumes the name. O
 a claimed launch re-renders the pending profile with `skills: []`.
 
 Policy errors carry `{kind: "ephemeral_policy", rule, message}` and never echo creator text.
-Archives record claimed, finalized, bound and released events, plus refusal counts. Archive updates
+Archives record claimed, finalized, decided, bound and released events, plus refusal counts. Archive updates
 are best-effort. Released rows keep their terminal identity, so a surviving terminal remains
 marked ephemeral and the existing delegation denial stays effective.
 

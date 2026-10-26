@@ -51,6 +51,15 @@ ALLOWLIST: Dict[str, str] = {
         "unparseable user mcp.json loses its servers from the CAO copy; the user's "
         "own file is never rewritten."
     ),
+    "cli_agent_orchestrator/services/ephemeral_service.py::decision_inputs": (
+        "_stored_spec() degrades an unreadable or modified spec to None by design: "
+        "the claimed launch then asks no decider and keeps the fallback the claim "
+        "finalized (#1068). Every JSON write it reaches is an archive update through "
+        "_audit_update (the refusal count, and the released event when a tightened "
+        "policy collects the name), which re-reads the archive itself and skips the "
+        "write when that read fails. _stored_spec returns None, not a default, and "
+        "the spec file is write-once."
+    ),
     # --- Live instances of the #737 class, found by this guard. Each rewrites the
     # --- same file it read leniently. Recorded, not fixed here: they are separate
     # --- issues (see .sweep/out/guard.md for GH#737).

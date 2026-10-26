@@ -5,8 +5,10 @@ the caller omits a model. Local and remote assign, elastic assign, handoff and
 CLI handoff use it. Both decision points are **off by default**, so normal
 launches keep their existing behavior until an operator enables routing.
 
-Plain terminal creates and older clients that do not send the original task
-message are not routed. An empty task message is also not routed: local and
+An ephemeral agent is routed only when its spec set `model_tier: "auto"`; see
+[Ephemeral agents](ephemeral-agents.md#model-tier-auto). Plain terminal creates and
+older clients that do not send the original task message are not routed. An empty
+task message is also not routed: local and
 remote assign, elastic assign, handoff and CLI handoff launch it unrouted
 rather than refusing it, the same as when no message is sent at all. The CLI
 still refuses an empty `--message-file` before it launches anything. Reusing a
@@ -423,7 +425,8 @@ need an interactive terminal. CAO's own agent-facing tools offer no consent.
 - A decider that blocks the event loop cannot be preempted by an asynchronous timeout.
 - Terminal records expose the launched model and whether it was honored, independently of decision state; decision fields stay in operator records.
 - If a policy tightens between a launch and `create_terminal`'s own idempotent retry, the retry can be refused before replaying the existing terminal. This does not occur with an identity policy. Each replayed delegation create writes its own `not_launched` row; in shadow or on the decider is asked again.
-- A direct API delegation to a reserved ephemeral name without a claim, carrying a per-call model, is refused at the delegation site with HTTP 400 "set the tier in the spec instead of a per-call model". The response names no reason code and no decision record is written. The ephemeral launch policy never sees the request, so it does not log the refusal either. Assign and handoff refuse reserved names before sending any request. A claimed launch skips the delegation site and is refused, and logged, by the ephemeral policy itself.
+- A direct API delegation to a reserved ephemeral name without a claim, carrying a per-call model, is refused at the delegation site with HTTP 400 "set the tier in the spec instead of a per-call model". The response names no reason code and no decision record is written. The ephemeral launch policy never sees the request, so it does not log the refusal either. Assign and handoff refuse reserved names before sending any request. A claimed launch with a per-call model asks no decider and is refused, and logged, by the ephemeral policy itself.
+- A claimed ephemeral launch asks `model.route` only when its stored spec declared `model_tier: "auto"` (see [Ephemeral agents](ephemeral-agents.md#model-tier-auto)). Explicit and omitted tiers, and launches without a claim, ask nothing and write no record. The decided model applies through the launch plan only; the ephemeral archive stores the record ids. `effort.route` is never asked for an ephemeral target.
 - A delegation is decided before the server applies the creator's delegation ceiling. A launch
   the ceiling refuses (403) has still been decided: in shadow or on, the decider was asked once
   with the redacted message, and in on mode the refusal waits for that answer. Its records are
