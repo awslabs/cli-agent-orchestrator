@@ -965,9 +965,12 @@ class TestBuildCommand:
         assert manifest["mcpServers"]["cao-mcp-server"]["command"] == "/venv/bin/cao-mcp-server"
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
-    def test_mcp_preserves_existing_cao_terminal_id(self, mock_load):
-        # The constructor's terminal_id must NOT override an
-        # explicit preset (matches the prior --mcp behaviour).
+    def test_mcp_overrides_a_profile_declared_cao_terminal_id(self, mock_load):
+        # The constructor's terminal_id always wins. This asserted the
+        # opposite until #1062: the MCP gates authorize on this value, so
+        # honouring a profile's preset let the profile pick its own
+        # authorization posture. See
+        # test/providers/test_terminal_identity_forwarding.py.
         import json
         from pathlib import Path
 
@@ -988,7 +991,7 @@ class TestBuildCommand:
         assert m is not None
         plugin_dir = Path(m.group(1))
         manifest = json.loads((plugin_dir / "plugin.json").read_text(encoding="utf-8"))
-        assert manifest["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "preset"
+        assert manifest["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
     def test_tool_restrictions_skip_system_prompt(self, mock_load):

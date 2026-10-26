@@ -142,6 +142,62 @@ def resolve_mcp_server_config(config: dict, *, persisted: bool = False) -> dict:
     return resolved
 
 
+#: The env var that tells a CAO MCP server which terminal is calling it. Every
+#: authorization decision taken next to an agent keys on it
+#: (``security.mcp_tool_gate.caller_is_bound``), which is why a profile does not
+#: get to choose its value.
+CAO_TERMINAL_ID_ENV = "CAO_TERMINAL_ID"
+
+#: The MCP config field carrying a server's environment, in every provider format
+#: that has one.
+_ENV_FIELD = "env"
+
+
+def forward_terminal_identity(config: dict, terminal_id: str, *, server_name: str = "") -> dict:
+    """Return ``config`` with ``CAO_TERMINAL_ID`` pinned to the REAL terminal id.
+
+    Providers whose agent does not pass its own environment to MCP subprocesses
+    have to inject the identity into each server entry's ``env``. Four of them
+    (claude_code, cursor_cli, omp, kimi_cli) each wrote
+    ``if "CAO_TERMINAL_ID" not in env`` -- "do not override an explicit preset",
+    from the days when the value was a convenience for handoff/assign rather than
+    an authorization input. It has been an authorization input since #671/#972:
+    the MCP gates read it to decide whether the caller is a bound terminal gated
+    on its recorded allowlist, or an operator context that is not gated at all.
+    Honouring a profile's preset therefore let the profile pick its own
+    authorization posture -- ``env: {CAO_TERMINAL_ID: ""}`` was an operator
+    context until the companion fix in ``caller_is_bound``, and a preset naming
+    ANOTHER terminal's id still borrows that terminal's allowlist. Found by
+    independent review of #1062; #940/#958 took the same decision for
+    antigravity, where a pinned id also leaked across terminals.
+
+    So: the launching terminal's own id always wins, and a profile that tried to
+    pin one is logged rather than silently obeyed -- the operator who wrote the
+    profile needs to know its line had no effect. Values other than
+    ``CAO_TERMINAL_ID`` in ``env`` are untouched.
+
+    PURE: returns a new entry with a new ``env`` dict, so a caller iterating a
+    profile's ``mcpServers`` cannot have the profile's own nested dict mutated
+    underneath it (the previous in-place ``env[...] = ...`` did exactly that).
+    """
+    entry = dict(config)
+    env = dict(entry.get(_ENV_FIELD) or {})
+    declared = env.get(CAO_TERMINAL_ID_ENV)
+    if declared is not None and declared != terminal_id:
+        logger.warning(
+            "Overriding %s=%r declared in the env of MCP server %r: a profile does not "
+            "choose the calling terminal's identity -- the CAO MCP gates authorize on "
+            "it -- so this server is launched with this terminal's own id (%s)",
+            CAO_TERMINAL_ID_ENV,
+            declared,
+            server_name or entry.get("command", ""),
+            terminal_id,
+        )
+    env[CAO_TERMINAL_ID_ENV] = terminal_id
+    entry[_ENV_FIELD] = env
+    return entry
+
+
 #: The POSIX shell fragment that carries a working directory for a provider whose
 #: MCP config format has no field for one. ``$1`` is the directory, ``$0`` is the
 #: label below, and everything after ``$1`` is the real command. ``exec`` replaces
