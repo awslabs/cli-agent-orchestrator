@@ -134,6 +134,7 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilityError,
     KiroPhase0KASError,
 )
+from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
     SCOPE_READ,
@@ -4274,7 +4275,12 @@ async def create_terminal_in_session(
         # that arm: IdempotencyKeyConflict is not a ValueError, so no reorder
         # of the ValueError family can shadow it.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except (KiroPhase0KASError, KiroCapabilityError, KiroAgentPathError) as e:
+    except (
+        KiroPhase0KASError,
+        KiroCapabilityError,
+        KiroAgentPathError,
+        KiroAgentIdentityError,
+    ) as e:
         # These subclass ValueError, so they must precede the generic arm below —
         # a rejected configuration is a bad request, not a missing resource. Matches
         # POST /sessions, which already returns 400 for the identical failure.
@@ -4402,7 +4408,12 @@ async def create_terminal_in_session_as_operator(
         raise
     except IdempotencyKeyConflict as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except (KiroPhase0KASError, KiroCapabilityError, KiroAgentPathError) as e:
+    except (
+        KiroPhase0KASError,
+        KiroCapabilityError,
+        KiroAgentPathError,
+        KiroAgentIdentityError,
+    ) as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except TerminalLimitError as e:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
@@ -5428,7 +5439,12 @@ async def run_step(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail={"message": str(e), "kind": "timeout", "terminal_id": None},
         )
-    except (KiroPhase0KASError, KiroCapabilityError, KiroAgentPathError) as e:
+    except (
+        KiroPhase0KASError,
+        KiroCapabilityError,
+        KiroAgentPathError,
+        KiroAgentIdentityError,
+    ) as e:
         # Ordered before the ValueError arm they subclass: a configuration rejection is
         # a bad request, not an unknown terminal.
         _settle_step(None, str(e))

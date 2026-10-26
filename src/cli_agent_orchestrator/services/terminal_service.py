@@ -120,6 +120,7 @@ from cli_agent_orchestrator.services.install_service import (
     installed_kiro_tools,
     installed_opencode_permission,
     kiro_install_predates_native_enforcement,
+    require_kiro_agent_resolves,
 )
 from cli_agent_orchestrator.services.memory_gateway import (
     memory_context_for_terminal,
@@ -1845,8 +1846,10 @@ async def _create_terminal_unguarded(
                 # No readable agent file with a `tools` list: on Kiro the installed
                 # file IS the policy, so the server cannot say what this launch
                 # would run. A bounded create fails closed here rather than
-                # skipping the check; the operator path is untouched (Kiro would
-                # fail to start the agent anyway, this just names the reason).
+                # skipping the check. Kiro itself would NOT fail on a missing
+                # agent: it starts its built-in kiro_default with every built-in
+                # tool (#1074). Unbounded and operator launches are covered by
+                # Step 1c's agent check and the provider's header identity check.
                 raise InstalledPolicyExceedsAllowlistError(
                     f"Delegation refused: no installed Kiro agent file with a `tools` list "
                     f"was found for '{agent_profile}', so the policy this bounded launch "
@@ -1982,6 +1985,15 @@ async def _create_terminal_unguarded(
         # (defeating the isolation #100 provides) and persist that stale path as the
         # terminal's working_directory. This is the effective launch cwd either way.
         resolved_working_directory = _resolve_working_directory(working_directory)
+
+        # Step 1c: a Kiro launch must name an agent kiro-cli will load. kiro-cli
+        # does not refuse an unknown --agent; it starts its built-in kiro_default
+        # with every built-in tool (#1074). Refused here, before any window or
+        # row exists, from the launch cwd (workspace agents live under it). The
+        # provider re-checks the pane header before any task is typed.
+        # Provisional (#1074): installed launches refuse rather than warn.
+        if provider == ProviderType.KIRO_CLI.value:
+            require_kiro_agent_resolves(agent_profile, resolved_working_directory, env_vars)
 
         # Normalize the session name BEFORE anything keys off it: the lifecycle
         # lock below is per session NAME, so it must be taken on the SAME string

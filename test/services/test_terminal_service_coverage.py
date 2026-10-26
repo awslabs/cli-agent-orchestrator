@@ -10,7 +10,7 @@ import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
-pytestmark = pytest.mark.usefixtures("isolated_memory_db")
+pytestmark = pytest.mark.usefixtures("isolated_memory_db", "kiro_agent_store_not_under_test")
 
 
 class TestCreateTerminalCleanup:

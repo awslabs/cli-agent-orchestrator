@@ -33,6 +33,11 @@ from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroPhase0KASError,
     build_kiro_command,
 )
+from cli_agent_orchestrator.providers.kiro_identity import (
+    KiroAgentIdentityError,
+    header_agent,
+    require_header_identity,
+)
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
@@ -181,6 +186,14 @@ TUI_TRUST_ALL_TOOLS_CURSOR = r"❯\s*No, exit"
 
 # Bottom pane lines scanned for the consent dialog (mirrors codex's window).
 STARTUP_PROMPT_BOTTOM_LINES = 15
+
+# Reads of the screen for the TUI header after the prompt is ready (see
+# KiroCliProvider._verify_agent_identity). Only a screen with no header row is
+# read again; a header naming the wrong agent is refused on the first read.
+# Provisional (#1074): about 2 s, after which a screen without a header (a
+# kiro-cli TUI change, say) is refused rather than trusted.
+IDENTITY_HEADER_READS = 5
+IDENTITY_HEADER_READ_INTERVAL_S = 0.5
 
 # =============================================================================
 # Error Detection
@@ -340,12 +353,15 @@ class KiroCliProvider(BaseProvider):
         1. Waits for the shell to be ready in the tmux window
         2. Sends the kiro-cli chat command with the configured agent profile
         3. Waits for the agent to reach IDLE state (ready for input)
+        4. Checks that the TUI header names the configured agent profile
 
         Returns:
             True if initialization was successful
 
         Raises:
             TimeoutError: If shell or Kiro CLI initialization times out
+            KiroAgentIdentityError: If kiro-cli started a different agent (for
+                example its ``kiro_default`` fallback) or no header was read
         """
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
@@ -419,8 +435,58 @@ class KiroCliProvider(BaseProvider):
                 f"(engine={self._engine.value}, profile={self._agent_profile!r})"
             )
 
+        # Step 4: the prompt being ready does not mean the requested agent is
+        # running. Nothing is typed into the pane until the header names it.
+        await self._verify_agent_identity()
+
         self._initialized = True
         return True
+
+    async def _verify_agent_identity(self) -> None:
+        """Raise unless the TUI header names this provider's agent (#1074).
+
+        kiro-cli answers an ``--agent`` it cannot load by starting its built-in
+        ``kiro_default`` agent, which has every built-in tool, and reaches the
+        same ready prompt. Called after the prompt is ready and before
+        ``initialize`` returns, so on a refusal no task has been typed: the
+        creation path tears the terminal down (or records the failure for its
+        external owner), and the pane receives no keys from here. Provisional
+        (#1074): no ``/exit`` is typed into the wrong agent either.
+
+        Reads the rendered screen, not the scrollback, so the requested name in
+        the echoed launch command is never what is matched (see
+        ``kiro_identity.header_agent``). A screen without a header row is read
+        again a few times, because the header can trail the prompt by a frame.
+
+        Raises:
+            KiroAgentIdentityError: ``identity_mismatch`` or ``header_not_found``.
+        """
+        backend = get_backend()
+        observed: Optional[str] = None
+        for attempt in range(IDENTITY_HEADER_READS):
+            if attempt:
+                await asyncio.sleep(IDENTITY_HEADER_READ_INTERVAL_S)
+            try:
+                screen = await asyncio.to_thread(
+                    backend.get_history,
+                    self.session_name,
+                    self.window_name,
+                    strip_escapes=True,
+                    visible_only=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - an unread screen is not identity
+                logger.debug("kiro_cli: screen read for the identity check failed: %s", exc)
+                continue
+            observed = header_agent(screen) if isinstance(screen, str) else None
+            if observed is not None:
+                break
+        try:
+            require_header_identity(self._agent_profile, observed)
+        except KiroAgentIdentityError as exc:
+            logger.error(
+                "kiro_cli: terminal %s refused before any input: %s", self.terminal_id, exc
+            )
+            raise
 
     async def _wait_ready_accepting_trust_dialog(self) -> bool:
         """Wait for the agent prompt, auto-answering the trust-all-tools dialog.

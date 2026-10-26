@@ -35,6 +35,22 @@ def mock_kiro_capability_probe(monkeypatch):
 
 
 @pytest.fixture
+def kiro_agent_store_not_under_test(monkeypatch):
+    """Skip the Kiro agent-store check for tests that use ``kiro_cli`` as a stand-in.
+
+    ``create_terminal`` refuses a Kiro launch whose agent no agent directory
+    defines (#1074). Modules that exercise unrelated launch behaviour (rollback,
+    plugin events, worktrees) with made-up profile names opt in here instead of
+    installing an agent file per name; ``test_kiro_agent_identity_launch`` and
+    ``test_delegation_ceiling`` cover the check itself.
+    """
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.require_kiro_agent_resolves",
+        lambda *args, **kwargs: None,
+    )
+
+
+@pytest.fixture
 def scoped_ast_parse(monkeypatch):
     """Fake ``ast.parse`` for ONE source string; every other call parses for real.
 

@@ -224,6 +224,12 @@ uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -k KiroCli -o 
    - Check: `kiro-cli mcp list` from inside the session — `cao-mcp-server` will be absent from the enabled servers
    - Fix: remove `--legacy-ui`; CAO pins `--agent-engine v2` on its own
 
+7. **"Kiro agent '<name>' was not found" or "Kiro started agent 'kiro_default' instead of '<name>'"**:
+   - kiro-cli does not refuse an `--agent` it cannot load. It prints `agent "<name>" not found, using "kiro_default"` and starts its built-in default agent, which has every built-in tool (shell, write, `use_aws`). CAO refuses such a launch instead (#1074).
+   - Before launch, CAO looks for the agent in `<working directory>/.kiro/agents/`, in the directory `cao install` writes (`~/.kiro/agents/` unless `CAO_AGENTS_DIR` is set), in `~/.kiro/agents/`, and in `$KIRO_HOME/agents/` when `KIRO_HOME` is an absolute path. Any of these counts: a `<name>.json`, a `<name>/` directory holding a JSON spec (the AIM layout above), or a spec whose `name` is `<name>`. If none is found, the create fails with `400` before any terminal exists.
+   - After kiro-cli starts, and before any task is typed, the TUI header row (`<agent> · <model> · ◔ N%`) must name the agent. If it names another agent, or no header can be read, the terminal is torn down and nothing is delivered. An agent file that kiro-cli cannot parse ends here; run `kiro-cli agent list` and look for `Error:` lines.
+   - Fix: `cao install <name> --provider kiro_cli`, then retry. Kiro's built-in agents (`kiro_default`, `kiro_help`, `kiro_planner`) have no agent file, so they cannot be launched through CAO.
+
 ## kiro-cli 2.11+ Notes
 
 Starting with kiro-cli 2.11, the TUI changed how it accepts pasted input and how

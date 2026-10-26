@@ -328,6 +328,38 @@ class TestTerminalCreationWithWorkingDirectory:
         [
             ("/sessions", "session_service.create_session"),
             ("/sessions/test-session/terminals", "terminal_service.create_terminal"),
+            ("/sessions/test-session/terminals:operator", "terminal_service.create_terminal"),
+        ],
+    )
+    @pytest.mark.parametrize("kind", ["agent_not_found", "identity_mismatch"])
+    def test_kiro_agent_identity_refusal_is_a_bad_request(self, client, endpoint, target, kind):
+        """A Kiro launch whose agent kiro-cli would not run (#1074) is a configuration
+        refusal: 400 with the remedy, not the 404 the generic ValueError arm gives."""
+        from cli_agent_orchestrator.providers.kiro_identity import KiroAgentIdentityError
+
+        refusal = KiroAgentIdentityError(
+            kind, "analyst", "Kiro agent 'analyst' ... `cao install analyst --provider kiro_cli`"
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch(f"cli_agent_orchestrator.api.main.{target}", new=AsyncMock(side_effect=refusal)),
+        ):
+            params = {"provider": "kiro_cli", "agent_profile": "analyst"}
+            if endpoint.endswith("/terminals"):
+                params["caller_id"] = "dcba8765"  # the in-session route requires one
+            response = client.post(endpoint, params=params)
+
+        assert response.status_code == 400, response.text
+        assert "cao install analyst" in response.json()["detail"]
+
+    @pytest.mark.parametrize(
+        "endpoint,target",
+        [
+            ("/sessions", "session_service.create_session"),
+            ("/sessions/test-session/terminals", "terminal_service.create_terminal"),
         ],
     )
     def test_kiro_policy_path_refusal_is_a_bad_request(

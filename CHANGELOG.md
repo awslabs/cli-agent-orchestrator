@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Kiro launches refuse an agent that kiro-cli would not run** (#1074). kiro-cli does not fail on
+  an unknown `--agent`. It prints `agent "<name>" not found, using "kiro_default"` and starts its
+  built-in default agent, which has every built-in tool, so launching a profile that was not
+  installed for Kiro, or whose agent file did not load, ran unrestricted. Every `kiro_cli` launch now
+  refuses an agent that no agent directory kiro-cli reads defines, before any terminal exists (`400`,
+  with the `cao install` remedy). It also refuses a pane whose TUI header names a different agent,
+  before any task is typed; that terminal is torn down. A correctly installed profile launches
+  exactly as before. **Behaviour change:** Kiro launches of a profile not installed for `kiro_cli`,
+  or of a Kiro built-in agent, are now refused. See `docs/kiro-cli.md`, troubleshooting item 7.
+
 - **Inbox deliveries confirm the submit and recover a swallowed Enter** (#78). A delivery is
   paste, delay, Enter; when the TUI swallows the Enter the message sat unsubmitted while the
   terminal still read IDLE, so the sender waited forever and the next message was pasted on top
